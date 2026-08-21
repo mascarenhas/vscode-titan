@@ -60,7 +60,7 @@ VSIX := $(VSIX_DIR)/titan-$(VSIX_TARGET).vsix
 .DEFAULT_GOAL := all
 
 .PHONY: all help toolchain toolchain-refresh npm-ci server server-test \
-	server-protocol-test extension extension-test extension-host-test test package inspect-server \
+	server-protocol-test codex-native-test extension extension-test extension-host-test test package inspect-server \
 	plugin-validate verify install-server install-server-test install-vsix clean clean-node
 
 all: server extension
@@ -72,6 +72,7 @@ help:
 	@echo "  server               build bin/titan-language-server as one native executable"
 	@echo "  server-test          compile and run the native Titan protocol tests"
 	@echo "  server-protocol-test exercise the native executable over framed stdio"
+	@echo "  codex-native-test    query the native executable through the Codex adapter"
 	@echo "  extension-test       compile and run the JavaScript unit tests"
 	@echo "  extension-host-test  run the VS Code Extension Host smoke test"
 	@echo "  test                 run the native Titan and JavaScript unit suites"
@@ -131,6 +132,9 @@ server-test: $(SERVER_SOURCES) | $(TITANC)
 server-protocol-test: $(SERVER)
 	node scripts/test-server-protocol.mjs "$(SERVER)"
 
+codex-native-test: $(SERVER)
+	node scripts/test-codex-native.mjs "$(SERVER)"
+
 extension: npm-ci
 	npm run compile
 
@@ -140,7 +144,7 @@ extension-test: npm-ci
 extension-host-test: $(SERVER) npm-ci
 	npm run test:vscode
 
-test: server-test server-protocol-test extension-test
+test: server-test server-protocol-test codex-native-test extension-test
 
 package: $(SERVER) npm-ci
 	@mkdir -p "$(VSIX_DIR)"

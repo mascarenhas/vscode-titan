@@ -46,8 +46,9 @@ If `.titan/` already exists after the sibling Titan checkout changes, run
 static providers match that checkout.
 
 The complete local gate builds the server and extension, runs Titan and
-JavaScript tests plus the Extension Host smoke test, packages the VSIX, checks
-its contents, validates the Codex plugin metadata, and inspects native linkage:
+JavaScript tests plus the Extension Host smoke test, queries the native server
+through the Codex adapter, packages the VSIX, checks its contents, validates the
+Codex plugin metadata, and inspects native linkage:
 
 ```sh
 make verify

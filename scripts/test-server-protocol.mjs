@@ -192,6 +192,10 @@ async function testSavedProjectSemantics() {
     "function use(): integer",
     "  return answer(#\"😀\", answer(21))",
     "end",
+    "function widen(item: integer): float",
+    "  local widened: float = item",
+    "  return widened",
+    "end",
     ""
   ];
   await writeFile(filename, sourceLines.join("\n"), "utf8");
@@ -216,6 +220,36 @@ async function testSavedProjectSemantics() {
       jsonrpc: "2.0",
       method: "initialized",
       params: {}
+    }));
+
+    // V1 semantics are deliberately saved-file-only. Even if a client sends
+    // text synchronization notifications that the server does not advertise,
+    // their divergent in-memory text must not become compiler input. Keep the
+    // buffer valid so a buffer-backed implementation cannot pass by falling
+    // back to the last valid disk AST.
+    const unsavedSource = [
+      `local ${sourceLines[0]}`,
+      ...sourceLines.slice(1)
+    ].join("\n");
+    child.stdin.write(frame({
+      jsonrpc: "2.0",
+      method: "textDocument/didOpen",
+      params: {
+        textDocument: {
+          uri,
+          languageId: "titan",
+          version: 1,
+          text: unsavedSource
+        }
+      }
+    }));
+    child.stdin.write(frame({
+      jsonrpc: "2.0",
+      method: "textDocument/didChange",
+      params: {
+        textDocument: { uri, version: 2 },
+        contentChanges: [{ text: unsavedSource }]
+      }
     }));
 
     const documentPosition = {
@@ -268,9 +302,35 @@ async function testSavedProjectSemantics() {
     );
     assert.equal(hover.result.contents.kind, "markdown");
     assert.match(hover.result.contents.value, /integer/);
+    assert.match(hover.result.contents.value, /Declaration: non-local/);
     assert.deepEqual(hover.result.range, {
       start: { line: 4, character: unicodeUse },
       end: { line: 4, character: unicodeUse + "answer".length }
+    });
+
+    const coercedItem = sourceLines[7].lastIndexOf("item");
+    assert.ok(coercedItem >= 0, "coercion fixture has no item use");
+    const coercionHover = await request(
+      child,
+      responses,
+      "coercion-hover",
+      "textDocument/hover",
+      {
+        textDocument: { uri },
+        position: { line: 7, character: coercedItem + 1 }
+      }
+    );
+    assert.equal(coercionHover.result.contents.kind, "markdown");
+    assert.match(coercionHover.result.contents.value,
+      /Inferred type: `integer`/);
+    assert.match(coercionHover.result.contents.value,
+      /Original type: `integer`/);
+    assert.match(coercionHover.result.contents.value,
+      /Coerced type: `float`/);
+    assert.match(coercionHover.result.contents.value, /Declaration: local/);
+    assert.deepEqual(coercionHover.result.range, {
+      start: { line: 7, character: coercedItem },
+      end: { line: 7, character: coercedItem + "item".length }
     });
 
     const folding = await request(
