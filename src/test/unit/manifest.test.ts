@@ -211,5 +211,12 @@ describe("Codex plugin manifest", () => {
       repositoryRoot,
       "plugins/titan-lsp/skills/titan-lsp-query/scripts/titan-lsp-query.mjs"
     )));
+    const skill = readFileSync(path.join(
+      repositoryRoot,
+      "plugins/titan-lsp/skills/titan-lsp-query/SKILL.md"
+    ), "utf8");
+    assert.match(skill, /sandbox_permissions: "require_escalated"/);
+    assert.match(skill, /Do not retry inside the sandbox/);
+    assert.match(skill, /does not authorize source\s+changes/);
   });
 });

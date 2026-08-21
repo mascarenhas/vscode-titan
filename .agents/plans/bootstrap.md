@@ -267,8 +267,9 @@ has evidence before moving to Done.
   and coerced types. The bridge normalizes those tables once into typed Titan
   records and unions.
 - The Makefile selects Titan's static provider and exports the embedded Lua C
-  API. Packages are host/architecture-specific; Linux CI builds on Ubuntu 22.04
-  and rejects binaries importing GLIBC symbols newer than 2.35.
+  API. Packages are host/architecture-specific; Linux CI builds in an Ubuntu
+  22.04 container on an Ubicloud runner and rejects binaries importing GLIBC
+  symbols newer than 2.35.
 - Codex's supported plugin surface is a bundled skill and deterministic query
   script. Marketplace-level `lspServers` registration is not part of the
   supported manifest contract.

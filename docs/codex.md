@@ -70,6 +70,15 @@ node plugins/titan-lsp/skills/titan-lsp-query/scripts/titan-lsp-query.mjs \
   --line 12 --character 8
 ```
 
+On managed Codex hosts, an agent must run this read-only command with
+`sandbox_permissions: "require_escalated"` on its first attempt. Node presents
+child stdio as Unix socket pairs, while the workspace sandbox blocks the
+socket-kind inspection libuv uses to distinguish protocol pipes from
+unsupported handles; the server would otherwise fail with
+`stdio.parent.kind` before LSP startup. It should not retry inside the sandbox.
+This is a command-sandbox compatibility requirement and does not authorize
+source-file writes.
+
 Line and character values use zero-based LSP coordinates; characters count
 UTF-16 code units. The `rename-preview` operation requires `--new-name` and
 returns a `WorkspaceEdit` with `applied: false`. It never changes source files.

@@ -18,6 +18,14 @@ node <this-skill-directory>/scripts/titan-lsp-query.mjs definition \
   --root /absolute/project --file src/main.titan --line 12 --character 8
 ```
 
+On managed Codex hosts, run this read-only client with
+`sandbox_permissions: "require_escalated"` on the first attempt. Node exposes
+child stdio as Unix socket pairs, while the workspace sandbox blocks the
+socket-kind inspection required by libuv; the server would otherwise fail with
+`stdio.parent.kind` before LSP startup. Do not retry inside the sandbox. This
+escalation authorizes only the query command and does not authorize source
+changes.
+
 The operations are:
 
 - `definition`, `references`, and `hover`: require zero-based LSP `--line` and
