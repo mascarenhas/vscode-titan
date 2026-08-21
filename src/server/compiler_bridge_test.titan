@@ -231,12 +231,53 @@ return function(mode)
           block = {
             _tag = "Ast.StatBlock",
             loc = { filename = "/workspace/fixture.titan", line = 3, col = 3 },
-            stats = {{
-              _tag = "Ast.StatDecl",
-              loc = { filename = "/workspace/fixture.titan", line = 3, col = 3 },
-              decls = { local_decl },
-              exps = { cast },
-            }},
+            stats = {
+              {
+                _tag = "Ast.StatDecl",
+                loc = {
+                  filename = "/workspace/fixture.titan", line = 3, col = 3,
+                },
+                decls = { local_decl },
+                exps = { cast },
+              },
+              {
+                _tag = "Ast.StatReturn",
+                loc = {
+                  filename = "/workspace/fixture.titan", line = 4, col = 3,
+                },
+                exps = {{
+                  _tag = "Ast.ExpInitList",
+                  loc = {
+                    filename = "/workspace/fixture.titan", line = 4, col = 10,
+                  },
+                  fields = {{
+                    _tag = "Ast.Field",
+                    loc = {
+                      filename = "/workspace/fixture.titan", line = 4, col = 11,
+                    },
+                    name = {
+                      _tag = "Ast.ExpString",
+                      loc = {
+                        filename = "/workspace/fixture.titan",
+                        line = 4,
+                        col = 12,
+                      },
+                      value = "computed",
+                    },
+                    exp = {
+                      _tag = "Ast.ExpInteger",
+                      loc = {
+                        filename = "/workspace/fixture.titan",
+                        line = 4,
+                        col = 27,
+                      },
+                      value = 1,
+                      _type = integer,
+                    },
+                  }},
+                }},
+              },
+            },
           },
           _type = { _tag = "Type.Function" },
         },
@@ -574,15 +615,24 @@ function test_compiler_bridge_normalizes_annotated_ast_and_provenance(
     end
 
     local saw_cast = false
+    local saw_computed_field = false
+    local saw_computed_key = false
     for index = 1, #project.nodes do
       local node = project.nodes[index]
       if node.tag == "Ast.ExpCast" then
         saw_cast = node.synthetic and node.original_type ~= nil and
           node.original_type.display == "integer" and
           node.coerced_type ~= nil and node.coerced_type.display == "float"
+      elseif node.tag == "Ast.Field" then
+        saw_computed_field = node.name == nil
+      elseif node.tag == "Ast.ExpString" and node.parent_id ~= nil then
+        saw_computed_key =
+          project.nodes[node.parent_id].tag == "Ast.Field"
       end
     end
     test.assert(saw_cast, "implicit compiler coercion was not normalized")
+    test.assert(saw_computed_field and saw_computed_key,
+                "computed initializer key was not normalized as an AST child")
 
     local definition_id: string? = nil
     local reference_id: string? = nil
@@ -942,6 +992,58 @@ end
 function test_compiler_bridge_normalizes_generic_nominal_and_member_metadata(
     _context: test.Context)
   test_runtime.run(normalizes_generic_nominal_member_metadata)
+end
+
+local function excludes_lowered_generic_case_payloads_from_exact_spans()
+  preload_real_compiler()
+  local filename = "/workspace/generic_case_payload.titan"
+  local source = [[union Maybe<T>
+  present: T
+  absent
+end
+function make<T>(item: T): Maybe<T>
+  return Maybe<T>.present(item)
+end
+function number(): integer
+  local candidate = make(42)
+  case candidate
+  when present: item then
+    return item
+  else
+    return 0
+  end
+end
+]]
+  local projects = {bridge.ProjectModule.new("generic_case_payload", {
+    bridge.SourceFile.new(filename, source),
+  })}
+  local analysis = bridge.load():analyze("generic_case_payload", projects)
+  test.assert(#analysis.diagnostics == 0,
+              "generic case payload fixture did not compile")
+  local module? = analysis:find_module("generic_case_payload")
+  test.assert(module ~= nil, "generic case payload module was not normalized")
+  local saw_lowered_payload = false
+  local source_item_spans = 0
+  for index = 1, #module.symbols do
+    local symbol = module.symbols[index]
+    if strings.find(symbol.name, "__generic_case_payload_", 1) == 1 then
+      saw_lowered_payload = true
+      test.assert(symbol.exact_span == nil,
+                  "lowered generic case payload gained a source span")
+    elseif symbol.name == "item" and symbol.exact_span ~= nil then
+      source_item_spans = source_item_spans + 1
+    end
+  end
+  test.assert(saw_lowered_payload,
+              "fixture did not exercise generic case payload lowering")
+  test.assert(source_item_spans >= 4,
+              "source-written generic bindings lost their exact spans")
+  features.build(projects, analysis.modules)
+end
+
+function test_compiler_bridge_excludes_lowered_generic_case_payloads_from_exact_spans(
+    _context: test.Context)
+  test_runtime.run(excludes_lowered_generic_case_payloads_from_exact_spans)
 end
 
 local function drives_shadowing_and_record_definition_features_from_compiler()

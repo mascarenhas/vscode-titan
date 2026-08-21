@@ -918,9 +918,15 @@ local function node_name(node: {string: value}, tag: string): string?
       or tag == "Ast.InterfaceMethod" or tag == "Ast.TypeParam"
       or tag == "Ast.VarName" or tag == "Ast.VarDot"
       or tag == "Ast.TypeName" or tag == "Ast.TypeQualName"
-      or tag == "Ast.ExpMethodRef" or tag == "Ast.CaseArm"
-      or tag == "Ast.Field" then
+      or tag == "Ast.ExpMethodRef" or tag == "Ast.CaseArm" then
     return optional_string(node["name"], DRIVER_MODULE, tag .. ".name")
+  end
+  if tag == "Ast.Field" then
+    local name: value = node["name"]
+    if name == nil or name == false then return nil end
+    if name is string then return name as string end
+    required_map(name, DRIVER_MODULE, tag .. ".name")
+    return nil
   end
   if tag == "Ast.ArgsMethod" or tag == "Ast.ArgsNamedMethod" then
     return optional_string(node["method"], DRIVER_MODULE, tag .. ".method")
@@ -1123,8 +1129,7 @@ local function occurrence_role(name: string): OccurrenceRole
 end
 
 local function exact_occurrence_span(node: {string: value}, tag: string,
-                                     parent_tag: string?, name: string,
-                                     location: SourceLocation): SourceSpan?
+                                     name: string): SourceSpan?
   -- Issue #91 explicitly leaves navigation to Titan FFI declarations out of
   -- V1. Calls may still carry a stable identity for hover/references, but the
   -- foreign declaration itself must not become a navigable project target or
@@ -1135,24 +1140,9 @@ local function exact_occurrence_span(node: {string: value}, tag: string,
   if name_location ~= nil then
     return exact_name_span(name_location, name)
   end
-  if tag == "Ast.VarName" or tag == "Ast.TypeName"
-      or tag == "Ast.TypeParam" then
-    return exact_name_span(location, name)
-  end
-  if tag == "Ast.Decl" then
-    if parent_tag == "Ast.TopLevelRecord" and
-        (optional_boolean(node["islocal"], DRIVER_MODULE, tag .. ".islocal")
-         or optional_boolean(node["isconst"], DRIVER_MODULE,
-                             tag .. ".isconst")) then
-      return nil
-    end
-    return exact_name_span(location, name)
-  end
-  if tag == "Ast.UnionVariant" and
-      not optional_boolean(node["islocal"], DRIVER_MODULE,
-                           tag .. ".islocal") then
-    return exact_name_span(location, name)
-  end
+  -- API 3 marks every source-written identifier with `_name_loc`. Compiler
+  -- lowerings reuse a nearby diagnostic `loc` for generated names, so that
+  -- broader location must never be promoted into an exact navigation span.
   return nil
 end
 
@@ -1175,7 +1165,7 @@ local function Walker:add_occurrence(node: {string: value}, tag: string,
   if local_hint ~= nil then localness = local_hint end
 
   local span: SourceSpan? = nil
-  span = exact_occurrence_span(node, tag, parent_tag, name, location)
+  span = exact_occurrence_span(node, tag, name)
   self.symbols[#self.symbols + 1] = SymbolOccurrence.new(
     name, declaration_id, occurrence_role(role_name), location, span,
     localness, optional_type(self.compiler, node, "_type", tag))
@@ -1232,6 +1222,7 @@ local function child_fields(): const { string }
     "constraint", "class", "params",
     "argtypes", "rettypes", "varargtype", "flexrettype", "block",
     "decl", "decls", "value", "type", "fields", "variants",
+    "name",
     "members", "methods", "stats", "condition", "start", "finish",
     "inc", "exps", "vars", "callexp", "exp", "var", "arms",
     "elseblock", "thens", "elsestat", "catchblock", "finallyblock",
