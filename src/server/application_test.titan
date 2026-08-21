@@ -1,0 +1,464 @@
+local async = import "async"
+local fs = import "fs"
+local strings = import "string"
+local test = import "test"
+local timer = import "timer"
+local application = import "server.application"
+local bridge = import "server.compiler_bridge"
+local dispatcher = import "server.dispatcher"
+local json = import "server.json"
+local project_service = import "server.project_service"
+local source_text = import "server.source_text"
+local test_runtime = import "server.test_runtime"
+
+local record YieldingAnalyzer
+  runs: integer
+  block: boolean
+  started: boolean
+  finished: boolean
+  fail: boolean
+end
+
+local record SavingRenameAnalyzer
+  filename: string
+  runs: integer
+end
+
+local function occurrence(filename: string, line: integer,
+                          start_column: integer, finish_column: integer,
+                          name: string, declaration_id: string,
+                          role: bridge.OccurrenceRole):
+    bridge.SymbolOccurrence
+  local start = bridge.SourceLocation.new(filename, line, start_column)
+  return bridge.SymbolOccurrence.new(
+    name, declaration_id, role, start,
+    bridge.SourceSpan.new(
+      start,
+      bridge.SourceLocation.new(filename, line, finish_column)),
+    true, nil)
+end
+
+local function find_project(request: project_service.AnalysisRequest,
+                            name: string): bridge.ProjectModule?
+  for index = 1, #request.project_modules do
+    if request.project_modules[index].module_name == name then
+      return request.project_modules[index]
+    end
+  end
+  return nil
+end
+
+local function project_snapshot(module: bridge.ProjectModule):
+    bridge.ModuleSnapshot
+  local filenames: {string} = {}
+  for index = 1, #module.files do
+    filenames[index] = module.files[index].filename
+  end
+  local nodes: {bridge.Node} = {}
+  -- Make the fixture's completed generation observably different: only the
+  -- initial three-line function contributes a structural folding node.
+  if strings.find(module.files[1].contents, "  return 1\n") ~= nil then
+    local start = bridge.SourceLocation.new(filenames[1], 1, 1)
+    nodes[1] = bridge.Node.new(
+      1, nil, "Ast.TopLevelFunc", bridge.NodeKind.declaration(), start,
+      bridge.SourceSpan.new(
+        start, bridge.SourceLocation.new(filenames[1], 3, 1)),
+      "answer", false, false, nil, nil, nil, nil, nil)
+  end
+  local symbols: {bridge.SymbolOccurrence} = {}
+  if strings.find(
+      module.files[1].contents,
+      "local answer = 1\nlocal copy = answer\n") ~= nil then
+    local declaration_id =
+      "ast:" .. module.module_name .. ":" .. filenames[1] ..
+      ":1:7:answer"
+    symbols[1] = occurrence(
+      filenames[1], 1, 7, 13, "answer", declaration_id,
+      bridge.OccurrenceRole.definition())
+    symbols[2] = occurrence(
+      filenames[1], 2, 14, 20, "answer", declaration_id,
+      bridge.OccurrenceRole.reference())
+  end
+  return bridge.ModuleSnapshot.new(
+    module.module_name,
+    bridge.Provenance.project_source(
+      bridge.SourceProvenance.new(filenames[1], filenames)),
+    bridge.Manifest.new(module.module_name, "public:" .. module.module_name),
+    nodes, symbols, {}, {})
+end
+
+local function SavingRenameAnalyzer:analyze(
+    snapshot: project_service.Snapshot,
+    projects: {bridge.ProjectModule}): bridge.Analysis
+  self.runs = self.runs + 1
+  test.assert(#projects == 1 and #projects[1].files == 1 and
+              projects[1].files[1].filename == self.filename and
+              projects[1].files[1].contents ==
+                "local renamed = 1\nlocal copy = renamed\n",
+              "rename preflight did not receive the edited saved project")
+
+  -- Simulate a concurrent editor save after compiler preflight has started.
+  -- Application must rediscover this disk generation before returning edits.
+  local saved = fs.read_file(self.filename)
+  fs.write_file(self.filename, saved .. "-- saved during rename\n")
+
+  local module = projects[1]
+  local declaration_id =
+    "ast:" .. module.module_name .. ":" .. self.filename ..
+    ":1:7:renamed"
+  local checked = bridge.ModuleSnapshot.new(
+    module.module_name,
+    bridge.Provenance.project_source(
+      bridge.SourceProvenance.new(self.filename, {self.filename})),
+    bridge.Manifest.new(module.module_name, "public:" .. module.module_name),
+    {}, {
+      occurrence(self.filename, 1, 7, 14, "renamed", declaration_id,
+                 bridge.OccurrenceRole.definition()),
+      occurrence(self.filename, 2, 14, 21, "renamed", declaration_id,
+                 bridge.OccurrenceRole.reference()),
+    }, {}, {})
+  return bridge.Analysis.new(snapshot.project_modules[1].module_name,
+                             {}, {checked}, {})
+end
+
+local function YieldingAnalyzer:analyze(
+    request: project_service.AnalysisRequest): bridge.Analysis
+  self.runs = self.runs + 1
+  if self.fail then raise "deliberate project recheck failure" end
+  if self.block then
+    self.started = true
+    while self.block do timer.yield() end
+    self.finished = true
+  end
+
+  local snapshots: {bridge.ModuleSnapshot} = {}
+  for index = 1, #request.dirty_modules do
+    local name = request.dirty_modules[index]
+    local module? = find_project(request, name)
+    test.assert(module ~= nil,
+                "application analyzer lost a dirty project module")
+    if module == nil then raise "dirty project module is missing" end
+    snapshots[index] = project_snapshot(module)
+  end
+  return bridge.Analysis.new(request.root_module, {}, snapshots, {})
+end
+
+local function request_for(path: string, id: integer,
+                           method: string): dispatcher.SemanticRequest
+  local uri?, uri_error? = source_text.path_to_file_uri(path)
+  test.assert(uri_error == nil and uri ~= nil,
+              "application fixture path did not become a file URI")
+  if uri == nil then raise "application fixture URI is missing" end
+  local actual_uri: string = uri
+  local members: {json.Member} = {
+    json.Member.new("textDocument", json.from_object({
+      json.Member.new("uri", json.from_string(actual_uri)),
+    })),
+  }
+  if method == "textDocument/rename" then
+    members[#members + 1] = json.Member.new("position", json.from_object({
+      json.Member.new("line", json.from_integer(0)),
+      json.Member.new("character", json.from_integer(0)),
+    }))
+    members[#members + 1] =
+      json.Member.new("newName", json.from_string("renamed"))
+  end
+  return dispatcher.SemanticRequest.new(
+    dispatcher.RequestId.integer_id(id), method, json.from_object(members))
+end
+
+local function rename_request_for(path: string, id: integer,
+                                  character: integer):
+    dispatcher.SemanticRequest
+  local uri?, uri_error? = source_text.path_to_file_uri(path)
+  test.assert(uri_error == nil and uri ~= nil,
+              "application fixture path did not become a file URI")
+  if uri == nil then raise "application fixture URI is missing" end
+  local document = json.from_object({
+    json.Member.new("uri", json.from_string(uri)),
+  })
+  local position = json.from_object({
+    json.Member.new("line", json.from_integer(0)),
+    json.Member.new("character", json.from_integer(character)),
+  })
+  local params = json.from_object({
+    json.Member.new("textDocument", document),
+    json.Member.new("position", position),
+    json.Member.new("newName", json.from_string("renamed")),
+  })
+  return dispatcher.SemanticRequest.new(
+    dispatcher.RequestId.integer_id(id), "textDocument/rename", params)
+end
+
+local function result_array_length(
+    outcome: dispatcher.SemanticOutcome, subject: string): integer
+  case outcome
+  when result: item then
+    local array? = json.as_array(item)
+    if array == nil then raise subject .. " did not return a JSON array" end
+    return #array.items
+  when failure: failure then
+    test.assert(false, subject .. ": " .. failure.message)
+  end
+  return -1
+end
+
+local function assert_result(outcome: dispatcher.SemanticOutcome,
+                             subject: string)
+  case outcome
+  when result then
+  when failure: failure then
+    test.assert(false, subject .. ": " .. failure.message)
+  end
+end
+
+local function assert_failure(outcome: dispatcher.SemanticOutcome,
+                              subject: string)
+  case outcome
+  when result then test.assert(false, subject .. " unexpectedly succeeded")
+  when failure then
+  end
+end
+
+local function join_outcome(
+    task: async.Task<dispatcher.SemanticOutcome, value>,
+    subject: string): dispatcher.SemanticOutcome
+  case async.join<dispatcher.SemanticOutcome, value>(task)
+  when succeeded: outcome then return outcome
+  when failed: failure then
+    raise subject .. ": " .. strings.tostring(failure.error)
+  when cancelled then raise subject .. " was cancelled"
+  else raise subject .. " did not finish"
+  end
+  return dispatcher.SemanticOutcome.failure(
+    dispatcher.SemanticError.new(-32603, subject .. " had no outcome"))
+end
+
+local function with_application(
+    body: (string, YieldingAnalyzer, application.Application) -> ())
+  local root = fs.tmpname()
+  fs.unlink(root)
+  fs.mkdir(root)
+  local filename = root .. "/main.titan"
+  fs.write_file(filename,
+    "function answer(): integer\n" ..
+    "  return 1\n" ..
+    "end\n")
+  defer do
+    if fs.lstat(filename) ~= nil then fs.unlink(filename) end
+    if fs.lstat(root) ~= nil then fs.rmdir(root) end
+  end
+
+  local analyzer = YieldingAnalyzer.new(0, false, false, false, false)
+  local service?, service_error? = project_service.load_with_analyzer(
+    root, "/sdk/lib/titan/0.26", analyzer:analyze)
+  test.assert(service_error == nil and service ~= nil,
+              "application fixture project did not load")
+  if service == nil then raise "application fixture Service is missing" end
+  local app = application.create_with_service(root, service)
+  defer app:close()
+  body(filename, analyzer, app)
+end
+
+local function serves_completed_view_during_yielding_recheck()
+  with_application(function (filename: string, analyzer: YieldingAnalyzer,
+                             app: application.Application)
+    fs.write_file(
+      filename, "function answer(): integer return 123456 end\n")
+    analyzer.block = true
+    analyzer.started = false
+    analyzer.finished = false
+
+    -- The first request owns the refresh and therefore waits for its stable
+    -- result. The second request arrives after the analyzer has yielded and
+    -- may read the immutable preceding completed generation.
+    local owner = async.run<dispatcher.SemanticOutcome, value>(function ():
+        dispatcher.SemanticOutcome
+      return app:handle(request_for(
+        filename, 1, "textDocument/foldingRange"))
+    end)
+    while not analyzer.started do timer.yield() end
+    test.assert(not owner:status():has_finished(),
+                "refresh-owning request did not await the recheck")
+
+    local responsive = app:handle(request_for(
+      filename, 2, "textDocument/foldingRange"))
+    test.assert(
+      result_array_length(
+        responsive, "read-only request during project recheck") == 1,
+      "responsive request did not use the preceding completed generation")
+    test.assert(not analyzer.finished and
+                not owner:status():has_finished(),
+                "responsive request waited for the yielding recheck")
+
+    -- Rename must not use the fallback because its edits target saved bytes.
+    local rename = async.run<dispatcher.SemanticOutcome, value>(function ():
+        dispatcher.SemanticOutcome
+      return app:handle(request_for(
+        filename, 3, "textDocument/rename"))
+    end)
+    timer.yield()
+    test.assert(not rename:status():has_finished(),
+                "rename used the completed-generation fallback")
+
+    -- A second save and its watcher hint while analysis is suspended supersede
+    -- this candidate. ProjectService must discard the in-flight snapshot and
+    -- recheck the newest bytes before Application can publish it.
+    local runs_before = analyzer.runs
+    fs.write_file(
+      filename, "function answer(): integer return 789 end\n")
+    app:note_saved_change()
+    analyzer.block = false
+    while not analyzer.finished do timer.yield() end
+    local owner_outcome = join_outcome(owner, "refresh owner")
+    test.assert(result_array_length(owner_outcome, "refresh owner") == 0,
+                "refresh owner did not receive the stable newest generation")
+    test.assert(analyzer.runs >= runs_before + 1,
+                "watcher-superseded refresh did not run another pass")
+    assert_failure(join_outcome(rename, "fresh rename"),
+                   "rename without a symbol")
+  end)
+end
+
+function test_application_serves_completed_view_during_yielding_recheck(
+    _context: test.Context)
+  test_runtime.run(serves_completed_view_during_yielding_recheck)
+end
+
+local function preserves_shared_refresh_after_owner_cancellation()
+  with_application(function (filename: string, analyzer: YieldingAnalyzer,
+                             app: application.Application)
+    test.assert(
+      result_array_length(
+        app:handle(request_for(
+          filename, 4, "textDocument/foldingRange")),
+        "completed generation before refresh-owner cancellation") == 1,
+      "cancellation fixture did not begin with its older completed generation")
+
+    fs.write_file(
+      filename, "function answer(): integer return 123456 end\n")
+    analyzer.block = true
+    analyzer.started = false
+    analyzer.finished = false
+    local runs_before = analyzer.runs
+
+    -- This Task represents the coordinator-owned request which discovers and
+    -- starts the refresh. Cancelling the request must detach its join without
+    -- propagating cancellation to the independently rooted refresh Task.
+    local owner = async.run<dispatcher.SemanticOutcome, value>(function ():
+        dispatcher.SemanticOutcome
+      return app:handle(request_for(
+        filename, 5, "textDocument/foldingRange"))
+    end)
+    while not analyzer.started do timer.yield() end
+    test.assert(analyzer.runs == runs_before + 1,
+                "refresh owner did not start exactly one shared recheck")
+
+    owner:cancel(async.CancellationReason.simple(
+      "cancel refresh-owning request in application test"))
+    local owner_cancelled = false
+    case async.join(owner)
+    when cancelled then owner_cancelled = true
+    when succeeded then
+    when failed then
+    else
+    end
+    test.assert(owner_cancelled,
+                "refresh-owning request did not finish as cancelled")
+
+    analyzer.block = false
+
+    -- Rename cannot use a completed-view fallback, so this request joins the
+    -- surviving shared refresh. If cancellation leaked to that refresh, this
+    -- call would need a replacement analyzer run and the original analyzer
+    -- would never reach its successful release point.
+    assert_failure(app:handle(request_for(
+      filename, 6, "textDocument/rename")),
+      "fresh request after refresh-owner cancellation")
+    test.assert(analyzer.finished,
+                "shared refresh did not survive owner cancellation")
+    test.assert(analyzer.runs == runs_before + 1,
+                "owner cancellation caused a replacement compiler recheck")
+
+    test.assert(
+      result_array_length(
+        app:handle(request_for(
+          filename, 7, "textDocument/foldingRange")),
+        "later request after refresh-owner cancellation") == 0,
+      "later request did not observe the published completed generation")
+  end)
+end
+
+function test_application_preserves_shared_refresh_after_owner_cancellation(
+    _context: test.Context)
+  test_runtime.run(preserves_shared_refresh_after_owner_cancellation)
+end
+
+local function rejects_fallback_after_refresh_failure()
+  with_application(function (filename: string, analyzer: YieldingAnalyzer,
+                             app: application.Application)
+    fs.write_file(filename, "deliberately changed saved source\n")
+    analyzer.fail = true
+    assert_failure(app:handle(request_for(
+      filename, 10, "textDocument/foldingRange")),
+      "request which discovered refresh failure")
+    assert_failure(app:handle(request_for(
+      filename, 11, "textDocument/foldingRange")),
+      "request after known refresh failure")
+
+    analyzer.fail = false
+    assert_result(app:handle(request_for(
+      filename, 12, "textDocument/foldingRange")),
+      "request after refresh recovery")
+  end)
+end
+
+function test_application_does_not_serve_fallback_after_refresh_failure(
+    _context: test.Context)
+  test_runtime.run(rejects_fallback_after_refresh_failure)
+end
+
+local function rejects_save_during_successful_rename_preflight()
+  local root = fs.tmpname()
+  fs.unlink(root)
+  fs.mkdir(root)
+  local filename = root .. "/main.titan"
+  fs.write_file(filename,
+    "local answer = 1\n" ..
+    "local copy = answer\n")
+  defer do
+    if fs.lstat(filename) ~= nil then fs.unlink(filename) end
+    if fs.lstat(root) ~= nil then fs.rmdir(root) end
+  end
+
+  local analyzer = YieldingAnalyzer.new(0, false, false, false, false)
+  local service?, service_error? = project_service.load_with_analyzer(
+    root, "/sdk/lib/titan/0.26", analyzer:analyze)
+  test.assert(service_error == nil and service ~= nil,
+              "rename-race fixture project did not load")
+  if service == nil then raise "rename-race fixture Service is missing" end
+
+  local saving = SavingRenameAnalyzer.new(filename, 0)
+  local app = application.create_with_service_and_rename_analyzer(
+    root, service, saving:analyze)
+  defer app:close()
+
+  local outcome = app:handle(rename_request_for(filename, 20, 7))
+  case outcome
+  when result then
+    test.assert(false, "rename returned edits for an obsolete saved generation")
+  when failure: failure then
+    test.assert(
+      failure.code == -32803 and
+      strings.find(failure.message,
+                   "saved Titan project changed during rename") ~= nil,
+      "rename save race did not return the retryable RequestFailed error")
+  end
+  test.assert(saving.runs == 1,
+              "rename save-race fixture did not run exactly one preflight")
+end
+
+function test_application_rejects_save_during_successful_rename_preflight(
+    _context: test.Context)
+  test_runtime.run(rejects_save_during_successful_rename_preflight)
+end

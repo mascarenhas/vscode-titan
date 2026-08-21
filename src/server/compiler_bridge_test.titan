@@ -1,0 +1,1205 @@
+local fs = import "fs"
+local test = import "test"
+local lua = import "titan.lua"
+local strings = import "string"
+local bridge = import "server.compiler_bridge"
+local features = import "server.semantic_features"
+local source_text = import "server.source_text"
+local test_runtime = import "server.test_runtime"
+
+local type EmptyFunction = () -> ()
+local type FixtureInstaller = (string) -> value
+
+local function new_fixture_installer(): FixtureInstaller
+  return lua.load([==[
+return function(mode)
+  local names = {
+    "titan-compiler.parser",
+    "titan-compiler.checker",
+    "titan-compiler.types",
+    "titan-compiler.driver",
+  }
+  local old_path, old_cpath = package.path, package.cpath
+  local old_loaded = {}
+  for _, name in ipairs(names) do old_loaded[name] = package.loaded[name] end
+
+  local integer = { _tag = "Type.Integer" }
+  local float = { _tag = "Type.Float" }
+  local function module_type(name)
+    return { _tag = "Type.Module", name = name }
+  end
+  local parser = {
+    parse = function() return {} end,
+    error_to_string = function(value) return tostring(value) end,
+  }
+  local checker = { check = function() return module_type("unused"), {} end }
+  local types = {
+    registry = {},
+    tostring = function(value)
+      if value._tag == "Type.Integer" then return "integer" end
+      if value._tag == "Type.Float" then return "float" end
+      return value._tag
+    end,
+    serialize = function(value)
+      return "Module(" .. string.format("%q", value.name) .. ",{}, {})"
+    end,
+  }
+  local driver = {
+    TITAN_VER = mode == "incompatible" and "99.0" or "0.26",
+    LANGUAGE_SERVER_API_VERSION =
+      mode == "wrong-language-server-api" and 2 or 3,
+    TITAN_SOURCE_PATH = ".",
+    TITAN_BIN_PATH = "",
+    INSTALL_PATHS = { titan_bin = "/opt/titan/lib/titan/0.26" },
+    imported = {},
+  }
+  if mode == "older-same-abi" then
+    driver.LANGUAGE_SERVER_API_VERSION = nil
+  end
+  driver.new_resolver_context = function(options)
+    assert(type(options.io) == "userdata")
+    return {
+      options = options,
+      io = options.io,
+      contextual_resolutions = {},
+      checked_source_modules = {},
+    }
+  end
+  driver.finalize_resolver_context = function(context)
+    if mode == "contextual-resolution" then
+      context.contextual_resolutions["fixture.facade\0fixture.owner"] = {
+        owner = "fixture.owner",
+        exposer = "fixture.facade",
+        kind = "static",
+        provider_file = "/binary/fixture-owner.a",
+        ordinary_lookup = true,
+      }
+    end
+    return context
+  end
+  driver.close_resolver_context = function() return true end
+  driver.close_loader = function() return true end
+  driver.resolve_external_modules = function(requests, known_sources, options)
+    assert(type(options.context) == "table")
+    assert(type(options.context.io) == "userdata")
+    if mode ~= "external-resolution" then return {} end
+    assert(driver.TITAN_SOURCE_PATH == "/configured/source")
+    assert(driver.TITAN_BIN_PATH == "/configured/binary")
+    assert(known_sources.app == true)
+    assert(requests["vendor.source"] == true)
+    assert(requests["vendor.dynamic"] == false)
+    assert(requests["vendor.static"] == false)
+    assert(requests["vendor.missing"] == false)
+    assert(requests["vendor.broken"] == false)
+    return {
+      ["vendor.source"] = {
+        kind = "source",
+        main_file = "/external/vendor/vendor.titan",
+        source_files = {
+          "/external/vendor/vendor.titan",
+          "/external/vendor/part.titan",
+        },
+      },
+      ["vendor.dynamic"] = {
+        kind = "dynamic",
+        provider_file = "/binary/vendor.so",
+      },
+      ["vendor.static"] = {
+        kind = "static",
+        provider_file = "/binary/vendor.a",
+      },
+      ["vendor.missing"] = { kind = "missing" },
+      ["vendor.broken"] = {
+        kind = "error",
+        message = "invalid provider metadata",
+      },
+    }
+  end
+  if mode ~= "same-api-missing-restat" then
+    driver.restat_c_header_dependencies = function(inputs, options)
+      assert(type(options.context) == "table")
+      assert(type(options.context.io) == "userdata")
+      local result = {}
+      for index, input in ipairs(inputs) do
+        result[index] = {
+          kind = input.kind,
+          path = input.path,
+          identity = mode == "header-metadata"
+            and input.identity .. ":restatted" or input.identity,
+        }
+      end
+      return result
+    end
+  end
+  driver.defaultloader = function(_, options)
+    if mode == "bad-loader" then return 42 end
+    return function(name)
+      if mode == "invalid-source" then
+        return false,
+          "/workspace/fixture.titan:2:7: syntax error: expected expression"
+      end
+      if mode == "bad-errors" then
+        return true, module_type(name), "not an error array", {}
+      end
+      if mode == "missing-root" then
+        return true, module_type(name), {}, {}
+      end
+
+      local decl = {
+        _tag = "Ast.Decl",
+        loc = { filename = "/workspace/fixture.titan", line = 2, col = 7 },
+        name = "count",
+        type = {
+          _tag = "Ast.TypeInteger",
+          loc = { filename = "/workspace/fixture.titan", line = 2, col = 14 },
+        },
+        _type = integer,
+      }
+      local declaration = {
+        _tag = "Ast.TopLevelVar",
+        loc = { filename = "/workspace/fixture.titan", line = 2, col = 1 },
+        islocal = true,
+        decl = decl,
+        value = {
+          _tag = "Ast.ExpInteger",
+          loc = { filename = "/workspace/fixture.titan", line = 2, col = 24 },
+          value = 1,
+          _type = integer,
+        },
+        _type = integer,
+      }
+      local reference = {
+        _tag = "Ast.VarName",
+        loc = { filename = "/workspace/fixture.titan", line = 3, col = 24 },
+        name = "count",
+        _decl = declaration,
+        _type = integer,
+      }
+      local cast = {
+        _tag = "Ast.ExpCast",
+        loc = { filename = "/workspace/fixture.titan", line = 3, col = 24 },
+        exp = {
+          _tag = "Ast.ExpVar",
+          loc = { filename = "/workspace/fixture.titan", line = 3, col = 24 },
+          var = reference,
+          _type = integer,
+        },
+        target = {
+          _tag = "Ast.TypeFloat",
+          loc = { filename = "/workspace/fixture.titan", line = 3, col = 17 },
+        },
+        _type = float,
+        _implicit_coercion = true,
+        _adjustment = {
+          kind = "direct_coercion",
+          source = integer,
+          target = float,
+          coercion = { op = "integer_to_float" },
+        },
+      }
+      local local_decl = {
+        _tag = "Ast.Decl",
+        loc = { filename = "/workspace/fixture.titan", line = 3, col = 9 },
+        name = "widened",
+        type = {
+          _tag = "Ast.TypeFloat",
+          loc = { filename = "/workspace/fixture.titan", line = 3, col = 17 },
+        },
+        _type = float,
+      }
+      local ast = {
+        {
+          _tag = "Ast.TopLevelImport",
+          loc = { filename = "/workspace/fixture.titan", line = 1, col = 1 },
+          _name_loc = {
+            filename = "/workspace/fixture.titan", line = 1, col = 7,
+          },
+          _type = module_type("fixture.external"),
+          localname = "dependency",
+          modname = "fixture.external",
+          source_required = true,
+        },
+        declaration,
+        {
+          _tag = "Ast.TopLevelFunc",
+          loc = { filename = "/workspace/fixture.titan", line = 3, col = 1 },
+          islocal = false,
+          name = "widen",
+          params = {},
+          rettypes = {},
+          typeparams = {},
+          block = {
+            _tag = "Ast.StatBlock",
+            loc = { filename = "/workspace/fixture.titan", line = 3, col = 3 },
+            stats = {{
+              _tag = "Ast.StatDecl",
+              loc = { filename = "/workspace/fixture.titan", line = 3, col = 3 },
+              decls = { local_decl },
+              exps = { cast },
+            }},
+          },
+          _type = { _tag = "Type.Function" },
+        },
+      }
+      local header_dependencies = {}
+      if mode == "header-metadata" then
+        header_dependencies = {
+          { kind = "file", path = "/headers/direct.h",
+            identity = "direct bytes" },
+          { kind = "search", path = "/headers/earlier.h",
+            identity = "missing candidate" },
+        }
+      elseif mode == "header-relative-path" then
+        header_dependencies = {
+          { kind = "file", path = "headers/direct.h",
+            identity = "direct bytes" },
+        }
+      elseif mode == "header-duplicate" then
+        header_dependencies = {
+          { kind = "file", path = "/headers/direct.h",
+            identity = "first" },
+          { kind = "file", path = "/headers/direct.h",
+            identity = "second" },
+        }
+      elseif mode == "header-unknown-kind" then
+        header_dependencies = {
+          { kind = "directory", path = "/headers",
+            identity = "directory state" },
+        }
+      elseif mode == "header-empty-identity" then
+        header_dependencies = {
+          { kind = "search", path = "/headers/earlier.h",
+            identity = "" },
+        }
+      end
+      driver.imported[name] = {
+        kind = "source",
+        ast = ast,
+        type = module_type(name),
+        filename = "/workspace/fixture.titan",
+        source_files = { "/workspace/fixture.titan" },
+        c_header_dependencies = header_dependencies,
+      }
+      driver.imported["fixture.external"] = {
+        kind = "source",
+        ast = {{
+          _tag = "Ast.TopLevelFunc",
+          loc = { filename = "/external/main.titan", line = 1, col = 1 },
+          islocal = false,
+          name = "hidden_raw_ast",
+          params = {}, rettypes = {}, typeparams = {},
+          block = { _tag = "Ast.StatBlock",
+                    loc = { filename = "/external/main.titan", line = 1, col = 1 },
+                    stats = {} },
+          _type = { _tag = "Type.Function" },
+        }},
+        type = module_type("fixture.external"),
+        filename = "/external/main.titan",
+        source_files = { "/external/main.titan", "/external/part.titan" },
+        c_header_dependencies = {},
+      }
+      local context = assert(options.context)
+      context.checked_source_modules[
+        #context.checked_source_modules + 1] = name
+      return true, module_type(name), {}, {}
+    end
+  end
+
+  if mode == "malformed-parser" then parser.parse = 42 end
+  local replacements = {
+    [names[1]] = parser,
+    [names[2]] = checker,
+    [names[3]] = types,
+    [names[4]] = driver,
+  }
+  if mode == "missing-parser" then replacements[names[1]] = nil end
+  package.path, package.cpath = "", ""
+  for _, name in ipairs(names) do package.loaded[name] = replacements[name] end
+  return function()
+    package.path, package.cpath = old_path, old_cpath
+    for _, name in ipairs(names) do package.loaded[name] = old_loaded[name] end
+  end
+end
+]==], "=compiler_bridge_fixture", nil)() as FixtureInstaller
+end
+
+local function with_fixture(mode: string, body: EmptyFunction)
+  local restore = new_fixture_installer()(mode) as EmptyFunction
+  defer restore()
+  body()
+catch
+  if error is bridge.BridgeError then
+    local failure = error as bridge.BridgeError
+    raise failure.module_name .. ": " .. failure.message
+  end
+  raise
+end
+
+local function expect_bridge_error(mode: string, expected: string)
+  with_fixture(mode, function ()
+    local rejected = false
+    do
+      bridge.load()
+    catch
+      rejected = true
+      test.assert(error is bridge.BridgeError,
+                  "bridge raised an untyped loading error")
+      local failure = error as bridge.BridgeError
+      test.assert(strings.find(failure.message, expected) ~= nil,
+                  failure.message)
+    end
+    test.assert(rejected, "malformed compiler API was accepted")
+  end)
+end
+
+function test_compiler_bridge_rejects_missing_incompatible_and_malformed_modules(
+    _context: test.Context)
+  expect_bridge_error("missing-parser", "cannot load compiler module")
+  expect_bridge_error("incompatible", "incompatible Titan compiler ABI")
+  expect_bridge_error("older-same-abi",
+                      "matching Titan ABI alone is insufficient")
+  expect_bridge_error("wrong-language-server-api",
+                      "requires LANGUAGE_SERVER_API_VERSION 3")
+  expect_bridge_error("same-api-missing-restat",
+                      "'restat_c_header_dependencies' must be a function, " ..
+                      "found nil. Install a Titan compiler implementing " ..
+                      "LANGUAGE_SERVER_API_VERSION 3")
+  expect_bridge_error("malformed-parser", "'parse' must be a function")
+end
+
+function test_compiler_bridge_rejects_malformed_compiler_results(
+    _context: test.Context)
+  with_fixture("bad-loader", function ()
+    local compiler = bridge.load()
+    local rejected = false
+    do
+      compiler:analyze("fixture", {bridge.ProjectModule.new(
+        "fixture", {bridge.SourceFile.new("/workspace/fixture.titan", "")})})
+    catch
+      rejected = true
+      test.assert(error is bridge.BridgeError,
+                  "bad loader result raised an untyped error")
+    end
+    test.assert(rejected, "non-function defaultloader result was accepted")
+  end)
+  with_fixture("bad-errors", function ()
+    local compiler = bridge.load()
+    local rejected = false
+    do
+      compiler:analyze("fixture", {bridge.ProjectModule.new(
+        "fixture", {bridge.SourceFile.new("/workspace/fixture.titan", "")})})
+    catch
+      rejected = true
+      test.assert(error is bridge.BridgeError,
+                  "bad diagnostics result raised an untyped error")
+    end
+    test.assert(rejected, "non-table compiler diagnostics were accepted")
+  end)
+end
+
+function test_compiler_bridge_normalizes_external_resolution_fingerprints(
+    _context: test.Context)
+  with_fixture("external-resolution", function ()
+    local compiler = bridge.load()
+    compiler:configure_paths(
+      "/configured/source", "/configured/binary", {})
+    local resolutions = compiler:resolve_external_modules({"app"}, {
+      bridge.ExternalResolutionRequest.new("vendor.source", true),
+      bridge.ExternalResolutionRequest.new("vendor.dynamic", false),
+      bridge.ExternalResolutionRequest.new("vendor.static", false),
+      bridge.ExternalResolutionRequest.new("vendor.missing", false),
+      bridge.ExternalResolutionRequest.new("vendor.broken", false),
+    })
+    test.assert(#resolutions == 5,
+                "external resolver result count changed at the bridge")
+    test.assert(resolutions[1].module_name == "vendor.source" and
+                resolutions[1].error == nil and
+                resolutions[1].provenance ~= nil,
+                "external source resolution lost typed identity")
+    case resolutions[1].provenance as bridge.Provenance
+    when external_source: source then
+      test.assert(source.main_file == "/external/vendor/vendor.titan" and
+                  #source.source_files == 2 and
+                  source.source_files[2] ==
+                    "/external/vendor/part.titan",
+                  "folder resolution lost a constituent")
+    else test.assert(false, "external source used a binary provenance")
+    end
+    case resolutions[2].provenance as bridge.Provenance
+    when dynamic_binary: binary then
+      test.assert(binary.provider_file == "/binary/vendor.so",
+                  "dynamic provider path was not normalized")
+    else test.assert(false, "dynamic provider used the wrong provenance")
+    end
+    case resolutions[3].provenance as bridge.Provenance
+    when static_binary: binary then
+      test.assert(binary.provider_file == "/binary/vendor.a",
+                  "static provider path was not normalized")
+    else test.assert(false, "static provider used the wrong provenance")
+    end
+    test.assert(resolutions[4].provenance == nil and
+                resolutions[4].error == nil and
+                resolutions[5].provenance == nil and
+                resolutions[5].error == "invalid provider metadata",
+                "missing/error resolution escaped the typed contract")
+  end)
+end
+
+function test_compiler_bridge_normalizes_contextual_owner_provenance(
+    _context: test.Context)
+  with_fixture("contextual-resolution", function ()
+    local compiler = bridge.load()
+    local analysis = compiler:analyze("fixture", {
+      bridge.ProjectModule.new("fixture", {bridge.SourceFile.new(
+        "/workspace/fixture.titan", "saved fixture")}),
+    })
+    test.assert(#analysis.contextual_resolutions == 1,
+                "contextual owner metadata was not normalized")
+    local resolution = analysis.contextual_resolutions[1]
+    test.assert(resolution.owner_module == "fixture.owner" and
+                resolution.exposer_module == "fixture.facade" and
+                resolution.ordinary_lookup,
+                "contextual owner graph identity was changed")
+    case resolution.provenance
+    when static_binary: binary then
+      test.assert(binary.provider_file == "/binary/fixture-owner.a",
+                  "contextual owner provider path was lost")
+    else
+      test.assert(false,
+                  "contextual owner used the wrong provenance variant")
+    end
+  end)
+end
+
+function test_compiler_bridge_normalizes_and_restats_c_header_dependencies(
+    _context: test.Context)
+  with_fixture("header-metadata", function ()
+    local compiler = bridge.load()
+    local analysis = compiler:analyze("fixture", {
+      bridge.ProjectModule.new("fixture", {bridge.SourceFile.new(
+        "/workspace/fixture.titan", "saved fixture")}),
+    })
+    local module? = analysis:find_module("fixture")
+    test.assert(module ~= nil and #module.c_header_dependencies == 2,
+                "per-module C header metadata was not normalized")
+    local snapshot: bridge.ModuleSnapshot = module
+    case snapshot.c_header_dependencies[1].kind
+    when file then
+    else test.assert(false, "direct C header used search-input kind")
+    end
+    case snapshot.c_header_dependencies[2].kind
+    when search then
+    else test.assert(false, "include candidate used file-input kind")
+    end
+    local current = compiler:restat_c_header_dependencies(
+      snapshot.c_header_dependencies)
+    test.assert(current[1].path == "/headers/direct.h" and
+                current[1].identity == "direct bytes:restatted" and
+                current[2].path == "/headers/earlier.h" and
+                current[2].identity == "missing candidate:restatted",
+                "typed restat changed ownership/order or lost identities")
+  end)
+end
+
+local function expect_c_header_metadata_error(mode: string,
+                                              expected: string)
+  with_fixture(mode, function ()
+    local compiler = bridge.load()
+    local rejected = false
+    do
+      compiler:analyze("fixture", {
+        bridge.ProjectModule.new("fixture", {bridge.SourceFile.new(
+          "/workspace/fixture.titan", "saved fixture")}),
+      })
+    catch
+      rejected = true
+      test.assert(error is bridge.BridgeError,
+                  "malformed C header metadata raised an untyped error")
+      local failure = error as bridge.BridgeError
+      test.assert(strings.find(failure.message, expected) ~= nil,
+                  failure.message)
+    end
+    test.assert(rejected, "malformed C header metadata was accepted")
+  end)
+end
+
+function test_compiler_bridge_rejects_malformed_c_header_dependencies(
+    _context: test.Context)
+  expect_c_header_metadata_error(
+    "header-relative-path", "path must be absolute")
+  expect_c_header_metadata_error(
+    "header-duplicate", "repeats file input")
+  expect_c_header_metadata_error(
+    "header-unknown-kind", "unknown kind 'directory'")
+  expect_c_header_metadata_error(
+    "header-empty-identity", "identity must be nonempty")
+end
+
+function test_compiler_bridge_normalizes_annotated_ast_and_provenance(
+    _context: test.Context)
+  with_fixture("valid", function ()
+    local compiler = bridge.load()
+    test.assert(compiler:installed_binary_modules_root() ==
+                  "/opt/titan/lib/titan/0.26",
+                "compiler installation ABI directory was not exposed")
+    local analysis = compiler:analyze("fixture", {bridge.ProjectModule.new(
+      "fixture", {bridge.SourceFile.new(
+        "/workspace/fixture.titan", "saved fixture")})})
+    test.assert(#analysis.diagnostics == 0, "valid fixture had diagnostics")
+    test.assert(compiler:has_project_ast("fixture"),
+                "project annotated AST was not retained behind the bridge")
+    test.assert(not compiler:has_project_ast("fixture.external"),
+                "external annotated AST leaked into retained project state")
+
+    local project? = analysis:find_module("fixture")
+    local external? = analysis:find_module("fixture.external")
+    test.assert(project ~= nil and external ~= nil,
+                "compiler imported modules were not normalized")
+    test.assert(project.manifest ~= nil and
+                strings.find(project.manifest.serialized, "fixture") ~= nil,
+                "project public manifest was not serialized")
+    test.assert(#project.imports == 1 and
+                project.imports[1].module_name == "fixture.external" and
+                project.imports[1].source_required,
+                "Titan import metadata was not normalized")
+    test.assert(#external.nodes == 0 and #external.symbols == 0,
+                "external source AST was exposed as project semantic state")
+    case external.provenance
+    when external_source: source then
+      test.assert(#source.source_files == 2 and
+                  source.source_files[2] == "/external/part.titan",
+                  "external folder source provenance lost member paths")
+    else
+      test.assert(false, "external source used the wrong provenance variant")
+    end
+
+    local saw_cast = false
+    for index = 1, #project.nodes do
+      local node = project.nodes[index]
+      if node.tag == "Ast.ExpCast" then
+        saw_cast = node.synthetic and node.original_type ~= nil and
+          node.original_type.display == "integer" and
+          node.coerced_type ~= nil and node.coerced_type.display == "float"
+      end
+    end
+    test.assert(saw_cast, "implicit compiler coercion was not normalized")
+
+    local definition_id: string? = nil
+    local reference_id: string? = nil
+    local saw_local_import = false
+    for index = 1, #project.symbols do
+      local symbol = project.symbols[index]
+      if symbol.name == "count" then
+        case symbol.role
+        when definition then definition_id = symbol.declaration_id
+        when reference then reference_id = symbol.declaration_id
+        else
+        end
+      elseif symbol.name == "dependency" then
+        case symbol.role
+        when import_alias then
+          saw_local_import = symbol.is_local and symbol.type_info ~= nil and
+            symbol.type_info.display == "module fixture.external"
+        else
+        end
+      end
+    end
+    test.assert(definition_id ~= nil and definition_id == reference_id,
+                "local definition and reference identities did not join")
+    test.assert(saw_local_import,
+                "compiler import alias was not normalized as a local term")
+  end)
+end
+
+function test_compiler_bridge_normalizes_invalid_source_diagnostic(
+    _context: test.Context)
+  with_fixture("invalid-source", function ()
+    local compiler = bridge.load()
+    local analysis = compiler:analyze("fixture", {bridge.ProjectModule.new(
+      "fixture", {bridge.SourceFile.new("/workspace/fixture.titan", "bad")})})
+    test.assert(#analysis.diagnostics == 1,
+                "invalid fixture did not produce one diagnostic")
+    local diagnostic = analysis.diagnostics[1]
+    case diagnostic.kind
+    when syntax then
+    else test.assert(false, "syntax diagnostic used the wrong kind")
+    end
+    test.assert(diagnostic.location ~= nil and
+                diagnostic.location.line == 2 and
+                diagnostic.location.column == 7,
+                "diagnostic location was not normalized")
+  end)
+end
+
+local function preload_real_compiler()
+  local preload = lua.load([==[
+return function()
+  require("titan-compiler.parser")
+  require("titan-compiler.checker")
+  require("titan-compiler.types")
+  require("titan-compiler.driver")
+end
+]==], "=compiler_bridge_real_compiler", nil)() as EmptyFunction
+  preload()
+end
+
+local function executes_installed_compiler_on_valid_and_invalid_source()
+  preload_real_compiler()
+  local compiler = bridge.load()
+  local valid = compiler:analyze("bridge.fixture.valid", {
+    bridge.ProjectModule.new("bridge.fixture.valid", {bridge.SourceFile.new(
+      "/workspace/bridge_fixture_valid.titan",
+      "function widen(n: integer): float\n" ..
+      "  local result: float = n\n" ..
+      "  return result\n" ..
+      "end\n")})
+  })
+  test.assert(#valid.diagnostics == 0,
+              "installed compiler rejected representative valid source")
+  local module? = valid:find_module("bridge.fixture.valid")
+  test.assert(module ~= nil and module.manifest ~= nil and #module.nodes > 0,
+              "installed compiler result was not normalized")
+
+  local invalid = compiler:analyze("bridge.fixture.invalid", {
+    bridge.ProjectModule.new("bridge.fixture.invalid", {bridge.SourceFile.new(
+      "/workspace/bridge_fixture_invalid.titan",
+      "function broken(: integer)\nend\n")})
+  })
+  test.assert(#invalid.diagnostics > 0 and
+              invalid.diagnostics[1].location ~= nil,
+              "installed compiler syntax failure was not normalized")
+catch
+  if error is bridge.BridgeError then
+    local failure = error as bridge.BridgeError
+    raise failure.module_name .. ": " .. failure.message
+  end
+  raise
+end
+
+function test_compiler_bridge_executes_installed_compiler_on_valid_and_invalid_source(
+    _context: test.Context)
+  test_runtime.run(executes_installed_compiler_on_valid_and_invalid_source)
+end
+
+local function runs_incremental_full_ast_cache()
+  preload_real_compiler()
+  local compiler = bridge.load()
+  local provider = bridge.ProjectModule.new("bridge_cache_provider", {
+    bridge.SourceFile.new(
+      "/workspace/bridge_cache_provider.titan",
+      "local function secret(): integer return 41 end\n")
+  })
+  local consumer = bridge.ProjectModule.new("bridge_cache_consumer", {
+    bridge.SourceFile.new(
+      "/workspace/bridge_cache_consumer.titan",
+      "local provider = import \"bridge_cache_provider.titan\"\n" ..
+      "function answer(): integer return provider.secret() end\n")
+  })
+
+  local initial = compiler:analyze(
+    "bridge_cache_consumer", {provider, consumer})
+  test.assert(#initial.diagnostics == 0 and
+              initial:find_module("bridge_cache_provider") ~= nil and
+              initial:find_module("bridge_cache_consumer") ~= nil,
+              "initial source-required project closure did not compile")
+
+  local edited_consumer = bridge.ProjectModule.new(
+    "bridge_cache_consumer", {bridge.SourceFile.new(
+      "/workspace/bridge_cache_consumer.titan",
+      "local provider = import \"bridge_cache_provider.titan\"\n" ..
+      "function answer(): integer return provider.secret() + 1 end\n")})
+  local incremental = compiler:analyze_incremental(
+    {provider, edited_consumer}, {"bridge_cache_consumer"}, {})
+  test.assert(#incremental.diagnostics == 0,
+              "dirty consumer failed against retained full project AST")
+  test.assert(incremental:find_module("bridge_cache_consumer") ~= nil and
+              incremental:find_module("bridge_cache_provider") == nil,
+              "unchanged source-required provider was reparsed or rechecked")
+  test.assert(compiler:has_project_ast("bridge_cache_provider"),
+              "clean project AST disappeared from the private bridge cache")
+end
+
+function test_compiler_bridge_reuses_unchanged_full_ast_incrementally(
+    _context: test.Context)
+  test_runtime.run(runs_incremental_full_ast_cache)
+end
+
+local function reparses_source_required_external_for_cached_project()
+  preload_real_compiler()
+  local external_root = fs.tmpname()
+  fs.unlink(external_root)
+  fs.mkdir(external_root)
+  local external_file =
+    external_root .. "/bridge_cached_external.titan"
+  fs.write_file(external_file,
+    "local function secret(): integer return 41 end\n")
+  defer do
+    fs.unlink(external_file)
+    fs.rmdir(external_root)
+  end
+
+  local compiler = bridge.load()
+  compiler:configure_paths(external_root, nil, nil)
+  local provider = bridge.ProjectModule.new("bridge_cached_provider", {
+    bridge.SourceFile.new(
+      "/workspace/bridge_cached_provider.titan",
+      "local external = import \"bridge_cached_external.titan\"\n" ..
+      "function answer(): integer return external.secret() end\n")
+  })
+  local initial = compiler:analyze("bridge_cached_provider", {provider})
+  test.assert(#initial.diagnostics == 0,
+              "initial source-required external closure did not compile")
+  local external? = initial:find_module("bridge_cached_external")
+  test.assert(external ~= nil and external.manifest ~= nil,
+              "initial external source manifest was not normalized")
+  local external_module: bridge.ModuleSnapshot = external
+  local external_manifest: bridge.Manifest = external_module.manifest
+  local cached_external = bridge.CachedSourceInterface.new(
+    "bridge_cached_external", external_manifest.serialized,
+    external_file, {external_file}, external_module.imports,
+    external_module.c_header_dependencies)
+
+  local consumer = bridge.ProjectModule.new("bridge_cached_consumer", {
+    bridge.SourceFile.new(
+      "/workspace/bridge_cached_consumer.titan",
+      "local provider = import \"bridge_cached_provider.titan\"\n" ..
+      "function result(): integer return provider.answer() + 1 end\n")
+  })
+  local incremental = compiler:analyze_incremental(
+    {provider, consumer}, {"bridge_cached_consumer"}, {cached_external})
+  test.assert(#incremental.diagnostics == 0,
+              "cached project failed with source-required external cache")
+  test.assert(incremental:find_module("bridge_cached_provider") == nil,
+              "clean project provider was unexpectedly rechecked")
+  local refreshed_external? =
+    incremental:find_module("bridge_cached_external")
+  test.assert(refreshed_external ~= nil and
+              #refreshed_external.nodes == 0 and
+              #refreshed_external.symbols == 0,
+              "external source was not transiently reparsed and discarded")
+  test.assert(not compiler:has_project_ast("bridge_cached_external"),
+              "external annotated AST leaked into the project cache")
+end
+
+function test_compiler_bridge_rechecks_source_required_external_dependencies_of_cached_projects(
+    _context: test.Context)
+  test_runtime.run(reparses_source_required_external_for_cached_project)
+end
+
+local function uses_analysis_local_ffi_include_dirs()
+  preload_real_compiler()
+  local include_root = fs.tmpname()
+  fs.unlink(include_root)
+  fs.mkdir(include_root)
+  local header = include_root .. "/vscode_titan_lsp_project_only.h"
+  fs.write_file(header, "typedef int vscode_titan_lsp_project_only_int;\n")
+  defer do
+    fs.unlink(header)
+    fs.rmdir(include_root)
+  end
+
+  local module = bridge.ProjectModule.new("bridge_ffi_include", {
+    bridge.SourceFile.new(
+      "/workspace/bridge_ffi_include.titan",
+      "local c = foreign import \"vscode_titan_lsp_project_only.h\"\n" ..
+      "function answer(): integer return 42 end\n")
+  })
+  local missing = bridge.load()
+  local rejected = missing:analyze("bridge_ffi_include", {module})
+  test.assert(#rejected.diagnostics > 0,
+              "project-only FFI header unexpectedly resolved globally")
+
+  local configured = bridge.load()
+  configured:configure_paths(nil, nil, {include_root})
+  local accepted = configured:analyze("bridge_ffi_include", {module})
+  local messages = strings.writer()
+  for index = 1, #accepted.diagnostics do
+    messages:write(accepted.diagnostics[index].message .. "\n")
+  end
+  test.assert(#accepted.diagnostics == 0 and
+              accepted:find_module("bridge_ffi_include") ~= nil,
+              "analysis-local FFI include directory did not reach compiler: " ..
+              messages:drain())
+  local accepted_module: bridge.ModuleSnapshot =
+    accepted:find_module("bridge_ffi_include")
+  local observed?: bridge.CHeaderDependency = nil
+  for index = 1, #accepted_module.c_header_dependencies do
+    local dependency = accepted_module.c_header_dependencies[index]
+    case dependency.kind
+    when file then
+      if dependency.path == header then observed = dependency end
+    else
+    end
+  end
+  test.assert(observed ~= nil,
+              "compiler bridge lost the resolved project FFI header")
+  fs.write_file(header,
+    "typedef long vscode_titan_lsp_project_only_int;\n")
+  local restatted = configured:restat_c_header_dependencies(
+    accepted_module.c_header_dependencies)
+  local changed = false
+  for index = 1, #restatted do
+    if restatted[index].path == header and
+       restatted[index].identity ~=
+         (observed as bridge.CHeaderDependency).identity then
+      changed = true
+    end
+  end
+  test.assert(changed,
+              "compiler bridge reused a changed header content identity")
+end
+
+function test_compiler_bridge_uses_analysis_local_ffi_include_directories(
+    _context: test.Context)
+  test_runtime.run(uses_analysis_local_ffi_include_dirs)
+end
+
+local function assert_joined_symbol(module: bridge.ModuleSnapshot,
+                                    name: string, minimum: integer)
+  local identity?: string = nil
+  local count = 0
+  for index = 1, #module.symbols do
+    local symbol = module.symbols[index]
+    if symbol.name == name and symbol.declaration_id ~= nil then
+      count = count + 1
+      test.assert(symbol.exact_span ~= nil,
+                  "compiler-backed symbol '" .. name .. "' lost exact span")
+      if identity == nil then identity = symbol.declaration_id end
+      test.assert(symbol.declaration_id == identity,
+                  "compiler-backed symbol '" .. name .. "' did not join")
+    end
+  end
+  test.assert(count >= minimum,
+              "compiler-backed symbol '" .. name .. "' was under-indexed")
+end
+
+local function normalizes_generic_nominal_member_metadata()
+  preload_real_compiler()
+  local compiler = bridge.load()
+  local source = [[record Box<T>
+  item: T
+end
+union Maybe
+  Some: Box<integer>
+  None
+end
+function Box:get(): T return self.item end
+function inspect<T>(box: Box<T>, maybe: Maybe): T
+  local field = box.item
+  local bound = box:get
+  local got = box:get()
+  local made: Box<T> = { item = field }
+  case maybe
+  when Some: some then
+  else
+  end
+  return field
+end
+]]
+  local analysis = compiler:analyze("bridge_metadata", {
+    bridge.ProjectModule.new("bridge_metadata", {bridge.SourceFile.new(
+      "/workspace/bridge_metadata.titan", source)})
+  })
+  test.assert(#analysis.diagnostics == 0,
+              "representative semantic metadata fixture did not compile")
+  local module? = analysis:find_module("bridge_metadata")
+  test.assert(module ~= nil, "semantic metadata module was not normalized")
+  assert_joined_symbol(module, "Box", 5)
+  assert_joined_symbol(module, "item", 4)
+  assert_joined_symbol(module, "get", 3)
+  assert_joined_symbol(module, "Maybe", 2)
+  assert_joined_symbol(module, "Some", 2)
+
+  local record_parameter?: string = nil
+  local function_parameter?: string = nil
+  local record_count = 0
+  local function_count = 0
+  for index = 1, #module.symbols do
+    local symbol = module.symbols[index]
+    if symbol.name == "T" and symbol.declaration_id ~= nil then
+      if symbol.location.line <= 8 then
+        record_count = record_count + 1
+        if record_parameter == nil then
+          record_parameter = symbol.declaration_id
+        end
+        test.assert(symbol.declaration_id == record_parameter,
+                    "record type parameter references did not join")
+      else
+        function_count = function_count + 1
+        if function_parameter == nil then
+          function_parameter = symbol.declaration_id
+        end
+        test.assert(symbol.declaration_id == function_parameter,
+                    "function type parameter references did not join")
+      end
+    end
+  end
+  test.assert(record_count >= 3 and function_count >= 3 and
+              record_parameter ~= function_parameter,
+              "generic type parameters lost lexical declaration identity")
+end
+
+function test_compiler_bridge_normalizes_generic_nominal_and_member_metadata(
+    _context: test.Context)
+  test_runtime.run(normalizes_generic_nominal_member_metadata)
+end
+
+local function drives_shadowing_and_record_definition_features_from_compiler()
+  preload_real_compiler()
+  local filename = "/workspace/semantic_acceptance.titan"
+  local source = [[record Parcel
+  amount: integer
+end
+function inspect(parcel: Parcel): integer
+  local count = parcel.amount
+  local observed = count
+  do
+    local count = parcel.amount + 1
+    local nested = count
+  end
+  return count + observed
+end
+]]
+  local projects = {bridge.ProjectModule.new("semantic_acceptance", {
+    bridge.SourceFile.new(filename, source),
+  })}
+  local compiler = bridge.load()
+  local analysis = compiler:analyze("semantic_acceptance", projects)
+  test.assert(#analysis.diagnostics == 0,
+              "compiler rejected source-grounded semantic acceptance fixture")
+  local model = features.build(projects, analysis.modules)
+
+  local outer_definition? = model:definition(
+    filename, source_text.Position.new(5, 20))
+  local inner_definition? = model:definition(
+    filename, source_text.Position.new(8, 20))
+  test.assert(outer_definition ~= nil and
+              outer_definition.range.start.line == 4 and
+              outer_definition.range.start.character == 8 and
+              outer_definition.range.finish.character == 13 and
+              inner_definition ~= nil and
+              inner_definition.range.start.line == 7 and
+              inner_definition.range.start.character == 10 and
+              inner_definition.range.finish.character == 15,
+              "compiler-backed shadowed locals resolved to the wrong declaration")
+
+  local outer_references = model:references(
+    filename, source_text.Position.new(5, 20), false)
+  local inner_references = model:references(
+    filename, source_text.Position.new(8, 20), false)
+  test.assert(#outer_references == 2 and
+              outer_references[1].range.start.line == 5 and
+              outer_references[2].range.start.line == 10 and
+              #inner_references == 1 and
+              inner_references[1].range.start.line == 8,
+              "references merged compiler-distinct shadowed locals")
+
+  local field_definition? = model:definition(
+    filename, source_text.Position.new(4, 24))
+  local field_references = model:references(
+    filename, source_text.Position.new(4, 24), false)
+  test.assert(field_definition ~= nil and
+              field_definition.range.start.line == 1 and
+              field_definition.range.start.character == 2 and
+              field_definition.range.finish.character == 8 and
+              #field_references == 2 and
+              field_references[1].range.start.line == 4 and
+              field_references[2].range.start.line == 7,
+              "record member use did not resolve to its source declaration")
+
+  local candidate?, candidate_error? = model:rename(
+    filename, source_text.Position.new(5, 20), "total")
+  test.assert(candidate_error == nil and candidate ~= nil,
+              "outer shadowed local did not produce a rename candidate")
+  local edited = candidate:edited_project_modules()
+  local expected = [[record Parcel
+  amount: integer
+end
+function inspect(parcel: Parcel): integer
+  local total = parcel.amount
+  local observed = total
+  do
+    local count = parcel.amount + 1
+    local nested = count
+  end
+  return total + observed
+end
+]]
+  test.assert(#edited == 1 and #edited[1].files == 1 and
+              edited[1].files[1].contents == expected,
+              "rename crossed the compiler's shadowing boundary")
+  local checked = bridge.load():analyze("semantic_acceptance", edited)
+  local verified?, verification_error? = candidate:preflight(checked)
+  test.assert(#checked.diagnostics == 0 and verification_error == nil and
+              verified ~= nil and
+              #verified:document_edits() == 1 and
+              #verified:document_edits()[1].edits == 3,
+              "shadow-preserving rename failed compiler preflight")
+end
+
+function test_compiler_bridge_drives_shadowing_and_record_definition_features_from_compiler(
+    _context: test.Context)
+  test_runtime.run(drives_shadowing_and_record_definition_features_from_compiler)
+end
+
+local function excludes_foreign_and_external_declarations_from_features()
+  preload_real_compiler()
+  local external_root = fs.tmpname()
+  fs.unlink(external_root)
+  fs.mkdir(external_root)
+  local external_file =
+    external_root .. "/semantic_acceptance_external.titan"
+  fs.write_file(external_file,
+    "function external_value(): integer return 17 end\n")
+  defer do
+    fs.unlink(external_file)
+    fs.rmdir(external_root)
+  end
+
+  local filename = "/workspace/semantic_boundaries.titan"
+  local source = [[local c = foreign import "string.h"
+local external = import "semantic_acceptance_external"
+function ffi_use(): integer
+  return c.strlen("Titan")
+end
+function external_use(): integer
+  return external.external_value()
+end
+]]
+  local projects = {bridge.ProjectModule.new("semantic_boundaries", {
+    bridge.SourceFile.new(filename, source),
+  })}
+  local compiler = bridge.load()
+  compiler:configure_paths(external_root, nil, nil)
+  local analysis = compiler:analyze("semantic_boundaries", projects)
+  local diagnostic_messages = strings.writer()
+  for index = 1, #analysis.diagnostics do
+    diagnostic_messages:write(analysis.diagnostics[index].message .. "\n")
+  end
+  test.assert(#analysis.diagnostics == 0,
+              "compiler rejected foreign/external semantic fixture: " ..
+              diagnostic_messages:drain())
+  local external? = analysis:find_module("semantic_acceptance_external")
+  test.assert(external ~= nil and #external.nodes == 0 and
+              #external.symbols == 0,
+              "external source AST escaped the compiler boundary")
+  local model = features.build(projects, analysis.modules)
+
+  local foreign_definition? = model:definition(
+    filename, source_text.Position.new(3, 12))
+  local foreign_references = model:references(
+    filename, source_text.Position.new(3, 12), true)
+  local foreign_rename?, foreign_rename_error? = model:rename(
+    filename, source_text.Position.new(3, 12), "renamed_native")
+  test.assert(foreign_definition == nil and
+              #foreign_references == 1 and
+              foreign_references[1].range.start.line == 3 and
+              foreign_references[1].range.start.character == 11 and
+              foreign_references[1].range.finish.character == 17 and
+              foreign_rename == nil and foreign_rename_error ~= nil and
+              strings.find(foreign_rename_error.message,
+                           "outside project") ~= nil,
+              "C FFI header declaration entered project results or allowed rename")
+
+  local external_definition? = model:definition(
+    filename, source_text.Position.new(6, 19))
+  local external_references = model:references(
+    filename, source_text.Position.new(6, 19), true)
+  local external_rename?, external_rename_error? = model:rename(
+    filename, source_text.Position.new(6, 19), "renamed_external")
+  test.assert(external_definition == nil and
+              #external_references == 1 and
+              external_references[1].range.start.line == 6 and
+              external_references[1].range.start.character == 18 and
+              external_references[1].range.finish.character == 32 and
+              external_rename == nil and external_rename_error ~= nil and
+              strings.find(external_rename_error.message,
+                           "outside project") ~= nil,
+              "external declaration escaped project-only semantic features")
+end
+
+function test_compiler_bridge_excludes_foreign_and_external_declarations_from_features(
+    _context: test.Context)
+  test_runtime.run(excludes_foreign_and_external_declarations_from_features)
+end
+
+local function symbol_identity(module: bridge.ModuleSnapshot,
+                               name: string): string?
+  local identity?: string = nil
+  for index = 1, #module.symbols do
+    local symbol = module.symbols[index]
+    if symbol.name == name and symbol.declaration_id ~= nil then
+      if identity == nil then identity = symbol.declaration_id end
+      test.assert(symbol.declaration_id == identity,
+                  "symbol '" .. name .. "' split inside one module")
+    end
+  end
+  return identity
+end
+
+local function preserves_alias_and_named_parameter_rename_metadata()
+  preload_real_compiler()
+  local provider_file = "/workspace/named_provider.titan"
+  local consumer_file = "/workspace/named_consumer.titan"
+  local provider_source = [[record Box
+  amount: integer
+end
+type Alias = Box
+function choose(first: integer, second: integer): integer
+  return first + second
+end
+]]
+  local consumer_source = [[local p = import "named_provider"
+function run(): integer
+  local box: p.Alias = p.Alias.new { amount = 3 }
+  return p.choose { second = box.amount, first = 1 }
+end
+]]
+  local projects = {
+    bridge.ProjectModule.new("named_provider", {
+      bridge.SourceFile.new(provider_file, provider_source),
+    }),
+    bridge.ProjectModule.new("named_consumer", {
+      bridge.SourceFile.new(consumer_file, consumer_source),
+    }),
+  }
+  local compiler = bridge.load()
+  local analysis = compiler:analyze("named_consumer", projects)
+  test.assert(#analysis.diagnostics == 0,
+              "named-argument semantic fixture did not compile")
+  local provider? = analysis:find_module("named_provider")
+  local consumer? = analysis:find_module("named_consumer")
+  test.assert(provider ~= nil and consumer ~= nil,
+              "named-argument semantic snapshots were incomplete")
+  local provider_module: bridge.ModuleSnapshot = provider
+  local consumer_module: bridge.ModuleSnapshot = consumer
+  test.assert(symbol_identity(provider_module, "Alias") ==
+                symbol_identity(consumer_module, "Alias"),
+              "qualified alias namespace did not join its declaration")
+  test.assert(symbol_identity(provider_module, "first") ==
+                symbol_identity(consumer_module, "first"),
+              "named label did not join its formal parameter")
+
+  local model = features.build(projects, analysis.modules)
+  local candidate?, candidate_error? = model:rename(
+    provider_file, source_text.Position.new(4, 17), "primary")
+  test.assert(candidate_error == nil and candidate ~= nil,
+              "formal parameter did not produce a rename candidate")
+  local edited = candidate:edited_project_modules()
+  local checked = bridge.load():analyze("named_consumer", edited)
+  local verified?, verification_error? = candidate:preflight(checked)
+  test.assert(verification_error == nil and verified ~= nil,
+              "named-argument parameter rename failed compiler preflight")
+  local documents = verified:document_edits()
+  test.assert(#documents == 2 and
+              documents[1].uri == "file:///workspace/named_consumer.titan" and
+              #documents[1].edits == 1 and
+              documents[2].uri == "file:///workspace/named_provider.titan" and
+              #documents[2].edits == 2,
+              "parameter rename did not edit its definition, uses, and label")
+end
+
+function test_compiler_bridge_preserves_alias_and_named_parameter_rename_metadata(
+    _context: test.Context)
+  test_runtime.run(preserves_alias_and_named_parameter_rename_metadata)
+end

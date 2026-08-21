@@ -1,0 +1,177 @@
+local async = import "async"
+local dispatcher = import "server.dispatcher"
+local json = import "server.json"
+local response_queue = import "server.response_queue"
+
+type SemanticHandler = (dispatcher.SemanticRequest) ->
+  dispatcher.SemanticOutcome
+
+local type RemoveListener = () -> ()
+
+local record ActiveRequest
+  id: dispatcher.RequestId
+  task: async.Task<dispatcher.SemanticOutcome, value>
+  remove_listener: RemoveListener?
+  responded: boolean
+end
+
+record Coordinator
+  local router: dispatcher.Dispatcher
+  local output: response_queue.ResponseQueue
+  local handler: SemanticHandler
+  local active: {ActiveRequest}
+end
+
+local REQUEST_CANCELLED = -32800
+local INTERNAL_ERROR = -32603
+local INVALID_REQUEST = -32600
+local METHOD_NOT_FOUND = -32601
+
+local function method_not_found(
+    _request: dispatcher.SemanticRequest): dispatcher.SemanticOutcome
+  return dispatcher.SemanticOutcome.failure(
+    dispatcher.SemanticError.new(METHOD_NOT_FOUND, "Method not found"))
+end
+
+function create(output: response_queue.ResponseQueue,
+                handler: SemanticHandler?): Coordinator
+  local actual = method_not_found
+  if handler ~= nil then actual = handler end
+  return Coordinator.new(dispatcher.create(), output, actual, {})
+end
+
+function Coordinator:phase_name(): string
+  return self.router:phase_name()
+end
+
+function Coordinator:active_count(): integer
+  return #self.active
+end
+
+local function Coordinator:find(id: dispatcher.RequestId): ActiveRequest?
+  for index = 1, #self.active do
+    local candidate = self.active[index]
+    if candidate.id:equals(id) then return candidate end
+  end
+  return nil
+end
+
+local function Coordinator:remove(target: ActiveRequest)
+  local count = #self.active
+  for index = 1, count do
+    if self.active[index] == target then
+      for following = index, count - 1 do
+        self.active[following] = self.active[following + 1]
+      end
+      self.active[count] = nil
+      return
+    end
+  end
+end
+
+local function Coordinator:publish(result: dispatcher.DispatchResult)
+  if result.response ~= nil then self.output:push(result.response) end
+end
+
+local function Coordinator:complete(
+    active: ActiveRequest,
+    status: async.TaskStatus<dispatcher.SemanticOutcome, value>)
+  if active.responded then return end
+  active.responded = true
+
+  local remove? = active.remove_listener
+  active.remove_listener = nil
+  if remove ~= nil then remove() end
+  self:remove(active)
+
+  case status
+  when succeeded: outcome then
+    case outcome
+    when result: result then
+      self:publish(dispatcher.result_response(active.id, result))
+    when failure: failure then
+      self:publish(dispatcher.failure_response(
+        active.id, failure.code, failure.message))
+    end
+  when failed then
+    self:publish(dispatcher.failure_response(
+      active.id, INTERNAL_ERROR, "Internal error"))
+  when cancelled then
+    self:publish(dispatcher.failure_response(
+      active.id, REQUEST_CANCELLED, "Request cancelled"))
+  else
+    self:publish(dispatcher.failure_response(
+      active.id, INTERNAL_ERROR, "Internal error"))
+  end
+end
+
+local function Coordinator:start(request: dispatcher.SemanticRequest)
+  if self:find(request.id) ~= nil then
+    self:publish(dispatcher.failure_response(
+      request.id, INVALID_REQUEST, "Duplicate active request id"))
+    return
+  end
+
+  local task = async.run<dispatcher.SemanticOutcome, value>(
+    function (): dispatcher.SemanticOutcome
+      return self.handler(request)
+    end)
+  local active = ActiveRequest.new(request.id, task, nil, false)
+  self.active[#self.active + 1] = active
+  active.remove_listener = task:add_terminal_listener(
+    function (status: async.TaskStatus<dispatcher.SemanticOutcome, value>)
+      self:complete(active, status)
+    end)
+end
+
+local function Coordinator:cancel(id: dispatcher.RequestId)
+  local active? = self:find(id)
+  if active == nil then return end
+  local task = active.task
+  if not task:status():has_finished() then
+    task:cancel(async.CancellationReason.simple("LSP request cancelled"))
+  end
+  -- Cancellation is a request, not completion. Joining retires the handler's
+  -- borrowed state before this ownership operation returns.
+  async.join(task)
+end
+
+function Coordinator:cancel_all(reason: string)
+  local snapshot: {ActiveRequest} = {}
+  for index = 1, #self.active do
+    snapshot[index] = self.active[index]
+  end
+
+  for index = 1, #snapshot do
+    local task = snapshot[index].task
+    if not task:status():has_finished() then
+      task:cancel(async.CancellationReason.simple(reason))
+    end
+  end
+  for index = 1, #snapshot do
+    async.join(snapshot[index].task)
+  end
+end
+
+-- Handle one already-framed JSON body. A nonnil result is the process exit
+-- code requested by the LSP exit notification.
+function Coordinator:handle(source: string): integer?
+  case self.router:route(source)
+  when immediate: result then
+    self:publish(result)
+    return result.exit_code
+  when semantic: request then
+    self:start(request)
+    return nil
+  when cancel: id then
+    self:cancel(id)
+    return nil
+  when shutdown: result then
+    self:cancel_all("language server shutdown")
+    self:publish(result)
+    return nil
+  when exit: code then
+    return code
+  end
+  return nil
+end

@@ -1,0 +1,421 @@
+local async = import "async"
+local fs = import "fs"
+local lua = import "titan.lua"
+local strings = import "string"
+local test = import "test"
+local timer = import "timer"
+local bridge = import "server.compiler_bridge"
+local test_runtime = import "server.test_runtime"
+
+local DRIVER_MODULE = "titan-compiler.driver"
+local SHARED_MODULE = "bridge_concurrency_shared"
+local PROJECT_A = "bridge_concurrency_project_a"
+
+local function temporary_root(): string
+  local root = fs.tmpname()
+  fs.unlink(root)
+  fs.mkdir(root)
+  return root
+end
+
+local function assert_external_provider(analysis: bridge.Analysis,
+                                        expected_file: string,
+                                        subject: string)
+  test.assert(#analysis.diagnostics == 0,
+              subject .. " produced compiler diagnostics")
+  local found? = analysis:find_module(SHARED_MODULE)
+  test.assert(found ~= nil, subject .. " omitted the external module")
+  local snapshot: bridge.ModuleSnapshot = found
+  case snapshot.provenance
+  when external_source: source then
+    test.assert(source.main_file == expected_file,
+                subject .. " selected another Compiler's source provider")
+    test.assert(#source.source_files == 1 and
+                source.source_files[1] == expected_file,
+                subject .. " retained another Compiler's source closure")
+  else
+    test.assert(false, subject .. " did not resolve an external source provider")
+  end
+end
+
+local function source_file_of(result: {bridge.ExternalResolution},
+                              module_name: string): string
+  if #result ~= 1 or result[1].module_name ~= module_name or
+     result[1].error ~= nil or result[1].provenance == nil then
+    raise "unexpected external resolution for " .. module_name
+  end
+  case result[1].provenance as bridge.Provenance
+  when external_source: source then return source.main_file
+  else raise "external resolution did not select source"
+  end
+end
+
+local function join_nil(task: async.Task<nil, value>, subject: string)
+  case async.join<nil, value>(task)
+  when succeeded then
+  when failed: failure then
+    raise subject .. " failed: " .. strings.tostring(failure.error)
+  when cancelled then raise subject .. " was cancelled"
+  else raise subject .. " did not finish"
+  end
+end
+
+local function serializes_real_compilers_across_cancellation()
+  local root_a = temporary_root()
+  defer fs.rmdir(root_a)
+  local provider_a = root_a .. "/" .. SHARED_MODULE .. ".titan"
+  fs.write_file(provider_a,
+    "function identity(): string return \"from-a\" end\n")
+  defer fs.unlink(provider_a)
+
+  local root_b = temporary_root()
+  defer fs.rmdir(root_b)
+  local provider_b = root_b .. "/" .. SHARED_MODULE .. ".titan"
+  fs.write_file(provider_b,
+    "function identity(): integer return 42 end\n")
+  defer fs.unlink(provider_b)
+
+  local project_a = bridge.ProjectModule.new(PROJECT_A, {
+    bridge.SourceFile.new(
+      "/workspace/" .. PROJECT_A .. ".titan",
+      "local shared = import \"" .. SHARED_MODULE .. ".titan\"\n" ..
+      "function identity(): string return shared.identity() end\n")
+  })
+
+  local compiler_a = bridge.load()
+  compiler_a:configure_paths(root_a, "", {})
+  local compiler_b = bridge.load()
+  compiler_b:configure_paths(root_b, "", {})
+  local driver = lua.require(DRIVER_MODULE) as {string: value}
+
+  local a_started = false
+  local a_task = async.run<bridge.Analysis, value>(function (): bridge.Analysis
+    a_started = true
+    return compiler_a:analyze(PROJECT_A, {project_a})
+  end)
+
+  while not a_started do async.yield() end
+  -- API 3 deliberately yields at async filesystem operations before external
+  -- resolution. Wait for the semantic state this test needs instead of
+  -- assuming that the first cooperative yield has already published it.
+  local active_provider?: string = nil
+  while active_provider == nil do
+    local active_imported: value = driver["imported"]
+    if active_imported is {string: value} then
+      local raw_external: value =
+        (active_imported as {string: value})[SHARED_MODULE]
+      if raw_external is {string: value} then
+        local raw_filename: value =
+          (raw_external as {string: value})["filename"]
+        if raw_filename is string then active_provider = raw_filename end
+      end
+    end
+    if active_provider == nil then
+      if a_task:status():has_finished() then
+        case async.join<bridge.Analysis, value>(a_task)
+        when succeeded: analysis then
+          local messages = strings.writer()
+          for index = 1, #analysis.diagnostics do
+            messages:write("\n" .. analysis.diagnostics[index].message)
+          end
+          raise "Compiler A finished before publishing its external provider" ..
+                messages:drain()
+        when failed: failure then
+          raise "Compiler A failed before publishing its external provider: " ..
+                strings.tostring(failure.error)
+        when cancelled then
+          raise "Compiler A was cancelled before the test requested it"
+        else
+          raise "finished Compiler A analysis had a nonterminal status"
+        end
+      end
+      async.yield()
+    end
+  end
+  test.assert(a_task:status():as_string() == "waiting",
+              "Compiler A did not cooperatively yield after publication")
+
+  local active_path: string = driver["TITAN_SOURCE_PATH"]
+  test.assert(active_path == root_a,
+              "Compiler A did not retain its configured source root")
+  test.assert((active_provider as string) == provider_a,
+              "Compiler A entered the wrong external source root")
+
+  local b_started = false
+  local b_saw_a_status = "not-started"
+  local b_saw_source_path = ""
+  local b_saw_provider = ""
+  local a_status_after_b_resolution = "not-resolved"
+  local b_provider?: string = nil
+  local b_task = async.run<nil, value>(function (): nil
+    b_started = true
+    b_saw_a_status = a_task:status():as_string()
+    b_saw_source_path = driver["TITAN_SOURCE_PATH"]
+    local before_imported: value = driver["imported"]
+    if before_imported is {string: value} then
+      local before_external: value =
+        (before_imported as {string: value})[SHARED_MODULE]
+      if before_external is {string: value} then
+        b_saw_provider =
+          (before_external as {string: value})["filename"]
+      end
+    end
+    a_task:cancel(async.CancellationReason.simple(
+      "cancel Compiler A while it owns the shared compiler permit"))
+    b_provider = source_file_of(
+      compiler_b:resolve_external_modules({}, {
+        bridge.ExternalResolutionRequest.new(SHARED_MODULE, true),
+      }), SHARED_MODULE)
+    a_status_after_b_resolution = a_task:status():as_string()
+    return nil
+  end)
+
+  join_nil(b_task, "Compiler B")
+  test.assert(b_started and b_saw_a_status == "waiting" and
+              b_saw_source_path == root_a and
+              b_saw_provider == provider_a,
+              "Compiler B did not start while Compiler A held root-A " ..
+              "compiler state (A=" .. b_saw_a_status ..
+              ", path=" .. b_saw_source_path ..
+              ", provider=" .. b_saw_provider .. ")")
+  test.assert(a_status_after_b_resolution == "cancelled",
+              "Compiler B entered shared compiler state before Compiler A " ..
+              "released it (A after B=" .. a_status_after_b_resolution .. ")")
+  test.assert(b_provider == provider_b,
+              "Compiler B resolved another Compiler's source provider")
+
+  local a_terminal = async.join<bridge.Analysis, value>(a_task)
+  test.assert(a_terminal:as_string() == "cancelled",
+              "Compiler A did not finish with cancellation")
+
+  local retry_a = compiler_a:analyze(PROJECT_A, {project_a})
+  assert_external_provider(retry_a, provider_a, "Compiler A retry")
+end
+
+function test_compiler_bridge_serializes_real_compilers_across_cancellation(
+    _context: test.Context)
+  test_runtime.run(serializes_real_compilers_across_cancellation)
+end
+
+local CLEANUP_MODULE = "bridge_concurrency_ffi_cleanup"
+
+local type RestoreProbeProvider = () -> ()
+local type ObserveProbeWorkspace = () -> string?
+local type InstallProbeWorkspaceObserver =
+  ({string: value}) -> (RestoreProbeProvider, ObserveProbeWorkspace)
+
+local function tmp_entries(): {string: boolean}
+  local result: {string: boolean} = {}
+  local entries = fs.list(fs.tmpdir())
+  for index = 1, #entries do result[entries[index]] = true end
+  return result
+end
+
+local function install_probe_workspace_observer(
+    driver: {string: value}):
+    (RestoreProbeProvider, ObserveProbeWorkspace)
+  local install = lua.load([==[
+return function(driver)
+  local original = driver.get_probe_service
+  local workspace_root
+  driver.get_probe_service = function(context)
+    local service, service_error = original(context)
+    if service and not workspace_root then
+      local workspace, workspace_error = service:_ensure_workspace()
+      assert(workspace, workspace_error)
+      workspace_root = workspace.root
+    end
+    return service, service_error
+  end
+  return function()
+    driver.get_probe_service = original
+  end, function()
+    return workspace_root
+  end
+end
+]==], "=compiler_bridge_probe_workspace_observer", nil)() as
+    InstallProbeWorkspaceObserver
+  return install(driver)
+end
+
+local function cancels_ffi_analysis_and_transfers_cleanup()
+  local root = temporary_root()
+  local ffi_header = root .. "/bridge_concurrency_cleanup.h"
+  fs.write_file(ffi_header,
+    "typedef int bridge_concurrency_cleanup_int;\n" ..
+    "typedef struct bridge_cleanup_source { int value; } " ..
+    "bridge_cleanup_source;\n" ..
+    "typedef struct bridge_cleanup_target { int value; } " ..
+    "bridge_cleanup_target;\n")
+  defer do
+    do fs.unlink(ffi_header) catch end
+    do fs.rmdir(root) catch end
+  end
+
+  local project = bridge.ProjectModule.new(CLEANUP_MODULE, {
+    bridge.SourceFile.new(
+      root .. "/" .. CLEANUP_MODULE .. ".titan",
+      "local c = foreign import \"bridge_concurrency_cleanup.h\"\n" ..
+      "local function probe_pointer(pointer: *c.bridge_cleanup_source): " ..
+      "*c.bridge_cleanup_target\n" ..
+      "  return pointer\n" ..
+      "end\n" ..
+      "foreign function identity(input: c.bridge_concurrency_cleanup_int): " ..
+      "c.bridge_concurrency_cleanup_int\n" ..
+      "  return input\n" ..
+      "end\n")
+  })
+  local before = tmp_entries()
+  local compiler = bridge.load()
+  local driver = lua.require(DRIVER_MODULE) as {string: value}
+  local restore_probe_provider, observe_probe_workspace =
+    install_probe_workspace_observer(driver)
+  defer restore_probe_provider()
+
+  local started = false
+  local analysis_task = async.run<bridge.Analysis, value>(
+    function (): bridge.Analysis
+      started = true
+      return compiler:analyze(CLEANUP_MODULE, {project})
+    end)
+  while not started do async.yield() end
+
+  -- The driver publishes this field immediately before its post-module
+  -- strategy yield. The absolute source filename avoids any intervening path
+  -- lookup, so observing it while the Task waits pins cancellation to that
+  -- exact yield rather than to an earlier filesystem or compiler operation.
+  local checking_header?: string = nil
+  while checking_header == nil do
+    local raw_imported: value = driver["imported"]
+    if raw_imported is {string: value} then
+      local raw_module: value =
+        (raw_imported as {string: value})[CLEANUP_MODULE]
+      if raw_module is {string: value} then
+        local raw_header: value =
+          (raw_module as {string: value})["checking_foreign_header"]
+        if raw_header is string then checking_header = raw_header end
+      end
+    end
+    if checking_header == nil then
+      if analysis_task:status():has_finished() then
+        case async.join<bridge.Analysis, value>(analysis_task)
+        when succeeded: analysis then
+          local messages = strings.writer()
+          for index = 1, #analysis.diagnostics do
+            messages:write("\n" .. analysis.diagnostics[index].message)
+          end
+          raise "FFI analysis finished before its post-module yield" ..
+                messages:drain()
+        when failed: failure then
+          raise "FFI analysis failed before its post-module yield: " ..
+                strings.tostring(failure.error)
+        when cancelled then
+          raise "FFI analysis was cancelled before the test requested it"
+        else
+          raise "finished FFI analysis had a nonterminal status"
+        end
+      end
+      async.yield()
+    end
+  end
+  test.assert(checking_header ~= nil,
+              "compiler did not publish a generated checking header")
+  test.assert(analysis_task:status():as_string() == "waiting",
+              "FFI analysis was not waiting at its post-module yield")
+  test.assert(fs.lstat(checking_header as string) ~= nil,
+              "generated checking header was absent before cancellation")
+
+  local workspace? = observe_probe_workspace()
+  test.assert(workspace ~= nil,
+              "real FFI analysis did not create a private probe workspace")
+  local workspace_path = workspace as string
+  local prefix = fs.tmpdir() .. "/titan-fs-"
+  test.assert(strings.sub(workspace_path, 1, #prefix) == prefix and
+              not before[strings.sub(workspace_path, #fs.tmpdir() + 2)] and
+              fs.lstat(workspace_path) ~= nil,
+              "FFI analysis did not retain its newly created titan-fs workspace")
+  local workspaces: {string} = {workspace_path}
+
+  analysis_task:cancel(async.CancellationReason.simple(
+    "cancel FFI analysis at its post-module yield"))
+  local terminal = async.join<bridge.Analysis, value>(analysis_task)
+  test.assert(terminal:as_string() == "cancelled",
+              "FFI analysis did not finish with cancellation")
+
+  -- Context close is retried by an uncancelled Task after the cancelled owner
+  -- releases the compiler permit. Wait for that transferred cleanup rather
+  -- than deleting either resource from this test Task.
+  local cleaned = false
+  local attempts = 0
+  while not cleaned and attempts < 10000 do
+    cleaned = fs.lstat(checking_header as string) == nil
+    for index = 1, #workspaces do
+      if fs.lstat(workspaces[index]) ~= nil then cleaned = false end
+    end
+    if not cleaned then timer.sleep(1) end
+    attempts = attempts + 1
+  end
+  test.assert(cleaned,
+              "transferred cancellation cleanup leaked the checking header " ..
+              "or private probe workspace")
+end
+
+function test_compiler_bridge_cancellation_transfers_real_ffi_cleanup(
+    _context: test.Context)
+  test_runtime.run(cancels_ffi_analysis_and_transfers_cleanup)
+end
+
+-- The compiler I/O strategy planned for the bridge is a plain Lua object in
+-- titanc and a Lua-visible Titan record in the language server. Keep this
+-- focused regression at that exact boundary: ordinary Lua receives the record
+-- userdata, calls its Titan method, and remains suspended while the method
+-- yields through the Task runtime and performs Titan filesystem I/O.
+record LuaProxyIoStrategy
+  path: string
+  phase: integer
+  observed_while_yielded: boolean
+end
+
+function LuaProxyIoStrategy:read_after_yield(): string
+  self.phase = 1
+  while not self.observed_while_yielded do async.yield() end
+  local contents = fs.read_file(self.path)
+  self.phase = 2
+  return contents
+end
+
+local function lua_proxy_resumes_titan_async_method()
+  local path = fs.tmpname()
+  defer fs.unlink(path)
+  fs.write_file(path, "read through Titan async fs")
+
+  local strategy = LuaProxyIoStrategy.new(path, 0, false)
+  local observer = async.run<nil, value>(function (): nil
+    test.assert(strategy.phase == 1,
+                "Lua did not remain inside the yielding Titan method")
+    strategy.observed_while_yielded = true
+    return nil
+  end)
+  local invoke = lua.load([==[
+return function(strategy)
+  assert(type(strategy) == "userdata",
+         "Titan record did not cross to Lua as its userdata proxy")
+  assert(strategy.phase == 0, "Lua received the wrong initial record state")
+  local contents = strategy:read_after_yield()
+  assert(strategy.phase == 2, "Titan method did not resume before returning")
+  return contents
+end
+]==], "=compiler_bridge_io_strategy_proxy", nil)() as
+    (LuaProxyIoStrategy) -> string
+
+  local contents = invoke(strategy)
+  test.assert(contents == "read through Titan async fs",
+              "Lua/Titan proxy call lost the async filesystem result")
+  test.assert(observer:status():has_succeeded(),
+              "observer did not run while the Lua-to-Titan call was yielded")
+end
+
+function test_compiler_bridge_lua_proxy_can_call_yielding_titan_io_strategy(
+    _context: test.Context)
+  test_runtime.run(lua_proxy_resumes_titan_async_method)
+end

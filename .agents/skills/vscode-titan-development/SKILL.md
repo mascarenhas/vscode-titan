@@ -58,12 +58,15 @@ errors. Do not solve discovery by embedding the compiler into the executable.
 
 Match `titanc --tree` module discovery, including folder modules. Keep one
 shared graph with complete annotated ASTs for project modules and only
-manifest/mtime metadata for external source and binary modules.
+manifest and exact filesystem provenance metadata for external source and
+binary modules. Compiler-observed C-header dependency closures are metadata,
+not retained external ASTs.
 
 Project watchers cover `.titan` creation, changes, and deletion. They never
-watch external trees. Recheck an external import by mtime when encountered.
-Propagate invalidation through immediate importers only when a module's public
-manifest changed; stop when it did not.
+watch external trees. Revalidate an encountered external import from its exact
+source/provider provenance, including ordered C-header bytes and include-search
+candidates where applicable. Propagate invalidation through immediate importers
+only when a module's public manifest changed; stop when it did not.
 
 Definition navigation stays inside project source and excludes foreign
 declarations. Completion and unsaved-buffer semantics remain out of scope.
@@ -80,7 +83,10 @@ Keep tests beside the layer they prove:
 - extension-host smoke tests for activation and process lifecycle.
 
 Use focused gates during development and the Makefile's complete gate before
-delivery. Inspect the VSIX contents and the executable's native dependencies.
+delivery. For a direct focused `titanc` invocation, copy `src/` to a temporary
+source stage first; using the working tree itself as `--tree` can emit generated
+`.c`/`.o` files beside the authored Titan modules. Inspect the VSIX contents and
+the executable's native dependencies.
 Update Project status/priority/size with `gh`, then stage exact paths and commit
 to `main` only when the owned acceptance criteria are satisfied.
 

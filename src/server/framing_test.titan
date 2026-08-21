@@ -1,0 +1,125 @@
+local test = import "test"
+local strings = import "string"
+local framing = import "server.framing"
+
+local type Action = () -> ()
+
+local function expect_frame_error(action: Action, expected: string)
+  local rejected = false
+  do
+    action()
+  catch
+    rejected = true
+    test.assert(error is framing.FrameError,
+                "malformed frame raised a non-framing error")
+    local failure = error as framing.FrameError
+    test.assert(strings.find(failure.message, expected) ~= nil,
+                "FrameError did not explain the rejected frame")
+  end
+  test.assert(rejected, "malformed frame was accepted")
+end
+
+function test_framing_handles_fragmented_and_coalesced_messages(
+    _context: test.Context)
+  local reader = framing.reader()
+  reader:feed("Content-Len")
+  local incomplete? = reader:next()
+  test.assert(incomplete == nil, "partial header produced a frame")
+
+  reader:feed("gth: 5\r\nContent-Type: application/vscode-jsonrpc; " ..
+              "charset=utf-8\r\n\r\nhello" .. framing.frame("world"))
+  local first? = reader:next()
+  local second? = reader:next()
+  local exhausted? = reader:next()
+  test.assert(first == "hello", "fragmented first body was not recovered")
+  test.assert(second == "world", "coalesced second frame was lost")
+  test.assert(exhausted == nil and reader:pending_bytes() == 0,
+              "frame reader retained bytes after both complete frames")
+end
+
+function test_framing_counts_utf8_body_bytes(_context: test.Context)
+  local body = [[{"word":"café"}]]
+  local framed = framing.frame(body)
+  test.assert(strings.find(framed, "Content-Length: " .. #body .. "\r\n") == 1,
+              "Content-Length did not use the UTF-8 byte count")
+
+  local reader = framing.reader()
+  for index = 1, #framed do
+    reader:feed(strings.sub(framed, index, index))
+  end
+  local decoded? = reader:next()
+  test.assert(decoded == body,
+              "byte-at-a-time framing changed a UTF-8 JSON body")
+end
+
+function test_framing_rejects_malformed_headers(_context: test.Context)
+  expect_frame_error(function ()
+    local reader = framing.reader()
+    reader:feed("Content-Length: 1\n\nx")
+    reader:next()
+  end, "CRLF")
+
+  expect_frame_error(function ()
+    local reader = framing.reader()
+    reader:feed("Content-Length: 1\r\ncontent-length: 1\r\n\r\nx")
+    reader:next()
+  end, "duplicate")
+
+  expect_frame_error(function ()
+    local reader = framing.reader()
+    reader:feed("Bad Name: value\r\nContent-Length: 1\r\n\r\nx")
+    reader:next()
+  end, "header name")
+
+  expect_frame_error(function ()
+    local reader = framing.reader()
+    reader:feed("Content-Length: -1\r\n\r\n")
+    reader:next()
+  end, "unsigned decimal")
+
+  expect_frame_error(function ()
+    local reader = framing.reader()
+    reader:feed("Content-Length: 1\r\nContent-Type: " ..
+                "application/vscode-jsonrpc; charset=latin-1\r\n\r\nx")
+    reader:next()
+  end, "UTF-8")
+end
+
+function test_framing_accepts_current_and_legacy_utf8_content_types(
+    _context: test.Context)
+  local current = framing.reader()
+  current:feed("Content-Length: 1\r\nContent-Type: " ..
+               "application/vscode-jsonrpc; charset=utf-8\r\n\r\nx")
+  test.assert(current:next() == "x",
+              "current UTF-8 Content-Type was rejected")
+
+  local legacy = framing.reader()
+  legacy:feed("Content-Length: 1\r\nContent-Type: " ..
+              "application/vscode-jsonrpc;charset=utf8\r\n\r\ny")
+  test.assert(legacy:next() == "y",
+              "legacy utf8 Content-Type was rejected")
+end
+
+function test_framing_reports_truncated_input(_context: test.Context)
+  expect_frame_error(function ()
+    local reader = framing.reader()
+    local source = strings.reader("Content-Length: 5\r\n\r\nabc")
+    reader:read(source)
+  end, "unexpected EOF")
+end
+
+function test_framing_rejects_oversized_content_before_body_accumulation(
+    _context: test.Context)
+  local boundary = framing.reader()
+  boundary:feed("Content-Length: 16777216\r\n\r\n")
+  test.assert(boundary:next() == nil,
+              "maximum permitted Content-Length was rejected")
+
+  expect_frame_error(function ()
+    local reader = framing.reader()
+    -- No body bytes are supplied: the declared size must be rejected as soon
+    -- as the complete header block is available.
+    reader:feed("Content-Length: 16777217\r\n\r\n")
+    reader:next()
+  end, "16777216")
+end

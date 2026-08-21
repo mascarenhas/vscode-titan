@@ -1,0 +1,327 @@
+local json = import "server.json"
+local source_text = import "server.source_text"
+local strings = import "string"
+
+record Error
+  code: integer
+  message: string
+end
+
+record TextDocument
+  uri: string
+  path: string
+end
+
+record DocumentPosition
+  uri: string
+  path: string
+  position: source_text.Position
+end
+
+record ReferencesParams
+  document: DocumentPosition
+  include_declaration: boolean
+end
+
+record RenameParams
+  document: DocumentPosition
+  new_name: string
+end
+
+record TextEdit
+  range: source_text.Span
+  new_text: string
+end
+
+record DocumentEdits
+  uri: string
+  edits: {TextEdit}
+end
+
+record FoldingRange
+  start_line: integer
+  start_character: integer?
+  end_line: integer
+  end_character: integer?
+  kind: string?
+end
+
+local INVALID_PARAMS = -32602
+
+local function invalid<T>(message: string): (T?, Error?)
+  return nil, Error.new(INVALID_PARAMS, message)
+end
+
+local function required_object(candidate: json.Value?, subject: string):
+    (json.Object?, Error?)
+  if candidate == nil then
+    return invalid<json.Object>(subject .. " must be an object")
+  end
+  local object? = json.as_object(candidate)
+  if object == nil then
+    return invalid<json.Object>(subject .. " must be an object")
+  end
+  return object, nil
+end
+
+local function required_member(object: json.Object, key: string,
+                               subject: string): (json.Value?, Error?)
+  local candidate? = object:get(key)
+  if candidate == nil then
+    return invalid<json.Value>(subject .. "." .. key .. " is required")
+  end
+  return candidate, nil
+end
+
+local function required_string(object: json.Object, key: string,
+                               subject: string): (string?, Error?)
+  local candidate?, failure? = required_member(object, key, subject)
+  if candidate == nil then return nil, failure end
+  local result? = json.as_string(candidate)
+  if result == nil then
+    return invalid<string>(subject .. "." .. key .. " must be a string")
+  end
+  return result, nil
+end
+
+local function required_integer(object: json.Object, key: string,
+                                subject: string): (integer?, Error?)
+  local candidate?, failure? = required_member(object, key, subject)
+  if candidate == nil then return nil, failure end
+  local result? = json.as_integer(candidate)
+  if result == nil then
+    return invalid<integer>(subject .. "." .. key .. " must be an integer")
+  end
+  return result, nil
+end
+
+function parse_document(params: json.Value?): (TextDocument?, Error?)
+  local object?, object_error? = required_object(params, "params")
+  if object == nil then return nil, object_error end
+
+  local raw_document?, document_error? =
+    required_member(object, "textDocument", "params")
+  if raw_document == nil then return nil, document_error end
+  local document?, document_object_error? =
+    required_object(raw_document, "params.textDocument")
+  if document == nil then return nil, document_object_error end
+  local uri?, uri_error? = required_string(
+    document, "uri", "params.textDocument")
+  if uri == nil then return nil, uri_error end
+
+  local path?, path_error? = source_text.file_uri_to_path(uri)
+  if path == nil then
+    local detail = "invalid file URI"
+    if path_error ~= nil then detail = path_error.message end
+    return invalid<TextDocument>(
+      "params.textDocument.uri is not a local file URI: " .. detail)
+  end
+  return TextDocument.new(uri, path), nil
+end
+
+local function parse_document_position_or_error(params: json.Value?):
+    (DocumentPosition?, Error?)
+  local document?, document_error? = parse_document(params)
+  if document == nil then return nil, document_error end
+  local object? = json.as_object(params)
+
+  local raw_position?, position_error? =
+    required_member(object, "position", "params")
+  if raw_position == nil then return nil, position_error end
+  local position?, position_object_error? =
+    required_object(raw_position, "params.position")
+  if position == nil then return nil, position_object_error end
+  local line?, line_error? = required_integer(
+    position, "line", "params.position")
+  if line == nil then return nil, line_error end
+  local character?, character_error? = required_integer(
+    position, "character", "params.position")
+  if character == nil then return nil, character_error end
+  if line < 0 or character < 0 then
+    return invalid<DocumentPosition>(
+      "params.position line and character must be non-negative")
+  end
+
+  return DocumentPosition.new(
+    document.uri, document.path,
+    source_text.Position.new(line, character)), nil
+end
+
+function parse_document_position(params: json.Value?):
+    (DocumentPosition?, Error?)
+  return parse_document_position_or_error(params)
+end
+
+function parse_references(params: json.Value?): (ReferencesParams?, Error?)
+  local document?, document_error? = parse_document_position_or_error(params)
+  if document == nil then return nil, document_error end
+  local object? = json.as_object(params)
+  local raw_context?, context_error? =
+    required_member(object, "context", "params")
+  if raw_context == nil then return nil, context_error end
+  local context?, context_object_error? =
+    required_object(raw_context, "params.context")
+  if context == nil then return nil, context_object_error end
+  local raw_include?, include_error? =
+    required_member(context, "includeDeclaration", "params.context")
+  if raw_include == nil then return nil, include_error end
+  local include? = json.as_boolean(raw_include)
+  if include == nil then
+    return invalid<ReferencesParams>(
+      "params.context.includeDeclaration must be a boolean")
+  end
+  return ReferencesParams.new(document, include), nil
+end
+
+local function ascii_letter(byte: integer): boolean
+  return (byte >= 65 and byte <= 90) or (byte >= 97 and byte <= 122)
+end
+
+local function keyword(name: string): boolean
+  return name == "and" or name == "as" or name == "boolean" or
+    name == "break" or name == "case" or name == "catch" or
+    name == "const" or name == "defer" or name == "do" or
+    name == "else" or name == "elseif" or name == "end" or
+    name == "false" or name == "finally" or name == "float" or
+    name == "for" or name == "foreign" or name == "function" or
+    name == "goto" or name == "if" or name == "import" or
+    name == "in" or name == "integer" or name == "interface" or
+    name == "is" or name == "local" or name == "nil" or
+    name == "not" or name == "or" or name == "owned" or
+    name == "raise" or name == "record" or name == "repeat" or
+    name == "return" or name == "string" or name == "then" or
+    name == "true" or name == "type" or name == "union" or
+    name == "until" or name == "value" or name == "when" or
+    name == "while"
+end
+
+function valid_identifier(name: string): boolean
+  if name == "" or keyword(name) then return false end
+  local first: integer = strings.byte(name, 1)
+  if first ~= 95 and not ascii_letter(first) then return false end
+  for index = 2, #name do
+    local byte: integer = strings.byte(name, index)
+    if byte ~= 95 and not ascii_letter(byte) and
+       not (byte >= 48 and byte <= 57) then
+      return false
+    end
+  end
+  return true
+end
+
+function parse_rename(params: json.Value?): (RenameParams?, Error?)
+  local document?, document_error? = parse_document_position_or_error(params)
+  if document == nil then return nil, document_error end
+  local object? = json.as_object(params)
+  local name?, name_error? = required_string(object, "newName", "params")
+  if name == nil then return nil, name_error end
+  if not valid_identifier(name) then
+    return invalid<RenameParams>(
+      "params.newName must be a non-keyword Titan identifier")
+  end
+  return RenameParams.new(document, name), nil
+end
+
+function position_value(position: source_text.Position): json.Value
+  return json.from_object({
+    json.Member.new("line", json.from_integer(position.line)),
+    json.Member.new("character", json.from_integer(position.character)),
+  })
+end
+
+function range_value(span: source_text.Span): json.Value
+  return json.from_object({
+    json.Member.new("start", position_value(span.start)),
+    json.Member.new("end", position_value(span.finish)),
+  })
+end
+
+function location_value(uri: string, span: source_text.Span): json.Value
+  return json.from_object({
+    json.Member.new("uri", json.from_string(uri)),
+    json.Member.new("range", range_value(span)),
+  })
+end
+
+function text_edit_value(edit: TextEdit): json.Value
+  return json.from_object({
+    json.Member.new("range", range_value(edit.range)),
+    json.Member.new("newText", json.from_string(edit.new_text)),
+  })
+end
+
+local function bytewise_less(left: string, right: string): boolean
+  local limit = #left
+  if #right < limit then limit = #right end
+  for index = 1, limit do
+    local left_byte: integer = strings.byte(left, index)
+    local right_byte: integer = strings.byte(right, index)
+    if left_byte < right_byte then return true end
+    if left_byte > right_byte then return false end
+  end
+  return #left < #right
+end
+
+local function sorted_documents(documents: {DocumentEdits}): {DocumentEdits}
+  local result: {DocumentEdits} = {}
+  for index = 1, #documents do
+    local item = documents[index]
+    local target = #result + 1
+    while target > 1 and bytewise_less(item.uri, result[target - 1].uri) do
+      result[target] = result[target - 1]
+      target = target - 1
+    end
+    result[target] = item
+  end
+  return result
+end
+
+function workspace_edit_value(documents: {DocumentEdits}): json.Value
+  local changes: {json.Member} = {}
+  local ordered = sorted_documents(documents)
+  for index = 1, #ordered do
+    local document = ordered[index]
+    local edits: {json.Value} = {}
+    for edit_index = 1, #document.edits do
+      edits[edit_index] = text_edit_value(document.edits[edit_index])
+    end
+    changes[#changes + 1] = json.Member.new(
+      document.uri, json.from_array(edits))
+  end
+  return json.from_object({
+    json.Member.new("changes", json.from_object(changes)),
+  })
+end
+
+function hover_value(markdown: string, span: source_text.Span?): json.Value
+  local members: {json.Member} = {
+    json.Member.new("contents", json.from_object({
+      json.Member.new("kind", json.from_string("markdown")),
+      json.Member.new("value", json.from_string(markdown)),
+    })),
+  }
+  if span ~= nil then
+    members[#members + 1] = json.Member.new("range", range_value(span))
+  end
+  return json.from_object(members)
+end
+
+function folding_range_value(range: FoldingRange): json.Value
+  local members: {json.Member} = {
+    json.Member.new("startLine", json.from_integer(range.start_line)),
+    json.Member.new("endLine", json.from_integer(range.end_line)),
+  }
+  if range.start_character ~= nil then
+    members[#members + 1] = json.Member.new(
+      "startCharacter", json.from_integer(range.start_character))
+  end
+  if range.end_character ~= nil then
+    members[#members + 1] = json.Member.new(
+      "endCharacter", json.from_integer(range.end_character))
+  end
+  if range.kind ~= nil then
+    members[#members + 1] = json.Member.new(
+      "kind", json.from_string(range.kind))
+  end
+  return json.from_object(members)
+end

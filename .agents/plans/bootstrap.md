@@ -93,6 +93,9 @@ Keep protocol plumbing separate from compiler semantics:
 5. **Cache and scheduler** — one module graph per project, annotated ASTs for
    project modules, manifests for every dependency, reverse imports, generation
    checks, and cooperative yields so stale work cannot overwrite newer state.
+   Compiler work holds one permit around the shared embedded Lua state, but its
+   resolver-scoped I/O strategy delegates files and child processes to Titan's
+   async modules and yields after each completely published source module.
 6. **Feature queries** — one symbol/reference index feeds definition,
    references, and rename; typed nodes feed hover; source structure feeds folding.
 
@@ -106,13 +109,25 @@ LSP open/change notifications do not become semantic input in V1. A request is
 answered from the newest completed generation derived from files on disk.
 Changes are detected through project `.titan` watchers and coalesced.
 
+The read request that initiates a refresh joins it, which surfaces a broken
+saved generation immediately. During a cooperatively yielding refresh, later
+read-only requests may use the immutable preceding completed generation;
+rename always joins and performs its second disk-generation check. A known
+refresh failure invalidates the fallback until a later refresh succeeds.
+
 - File content change invalidates its owning module.
 - Creating or deleting a constituent of a folder module invalidates that whole
   module and updates membership.
 - Project modules retain their full annotated AST and manifest.
-- External source and binary modules retain only manifest and mtime metadata.
-- External trees are never watched; an imported external module is revalidated
-  by mtime when encountered again.
+- External source and binary modules retain only manifest and filesystem
+  provenance metadata, never complete ASTs. An external source entry may also
+  retain its compiler-observed C-header fingerprint closure.
+- External trees are never watched. Imported external modules are revalidated
+  by exact provenance when encountered again; C FFI modules additionally
+  revalidate the ordered direct/transitive header bytes and include-search
+  candidates observed by the compiler, both before analysis and immediately
+  before publication. This detects edits, deletion/recovery, and a newly
+  shadowing header without watching or walking an external include tree.
 - After rechecking a module, compare the new public manifest with the previous
   manifest. A changed manifest recursively invalidates immediate importers; an
   unchanged one stops propagation.
@@ -210,9 +225,10 @@ through the compiled server.
   platforms are built.
 - Document clean builds, all tests, F5 development, VSIX creation, and local
   `code --install-extension` installation.
-- Document an agent-readable Codex connection that launches the same executable
-  directly, including root and compiler `package.path` requirements, then run a
-  protocol smoke test through that path.
+- Package an agent-readable, skills-only Codex adapter whose deterministic
+  read-only query script launches the same executable directly, including root
+  and compiler `package.path` requirements, then test its framing and lifecycle
+  through definitions, references, hover, folding, and rename previews.
 - Run the full Make/npm/Titan gates, inspect the packaged contents and native
   dependencies, and review scope against every acceptance criterion.
 - Commit exact paths to `main`. If Titan changed, finish its separate tests and
@@ -237,16 +253,22 @@ has evidence before moving to Done.
 - Tests build and run, rather than stopping after compilation.
 - Project fields and dependency notes match the actual implementation state.
 
-## Known investigation points
+## Resolved investigation outcomes
 
-- Exact compiler object/API seam for retaining annotated ASTs and manifests
-  without repeating work.
-- Whether compiler I/O/yield injection requires a Titan compiler change, and its
-  smallest backwards-compatible shape.
-- Exact compiler AST tags and source-span representation needed by the typed
-  adapter.
-- Cross-platform native-link inputs and VSIX platform matrix.
-- The currently supported Codex language-server registration surface.
-
-Resolve these from source or authoritative product documentation before
-implementation; do not encode guesses as public interfaces.
+- Compiler API 3 exposes resolver-scoped incremental analysis, complete project
+  AST reuse, detached public manifests, exact external provenance, and ordered
+  checked-module checkpoints without embedding compiler Lua modules.
+- The resolver context owns one I/O strategy. Ordinary `titanc` uses the Lua
+  implementation; the server supplies a Titan-record proxy backed by Titan
+  async filesystem/process APIs and `async.yield`. No Titan standard-library
+  API change was required.
+- Parser/checker-private metadata supplies exact source spans, declaration
+  identity, localness, surface type arguments, named arguments, and original
+  and coerced types. The bridge normalizes those tables once into typed Titan
+  records and unions.
+- The Makefile selects Titan's static provider and exports the embedded Lua C
+  API. Packages are host/architecture-specific; Linux CI builds on Ubuntu 22.04
+  and rejects binaries importing GLIBC symbols newer than 2.35.
+- Codex's supported plugin surface is a bundled skill and deterministic query
+  script. Marketplace-level `lspServers` registration is not part of the
+  supported manifest contract.

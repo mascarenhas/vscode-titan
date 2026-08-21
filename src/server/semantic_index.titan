@@ -1,0 +1,431 @@
+local strings = import "string"
+local bridge = import "server.compiler_bridge"
+local source_text = import "server.source_text"
+
+-- Symbol identity is nominal at the server boundary even though the compiler
+-- bridge supplies its stable representation as a string.
+record SymbolId
+  const declaration_id: string
+end
+
+record Occurrence
+  const symbol_id: SymbolId
+  const module_name: string
+  const filename: string
+  const name: string
+  const role: bridge.OccurrenceRole
+  const span: source_text.Span
+  const byte_span: source_text.ByteSpan
+  const is_local: boolean
+  const type_info: bridge.TypeInfo?
+end
+
+record Error
+  const module_name: string?
+  const filename: string?
+  const message: string
+end
+
+local record SavedFile
+  const module_name: string
+  const contents: string
+end
+
+record Index
+  local by_file: {string: {Occurrence}}
+  local by_symbol: {string: {Occurrence}}
+  local definitions: {string: Occurrence}
+  local filenames: {string}
+end
+
+local function fail<T>(module_name: string?, filename: string?,
+                        message: string): T
+  raise Error.new(module_name, filename, message)
+end
+
+local function fail_span(module_name: string?, filename: string?,
+                         message: string):
+    (source_text.Span, source_text.ByteSpan)
+  raise Error.new(module_name, filename, message)
+end
+
+local function role_rank(role: bridge.OccurrenceRole): integer
+  case role
+  when definition then return 0
+  when import_alias then return 1
+  when write then return 2
+  when reference then return 3
+  when type_reference then return 4
+  end
+end
+
+local function same_role(left: bridge.OccurrenceRole,
+                         right: bridge.OccurrenceRole): boolean
+  return role_rank(left) == role_rank(right)
+end
+
+local function declaration_role(role: bridge.OccurrenceRole): boolean
+  case role
+  when definition then return true
+  when import_alias then return true
+  else return false
+  end
+end
+
+local function same_type(left: bridge.TypeInfo?,
+                         right: bridge.TypeInfo?): boolean
+  if left == nil or right == nil then return left == nil and right == nil end
+  return left.tag == right.tag and left.display == right.display
+end
+
+local function optional_type_key(info: bridge.TypeInfo?): string
+  if info == nil then return "" end
+  return "\1" .. info.tag .. "\0" .. info.display
+end
+
+local function occurrence_less(left: Occurrence,
+                               right: Occurrence): boolean
+  if left.filename ~= right.filename then
+    return left.filename < right.filename
+  end
+  if left.byte_span.start ~= right.byte_span.start then
+    return left.byte_span.start < right.byte_span.start
+  end
+  if left.byte_span.finish ~= right.byte_span.finish then
+    return left.byte_span.finish < right.byte_span.finish
+  end
+  if left.symbol_id.declaration_id ~= right.symbol_id.declaration_id then
+    return left.symbol_id.declaration_id < right.symbol_id.declaration_id
+  end
+  local left_role = role_rank(left.role)
+  local right_role = role_rank(right.role)
+  if left_role ~= right_role then return left_role < right_role end
+  if left.module_name ~= right.module_name then
+    return left.module_name < right.module_name
+  end
+  if left.name ~= right.name then return left.name < right.name end
+  if left.is_local ~= right.is_local then return not left.is_local end
+  return optional_type_key(left.type_info) < optional_type_key(right.type_info)
+end
+
+local function same_occurrence(left: Occurrence,
+                               right: Occurrence): boolean
+  return left.symbol_id.declaration_id == right.symbol_id.declaration_id and
+         left.module_name == right.module_name and
+         left.filename == right.filename and
+         left.name == right.name and
+         same_role(left.role, right.role) and
+         left.byte_span.start == right.byte_span.start and
+         left.byte_span.finish == right.byte_span.finish and
+         left.is_local == right.is_local and
+         same_type(left.type_info, right.type_info)
+end
+
+local function insert_sorted(items: {Occurrence}, item: Occurrence)
+  local position = #items + 1
+  while position > 1 and occurrence_less(item, items[position - 1]) do
+    items[position] = items[position - 1]
+    position = position - 1
+  end
+  items[position] = item
+end
+
+local function line_start(source: string, target_line: integer,
+                          module_name: string, filename: string): integer
+  if target_line < 1 then
+    return fail<integer>(module_name, filename,
+      "compiler span has a non-positive line")
+  end
+  local line = 1
+  local index = 1
+  while line < target_line do
+    if index > #source then
+      return fail<integer>(module_name, filename,
+        "compiler span line is outside the saved source")
+    end
+    local byte: integer = strings.byte(source, index)
+    -- Match titan-compiler.location exactly: only LF advances the compiler
+    -- line, while a preceding CR remains part of that line's byte columns.
+    if byte == 0x0a then
+      index = index + 1
+      line = line + 1
+    else
+      index = index + 1
+    end
+  end
+  return index
+end
+
+local function line_finish(source: string, start_index: integer): integer
+  local index = start_index
+  while index <= #source do
+    local byte: integer = strings.byte(source, index)
+    if byte == 0x0a then return index end
+    index = index + 1
+  end
+  return #source + 1
+end
+
+-- Compiler locations are one-based byte columns. Convert them to a zero-based
+-- byte offset first; SourceText remains the sole owner of UTF-8/UTF-16
+-- validation and conversion.
+local function location_offset(source: string,
+                               location: bridge.SourceLocation,
+                               module_name: string): integer
+  if location.column < 1 then
+    return fail<integer>(module_name, location.filename,
+      "compiler span has a non-positive column")
+  end
+  local start_index = line_start(
+    source, location.line, module_name, location.filename)
+  local target_index = start_index + location.column - 1
+  if target_index > line_finish(source, start_index) then
+    return fail<integer>(module_name, location.filename,
+      "compiler span column is outside its saved source line")
+  end
+  return target_index - 1
+end
+
+local function validate_span(module_name: string, saved: SavedFile,
+                             symbol: bridge.SymbolOccurrence):
+    (source_text.Span, source_text.ByteSpan)
+  local exact? = symbol.exact_span
+  if exact == nil then
+    return fail_span(
+      module_name, symbol.location.filename,
+      "internal error: missing exact compiler span reached validation")
+  end
+  if exact.start.filename ~= symbol.location.filename or
+     exact.finish.filename ~= symbol.location.filename then
+    return fail_span(
+      module_name, symbol.location.filename,
+      "exact compiler span crosses or changes source files")
+  end
+  if exact.start.line ~= symbol.location.line or
+     exact.start.column ~= symbol.location.column then
+    return fail_span(
+      module_name, symbol.location.filename,
+      "exact compiler span does not start at the occurrence location")
+  end
+  if exact.finish.line ~= exact.start.line then
+    return fail_span(
+      module_name, symbol.location.filename,
+      "identifier span crosses a source line")
+  end
+
+  local start_offset = location_offset(saved.contents, exact.start, module_name)
+  local finish_offset = location_offset(
+    saved.contents, exact.finish, module_name)
+  if finish_offset < start_offset then
+    return fail_span(
+      module_name, symbol.location.filename,
+      "identifier span finishes before it starts")
+  end
+  local actual = strings.sub(saved.contents, start_offset + 1, finish_offset)
+  if actual ~= symbol.name then
+    return fail_span(
+      module_name, symbol.location.filename,
+      "saved source does not contain identifier '" .. symbol.name ..
+      "' at the compiler's exact span")
+  end
+
+  local span?, span_error? = source_text.span_for_offsets(
+    saved.contents, start_offset, finish_offset)
+  if span == nil then
+    local detail = "invalid UTF-8 boundary"
+    if span_error ~= nil then detail = span_error.message end
+    return fail_span(
+      module_name, symbol.location.filename,
+      "cannot convert compiler span to LSP coordinates: " .. detail)
+  end
+  return span, source_text.ByteSpan.new(start_offset, finish_offset)
+end
+
+local function project_files(projects: {bridge.ProjectModule}):
+    ({string: SavedFile}, {string: boolean})
+  local files: {string: SavedFile} = {}
+  local modules: {string: boolean} = {}
+  for project_index = 1, #projects do
+    local project = projects[project_index]
+    if modules[project.module_name] then
+      fail<value>(project.module_name, nil,
+        "duplicate saved project module")
+    end
+    modules[project.module_name] = true
+    for file_index = 1, #project.files do
+      local file = project.files[file_index]
+      if files[file.filename] ~= nil then
+        fail<value>(project.module_name, file.filename,
+          "saved source file belongs to more than one project module")
+      end
+      files[file.filename] = SavedFile.new(project.module_name, file.contents)
+    end
+  end
+  return files, modules
+end
+
+local function append_snapshot_occurrences(
+    target: {Occurrence}, snapshot: bridge.ModuleSnapshot,
+    files: {string: SavedFile}, projects: {string: boolean})
+  case snapshot.provenance
+  when project_source then
+  else
+    -- External source and binary snapshots never contribute source locations.
+    return
+  end
+  if not projects[snapshot.module_name] then
+    fail<value>(snapshot.module_name, nil,
+      "project compiler snapshot has no matching saved project module")
+  end
+
+  for index = 1, #snapshot.symbols do
+    local symbol = snapshot.symbols[index]
+    local saved? = files[symbol.location.filename]
+    -- A compiler declaration object from an imported module can be reachable
+    -- from a project AST. It is not owned by this snapshot and must not leak
+    -- external or duplicate project declarations into the index.
+    if saved ~= nil and saved.module_name == snapshot.module_name and
+       symbol.declaration_id ~= nil and symbol.exact_span ~= nil then
+      if symbol.declaration_id == "" then
+        fail<value>(snapshot.module_name, symbol.location.filename,
+          "compiler occurrence has an empty declaration identity")
+      end
+      if symbol.name == "" then
+        fail<value>(snapshot.module_name, symbol.location.filename,
+          "compiler occurrence has an empty identifier")
+      end
+      local span, bytes = validate_span(snapshot.module_name, saved, symbol)
+      insert_sorted(target, Occurrence.new(
+        SymbolId.new(symbol.declaration_id), snapshot.module_name,
+        symbol.location.filename, symbol.name, symbol.role, span, bytes,
+        symbol.is_local, symbol.type_info))
+    end
+  end
+end
+
+local function normalize_occurrences(items: {Occurrence}): {Occurrence}
+  local result: {Occurrence} = {}
+  for index = 1, #items do
+    local item = items[index]
+    local previous? = result[#result]
+    if previous ~= nil and same_occurrence(previous, item) then
+      -- The bridge may encounter one AST table through multiple paths. One
+      -- physical semantic occurrence is indexed once.
+    else
+      if previous ~= nil and previous.filename == item.filename and
+         item.byte_span.start < previous.byte_span.finish then
+        return fail<{Occurrence}>(item.module_name, item.filename,
+          "compiler symbol spans overlap in saved source")
+      end
+      result[#result + 1] = item
+    end
+  end
+  return result
+end
+
+function build(projects: {bridge.ProjectModule},
+               snapshots: {bridge.ModuleSnapshot}): Index
+  local files, project_names = project_files(projects)
+  local raw: {Occurrence} = {}
+  for index = 1, #snapshots do
+    append_snapshot_occurrences(
+      raw, snapshots[index], files, project_names)
+  end
+  local occurrences = normalize_occurrences(raw)
+  local by_file: {string: {Occurrence}} = {}
+  local by_symbol: {string: {Occurrence}} = {}
+  local definitions: {string: Occurrence} = {}
+  local filenames: {string} = {}
+
+  for index = 1, #occurrences do
+    local occurrence = occurrences[index]
+    local file_bucket? = by_file[occurrence.filename]
+    if file_bucket == nil then
+      file_bucket = {}
+      by_file[occurrence.filename] = file_bucket
+      filenames[#filenames + 1] = occurrence.filename
+    end
+    file_bucket[#file_bucket + 1] = occurrence
+
+    local key = occurrence.symbol_id.declaration_id
+    local symbol_bucket? = by_symbol[key]
+    if symbol_bucket == nil then
+      symbol_bucket = {}
+      by_symbol[key] = symbol_bucket
+    end
+    symbol_bucket[#symbol_bucket + 1] = occurrence
+
+    if declaration_role(occurrence.role) then
+      local old? = definitions[key]
+      if old ~= nil then
+        return fail<Index>(occurrence.module_name, occurrence.filename,
+          "symbol '" .. key .. "' has more than one exact declaration")
+      end
+      definitions[key] = occurrence
+    end
+  end
+  return Index.new(by_file, by_symbol, definitions, filenames)
+end
+
+local function copy_occurrences(items: {Occurrence}): {Occurrence}
+  local result: {Occurrence} = {}
+  for index = 1, #items do result[index] = items[index] end
+  return result
+end
+
+function Index:file_names(): {string}
+  local result: {string} = {}
+  for index = 1, #self.filenames do result[index] = self.filenames[index] end
+  return result
+end
+
+function Index:file_occurrences(filename: string): {Occurrence}
+  local items? = self.by_file[filename]
+  if items == nil then return {} end
+  return copy_occurrences(items)
+end
+
+local function position_less(left: source_text.Position,
+                             right: source_text.Position): boolean
+  return left.line < right.line or
+         (left.line == right.line and left.character < right.character)
+end
+
+local function position_equal(left: source_text.Position,
+                              right: source_text.Position): boolean
+  return left.line == right.line and left.character == right.character
+end
+
+function Index:occurrence_at(filename: string,
+                             position: source_text.Position): Occurrence?
+  local items? = self.by_file[filename]
+  if items == nil then return nil end
+  for index = 1, #items do
+    local item = items[index]
+    if position_less(position, item.span.start) then return nil end
+    if (position_equal(position, item.span.start) or
+        position_less(item.span.start, position)) and
+       position_less(position, item.span.finish) then
+      return item
+    end
+  end
+  return nil
+end
+
+function Index:definition(symbol_id: SymbolId): Occurrence?
+  return self.definitions[symbol_id.declaration_id]
+end
+
+function Index:occurrences(symbol_id: SymbolId,
+                           include_declaration: boolean): {Occurrence}
+  local items? = self.by_symbol[symbol_id.declaration_id]
+  if items == nil then return {} end
+  if include_declaration then return copy_occurrences(items) end
+  local result: {Occurrence} = {}
+  for index = 1, #items do
+    if not declaration_role(items[index].role) then
+      result[#result + 1] = items[index]
+    end
+  end
+  return result
+end

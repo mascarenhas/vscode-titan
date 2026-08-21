@@ -1,0 +1,202 @@
+local async = import "async"
+local fs = import "fs"
+local iteration = import "titan.iteration"
+local lua = import "titan.lua"
+local strings = import "string"
+local source_text = import "server.source_text"
+
+record Error
+  path: string
+  message: string
+end
+
+record ProjectConfig
+  project_root: string
+  config_file: string?
+  source_modules_root: string
+  binary_modules_root: string
+  extra_ffi_include_dirs: {string}
+end
+
+local function fail<T>(path: string, message: string): T
+  raise Error.new(path, message)
+end
+
+local function absolute_project_root(path: string): string
+  local candidate = path
+  if candidate == "" then candidate = "." end
+  if strings.sub(candidate, 1, 1) ~= "/" then
+    local resolved?, failure? = source_text.resolve_path(fs.pwd(), candidate)
+    if resolved == nil then
+      return fail<string>(path, failure.message)
+    end
+    return resolved
+  end
+  local normalized?, failure? = source_text.normalize_absolute_path(candidate)
+  if normalized == nil then return fail<string>(path, failure.message) end
+  return normalized
+end
+
+local function resolve_config_path(config_file: string, base: string,
+                                   candidate: string, field: string): string
+  if candidate == "" then
+    return fail<string>(config_file, field .. " must not be empty")
+  end
+  local resolved?, failure? = source_text.resolve_path(base, candidate)
+  if resolved == nil then
+    return fail<string>(config_file, field .. ": " .. failure.message)
+  end
+  return resolved
+end
+
+local function optional_path(config_file: string, base: string,
+                             candidate: value, field: string,
+                             default_path: string): string
+  if candidate == nil then return default_path end
+  if not (candidate is string) then
+    return fail<string>(config_file, field .. " must be a string")
+  end
+  return resolve_config_path(
+    config_file, base, candidate as string, field)
+end
+
+local function normalize_include_dirs(config_file: string, base: string,
+                                      candidate: value): {string}
+  if candidate == nil then return {} end
+  if not (candidate is {value: value}) then
+    return fail<{string}>(
+      config_file, "extra_ffi_include_dirs must be a Lua array table")
+  end
+
+  local raw = candidate as {value: value}
+  local normalized: {integer: string} = {}
+  local count = 0
+  local maximum = 0
+  for key, item in iteration.pairs(raw) do
+    if not (key is integer) then
+      return fail<{string}>(
+        config_file,
+        "extra_ffi_include_dirs must contain only integer array keys")
+    end
+    local index = key as integer
+    if index < 1 then
+      return fail<{string}>(
+        config_file,
+        "extra_ffi_include_dirs array keys must be positive")
+    end
+    if not (item is string) then
+      return fail<{string}>(
+        config_file,
+        "extra_ffi_include_dirs entries must be strings")
+    end
+    normalized[index] = resolve_config_path(
+      config_file, base, item as string,
+      "extra_ffi_include_dirs[" .. index .. "]")
+    count = count + 1
+    if index > maximum then maximum = index end
+  end
+  if count ~= maximum then
+    return fail<{string}>(
+      config_file, "extra_ffi_include_dirs must be a dense Lua array")
+  end
+
+  local result: {string} = {}
+  for index = 1, maximum do result[index] = normalized[index] end
+  return result
+end
+
+local function normalize_table(config_file: string, project_root: string,
+                               default_binary_root: string,
+                               candidate: value): ProjectConfig
+  if not (candidate is {value: value}) then
+    return fail<ProjectConfig>(
+      config_file, "titan-config.lua must return one Lua table")
+  end
+
+  local raw_source_root: value = nil
+  local raw_binary_root: value = nil
+  local raw_include_dirs: value = nil
+  local raw = candidate as {value: value}
+  for key, item in iteration.pairs(raw) do
+    if not (key is string) then
+      return fail<ProjectConfig>(
+        config_file, "titan-config.lua keys must be strings")
+    end
+    local name = key as string
+    if name == "source_modules_root" then
+      raw_source_root = item
+    elseif name == "binary_modules_root" then
+      raw_binary_root = item
+    elseif name == "extra_ffi_include_dirs" then
+      raw_include_dirs = item
+    else
+      return fail<ProjectConfig>(
+        config_file, "unknown titan-config.lua field '" .. name .. "'")
+    end
+  end
+
+  local source_root = optional_path(
+    config_file, project_root, raw_source_root,
+    "source_modules_root", project_root)
+  local binary_root = optional_path(
+    config_file, project_root, raw_binary_root,
+    "binary_modules_root", default_binary_root)
+  local include_dirs = normalize_include_dirs(
+    config_file, project_root, raw_include_dirs)
+  return ProjectConfig.new(
+    project_root, config_file, source_root, binary_root, include_dirs)
+end
+
+local function load_or_raise(project_root: string,
+                             installed_binary_modules_root: string):
+    ProjectConfig
+  local root = absolute_project_root(project_root)
+  local default_binary_root = resolve_config_path(
+    root, root, installed_binary_modules_root,
+    "installed binary modules root")
+  local config_file = root .. "/titan-config.lua"
+  if root == "/" then config_file = "/titan-config.lua" end
+
+  local metadata? = fs.stat(config_file)
+  if metadata == nil then
+    return ProjectConfig.new(root, nil, root, default_binary_root, {})
+  end
+  if metadata.kind ~= "file" then
+    return fail<ProjectConfig>(
+      config_file, "titan-config.lua is not a regular file")
+  end
+
+  local candidate: value = nil
+  do
+    -- Configuration is data, not an extension hook. Evaluate it with an
+    -- empty environment so workspace code cannot write protocol-corrupting
+    -- bytes through print/io (or mutate the embedded compiler Lua state).
+    -- A valid file needs only Lua literals and `return { ... }`.
+    local source = fs.read_file(config_file)
+    local environment: {string: value} = {}
+    local chunk = lua.load(source, "@" .. config_file, environment)
+    candidate = chunk()
+  catch
+    if error is async.CancellationReason then raise end
+    return fail<ProjectConfig>(
+      config_file,
+      "cannot evaluate titan-config.lua: " .. strings.tostring(error))
+  end
+  return normalize_table(
+    config_file, root, default_binary_root, candidate)
+end
+
+-- The caller supplies the installed ABI directory reported by the compatible
+-- compiler bridge. This keeps the Lua value boundary here limited to the
+-- optional project file and makes the default explicit and testable.
+function load(project_root: string,
+              installed_binary_modules_root: string):
+    (ProjectConfig?, Error?)
+  do
+    return load_or_raise(project_root, installed_binary_modules_root), nil
+  catch
+    if error is async.CancellationReason then raise end
+    if error is Error then return nil, error as Error end
+    return nil, Error.new(project_root, strings.tostring(error))
+  end
+end

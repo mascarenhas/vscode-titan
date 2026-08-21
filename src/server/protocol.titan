@@ -1,0 +1,201 @@
+local async = import "async"
+local io = import "io"
+local strings = import "string"
+local framing = import "server.framing"
+local coordinator = import "server.coordinator"
+local response_queue = import "server.response_queue"
+
+record ProtocolError
+  message: string
+end
+
+local record InputDelivery
+  body: string
+  acknowledged: boolean
+  reader: async.Task?
+end
+
+local union InputEvent
+  message: InputDelivery
+  eof
+  failure: string
+end
+
+local record InputQueue
+  items: {InputEvent}
+  waiter: async.Task?
+end
+
+local record Session
+  input: InputQueue
+  output: response_queue.ResponseQueue
+  coordinator: coordinator.Coordinator
+  reader: async.Task<nil, value>
+  writer: async.Task<nil, value>
+  closed: boolean
+end
+
+local function new_input_queue(): InputQueue
+  return InputQueue.new({}, nil)
+end
+
+local function InputDelivery:acknowledge()
+  if self.acknowledged then return end
+  self.acknowledged = true
+  local reader? = self.reader
+  self.reader = nil
+  if reader ~= nil then reader:resume() end
+end
+
+local function InputDelivery:wait()
+  if self.acknowledged then return end
+  if self.reader ~= nil then
+    raise "protocol input delivery already has a waiting reader"
+  end
+  local current = async.running()
+  self.reader = current
+  local detach = function ()
+    if self.reader == current then self.reader = nil end
+  end
+  defer detach()
+  while not self.acknowledged do async.suspend(detach) end
+end
+
+local function InputQueue:push(event: InputEvent)
+  self.items[#self.items + 1] = event
+  local waiter? = self.waiter
+  if waiter == nil then return end
+  self.waiter = nil
+  waiter:resume()
+end
+
+local function InputQueue:take(): InputEvent
+  while #self.items == 0 do
+    if self.waiter ~= nil then
+      raise "protocol input queue already has a waiting consumer"
+    end
+    local current = async.running()
+    self.waiter = current
+    local detach = function ()
+      if self.waiter == current then self.waiter = nil end
+    end
+    defer detach()
+    async.suspend(detach)
+  end
+
+  local count = #self.items
+  local event = self.items[1]
+  for index = 1, count - 1 do
+    self.items[index] = self.items[index + 1]
+  end
+  self.items[count] = nil
+  return event
+end
+
+-- This Task is the sole stdin owner and keeps reading while semantic request
+-- Tasks are suspended or running between cooperative yields.
+local function read_messages(source: io.Reader, queue: InputQueue): nil
+  local reader = framing.reader()
+  while true do
+    local body? = reader:read(source)
+    if body == nil then
+      queue:push(InputEvent.eof())
+      return nil
+    end
+    local delivery = InputDelivery.new(body, false, nil)
+    queue:push(InputEvent.message(delivery))
+    -- Do not submit another stdin read until the coordinator has processed
+    -- this envelope. In particular, exit leaves the reader explicitly
+    -- suspended, so session teardown can cancel and join it without waiting
+    -- for EOF from a client that correctly keeps its pipe open until exit.
+    delivery:wait()
+  end
+  return nil
+catch
+  if error is framing.FrameError then
+    local failure = error as framing.FrameError
+    queue:push(InputEvent.failure(failure.message))
+  else
+    queue:push(InputEvent.failure(strings.tostring(error)))
+  end
+  return nil
+end
+
+-- No other Task writes stdout/the injected writer. Queue publication itself is
+-- nonyielding, while this owner performs each complete framed write in order.
+local function write_messages(target: io.Writer,
+                              queue: response_queue.ResponseQueue): nil
+  while true do
+    local message? = queue:take()
+    if message == nil then return nil end
+    target:write(framing.frame(message))
+  end
+  return nil
+end
+
+local function new_session(source: io.Reader, target: io.Writer,
+                           handler: coordinator.SemanticHandler?): Session
+  local input = new_input_queue()
+  local output = response_queue.create()
+  local server = coordinator.create(output, handler)
+  local writer = async.run<nil, value>(function (): nil
+    return write_messages(target, output)
+  end)
+  local reader = async.run<nil, value>(function (): nil
+    return read_messages(source, input)
+  end)
+  return Session.new(input, output, server, reader, writer, false)
+end
+
+local function rethrow_failed(status: async.TaskStatus<nil, value>,
+                              owner: string)
+  case status
+  when succeeded then return
+  when failed: failure then raise failure.error
+  when cancelled then return
+  else raise owner .. " did not reach a terminal Task status"
+  end
+end
+
+local function Session:close()
+  if self.closed then return end
+  self.closed = true
+
+  self.coordinator:cancel_all("language server session ended")
+  if not self.reader:status():has_finished() then
+    self.reader:cancel(async.CancellationReason.simple(
+      "language server stopped reading"))
+  end
+  local reader_status = async.join(self.reader)
+
+  -- All response-producing Tasks are joined before the stop marker. The sole
+  -- writer therefore drains every terminal response and then exits.
+  self.output:stop()
+  local writer_status = async.join(self.writer)
+  rethrow_failed(writer_status, "protocol writer")
+  rethrow_failed(reader_status, "protocol reader")
+end
+
+function run(source: io.Reader, target: io.Writer,
+             handler: coordinator.SemanticHandler?): integer
+  local session = new_session(source, target, handler)
+  defer session:close()
+
+  while true do
+    case session.input:take()
+    when message: delivery then
+      local exit_code? = session.coordinator:handle(delivery.body)
+      delivery:acknowledge()
+      if exit_code ~= nil then return exit_code end
+      -- Yield once per acknowledged envelope so the reader, semantic Tasks,
+      -- and sole writer all advance without one buffered owner starving the
+      -- others.
+      async.yield()
+    when eof then
+      raise ProtocolError.new("stdin closed before the exit notification")
+    when failure: message then
+      raise ProtocolError.new(message)
+    end
+  end
+  return 1
+end

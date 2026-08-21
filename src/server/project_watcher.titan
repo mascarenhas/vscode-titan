@@ -1,0 +1,346 @@
+local async = import "async"
+local fs = import "fs"
+local strings = import "string"
+
+-- These directories are the complete watch authority for one project. Callers
+-- discover them from the project source/configuration roots; this module never
+-- derives another registration from a notification path.
+record DirectoryScope
+  const project_directories: {string}
+  const configuration_directories: {string}
+end
+
+record WatchFailure
+  const code: integer
+  const name: string
+  const message: string
+  const operation: string
+end
+
+-- A path is only a hint that saved disk state may have changed. Consumers must
+-- rediscover membership and reread files rather than treating a hint as an
+-- authoritative create/delete/modify operation.
+record RediscoveryBatch
+  const paths: {string}
+  const failures: {WatchFailure}
+  const watch_set_changed: boolean
+end
+
+type RediscoveryCallback = (RediscoveryBatch) -> ()
+
+local union BackendEvent
+  changed: string
+  deleted: string
+  failed: WatchFailure
+end
+
+-- The private backend is the deterministic test seam. Production constructs
+-- one wrapper around one fs.Watcher; no dynamic values cross this boundary.
+local record Backend
+  canonicalize_directory: (string) -> string
+  watch: (string) -> ()
+  stop: (string) -> ()
+  is_watching: (string) -> boolean
+  clear: () -> ()
+  poll: () -> {BackendEvent}
+end
+
+record ProjectWatcher
+  local backend: Backend
+  local callback: RediscoveryCallback
+  local active: {string: boolean}
+  local active_order: {string}
+  local poll_task: async.Task<nil, value>?
+  local poll_cancel_expected: boolean
+  local operation_active: boolean
+  local stopped: boolean
+end
+
+local function remove_path(paths: {string}, path: string)
+  local count = #paths
+  for index = 1, count do
+    if paths[index] == path then
+      for following = index, count - 1 do
+        paths[following] = paths[following + 1]
+      end
+      paths[count] = nil
+      return
+    end
+  end
+end
+
+local function append_unique(paths: {string}, present: {string: boolean},
+                             path: string)
+  if present[path] then return end
+  present[path] = true
+  paths[#paths + 1] = path
+end
+
+local function normalized_scope(backend: Backend,
+                                scope: DirectoryScope):
+    ({string}, {string: boolean})
+  local paths: {string} = {}
+  local present: {string: boolean} = {}
+  for index = 1, #scope.project_directories do
+    local path = backend.canonicalize_directory(
+      scope.project_directories[index])
+    append_unique(paths, present, path)
+  end
+  for index = 1, #scope.configuration_directories do
+    local path = backend.canonicalize_directory(
+      scope.configuration_directories[index])
+    append_unique(paths, present, path)
+  end
+  return paths, present
+end
+
+local function copy_paths(paths: {string}): {string}
+  local copy: {string} = {}
+  for index = 1, #paths do copy[index] = paths[index] end
+  return copy
+end
+
+function ProjectWatcher:watched_directories(): {string}
+  return copy_paths(self.active_order)
+end
+
+function ProjectWatcher:is_stopped(): boolean
+  return self.stopped
+end
+
+local function ProjectWatcher:retire_missing_registrations(): boolean
+  local changed = false
+  local snapshot = copy_paths(self.active_order)
+  for index = 1, #snapshot do
+    local path = snapshot[index]
+    if not self.backend.is_watching(path) then
+      self.active[path] = nil
+      remove_path(self.active_order, path)
+      changed = true
+    end
+  end
+  return changed
+end
+
+local function ProjectWatcher:publish(events: {BackendEvent})
+  local paths: {string} = {}
+  local present: {string: boolean} = {}
+  local failures: {WatchFailure} = {}
+  for index = 1, #events do
+    case events[index]
+    when changed: path then
+      append_unique(paths, present, path)
+    when deleted: path then
+      append_unique(paths, present, path)
+    when failed: failure then
+      failures[#failures + 1] = failure
+    end
+  end
+
+  local watch_set_changed = self:retire_missing_registrations()
+  if #paths > 0 or #failures > 0 or watch_set_changed then
+    self.callback(RediscoveryBatch.new(
+      paths, failures, watch_set_changed))
+  end
+end
+
+local function ProjectWatcher:report_poll_failure(failure: value)
+  if self.poll_cancel_expected or self.stopped then return end
+  self.callback(RediscoveryBatch.new({}, {
+    WatchFailure.new(
+      0, "project_watcher", strings.tostring(failure),
+      "project_watcher.poll"),
+  }, false))
+end
+
+local function ProjectWatcher:poll_loop(): nil
+  while not self.stopped and #self.active_order > 0 do
+    local events: {BackendEvent}? = nil
+    do
+      events = self.backend.poll()
+    catch
+      self:report_poll_failure(error)
+      self.poll_task = nil
+      return nil
+    end
+    self:publish(events)
+  end
+  self.poll_task = nil
+  return nil
+end
+
+local function ProjectWatcher:start_polling()
+  if self.stopped or #self.active_order == 0 or self.poll_task ~= nil then
+    return
+  end
+  self.poll_task = async.run<nil, value>(function (): nil
+    return self:poll_loop()
+  end)
+end
+
+local function ProjectWatcher:begin_operation()
+  if self.operation_active then
+    raise "project watcher already has an active lifecycle operation"
+  end
+  self.operation_active = true
+end
+
+local function ProjectWatcher:finish_operation()
+  self.operation_active = false
+end
+
+local function ProjectWatcher:pause_polling(allow_current: boolean)
+  local task? = self.poll_task
+  if task == nil then return end
+  if task == async.running() then
+    if allow_current then return end
+    raise "project watcher cannot stop from its rediscovery callback"
+  end
+  self.poll_task = nil
+  if not task:status():has_finished() then
+    self.poll_cancel_expected = true
+    task:cancel(async.CancellationReason.simple(
+      "project watcher registrations are changing"))
+    async.join(task)
+    self.poll_cancel_expected = false
+  else
+    async.join(task)
+  end
+end
+
+function ProjectWatcher:reconcile(scope: DirectoryScope)
+  self:begin_operation()
+  defer self:finish_operation()
+  if self.stopped then raise "project watcher is stopped" end
+
+  -- A callback runs after its poll has returned, so it may reconcile on that
+  -- same Task without cancelling or joining itself. External reconciliation
+  -- still cancels and joins the poll before touching registrations.
+  self:pause_polling(true)
+  defer self:start_polling()
+
+  local target_order, target = normalized_scope(self.backend, scope)
+
+  local old_order = copy_paths(self.active_order)
+  for index = 1, #old_order do
+    local path = old_order[index]
+    if not target[path] then
+      self.backend.stop(path)
+      self.active[path] = nil
+      remove_path(self.active_order, path)
+    end
+  end
+
+  for index = 1, #target_order do
+    local path = target_order[index]
+    if not self.active[path] then
+      self.backend.watch(path)
+      self.active[path] = true
+      self.active_order[#self.active_order + 1] = path
+    end
+  end
+
+  -- Present the active set in caller scope order even when reconciliation
+  -- retained some registrations and added others.
+  local reordered: {string} = {}
+  for index = 1, #target_order do
+    local path = target_order[index]
+    if self.active[path] then reordered[#reordered + 1] = path end
+  end
+  self.active_order = reordered
+end
+
+function ProjectWatcher:stop()
+  if self.operation_active then
+    raise "project watcher already has an active lifecycle operation"
+  end
+  if self.stopped then return end
+  self:begin_operation()
+  defer self:finish_operation()
+  self:pause_polling(false)
+  self.stopped = true
+
+  local failed = false
+  local failure: value = nil
+  local snapshot = copy_paths(self.active_order)
+  for index = 1, #snapshot do
+    do
+      self.backend.stop(snapshot[index])
+    catch
+      if not failed then
+        failed = true
+        failure = error
+      end
+    end
+  end
+  do
+    self.backend.clear()
+  catch
+    if not failed then
+      failed = true
+      failure = error
+    end
+  end
+
+  self.active = {}
+  self.active_order = {}
+  if failed then raise failure end
+end
+
+local function fs_backend(): Backend
+  local watcher = fs.watcher()
+  local canonicalize = function (path: string): string
+    local canonical = fs.realpath(path)
+    local metadata? = fs.stat(canonical)
+    if metadata == nil or metadata.kind ~= "directory" then
+      raise "project watch path is not a directory: " .. path
+    end
+    return canonical
+  end
+  local watch = function (path: string)
+    watcher:watch(path)
+  end
+  local stop = function (path: string)
+    watcher:stop(path)
+  end
+  local is_watching = function (path: string): boolean
+    return watcher:is_watching(path)
+  end
+  local clear = function ()
+    watcher:clear()
+  end
+  local poll = function (): {BackendEvent}
+    local native = watcher:poll()
+    local events: {BackendEvent} = {}
+    for index = 1, #native do
+      case native[index]
+      when created: path then
+        events[#events + 1] = BackendEvent.changed(path)
+      when modified: path then
+        events[#events + 1] = BackendEvent.changed(path)
+      when deleted: path then
+        events[#events + 1] = BackendEvent.deleted(path)
+      when error: failure then
+        events[#events + 1] = BackendEvent.failed(WatchFailure.new(
+          failure.code, failure.name, failure.message, failure.operation))
+      end
+    end
+    return events
+  end
+  return Backend.new(
+    canonicalize, watch, stop, is_watching, clear, poll)
+end
+
+local function start_with_backend(backend: Backend, scope: DirectoryScope,
+                                  callback: RediscoveryCallback):
+    ProjectWatcher
+  local owner = ProjectWatcher.new(
+    backend, callback, {}, {}, nil, false, false, false)
+  owner:reconcile(scope)
+  return owner
+end
+
+function start(scope: DirectoryScope,
+               callback: RediscoveryCallback): ProjectWatcher
+  return start_with_backend(fs_backend(), scope, callback)
+end

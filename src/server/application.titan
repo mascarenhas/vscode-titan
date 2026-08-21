@@ -1,0 +1,503 @@
+local async = import "async"
+local fs = import "fs"
+local os = import "os"
+local strings = import "string"
+local bridge = import "server.compiler_bridge"
+local dispatcher = import "server.dispatcher"
+local json = import "server.json"
+local lsp = import "server.lsp_types"
+local project_service = import "server.project_service"
+local project_watcher = import "server.project_watcher"
+local semantic_features = import "server.semantic_features"
+
+record Error
+  const message: string
+end
+
+local record View
+  const snapshot: project_service.Snapshot
+  const features: semantic_features.Features
+end
+
+local union RefreshOutcome
+  ready: View
+  failure: Error
+end
+
+type RenameAnalyzer = (
+  project_service.Snapshot, {bridge.ProjectModule}) -> bridge.Analysis
+
+record Application
+  local const project_root: string
+  local service: project_service.Service?
+  local watcher: project_watcher.ProjectWatcher?
+  local refresh_task: async.Task<RefreshOutcome, value>?
+  local completed_view: View?
+  local refresh_failure: Error?
+  local dirty_hint: boolean
+  local closed: boolean
+  local const rename_analyzer: RenameAnalyzer
+end
+
+local INVALID_PARAMS = -32602
+local METHOD_NOT_FOUND = -32601
+local INTERNAL_ERROR = -32603
+local REQUEST_FAILED = -32803
+
+local function failure(code: integer, message: string):
+    dispatcher.SemanticOutcome
+  return dispatcher.SemanticOutcome.failure(
+    dispatcher.SemanticError.new(code, message))
+end
+
+local function runtime_error(candidate: value): Error
+  if candidate is Error then return candidate as Error end
+  if candidate is project_service.Error then
+    local item = candidate as project_service.Error
+    return Error.new(item.path .. ": " .. item.message)
+  end
+  if candidate is bridge.BridgeError then
+    local item = candidate as bridge.BridgeError
+    return Error.new(item.module_name .. ": " .. item.message)
+  end
+  if candidate is semantic_features.Error then
+    return Error.new((candidate as semantic_features.Error).message)
+  end
+  if candidate is async.OperationError then
+    local item = candidate as async.OperationError
+    return Error.new(item.operation .. ": " .. item.message ..
+                     " (" .. item.name .. ")")
+  end
+  return Error.new(strings.tostring(candidate))
+end
+
+local function parent_directory(path: string): string
+  if path == "/" then return "/" end
+  local slash = 0
+  for index = 1, #path do
+    if strings.byte(path, index) == 47 then slash = index end
+  end
+  if slash <= 1 then return "/" end
+  return strings.sub(path, 1, slash - 1)
+end
+
+local function watcher_scope(snapshot: project_service.Snapshot):
+    project_watcher.DirectoryScope
+  local configuration = {snapshot.config.project_root}
+  if snapshot.config.config_file ~= nil then
+    configuration[#configuration + 1] =
+      parent_directory(snapshot.config.config_file)
+  end
+  return project_watcher.DirectoryScope.new(
+    snapshot.project_directories, configuration)
+end
+
+local function project_inputs(snapshot: project_service.Snapshot):
+    ({bridge.ProjectModule}, {bridge.ModuleSnapshot})
+  if #snapshot.dirty_modules > 0 then
+    raise Error.new(
+      "Titan project has no complete compiler snapshot for the current " ..
+      "saved generation")
+  end
+  local projects: {bridge.ProjectModule} = {}
+  local snapshots: {bridge.ModuleSnapshot} = {}
+  for module_index = 1, #snapshot.project_modules do
+    local module = snapshot.project_modules[module_index]
+    if module.dirty or module.compiler_snapshot == nil or
+       #module.diagnostics > 0 then
+      raise Error.new(
+        "Titan project module '" .. module.module_name ..
+        "' has no compiler snapshot for the current saved generation")
+    end
+    local files: {bridge.SourceFile} = {}
+    for file_index = 1, #module.source_files do
+      local file = module.source_files[file_index]
+      files[file_index] = bridge.SourceFile.new(file.filename, file.contents)
+    end
+    projects[module_index] = bridge.ProjectModule.new(
+      module.module_name, files)
+    snapshots[#snapshots + 1] = module.compiler_snapshot
+  end
+  return projects, snapshots
+end
+
+local function log_watch_failure(failure: project_watcher.WatchFailure)
+  os.stderr:write(
+    "titan-language-server: " .. failure.operation .. ": " ..
+    failure.message .. " (" .. failure.name .. ", " .. failure.code ..
+    ")\n")
+end
+
+local function Application:watch_callback(
+    batch: project_watcher.RediscoveryBatch)
+  if #batch.paths > 0 or batch.watch_set_changed then
+    -- Watch events are hints only. The next semantic request rediscovers the
+    -- complete saved project and never consumes editor notification text.
+    self:note_saved_change()
+  end
+  for index = 1, #batch.failures do
+    log_watch_failure(batch.failures[index])
+  end
+end
+
+-- Keep watcher policy behind one method so the refresh state-machine tests can
+-- deterministically inject the same coalesced hint without depending on kernel
+-- event timing.
+function Application:note_saved_change()
+  self.dirty_hint = true
+end
+
+local function Application:install_view(
+    snapshot: project_service.Snapshot): View
+  local projects, snapshots = project_inputs(snapshot)
+  local view = View.new(
+    snapshot, semantic_features.build(projects, snapshots))
+
+  local scope = watcher_scope(snapshot)
+  if self.watcher == nil then
+    self.watcher = project_watcher.start(
+      scope,
+      function (batch: project_watcher.RediscoveryBatch)
+        self:watch_callback(batch)
+      end)
+  else
+    self.watcher:reconcile(scope)
+  end
+  return view
+end
+
+local function Application:refresh_once(): RefreshOutcome
+  -- Clear only the hint observed before this refresh. A callback that arrives
+  -- while filesystem operations yield sets it again for the following pass.
+  self.dirty_hint = false
+  do
+    local service? = self.service
+    if service == nil then
+      local loaded?, load_error? = project_service.load_default(
+        self.project_root)
+      if loaded == nil then
+        local message = "cannot load Titan project"
+        if load_error ~= nil then
+          message = load_error.path .. ": " .. load_error.message
+        end
+        self.dirty_hint = true
+        return RefreshOutcome.failure(Error.new(message))
+      end
+      self.service = loaded
+      return RefreshOutcome.ready(self:install_view(loaded:latest()))
+    end
+
+    local report?, refresh_error? = service:refresh()
+    if report == nil then
+      local message = "cannot refresh Titan project"
+      if refresh_error ~= nil then
+        message = refresh_error.path .. ": " .. refresh_error.message
+      end
+      self.dirty_hint = true
+      return RefreshOutcome.failure(Error.new(message))
+    end
+    return RefreshOutcome.ready(self:install_view(service:latest()))
+  catch
+    self.dirty_hint = true
+    if error is async.CancellationReason then raise end
+    return RefreshOutcome.failure(runtime_error(error))
+  end
+end
+
+local function Application:start_refresh():
+    async.Task<RefreshOutcome, value>
+  local task = async.run<RefreshOutcome, value>(
+    function (): RefreshOutcome
+      defer self.refresh_task = nil
+      while true do
+        local outcome = self:refresh_once()
+        case outcome
+        when failure: failure then
+          -- A known failed refresh invalidates the fallback view for future
+          -- requests. The request that initiated this refresh joins it and
+          -- receives the failure; a later request may retry from disk.
+          self.refresh_failure = failure
+          return outcome
+        when ready: view then
+          -- If a watcher callback ran across a yielding scan/reconcile, its
+          -- coalesced hint describes state that may be newer than this View.
+          -- Repeat before publishing instead of serving a stale generation.
+          if not self.dirty_hint then
+            self.completed_view = view
+            self.refresh_failure = nil
+            return outcome
+          end
+        end
+      end
+      return RefreshOutcome.failure(
+        Error.new("project refresh loop terminated unexpectedly"))
+    end)
+  self.refresh_task = task
+  return task
+end
+
+local function joined_view(task: async.Task<RefreshOutcome, value>):
+    (View?, Error?)
+  case async.join<RefreshOutcome, value>(task)
+  when succeeded: outcome then
+    case outcome
+    when ready: view then return view, nil
+    when failure: item then return nil, item
+    end
+  when failed: item then
+    return nil, runtime_error(item.error)
+  when cancelled then
+    return nil, Error.new("project refresh was cancelled")
+  else
+    return nil, Error.new("project refresh did not finish")
+  end
+  return nil, Error.new("project refresh produced no result")
+end
+
+-- Read-only feature requests may use the newest completed saved-file
+-- generation only when another request already has a newer refresh underway.
+-- The request which starts a refresh still joins it, so a newly discovered
+-- configuration/compiler failure is surfaced instead of silently falling
+-- back. This keeps the server responsive at cooperative compiler boundaries
+-- without weakening rename's disk-validation contract.
+local function Application:current_view(): (View?, Error?)
+  if self.closed then
+    return nil, Error.new("language server application is closed")
+  end
+
+  -- Refreshing on every semantic request also revalidates external imports,
+  -- whose trees are intentionally not watched. Concurrent requests share the
+  -- same refresh Task instead of starting overlapping scans or compiler runs.
+  local task? = self.refresh_task
+  if task ~= nil and self.refresh_failure == nil then
+    local completed? = self.completed_view
+    if completed ~= nil then return completed, nil end
+  end
+  if task == nil then task = self:start_refresh() end
+  return joined_view(task)
+end
+
+-- Rename produces edits against saved bytes, so it must never use the
+-- responsive completed-generation fallback. Always await the current stable
+-- refresh and let the caller perform the existing post-preflight generation
+-- check with a second fresh refresh.
+local function Application:fresh_view(): (View?, Error?)
+  if self.closed then
+    return nil, Error.new("language server application is closed")
+  end
+  local task? = self.refresh_task
+  if task == nil then task = self:start_refresh() end
+  return joined_view(task)
+end
+
+local function parse_error(item: lsp.Error?): dispatcher.SemanticOutcome
+  if item == nil then
+    return failure(INVALID_PARAMS, "Invalid params")
+  end
+  return failure(item.code, item.message)
+end
+
+local function location_result(location: semantic_features.Location?):
+    json.Value
+  if location == nil then return json.null() end
+  return lsp.location_value(location.uri, location.range)
+end
+
+local function locations_result(locations: {semantic_features.Location}):
+    json.Value
+  local result: {json.Value} = {}
+  for index = 1, #locations do
+    result[index] = lsp.location_value(
+      locations[index].uri, locations[index].range)
+  end
+  return json.from_array(result)
+end
+
+local function folding_result(ranges: {lsp.FoldingRange}): json.Value
+  local result: {json.Value} = {}
+  for index = 1, #ranges do
+    result[index] = lsp.folding_range_value(ranges[index])
+  end
+  return json.from_array(result)
+end
+
+local function Application:handle_definition(
+    request: dispatcher.SemanticRequest): dispatcher.SemanticOutcome
+  local params?, params_error? = lsp.parse_document_position(request.params)
+  if params == nil then return parse_error(params_error) end
+  local view?, view_error? = self:current_view()
+  if view == nil then return failure(REQUEST_FAILED, view_error.message) end
+  return dispatcher.SemanticOutcome.result(location_result(
+    view.features:definition(params.path, params.position)))
+end
+
+local function Application:handle_references(
+    request: dispatcher.SemanticRequest): dispatcher.SemanticOutcome
+  local params?, params_error? = lsp.parse_references(request.params)
+  if params == nil then return parse_error(params_error) end
+  local view?, view_error? = self:current_view()
+  if view == nil then return failure(REQUEST_FAILED, view_error.message) end
+  return dispatcher.SemanticOutcome.result(locations_result(
+    view.features:references(
+      params.document.path, params.document.position,
+      params.include_declaration)))
+end
+
+local function Application:handle_hover(
+    request: dispatcher.SemanticRequest): dispatcher.SemanticOutcome
+  local params?, params_error? = lsp.parse_document_position(request.params)
+  if params == nil then return parse_error(params_error) end
+  local view?, view_error? = self:current_view()
+  if view == nil then return failure(REQUEST_FAILED, view_error.message) end
+  local hover? = view.features:hover(params.path, params.position)
+  if hover == nil then
+    return dispatcher.SemanticOutcome.result(json.null())
+  end
+  return dispatcher.SemanticOutcome.result(
+    lsp.hover_value(hover:markdown(), hover.range))
+end
+
+local function Application:handle_folding(
+    request: dispatcher.SemanticRequest): dispatcher.SemanticOutcome
+  local params?, params_error? = lsp.parse_document(request.params)
+  if params == nil then return parse_error(params_error) end
+  local view?, view_error? = self:current_view()
+  if view == nil then return failure(REQUEST_FAILED, view_error.message) end
+  return dispatcher.SemanticOutcome.result(folding_result(
+    view.features:folding_ranges(params.path)))
+end
+
+local function default_rename_analyzer(
+    snapshot: project_service.Snapshot,
+    projects: {bridge.ProjectModule}): bridge.Analysis
+  local compiler = bridge.load()
+  compiler:configure_paths(
+    snapshot.config.source_modules_root,
+    snapshot.config.binary_modules_root,
+    snapshot.config.extra_ffi_include_dirs)
+  return compiler:analyze(snapshot.project_modules[1].module_name, projects)
+end
+
+local function Application:rename_analysis(
+    view: View, candidate: semantic_features.RenameCandidate):
+    (bridge.Analysis?, Error?)
+  if #view.snapshot.project_modules == 0 then
+    return nil, Error.new("cannot rename in an empty Titan project")
+  end
+
+  do
+    return self.rename_analyzer(
+      view.snapshot, candidate:edited_project_modules()), nil
+  catch
+    if error is async.CancellationReason then raise end
+    return nil, runtime_error(error)
+  end
+end
+
+local function Application:handle_rename(
+    request: dispatcher.SemanticRequest): dispatcher.SemanticOutcome
+  local params?, params_error? = lsp.parse_rename(request.params)
+  if params == nil then return parse_error(params_error) end
+  local view?, view_error? = self:fresh_view()
+  if view == nil then return failure(REQUEST_FAILED, view_error.message) end
+
+  local candidate?, rename_error? = view.features:rename(
+    params.document.path, params.document.position, params.new_name)
+  if rename_error ~= nil then
+    return failure(REQUEST_FAILED, rename_error.message)
+  end
+  if candidate == nil then
+    return failure(REQUEST_FAILED, "no project symbol exists at the position")
+  end
+
+  local analysis?, analysis_error? = self:rename_analysis(view, candidate)
+  if analysis == nil then
+    return failure(INTERNAL_ERROR, analysis_error.message)
+  end
+  local verified?, preflight_error? = candidate:preflight(analysis)
+  if verified == nil then
+    local message = "candidate rename failed compiler preflight"
+    if preflight_error ~= nil then message = preflight_error.message end
+    return failure(REQUEST_FAILED, message)
+  end
+
+  -- Compiler preflight works from an immutable copy of the saved generation.
+  -- Revalidate disk state before publishing edits so a save that happened
+  -- during the request cannot make the WorkspaceEdit target an older file.
+  local latest?, latest_error? = self:fresh_view()
+  if latest == nil then
+    return failure(REQUEST_FAILED, latest_error.message)
+  end
+  if latest.snapshot.generation ~= view.snapshot.generation then
+    return failure(
+      REQUEST_FAILED, "saved Titan project changed during rename; retry")
+  end
+  return dispatcher.SemanticOutcome.result(
+    lsp.workspace_edit_value(verified:document_edits()))
+end
+
+function create(project_root: string): Application
+  return Application.new(
+    project_root, nil, nil, nil, nil, nil, false, false,
+    default_rename_analyzer)
+end
+
+-- Dependency-injected constructor used by the project/application integration
+-- tests. Keeping the real Service here exercises the same refresh state
+-- machine without loading process-global compiler modules in the fixture.
+function create_with_service(project_root: string,
+                             service: project_service.Service): Application
+  local application = Application.new(
+    project_root, service, nil, nil, nil, nil, false, false,
+    default_rename_analyzer)
+  application.completed_view = application:install_view(service:latest())
+  return application
+end
+
+function create_with_service_and_rename_analyzer(
+    project_root: string, service: project_service.Service,
+    rename_analyzer: RenameAnalyzer): Application
+  local application = Application.new(
+    project_root, service, nil, nil, nil, nil, false, false,
+    rename_analyzer)
+  application.completed_view = application:install_view(service:latest())
+  return application
+end
+
+function Application:handle(
+    request: dispatcher.SemanticRequest): dispatcher.SemanticOutcome
+  if request.method == "textDocument/definition" then
+    return self:handle_definition(request)
+  elseif request.method == "textDocument/references" then
+    return self:handle_references(request)
+  elseif request.method == "textDocument/rename" then
+    return self:handle_rename(request)
+  elseif request.method == "textDocument/hover" then
+    return self:handle_hover(request)
+  elseif request.method == "textDocument/foldingRange" then
+    return self:handle_folding(request)
+  end
+  return failure(METHOD_NOT_FOUND, "Method not found")
+catch
+  if error is async.CancellationReason then raise end
+  return failure(INTERNAL_ERROR, runtime_error(error).message)
+end
+
+function Application:close()
+  if self.closed then return end
+  self.closed = true
+
+  local refresh? = self.refresh_task
+  if refresh ~= nil then
+    if not refresh:status():has_finished() then
+      refresh:cancel(async.CancellationReason.simple(
+        "language server application is closing"))
+    end
+    async.join(refresh)
+    self.refresh_task = nil
+  end
+
+  local watcher? = self.watcher
+  self.watcher = nil
+  if watcher ~= nil then watcher:stop() end
+end

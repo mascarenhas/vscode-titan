@@ -1,0 +1,222 @@
+local fs = import "fs"
+local test = import "test"
+local strings = import "string"
+local discovery = import "server.project_discovery"
+local test_runtime = import "server.test_runtime"
+
+local record Fixture
+  root: string
+  files: {string}
+  directories: {string}
+  known_files: {string: boolean}
+  known_directories: {string: boolean}
+end
+
+local type FixtureBody = (Fixture) -> ()
+
+local function new_fixture(): Fixture
+  local root = fs.tmpname()
+  fs.unlink(root)
+  fs.mkdir(root)
+  return Fixture.new(root, {}, {root}, {}, {[root] = true})
+end
+
+local function Fixture:path(relative: string): string
+  return self.root .. "/" .. relative
+end
+
+local function Fixture:mkdir(relative: string)
+  local path = self:path(relative)
+  fs.mkdir(path)
+  if self.known_directories[path] == nil then
+    self.known_directories[path] = true
+    self.directories[#self.directories + 1] = path
+  end
+end
+
+local function Fixture:write(relative: string)
+  local path = self:path(relative)
+  fs.write_file(path, "-- " .. relative .. "\n")
+  if self.known_files[path] == nil then
+    self.known_files[path] = true
+    self.files[#self.files + 1] = path
+  end
+end
+
+local function Fixture:remove(relative: string)
+  local path = self:path(relative)
+  if fs.lstat(path) ~= nil then fs.unlink(path) end
+end
+
+local function Fixture:cleanup()
+  for index = #self.files, 1, -1 do
+    if fs.lstat(self.files[index]) ~= nil then fs.unlink(self.files[index]) end
+  end
+  for index = #self.directories, 1, -1 do
+    if fs.lstat(self.directories[index]) ~= nil then
+      fs.rmdir(self.directories[index])
+    end
+  end
+end
+
+local function with_fixture(body: FixtureBody)
+  local fixture = new_fixture()
+  defer fixture:cleanup()
+  body(fixture)
+end
+
+local function require_discovery(root: string): discovery.Discovery
+  local found?, failure? = discovery.discover(root)
+  test.assert(failure == nil and found ~= nil,
+              "valid project source tree was not discovered")
+  return found
+end
+
+local function scans_flat_folder_and_nested_modules()
+  with_fixture(function (fixture: Fixture)
+    fixture:mkdir("pkg")
+    fixture:mkdir("pkg/nested")
+    fixture:mkdir(".build")
+    fixture:mkdir(".build/generated")
+    fixture:write("flat.titan")
+    fixture:write("pkg.titan")
+    fixture:write("pkg/pkg.titan")
+    fixture:write("pkg/z.titan")
+    fixture:write("pkg/A.titan")
+    fixture:write("pkg/nested.titan")
+    fixture:write("pkg/titan.titan")
+    fixture:write("pkg/nested/nested.titan")
+    fixture:write("pkg/nested/b.titan")
+    fixture:write(".build/generated/copied.titan")
+
+    local found = require_discovery(fixture.root)
+    test.assert(#found.issues == 0,
+                "valid folder project produced discovery issues")
+    test.assert(#found.modules == 3 and
+                found.modules[1].name == "flat" and
+                found.modules[2].name == "pkg" and
+                found.modules[3].name == "pkg.nested",
+                "module list was not bytewise sorted, complete, or pruned")
+    test.assert(#found.directories == 3 and
+                found.directories[1] == fixture.root and
+                found.directories[2] == fixture:path("pkg") and
+                found.directories[3] == fixture:path("pkg/nested"),
+                "discovery did not retain its exact traversed directory set")
+
+    local pkg? = found:find_module("pkg")
+    test.assert(pkg ~= nil and pkg:is_folder(),
+                "folder main did not take precedence over flat source")
+    test.assert(#pkg.files == 5 and
+                pkg.files[1] == fixture:path("pkg/pkg.titan") and
+                pkg.files[2] == fixture:path("pkg/A.titan") and
+                pkg.files[3] == fixture:path("pkg/nested.titan") and
+                pkg.files[4] == fixture:path("pkg/titan.titan") and
+                pkg.files[5] == fixture:path("pkg/z.titan"),
+                "folder contributors were not main-first bytewise sorted")
+
+    test.assert(found:owner_for_file("pkg/A.titan") == "pkg" and
+                found:owner_for_file("pkg/nested.titan") == "pkg" and
+                found:owner_for_file("pkg/nested/nested.titan") ==
+                  "pkg.nested",
+                "owner_by_file lost contributor or nested-module ownership")
+    test.assert(found:owner_for_file("pkg.titan") == nil,
+                "folder-shadowed flat source was incorrectly made an owner")
+  end)
+end
+
+function test_project_discovery_matches_folder_first_driver_precedence(
+    _context: test.Context)
+  test_runtime.run(scans_flat_folder_and_nested_modules)
+end
+
+local function reports_only_invalid_logical_module_names()
+  with_fixture(function (fixture: Fixture)
+    fixture:mkdir("good")
+    fixture:mkdir("owner")
+    fixture:write("titan.titan")
+    fixture:write("bad name.titan")
+    fixture:write("good/9bad.titan")
+    fixture:write("owner/owner.titan")
+    fixture:write("owner/bad name.titan")
+
+    local found = require_discovery(fixture.root)
+    test.assert(found:find_module("titan") ~= nil and
+                found:find_module("owner") ~= nil,
+                "valid root or folder module was omitted")
+    test.assert(#found.issues == 2 and
+                strings.find(found.issues[1].message,
+                             "invalid logical Titan module name") ~= nil and
+                strings.find(found.issues[2].message,
+                             "invalid logical Titan module name") ~= nil,
+                "invalid flat module names were not reported deterministically")
+    test.assert(found:owner_for_file("owner/bad name.titan") == "owner",
+                "folder contributor filename was incorrectly treated as a " ..
+                "logical module name")
+
+    test.assert(discovery.valid_module_name("a-b.child_2"),
+                "portable dash/underscore module name was rejected")
+    test.assert(discovery.valid_module_name("titan"),
+                "bare logical module titan was rejected")
+    test.assert(not discovery.valid_module_name("app.titan") and
+                not discovery.valid_module_name("bad..name") and
+                not discovery.valid_module_name("9bad"),
+                "reserved or non-portable logical module name was accepted")
+  end)
+end
+
+function test_project_discovery_reports_invalid_names_without_rejecting_folder_contributors(
+    _context: test.Context)
+  test_runtime.run(reports_only_invalid_logical_module_names)
+end
+
+local function observes_folder_main_transitions()
+  with_fixture(function (fixture: Fixture)
+    fixture:mkdir("pkg")
+    fixture:write("pkg.titan")
+    fixture:write("pkg/extra.titan")
+
+    local flat = require_discovery(fixture.root)
+    test.assert(#flat.modules == 2 and
+                flat:find_module("pkg") ~= nil and
+                flat:find_module("pkg.extra") ~= nil and
+                flat:owner_for_file("pkg.titan") == "pkg" and
+                flat:owner_for_file("pkg/extra.titan") == "pkg.extra",
+                "flat project did not expose both modules")
+
+    fixture:write("pkg/pkg.titan")
+    local folder = require_discovery(fixture.root)
+    local pkg? = folder:find_module("pkg")
+    test.assert(#folder.modules == 1 and pkg ~= nil and pkg:is_folder(),
+                "creating a folder main did not replace flat resolution")
+    test.assert(folder:owner_for_file("pkg.titan") == nil and
+                folder:owner_for_file("pkg/extra.titan") == "pkg",
+                "folder-main transition did not update file ownership")
+
+    fixture:remove("pkg/pkg.titan")
+    local restored = require_discovery(fixture.root)
+    test.assert(#restored.modules == 2 and
+                restored:find_module("pkg.extra") ~= nil and
+                restored:owner_for_file("pkg.titan") == "pkg" and
+                restored:owner_for_file("pkg/extra.titan") == "pkg.extra",
+                "removing a folder main did not restore flat modules")
+  end)
+end
+
+function test_project_discovery_recomputes_folder_main_transitions(
+    _context: test.Context)
+  test_runtime.run(observes_folder_main_transitions)
+end
+
+local function rejects_non_directory_root()
+  local path = fs.tmpname()
+  defer fs.unlink(path)
+  local found?, failure? = discovery.discover(path)
+  test.assert(found == nil and failure ~= nil and
+              strings.find(failure.message, "not a directory") ~= nil,
+              "regular file was accepted as a source modules root")
+end
+
+function test_project_discovery_rejects_non_directory_source_root(
+    _context: test.Context)
+  test_runtime.run(rejects_non_directory_root)
+end

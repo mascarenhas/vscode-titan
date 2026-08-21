@@ -1,0 +1,216 @@
+local test = import "test"
+local json = import "server.json"
+local framing = import "server.framing"
+local dispatcher = import "server.dispatcher"
+
+local function response_object(result: dispatcher.DispatchResult): json.Object
+  test.assert(result.response ~= nil, "request produced no response")
+  local parsed?, failure? = json.parse(result.response)
+  test.assert(failure == nil and parsed ~= nil,
+              "dispatcher produced invalid response JSON")
+  local object? = json.as_object(parsed)
+  test.assert(object ~= nil, "dispatcher response was not an object")
+  return object
+end
+
+local function response_error_code(result: dispatcher.DispatchResult): integer
+  local object = response_object(result)
+  local failure? = json.as_object(object:get("error"))
+  test.assert(failure ~= nil, "response did not contain an error object")
+  local code? = json.as_integer(failure:get("code"))
+  test.assert(code ~= nil, "response error did not contain an integer code")
+  return code
+end
+
+function test_dispatcher_runs_the_lsp_lifecycle(_context: test.Context)
+  local server = dispatcher.create()
+
+  local initialized = server:dispatch(
+    [[{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}]])
+  local initialize_response = response_object(initialized)
+  test.assert(json.as_integer(initialize_response:get("id")) == 1,
+              "initialize response changed the request id")
+  local initialize_result? =
+    json.as_object(initialize_response:get("result"))
+  local capabilities? =
+    json.as_object(initialize_result:get("capabilities"))
+  test.assert(capabilities ~= nil and #capabilities.members == 5 and
+              json.as_boolean(capabilities:get("definitionProvider")) and
+              json.as_boolean(capabilities:get("referencesProvider")) and
+              json.as_boolean(capabilities:get("renameProvider")) and
+              json.as_boolean(capabilities:get("hoverProvider")) and
+              json.as_boolean(capabilities:get("foldingRangeProvider")),
+              "dispatcher omitted a supported semantic capability")
+
+  local ready = server:dispatch(
+    [[{"jsonrpc":"2.0","method":"initialized","params":{}}]])
+  test.assert(ready.response == nil and ready.exit_code == nil,
+              "initialized notification produced output")
+
+  local unknown = server:dispatch(
+    [[{"jsonrpc":"2.0","id":"feature","method":"textDocument/hover",]] ..
+    [["params":{}}]])
+  test.assert(response_error_code(unknown) == -32601,
+              "unsupported request did not return Method not found")
+
+  local cancellation = server:dispatch(
+    [[{"jsonrpc":"2.0","method":"$/cancelRequest",]] ..
+    [["params":{"id":"feature"}}]])
+  test.assert(cancellation.response == nil and cancellation.exit_code == nil,
+              "cancellation notification produced protocol output")
+
+  local shutdown = server:dispatch(
+    [[{"jsonrpc":"2.0","id":2,"method":"shutdown"}]])
+  local shutdown_response = response_object(shutdown)
+  test.assert(json.as_integer(shutdown_response:get("id")) == 2 and
+              json.is_null(shutdown_response:get("result")),
+              "shutdown response did not preserve id and null result")
+
+  local exited = server:dispatch(
+    [[{"jsonrpc":"2.0","method":"exit"}]])
+  test.assert(exited.response == nil and exited.exit_code == 0,
+              "orderly exit did not terminate successfully")
+end
+
+function test_dispatcher_returns_json_rpc_errors(_context: test.Context)
+  local malformed = dispatcher.create():dispatch("{")
+  test.assert(response_error_code(malformed) == -32700,
+              "malformed JSON did not return Parse error")
+
+  local invalid = dispatcher.create():dispatch(
+    [[{"jsonrpc":"2.0","id":1.0,"method":"initialize","params":{}}]])
+  test.assert(response_error_code(invalid) == -32600,
+              "non-LSP request id did not return Invalid Request")
+
+  local early = dispatcher.create():dispatch(
+    [[{"jsonrpc":"2.0","id":7,"method":"workspace/symbol"}]])
+  test.assert(response_error_code(early) == -32002,
+              "pre-initialize request did not return ServerNotInitialized")
+
+  local bad_params = dispatcher.create():dispatch(
+    [[{"jsonrpc":"2.0","id":8,"method":"initialize","params":null}]])
+  test.assert(response_error_code(bad_params) == -32600,
+              "scalar envelope params did not return Invalid Request")
+
+  local notification = dispatcher.create():dispatch(
+    [[{"jsonrpc":"2.0","method":"unknown/notification"}]])
+  test.assert(notification.response == nil,
+              "unknown notification incorrectly produced an error response")
+
+  local bad_cancellation = dispatcher.create():dispatch(
+    [[{"jsonrpc":"2.0","method":"$/cancelRequest","params":{}}]])
+  test.assert(bad_cancellation.response == nil,
+              "invalid cancellation notification produced a response")
+
+  local cancellation_server = dispatcher.create()
+  cancellation_server:dispatch(
+    [[{"jsonrpc":"2.0","id":10,"method":"initialize","params":{}}]])
+  local cancellation_request = cancellation_server:dispatch(
+    [[{"jsonrpc":"2.0","id":9,"method":"$/cancelRequest",]] ..
+    [["params":{"id":8}}]])
+  test.assert(response_error_code(cancellation_request) == -32601,
+              "$/ request did not return Method not found")
+end
+
+function test_dispatcher_validates_envelope_params_without_replying_to_notifications(
+    _context: test.Context)
+  local request = dispatcher.create():dispatch(
+    [[{"jsonrpc":"2.0","id":1,"method":"initialize","params":7}]])
+  test.assert(response_error_code(request) == -32600,
+              "scalar request params did not invalidate the envelope")
+
+  local server = dispatcher.create()
+  server:dispatch(
+    [[{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}]])
+  local bad_notification = server:dispatch(
+    [[{"jsonrpc":"2.0","method":"initialized","params":"bad"}]])
+  test.assert(bad_notification.response == nil and
+              server:phase_name() == "awaiting_initialized",
+              "invalid notification params responded or changed lifecycle")
+
+  local initialized = server:dispatch(
+    [[{"jsonrpc":"2.0","method":"initialized","params":[]}]])
+  test.assert(initialized.response == nil and
+              server:phase_name() == "awaiting_initialized",
+              "initialized accepted array params required to be an object")
+  server:dispatch(
+    [[{"jsonrpc":"2.0","method":"initialized","params":{}}]])
+
+  local array_params = server:dispatch(
+    [[{"jsonrpc":"2.0","id":2,"method":"workspace/symbol",]] ..
+    [["params":[]}]])
+  test.assert(response_error_code(array_params) == -32601,
+              "JSON-RPC array params were rejected at the envelope boundary")
+
+  local shutdown = server:dispatch(
+    [[{"jsonrpc":"2.0","id":3,"method":"shutdown","params":null}]])
+  test.assert(json.is_null(response_object(shutdown):get("result")),
+              "shutdown rejected interoperable null params")
+  local bad_exit = server:dispatch(
+    [[{"jsonrpc":"2.0","method":"exit","params":{}}]])
+  test.assert(bad_exit.response == nil and bad_exit.exit_code == nil and
+              server:phase_name() == "shutdown",
+              "invalid exit params changed lifecycle or produced a response")
+  local exit = server:dispatch(
+    [[{"jsonrpc":"2.0","method":"exit"}]])
+  test.assert(exit.exit_code == 0,
+              "exit with omitted params was rejected")
+end
+
+function test_dispatcher_enforces_lsp_request_id_domain(
+    _context: test.Context)
+  local maximum = dispatcher.create():dispatch(
+    [[{"jsonrpc":"2.0","id":2147483647,"method":"initialize",]] ..
+    [["params":{}}]])
+  test.assert(json.as_integer(response_object(maximum):get("id")) ==
+                2147483647,
+              "maximum signed 32-bit request id was rejected")
+
+  local minimum = dispatcher.create():dispatch(
+    [[{"jsonrpc":"2.0","id":-2147483648,"method":"initialize",]] ..
+    [["params":{}}]])
+  test.assert(json.as_integer(response_object(minimum):get("id")) ==
+                -2147483648,
+              "minimum signed 32-bit request id was rejected")
+
+  local too_large = dispatcher.create():dispatch(
+    [[{"jsonrpc":"2.0","id":2147483648,"method":"initialize",]] ..
+    [["params":{}}]])
+  test.assert(response_error_code(too_large) == -32600 and
+              json.is_null(response_object(too_large):get("id")),
+              "out-of-range positive request id was accepted")
+
+  local too_small = dispatcher.create():dispatch(
+    [[{"jsonrpc":"2.0","id":-2147483649,"method":"initialize",]] ..
+    [["params":{}}]])
+  test.assert(response_error_code(too_small) == -32600,
+              "out-of-range negative request id was accepted")
+
+  local fractional = dispatcher.create():dispatch(
+    [[{"jsonrpc":"2.0","id":1.5,"method":"initialize",]] ..
+    [["params":{}}]])
+  test.assert(response_error_code(fractional) == -32600,
+              "fractional request id was accepted")
+end
+
+function test_dispatcher_processes_a_coalesced_framed_transcript(
+    _context: test.Context)
+  local input = framing.reader()
+  local initialize =
+    [[{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}]]
+  local shutdown =
+    [[{"jsonrpc":"2.0","id":2,"method":"shutdown"}]]
+  input:feed(framing.frame(initialize) .. framing.frame(shutdown))
+
+  local server = dispatcher.create()
+  local first_body? = input:next()
+  local second_body? = input:next()
+  local first = server:dispatch(first_body)
+  local second = server:dispatch(second_body)
+  test.assert(json.as_integer(response_object(first):get("id")) == 1,
+              "first coalesced request was not dispatched first")
+  test.assert(json.as_integer(response_object(second):get("id")) == 2,
+              "second coalesced request was lost or reordered")
+  test.assert(input:next() == nil,
+              "coalesced transcript left an unexpected third frame")
+end

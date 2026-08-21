@@ -1,0 +1,87 @@
+local test = import "test"
+local strings = import "string"
+local json = import "server.json"
+
+local function expect_parse_error(source: string, expected: string)
+  local parsed?, failure? = json.parse(source)
+  test.assert(parsed == nil, "malformed JSON unexpectedly parsed")
+  test.assert(failure ~= nil, "malformed JSON did not return a ParseError")
+  test.assert(strings.find(failure.message, expected) ~= nil,
+              "JSON ParseError did not explain the rejected input")
+end
+
+local function nested_array(depth: integer): string
+  local output = strings.writer()
+  for _ = 1, depth do output:write("[") end
+  output:write("0")
+  for _ = 1, depth do output:write("]") end
+  return output:drain()
+end
+
+function test_json_parses_and_encodes_protocol_values(_context: test.Context)
+  local parsed?, failure? = json.parse(
+    [[{"text":"caf\u00e9 \ud834\udd1e","count":12,"ratio":1.5,]] ..
+    [["enabled":true,"nothing":null,"items":[1,false]}]])
+  test.assert(failure == nil and parsed ~= nil,
+              "valid nested JSON did not parse")
+
+  local object? = json.as_object(parsed)
+  test.assert(object ~= nil, "top-level JSON value was not an object")
+  test.assert(json.as_string(object:get("text")) == "café 𝄞",
+              "Unicode escapes were not decoded to UTF-8")
+  test.assert(json.as_integer(object:get("count")) == 12,
+              "integer JSON number lost its integer representation")
+  test.assert(json.as_number(object:get("ratio")) == 1.5,
+              "fractional JSON number was not parsed")
+  test.assert(json.as_boolean(object:get("enabled")) == true,
+              "JSON boolean was not parsed")
+  test.assert(json.is_null(object:get("nothing")),
+              "JSON null was not parsed")
+
+  local items? = json.as_array(object:get("items"))
+  test.assert(items ~= nil and #items.items == 2,
+              "JSON array members were not preserved")
+  test.assert(json.as_integer(items.items[1]) == 1 and
+              json.as_boolean(items.items[2]) == false,
+              "JSON array member values changed")
+
+  local encoded = json.encode(parsed)
+  local reparsed?, second_failure? = json.parse(encoded)
+  test.assert(second_failure == nil and reparsed ~= nil,
+              "encoded JSON did not parse again")
+  test.assert(json.encode(reparsed) == encoded,
+              "JSON encode/parse did not stabilize")
+end
+
+function test_json_rejects_ambiguous_or_malformed_input(
+    _context: test.Context)
+  expect_parse_error([[{"same":1,"same":2}]], "duplicate key")
+  expect_parse_error("01", "leading zero")
+  expect_parse_error([["\ud800"]], "high surrogate")
+  expect_parse_error([["\udc00"]], "low surrogate")
+  expect_parse_error("true false", "trailing bytes")
+  expect_parse_error("\"" .. strings.char(0xc0, 0x80) .. "\"",
+                     "invalid UTF-8")
+end
+
+function test_json_encoder_rejects_invalid_utf8(_context: test.Context)
+  local rejected = false
+  do
+    json.encode(json.from_string(strings.char(0xff)))
+  catch
+    rejected = true
+    test.assert(error == "cannot encode invalid UTF-8 in a JSON string",
+                "JSON encoder raised the wrong invalid-UTF-8 error")
+  end
+  test.assert(rejected, "JSON encoder accepted invalid UTF-8")
+end
+
+function test_json_caps_container_nesting(_context: test.Context)
+  local boundary?, boundary_failure? = json.parse(nested_array(128))
+  test.assert(boundary_failure == nil and boundary ~= nil,
+              "JSON rejected the documented 128-level nesting boundary")
+  test.assert(json.encode(boundary) == nested_array(128),
+              "JSON encoder changed a value at the nesting boundary")
+
+  expect_parse_error(nested_array(129), "nesting exceeds 128")
+end

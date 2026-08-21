@@ -1,0 +1,605 @@
+local strings = import "string"
+local math = import "titan.math"
+
+-- JSON is kept nominal at the protocol boundary. In particular, objects and
+-- arrays are not exposed as dynamic Lua tables.
+record Member
+  key: string
+  item: Value
+end
+
+record Object
+  members: {Member}
+end
+
+record Array
+  items: {Value}
+end
+
+union Value
+  null_value
+  boolean_value: boolean
+  integer_value: integer
+  number_value: float
+  string_value: string
+  array_value: Array
+  object_value: Object
+end
+
+record ParseError
+  message: string
+  position: integer
+end
+
+local record Parser
+  source: string
+  position: integer
+end
+
+local MAX_NESTING = 128
+
+local function fail<T>(message: string, position: integer): T
+  raise ParseError.new(message, position)
+end
+
+function null(): Value
+  return Value.null_value()
+end
+
+function from_boolean(item: boolean): Value
+  return Value.boolean_value(item)
+end
+
+function from_integer(item: integer): Value
+  return Value.integer_value(item)
+end
+
+function from_number(item: float): Value
+  return Value.number_value(item)
+end
+
+function from_string(item: string): Value
+  return Value.string_value(item)
+end
+
+function from_array(items: {Value}?): Value
+  local actual: {Value} = {}
+  if items ~= nil then actual = items end
+  return Value.array_value(Array.new(actual))
+end
+
+function from_object(members: {Member}?): Value
+  local actual: {Member} = {}
+  if members ~= nil then actual = members end
+  return Value.object_value(Object.new(actual))
+end
+
+function new_object(): Value
+  return Value.object_value(Object.new({}))
+end
+
+function Object:get(key: string): Value?
+  for index = 1, #self.members do
+    local member = self.members[index]
+    if member.key == key then return member.item end
+  end
+  return nil
+end
+
+function Object:set(key: string, item: Value)
+  for index = 1, #self.members do
+    local member = self.members[index]
+    if member.key == key then
+      member.item = item
+      return
+    end
+  end
+  self.members[#self.members + 1] = Member.new(key, item)
+end
+
+function as_object(item: Value): Object?
+  case item
+  when object_value: result then return result
+  else return nil
+  end
+end
+
+function as_array(item: Value): Array?
+  case item
+  when array_value: result then return result
+  else return nil
+  end
+end
+
+function as_string(item: Value): string?
+  case item
+  when string_value: result then return result
+  else return nil
+  end
+end
+
+function as_integer(item: Value): integer?
+  case item
+  when integer_value: result then return result
+  else return nil
+  end
+end
+
+function as_number(item: Value): float?
+  case item
+  when number_value: result then return result
+  else return nil
+  end
+end
+
+function as_boolean(item: Value): boolean?
+  case item
+  when boolean_value: result then return result
+  else return nil
+  end
+end
+
+function is_null(item: Value): boolean
+  case item
+  when null_value then return true
+  else return false
+  end
+end
+
+local function Parser:at_end(): boolean
+  return self.position > #self.source
+end
+
+local function Parser:peek(): integer?
+  if self:at_end() then return nil end
+  local byte?: integer = strings.byte(self.source, self.position)
+  return byte
+end
+
+local function Parser:take(): integer
+  local byte? = self:peek()
+  if byte == nil then
+    return fail<integer>("unexpected end of JSON input", self.position)
+  end
+  self.position = self.position + 1
+  return byte
+end
+
+local function Parser:skip_whitespace()
+  while true do
+    local byte? = self:peek()
+    if byte ~= 32 and byte ~= 9 and byte ~= 10 and byte ~= 13 then return end
+    self.position = self.position + 1
+  end
+end
+
+local function is_digit(byte: integer?): boolean
+  if byte == nil then return false end
+  local actual: integer = byte
+  return actual >= 48 and actual <= 57
+end
+
+local function is_hex_digit(byte: integer?): boolean
+  if byte == nil then return false end
+  local actual: integer = byte
+  if actual >= 48 and actual <= 57 then return true end
+  if actual >= 65 and actual <= 70 then return true end
+  return actual >= 97 and actual <= 102
+end
+
+local function hex_value(byte: integer): integer
+  if byte >= 48 and byte <= 57 then return byte - 48 end
+  if byte >= 65 and byte <= 70 then return byte - 65 + 10 end
+  return byte - 97 + 10
+end
+
+-- JSON text is Unicode encoded as UTF-8. Titan strings are arbitrary byte
+-- strings, so validate that boundary explicitly instead of allowing malformed
+-- byte sequences to leak into protocol messages.
+local function valid_utf8(subject: string): boolean
+  local index = 1
+  while index <= #subject do
+    local first: integer = strings.byte(subject, index)
+    if first <= 0x7f then
+      index = index + 1
+    elseif first >= 0xc2 and first <= 0xdf then
+      if index + 1 > #subject then return false end
+      local second: integer = strings.byte(subject, index + 1)
+      if second < 0x80 or second > 0xbf then return false end
+      index = index + 2
+    elseif first >= 0xe0 and first <= 0xef then
+      if index + 2 > #subject then return false end
+      local second: integer = strings.byte(subject, index + 1)
+      local third: integer = strings.byte(subject, index + 2)
+      if third < 0x80 or third > 0xbf then return false end
+      if first == 0xe0 then
+        if second < 0xa0 or second > 0xbf then return false end
+      elseif first == 0xed then
+        if second < 0x80 or second > 0x9f then return false end
+      elseif second < 0x80 or second > 0xbf then
+        return false
+      end
+      index = index + 3
+    elseif first >= 0xf0 and first <= 0xf4 then
+      if index + 3 > #subject then return false end
+      local second: integer = strings.byte(subject, index + 1)
+      local third: integer = strings.byte(subject, index + 2)
+      local fourth: integer = strings.byte(subject, index + 3)
+      if third < 0x80 or third > 0xbf or
+         fourth < 0x80 or fourth > 0xbf then
+        return false
+      end
+      if first == 0xf0 then
+        if second < 0x90 or second > 0xbf then return false end
+      elseif first == 0xf4 then
+        if second < 0x80 or second > 0x8f then return false end
+      elseif second < 0x80 or second > 0xbf then
+        return false
+      end
+      index = index + 4
+    else
+      return false
+    end
+  end
+  return true
+end
+
+local function Parser:parse_hex_quad(): integer
+  local result = 0
+  for _ = 1, 4 do
+    local byte? = self:peek()
+    if not is_hex_digit(byte) then
+      return fail<integer>("expected four hexadecimal digits after \\u",
+                           self.position)
+    end
+    result = result * 16 + hex_value(self:take())
+  end
+  return result
+end
+
+local function write_codepoint(output: strings.StringWriter, codepoint: integer,
+                               position: integer)
+  if codepoint < 0 or codepoint > 0x10ffff or
+     (codepoint >= 0xd800 and codepoint <= 0xdfff) then
+    fail<value>("invalid Unicode scalar value", position)
+  elseif codepoint <= 0x7f then
+    output:write(strings.char(codepoint))
+  elseif codepoint <= 0x7ff then
+    output:write(strings.char(
+      0xc0 + codepoint // 0x40,
+      0x80 + codepoint % 0x40))
+  elseif codepoint <= 0xffff then
+    output:write(strings.char(
+      0xe0 + codepoint // 0x1000,
+      0x80 + (codepoint // 0x40) % 0x40,
+      0x80 + codepoint % 0x40))
+  else
+    output:write(strings.char(
+      0xf0 + codepoint // 0x40000,
+      0x80 + (codepoint // 0x1000) % 0x40,
+      0x80 + (codepoint // 0x40) % 0x40,
+      0x80 + codepoint % 0x40))
+  end
+end
+
+local function Parser:parse_unicode_escape(output: strings.StringWriter,
+                                           escape_position: integer)
+  local first = self:parse_hex_quad()
+  if first >= 0xd800 and first <= 0xdbff then
+    if self:take() ~= 92 or self:take() ~= 117 then
+      fail<value>("high surrogate must be followed by a low surrogate",
+                  escape_position)
+    end
+    local second = self:parse_hex_quad()
+    if second < 0xdc00 or second > 0xdfff then
+      fail<value>("high surrogate must be followed by a low surrogate",
+                  escape_position)
+    end
+    local codepoint = 0x10000 +
+      (first - 0xd800) * 0x400 + (second - 0xdc00)
+    write_codepoint(output, codepoint, escape_position)
+  elseif first >= 0xdc00 and first <= 0xdfff then
+    fail<value>("low surrogate has no preceding high surrogate",
+                escape_position)
+  else
+    write_codepoint(output, first, escape_position)
+  end
+end
+
+local function Parser:parse_string(): string
+  local opening = self.position
+  if self:take() ~= 34 then
+    return fail<string>("expected a JSON string", opening)
+  end
+
+  local output = strings.writer()
+  while true do
+    local byte_position = self.position
+    local byte = self:take()
+    if byte == 34 then
+      local result = output:drain()
+      if not valid_utf8(result) then
+        return fail<string>("invalid UTF-8 in JSON string", opening)
+      end
+      return result
+    end
+    if byte < 0x20 then
+      return fail<string>("unescaped control byte in JSON string",
+                          byte_position)
+    end
+    if byte ~= 92 then
+      output:write(strings.char(byte))
+    else
+      local escape_position = self.position - 1
+      local escaped = self:take()
+      if escaped == 34 or escaped == 47 or escaped == 92 then
+        output:write(strings.char(escaped))
+      elseif escaped == 98 then output:write("\b")
+      elseif escaped == 102 then output:write("\f")
+      elseif escaped == 110 then output:write("\n")
+      elseif escaped == 114 then output:write("\r")
+      elseif escaped == 116 then output:write("\t")
+      elseif escaped == 117 then
+        self:parse_unicode_escape(output, escape_position)
+      else
+        return fail<string>("invalid JSON string escape", escape_position)
+      end
+    end
+  end
+  return ""
+end
+
+local function Parser:consume_literal(literal: string)
+  local start = self.position
+  local last = start + #literal - 1
+  if strings.sub(self.source, start, last) ~= literal then
+    fail<value>("invalid JSON literal", start)
+  end
+  self.position = last + 1
+end
+
+local function finite(number: float): boolean
+  return number == number and number ~= math.huge and number ~= -math.huge
+end
+
+local function Parser:parse_number(): Value
+  local start = self.position
+  if self:peek() == 45 then self.position = self.position + 1 end
+
+  local first? = self:peek()
+  if first == 48 then
+    self.position = self.position + 1
+    if is_digit(self:peek()) then
+      return fail<Value>("leading zero in JSON number", self.position)
+    end
+  elseif is_digit(first) then
+    while is_digit(self:peek()) do self.position = self.position + 1 end
+  else
+    return fail<Value>("expected a digit in JSON number", self.position)
+  end
+
+  local floating = false
+  if self:peek() == 46 then
+    floating = true
+    self.position = self.position + 1
+    if not is_digit(self:peek()) then
+      return fail<Value>("expected a digit after JSON decimal point",
+                         self.position)
+    end
+    while is_digit(self:peek()) do self.position = self.position + 1 end
+  end
+
+  local exponent? = self:peek()
+  if exponent == 69 or exponent == 101 then
+    floating = true
+    self.position = self.position + 1
+    local sign? = self:peek()
+    if sign == 43 or sign == 45 then self.position = self.position + 1 end
+    if not is_digit(self:peek()) then
+      return fail<Value>("expected a digit in JSON exponent", self.position)
+    end
+    while is_digit(self:peek()) do self.position = self.position + 1 end
+  end
+
+  local token = strings.sub(self.source, start, self.position - 1)
+  if not floating then
+    local parsed_integer? = math.tointeger(token)
+    if parsed_integer ~= nil then
+      return Value.integer_value(parsed_integer)
+    end
+  end
+
+  local parsed? = math.tonumber(token)
+  if parsed == nil then
+    return fail<Value>("JSON number is not representable", start)
+  end
+  local parsed_float = parsed as float
+  if not finite(parsed_float) then
+    return fail<Value>("JSON number is not finite", start)
+  end
+  return Value.number_value(parsed_float)
+end
+
+local function Parser:parse_array(depth: integer): Value
+  local start = self.position
+  if self:take() ~= 91 then
+    return fail<Value>("expected '['", start)
+  end
+  local items: {Value} = {}
+  self:skip_whitespace()
+  if self:peek() == 93 then
+    self.position = self.position + 1
+    return Value.array_value(Array.new(items))
+  end
+
+  while true do
+    items[#items + 1] = self:parse_value(depth)
+    self:skip_whitespace()
+    local separator = self:take()
+    if separator == 93 then break end
+    if separator ~= 44 then
+      return fail<Value>("expected ',' or ']' in JSON array",
+                         self.position - 1)
+    end
+    self:skip_whitespace()
+  end
+  return Value.array_value(Array.new(items))
+end
+
+local function Parser:parse_object(depth: integer): Value
+  local start = self.position
+  if self:take() ~= 123 then
+    return fail<Value>("expected '{'", start)
+  end
+  local result = Object.new({})
+  self:skip_whitespace()
+  if self:peek() == 125 then
+    self.position = self.position + 1
+    return Value.object_value(result)
+  end
+
+  while true do
+    if self:peek() ~= 34 then
+      return fail<Value>("expected a string key in JSON object",
+                         self.position)
+    end
+    local key = self:parse_string()
+    if result:get(key) ~= nil then
+      return fail<Value>("duplicate key in JSON object", self.position)
+    end
+    self:skip_whitespace()
+    if self:take() ~= 58 then
+      return fail<Value>("expected ':' after JSON object key",
+                         self.position - 1)
+    end
+    self:skip_whitespace()
+    result:set(key, self:parse_value(depth))
+    self:skip_whitespace()
+    local separator = self:take()
+    if separator == 125 then break end
+    if separator ~= 44 then
+      return fail<Value>("expected ',' or '}' in JSON object",
+                         self.position - 1)
+    end
+    self:skip_whitespace()
+  end
+  return Value.object_value(result)
+end
+
+local function Parser:parse_value(depth: integer): Value
+  self:skip_whitespace()
+  local byte? = self:peek()
+  if byte == 34 then return Value.string_value(self:parse_string()) end
+  if byte == 91 or byte == 123 then
+    if depth >= MAX_NESTING then
+      return fail<Value>("JSON nesting exceeds 128 levels", self.position)
+    end
+    if byte == 91 then return self:parse_array(depth + 1) end
+    return self:parse_object(depth + 1)
+  end
+  if byte == 45 or is_digit(byte) then return self:parse_number() end
+  if byte == 116 then
+    self:consume_literal("true")
+    return Value.boolean_value(true)
+  end
+  if byte == 102 then
+    self:consume_literal("false")
+    return Value.boolean_value(false)
+  end
+  if byte == 110 then
+    self:consume_literal("null")
+    return Value.null_value()
+  end
+  return fail<Value>("expected a JSON value", self.position)
+end
+
+function parse(source: string): (Value?, ParseError?)
+  local parser = Parser.new(source, 1)
+  local result = parser:parse_value(0)
+  parser:skip_whitespace()
+  if not parser:at_end() then
+    raise ParseError.new("trailing bytes after JSON value", parser.position)
+  end
+  return result, nil
+catch
+  if error is ParseError then
+    local failure: ParseError = error
+    return nil, failure
+  end
+  raise
+end
+
+local function write_escaped(output: strings.StringWriter, subject: string)
+  if not valid_utf8(subject) then
+    raise "cannot encode invalid UTF-8 in a JSON string"
+  end
+  local hex = "0123456789abcdef"
+  output:write("\"")
+  for index = 1, #subject do
+    local byte?: integer = strings.byte(subject, index)
+    if byte == 34 then output:write("\\\"")
+    elseif byte == 92 then output:write("\\\\")
+    elseif byte == 8 then output:write("\\b")
+    elseif byte == 12 then output:write("\\f")
+    elseif byte == 10 then output:write("\\n")
+    elseif byte == 13 then output:write("\\r")
+    elseif byte == 9 then output:write("\\t")
+    elseif byte < 0x20 then
+      output:write("\\u00")
+      output:write(strings.sub(hex, byte // 16 + 1, byte // 16 + 1))
+      output:write(strings.sub(hex, byte % 16 + 1, byte % 16 + 1))
+    else
+      output:write(strings.char(byte))
+    end
+  end
+  output:write("\"")
+end
+
+local function encode_value(output: strings.StringWriter, item: Value,
+                            depth: integer)
+  case item
+  when null_value then output:write("null")
+  when boolean_value: flag then
+    if flag then output:write("true") else output:write("false") end
+  when integer_value: count then output:write("" .. count)
+  when number_value: quantity then
+    if not finite(quantity) then raise "cannot encode a non-finite JSON number" end
+    local rendered = strings.format("%.17g", quantity)
+    if not strings.find(rendered, ".") and
+       not strings.find(rendered, "e") and
+       not strings.find(rendered, "E") then
+      rendered = rendered .. ".0"
+    end
+    output:write(rendered)
+  when string_value: text then write_escaped(output, text)
+  when array_value: collection then
+    if depth >= MAX_NESTING then
+      raise "cannot encode JSON nested beyond 128 levels"
+    end
+    output:write("[")
+    for index = 1, #collection.items do
+      if index > 1 then output:write(",") end
+      encode_value(output, collection.items[index], depth + 1)
+    end
+    output:write("]")
+  when object_value: dictionary then
+    if depth >= MAX_NESTING then
+      raise "cannot encode JSON nested beyond 128 levels"
+    end
+    output:write("{")
+    for index = 1, #dictionary.members do
+      if index > 1 then output:write(",") end
+      local member = dictionary.members[index]
+      write_escaped(output, member.key)
+      output:write(":")
+      encode_value(output, member.item, depth + 1)
+    end
+    output:write("}")
+  end
+end
+
+function encode(item: Value): string
+  local output = strings.writer()
+  encode_value(output, item, 0)
+  return output:drain()
+end

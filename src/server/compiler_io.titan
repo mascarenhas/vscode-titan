@@ -1,0 +1,565 @@
+local async = import "async"
+local fs = import "fs"
+local iteration = import "titan.iteration"
+local system = import "os"
+local strings = import "string"
+
+-- The compiler sees this record only through its ordinary Lua userdata proxy.
+-- Every argument/result crossing that boundary therefore uses Lua-native
+-- scalars or Maps; Titan Arrays and records never leak into compiler state.
+record CompilerIO
+  -- Empty public records have no Lua-visible userdata member table. This
+  -- private inert field gives the strategy the ordinary record proxy that the
+  -- compiler validates and invokes; it carries no semantic state.
+  local proxy_marker: boolean
+end
+
+local function failure_message(failure: value): string
+  -- Filesystem/process operations are cancellation points. Do not turn the
+  -- Task's authoritative cancellation request into an ordinary compiler I/O
+  -- error merely because this strategy normalizes backend failures.
+  if failure is async.CancellationReason then raise failure end
+  if failure is async.OperationError then
+    local operation = failure as async.OperationError
+    return operation.operation .. ": " .. operation.name .. ": " ..
+           operation.message
+  end
+  return strings.tostring(failure)
+end
+
+function create(): CompilerIO
+  return CompilerIO.new(false)
+end
+
+local function checked_path(path: string): (string?, string?)
+  local nul? = strings.find(path, "\0")
+  if nul then return nil, "path contains a NUL byte" end
+  return path, nil
+end
+
+function CompilerIO:cwd(): (string?, string?)
+  return system.cwd(), nil
+catch
+  return nil, failure_message(error)
+end
+
+function CompilerIO:realpath(path: string): (string?, string?)
+  local valid?, path_error? = checked_path(path)
+  if not valid then return nil, path_error end
+  return fs.realpath(path), nil
+catch
+  if error is async.OperationError and
+     (error as async.OperationError).name == "ENOENT" then
+    return nil, "path does not exist: " .. path
+  end
+  return nil, failure_message(error)
+end
+
+local function stat_map(stat: fs.Stat): {string: value}
+  return {
+    ["size"] = stat.size,
+    ["kind"] = stat.kind,
+    ["mode"] = stat.mode,
+    ["modified_seconds"] = stat.modified_seconds,
+    ["modified_nanoseconds"] = stat.modified_nanoseconds,
+  }
+end
+
+function CompilerIO:stat(path: string): ({string: value}?, string?)
+  local valid?, path_error? = checked_path(path)
+  if not valid then return nil, path_error end
+  local metadata? = fs.stat(path)
+  if not metadata then return nil, nil end
+  return stat_map(metadata as fs.Stat), nil
+catch
+  return nil, failure_message(error)
+end
+
+function CompilerIO:lstat(path: string): ({string: value}?, string?)
+  local valid?, path_error? = checked_path(path)
+  if not valid then return nil, path_error end
+  local metadata? = fs.lstat(path)
+  if not metadata then return nil, nil end
+  return stat_map(metadata as fs.Stat), nil
+catch
+  return nil, failure_message(error)
+end
+
+function CompilerIO:readable(path: string): boolean
+  local valid? = checked_path(path)
+  if not valid then return false end
+  local file = fs.open(path, "r")
+  file:close()
+  return true
+catch
+  failure_message(error)
+  return false
+end
+
+function CompilerIO:read_file(path: string): (string?, string?)
+  local valid?, path_error? = checked_path(path)
+  if not valid then return nil, path_error end
+  return fs.read_file(path), nil
+catch
+  return nil, failure_message(error)
+end
+
+local function temporary_leaf(path: string): string
+  local index = #path
+  while index >= 1 do
+    if strings.sub(path, index, index) == "/" then
+      return strings.sub(path, index + 1)
+    end
+    index = index - 1
+  end
+  return path
+end
+
+local function write_atomic(path: string, contents: string,
+                            temporary: string): (boolean?, string?)
+  fs.write_file(temporary, contents)
+  fs.rename(temporary, path)
+  return true, nil
+catch
+  local original = error
+  local cancellation = original is async.CancellationReason
+  local message = ""
+  if not cancellation then message = failure_message(original) end
+  if cancellation then
+    -- A pending cancellation prevents another cancellation-sensitive unlink
+    -- from being submitted by this Task. Transfer cleanup to an uncancelled
+    -- child which remains runtime-rooted after the caller unwinds.
+    do
+      async.run<nil, value>(function (): nil
+        do fs.unlink(temporary) catch end
+        return nil
+      end)
+    catch
+    end
+  else
+    do fs.unlink(temporary) catch end
+  end
+  if cancellation then raise original end
+  return nil, message
+end
+
+local record ReleasedReservation
+  path: string?
+  message: string?
+end
+
+local function release_reservation(strategy: CompilerIO): ReleasedReservation
+  local reservation?, reservation_error? = strategy:tmpname()
+  if not reservation then
+    return ReleasedReservation.new(nil, reservation_error)
+  end
+  local removed?, remove_error? = strategy:unlink(reservation as string)
+  if not removed then
+    return ReleasedReservation.new(nil, remove_error)
+  end
+  return ReleasedReservation.new(reservation, nil)
+end
+
+function CompilerIO:write_file(path: string,
+                               contents: string): (boolean?, string?)
+  local valid?, path_error? = checked_path(path)
+  if not valid then return nil, path_error end
+
+  -- Reserve the same process-unique identity as the synchronous strategy,
+  -- move only its basename beside the destination, and publish by rename
+  -- after the complete sibling file has been closed.
+  -- Keep creation and removal of the name reservation in a child Task. If the
+  -- calling compiler Task is cancelled while joining it, the child still owns
+  -- enough state to finish the unlink instead of losing a completed tmpname.
+  local release = async.run<ReleasedReservation, value>(
+    function (): ReleasedReservation return release_reservation(self) end)
+  local reservation?: string = nil
+  case async.join<ReleasedReservation, value>(release)
+  when succeeded: result then
+    if not result.path then return nil, result.message end
+    reservation = result.path
+  when failed: failure then
+    return nil, failure_message(failure.error)
+  when cancelled then
+    return nil, "temporary-name reservation task was cancelled"
+  else
+    return nil, "temporary-name reservation task did not finish"
+  end
+  local temporary = path .. "." ..
+    temporary_leaf(reservation as string) .. ".tmp"
+  return write_atomic(path, contents, temporary)
+end
+
+function CompilerIO:list(path: string): ({integer: string}?, string?)
+  local valid?, path_error? = checked_path(path)
+  if not valid then return nil, path_error end
+  local entries = fs.list(path)
+  local result: {integer: string} = {}
+  for index = 1, #entries do result[index] = entries[index] end
+  return result, nil
+catch
+  return nil, failure_message(error)
+end
+
+function CompilerIO:mkdir(path: string,
+                          remove_if_cancelled: boolean?): (boolean?, string?)
+  local valid?, path_error? = checked_path(path)
+  if not valid then return nil, path_error end
+  fs.mkdir(path)
+  return true, nil
+catch
+  if error is async.CancellationReason and remove_if_cancelled == true then
+    -- The caller marks only a freshly reserved, previously absent directory.
+    -- Complete rollback in an uncancelled child because this Task can no
+    -- longer submit another cancellation-sensitive filesystem operation.
+    do
+      async.run<nil, value>(function (): nil
+        do fs.rmdir(path) catch end
+        return nil
+      end)
+    catch
+    end
+    raise
+  end
+  return nil, failure_message(error)
+end
+
+function CompilerIO:unlink(path: string,
+                           remove_if_cancelled: boolean?): (boolean?, string?)
+  local valid?, path_error? = checked_path(path)
+  if not valid then return nil, path_error end
+  if remove_if_cancelled == true then
+    -- This flag is reserved for a fresh regular file returned by tmpname.
+    -- Avoid a second cancellation point before releasing that reservation.
+    fs.unlink(path)
+    return true, nil
+  end
+  local metadata? = fs.lstat(path)
+  if metadata and (metadata as fs.Stat).kind == "directory" then
+    return nil, "cannot unlink directory '" .. path .. "'"
+  end
+  fs.unlink(path)
+  return true, nil
+catch
+  if error is async.CancellationReason and remove_if_cancelled == true then
+    -- An accepted unlink may have completed before libuv delivers the
+    -- authoritative cancellation. Retry in an uncancelled child so both that
+    -- case and cancellation before submission leave the owned path absent.
+    do
+      async.run<nil, value>(function (): nil
+        do fs.unlink(path) catch end
+        return nil
+      end)
+    catch
+    end
+    raise
+  end
+  return nil, failure_message(error)
+end
+
+function CompilerIO:rmdir(path: string): (boolean?, string?)
+  local valid?, path_error? = checked_path(path)
+  if not valid then return nil, path_error end
+  fs.rmdir(path)
+  return true, nil
+catch
+  return nil, failure_message(error)
+end
+
+function CompilerIO:rename(from: string,
+                           to: string): (boolean?, string?)
+  local valid_from?, from_error? = checked_path(from)
+  if not valid_from then return nil, from_error end
+  local valid_to?, to_error? = checked_path(to)
+  if not valid_to then return nil, to_error end
+  fs.rename(from, to)
+  return true, nil
+catch
+  return nil, failure_message(error)
+end
+
+local record TmpnameHandoff
+  path: string?
+  failure: value
+  accepted: boolean
+  abandoned: boolean
+  finished: boolean
+end
+
+function CompilerIO:tmpname(): (string?, string?)
+  local handoff = TmpnameHandoff.new(nil, nil, false, false, false)
+  async.run<nil, value>(function (): nil
+    do
+      local path = fs.tmpname()
+      handoff.path = path
+      while not handoff.accepted and not handoff.abandoned do
+        async.yield()
+      end
+      if handoff.abandoned then do fs.unlink(path) catch end end
+    catch
+      handoff.failure = error
+    end
+    handoff.finished = true
+    return nil
+  end)
+
+  do
+    while handoff.path == nil and not handoff.finished do async.yield() end
+    if handoff.path == nil then
+      return nil, failure_message(handoff.failure)
+    end
+    handoff.accepted = true
+    return handoff.path, nil
+  catch
+    handoff.abandoned = true
+    if error is async.CancellationReason then raise end
+    return nil, failure_message(error)
+  end
+end
+
+function CompilerIO:yield()
+  async.yield()
+end
+
+local function invalid_run(diagnostic: string): {string: value}
+  return {
+    ["started"] = false,
+    ["ok"] = false,
+    ["diagnostic"] = diagnostic,
+  }
+end
+
+local function quote_word(word: string): string
+  local output = strings.writer()
+  output:write("'")
+  for index = 1, #word do
+    local byte = strings.sub(word, index, index)
+    if byte == "'" then
+      output:write("'\\''")
+    else
+      output:write(byte)
+    end
+  end
+  output:write("'")
+  return output:drain()
+end
+
+local function normalize_argv(candidate: value):
+    ({string}?, string?)
+  if not (candidate is {integer: value}) then
+    return nil, "command must be an argument array"
+  end
+  local source = candidate as {integer: value}
+  local length = #source
+  local entries = 0
+  for key, _ in iteration.pairs(source) do
+    entries = entries + 1
+    if key < 1 or key > length then
+      return nil, "command must be a dense argument array"
+    end
+  end
+  if entries ~= length then
+    return nil, "command must be a dense argument array"
+  end
+
+  local argv: {string} = {}
+  for index = 1, length do
+    local raw? = source[index]
+    if raw == nil or not ((raw as value) is string) then
+      return nil, "command argument " .. index .. " must be a string"
+    end
+    local argument = (raw as value) as string
+    local nul? = strings.find(argument, "\0")
+    if nul then
+      return nil, "command argument " .. index .. " contains a NUL byte"
+    end
+    argv[index] = argument
+  end
+  return argv, nil
+end
+
+local function merge_stderr(candidate: value): (boolean?, string?)
+  if candidate == nil then return true, nil end
+  if not (candidate is {string: value}) then
+    return nil, "command options must be a table"
+  end
+  local options = candidate as {string: value}
+  local configured: value = options["stderr_to_stdout"]
+  return configured ~= false, nil
+end
+
+local function command_label(argv: {string}, merged: boolean): string
+  local output = strings.writer()
+  output:write("env LANG=C LC_ALL=C")
+  for index = 1, #argv do
+    output:write(" ")
+    output:write(quote_word(argv[index]))
+  end
+  if merged then output:write(" 2>&1") end
+  return output:drain()
+end
+
+local function read_all(input: system.InputStream): string
+  defer input:close()
+  local output = strings.writer()
+  for chunk in input:read do output:write(chunk) end
+  return output:drain()
+end
+
+local function required_input(candidate: system.InputStream?,
+                              subject: string): system.InputStream
+  if not candidate then raise subject .. " was not captured" end
+  return candidate as system.InputStream
+end
+
+local function required_output(candidate: system.OutputStream?,
+                               subject: string): system.OutputStream
+  if not candidate then raise subject .. " was not captured" end
+  return candidate as system.OutputStream
+end
+
+local function kill_owned_process(process: system.Process)
+  do
+    if process:is_running() then process:kill("kill") end
+  catch
+    -- The child may have exited between the OS query and the signal. Its
+    -- already-started wait Task below remains the authoritative reaper.
+  end
+end
+
+local function capture_failure(command: string,
+                               diagnostic: string): {string: value}
+  return {
+    ["started"] = false,
+    ["ok"] = false,
+    ["command"] = command,
+    ["diagnostic"] = diagnostic,
+  }
+end
+
+local function capture_process(process: system.Process,
+                               command: string): {string: value}
+  local output = required_input(process.stdout, "captured command stdout")
+  local input = required_output(process.stdin, "captured command stdin")
+
+  -- Start every callback-owning Task before the first operation in this
+  -- function can suspend. If the caller is cancelled while closing stdin or
+  -- joining, the reader still drains/closes its pipe and the waiter still
+  -- reaps the process after kill_owned_process terminates it.
+  local reader = async.run<string, value>(function (): string
+    return read_all(output)
+  end)
+  local waiter = async.run<system.ExitStatus, value>(
+    function (): system.ExitStatus return process:wait() end)
+
+  do
+    input:close()
+    local read_status, wait_status = async.join_two(reader, waiter)
+
+    local captured? : string = nil
+    case read_status
+    when succeeded: bytes then captured = bytes
+    when failed: failure then
+      return capture_failure(
+        command, "could not capture command output: " ..
+        failure_message(failure.error))
+    when cancelled then
+      return capture_failure(command, "captured command reader was cancelled")
+    else
+      return capture_failure(command, "captured command reader did not finish")
+    end
+
+    local status?: system.ExitStatus = nil
+    case wait_status
+    when succeeded: exit_status then status = exit_status
+    when failed: failure then
+      return capture_failure(
+        command, (captured as string) ..
+        "\nfailed waiting for command: " .. failure_message(failure.error))
+    when cancelled then
+      return capture_failure(command, "captured command wait was cancelled")
+    else
+      return capture_failure(command, "captured command wait did not finish")
+    end
+
+    local actual = status as system.ExitStatus
+    local signal?: integer = nil
+    if actual.signal_number > 0 then signal = actual.signal_number end
+    local interrupted = signal ~= nil
+    local why = "exit"
+    local normalized_status = actual.code
+    local shell_status?: integer = nil
+    if interrupted then
+      why = "signal"
+      normalized_status = signal
+      if normalized_status >= 1 and normalized_status <= 64 then
+        shell_status = 128 + normalized_status
+      end
+    end
+    local missing = not interrupted and
+      (actual.code == 126 or actual.code == 127)
+    local succeeded = actual.code == 0
+    if interrupted then succeeded = false end
+
+    local result: {string: value} = {
+      ["started"] = not missing,
+      ["ok"] = succeeded,
+      ["status"] = normalized_status,
+      ["interrupted"] = interrupted,
+      ["command"] = command,
+      ["diagnostic"] = captured as string,
+      ["output"] = captured as string,
+    }
+    if signal then result["signal"] = signal end
+    if shell_status then result["shell_status"] = shell_status as integer end
+    result["why"] = why
+    return result
+  catch
+    kill_owned_process(process)
+    raise
+  end
+end
+
+local function spawn_and_capture(env_arguments: {string}, command: string,
+                                 merged: boolean): {string: value}
+  if merged then
+    local process = system.spawn(
+      "/usr/bin/env", env_arguments, system.with_merged_output)
+    return capture_process(process, command)
+  end
+  -- This matches io.popen(command, "r"): stdout is captured while stderr
+  -- remains the language-server process's diagnostic stream.
+  local process = system.spawn(
+    "/usr/bin/env", env_arguments, system.with_parent_stderr)
+  return capture_process(process, command)
+catch
+  if error is async.CancellationReason then raise end
+  return capture_failure(
+    command, "could not start captured command: " .. failure_message(error))
+end
+
+local function run_checked(argv_value: value,
+                           options_value: value): {string: value}
+  local argv?, argv_error? = normalize_argv(argv_value)
+  if not argv then return invalid_run(argv_error as string) end
+  if #argv == 0 then return invalid_run("command is empty") end
+  local merged?, options_error? = merge_stderr(options_value)
+  if merged == nil then return invalid_run(options_error as string) end
+
+  local arguments = argv as {string}
+  local should_merge = merged as boolean
+  local command = command_label(arguments, should_merge)
+  local env_arguments: {string} = {"LANG=C", "LC_ALL=C"}
+  for index = 1, #arguments do
+    env_arguments[#env_arguments + 1] = arguments[index]
+  end
+
+  return spawn_and_capture(env_arguments, command, should_merge)
+catch
+  if error is async.CancellationReason then raise end
+  return invalid_run("command must be a dense argument array")
+end
+
+function CompilerIO:run(argv: value, options: value): {string: value}
+  return run_checked(argv, options)
+end

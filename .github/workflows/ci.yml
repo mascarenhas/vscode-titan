@@ -1,0 +1,81 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify-linux-x64:
+    name: Verify Ubuntu 22.04 x64
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+
+    env:
+      CCACHE_DISABLE: "1"
+      CI: "true"
+      READLINE_MODE: bundled
+      TITAN_MAX_GLIBC_VERSION: "2.35"
+
+    steps:
+      - name: Check out vscode-titan
+        uses: actions/checkout@v7.0.1
+        with:
+          path: vscode-titan
+          persist-credentials: false
+
+      - name: Check out pinned Titan compiler and standard library
+        uses: actions/checkout@v7.0.1
+        with:
+          repository: mascarenhas/titan
+          ref: 2edaa6eccff93d4b2f674b2f407709db5e015464
+          path: titan
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7.0.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: vscode-titan/package-lock.json
+
+      - name: Install native and extension-host dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            binutils \
+            build-essential \
+            ca-certificates \
+            cmake \
+            curl \
+            file \
+            git \
+            libssl-dev \
+            libtinfo-dev \
+            libuv1-dev \
+            perl \
+            pkg-config \
+            unzip \
+            xauth \
+            xvfb
+
+      - name: Build, test, package, and inspect
+        working-directory: vscode-titan
+        run: xvfb-run -a make -j1 verify TITAN_REPO="$GITHUB_WORKSPACE/titan"
+
+      - name: Upload Linux x64 VSIX
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: titan-linux-x64-vsix
+          path: vscode-titan/.build/vsix/titan-linux-x64.vsix
+          if-no-files-found: error
+          include-hidden-files: true

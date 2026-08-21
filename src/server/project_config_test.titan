@@ -1,0 +1,119 @@
+local fs = import "fs"
+local test = import "test"
+local strings = import "string"
+local config = import "server.project_config"
+local source_text = import "server.source_text"
+local test_runtime = import "server.test_runtime"
+
+local type FixtureBody = (string) -> ()
+
+local function with_temporary_project(body: FixtureBody)
+  local root = fs.tmpname()
+  fs.unlink(root)
+  fs.mkdir(root)
+  defer fs.rmdir(root)
+  body(root)
+end
+
+local function run_without_config()
+  with_temporary_project(function (root: string)
+    local loaded?, failure? = config.load(root, "/sdk/lib/titan/0.26")
+    test.assert(failure == nil and loaded ~= nil,
+                "missing optional config did not use defaults")
+    test.assert(loaded.project_root == root and loaded.config_file == nil,
+                "default config did not retain its project identity")
+    test.assert(loaded.source_modules_root == root,
+                "source root did not default to the project root")
+    test.assert(loaded.binary_modules_root == "/sdk/lib/titan/0.26",
+                "binary root did not default to the installed ABI tree")
+    test.assert(#loaded.extra_ffi_include_dirs == 0,
+                "include directories did not default to an empty array")
+  end)
+end
+
+function test_project_config_defaults_when_root_file_is_absent(
+    _context: test.Context)
+  test_runtime.run(run_without_config)
+end
+
+local function run_relative_config()
+  with_temporary_project(function (root: string)
+    local filename = root .. "/titan-config.lua"
+    fs.write_file(filename, [[
+return {
+  source_modules_root = "src/../modules",
+  binary_modules_root = "./vendor/titan",
+  extra_ffi_include_dirs = { "./include", "../shared/include" },
+}
+]])
+    defer fs.unlink(filename)
+
+    local loaded?, failure? = config.load(root, "/sdk/lib/titan/0.26")
+    test.assert(failure == nil and loaded ~= nil,
+                "valid titan-config.lua was rejected")
+    test.assert(loaded.config_file == filename,
+                "loaded config did not retain its filename")
+    test.assert(loaded.source_modules_root == root .. "/modules",
+                "relative source root was not resolved from the config file")
+    test.assert(loaded.binary_modules_root == root .. "/vendor/titan",
+                "relative binary root was not resolved from the config file")
+    local shared_include?, shared_failure? =
+      source_text.resolve_path(root, "../shared/include")
+    test.assert(shared_failure == nil and shared_include ~= nil,
+                "test fixture could not resolve its expected include path")
+    test.assert(#loaded.extra_ffi_include_dirs == 2 and
+                loaded.extra_ffi_include_dirs[1] == root .. "/include" and
+                loaded.extra_ffi_include_dirs[2] == shared_include,
+                "FFI include directories were not normalized in array order")
+  end)
+end
+
+function test_project_config_normalizes_typed_relative_paths(
+    _context: test.Context)
+  test_runtime.run(run_relative_config)
+end
+
+local function assert_config_error(root: string, source: string,
+                                   expected: string)
+  local filename = root .. "/titan-config.lua"
+  fs.write_file(filename, source)
+  local loaded?, failure? = config.load(root, "/sdk/lib/titan/0.26")
+  test.assert(loaded == nil and failure ~= nil,
+              "malformed project configuration was accepted")
+  test.assert(failure.path == filename and
+              strings.find(failure.message, expected) ~= nil,
+              "project configuration error was not actionable")
+end
+
+local function run_invalid_configs()
+  with_temporary_project(function (root: string)
+    local filename = root .. "/titan-config.lua"
+    defer fs.unlink(filename)
+
+    assert_config_error(root, "return 42\n", "return one Lua table")
+    assert_config_error(root,
+      "return { source_modules_root = false }\n",
+      "source_modules_root must be a string")
+    assert_config_error(root,
+      "return { extra_ffi_include_dirs = { [2] = './two' } }\n",
+      "dense Lua array")
+    assert_config_error(root,
+      "return { extra_ffi_include_dirs = { './one', 2 } }\n",
+      "entries must be strings")
+    assert_config_error(root,
+      "return { source_module_root = './typo' }\n",
+      "unknown titan-config.lua field")
+    assert_config_error(root,
+      "print('must never reach LSP stdout')\nreturn {}\n",
+      "cannot evaluate")
+    assert_config_error(root,
+      "io.write('must never reach LSP stdout')\nreturn {}\n",
+      "cannot evaluate")
+    assert_config_error(root, "return {\n", "cannot evaluate")
+  end)
+end
+
+function test_project_config_rejects_untyped_sparse_or_invalid_values(
+    _context: test.Context)
+  test_runtime.run(run_invalid_configs)
+end

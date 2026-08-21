@@ -1,0 +1,286 @@
+local async = import "async"
+local fs = import "fs"
+local test = import "test"
+local timer = import "timer"
+local project_watcher = import "server.project_watcher.titan"
+local test_runtime = import "server.test_runtime"
+
+local record Fake
+  watching: {string: boolean}
+  operations: {string}
+  batches: {{project_watcher.BackendEvent}}
+  waiter: async.Task?
+  active_polls: integer
+  maximum_active_polls: integer
+  poll_count: integer
+  clear_count: integer
+end
+
+local function Fake:canonicalize(path: string): string
+  self.operations[#self.operations + 1] = "canonicalize:" .. path
+  return path
+end
+
+local function Fake:watch(path: string)
+  self.operations[#self.operations + 1] = "watch:" .. path
+  self.watching[path] = true
+end
+
+local function Fake:stop(path: string)
+  self.operations[#self.operations + 1] = "stop:" .. path
+  self.watching[path] = nil
+end
+
+local function Fake:is_watching(path: string): boolean
+  return self.watching[path] == true
+end
+
+local function Fake:clear()
+  self.operations[#self.operations + 1] = "clear"
+  self.clear_count = self.clear_count + 1
+  self.watching = {}
+end
+
+local function Fake:remove_first_batch():
+    {project_watcher.BackendEvent}
+  local result = self.batches[1]
+  local count = #self.batches
+  for index = 1, count - 1 do
+    self.batches[index] = self.batches[index + 1]
+  end
+  self.batches[count] = nil
+  return result
+end
+
+local function Fake:poll(): {project_watcher.BackendEvent}
+  self.poll_count = self.poll_count + 1
+  self.active_polls = self.active_polls + 1
+  if self.active_polls > self.maximum_active_polls then
+    self.maximum_active_polls = self.active_polls
+  end
+  self.operations[#self.operations + 1] = "poll:start"
+  defer do
+    self.active_polls = self.active_polls - 1
+    self.operations[#self.operations + 1] = "poll:end"
+  end
+
+  local current = async.running()
+  local detach = function ()
+    if self.waiter == current then self.waiter = nil end
+  end
+  defer detach()
+  while #self.batches == 0 do
+    self.waiter = current
+    async.suspend(detach)
+  end
+
+  local result = self:remove_first_batch()
+  for index = 1, #result do
+    case result[index]
+    when deleted: path then self.watching[path] = nil
+    else
+    end
+  end
+  return result
+end
+
+local function Fake:push(events: {project_watcher.BackendEvent})
+  self.batches[#self.batches + 1] = events
+  local waiter? = self.waiter
+  if waiter ~= nil then waiter:resume() end
+end
+
+local function Fake:backend(): project_watcher.Backend
+  return project_watcher.Backend.new(
+    function (path: string): string return self:canonicalize(path) end,
+    function (path: string) self:watch(path) end,
+    function (path: string) self:stop(path) end,
+    function (path: string): boolean return self:is_watching(path) end,
+    function () self:clear() end,
+    function (): {project_watcher.BackendEvent} return self:poll() end)
+end
+
+local function scope(project: {string}, configuration: {string}):
+    project_watcher.DirectoryScope
+  return project_watcher.DirectoryScope.new(project, configuration)
+end
+
+local function wait_until(predicate: () -> boolean, message: string)
+  for _attempt = 1, 200 do
+    if predicate() then return end
+    timer.yield()
+  end
+  test.assert(false, message)
+end
+
+local function contains(items: {string}, wanted: string): boolean
+  for index = 1, #items do
+    if items[index] == wanted then return true end
+  end
+  return false
+end
+
+local function fake_lifecycle_and_coalescing()
+  local fake = Fake.new({}, {}, {}, nil, 0, 0, 0, 0)
+  local received: {project_watcher.RediscoveryBatch} = {}
+  local owner?: project_watcher.ProjectWatcher
+  owner = project_watcher.start_with_backend(
+    fake:backend(), scope({"/project/a", "/project/a"}, {"/config"}),
+    function (batch: project_watcher.RediscoveryBatch)
+      received[#received + 1] = batch
+      if batch.watch_set_changed then
+        -- Project discovery may change the directory set in direct response to
+        -- a hint. This runs after poll returned and must not self-join.
+        owner:reconcile(scope({}, {"/config"}))
+      end
+    end)
+  defer owner:stop()
+
+  wait_until(function (): boolean return fake.active_polls == 1 end,
+             "initial project watch poll did not start")
+  test.assert(fake.maximum_active_polls == 1,
+              "project watcher started concurrent backend polls")
+  test.assert(fake.watching["/project/a"] and fake.watching["/config"] and
+              not fake.watching["/external"],
+              "watcher registered outside the supplied project/config set")
+
+  owner:reconcile(scope({"/project/b"}, {"/config"}))
+  wait_until(function (): boolean return fake.active_polls == 1 end,
+             "reconciled project watch poll did not restart")
+  test.assert(not fake.watching["/project/a"] and
+              fake.watching["/project/b"] and fake.watching["/config"],
+              "directory reconciliation retained the wrong registrations")
+  test.assert(fake.maximum_active_polls == 1,
+              "reconciliation overlapped old and new polls")
+
+  fake:push({
+    project_watcher.BackendEvent.changed("/project/b/file.titan"),
+    project_watcher.BackendEvent.changed("/project/b/file.titan"),
+    project_watcher.BackendEvent.deleted("/project/b"),
+    project_watcher.BackendEvent.changed("/config/titan-config.lua"),
+    project_watcher.BackendEvent.failed(project_watcher.WatchFailure.new(
+      5, "EIO", "input/output error", "fs.watcher")),
+  })
+  wait_until(function (): boolean return #received == 1 end,
+             "coalesced watcher batch was not published")
+
+  local batch = received[1]
+  test.assert(#batch.paths == 3 and
+              batch.paths[1] == "/project/b/file.titan" and
+              batch.paths[2] == "/project/b" and
+              batch.paths[3] == "/config/titan-config.lua",
+              "watcher did not coalesce duplicate path hints in order")
+  test.assert(#batch.failures == 1 and
+              batch.failures[1].operation == "fs.watcher",
+              "watcher did not preserve a typed polling failure")
+  test.assert(batch.watch_set_changed,
+              "deleted registration was not reported as retired")
+  local active = owner:watched_directories()
+  test.assert(#active == 1 and active[1] == "/config",
+              "deleted registration remained in the active set")
+
+  wait_until(function (): boolean return fake.active_polls == 1 end,
+             "watcher did not continue polling a surviving registration")
+  local before_stop = #fake.operations
+  owner:stop()
+  test.assert(fake.active_polls == 0 and fake.clear_count == 1,
+              "stop did not join the poll and clear the backend")
+  test.assert(fake.operations[before_stop + 1] == "poll:end" and
+              fake.operations[before_stop + 2] == "stop:/config" and
+              fake.operations[before_stop + 3] == "clear",
+              "stop did not retire the poll before registrations and clear")
+  test.assert(not contains(fake.operations, "stop:/project/b"),
+              "stop tried to retire an already deleted registration")
+
+  local completed_operations = #fake.operations
+  owner:stop()
+  test.assert(owner:is_stopped() and
+              #fake.operations == completed_operations,
+              "project watcher stop was not idempotent")
+end
+
+function test_project_watcher_owns_one_poll_and_coalesces_hints(
+    _context: test.Context)
+  test_runtime.run(fake_lifecycle_and_coalescing)
+end
+
+local function remove_if_present(path: string)
+  local metadata? = fs.lstat(path)
+  if metadata == nil then return end
+  if metadata.kind == "directory" then
+    fs.rmdir(path)
+  else
+    fs.unlink(path)
+  end
+end
+
+local function real_saved_file_hint()
+  local root = fs.tmpname()
+  fs.unlink(root)
+  fs.mkdir(root)
+  defer remove_if_present(root)
+
+  local changed = root .. "/changed.titan"
+  local late = root .. "/late.titan"
+  defer remove_if_present(changed)
+  defer remove_if_present(late)
+
+  local callbacks = 0
+  local path_callbacks = 0
+  local owner = project_watcher.start(
+    scope({root}, {}),
+    function (batch: project_watcher.RediscoveryBatch)
+      callbacks = callbacks + 1
+      local matched = false
+      for index = 1, #batch.paths do
+        if batch.paths[index] == changed then matched = true end
+      end
+      if matched then path_callbacks = path_callbacks + 1 end
+    end)
+  defer owner:stop()
+
+  local wait_for_next_path_callback = function (previous: integer,
+                                                 description: string)
+    for _attempt = 1, 100 do
+      if path_callbacks > previous then return end
+      timer.sleep(10)
+    end
+    test.assert(false, description)
+  end
+
+  -- Darwin establishes its FSEvents stream asynchronously after registration;
+  -- the same portable boundary is used by Titan's fs watcher suite.
+  timer.sleep(100)
+  local before_create = path_callbacks
+  fs.write_file(changed, "created")
+  wait_for_next_path_callback(
+    before_create, "real directory watcher did not publish file creation")
+  test.assert(path_callbacks > before_create,
+              "file creation callback did not contain the saved path")
+
+  local before_modify = path_callbacks
+  fs.write_file(changed, "modified contents")
+  wait_for_next_path_callback(
+    before_modify, "real directory watcher did not publish file modification")
+  test.assert(path_callbacks > before_modify,
+              "file modification callback did not contain the saved path")
+
+  local before_delete = path_callbacks
+  fs.unlink(changed)
+  wait_for_next_path_callback(
+    before_delete, "real directory watcher did not publish file deletion")
+  test.assert(path_callbacks > before_delete,
+              "file deletion callback did not contain the saved path")
+
+  owner:stop()
+  local before_late_write = callbacks
+  fs.write_file(late, "after stop")
+  timer.sleep(50)
+  test.assert(callbacks == before_late_write,
+              "stopped project watcher published a later filesystem event")
+end
+
+function test_project_watcher_observes_real_saved_file_changes(
+    _context: test.Context)
+  test_runtime.run(real_saved_file_hint)
+end

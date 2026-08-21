@@ -1,0 +1,357 @@
+local async = import "async"
+local fs = import "fs"
+local iteration = import "titan.iteration"
+local strings = import "string"
+local source_text = import "server.source_text"
+
+union ModuleKind
+  flat
+  folder
+end
+
+record Module
+  name: string
+  kind: ModuleKind
+  main_file: string
+  files: {string}
+end
+
+function Module:is_folder(): boolean
+  case self.kind
+  when folder then return true
+  else return false
+  end
+end
+
+record Issue
+  path: string
+  message: string
+end
+
+record Error
+  path: string
+  message: string
+end
+
+record Discovery
+  source_root: string
+  directories: {string}
+  modules: {Module}
+  owner_by_file: {string: string}
+  issues: {Issue}
+end
+
+function Discovery:find_module(name: string): Module?
+  for index = 1, #self.modules do
+    if self.modules[index].name == name then return self.modules[index] end
+  end
+  return nil
+end
+
+function Discovery:owner_for_file(path: string): string?
+  local normalized?: string
+  if strings.sub(path, 1, 1) == "/" then
+    normalized = source_text.normalize_absolute_path(path)
+  else
+    normalized = source_text.resolve_path(self.source_root, path)
+  end
+  if normalized == nil then return nil end
+  local owner? = self.owner_by_file[normalized]
+  return owner
+end
+
+local record FileEntry
+  path: string
+  relative: string
+  directory: string
+  basename: string
+end
+
+local function fail<T>(path: string, message: string): T
+  raise Error.new(path, message)
+end
+
+local function bytewise_less(left: string, right: string): boolean
+  local limit = #left
+  if #right < limit then limit = #right end
+  for index = 1, limit do
+    local left_byte: integer = strings.byte(left, index)
+    local right_byte: integer = strings.byte(right, index)
+    if left_byte < right_byte then return true end
+    if left_byte > right_byte then return false end
+  end
+  return #left < #right
+end
+
+local function sort_strings(items: {string})
+  for index = 2, #items do
+    local item = items[index]
+    local target = index
+    while target > 1 and bytewise_less(item, items[target - 1]) do
+      items[target] = items[target - 1]
+      target = target - 1
+    end
+    items[target] = item
+  end
+end
+
+local function sort_files(items: {FileEntry})
+  for index = 2, #items do
+    local item = items[index]
+    local target = index
+    while target > 1 and
+          bytewise_less(item.basename, items[target - 1].basename) do
+      items[target] = items[target - 1]
+      target = target - 1
+    end
+    items[target] = item
+  end
+end
+
+local function sort_modules(items: {Module})
+  for index = 2, #items do
+    local item = items[index]
+    local target = index
+    while target > 1 and bytewise_less(item.name, items[target - 1].name) do
+      items[target] = items[target - 1]
+      target = target - 1
+    end
+    items[target] = item
+  end
+end
+
+local function sort_issues(items: {Issue})
+  for index = 2, #items do
+    local item = items[index]
+    local target = index
+    while target > 1 and bytewise_less(item.path, items[target - 1].path) do
+      items[target] = items[target - 1]
+      target = target - 1
+    end
+    items[target] = item
+  end
+end
+
+local function join(root: string, name: string): string
+  if root == "/" then return "/" .. name end
+  return root .. "/" .. name
+end
+
+local function titan_source(name: string): boolean
+  return #name >= 6 and strings.sub(name, #name - 5) == ".titan"
+end
+
+local function source_stem(name: string): string
+  return strings.sub(name, 1, #name - 6)
+end
+
+local function valid_component(component: string): boolean
+  if component == "" then return false end
+  local first: integer = strings.byte(component, 1)
+  local first_valid = first == 95
+  if first >= 65 and first <= 90 then first_valid = true end
+  if first >= 97 and first <= 122 then first_valid = true end
+  if not first_valid then
+    return false
+  end
+  for index = 2, #component do
+    local byte: integer = strings.byte(component, index)
+    local valid = byte == 95
+    if byte == 45 then valid = true end
+    if byte >= 65 and byte <= 90 then valid = true end
+    if byte >= 97 and byte <= 122 then valid = true end
+    if byte >= 48 and byte <= 57 then valid = true end
+    if not valid then
+      return false
+    end
+  end
+  return true
+end
+
+local function collect(directory: string, relative_directory: string,
+                       files: {FileEntry}, directories: {string})
+  directories[#directories + 1] = directory
+  local entries = fs.list(directory)
+  sort_strings(entries)
+  for index = 1, #entries do
+    local name = entries[index]
+    local path = join(directory, name)
+    local relative = name
+    if relative_directory ~= "" then
+      relative = relative_directory .. "/" .. name
+    end
+    local metadata? = fs.lstat(path)
+    if metadata ~= nil then
+      -- A directory component that cannot occur in a logical Titan module
+      -- cannot contain a resolvable descendant either. Pruning it here keeps
+      -- build/tooling trees such as .build, .titan, and .git out of both
+      -- project discovery and the watcher set.
+      if metadata.kind == "directory" and valid_component(name) then
+        collect(path, relative, files, directories)
+      elseif metadata.kind == "file" and titan_source(name) then
+        files[#files + 1] =
+          FileEntry.new(path, relative, relative_directory, name)
+      end
+      -- Symlinks are deliberately not followed. The project identity is the
+      -- lexical source tree, and a watch must not escape it through a link.
+    end
+  end
+end
+
+local function path_components(path: string): {string}
+  local result: {string} = {}
+  local start = 1
+  local index = 1
+  while index <= #path + 1 do
+    if index == #path + 1 or strings.byte(path, index) == 47 then
+      result[#result + 1] = strings.sub(path, start, index - 1)
+      start = index + 1
+    end
+    index = index + 1
+  end
+  return result
+end
+
+local function dotted(components: {string}, count: integer): string
+  local output = strings.writer()
+  for index = 1, count do
+    if index > 1 then output:write(".") end
+    output:write(components[index])
+  end
+  return output:drain()
+end
+
+function valid_module_name(name: string): boolean
+  local components: {string} = {}
+  local start = 1
+  local index = 1
+  while index <= #name + 1 do
+    if index == #name + 1 or strings.byte(name, index) == 46 then
+      local component = strings.sub(name, start, index - 1)
+      if not valid_component(component) then return false end
+      components[#components + 1] = component
+      start = index + 1
+    end
+    index = index + 1
+  end
+  if #components == 0 then return false end
+  if #components == 1 then return true end
+  return components[#components] ~= "titan"
+end
+
+local function flat_module_name(entry: FileEntry): string
+  local stem = strings.sub(entry.relative, 1, #entry.relative - 6)
+  local components = path_components(stem)
+  return dotted(components, #components)
+end
+
+local function folder_module_name(entry: FileEntry): string?
+  if entry.directory == "" then return nil end
+  local components = path_components(entry.directory)
+  local stem = source_stem(entry.basename)
+  if components[#components] ~= stem then return nil end
+  local name = dotted(components, #components)
+  if not valid_module_name(name) then return nil end
+  return name
+end
+
+local function absolute_root(path: string): string
+  local candidate = path
+  if candidate == "" then candidate = "." end
+  if strings.sub(candidate, 1, 1) == "/" then
+    local normalized?, failure? =
+      source_text.normalize_absolute_path(candidate)
+    if normalized == nil then return fail<string>(path, failure.message) end
+    return normalized
+  end
+  local normalized?, failure? =
+    source_text.resolve_path(fs.pwd(), candidate)
+  if normalized == nil then return fail<string>(path, failure.message) end
+  return normalized
+end
+
+local function discover_or_raise(source_root: string): Discovery
+  local root = absolute_root(source_root)
+  local root_metadata? = fs.stat(root)
+  if root_metadata == nil then
+    return fail<Discovery>(root, "source modules root does not exist")
+  end
+  if root_metadata.kind ~= "directory" then
+    return fail<Discovery>(root, "source modules root is not a directory")
+  end
+
+  local entries: {FileEntry} = {}
+  local directories: {string} = {}
+  collect(root, "", entries, directories)
+
+  local modules: {Module} = {}
+  local modules_by_name: {string: Module} = {}
+  local folders_by_directory: {string: Module} = {}
+  local owner_by_file: {string: string} = {}
+  local issues: {Issue} = {}
+
+  -- Folder mains are selected before flat files, exactly as driver.lua does.
+  for index = 1, #entries do
+    local entry = entries[index]
+    local name? = folder_module_name(entry)
+    if name ~= nil then
+      local module = Module.new(
+        name, ModuleKind.folder(), entry.path, {entry.path})
+      modules[#modules + 1] = module
+      modules_by_name[name] = module
+      folders_by_directory[entry.directory] = module
+      owner_by_file[entry.path] = name
+    end
+  end
+
+  -- Every immediate .titan sibling belongs to the folder module. Contributor
+  -- basenames use the compiler's raw byte ordering, while the main stays first.
+  for directory, module in iteration.pairs(folders_by_directory) do
+    local contributors: {FileEntry} = {}
+    for index = 1, #entries do
+      local entry = entries[index]
+      if entry.directory == directory and entry.path ~= module.main_file then
+        contributors[#contributors + 1] = entry
+      end
+    end
+    sort_files(contributors)
+    for index = 1, #contributors do
+      local contributor = contributors[index]
+      module.files[#module.files + 1] = contributor.path
+      owner_by_file[contributor.path] = module.name
+    end
+  end
+
+  for index = 1, #entries do
+    local entry = entries[index]
+    if owner_by_file[entry.path] == nil then
+      local name = flat_module_name(entry)
+      if not valid_module_name(name) then
+        issues[#issues + 1] = Issue.new(
+          entry.path,
+          "invalid logical Titan module name '" .. name .. "'")
+      elseif modules_by_name[name] == nil then
+        local module = Module.new(
+          name, ModuleKind.flat(), entry.path, {entry.path})
+        modules[#modules + 1] = module
+        modules_by_name[name] = module
+        owner_by_file[entry.path] = name
+      end
+      -- A same-name flat file is shadowed by the already selected folder main.
+    end
+  end
+
+  sort_modules(modules)
+  sort_issues(issues)
+  return Discovery.new(root, directories, modules, owner_by_file, issues)
+end
+
+function discover(source_root: string): (Discovery?, Error?)
+  do
+    return discover_or_raise(source_root), nil
+  catch
+    if error is async.CancellationReason then raise end
+    if error is Error then return nil, error as Error end
+    return nil, Error.new(source_root, strings.tostring(error))
+  end
+end

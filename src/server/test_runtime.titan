@@ -1,0 +1,26 @@
+local async = import "async"
+
+type Body = () -> ()
+
+-- The repository builds server tests with --no-uv-bootstrap so each async
+-- case owns one complete Runtime session explicitly.
+function run(body: Body)
+  local failed = false
+  local failure: value = nil
+  local supervisor = async.run<nil, value>(function (): nil
+    do
+      body()
+    catch
+      failed = true
+      failure = error
+    end
+    return nil
+  end)
+
+  async.loop()
+  if not supervisor:status():has_succeeded() then
+    raise "async test supervisor ended " ..
+      supervisor:status():as_string()
+  end
+  if failed then raise failure end
+end

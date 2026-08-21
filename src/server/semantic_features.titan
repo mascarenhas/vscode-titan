@@ -1,0 +1,858 @@
+local strings = import "string"
+local bridge = import "server.compiler_bridge"
+local lsp = import "server.lsp_types"
+local indexer = import "server.semantic_index"
+local source_text = import "server.source_text"
+
+record Error
+  const message: string
+end
+
+record Location
+  const uri: string
+  const range: source_text.Span
+end
+
+record Hover
+  const range: source_text.Span
+  const inferred_type: bridge.TypeInfo?
+  const declared_type: bridge.TypeInfo?
+  const original_type: bridge.TypeInfo?
+  const coerced_type: bridge.TypeInfo?
+  const local_declaration: boolean?
+end
+
+local record SavedFile
+  const module_name: string
+  const contents: string
+end
+
+local record RenameAnchor
+  const filename: string
+  const before: source_text.ByteSpan
+  const after: source_text.Span
+end
+
+local record PendingRenameAnchor
+  const filename: string
+  const before: source_text.ByteSpan
+  const after_start: integer
+  const after_finish: integer
+end
+
+-- RenameCandidate is intentionally not an encodable workspace edit. Its
+-- edited_project_modules method supplies the in-memory saved-file snapshot to
+-- the compiler. Only preflight can produce VerifiedRename after that analysis
+-- has no diagnostics and every edited occurrence resolves to one declaration.
+record RenameCandidate
+  local const old_name: string
+  local const new_name: string
+  local const edited_projects: {bridge.ProjectModule}
+  local const documents: {lsp.DocumentEdits}
+  local const anchors: {RenameAnchor}
+end
+
+record VerifiedRename
+  local const documents: {lsp.DocumentEdits}
+end
+
+record Features
+  local const projects: {bridge.ProjectModule}
+  local const snapshots: {bridge.ModuleSnapshot}
+  local const files: {string: SavedFile}
+  local const index: indexer.Index
+end
+
+local function fail<T>(message: string): T
+  raise Error.new(message)
+end
+
+local function rejected<T>(message: string): (T?, Error?)
+  return nil, Error.new(message)
+end
+
+local function copy_position(position: source_text.Position):
+    source_text.Position
+  return source_text.Position.new(position.line, position.character)
+end
+
+local function copy_span(span: source_text.Span): source_text.Span
+  return source_text.Span.new(
+    copy_position(span.start), copy_position(span.finish))
+end
+
+local function copy_edit(edit: lsp.TextEdit): lsp.TextEdit
+  return lsp.TextEdit.new(copy_span(edit.range), edit.new_text)
+end
+
+local function copy_documents(source: {lsp.DocumentEdits}):
+    {lsp.DocumentEdits}
+  local result: {lsp.DocumentEdits} = {}
+  for index = 1, #source do
+    local edits: {lsp.TextEdit} = {}
+    for edit_index = 1, #source[index].edits do
+      edits[edit_index] = copy_edit(source[index].edits[edit_index])
+    end
+    result[index] = lsp.DocumentEdits.new(source[index].uri, edits)
+  end
+  return result
+end
+
+local function copy_projects(source: {bridge.ProjectModule}):
+    {bridge.ProjectModule}
+  local result: {bridge.ProjectModule} = {}
+  for module_index = 1, #source do
+    local module = source[module_index]
+    local files: {bridge.SourceFile} = {}
+    for file_index = 1, #module.files do
+      local file = module.files[file_index]
+      files[file_index] = bridge.SourceFile.new(file.filename, file.contents)
+    end
+    result[module_index] = bridge.ProjectModule.new(module.module_name, files)
+  end
+  return result
+end
+
+local function saved_files(projects: {bridge.ProjectModule}):
+    {string: SavedFile}
+  local result: {string: SavedFile} = {}
+  local modules: {string: boolean} = {}
+  for module_index = 1, #projects do
+    local module = projects[module_index]
+    if modules[module.module_name] then
+      return fail<{string: SavedFile}>(
+        "duplicate saved project module '" .. module.module_name .. "'")
+    end
+    modules[module.module_name] = true
+    for file_index = 1, #module.files do
+      local file = module.files[file_index]
+      if result[file.filename] ~= nil then
+        return fail<{string: SavedFile}>(
+          "saved source file belongs to more than one project module: " ..
+          file.filename)
+      end
+      result[file.filename] = SavedFile.new(
+        module.module_name, file.contents)
+    end
+  end
+  return result
+end
+
+function build(projects: {bridge.ProjectModule},
+               snapshots: {bridge.ModuleSnapshot}): Features
+  local owned_projects = copy_projects(projects)
+  local owned_snapshots: {bridge.ModuleSnapshot} = {}
+  for index = 1, #snapshots do owned_snapshots[index] = snapshots[index] end
+  return Features.new(
+    owned_projects, owned_snapshots, saved_files(owned_projects),
+    indexer.build(owned_projects, owned_snapshots))
+end
+
+local function location_for(occurrence: indexer.Occurrence): Location
+  local uri?, uri_error? = source_text.path_to_file_uri(occurrence.filename)
+  if uri == nil then
+    local detail = "invalid project source path"
+    if uri_error ~= nil then detail = uri_error.message end
+    return fail<Location>(
+      "cannot encode location for '" .. occurrence.filename .. "': " ..
+      detail)
+  end
+  return Location.new(uri, copy_span(occurrence.span))
+end
+
+function Features:definition(filename: string,
+                             position: source_text.Position): Location?
+  local occurrence? = self.index:occurrence_at(filename, position)
+  if occurrence == nil then return nil end
+  local definition? = self.index:definition(occurrence.symbol_id)
+  if definition == nil then
+    -- The symbol is unresolved or declared in external/foreign source. V1
+    -- never navigates outside the project snapshot.
+    return nil
+  end
+  return location_for(definition)
+end
+
+function Features:references(filename: string, position: source_text.Position,
+                             include_declaration: boolean): {Location}
+  local occurrence? = self.index:occurrence_at(filename, position)
+  if occurrence == nil then return {} end
+  local occurrences = self.index:occurrences(
+    occurrence.symbol_id, include_declaration)
+  local result: {Location} = {}
+  for index = 1, #occurrences do
+    result[index] = location_for(occurrences[index])
+  end
+  return result
+end
+
+local function same_type(left: bridge.TypeInfo?,
+                         right: bridge.TypeInfo?): boolean
+  if left == nil or right == nil then return left == nil and right == nil end
+  return left.tag == right.tag and left.display == right.display
+end
+
+local function compiler_offset(source: string,
+                               location: bridge.SourceLocation): integer?
+  if location.line < 1 or location.column < 1 then return nil end
+  local index = 1
+  local line = 1
+  while line < location.line do
+    if index > #source then return nil end
+    local byte: integer = strings.byte(source, index)
+    index = index + 1
+    if byte == 0x0a then line = line + 1 end
+  end
+
+  local target = index + location.column - 1
+  local finish = index
+  while finish <= #source and strings.byte(source, finish) ~= 0x0a do
+    finish = finish + 1
+  end
+  if target > finish then return nil end
+  return target - 1
+end
+
+local function matching_hover_node(snapshot: bridge.ModuleSnapshot,
+                                   saved: SavedFile,
+                                   occurrence: indexer.Occurrence): bridge.Node?
+  local selected: bridge.Node? = nil
+  local selected_score = -1
+  for index = 1, #snapshot.nodes do
+    local node = snapshot.nodes[index]
+    local location? = node.location
+    if not node.synthetic and location ~= nil and node.name ~= nil and
+       location.filename == occurrence.filename and
+       node.name == occurrence.name and
+       compiler_offset(saved.contents, location) == occurrence.byte_span.start
+    then
+      local score = 0
+      if node.inferred_type ~= nil then score = score + 1 end
+      if node.declared_type ~= nil then score = score + 2 end
+      if node.original_type ~= nil and node.coerced_type ~= nil then
+        score = score + 4
+      end
+      -- Later nodes are normally the more specific child in the compiler's
+      -- preorder AST, so equal richness deliberately replaces its parent.
+      if score >= selected_score then
+        selected = node
+        selected_score = score
+      end
+    end
+  end
+  return selected
+end
+
+local function node_by_id(snapshot: bridge.ModuleSnapshot,
+                          id: integer): bridge.Node?
+  if id >= 1 and id <= #snapshot.nodes and
+     snapshot.nodes[id].id == id then
+    return snapshot.nodes[id]
+  end
+  for index = 1, #snapshot.nodes do
+    if snapshot.nodes[index].id == id then return snapshot.nodes[index] end
+  end
+  return nil
+end
+
+local function semantic_container(kind: bridge.NodeKind): boolean
+  case kind
+  when expression then return true
+  when variable then return true
+  when type_syntax then return true
+  else return false
+  end
+end
+
+local function node_covers_occurrence(node: bridge.Node, saved: SavedFile,
+                                      occurrence: indexer.Occurrence): boolean
+  local location? = node.location
+  if location ~= nil and location.filename == occurrence.filename and
+     compiler_offset(saved.contents, location) == occurrence.byte_span.start
+  then
+    return true
+  end
+  local span? = node.source_span
+  if span == nil or not semantic_container(node.kind) or
+     span.start.filename ~= occurrence.filename or
+     span.finish.filename ~= occurrence.filename then
+    return false
+  end
+  local start? = compiler_offset(saved.contents, span.start)
+  local finish? = compiler_offset(saved.contents, span.finish)
+  return start ~= nil and finish ~= nil and
+         start <= occurrence.byte_span.start and
+         occurrence.byte_span.start < finish
+end
+
+local function snapshot_for_module(snapshots: {bridge.ModuleSnapshot},
+                                   module_name: string):
+    bridge.ModuleSnapshot?
+  for index = 1, #snapshots do
+    local snapshot = snapshots[index]
+    if snapshot.module_name == module_name then
+      case snapshot.provenance
+      when project_source then return snapshot
+      else return nil
+      end
+    end
+  end
+  return nil
+end
+
+function Features:hover(filename: string,
+                        position: source_text.Position): Hover?
+  local occurrence? = self.index:occurrence_at(filename, position)
+  if occurrence == nil then return nil end
+  local saved? = self.files[occurrence.filename]
+  if saved == nil then return nil end
+
+  local inferred: bridge.TypeInfo? = nil
+  local declared: bridge.TypeInfo? = nil
+  local original: bridge.TypeInfo? = nil
+  local coerced: bridge.TypeInfo? = nil
+  local snapshot? = snapshot_for_module(
+    self.snapshots, occurrence.module_name)
+  if snapshot ~= nil then
+    local node? = matching_hover_node(snapshot, saved, occurrence)
+    local current? = node
+    while current ~= nil and
+          node_covers_occurrence(current, saved, occurrence) do
+      if inferred == nil and current.inferred_type ~= nil then
+        inferred = current.inferred_type
+      end
+      if declared == nil and current.declared_type ~= nil then
+        declared = current.declared_type
+      end
+      if original == nil and coerced == nil and
+         current.original_type ~= nil and current.coerced_type ~= nil and
+         not same_type(current.original_type, current.coerced_type) then
+        original = current.original_type
+        coerced = current.coerced_type
+      end
+      local parent_id? = current.parent_id
+      if parent_id == nil then current = nil
+      else current = node_by_id(snapshot, parent_id) end
+    end
+  end
+  if inferred == nil then inferred = occurrence.type_info end
+
+  local local_declaration: boolean? = nil
+  local definition? = self.index:definition(occurrence.symbol_id)
+  if definition ~= nil then
+    local_declaration = definition.is_local
+  else
+    -- Imported declarations do not have a project definition occurrence, but
+    -- the compiler still supplies their localness at the use site. The same
+    -- fallback also covers a malformed snapshot that omitted a local
+    -- declaration occurrence.
+    local_declaration = occurrence.is_local
+  end
+
+  if inferred == nil and declared == nil and original == nil and
+     local_declaration == nil then
+    return nil
+  end
+  return Hover.new(copy_span(occurrence.span), inferred, declared,
+                   original, coerced, local_declaration)
+end
+
+local function write_type_line(output: strings.StringWriter, label: string,
+                               info: bridge.TypeInfo?)
+  if info == nil then return end
+  output:write("- ")
+  output:write(label)
+  output:write(": `")
+  output:write(info.display)
+  output:write("`\n")
+end
+
+function Hover:markdown(): string
+  local output = strings.writer()
+  write_type_line(output, "Inferred type", self.inferred_type)
+  write_type_line(output, "Declared type", self.declared_type)
+  if self.original_type ~= nil and self.coerced_type ~= nil then
+    write_type_line(output, "Original type", self.original_type)
+    write_type_line(output, "Coerced type", self.coerced_type)
+  end
+  if self.local_declaration ~= nil then
+    output:write("- Declaration: ")
+    if self.local_declaration then
+      output:write("local\n")
+    else
+      output:write("non-local\n")
+    end
+  end
+  return output:drain()
+end
+
+local function foldable_tag(tag: string): boolean
+  return tag == "Ast.TopLevelMethod" or
+    tag == "Ast.TopLevelStatic" or
+    tag == "Ast.TopLevelFunc" or
+    tag == "Ast.TopLevelForeignFunc" or
+    tag == "Ast.TopLevelRecord" or
+    tag == "Ast.TopLevelUnion" or
+    tag == "Ast.TopLevelInterface" or
+    tag == "Ast.ExpFunction" or
+    tag == "Ast.StatBlock" or
+    tag == "Ast.StatTry" or
+    tag == "Ast.StatIf" or
+    tag == "Ast.StatFor" or
+    tag == "Ast.StatForIn" or
+    tag == "Ast.StatWhile" or
+    tag == "Ast.StatRepeat" or
+    tag == "Ast.StatCase"
+end
+
+local function lsp_span_for_compiler_span(source: string,
+                                           span: bridge.SourceSpan):
+    source_text.Span
+  if span.start.filename ~= span.finish.filename then
+    return fail<source_text.Span>(
+      "compiler structural span crosses source files")
+  end
+  local start? = compiler_offset(source, span.start)
+  local finish? = compiler_offset(source, span.finish)
+  if start == nil or finish == nil or finish < start then
+    return fail<source_text.Span>(
+      "compiler structural span is outside the saved source")
+  end
+  local converted?, conversion_error? = source_text.span_for_offsets(
+    source, start, finish)
+  if converted == nil then
+    local detail = "invalid UTF-8 boundary"
+    if conversion_error ~= nil then detail = conversion_error.message end
+    return fail<source_text.Span>(
+      "cannot convert compiler structural span: " .. detail)
+  end
+  return converted
+end
+
+local function fold_less(left: lsp.FoldingRange,
+                         right: lsp.FoldingRange): boolean
+  if left.start_line ~= right.start_line then
+    return left.start_line < right.start_line
+  end
+  -- Outer ranges precede nested ranges that begin on the same line.
+  return left.end_line > right.end_line
+end
+
+local function same_fold(left: lsp.FoldingRange,
+                         right: lsp.FoldingRange): boolean
+  return left.start_line == right.start_line and
+         left.end_line == right.end_line
+end
+
+local function insert_fold(ranges: {lsp.FoldingRange},
+                           range: lsp.FoldingRange)
+  -- Reject an equal range before making room for an insertion. Comments are
+  -- added after structural ranges, so a duplicate can otherwise be discovered
+  -- only after later entries have already been shifted.
+  for index = 1, #ranges do
+    if same_fold(ranges[index], range) then return end
+  end
+  local target = #ranges + 1
+  while target > 1 and fold_less(range, ranges[target - 1]) do
+    ranges[target] = ranges[target - 1]
+    target = target - 1
+  end
+  ranges[target] = range
+end
+
+local record LongBracket
+  const level: integer
+  const contents_start: integer
+end
+
+-- Titan's compiler AST intentionally drops comments. Mirror only the lexical
+-- long-bracket boundary used by the Titan lexer; all language structures
+-- continue to come from compiler source spans.
+local function long_bracket(source: string, index: integer): LongBracket?
+  if index > #source or strings.byte(source, index) ~= 91 then return nil end
+  local cursor = index + 1
+  while cursor <= #source and strings.byte(source, cursor) == 61 do
+    cursor = cursor + 1
+  end
+  if cursor > #source or strings.byte(source, cursor) ~= 91 then return nil end
+  return LongBracket.new(cursor - index - 1, cursor + 1)
+end
+
+local function long_bracket_finish(source: string, bracket: LongBracket):
+    integer?
+  local index = bracket.contents_start
+  while index <= #source do
+    if strings.byte(source, index) == 93 then
+      local cursor = index + 1
+      local equals = 0
+      while equals < bracket.level and cursor <= #source and
+          strings.byte(source, cursor) == 61 do
+        cursor = cursor + 1
+        equals = equals + 1
+      end
+      if equals == bracket.level and cursor <= #source and
+          strings.byte(source, cursor) == 93 then
+        return cursor + 1
+      end
+    end
+    index = index + 1
+  end
+  return nil
+end
+
+local function skip_short_string(source: string, index: integer): integer
+  local delimiter: integer = strings.byte(source, index)
+  local cursor = index + 1
+  while cursor <= #source do
+    local byte: integer = strings.byte(source, cursor)
+    if byte == delimiter then return cursor + 1 end
+    if byte == 92 then
+      if cursor == #source then return #source + 1 end
+      local escaped: integer = strings.byte(source, cursor + 1)
+      if cursor + 2 <= #source then
+        local following: integer = strings.byte(source, cursor + 2)
+        if (escaped == 10 and following == 13) or
+            (escaped == 13 and following == 10) then
+          cursor = cursor + 3
+        else
+          cursor = cursor + 2
+        end
+      else
+        cursor = cursor + 2
+      end
+    else
+      cursor = cursor + 1
+    end
+  end
+  return #source + 1
+end
+
+local function insert_comment_fold(source: string, start_offset: integer,
+                                   finish_offset: integer,
+                                   ranges: {lsp.FoldingRange})
+  local start?, start_error? = source_text.position_for_offset(
+    source, start_offset)
+  local finish?, finish_error? = source_text.position_for_offset(
+    source, finish_offset)
+  if start_error ~= nil or finish_error ~= nil or
+      start == nil or finish == nil then
+    return
+  end
+  -- If anything follows the closing delimiter on its line, keep that whole
+  -- line visible rather than folding unrelated source text with the comment.
+  local end_line = finish.line
+  local cursor = finish_offset + 1
+  while cursor <= #source do
+    local byte: integer = strings.byte(source, cursor)
+    if byte == 10 or byte == 13 then break end
+    if byte ~= 9 and byte ~= 11 and byte ~= 12 and byte ~= 32 then
+      end_line = end_line - 1
+      break
+    end
+    cursor = cursor + 1
+  end
+  if end_line <= start.line then return end
+  insert_fold(ranges, lsp.FoldingRange.new(
+    start.line, nil, end_line, nil, "comment"))
+end
+
+local function insert_long_comment_folds(source: string,
+                                         ranges: {lsp.FoldingRange})
+  local index = 1
+  while index <= #source do
+    local byte: integer = strings.byte(source, index)
+    if byte == 34 or byte == 39 then
+      index = skip_short_string(source, index)
+    elseif byte == 91 then
+      local literal? = long_bracket(source, index)
+      if literal == nil then
+        index = index + 1
+      else
+        local finish? = long_bracket_finish(source, literal)
+        if finish == nil then return end
+        index = finish
+      end
+    elseif byte == 45 and index < #source and
+        strings.byte(source, index + 1) == 45 then
+      local comment? = long_bracket(source, index + 2)
+      if comment == nil then
+        index = index + 2
+        while index <= #source and strings.byte(source, index) ~= 10 do
+          index = index + 1
+        end
+      else
+        local finish? = long_bracket_finish(source, comment)
+        if finish == nil then return end
+        insert_comment_fold(source, index - 1, finish - 1, ranges)
+        index = finish
+      end
+    else
+      index = index + 1
+    end
+  end
+end
+
+function Features:folding_ranges(filename: string): {lsp.FoldingRange}
+  local saved? = self.files[filename]
+  if saved == nil then return {} end
+  local snapshot? = snapshot_for_module(self.snapshots, saved.module_name)
+  if snapshot == nil then return {} end
+
+  local result: {lsp.FoldingRange} = {}
+  for index = 1, #snapshot.nodes do
+    local node = snapshot.nodes[index]
+    local span? = node.source_span
+    if not node.synthetic and span ~= nil and foldable_tag(node.tag) and
+       span.start.filename == filename then
+      local converted = lsp_span_for_compiler_span(saved.contents, span)
+      -- The compiler's half-open finish is the start of the closing `end` or
+      -- `until`. LSP folding endLine is inclusive, so leave that closing line
+      -- visible and fold through the preceding line.
+      local end_line = converted.finish.line - 1
+      if end_line > converted.start.line then
+        insert_fold(result, lsp.FoldingRange.new(
+          converted.start.line, nil, end_line, nil, nil))
+      end
+    end
+  end
+  insert_long_comment_folds(saved.contents, result)
+  return result
+end
+
+local function edited_file(source: string,
+                           occurrences: {indexer.Occurrence},
+                           new_name: string):
+    (string, {PendingRenameAnchor}, {lsp.TextEdit})
+  local output = strings.writer()
+  local anchors: {PendingRenameAnchor} = {}
+  local edits: {lsp.TextEdit} = {}
+  local cursor = 0
+  local delta = 0
+  for index = 1, #occurrences do
+    local occurrence = occurrences[index]
+    if occurrence.byte_span.start < cursor then
+      raise Error.new("rename occurrences overlap")
+    end
+    output:write(strings.sub(
+      source, cursor + 1, occurrence.byte_span.start))
+    output:write(new_name)
+    local after_start = occurrence.byte_span.start + delta
+    local after_finish = after_start + #new_name
+    anchors[index] = PendingRenameAnchor.new(
+      occurrence.filename, occurrence.byte_span, after_start, after_finish)
+    edits[index] = lsp.TextEdit.new(copy_span(occurrence.span), new_name)
+    cursor = occurrence.byte_span.finish
+    delta = delta + #new_name -
+      (occurrence.byte_span.finish - occurrence.byte_span.start)
+  end
+  output:write(strings.sub(source, cursor + 1))
+  return output:drain(), anchors, edits
+end
+
+local function replace_anchor_offsets(anchors: {PendingRenameAnchor},
+                                      contents: string): {RenameAnchor}
+  local result: {RenameAnchor} = {}
+  for index = 1, #anchors do
+    local anchor = anchors[index]
+    local span?, failure? = source_text.span_for_offsets(
+      contents, anchor.after_start, anchor.after_finish)
+    if span == nil then
+      local detail = "invalid post-rename UTF-8 boundary"
+      if failure ~= nil then detail = failure.message end
+      return fail<{RenameAnchor}>(detail)
+    end
+    result[index] = RenameAnchor.new(anchor.filename, anchor.before, span)
+  end
+  return result
+end
+
+local function append_anchors(target: {RenameAnchor},
+                              source: {RenameAnchor})
+  for index = 1, #source do target[#target + 1] = source[index] end
+end
+
+local function occurrences_for_file(occurrences: {indexer.Occurrence},
+                                    filename: string): {indexer.Occurrence}
+  local result: {indexer.Occurrence} = {}
+  for index = 1, #occurrences do
+    if occurrences[index].filename == filename then
+      result[#result + 1] = occurrences[index]
+    end
+  end
+  return result
+end
+
+function Features:rename(filename: string, position: source_text.Position,
+                         new_name: string): (RenameCandidate?, Error?)
+  if not lsp.valid_identifier(new_name) then
+    return rejected<RenameCandidate>(
+      "rename target must be a non-keyword Titan identifier")
+  end
+  local selected? = self.index:occurrence_at(filename, position)
+  if selected == nil then return nil, nil end
+  local definition? = self.index:definition(selected.symbol_id)
+  if definition == nil then
+    return rejected<RenameCandidate>(
+      "cannot rename a symbol declared outside project source")
+  end
+
+  local occurrences = self.index:occurrences(selected.symbol_id, true)
+  if #occurrences == 0 then
+    return rejected<RenameCandidate>(
+      "cannot rename a symbol with no project occurrences")
+  end
+  local edited_contents: {string: string} = {}
+  local anchors: {RenameAnchor} = {}
+  local documents: {lsp.DocumentEdits} = {}
+  local filenames = self.index:file_names()
+  for file_index = 1, #filenames do
+    local current = occurrences_for_file(occurrences, filenames[file_index])
+    if #current > 0 then
+      local saved? = self.files[filenames[file_index]]
+      if saved == nil then
+        return rejected<RenameCandidate>(
+          "rename occurrence has no saved project source")
+      end
+      local contents, raw_anchors, edits = edited_file(
+        saved.contents, current, new_name)
+      edited_contents[filenames[file_index]] = contents
+      append_anchors(anchors, replace_anchor_offsets(raw_anchors, contents))
+      local uri?, uri_error? = source_text.path_to_file_uri(
+        filenames[file_index])
+      if uri == nil then
+        local detail = "invalid project source path"
+        if uri_error ~= nil then detail = uri_error.message end
+        return rejected<RenameCandidate>(detail)
+      end
+      documents[#documents + 1] = lsp.DocumentEdits.new(uri, edits)
+    end
+  end
+
+  local edited_projects: {bridge.ProjectModule} = {}
+  for module_index = 1, #self.projects do
+    local module = self.projects[module_index]
+    local files: {bridge.SourceFile} = {}
+    for file_index = 1, #module.files do
+      local file = module.files[file_index]
+      local contents? = edited_contents[file.filename]
+      if contents == nil then contents = file.contents end
+      files[file_index] = bridge.SourceFile.new(file.filename, contents)
+    end
+    edited_projects[module_index] = bridge.ProjectModule.new(
+      module.module_name, files)
+  end
+  return RenameCandidate.new(
+    definition.name, new_name, edited_projects, documents, anchors), nil
+end
+
+function RenameCandidate:edited_project_modules(): {bridge.ProjectModule}
+  return copy_projects(self.edited_projects)
+end
+
+function RenameCandidate:source_name(): string
+  return self.old_name
+end
+
+function RenameCandidate:target_name(): string
+  return self.new_name
+end
+
+local function same_position(left: source_text.Position,
+                             right: source_text.Position): boolean
+  return left.line == right.line and left.character == right.character
+end
+
+local function same_source_span(left: source_text.Span,
+                                right: source_text.Span): boolean
+  return same_position(left.start, right.start) and
+         same_position(left.finish, right.finish)
+end
+
+local function contains_anchor(anchors: {RenameAnchor},
+                               occurrence: indexer.Occurrence): boolean
+  for index = 1, #anchors do
+    if anchors[index].filename == occurrence.filename and
+       same_source_span(anchors[index].after, occurrence.span) then
+      return true
+    end
+  end
+  return false
+end
+
+function RenameCandidate:preflight(analysis: bridge.Analysis):
+    (VerifiedRename?, Error?)
+  if #analysis.diagnostics > 0 then
+    return rejected<VerifiedRename>(
+      "compiler rejected the candidate rename")
+  end
+
+  local project_snapshots: {bridge.ModuleSnapshot} = {}
+  local seen_projects: {string: boolean} = {}
+  for index = 1, #analysis.modules do
+    local snapshot = analysis.modules[index]
+    case snapshot.provenance
+    when project_source then
+      if seen_projects[snapshot.module_name] then
+        return rejected<VerifiedRename>(
+          "compiler returned a duplicate project snapshot")
+      end
+      seen_projects[snapshot.module_name] = true
+      project_snapshots[#project_snapshots + 1] = snapshot
+    else
+      project_snapshots[#project_snapshots + 1] = snapshot
+    end
+  end
+  for index = 1, #self.edited_projects do
+    if not seen_projects[self.edited_projects[index].module_name] then
+      return rejected<VerifiedRename>(
+        "compiler omitted a renamed project module")
+    end
+  end
+
+  local checked = indexer.build(self.edited_projects, project_snapshots)
+  local resolved: indexer.SymbolId? = nil
+  for index = 1, #self.anchors do
+    local anchor = self.anchors[index]
+    local occurrence? = checked:occurrence_at(
+      anchor.filename, anchor.after.start)
+    if occurrence == nil or occurrence.name ~= self.new_name or
+       not same_source_span(occurrence.span, anchor.after) then
+      return rejected<VerifiedRename>(
+        "compiler did not preserve a renamed occurrence")
+    end
+    if resolved == nil then
+      resolved = occurrence.symbol_id
+    elseif resolved.declaration_id ~= occurrence.symbol_id.declaration_id then
+      return rejected<VerifiedRename>(
+        "candidate rename would capture or split symbol references")
+    end
+  end
+  if resolved == nil then
+    return rejected<VerifiedRename>(
+      "candidate rename has no compiler-verified occurrences")
+  end
+
+  local definition? = checked:definition(resolved)
+  if definition == nil or definition.name ~= self.new_name or
+     not contains_anchor(self.anchors, definition) then
+    return rejected<VerifiedRename>(
+      "candidate rename did not produce one project declaration")
+  end
+  local occurrences = checked:occurrences(resolved, true)
+  if #occurrences ~= #self.anchors then
+    return rejected<VerifiedRename>(
+      "candidate rename changed the resolved occurrence set")
+  end
+  for index = 1, #occurrences do
+    if occurrences[index].name ~= self.new_name or
+       not contains_anchor(self.anchors, occurrences[index]) then
+      return rejected<VerifiedRename>(
+        "candidate rename resolved an unexpected occurrence")
+    end
+  end
+  return VerifiedRename.new(copy_documents(self.documents)), nil
+end
+
+function VerifiedRename:document_edits(): {lsp.DocumentEdits}
+  return copy_documents(self.documents)
+end

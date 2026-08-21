@@ -1,0 +1,2065 @@
+local iteration = import "titan.iteration"
+local lua = import "titan.lua"
+local math = import "titan.math"
+local strings = import "string"
+local async = import "async"
+local compiler_io = import "server.compiler_io"
+local compiler_scheduler = import "server.compiler_scheduler"
+
+local COMPILER_ABI = "0.26"
+local COMPILER_LANGUAGE_SERVER_API = 3
+local COMPILER_LANGUAGE_SERVER_API_MARKER = "LANGUAGE_SERVER_API_VERSION"
+local PARSER_MODULE = "titan-compiler.parser"
+local CHECKER_MODULE = "titan-compiler.checker"
+local TYPES_MODULE = "titan-compiler.types"
+local DRIVER_MODULE = "titan-compiler.driver"
+
+record BridgeError
+  module_name: string
+  message: string
+end
+
+record SourceFile
+  filename: string
+  contents: string
+end
+
+record ProjectModule
+  module_name: string
+  files: {SourceFile}
+end
+
+record SourceLocation
+  filename: string
+  line: integer
+  column: integer
+end
+
+record SourceSpan
+  start: SourceLocation
+  finish: SourceLocation
+end
+
+union DiagnosticKind
+  syntax
+  type_error
+  compiler
+end
+
+record Diagnostic
+  kind: DiagnosticKind
+  message: string
+  location: SourceLocation?
+end
+
+record TypeInfo
+  tag: string
+  display: string
+end
+
+record AdjustmentInfo
+  kind: string
+  operation: string?
+  source: TypeInfo?
+  target: TypeInfo?
+end
+
+union Adjustment
+  identity: AdjustmentInfo
+  coercion: AdjustmentInfo
+  gradual: AdjustmentInfo
+  callable: AdjustmentInfo
+  written: AdjustmentInfo
+  other: AdjustmentInfo
+end
+
+union NodeKind
+  declaration
+  statement
+  expression
+  variable
+  type_syntax
+  other
+end
+
+record Node
+  id: integer
+  parent_id: integer?
+  tag: string
+  kind: NodeKind
+  location: SourceLocation?
+  source_span: SourceSpan?
+  name: string?
+  is_local: boolean
+  synthetic: boolean
+  inferred_type: TypeInfo?
+  declared_type: TypeInfo?
+  original_type: TypeInfo?
+  coerced_type: TypeInfo?
+  adjustment: Adjustment?
+end
+
+union OccurrenceRole
+  definition
+  reference
+  write
+  type_reference
+  import_alias
+end
+
+record SymbolOccurrence
+  name: string
+  declaration_id: string?
+  role: OccurrenceRole
+  location: SourceLocation
+  exact_span: SourceSpan?
+  is_local: boolean
+  type_info: TypeInfo?
+end
+
+record Import
+  alias: string
+  module_name: string
+  source_required: boolean
+  location: SourceLocation
+end
+
+record Manifest
+  module_name: string
+  serialized: string
+end
+
+record SourceProvenance
+  main_file: string
+  source_files: {string}
+end
+
+record BinaryProvenance
+  provider_file: string
+end
+
+union Provenance
+  project_source: SourceProvenance
+  external_source: SourceProvenance
+  dynamic_binary: BinaryProvenance
+  static_binary: BinaryProvenance
+end
+
+record ExternalResolutionRequest
+  module_name: string
+  source_required: boolean
+end
+
+-- A missing/error result deliberately carries no compiler type or AST. This
+-- is a pre-analysis topology fingerprint, not another compiler cache.
+record ExternalResolution
+  module_name: string
+  provenance: Provenance?
+  error: string?
+end
+
+-- A compiled interface can expose a nominal type owned by another logical
+-- module without importing or linking that owner independently. This record
+-- carries only the physical interface provenance needed by the project cache.
+record ContextualResolution
+  owner_module: string
+  exposer_module: string
+  provenance: Provenance
+  ordinary_lookup: boolean
+end
+
+union CHeaderDependencyKind
+  file
+  search
+end
+
+-- `file` identities hash the exact bytes cdriver parsed. `search` identities
+-- describe one exact include candidate (including a miss) so an earlier
+-- shadow appearing later invalidates the owning module without scanning a
+-- whole external include tree.
+record CHeaderDependency
+  kind: CHeaderDependencyKind
+  path: string
+  identity: string
+end
+
+record ModuleSnapshot
+  module_name: string
+  provenance: Provenance
+  manifest: Manifest?
+  nodes: {Node}
+  symbols: {SymbolOccurrence}
+  imports: {Import}
+  c_header_dependencies: {CHeaderDependency}
+end
+
+record Analysis
+  root_module: string
+  diagnostics: {Diagnostic}
+  modules: {ModuleSnapshot}
+  contextual_resolutions: {ContextualResolution}
+end
+
+-- Only unchanged external source modules use this serialized boundary. Clean
+-- project modules retain their complete compiler-owned entries privately in
+-- Compiler, while binary interfaces keep their physical provider resolution.
+record CachedSourceInterface
+  module_name: string
+  serialized: string
+  main_file: string
+  source_files: {string}
+  imports: {Import}
+  c_header_dependencies: {CHeaderDependency}
+end
+
+function Analysis:find_module(module_name: string): ModuleSnapshot?
+  for index = 1, #self.modules do
+    if self.modules[index].module_name == module_name then
+      return self.modules[index]
+    end
+  end
+  return nil
+end
+
+local type RequireFunction = (string) -> value
+local type TypeOfFunction = (value) -> string
+local type CompilerFunction = (...: value) -> (...: value)
+
+record Compiler
+  local parser: {string: value}
+  local checker: {string: value}
+  local types: {string: value}
+  local driver: {string: value}
+  local type_of: TypeOfFunction
+  local io: compiler_io.CompilerIO
+  local project_asts: {string: value}
+  local project_entries: {string: value}
+  local source_path: string?
+  local binary_path: string?
+  local extra_ffi_include_dirs: {string}
+end
+
+local function fail<T>(module_name: string, message: string): T
+  raise BridgeError.new(module_name, message)
+end
+
+local function describe(candidate: value, type_of: TypeOfFunction): string
+  local kind = type_of(candidate)
+  if kind == "nil" then return "nil" end
+  return kind
+end
+
+local function required_map(candidate: value, module_name: string,
+                            subject: string): {string: value}
+  if not (candidate is {string: value}) then
+    return fail<{string: value}>(
+      module_name, subject .. " must be a Lua table")
+  end
+  return candidate as {string: value}
+end
+
+local function required_string(candidate: value, module_name: string,
+                               subject: string): string
+  if not (candidate is string) then
+    return fail<string>(module_name, subject .. " must be a string")
+  end
+  return candidate as string
+end
+
+local function optional_string(candidate: value, module_name: string,
+                               subject: string): string?
+  if candidate == nil or candidate == false then return nil end
+  return required_string(candidate, module_name, subject)
+end
+
+local function required_integer(candidate: value, module_name: string,
+                                subject: string): integer
+  local result: integer = candidate
+  return result
+catch
+  return fail<integer>(module_name,
+    subject .. " must carry an exact Lua integer")
+end
+
+local function required_boolean(candidate: value, module_name: string,
+                                subject: string): boolean
+  local result: boolean = candidate
+  return result
+catch
+  return fail<boolean>(module_name, subject .. " must be a boolean")
+end
+
+local function required_string_list(candidate: value, module_name: string,
+                                    subject: string): {string}
+  if not (candidate is {integer: value}) then
+    return fail<{string}>(module_name, subject .. " must be a Lua array")
+  end
+  local raw = candidate as {integer: value}
+  local result: {string} = {}
+  for index = 1, #raw do
+    result[index] = required_string(
+      raw[index], module_name, subject .. "[" .. index .. "]")
+  end
+  return result
+end
+
+local function normalize_c_header_dependencies(
+    candidate: value, subject: string): {CHeaderDependency}
+  if candidate == nil or candidate == false then return {} end
+  if not (candidate is {integer: value}) then
+    return fail<{CHeaderDependency}>(
+      DRIVER_MODULE, subject .. " must be a Lua array")
+  end
+  local raw = candidate as {integer: value}
+  local result: {CHeaderDependency} = {}
+  local seen: {string: boolean} = {}
+  for index = 1, #raw do
+    local item = required_map(
+      raw[index], DRIVER_MODULE, subject .. "[" .. index .. "]")
+    local raw_kind = required_string(
+      item["kind"], DRIVER_MODULE,
+      subject .. "[" .. index .. "].kind")
+    local kind = CHeaderDependencyKind.file()
+    if raw_kind == "search" then
+      kind = CHeaderDependencyKind.search()
+    elseif raw_kind ~= "file" then
+      return fail<{CHeaderDependency}>(DRIVER_MODULE,
+        subject .. "[" .. index .. "] has unknown kind '" ..
+        raw_kind .. "'")
+    end
+    local path = required_string(
+      item["path"], DRIVER_MODULE,
+      subject .. "[" .. index .. "].path")
+    local identity = required_string(
+      item["identity"], DRIVER_MODULE,
+      subject .. "[" .. index .. "].identity")
+    if strings.sub(path, 1, 1) ~= "/" then
+      return fail<{CHeaderDependency}>(DRIVER_MODULE,
+        subject .. "[" .. index .. "].path must be absolute")
+    elseif identity == "" then
+      return fail<{CHeaderDependency}>(DRIVER_MODULE,
+        subject .. "[" .. index .. "].identity must be nonempty")
+    end
+    local key = raw_kind .. "\0" .. path
+    if seen[key] then
+      return fail<{CHeaderDependency}>(DRIVER_MODULE,
+        subject .. " repeats " .. raw_kind .. " input '" .. path .. "'")
+    end
+    seen[key] = true
+    result[index] = CHeaderDependency.new(kind, path, identity)
+  end
+  return result
+end
+
+local function raw_c_header_dependencies(
+    dependencies: {CHeaderDependency}): {integer: value}
+  local result: {integer: value} = {}
+  for index = 1, #dependencies do
+    local dependency = dependencies[index]
+    local kind = "file"
+    case dependency.kind
+    when search then kind = "search"
+    when file then
+    end
+    local item: {string: value} = {}
+    item["kind"] = kind
+    item["path"] = dependency.path
+    item["identity"] = dependency.identity
+    result[index] = item
+  end
+  return result
+end
+
+local function optional_boolean(candidate: value, module_name: string,
+                                subject: string): boolean
+  if candidate == nil or candidate == false then return false end
+  local result: boolean = candidate
+  return result
+catch
+  return fail<boolean>(module_name, subject .. " must be a boolean")
+end
+
+local function checked_function(module: {string: value},
+                                module_name: string, member: string,
+                                type_of: TypeOfFunction): value
+  local candidate: value = module[member]
+  if type_of(candidate) ~= "function" then
+    return fail<value>(module_name,
+      "compiler API member '" .. member .. "' must be a function, found " ..
+      describe(candidate, type_of) ..
+      ". Install a Titan compiler implementing " ..
+      COMPILER_LANGUAGE_SERVER_API_MARKER .. " " ..
+      COMPILER_LANGUAGE_SERVER_API)
+  end
+  return candidate
+end
+
+local function require_compiler_module(require_function: RequireFunction,
+                                       type_of: TypeOfFunction,
+                                       module_name: string): {string: value}
+  local loaded: value = nil
+  do
+    loaded = require_function(module_name)
+  catch
+    return fail<{string: value}>(module_name,
+      "cannot load compiler module through package.path/package.cpath: " ..
+      strings.tostring(error))
+  end
+  if type_of(loaded) ~= "table" then
+    return fail<{string: value}>(module_name,
+      "compiler module must return a table, found " ..
+      describe(loaded, type_of))
+  end
+  return required_map(loaded, module_name, "compiler module")
+end
+
+local function make_type_of(): TypeOfFunction
+  local chunk = lua.load("return type", "=compiler_bridge.type", nil)
+  local candidate: value = chunk()
+  return candidate as TypeOfFunction
+end
+
+local function load_with(require_function: RequireFunction): Compiler
+  local type_of = make_type_of()
+  local parser = require_compiler_module(
+    require_function, type_of, PARSER_MODULE)
+  local checker = require_compiler_module(
+    require_function, type_of, CHECKER_MODULE)
+  local types = require_compiler_module(
+    require_function, type_of, TYPES_MODULE)
+  local driver = require_compiler_module(
+    require_function, type_of, DRIVER_MODULE)
+
+  local version = required_string(
+    driver["TITAN_VER"], DRIVER_MODULE, "TITAN_VER")
+  if version ~= COMPILER_ABI then
+    return fail<Compiler>(DRIVER_MODULE,
+      "incompatible Titan compiler ABI " .. version ..
+      "; this server requires " .. COMPILER_ABI)
+  end
+
+  local raw_language_server_api: value =
+    driver[COMPILER_LANGUAGE_SERVER_API_MARKER]
+  if raw_language_server_api == nil then
+    return fail<Compiler>(DRIVER_MODULE,
+      "Titan compiler ABI " .. version .. " is missing " ..
+      COMPILER_LANGUAGE_SERVER_API_MARKER ..
+      "; matching Titan ABI alone is insufficient. Install the Titan " ..
+      "compiler built for this vscode-titan server (language-server API " ..
+      COMPILER_LANGUAGE_SERVER_API .. ")")
+  end
+  local language_server_api: integer = 0
+  do
+    language_server_api = raw_language_server_api
+  catch
+    return fail<Compiler>(DRIVER_MODULE,
+      "incompatible Titan language-server API " ..
+      describe(raw_language_server_api, type_of) .. " for compiler ABI " ..
+      version .. "; this server requires " ..
+      COMPILER_LANGUAGE_SERVER_API_MARKER .. " " ..
+      COMPILER_LANGUAGE_SERVER_API ..
+      ". Install the matching Titan compiler; matching Titan ABI alone " ..
+      "is insufficient")
+  end
+  if language_server_api ~= COMPILER_LANGUAGE_SERVER_API then
+    return fail<Compiler>(DRIVER_MODULE,
+      "incompatible Titan language-server API " .. language_server_api ..
+      " for compiler ABI " .. version .. "; this server requires " ..
+      COMPILER_LANGUAGE_SERVER_API_MARKER .. " " ..
+      COMPILER_LANGUAGE_SERVER_API ..
+      ". Install the matching Titan compiler; matching Titan ABI alone " ..
+      "is insufficient")
+  end
+
+  checked_function(parser, PARSER_MODULE, "parse", type_of)
+  checked_function(parser, PARSER_MODULE, "error_to_string", type_of)
+  checked_function(checker, CHECKER_MODULE, "check", type_of)
+  checked_function(types, TYPES_MODULE, "tostring", type_of)
+  checked_function(types, TYPES_MODULE, "serialize", type_of)
+  checked_function(driver, DRIVER_MODULE, "defaultloader", type_of)
+  checked_function(driver, DRIVER_MODULE, "new_resolver_context", type_of)
+  checked_function(driver, DRIVER_MODULE, "finalize_resolver_context", type_of)
+  checked_function(driver, DRIVER_MODULE, "close_resolver_context", type_of)
+  checked_function(driver, DRIVER_MODULE, "close_loader", type_of)
+  checked_function(driver, DRIVER_MODULE, "resolve_external_modules", type_of)
+  checked_function(
+    driver, DRIVER_MODULE, "restat_c_header_dependencies", type_of)
+  required_map(driver["imported"], DRIVER_MODULE, "driver.imported")
+  required_map(types["registry"], TYPES_MODULE, "types.registry")
+
+  return Compiler.new(
+    parser, checker, types, driver, type_of, compiler_io.create(),
+    {}, {}, nil, nil, {})
+end
+
+function load(): Compiler
+  return load_with(lua.require)
+end
+
+function Compiler:compiler_abi(): string
+  return COMPILER_ABI
+end
+
+function Compiler:has_project_ast(module_name: string): boolean
+  return self.project_asts[module_name] ~= nil
+end
+
+function Compiler:drop_project_ast(module_name: string)
+  self.project_asts[module_name] = nil
+  self.project_entries[module_name] = nil
+end
+
+function Compiler:configure_paths(source_path: string?, binary_path: string?,
+                                  extra_ffi_include_dirs: {string}?)
+  self.source_path = source_path
+  self.binary_path = binary_path
+  self.extra_ffi_include_dirs = {}
+  if extra_ffi_include_dirs ~= nil then
+    local source = extra_ffi_include_dirs as {string}
+    for index = 1, #source do
+      self.extra_ffi_include_dirs[index] = source[index]
+    end
+  end
+end
+
+local function new_context(compiler: Compiler,
+                           supplied: {string: value}?): value
+  local raw_new_context = checked_function(
+    compiler.driver, DRIVER_MODULE, "new_resolver_context", compiler.type_of)
+  local create = raw_new_context as (value) -> value
+  local options: {string: value} = {}
+  if supplied ~= nil then options = supplied as {string: value} end
+  options["io"] = compiler.io
+  local context: value = create(options)
+  if compiler.type_of(context) ~= "table" then
+    return fail<value>(DRIVER_MODULE,
+      "driver.new_resolver_context returned " ..
+      describe(context, compiler.type_of) .. " instead of a table")
+  end
+  return context
+end
+
+local function close_loader_now(compiler: Compiler, loader: value)
+  local raw_close = checked_function(
+    compiler.driver, DRIVER_MODULE, "close_loader", compiler.type_of)
+  local close = raw_close as (value) -> (value, value)
+  local ok, close_error = close(loader)
+  if not ok then
+    fail<value>(DRIVER_MODULE,
+      "cannot close compiler resolver: " .. strings.tostring(close_error))
+  end
+end
+
+local function close_context_now(compiler: Compiler, context: value)
+  local raw_close = checked_function(
+    compiler.driver, DRIVER_MODULE, "close_resolver_context", compiler.type_of)
+  local close = raw_close as (value) -> (value, value)
+  local ok, close_error = close(context)
+  if not ok then
+    fail<value>(DRIVER_MODULE,
+      "cannot close compiler resolver context: " ..
+      strings.tostring(close_error))
+  end
+end
+
+local function close_loader(compiler: Compiler, loader: value)
+  do
+    close_loader_now(compiler, loader)
+  catch
+    if error is async.CancellationReason then
+      -- Cleanup I/O cannot be submitted by a Task with sticky cancellation.
+      -- Retain the Lua object in a fresh Task and wait for the current owner to
+      -- release the shared compiler permit before retrying the close.
+      async.run<nil, value>(function (): nil
+        local permit = compiler_scheduler.acquire()
+        defer permit:release()
+        close_loader_now(compiler, loader)
+        return nil
+      end)
+    end
+    raise
+  end
+end
+
+local function close_context(compiler: Compiler, context: value)
+  do
+    close_context_now(compiler, context)
+  catch
+    if error is async.CancellationReason then
+      async.run<nil, value>(function (): nil
+        local permit = compiler_scheduler.acquire()
+        defer permit:release()
+        close_context_now(compiler, context)
+        return nil
+      end)
+    end
+    raise
+  end
+end
+
+-- Recompute only the exact physical header bytes and ordered search candidates
+-- already reported by the compiler. The operation owns the global compiler
+-- permit but its Titan-backed I/O may suspend the current Task.
+function Compiler:restat_c_header_dependencies(
+    dependencies: {CHeaderDependency}): {CHeaderDependency}
+  local permit = compiler_scheduler.acquire()
+  defer permit:release()
+  local context = new_context(self, nil)
+  defer close_context(self, context)
+  local raw_restat = checked_function(
+    self.driver, DRIVER_MODULE, "restat_c_header_dependencies", self.type_of)
+  local restat = raw_restat as (value, value) -> (value, value)
+  local options: {string: value} = { ["context"] = context }
+  local raw_result, raw_error = restat(
+    raw_c_header_dependencies(dependencies), options)
+  if raw_result == nil or raw_result == false then
+    return fail<{CHeaderDependency}>(DRIVER_MODULE,
+      "cannot restat C header dependencies: " ..
+      strings.tostring(raw_error))
+  end
+  return normalize_c_header_dependencies(
+    raw_result, "driver.restat_c_header_dependencies result")
+catch
+  if error is async.CancellationReason then raise end
+  if error is BridgeError then raise end
+  raise BridgeError.new(DRIVER_MODULE,
+    "C header dependency restat failed: " .. strings.tostring(error))
+end
+
+-- Re-resolve known external import names under the currently configured paths
+-- without parsing source. The compiler driver returns only physical
+-- provenance; normalize it here so untyped Lua tables do not escape into the
+-- project service.
+function Compiler:resolve_external_modules(
+    project_modules: {string},
+    requests: {ExternalResolutionRequest}): {ExternalResolution}
+  local permit = compiler_scheduler.acquire()
+  defer permit:release()
+  local context = new_context(self, nil)
+  defer close_context(self, context)
+
+  local previous_source_path: value = self.driver["TITAN_SOURCE_PATH"]
+  local previous_binary_path: value = self.driver["TITAN_BIN_PATH"]
+  defer self.driver["TITAN_SOURCE_PATH"] = previous_source_path
+  defer self.driver["TITAN_BIN_PATH"] = previous_binary_path
+  if self.source_path then
+    self.driver["TITAN_SOURCE_PATH"] = self.source_path as string
+  end
+  if self.binary_path then
+    self.driver["TITAN_BIN_PATH"] = self.binary_path as string
+  end
+
+  local raw_projects: {string: value} = {}
+  for index = 1, #project_modules do
+    local name = project_modules[index]
+    if raw_projects[name] ~= nil then
+      return fail<{ExternalResolution}>(
+        DRIVER_MODULE, "duplicate project module '" .. name ..
+        "' in external resolution request")
+    end
+    raw_projects[name] = true
+  end
+  local raw_requests: {string: value} = {}
+  local requested: {string: boolean} = {}
+  for index = 1, #requests do
+    local request = requests[index]
+    if requested[request.module_name] then
+      return fail<{ExternalResolution}>(
+        DRIVER_MODULE, "duplicate external module '" ..
+        request.module_name .. "' in resolution request")
+    end
+    requested[request.module_name] = true
+    raw_requests[request.module_name] = request.source_required
+  end
+
+  local raw_resolver = checked_function(
+    self.driver, DRIVER_MODULE, "resolve_external_modules", self.type_of)
+  local resolver = raw_resolver as (value, value, value) -> value
+  local options: {string: value} = { ["context"] = context }
+  local raw_results = required_map(
+    resolver(raw_requests, raw_projects, options), DRIVER_MODULE,
+    "driver.resolve_external_modules result")
+  for name in iteration.pairs<string, value>(raw_results) do
+    if not requested[name] then
+      return fail<{ExternalResolution}>(DRIVER_MODULE,
+        "driver.resolve_external_modules returned unexpected module '" ..
+        name .. "'")
+    end
+  end
+
+  local result: {ExternalResolution} = {}
+  for index = 1, #requests do
+    local request = requests[index]
+    local subject = "external resolution for '" ..
+      request.module_name .. "'"
+    local raw = required_map(
+      raw_results[request.module_name], DRIVER_MODULE, subject)
+    local kind = required_string(raw["kind"], DRIVER_MODULE,
+                                 subject .. ".kind")
+    local provenance?: Provenance = nil
+    local message?: string = nil
+    if kind == "source" then
+      provenance = Provenance.external_source(SourceProvenance.new(
+        required_string(raw["main_file"], DRIVER_MODULE,
+                        subject .. ".main_file"),
+        required_string_list(raw["source_files"], DRIVER_MODULE,
+                             subject .. ".source_files")))
+    elseif kind == "dynamic" then
+      provenance = Provenance.dynamic_binary(BinaryProvenance.new(
+        required_string(raw["provider_file"], DRIVER_MODULE,
+                        subject .. ".provider_file")))
+    elseif kind == "static" then
+      provenance = Provenance.static_binary(BinaryProvenance.new(
+        required_string(raw["provider_file"], DRIVER_MODULE,
+                        subject .. ".provider_file")))
+    elseif kind == "error" then
+      message = required_string(raw["message"], DRIVER_MODULE,
+                                subject .. ".message")
+    elseif kind ~= "missing" then
+      return fail<{ExternalResolution}>(DRIVER_MODULE,
+        subject .. " has unknown kind '" .. kind .. "'")
+    end
+    result[index] = ExternalResolution.new(
+      request.module_name, provenance, message)
+  end
+  return result
+catch
+  if error is async.CancellationReason then raise end
+  if error is BridgeError then raise end
+  raise BridgeError.new(DRIVER_MODULE,
+    "external module resolution failed: " .. strings.tostring(error))
+end
+
+local function raw_location(candidate: value, subject: string): SourceLocation
+  local loc = required_map(candidate, DRIVER_MODULE, subject)
+  local filename = required_string(
+    loc["filename"], DRIVER_MODULE, subject .. ".filename")
+  local line = required_integer(
+    loc["line"], DRIVER_MODULE, subject .. ".line")
+  local column = required_integer(
+    loc["col"], DRIVER_MODULE, subject .. ".col")
+  if line < 1 or column < 1 then
+    return fail<SourceLocation>(
+      DRIVER_MODULE, subject .. " must use positive line and column values")
+  end
+  return SourceLocation.new(filename, line, column)
+end
+
+local function optional_location(node: {string: value},
+                                 subject: string): SourceLocation?
+  local candidate: value = node["loc"]
+  if candidate == nil or candidate == false then return nil end
+  return raw_location(candidate, subject .. ".loc")
+end
+
+local function optional_field_location(node: {string: value}, field: string,
+                                       subject: string): SourceLocation?
+  local candidate: value = node[field]
+  if candidate == nil or candidate == false then return nil end
+  return raw_location(candidate, subject .. "." .. field)
+end
+
+local function semantic_location(node: {string: value},
+                                 subject: string): SourceLocation?
+  local exact? = optional_field_location(node, "_name_loc", subject)
+  if exact ~= nil then return exact end
+  return optional_location(node, subject)
+end
+
+-- `_end_loc` is the start of the closing `end`/`until`. `_structure_loc`
+-- exists only for an explicit `do ... end` StatBlock; all other parser-marked
+-- structures begin at their ordinary diagnostic location.
+local function structural_span(node: {string: value},
+                               subject: string): SourceSpan?
+  local finish? = optional_field_location(node, "_end_loc", subject)
+  if finish == nil then return nil end
+  local start? = optional_field_location(node, "_structure_loc", subject)
+  if start == nil then start = optional_location(node, subject) end
+  if start == nil then
+    return fail<SourceSpan>(DRIVER_MODULE,
+      subject .. " has _end_loc without a structural start")
+  end
+  if start.filename ~= finish.filename then
+    return fail<SourceSpan>(DRIVER_MODULE,
+      subject .. " structural span crosses source files")
+  end
+  if finish.line < start.line or
+     (finish.line == start.line and finish.column < start.column) then
+    return fail<SourceSpan>(DRIVER_MODULE,
+      subject .. " structural span finishes before it starts")
+  end
+  return SourceSpan.new(start, finish)
+end
+
+local function exact_name_span(location: SourceLocation,
+                               name: string): SourceSpan
+  return SourceSpan.new(
+    location,
+    SourceLocation.new(location.filename, location.line,
+                       location.column + #name))
+end
+
+local function type_tag(candidate: value, subject: string): string
+  local raw = required_map(candidate, TYPES_MODULE, subject)
+  local tag = required_string(raw["_tag"], TYPES_MODULE, subject .. "._tag")
+  if strings.sub(tag, 1, 5) ~= "Type." then
+    return fail<string>(TYPES_MODULE,
+      subject .. " has invalid type tag '" .. tag .. "'")
+  end
+  return tag
+end
+
+local function render_type(compiler: Compiler, candidate: value,
+                           subject: string): TypeInfo
+  local raw = required_map(candidate, TYPES_MODULE, subject)
+  local tag = type_tag(candidate, subject)
+  local display = ""
+  if tag == "Type.Module" then
+    display = "module " .. required_string(
+      raw["name"], TYPES_MODULE, subject .. ".name")
+  elseif tag == "Type.ModuleMember" or tag == "Type.ModuleVariable"
+      or tag == "Type.Field" then
+    local nested: value = raw["type"]
+    if nested == nil then
+      return fail<TypeInfo>(TYPES_MODULE,
+        subject .. " has no nested member type")
+    end
+    display = render_type(compiler, nested, subject .. ".type").display
+  else
+    local raw_renderer = checked_function(
+      compiler.types, TYPES_MODULE, "tostring", compiler.type_of)
+    local renderer = raw_renderer as (value) -> value
+    local rendered: value = nil
+    do
+      rendered = renderer(candidate)
+    catch
+      return fail<TypeInfo>(TYPES_MODULE,
+        "cannot render " .. subject .. ": " .. strings.tostring(error))
+    end
+    display = required_string(
+      rendered, TYPES_MODULE, "types.tostring result for " .. subject)
+  end
+  return TypeInfo.new(tag, display)
+end
+
+local function optional_type(compiler: Compiler, node: {string: value},
+                             field: string, subject: string): TypeInfo?
+  local candidate: value = node[field]
+  if candidate == nil or candidate == false then return nil end
+  return render_type(compiler, candidate, subject .. "." .. field)
+end
+
+local function adjustment_info(compiler: Compiler, candidate: value,
+                               subject: string): AdjustmentInfo
+  local raw = required_map(candidate, TYPES_MODULE, subject)
+  local kind = required_string(raw["kind"], TYPES_MODULE, subject .. ".kind")
+  local operation: string? = optional_string(
+    raw["op"], TYPES_MODULE, subject .. ".op")
+  local source: TypeInfo? = nil
+  local target: TypeInfo? = nil
+  if raw["source"] ~= nil and raw["source"] ~= false then
+    source = render_type(compiler, raw["source"], subject .. ".source")
+  end
+  if raw["target"] ~= nil and raw["target"] ~= false then
+    target = render_type(compiler, raw["target"], subject .. ".target")
+  end
+  if kind == "direct_coercion" then
+    local nested = required_map(
+      raw["coercion"], TYPES_MODULE, subject .. ".coercion")
+    operation = optional_string(
+      nested["op"], TYPES_MODULE, subject .. ".coercion.op")
+  end
+  return AdjustmentInfo.new(kind, operation, source, target)
+end
+
+local function normalize_adjustment(compiler: Compiler, candidate: value,
+                                    subject: string): Adjustment
+  local info = adjustment_info(compiler, candidate, subject)
+  if info.kind == "identity" then return Adjustment.identity(info) end
+  if info.kind == "direct_coercion" then
+    return Adjustment.coercion(info)
+  end
+  if info.kind == "gradual_view" then return Adjustment.gradual(info) end
+  if info.kind == "callable" then return Adjustment.callable(info) end
+  if info.kind == "written_cast" then return Adjustment.written(info) end
+  return Adjustment.other(info)
+end
+
+local function node_kind(tag: string): NodeKind
+  if strings.sub(tag, 1, 12) == "Ast.TopLevel"
+      or tag == "Ast.Decl" or tag == "Ast.UnionVariant"
+      or tag == "Ast.InterfaceMethod" then
+    return NodeKind.declaration()
+  end
+  if strings.sub(tag, 1, 8) == "Ast.Stat" or tag == "Ast.Then"
+      or tag == "Ast.CaseArm" then
+    return NodeKind.statement()
+  end
+  if strings.sub(tag, 1, 7) == "Ast.Exp" or strings.sub(tag, 1, 8) == "Ast.Args"
+      or tag == "Ast.Field" then
+    return NodeKind.expression()
+  end
+  if strings.sub(tag, 1, 7) == "Ast.Var" then
+    return NodeKind.variable()
+  end
+  if strings.sub(tag, 1, 8) == "Ast.Type"
+      or tag == "Ast.TypeParam" then
+    return NodeKind.type_syntax()
+  end
+  return NodeKind.other()
+end
+
+local function node_name(node: {string: value}, tag: string): string?
+  if tag == "Ast.TopLevelMethod" or tag == "Ast.TopLevelStatic"
+      or tag == "Ast.TopLevelFunc" or tag == "Ast.TopLevelForeignFunc"
+      or tag == "Ast.TopLevelTypeAlias" or tag == "Ast.TopLevelRecord"
+      or tag == "Ast.TopLevelUnion" or tag == "Ast.TopLevelInterface"
+      or tag == "Ast.Decl" or tag == "Ast.UnionVariant"
+      or tag == "Ast.InterfaceMethod" or tag == "Ast.TypeParam"
+      or tag == "Ast.VarName" or tag == "Ast.VarDot"
+      or tag == "Ast.TypeName" or tag == "Ast.TypeQualName"
+      or tag == "Ast.ExpMethodRef" or tag == "Ast.CaseArm"
+      or tag == "Ast.Field" then
+    return optional_string(node["name"], DRIVER_MODULE, tag .. ".name")
+  end
+  if tag == "Ast.ArgsMethod" or tag == "Ast.ArgsNamedMethod" then
+    return optional_string(node["method"], DRIVER_MODULE, tag .. ".method")
+  end
+  if tag == "Ast.TopLevelImport" or tag == "Ast.TopLevelForeignImport" then
+    return optional_string(
+      node["localname"], DRIVER_MODULE, tag .. ".localname")
+  end
+  return nil
+end
+
+local function node_is_local(node: {string: value}): boolean
+  local tag = required_string(node["_tag"], DRIVER_MODULE, "AST _tag")
+  if tag == "Ast.TopLevelImport" or
+      tag == "Ast.TopLevelForeignImport" then
+    -- Import namespaces are always introduced by Titan's `local` import
+    -- syntax. The compiler does not need an `islocal` marker for checking, so
+    -- normalize that source fact explicitly at the language-server boundary.
+    return true
+  end
+  if optional_boolean(node["islocal"], DRIVER_MODULE, "AST islocal") then
+    return true
+  end
+  local depth: value = node["_funcdepth"]
+  if depth ~= nil and depth ~= false then
+    return required_integer(depth, DRIVER_MODULE, "AST _funcdepth") > 0
+  end
+  return false
+end
+
+local function node_is_synthetic(node: {string: value}, tag: string): boolean
+  return optional_boolean(
+      node["_record_constructor"], DRIVER_MODULE, tag .. "._record_constructor")
+    or optional_boolean(
+      node["_union_constructor"], DRIVER_MODULE, tag .. "._union_constructor")
+    or optional_boolean(
+      node["_implicit_coercion"], DRIVER_MODULE, tag .. "._implicit_coercion")
+end
+
+local function node_has_synthetic_children(node: {string: value},
+                                           tag: string): boolean
+  return optional_boolean(
+      node["_record_constructor"], DRIVER_MODULE, tag .. "._record_constructor")
+    or optional_boolean(
+      node["_union_constructor"], DRIVER_MODULE, tag .. "._union_constructor")
+end
+
+local function ast_identity(module_name: string, raw: {string: value},
+                            tag: string, name: string): string
+  local exported = false
+  if strings.sub(tag, 1, 12) == "Ast.TopLevel"
+      and tag ~= "Ast.TopLevelImport"
+      and tag ~= "Ast.TopLevelForeignImport" then
+    exported = not node_is_local(raw)
+  end
+  if exported then
+    return "export:" .. module_name .. ":" .. name
+  end
+  local location: SourceLocation? = semantic_location(
+    raw, "symbol declaration")
+  if not location then return "ast:" .. module_name .. ":" .. tag .. ":" .. name end
+  return "ast:" .. module_name .. ":" .. location.filename .. ":" ..
+    location.line .. ":" .. location.column .. ":" .. name
+end
+
+local function declaration_identity(module_name: string, candidate: value): string?
+  if candidate == nil or candidate == false then return nil end
+  local raw = required_map(candidate, DRIVER_MODULE, "symbol declaration")
+  local tag = required_string(
+    raw["_tag"], DRIVER_MODULE, "symbol declaration._tag")
+  if tag == "Ast.Decl" then
+    local canonical: value = raw["_decl"]
+    if canonical ~= nil and canonical ~= false and canonical ~= candidate then
+      return declaration_identity(module_name, canonical)
+    end
+  end
+  if strings.sub(tag, 1, 4) == "Ast." then
+    local name: string? = optional_string(
+      raw["name"], DRIVER_MODULE, "symbol declaration.name")
+    if tag == "Ast.TopLevelImport" or tag == "Ast.TopLevelForeignImport" then
+      name = optional_string(
+        raw["localname"], DRIVER_MODULE, "symbol declaration.localname")
+    elseif tag == "Ast.TopLevelVar" then
+      local declaration = required_map(
+        raw["decl"], DRIVER_MODULE, "Ast.TopLevelVar.decl")
+      name = required_string(
+        declaration["name"], DRIVER_MODULE, "Ast.TopLevelVar.decl.name")
+      if node_is_local(raw) then
+        return ast_identity(module_name, declaration, "Ast.Decl", name)
+      end
+    end
+    if not name then return nil end
+    return ast_identity(module_name, raw, tag, name)
+  end
+  if strings.sub(tag, 1, 5) == "Type." and
+      (strings.sub(tag, 1, 6) == "Type.C" or tag == "Type.Invalid") then
+    -- Foreign/compiler-only descriptors have no navigable Titan declaration
+    -- in V1. Do not manufacture a project identity for them.
+    return nil
+  end
+  if strings.sub(tag, 1, 8) == "Checker." and
+      tag ~= "Checker.TypeMember" and tag ~= "Checker.Parameter" then
+    return nil
+  end
+  local name = required_string(
+    raw["name"], DRIVER_MODULE, "symbol declaration.name")
+  if tag == "Checker.Parameter" then
+    local owner_kind = required_string(
+      raw["owner_kind"], DRIVER_MODULE,
+      "Checker.Parameter.owner_kind")
+    if owner_kind ~= "module" and owner_kind ~= "member" then
+      return fail<string>(DRIVER_MODULE,
+        "Checker.Parameter.owner_kind must be 'module' or 'member'")
+    end
+    local owner_name = required_string(
+      raw["owner_name"], DRIVER_MODULE,
+      "Checker.Parameter.owner_name")
+    local callable_name = required_string(
+      raw["callable_name"], DRIVER_MODULE,
+      "Checker.Parameter.callable_name")
+    local index = required_integer(
+      raw["index"], DRIVER_MODULE, "Checker.Parameter.index")
+    if index < 1 then
+      return fail<string>(DRIVER_MODULE,
+        "Checker.Parameter.index must be positive")
+    end
+    return "parameter:" .. owner_kind .. ":" .. owner_name .. ":" ..
+      callable_name .. ":" .. index .. ":" .. name
+  end
+  if tag == "Type.Field" or tag == "Type.Variant"
+      or tag == "Type.Method" or tag == "Type.StaticMethod" then
+    local fqtn = required_string(
+      raw["fqtn"], DRIVER_MODULE, "symbol declaration.fqtn")
+    return "member:" .. fqtn .. ":" .. name
+  end
+  local owner: string? = optional_string(
+    raw["modname"], DRIVER_MODULE, "symbol declaration.modname")
+  if tag == "Type.Record" or tag == "Type.Union"
+      or tag == "Type.Interface" then
+    local split = 0
+    for index = 1, #name do
+      if strings.byte(name, index) == 46 then split = index end
+    end
+    if split == 0 or split == #name then
+      return fail<string>(TYPES_MODULE,
+        "nominal declaration name '" .. name .. "' is not fully qualified")
+    end
+    owner = strings.sub(name, 1, split - 1)
+    name = strings.sub(name, split + 1)
+  end
+  if not owner then
+    owner = optional_string(
+      raw["fqtn"], DRIVER_MODULE, "symbol declaration.fqtn")
+  end
+  if not owner then owner = module_name end
+  return "export:" .. owner .. ":" .. name
+end
+
+local function declaration_local(candidate: value): boolean
+  if candidate == nil or candidate == false then return false end
+  local raw = required_map(candidate, DRIVER_MODULE, "symbol declaration")
+  return node_is_local(raw)
+end
+
+local function semantic_declaration(node: {string: value}, tag: string): value
+  local declaration: value = node["_decl"]
+  if declaration ~= nil and declaration ~= false then return declaration end
+  if tag == "Ast.ExpMethodRef" or tag == "Ast.ArgsMethod"
+      or tag == "Ast.ArgsNamedMethod" then
+    return node["_method"]
+  end
+  if tag == "Ast.CaseArm" then return node["_variant"] end
+  if tag == "Ast.Field" then return node["_field"] end
+  return nil
+end
+
+local record Walker
+  compiler: Compiler
+  module_name: string
+  nodes: {Node}
+  symbols: {SymbolOccurrence}
+  imports: {Import}
+  local seen: {value}
+end
+
+local function Walker:already_seen(candidate: value): boolean
+  for index = 1, #self.seen do
+    if self.seen[index] == candidate then return true end
+  end
+  self.seen[#self.seen + 1] = candidate
+  return false
+end
+
+local function occurrence_role(name: string): OccurrenceRole
+  if name == "definition" then return OccurrenceRole.definition() end
+  if name == "write" then return OccurrenceRole.write() end
+  if name == "type_reference" then return OccurrenceRole.type_reference() end
+  if name == "import_alias" then return OccurrenceRole.import_alias() end
+  return OccurrenceRole.reference()
+end
+
+local function exact_occurrence_span(node: {string: value}, tag: string,
+                                     parent_tag: string?, name: string,
+                                     location: SourceLocation): SourceSpan?
+  -- Issue #91 explicitly leaves navigation to Titan FFI declarations out of
+  -- V1. Calls may still carry a stable identity for hover/references, but the
+  -- foreign declaration itself must not become a navigable project target or
+  -- a rename anchor.
+  if tag == "Ast.TopLevelForeignFunc" then return nil end
+  local name_location? = optional_field_location(
+    node, "_name_loc", tag)
+  if name_location ~= nil then
+    return exact_name_span(name_location, name)
+  end
+  if tag == "Ast.VarName" or tag == "Ast.TypeName"
+      or tag == "Ast.TypeParam" then
+    return exact_name_span(location, name)
+  end
+  if tag == "Ast.Decl" then
+    if parent_tag == "Ast.TopLevelRecord" and
+        (optional_boolean(node["islocal"], DRIVER_MODULE, tag .. ".islocal")
+         or optional_boolean(node["isconst"], DRIVER_MODULE,
+                             tag .. ".isconst")) then
+      return nil
+    end
+    return exact_name_span(location, name)
+  end
+  if tag == "Ast.UnionVariant" and
+      not optional_boolean(node["islocal"], DRIVER_MODULE,
+                           tag .. ".islocal") then
+    return exact_name_span(location, name)
+  end
+  return nil
+end
+
+local function Walker:add_occurrence(node: {string: value}, tag: string,
+                                     name: string, role_name: string,
+                                     location: SourceLocation,
+                                     local_hint: boolean?,
+                                     parent_tag: string?)
+  local declaration: value = semantic_declaration(node, tag)
+  local declaration_id: string? = nil
+  local localness = node_is_local(node)
+  if declaration ~= nil and declaration ~= false then
+    declaration_id = declaration_identity(self.module_name, declaration)
+    localness = declaration_local(declaration)
+  elseif role_name == "definition" and local_hint == false then
+    declaration_id = "export:" .. self.module_name .. ":" .. name
+  elseif role_name == "definition" or role_name == "import_alias" then
+    declaration_id = declaration_identity(self.module_name, node)
+  end
+  if local_hint ~= nil then localness = local_hint end
+
+  local span: SourceSpan? = nil
+  span = exact_occurrence_span(node, tag, parent_tag, name, location)
+  self.symbols[#self.symbols + 1] = SymbolOccurrence.new(
+    name, declaration_id, occurrence_role(role_name), location, span,
+    localness, optional_type(self.compiler, node, "_type", tag))
+end
+
+local function Walker:add_bound_occurrence(name: string, declaration: value,
+                                            location: SourceLocation,
+                                            role: OccurrenceRole)
+  local declaration_id = declaration_identity(
+    self.module_name, declaration)
+  self.symbols[#self.symbols + 1] = SymbolOccurrence.new(
+    name, declaration_id, role, location,
+    exact_name_span(location, name), declaration_local(declaration), nil)
+end
+
+local function Walker:add_import(node: {string: value},
+                                 location: SourceLocation)
+  local alias = required_string(
+    node["localname"], DRIVER_MODULE, "Ast.TopLevelImport.localname")
+  local module_name = required_string(
+    node["modname"], DRIVER_MODULE, "Ast.TopLevelImport.modname")
+  local source_required = optional_boolean(
+    node["source_required"], DRIVER_MODULE,
+    "Ast.TopLevelImport.source_required")
+  self.imports[#self.imports + 1] = Import.new(
+    alias, module_name, source_required, location)
+end
+
+local function Walker:visit_any(candidate: value, parent_id: integer?,
+                                role_name: string, local_hint: boolean?,
+                                synthetic_parent: boolean)
+  if candidate == nil or candidate == false then return end
+  if self.compiler.type_of(candidate) ~= "table" then return end
+  local table_value = candidate as {string: value}
+  local raw_tag: value = table_value["_tag"]
+  if raw_tag is string and
+      strings.sub(raw_tag as string, 1, 4) == "Ast." then
+    self:visit_node(
+      candidate, parent_id, role_name, local_hint, synthetic_parent)
+    return
+  end
+
+  local list = candidate as {integer: value}
+  for index = 1, #list do
+    self:visit_any(
+      list[index], parent_id, role_name, local_hint, synthetic_parent)
+  end
+end
+
+local function child_fields(): const { string }
+  return {
+    "typeparams", "typeargs", "_surface_typeparams", "_surface_typeargs",
+    "_surface_named_args",
+    "constraint", "class", "params",
+    "argtypes", "rettypes", "varargtype", "flexrettype", "block",
+    "decl", "decls", "value", "type", "fields", "variants",
+    "members", "methods", "stats", "condition", "start", "finish",
+    "inc", "exps", "vars", "callexp", "exp", "var", "arms",
+    "elseblock", "thens", "elsestat", "catchblock", "finallyblock",
+    "exp1", "exp2", "lhs", "rhs", "target", "args", "subtype",
+    "base", "keystype", "valuestype", "basetype", "payload",
+    "binding", "index", "owner", "variant", "method",
+  }
+end
+
+local function Walker:visit_node(candidate: value, parent_id: integer?,
+                                 role_name: string, local_hint: boolean?,
+                                 synthetic_parent: boolean)
+  if self:already_seen(candidate) then return end
+  local raw = required_map(candidate, DRIVER_MODULE, "AST node")
+  local tag = required_string(raw["_tag"], DRIVER_MODULE, "AST node._tag")
+  if strings.sub(tag, 1, 4) ~= "Ast." then
+    fail<value>(DRIVER_MODULE, "invalid AST tag '" .. tag .. "'")
+  end
+  local location? = semantic_location(raw, tag)
+  local source_span? = structural_span(raw, tag)
+  local name? = node_name(raw, tag)
+  local inferred: TypeInfo? = optional_type(
+    self.compiler, raw, "_type", tag)
+  local declared: TypeInfo? = optional_type(
+    self.compiler, raw, "_declared_type", tag)
+  local adjustment: Adjustment? = nil
+  local original: TypeInfo? = nil
+  local coerced: TypeInfo? = nil
+  local raw_adjustment: value = raw["_adjustment"]
+  if raw_adjustment == nil or raw_adjustment == false then
+    raw_adjustment = raw["_assignment_adjustment"]
+  end
+  if raw_adjustment ~= nil and raw_adjustment ~= false then
+    adjustment = normalize_adjustment(
+      self.compiler, raw_adjustment, tag .. " adjustment")
+    local detail: AdjustmentInfo? = nil
+    case adjustment
+    when identity: item then detail = item
+    when coercion: item then detail = item
+    when gradual: item then detail = item
+    when callable: item then detail = item
+    when written: item then detail = item
+    when other: item then detail = item
+    end
+    if detail then
+      original = detail.source
+      coerced = detail.target
+    end
+  end
+
+  local id = #self.nodes + 1
+  local synthetic = synthetic_parent or node_is_synthetic(raw, tag)
+  local children_synthetic = synthetic_parent or
+    node_has_synthetic_children(raw, tag)
+  local localness = node_is_local(raw)
+  if local_hint ~= nil then localness = local_hint end
+  self.nodes[id] = Node.new(
+    id, parent_id, tag, node_kind(tag), location, source_span, name,
+    localness, synthetic, inferred, declared, original, coerced,
+    adjustment)
+
+  local parent_tag: string? = nil
+  if parent_id then parent_tag = self.nodes[parent_id].tag end
+  if not synthetic and location and name then
+    local role = role_name
+    if strings.sub(tag, 1, 12) == "Ast.TopLevel"
+        or tag == "Ast.Decl" or tag == "Ast.UnionVariant"
+        or tag == "Ast.TypeParam"
+        or tag == "Ast.InterfaceMethod" then
+      role = (tag == "Ast.TopLevelImport" or
+              tag == "Ast.TopLevelForeignImport")
+        and "import_alias" or "definition"
+    elseif tag == "Ast.TypeName" or tag == "Ast.TypeQualName" then
+      role = "type_reference"
+    end
+    self:add_occurrence(
+      raw, tag, name, role, location, local_hint, parent_tag)
+  end
+  if not synthetic and tag == "Ast.TypeQualName" then
+    local module_location? = optional_field_location(
+      raw, "_module_loc", tag)
+    if module_location ~= nil then
+      local module_name = required_string(
+        raw["module"], DRIVER_MODULE, tag .. ".module")
+      self:add_bound_occurrence(
+        module_name, raw["_module_decl"], module_location,
+        OccurrenceRole.reference())
+    end
+  end
+  if not synthetic and (tag == "Ast.TopLevelMethod"
+      or tag == "Ast.TopLevelStatic") then
+    local owner_location? = optional_field_location(
+      raw, "_owner_loc", tag)
+    if owner_location ~= nil then
+      local owner_name = required_string(
+        raw["class"], DRIVER_MODULE, tag .. ".class")
+      self:add_bound_occurrence(
+        owner_name, raw["_owner_decl"], owner_location,
+        OccurrenceRole.type_reference())
+    end
+  end
+  if not synthetic and tag == "Ast.TopLevelImport" and location then
+    self:add_import(raw, location)
+  end
+
+  if tag == "Ast.StatAssign" then
+    self:visit_any(raw["vars"], id, "write", nil, children_synthetic)
+  elseif tag == "Ast.TopLevelVar" then
+    self:visit_any(
+      raw["decl"], id, "definition", node_is_local(raw), children_synthetic)
+  elseif tag == "Ast.TopLevelFunc" or tag == "Ast.TopLevelForeignFunc"
+      or tag == "Ast.TopLevelMethod" or tag == "Ast.TopLevelStatic" then
+    self:visit_any(
+      raw["params"], id, "definition", true, children_synthetic)
+  elseif tag == "Ast.StatDecl" or tag == "Ast.StatFor"
+      or tag == "Ast.StatForIn" then
+    self:visit_any(
+      raw["decls"], id, "definition", true, children_synthetic)
+    self:visit_any(
+      raw["decl"], id, "definition", true, children_synthetic)
+  end
+
+  local fields = child_fields()
+  for index = 1, #fields do
+    self:visit_any(
+      raw[fields[index]], id, "reference", nil, children_synthetic)
+  end
+end
+
+local function walk_ast(compiler: Compiler, module_name: string,
+                        candidate: value):
+    ({Node}, {SymbolOccurrence}, {Import})
+  if compiler.type_of(candidate) ~= "table" then
+    raise BridgeError.new(
+      DRIVER_MODULE, "annotated AST root must be a Lua table")
+  end
+  local walker = Walker.new(compiler, module_name, {}, {}, {}, {})
+  walker:visit_any(candidate, nil, "reference", nil, false)
+  return walker.nodes, walker.symbols, walker.imports
+end
+
+local function diagnostic_body(message: string, start: integer): string
+  if start > #message then return "" end
+  return strings.sub(message, start)
+end
+
+local function parse_diagnostic(message: string): Diagnostic
+  local search = 1
+  while search <= #message do
+    local first: integer? = strings.find(message, ":", search)
+    if not first then break end
+    local second: integer? = strings.find(message, ":", first + 1)
+    if not second then break end
+    local third: integer? = strings.find(message, ":", second + 1)
+    if not third then break end
+    local raw_line = strings.sub(message, first + 1, second - 1)
+    local raw_column = strings.sub(message, second + 1, third - 1)
+    local line: integer? = math.tointeger(raw_line)
+    local column: integer? = math.tointeger(raw_column)
+    if line and column and line > 0 and column > 0 then
+      local body = diagnostic_body(message, third + 2)
+      local kind = DiagnosticKind.compiler()
+      if strings.sub(body, 1, 14) == "syntax error: " then
+        kind = DiagnosticKind.syntax()
+      elseif strings.sub(body, 1, 12) == "type error: " then
+        kind = DiagnosticKind.type_error()
+      end
+      return Diagnostic.new(kind, body, SourceLocation.new(
+        strings.sub(message, 1, first - 1), line, column))
+    end
+    search = first + 1
+  end
+  return Diagnostic.new(DiagnosticKind.compiler(), message, nil)
+end
+
+local function normalize_diagnostics(candidate: value): {Diagnostic}
+  if candidate == nil or candidate == false then
+    return fail<{Diagnostic}>(
+      DRIVER_MODULE, "compiler error list must be a Lua table")
+  end
+  if not (candidate is {integer: value}) then
+    return fail<{Diagnostic}>(
+      DRIVER_MODULE, "compiler error list must be a Lua table")
+  end
+  local raw = candidate as {integer: value}
+  local diagnostics: {Diagnostic} = {}
+  for index = 1, #raw do
+    diagnostics[index] = parse_diagnostic(required_string(
+      raw[index], DRIVER_MODULE, "compiler error " .. index))
+  end
+  return diagnostics
+end
+
+local function serialize_manifest(compiler: Compiler, module_name: string,
+                                  candidate: value): Manifest
+  local raw_type = required_map(
+    candidate, TYPES_MODULE, "module interface for '" .. module_name .. "'")
+  local tag = required_string(
+    raw_type["_tag"], TYPES_MODULE,
+    "module interface for '" .. module_name .. "'._tag")
+  if tag ~= "Type.Module" then
+    return fail<Manifest>(TYPES_MODULE,
+      "module interface for '" .. module_name ..
+      "' must have tag Type.Module, found " .. tag)
+  end
+  local raw_serializer = checked_function(
+    compiler.types, TYPES_MODULE, "serialize", compiler.type_of)
+  local serializer = raw_serializer as (value) -> value
+  local serialized: value = nil
+  do
+    serialized = serializer(candidate)
+  catch
+    return fail<Manifest>(TYPES_MODULE,
+      "cannot serialize public manifest for '" .. module_name .. "': " ..
+      strings.tostring(error))
+  end
+  return Manifest.new(module_name, required_string(
+    serialized, TYPES_MODULE,
+    "types.serialize result for '" .. module_name .. "'"))
+end
+
+local function project_index(modules: {ProjectModule}): {string: ProjectModule}
+  local result: {string: ProjectModule} = {}
+  for index = 1, #modules do
+    local module = modules[index]
+    if result[module.module_name] ~= nil then
+      return fail<{string: ProjectModule}>(
+        DRIVER_MODULE, "duplicate project module '" .. module.module_name .. "'")
+    end
+    if #module.files == 0 then
+      return fail<{string: ProjectModule}>(
+        DRIVER_MODULE, "project module '" .. module.module_name ..
+        "' has no saved source files")
+    end
+    result[module.module_name] = module
+  end
+  return result
+end
+
+local function raw_source_descriptor(module: ProjectModule): value
+  local files: {integer: value} = {}
+  local contents: {string: value} = {}
+  for index = 1, #module.files do
+    local source = module.files[index]
+    if contents[source.filename] ~= nil then
+      return fail<value>(DRIVER_MODULE,
+        "project module '" .. module.module_name ..
+        "' repeats source file '" .. source.filename .. "'")
+    end
+    files[index] = source.filename
+    contents[source.filename] = source.contents
+  end
+  local descriptor: {string: value} = {}
+  descriptor["kind"] = #module.files == 1 and "flat" or "folder"
+  descriptor["main"] = module.files[1].filename
+  descriptor["files"] = files
+  descriptor["contents"] = contents
+  descriptor["native_output"] = module.files[1].filename
+  descriptor["program_output"] = module.module_name
+  return descriptor
+end
+
+local function project_loader_inputs(modules: {ProjectModule}):
+    ({string: value}, {string: ProjectModule})
+  local projects = project_index(modules)
+  local overrides: {string: value} = {}
+  for index = 1, #modules do
+    local module = modules[index]
+    overrides[module.module_name] = raw_source_descriptor(module)
+  end
+  return overrides, projects
+end
+
+local function requested_modules(names: {string},
+                                 projects: {string: ProjectModule}):
+    ({string: boolean}, {string})
+  local requested: {string: boolean} = {}
+  local ordered: {string} = {}
+  for index = 1, #names do
+    local name = names[index]
+    if projects[name] == nil then
+      raise BridgeError.new(
+        DRIVER_MODULE, "analysis module '" .. name ..
+        "' is not in the project snapshot")
+    end
+    if not requested[name] then
+      requested[name] = true
+      ordered[#ordered + 1] = name
+    end
+  end
+  if #ordered == 0 then
+    raise BridgeError.new(
+      DRIVER_MODULE, "incremental analysis requires at least one module")
+  end
+  return requested, ordered
+end
+
+local function cached_source_map(cached: {CachedSourceInterface},
+                                 projects: {string: ProjectModule}):
+    ({string: CachedSourceInterface}, {string: value})
+  local normalized: {string: CachedSourceInterface} = {}
+  local raw: {string: value} = {}
+  for index = 1, #cached do
+    local item = cached[index]
+    if projects[item.module_name] ~= nil then
+      raise BridgeError.new(
+        DRIVER_MODULE, "external cached interface '" .. item.module_name ..
+        "' collides with a project module")
+    end
+    if normalized[item.module_name] ~= nil then
+      raise BridgeError.new(
+        DRIVER_MODULE, "duplicate external cached interface '" ..
+        item.module_name .. "'")
+    end
+    if item.main_file == "" or item.serialized == "" then
+      raise BridgeError.new(
+        DRIVER_MODULE, "cached source interface '" .. item.module_name ..
+        "' has an empty filename or manifest")
+    end
+    normalized[item.module_name] = item
+    local source_files: {integer: value} = {}
+    for file_index = 1, #item.source_files do
+      source_files[file_index] = item.source_files[file_index]
+    end
+    local dependencies: {integer: value} = {}
+    local seen: {string: boolean} = {}
+    for import_index = 1, #item.imports do
+      local dependency = item.imports[import_index].module_name
+      if not seen[dependency] then
+        seen[dependency] = true
+        dependencies[#dependencies + 1] = dependency
+      end
+    end
+    local descriptor: {string: value} = {}
+    descriptor["serialized"] = item.serialized
+    descriptor["filename"] = item.main_file
+    descriptor["source_files"] = source_files
+    descriptor["dependencies"] = dependencies
+    descriptor["c_header_dependencies"] =
+      raw_c_header_dependencies(item.c_header_dependencies)
+    raw[item.module_name] = descriptor
+  end
+  return normalized, raw
+end
+
+local function provenance(entry: {string: value}, module_name: string,
+                          projects: {string: ProjectModule}): Provenance
+  local kind = required_string(
+    entry["kind"], DRIVER_MODULE,
+    "compiler provenance for '" .. module_name .. "'.kind")
+  if kind == "source" then
+    local main_file = required_string(
+      entry["filename"], DRIVER_MODULE,
+      "compiler provenance for '" .. module_name .. "'.filename")
+    local source_files: {string} = {main_file}
+    if entry["source_files"] ~= nil and entry["source_files"] ~= false then
+      source_files = required_string_list(
+        entry["source_files"], DRIVER_MODULE,
+        "compiler provenance for '" .. module_name .. "'.source_files")
+    end
+    local source = SourceProvenance.new(main_file, source_files)
+    if projects[module_name] ~= nil then
+      return Provenance.project_source(source)
+    end
+    return Provenance.external_source(source)
+  end
+  if kind == "dynamic" then
+    return Provenance.dynamic_binary(BinaryProvenance.new(required_string(
+      entry["filename"], DRIVER_MODULE,
+      "compiler provenance for '" .. module_name .. "'.filename")))
+  end
+  if kind == "static" then
+    return Provenance.static_binary(BinaryProvenance.new(required_string(
+      entry["static_archive"], DRIVER_MODULE,
+      "compiler provenance for '" .. module_name .. "'.static_archive")))
+  end
+  return fail<Provenance>(DRIVER_MODULE,
+    "unsupported compiler provenance kind '" .. kind .. "'")
+end
+
+local function snapshot_module(compiler: Compiler, module_name: string,
+                               candidate: value,
+                               projects: {string: ProjectModule},
+                               cached: {string: CachedSourceInterface},
+                               valid_manifest: boolean): ModuleSnapshot
+  local entry = required_map(
+    candidate, DRIVER_MODULE, "driver.imported['" .. module_name .. "']")
+  local origin = provenance(entry, module_name, projects)
+  local manifest: Manifest? = nil
+  if valid_manifest then
+    local cached_source? = cached[module_name]
+    if cached_source ~= nil then
+      manifest = Manifest.new(module_name, cached_source.serialized)
+    else
+      manifest = serialize_manifest(
+        compiler, module_name, entry["type"])
+    end
+  end
+  local nodes: {Node} = {}
+  local symbols: {SymbolOccurrence} = {}
+  local imports: {Import} = {}
+  local header_dependencies = normalize_c_header_dependencies(
+    entry["c_header_dependencies"],
+    "driver.imported['" .. module_name .. "'].c_header_dependencies")
+  local raw_ast: value = entry["ast"]
+  if projects[module_name] ~= nil then
+    if raw_ast == nil or raw_ast == false then
+      return fail<ModuleSnapshot>(DRIVER_MODULE,
+        "project source '" .. module_name .. "' has no annotated AST")
+    end
+    nodes, symbols, imports = walk_ast(compiler, module_name, raw_ast)
+    if valid_manifest then compiler.project_asts[module_name] = raw_ast end
+  elseif cached[module_name] ~= nil then
+    local cached_source = cached[module_name]
+    for index = 1, #cached_source.imports do
+      imports[index] = cached_source.imports[index]
+    end
+  elseif raw_ast ~= nil and raw_ast ~= false then
+    -- External ASTs exist only for this transient compiler attempt. Normalize
+    -- their dependency edges, then immediately discard nodes and symbols.
+    local _nodes, _symbols, discovered = walk_ast(
+      compiler, module_name, raw_ast)
+    imports = discovered
+  else
+    local dependencies: {string} = {}
+    local raw_dependencies: value = entry["deps"]
+    if raw_dependencies is {string: value} then
+      for dependency, enabled in iteration.pairs<string, value>(
+          raw_dependencies as {string: value}) do
+        if enabled then
+          local position = #dependencies + 1
+          while position > 1 and
+              dependencies[position - 1] > dependency do
+            dependencies[position] = dependencies[position - 1]
+            position = position - 1
+          end
+          dependencies[position] = dependency
+        end
+      end
+    end
+    local filename = "<" .. module_name .. ">"
+    case origin
+    when external_source: source then filename = source.main_file
+    when dynamic_binary: binary then filename = binary.provider_file
+    when static_binary: binary then filename = binary.provider_file
+    when project_source then
+    end
+    for index = 1, #dependencies do
+      imports[index] = Import.new(
+        dependencies[index], dependencies[index], false,
+        SourceLocation.new(filename, 1, 1))
+    end
+  end
+  return ModuleSnapshot.new(
+    module_name, origin, manifest, nodes, symbols, imports,
+    header_dependencies)
+end
+
+local function normalize_contextual_resolutions(context: value):
+    {ContextualResolution}
+  local raw_context = required_map(
+    context, DRIVER_MODULE, "compiler resolver context")
+  local raw_resolutions = required_map(
+    raw_context["contextual_resolutions"], DRIVER_MODULE,
+    "compiler resolver contextual_resolutions")
+  local result: {ContextualResolution} = {}
+  for key, candidate in iteration.pairs<string, value>(raw_resolutions) do
+    local raw = required_map(candidate, DRIVER_MODULE,
+      "compiler contextual resolution '" .. key .. "'")
+    local owner = required_string(
+      raw["owner"], DRIVER_MODULE,
+      "compiler contextual resolution '" .. key .. "'.owner")
+    local exposer = required_string(
+      raw["exposer"], DRIVER_MODULE,
+      "compiler contextual resolution '" .. key .. "'.exposer")
+    local kind = required_string(
+      raw["kind"], DRIVER_MODULE,
+      "compiler contextual resolution '" .. key .. "'.kind")
+    local provider_file = required_string(
+      raw["provider_file"], DRIVER_MODULE,
+      "compiler contextual resolution '" .. key .. "'.provider_file")
+    local origin?: Provenance = nil
+    if kind == "dynamic" then
+      origin = Provenance.dynamic_binary(
+        BinaryProvenance.new(provider_file))
+    elseif kind == "static" then
+      origin = Provenance.static_binary(
+        BinaryProvenance.new(provider_file))
+    else
+      return fail<{ContextualResolution}>(DRIVER_MODULE,
+        "compiler contextual resolution '" .. key ..
+        "' has unsupported provenance kind '" .. kind .. "'")
+    end
+    local normalized = ContextualResolution.new(
+      owner, exposer, origin as Provenance, required_boolean(
+        raw["ordinary_lookup"], DRIVER_MODULE,
+        "compiler contextual resolution '" .. key ..
+        "'.ordinary_lookup"))
+    local position = #result + 1
+    local identity = exposer .. "\0" .. owner .. "\0" ..
+                     kind .. "\0" .. provider_file
+    while position > 1 do
+      local previous = result[position - 1]
+      local previous_kind = "dynamic"
+      local previous_file = ""
+      case previous.provenance
+      when dynamic_binary: binary then previous_file = binary.provider_file
+      when static_binary: binary then
+        previous_kind = "static"
+        previous_file = binary.provider_file
+      else
+      end
+      local previous_identity = previous.exposer_module .. "\0" ..
+        previous.owner_module .. "\0" .. previous_kind .. "\0" ..
+        previous_file
+      if previous_identity <= identity then break end
+      result[position] = previous
+      position = position - 1
+    end
+    result[position] = normalized
+  end
+  return result
+end
+
+-- Installation discovery belongs to the compiler, but API 3 deliberately
+-- defers physical path resolution until a resolver owns an I/O strategy.
+-- Initialize and close that resolver under the shared Lua-state permit before
+-- exposing the compiler's ABI directory to project configuration.
+function Compiler:installed_binary_modules_root(): string
+  local permit = compiler_scheduler.acquire()
+  defer permit:release()
+
+  local context = new_context(self, nil)
+  defer close_context(self, context)
+
+  local paths = required_map(
+    self.driver["INSTALL_PATHS"], DRIVER_MODULE,
+    "driver.INSTALL_PATHS")
+  return required_string(
+    paths["titan_bin"], DRIVER_MODULE,
+    "driver.INSTALL_PATHS.titan_bin")
+catch
+  if error is async.CancellationReason then raise end
+  if error is BridgeError then raise end
+  raise BridgeError.new(DRIVER_MODULE,
+    "compiler installation discovery failed: " .. strings.tostring(error))
+end
+
+local function append_diagnostics(target: {Diagnostic}, source: {Diagnostic})
+  for index = 1, #source do
+    target[#target + 1] = source[index]
+  end
+end
+
+local record AttemptResult
+  diagnostics: {Diagnostic}
+  modules: {ModuleSnapshot}
+  contextual_resolutions: {ContextualResolution}
+  checked: {string}
+  entries: {string: value}
+  failed: {string: boolean}
+end
+
+local function module_for_filename(projects: {string: ProjectModule},
+                                   filename: string): string?
+  for name, project in iteration.pairs<string, ProjectModule>(projects) do
+    for index = 1, #project.files do
+      if project.files[index].filename == filename then return name end
+    end
+  end
+  return nil
+end
+
+local function sorted_entry_names(entries: {string: value}): {string}
+  local result: {string} = {}
+  for name in iteration.pairs<string, value>(entries) do
+    local position = #result + 1
+    while position > 1 and result[position - 1] > name do
+      result[position] = result[position - 1]
+      position = position - 1
+    end
+    result[position] = name
+  end
+  return result
+end
+
+local function failed_projects(root_module: string,
+                               diagnostics: {Diagnostic},
+                               projects: {string: ProjectModule},
+                               loader_failed: boolean): {string: boolean}
+  local failed: {string: boolean} = {}
+  if loader_failed then failed[root_module] = true end
+  for index = 1, #diagnostics do
+    local diagnostic = diagnostics[index]
+    local owner?: string = nil
+    if diagnostic.location ~= nil then
+      owner = module_for_filename(projects, diagnostic.location.filename)
+    end
+    if owner == nil then owner = root_module end
+    failed[owner as string] = true
+  end
+  return failed
+end
+
+local function failed_project_snapshot(project: ProjectModule): ModuleSnapshot
+  local files: {string} = {}
+  for index = 1, #project.files do
+    files[index] = project.files[index].filename
+  end
+  return ModuleSnapshot.new(
+    project.module_name,
+    Provenance.project_source(SourceProvenance.new(
+      project.files[1].filename, files)),
+    nil, {}, {}, {}, {})
+end
+
+local function Compiler:run_attempt(
+    root_module: string, projects: {string: ProjectModule},
+    overrides: {string: value},
+    pending: {string: boolean}, cached: {string: CachedSourceInterface},
+    raw_cached_interfaces: {string: value}): AttemptResult
+  local options: {string: value} = { ["io"] = self.io }
+  local roots: {string: value} = {[root_module] = true}
+  local active_overrides: {string: value} = {}
+  local retained_entries: {string: value} = {}
+  local known_source_modules: {string: value} = {}
+  for name in iteration.pairs<string, ProjectModule>(projects) do
+    known_source_modules[name] = true
+    if pending[name] then
+      active_overrides[name] = overrides[name]
+    elseif self.project_entries[name] ~= nil then
+      retained_entries[name] = self.project_entries[name]
+    end
+  end
+  options["source_roots"] = roots
+  options["source_overrides"] = active_overrides
+  options["known_source_modules"] = known_source_modules
+  options["cached_source_entries"] = retained_entries
+  options["cached_interfaces"] = raw_cached_interfaces
+  local raw_includes: {integer: value} = {}
+  for index = 1, #self.extra_ffi_include_dirs do
+    raw_includes[index] = self.extra_ffi_include_dirs[index]
+  end
+  options["extra_ffi_include_dirs"] = raw_includes
+
+  local previous_imported: value = self.driver["imported"]
+  local previous_registry: value = self.types["registry"]
+  defer self.driver["imported"] = previous_imported
+  defer self.types["registry"] = previous_registry
+  local imported: {string: value} = {}
+  self.driver["imported"] = imported
+  self.types["registry"] = {} as {string: value}
+
+  local context = new_context(self, options)
+  defer close_context(self, context)
+  options["context"] = context
+
+  local raw_defaultloader = checked_function(
+    self.driver, DRIVER_MODULE, "defaultloader", self.type_of)
+  local defaultloader = raw_defaultloader as (value, value) -> value
+  local static_dependencies: {string: value} = {}
+  local loader: value = defaultloader(static_dependencies, options)
+  if self.type_of(loader) ~= "function" then
+    return fail<AttemptResult>(DRIVER_MODULE,
+      "driver.defaultloader returned " .. describe(loader, self.type_of) ..
+      " instead of a function")
+  end
+  defer close_loader(self, loader)
+
+  local diagnostics: {Diagnostic} = {}
+  local invoke = loader as (string) -> (value, value, value, value)
+  local raw_ok, interface_or_error, raw_errors = invoke(root_module)
+  local ok = required_boolean(
+    raw_ok, DRIVER_MODULE, "compiler loader result")
+  if not ok then
+    diagnostics[#diagnostics + 1] = parse_diagnostic(required_string(
+      interface_or_error, DRIVER_MODULE, "compiler loader error"))
+  else
+    append_diagnostics(diagnostics, normalize_diagnostics(raw_errors))
+  end
+
+  local raw_context = required_map(
+    context, DRIVER_MODULE, "compiler resolver context")
+  local checked = required_string_list(
+    raw_context["checked_source_modules"], DRIVER_MODULE,
+    "compiler resolver checked_source_modules")
+
+  local raw_finalize = checked_function(
+    self.driver, DRIVER_MODULE, "finalize_resolver_context", self.type_of)
+  local finalize = raw_finalize as (value) -> (value, value)
+  local finalized, raw_final_errors = finalize(context)
+  if finalized == nil or finalized == false then
+    append_diagnostics(diagnostics, normalize_diagnostics(raw_final_errors))
+  end
+  local contextual_resolutions: {ContextualResolution} = {}
+  if finalized ~= nil and finalized ~= false then
+    contextual_resolutions = normalize_contextual_resolutions(context)
+  end
+
+  local failed = failed_projects(
+    root_module, diagnostics, projects, not ok)
+  local checked_set: {string: boolean} = {}
+  for index = 1, #checked do checked_set[checked[index]] = true end
+  -- A loader that fails before publishing a module cannot add the root to the
+  -- context's checked list. Its failed root still belongs in this attempt's
+  -- explicit result.
+  if not ok then checked_set[root_module] = true end
+
+  local modules: {ModuleSnapshot} = {}
+  local entries: {string: value} = {}
+  local names = sorted_entry_names(imported)
+  for index = 1, #names do
+    local name = names[index]
+    local is_project = projects[name] ~= nil
+    if not is_project or checked_set[name] then
+      local valid = #diagnostics == 0
+      if is_project then valid = failed[name] ~= true end
+      modules[#modules + 1] = snapshot_module(
+        self, name, imported[name], projects, cached, valid)
+      if is_project and valid then entries[name] = imported[name] end
+    end
+  end
+  if checked_set[root_module] and imported[root_module] == nil then
+    modules[#modules + 1] = failed_project_snapshot(projects[root_module])
+  end
+  return AttemptResult.new(
+    diagnostics, modules, contextual_resolutions, checked, entries, failed)
+end
+
+function Compiler:analyze_incremental(
+    project_modules: {ProjectModule}, dirty_modules: {string},
+    cached_sources: {CachedSourceInterface}): Analysis
+  local overrides, projects = project_loader_inputs(project_modules)
+  local requested, ordered = requested_modules(dirty_modules, projects)
+  local cached, raw_cached_interfaces = cached_source_map(
+    cached_sources, projects)
+  local permit = compiler_scheduler.acquire()
+  defer permit:release()
+
+  local previous_source_path: value = self.driver["TITAN_SOURCE_PATH"]
+  local previous_binary_path: value = self.driver["TITAN_BIN_PATH"]
+  defer self.driver["TITAN_SOURCE_PATH"] = previous_source_path
+  defer self.driver["TITAN_BIN_PATH"] = previous_binary_path
+  if self.source_path then
+    self.driver["TITAN_SOURCE_PATH"] = self.source_path as string
+  end
+  if self.binary_path then
+    self.driver["TITAN_BIN_PATH"] = self.binary_path as string
+  end
+
+  -- Purge deleted and invalidated project state before constructing any fresh
+  -- resolver. A dirty module can never be seeded from an older generation.
+  for name in iteration.pairs<string, value>(self.project_entries) do
+    if projects[name] == nil or requested[name] then
+      self.project_entries[name] = nil
+      self.project_asts[name] = nil
+    end
+  end
+
+  local pending: {string: boolean} = {}
+  for index = 1, #ordered do pending[ordered[index]] = true end
+  local diagnostics: {Diagnostic} = {}
+  local snapshots: {string: ModuleSnapshot} = {}
+  local contextual_resolutions: {ContextualResolution} = {}
+
+  for index = 1, #ordered do
+    local root = ordered[index]
+    if pending[root] then
+      local attempt = self:run_attempt(
+        root, projects, overrides, pending, cached,
+        raw_cached_interfaces)
+      append_diagnostics(diagnostics, attempt.diagnostics)
+      for module_index = 1, #attempt.modules do
+        local snapshot = attempt.modules[module_index]
+        snapshots[snapshot.module_name] = snapshot
+      end
+      for resolution_index = 1, #attempt.contextual_resolutions do
+        contextual_resolutions[#contextual_resolutions + 1] =
+          attempt.contextual_resolutions[resolution_index]
+      end
+      for name, entry in iteration.pairs<string, value>(attempt.entries) do
+        self.project_entries[name] = entry
+      end
+      for checked_index = 1, #attempt.checked do
+        local name = attempt.checked[checked_index]
+        if requested[name] then pending[name] = nil end
+      end
+      if attempt.failed[root] then pending[root] = nil end
+      -- Parsing may fail before the context publishes the root.
+      if snapshots[root] ~= nil then pending[root] = nil end
+    end
+  end
+
+  local modules: {ModuleSnapshot} = {}
+  for index = 1, #project_modules do
+    local name = project_modules[index].module_name
+    local snapshot? = snapshots[name]
+    if snapshot ~= nil then modules[#modules + 1] = snapshot end
+  end
+  local external_names: {string} = {}
+  for name in iteration.pairs<string, ModuleSnapshot>(snapshots) do
+    if projects[name] == nil then
+      local position = #external_names + 1
+      while position > 1 and external_names[position - 1] > name do
+        external_names[position] = external_names[position - 1]
+        position = position - 1
+      end
+      external_names[position] = name
+    end
+  end
+  for index = 1, #external_names do
+    modules[#modules + 1] = snapshots[external_names[index]]
+  end
+  return Analysis.new(
+    ordered[1], diagnostics, modules, contextual_resolutions)
+catch
+  if error is async.CancellationReason then raise end
+  if error is BridgeError then raise end
+  raise BridgeError.new(DRIVER_MODULE,
+    "compiler analysis failed: " .. strings.tostring(error))
+end
+
+function Compiler:analyze(root_module: string,
+                          project_modules: {ProjectModule}): Analysis
+  local roots: {string} = {root_module}
+  for index = 1, #project_modules do
+    local name = project_modules[index].module_name
+    if name ~= root_module then roots[#roots + 1] = name end
+  end
+  return self:analyze_incremental(project_modules, roots, {})
+end

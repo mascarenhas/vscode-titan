@@ -1,0 +1,425 @@
+local strings = import "string"
+
+-- ByteOffset uses the usual half-open, zero-based convention. Position is the
+-- zero-based UTF-16 coordinate required by LSP.
+record Position
+  line: integer
+  character: integer
+end
+
+record Span
+  start: Position
+  finish: Position
+end
+
+record ByteSpan
+  start: integer
+  finish: integer
+end
+
+record Error
+  message: string
+  byte_offset: integer?
+end
+
+local record CodePoint
+  scalar: integer
+  next_index: integer
+end
+
+local function fail<T>(message: string, byte_offset: integer?): T
+  raise Error.new(message, byte_offset)
+end
+
+local function continuation(byte: integer): boolean
+  return byte >= 0x80 and byte <= 0xbf
+end
+
+-- Decode one UTF-8 scalar at a one-based byte index. Invalid encodings,
+-- overlong forms, surrogates, and values above U+10FFFF are rejected.
+local function decode(source: string, index: integer): CodePoint
+  local first: integer = strings.byte(source, index)
+  if first <= 0x7f then return CodePoint.new(first, index + 1) end
+
+  if first >= 0xc2 and first <= 0xdf then
+    if index + 1 > #source then
+      return fail<CodePoint>("truncated UTF-8 sequence", index - 1)
+    end
+    local second: integer = strings.byte(source, index + 1)
+    if not continuation(second) then
+      return fail<CodePoint>("invalid UTF-8 continuation byte", index)
+    end
+    return CodePoint.new(
+      (first - 0xc0) * 0x40 + (second - 0x80), index + 2)
+  end
+
+  if first >= 0xe0 and first <= 0xef then
+    if index + 2 > #source then
+      return fail<CodePoint>("truncated UTF-8 sequence", index - 1)
+    end
+    local second: integer = strings.byte(source, index + 1)
+    local third: integer = strings.byte(source, index + 2)
+    if not continuation(third) then
+      return fail<CodePoint>("invalid UTF-8 continuation byte", index + 1)
+    end
+    if first == 0xe0 then
+      if second < 0xa0 or second > 0xbf then
+        return fail<CodePoint>("invalid UTF-8 sequence", index - 1)
+      end
+    elseif first == 0xed then
+      if second < 0x80 or second > 0x9f then
+        return fail<CodePoint>("UTF-8 cannot encode a surrogate", index - 1)
+      end
+    elseif not continuation(second) then
+      return fail<CodePoint>("invalid UTF-8 continuation byte", index)
+    end
+    return CodePoint.new(
+      (first - 0xe0) * 0x1000 +
+      (second - 0x80) * 0x40 +
+      (third - 0x80), index + 3)
+  end
+
+  if first >= 0xf0 and first <= 0xf4 then
+    if index + 3 > #source then
+      return fail<CodePoint>("truncated UTF-8 sequence", index - 1)
+    end
+    local second: integer = strings.byte(source, index + 1)
+    local third: integer = strings.byte(source, index + 2)
+    local fourth: integer = strings.byte(source, index + 3)
+    if not continuation(third) or not continuation(fourth) then
+      return fail<CodePoint>("invalid UTF-8 continuation byte", index + 1)
+    end
+    if first == 0xf0 then
+      if second < 0x90 or second > 0xbf then
+        return fail<CodePoint>("invalid UTF-8 sequence", index - 1)
+      end
+    elseif first == 0xf4 then
+      if second < 0x80 or second > 0x8f then
+        return fail<CodePoint>("UTF-8 scalar is above U+10FFFF", index - 1)
+      end
+    elseif not continuation(second) then
+      return fail<CodePoint>("invalid UTF-8 continuation byte", index)
+    end
+    return CodePoint.new(
+      (first - 0xf0) * 0x40000 +
+      (second - 0x80) * 0x1000 +
+      (third - 0x80) * 0x40 +
+      (fourth - 0x80), index + 4)
+  end
+
+  return fail<CodePoint>("invalid UTF-8 leading byte", index - 1)
+end
+
+local function utf16_width(codepoint: integer): integer
+  if codepoint > 0xffff then return 2 end
+  return 1
+end
+
+local function position_for_offset_or_raise(source: string,
+                                             byte_offset: integer): Position
+  if byte_offset < 0 or byte_offset > #source then
+    return fail<Position>("byte offset is outside the source text", byte_offset)
+  end
+
+  local target = byte_offset + 1
+  local index = 1
+  local line = 0
+  local character = 0
+  while index <= #source do
+    if index == target then return Position.new(line, character) end
+    local byte: integer = strings.byte(source, index)
+    if byte == 0x0d then
+      if index + 1 <= #source and
+         strings.byte(source, index + 1) == 0x0a then
+        if target == index + 1 then
+          return fail<Position>(
+            "byte offset splits a CRLF line ending", byte_offset)
+        end
+        index = index + 2
+      else
+        index = index + 1
+      end
+      line = line + 1
+      character = 0
+    elseif byte == 0x0a then
+      index = index + 1
+      line = line + 1
+      character = 0
+    else
+      local decoded = decode(source, index)
+      if target > index and target < decoded.next_index then
+        return fail<Position>(
+          "byte offset splits a UTF-8 scalar", byte_offset)
+      end
+      character = character + utf16_width(decoded.scalar)
+      index = decoded.next_index
+    end
+  end
+  return Position.new(line, character)
+end
+
+function position_for_offset(source: string, byte_offset: integer):
+    (Position?, Error?)
+  do
+    return position_for_offset_or_raise(source, byte_offset), nil
+  catch
+    if error is Error then return nil, error as Error end
+    raise
+  end
+end
+
+local function offset_for_position_or_raise(source: string,
+                                             position: Position): integer
+  if position.line < 0 or position.character < 0 then
+    return fail<integer>("LSP positions cannot be negative", nil)
+  end
+
+  local index = 1
+  local line = 0
+  local character = 0
+  while true do
+    if line == position.line and character == position.character then
+      return index - 1
+    end
+    if index > #source then
+      if line < position.line then
+        return fail<integer>("LSP line is outside the source text", nil)
+      end
+      return fail<integer>("LSP character is outside its line", nil)
+    end
+
+    local byte: integer = strings.byte(source, index)
+    if byte == 0x0d or byte == 0x0a then
+      if line == position.line then
+        return fail<integer>("LSP character is outside its line", index - 1)
+      end
+      if byte == 0x0d and index + 1 <= #source and
+         strings.byte(source, index + 1) == 0x0a then
+        index = index + 2
+      else
+        index = index + 1
+      end
+      line = line + 1
+      character = 0
+    else
+      local decoded = decode(source, index)
+      local width = utf16_width(decoded.scalar)
+      if line == position.line and
+         position.character > character and
+         position.character < character + width then
+        return fail<integer>(
+          "LSP character splits a UTF-16 surrogate pair", index - 1)
+      end
+      character = character + width
+      index = decoded.next_index
+    end
+  end
+end
+
+function offset_for_position(source: string, position: Position):
+    (integer?, Error?)
+  do
+    return offset_for_position_or_raise(source, position), nil
+  catch
+    if error is Error then return nil, error as Error end
+    raise
+  end
+end
+
+function span_for_offsets(source: string, start_offset: integer,
+                          finish_offset: integer): (Span?, Error?)
+  if finish_offset < start_offset then
+    return nil, Error.new("span finish precedes its start", finish_offset)
+  end
+  local start?, start_error? = position_for_offset(source, start_offset)
+  if start == nil then return nil, start_error end
+  local finish?, finish_error? = position_for_offset(source, finish_offset)
+  if finish == nil then return nil, finish_error end
+  return Span.new(start, finish), nil
+end
+
+function offsets_for_span(source: string, span: Span): (ByteSpan?, Error?)
+  local start?, start_error? = offset_for_position(source, span.start)
+  if start == nil then return nil, start_error end
+  local finish?, finish_error? = offset_for_position(source, span.finish)
+  if finish == nil then return nil, finish_error end
+  if finish < start then
+    return nil, Error.new("span finish precedes its start", finish)
+  end
+  return ByteSpan.new(start, finish), nil
+end
+
+local function is_hex(byte: integer): boolean
+  if byte >= 48 and byte <= 57 then return true end
+  if byte >= 65 and byte <= 70 then return true end
+  return byte >= 97 and byte <= 102
+end
+
+local function hex_value(byte: integer): integer
+  if byte >= 48 and byte <= 57 then return byte - 48 end
+  if byte >= 65 and byte <= 70 then return byte - 65 + 10 end
+  return byte - 97 + 10
+end
+
+local function append_component(components: {string}, component: string)
+  if component == "" or component == "." then return end
+  if component == ".." then
+    if #components > 0 then components[#components] = nil end
+    return
+  end
+  components[#components + 1] = component
+end
+
+local function normalize_absolute_or_raise(path: string): string
+  if path == "" or strings.byte(path, 1) ~= 47 then
+    return fail<string>("path must be absolute", nil)
+  end
+  if strings.find(path, "\0") ~= nil then
+    return fail<string>("path contains a NUL byte", nil)
+  end
+
+  local components: {string} = {}
+  local start = 2
+  local index = 2
+  while index <= #path + 1 do
+    if index == #path + 1 or strings.byte(path, index) == 47 then
+      append_component(components, strings.sub(path, start, index - 1))
+      start = index + 1
+    end
+    index = index + 1
+  end
+  if #components == 0 then return "/" end
+
+  local output = strings.writer()
+  for component_index = 1, #components do
+    output:write("/")
+    output:write(components[component_index])
+  end
+  return output:drain()
+end
+
+function normalize_absolute_path(path: string): (string?, Error?)
+  do
+    return normalize_absolute_or_raise(path), nil
+  catch
+    if error is Error then return nil, error as Error end
+    raise
+  end
+end
+
+function resolve_path(base: string, path: string): (string?, Error?)
+  local normalized_base?, base_error? = normalize_absolute_path(base)
+  if normalized_base == nil then return nil, base_error end
+  if path ~= "" and strings.byte(path, 1) == 47 then
+    return normalize_absolute_path(path)
+  end
+  local separator = "/"
+  if normalized_base == "/" then separator = "" end
+  return normalize_absolute_path(normalized_base .. separator .. path)
+end
+
+function relative_path(root: string, path: string): string?
+  local normalized_root?, root_error? = normalize_absolute_path(root)
+  if root_error ~= nil then return nil end
+  local normalized_path?, path_error? = normalize_absolute_path(path)
+  if path_error ~= nil then return nil end
+  if normalized_path == normalized_root then return "" end
+  local prefix = normalized_root
+  if prefix ~= "/" then prefix = prefix .. "/" end
+  if strings.sub(normalized_path, 1, #prefix) ~= prefix then return nil end
+  return strings.sub(normalized_path, #prefix + 1)
+end
+
+local function decode_uri_path(source: string): string
+  local output = strings.writer()
+  local index = 1
+  while index <= #source do
+    local byte: integer = strings.byte(source, index)
+    if byte == 37 then
+      if index + 2 > #source then
+        return fail<string>("malformed percent escape in file URI", index - 1)
+      end
+      local high: integer = strings.byte(source, index + 1)
+      local low: integer = strings.byte(source, index + 2)
+      if not is_hex(high) or not is_hex(low) then
+        return fail<string>("malformed percent escape in file URI", index - 1)
+      end
+      output:write(strings.char(hex_value(high) * 16 + hex_value(low)))
+      index = index + 3
+    else
+      output:write(strings.char(byte))
+      index = index + 1
+    end
+  end
+  return output:drain()
+end
+
+local function file_uri_to_path_or_raise(uri: string): string
+  if strings.sub(uri, 1, 7) ~= "file://" then
+    return fail<string>("URI must use the file scheme", nil)
+  end
+  if strings.find(uri, "?", 8) ~= nil or strings.find(uri, "#", 8) ~= nil then
+    return fail<string>("file URI query and fragment must be percent encoded",
+                        nil)
+  end
+
+  local remainder = strings.sub(uri, 8)
+  local encoded_path = remainder
+  if strings.sub(remainder, 1, 1) == "/" then
+    encoded_path = remainder
+  else
+    local slash? = strings.find(remainder, "/")
+    if slash == nil then
+      return fail<string>("file URI has no absolute path", nil)
+    end
+    local authority = strings.sub(remainder, 1, slash - 1)
+    if authority ~= "localhost" then
+      return fail<string>("file URI has a non-local authority", nil)
+    end
+    encoded_path = strings.sub(remainder, slash)
+  end
+  return normalize_absolute_or_raise(decode_uri_path(encoded_path))
+end
+
+function file_uri_to_path(uri: string): (string?, Error?)
+  do
+    return file_uri_to_path_or_raise(uri), nil
+  catch
+    if error is Error then return nil, error as Error end
+    raise
+  end
+end
+
+local function uri_safe(byte: integer): boolean
+  if byte >= 65 and byte <= 90 then return true end
+  if byte >= 97 and byte <= 122 then return true end
+  if byte >= 48 and byte <= 57 then return true end
+  if byte == 45 then return true end
+  if byte == 46 then return true end
+  if byte == 95 then return true end
+  if byte == 126 then return true end
+  if byte == 47 then return true end
+  return byte == 58
+end
+
+local function hex_digit(nibble: integer): string
+  return strings.sub("0123456789ABCDEF", nibble + 1, nibble + 1)
+end
+
+function path_to_file_uri(path: string): (string?, Error?)
+  local normalized?, failure? = normalize_absolute_path(path)
+  if normalized == nil then return nil, failure end
+  local output = strings.writer()
+  output:write("file://")
+  for index = 1, #normalized do
+    local byte: integer = strings.byte(normalized, index)
+    if uri_safe(byte) then
+      output:write(strings.char(byte))
+    else
+      output:write("%")
+      output:write(hex_digit(byte // 16))
+      output:write(hex_digit(byte % 16))
+    end
+  end
+  return output:drain(), nil
+end

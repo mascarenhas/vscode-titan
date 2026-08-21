@@ -1,0 +1,511 @@
+local async = import "async"
+local fs = import "fs"
+local iteration = import "titan.iteration"
+local lua = import "titan.lua"
+local system = import "os"
+local strings = import "string"
+local test = import "test"
+local compiler_io = import "server.compiler_io"
+local test_runtime = import "server.test_runtime"
+
+local function temporary_root(): string
+  local root = fs.tmpname()
+  fs.unlink(root)
+  fs.mkdir(root)
+  return root
+end
+
+local function remove_path(path: string)
+  do
+    local metadata? = fs.lstat(path)
+    if not metadata then return end
+    if (metadata as fs.Stat).kind == "directory" then
+      fs.rmdir(path)
+    else
+      fs.unlink(path)
+    end
+  catch
+  end
+end
+
+local function required_string(candidate: string?, failure: string?,
+                               subject: string): string
+  if not candidate then
+    raise subject .. ": " .. (failure or "missing value")
+  end
+  test.assert(failure == nil, subject .. " returned a value and an error")
+  return candidate as string
+end
+
+local function required_mutation(candidate: boolean?, failure: string?,
+                                 subject: string)
+  test.assert(candidate == true and failure == nil,
+              subject .. ": " .. (failure or "operation returned false"))
+end
+
+local function bool_field(result: {string: value}, name: string): boolean
+  local raw: value = result[name]
+  if raw == nil then raise "missing boolean result field '" .. name .. "'" end
+  local field: boolean = raw
+  return field
+end
+
+local function integer_field(result: {string: value}, name: string): integer
+  local field: integer = result[name]
+  return field
+end
+
+local function string_field(result: {string: value}, name: string): string
+  local field: string = result[name]
+  return field
+end
+
+local function dump_fields(result: {string: value}): string
+  local output = strings.writer()
+  for key, item in iteration.pairs(result) do
+    output:write(key .. "=" .. strings.tostring(item) .. ";")
+  end
+  return output:drain()
+end
+
+local function filesystem_contract()
+  local strategy = compiler_io.create()
+  local root = temporary_root()
+  defer remove_path(root)
+
+  local cwd?, cwd_error? = strategy:cwd()
+  test.assert(required_string(cwd, cwd_error, "cwd") == system.cwd(),
+              "compiler I/O cwd changed the process directory")
+
+  local directory = root .. "/nested"
+  local made?, make_error? = strategy:mkdir(directory)
+  required_mutation(made, make_error, "mkdir")
+  defer remove_path(directory)
+
+  local source = directory .. "/source.bin"
+  local bytes = "prefix\0middle\255suffix"
+  local written?, write_error? = strategy:write_file(source, bytes)
+  required_mutation(written, write_error, "write_file")
+  defer remove_path(source)
+  test.assert(strategy:readable(source),
+              "written compiler input was not readable")
+  local contents?, read_error? = strategy:read_file(source)
+  test.assert(required_string(contents, read_error, "read_file") == bytes,
+              "compiler I/O changed binary file bytes")
+
+  local raw_metadata?, stat_error? = strategy:stat(source)
+  test.assert(raw_metadata ~= nil and stat_error == nil,
+              "stat did not return file metadata")
+  local metadata: {string: value} = raw_metadata
+  local kind: string = metadata["kind"]
+  local size: integer = metadata["size"]
+  local mode: integer = metadata["mode"]
+  local modified_seconds: integer = metadata["modified_seconds"]
+  local modified_nanoseconds: integer = metadata["modified_nanoseconds"]
+  test.assert(kind == "file" and size == #bytes and
+              (mode & 0xF000) == 0x8000,
+              "stat returned non-normalized file metadata")
+  test.assert(modified_seconds >= 0 and modified_nanoseconds >= 0 and
+              modified_nanoseconds < 1000000000,
+              "stat returned an invalid modification timestamp")
+
+  local raw_entries?, list_error? = strategy:list(directory)
+  test.assert(raw_entries ~= nil and list_error == nil,
+              "list failed for the compiler input directory")
+  local entries: {integer: string} = raw_entries
+  test.assert(#entries == 1 and entries[1] == "source.bin",
+              "list did not return one dense Lua-compatible entry table")
+
+  local canonical?, canonical_error? = strategy:realpath(source)
+  local canonical_path = required_string(
+    canonical, canonical_error, "realpath")
+  test.assert(strings.sub(canonical_path, 1, 1) == "/",
+              "realpath did not return an absolute source path")
+
+  local link = directory .. "/source-link"
+  defer remove_path(link)
+  local linked = strategy:run({
+    [1] = "ln", [2] = "-s", [3] = source, [4] = link,
+  }, nil)
+  test.assert(bool_field(linked, "ok"),
+              "could not create symlink fixture: " ..
+              string_field(linked, "diagnostic"))
+  local followed? = strategy:stat(link)
+  local unlinked? = strategy:lstat(link)
+  test.assert(followed ~= nil and unlinked ~= nil,
+              "stat/lstat omitted an existing symlink")
+  local followed_metadata: {string: value} = followed
+  local link_metadata: {string: value} = unlinked
+  local followed_kind: string = followed_metadata["kind"]
+  local link_kind: string = link_metadata["kind"]
+  test.assert(followed_kind == "file" and link_kind == "symlink",
+              "stat/lstat did not distinguish a symlink from its target")
+  local link_canonical?, link_canonical_error? = strategy:realpath(link)
+  test.assert(required_string(
+    link_canonical, link_canonical_error, "symlink realpath") ==
+    canonical_path,
+    "realpath did not canonicalize a symlink to its target")
+
+  local renamed = directory .. "/renamed.bin"
+  defer remove_path(renamed)
+  local renamed_ok?, rename_error? = strategy:rename(source, renamed)
+  required_mutation(renamed_ok, rename_error, "rename")
+  local renamed_contents?, renamed_read_error? = strategy:read_file(renamed)
+  test.assert(required_string(
+    renamed_contents, renamed_read_error, "renamed read") == bytes,
+    "rename changed the complete file bytes")
+
+  local removed?, remove_error? = strategy:unlink(renamed)
+  required_mutation(removed, remove_error, "unlink")
+  local absent?, absent_error? = strategy:stat(renamed)
+  test.assert(absent == nil and absent_error == nil,
+              "stat did not normalize a missing path to nil, nil")
+  absent, absent_error = strategy:lstat(renamed)
+  test.assert(absent == nil and absent_error == nil,
+              "lstat did not normalize a missing path to nil, nil")
+  local missing_contents?, missing_error? = strategy:read_file(renamed)
+  test.assert(missing_contents == nil and missing_error ~= nil,
+              "read_file did not retain a missing-path error string")
+
+  local temporary?, temporary_error? = strategy:tmpname()
+  local temporary_path = required_string(
+    temporary, temporary_error, "tmpname")
+  defer remove_path(temporary_path)
+  local temporary_stat? = strategy:stat(temporary_path)
+  test.assert(temporary_stat ~= nil,
+              "tmpname did not leave its caller-owned empty file")
+
+  remove_path(link)
+  local replacement?, replacement_error? =
+    strategy:write_file(directory, "must not replace a directory")
+  test.assert(replacement == nil and replacement_error ~= nil,
+              "atomic write unexpectedly replaced a directory")
+  local root_entries? = strategy:list(root)
+  local remaining: {integer: string} = root_entries
+  local preserved_directory? = strategy:stat(directory)
+  test.assert(#remaining == 1 and remaining[1] == "nested" and
+              preserved_directory ~= nil,
+              "failed atomic write leaked its sibling or removed its target")
+
+  local removed_directory?, directory_error? = strategy:rmdir(directory)
+  required_mutation(removed_directory, directory_error, "rmdir")
+end
+
+function test_compiler_io_preserves_files_paths_and_lua_tables(
+    _context: test.Context)
+  test_runtime.run(filesystem_contract)
+end
+
+local function process_contract()
+  local strategy = compiler_io.create()
+  local script =
+    "printf '%s|%s|' \"$LANG\" \"$LC_ALL\"; " ..
+    "printf 'A\\000B'; printf '|diagnostic' >&2"
+  local success = strategy:run({
+    [1] = "sh", [2] = "-c", [3] = script,
+  }, nil)
+  test.assert(success["ok"] ~= nil, "success result omitted ok")
+  test.assert(bool_field(success, "started") and
+              bool_field(success, "ok") and
+              integer_field(success, "status") == 0 and
+              string_field(success, "why") == "exit" and
+              not bool_field(success, "interrupted"),
+              "successful captured command returned the wrong status")
+  test.assert(string_field(success, "output") ==
+              "C|C|A\0B|diagnostic" and
+              string_field(success, "diagnostic") ==
+              string_field(success, "output"),
+              "captured command changed locale, binary bytes, or merge order")
+  local command = string_field(success, "command")
+  local prefix? = strings.find(command, "env LANG=C LC_ALL=C ")
+  test.assert(prefix == 1 and strings.sub(command, -5) == " 2>&1",
+              "captured command label omitted locale or merge policy")
+
+  local rejected = strategy:run({
+    [1] = "sh", [2] = "-c", [3] = "printf rejected; exit 7",
+  }, nil)
+  test.assert(rejected["ok"] ~= nil, "nonzero result omitted ok")
+  test.assert(bool_field(rejected, "started") and
+              not bool_field(rejected, "ok") and
+              integer_field(rejected, "status") == 7 and
+              string_field(rejected, "why") == "exit" and
+              string_field(rejected, "output") == "rejected",
+              "nonzero command status was not normalized")
+
+  local missing = strategy:run({
+    [1] = "/definitely/missing/titan-compiler-command",
+  }, nil)
+  test.assert(missing["ok"] ~= nil, "missing result omitted ok")
+  test.assert(not bool_field(missing, "started") and
+              not bool_field(missing, "ok") and
+              integer_field(missing, "status") == 127 and
+              string_field(missing, "why") == "exit" and
+              not bool_field(missing, "interrupted"),
+              "missing executable status was not normalized")
+
+  local signalled = strategy:run({
+    [1] = "sh", [2] = "-c", [3] = "kill -TERM $$",
+  }, nil)
+  test.assert(signalled["ok"] ~= nil,
+              "signal result omitted ok: " .. dump_fields(signalled))
+  test.assert(bool_field(signalled, "started") and
+              not bool_field(signalled, "ok") and
+              string_field(signalled, "why") == "signal" and
+              integer_field(signalled, "status") == 15 and
+              integer_field(signalled, "signal") == 15 and
+              integer_field(signalled, "shell_status") == 143 and
+              bool_field(signalled, "interrupted"),
+              "signal termination was not normalized")
+
+  local unmerged = strategy:run({
+    [1] = "sh", [2] = "-c", [3] = "printf stdout-only",
+  }, { ["stderr_to_stdout"] = false })
+  test.assert(string_field(unmerged, "output") == "stdout-only" and
+              strings.sub(string_field(unmerged, "command"), -5) ~= " 2>&1",
+              "stderr_to_stdout=false did not select the split policy")
+
+  -- This exceeds ordinary pipe capacity. The run can finish only when its
+  -- output reader and process waiter make progress concurrently.
+  local large = strategy:run({
+    [1] = "sh", [2] = "-c",
+    [3] = "i=0; while [ $i -lt 8192 ]; do " ..
+          "printf 0123456789abcdef; i=$((i+1)); done",
+  }, nil)
+  test.assert(large["ok"] ~= nil, "large-output result omitted ok")
+  test.assert(bool_field(large, "ok") and
+              #string_field(large, "output") == 131072,
+              "captured process did not concurrently drain large output")
+end
+
+function test_compiler_io_captures_process_output_and_status(
+    _context: test.Context)
+  test_runtime.run(process_contract)
+end
+
+local function lua_proxy_yield_contract()
+  local strategy = compiler_io.create()
+  local root = temporary_root()
+  defer remove_path(root)
+  local source = root .. "/source.titan"
+  fs.write_file(source, "function answer(): integer return 42 end\n")
+  defer remove_path(source)
+
+  local observed = false
+  local observer = async.run<nil, value>(function (): nil
+    observed = true
+    return nil
+  end)
+  local invoke = lua.load([==[
+return function(strategy, path)
+  assert(type(strategy) == "userdata",
+         "Titan compiler I/O strategy did not cross as userdata")
+  local metadata, stat_error = strategy:stat(path)
+  assert(metadata and stat_error == nil and type(metadata) == "table",
+         "stat did not cross as an ordinary Lua table")
+  local entries, list_error = strategy:list(path:match("^(.*)/"))
+  assert(entries and list_error == nil and type(entries) == "table",
+         "list did not cross as an ordinary Lua table")
+  strategy:yield()
+  return metadata.kind, metadata.size, #entries
+end
+]==], "=compiler_io_lua_proxy", nil)() as
+    (compiler_io.CompilerIO, string) -> (string, integer, integer)
+
+  local kind, size, entries = invoke(strategy, source)
+  test.assert(observed,
+              "CompilerIO:yield did not cooperatively run another Task")
+  test.assert(kind == "file" and size > 0 and entries == 1,
+              "Lua proxy invocation changed stat/list results")
+  test.assert(observer:status():has_succeeded(),
+              "yield observer did not finish successfully")
+end
+
+function test_compiler_io_lua_proxy_calls_async_methods_and_yields(
+    _context: test.Context)
+  test_runtime.run(lua_proxy_yield_contract)
+end
+
+local function cancellation_contract()
+  local strategy = compiler_io.create()
+  local root = temporary_root()
+  defer remove_path(root)
+  local marker = root .. "/child.pid"
+  defer remove_path(marker)
+
+  local command: {integer: string} = {
+    [1] = "sh", [2] = "-c",
+    [3] = "echo $$ > '" .. marker .. "'; exec /bin/sleep 60",
+  }
+  local running = async.run<{string: value}, value>(
+    function (): {string: value} return strategy:run(command, nil) end)
+
+  local attempts = 0
+  while not fs.stat(marker) and attempts < 10000 do
+    async.yield()
+    attempts = attempts + 1
+  end
+  test.assert(fs.stat(marker) ~= nil,
+              "owned child did not publish its process marker")
+
+  running:cancel(async.CancellationReason.simple(
+    "cancel captured compiler process"))
+  local terminal = async.join(running)
+  test.assert(terminal:as_string() == "cancelled",
+              "cancelled captured process Task did not finish cancelled")
+
+  local pid = fs.read_file(marker)
+  local newline? = strings.find(pid, "\n")
+  if newline then pid = strings.sub(pid, 1, newline - 1) end
+  local gone = false
+  attempts = 0
+  while not gone and attempts < 100 do
+    local probe = strategy:run({
+      [1] = "sh", [2] = "-c",
+      [3] = "kill -0 " .. pid .. " 2>/dev/null",
+    }, nil)
+    gone = not bool_field(probe, "ok")
+    if not gone then async.yield() end
+    attempts = attempts + 1
+  end
+  if not gone then
+    strategy:run({
+      [1] = "sh", [2] = "-c", [3] = "kill -KILL " .. pid,
+    }, nil)
+  end
+  test.assert(gone,
+              "cancellation did not terminate and reap the owned child")
+end
+
+local function tmpname_entries(): {string: boolean}
+  local result: {string: boolean} = {}
+  local entries = fs.list(fs.tmpdir())
+  for index = 1, #entries do
+    local name = entries[index]
+    if strings.sub(name, 1, 9) == "titan-fs-" then result[name] = true end
+  end
+  return result
+end
+
+local function cancelled_tmpname_releases_reservation()
+  local strategy = compiler_io.create()
+  local before = tmpname_entries()
+  local pending = async.run<string?, value>(function (): string?
+    local path? = strategy:tmpname()
+    return path
+  end)
+
+  -- The caller Task first waits while its uncancelled handoff worker owns the
+  -- mkstemp result. Cancellation at this point must make that worker unlink
+  -- the reservation even though the caller cannot submit cleanup I/O itself.
+  async.yield()
+  test.assert(not pending:status():has_finished(),
+              "tmpname handoff completed before cancellation could be tested")
+  pending:cancel(async.CancellationReason.simple(
+    "cancel tmpname while its reservation is in flight"))
+  local terminal = async.join<string?, value>(pending)
+  test.assert(terminal:as_string() == "cancelled",
+              "tmpname caller did not finish cancelled")
+
+  local clean = false
+  local attempts = 0
+  while not clean and attempts < 1000 do
+    clean = true
+    local after = tmpname_entries()
+    for name, _ in iteration.pairs(after) do
+      if not before[name] then clean = false end
+    end
+    if not clean then async.yield() end
+    attempts = attempts + 1
+  end
+  test.assert(clean, "cancelled tmpname leaked its caller-owned reservation")
+end
+
+local function cancelled_owned_unlink_releases_reservation()
+  local strategy = compiler_io.create()
+  local reservation = fs.tmpname()
+  defer remove_path(reservation)
+  local started = false
+  local pending = async.run<nil, value>(function (): nil
+    started = true
+    local removed?, failure? = strategy:unlink(reservation, true)
+    if not removed then raise failure or "owned unlink failed" end
+    return nil
+  end)
+
+  -- The first turn starts the Task and submits its unlink. Titan's filesystem
+  -- continuation delivers a pending cancellation only after the accepted
+  -- native operation completes, so the rollback branch must tolerate both an
+  -- already absent path and an unlink that still needs to be retried.
+  while not started do async.yield() end
+  test.assert(not pending:status():has_finished(),
+              "owned unlink completed before cancellation could be tested")
+  pending:cancel(async.CancellationReason.simple(
+    "cancel owned tmpname unlink while it is in flight"))
+  local terminal = async.join<nil, value>(pending)
+  test.assert(terminal:as_string() == "cancelled",
+              "owned unlink caller did not finish cancelled")
+
+  local clean = false
+  local attempts = 0
+  while not clean and attempts < 1000 do
+    clean = fs.lstat(reservation) == nil
+    if not clean then async.yield() end
+    attempts = attempts + 1
+  end
+  test.assert(clean,
+              "cancelled owned unlink leaked its tmpname reservation")
+end
+
+local function cancelled_owned_mkdir_removes_directory()
+  local strategy = compiler_io.create()
+  local root = temporary_root()
+  defer remove_path(root)
+  local directory = root .. "/cancelled-owned-directory"
+  defer remove_path(directory)
+  local started = false
+  local pending = async.run<nil, value>(function (): nil
+    started = true
+    local made?, failure? = strategy:mkdir(directory, true)
+    if not made then raise failure or "owned mkdir failed" end
+    return nil
+  end)
+
+  while not started do async.yield() end
+  test.assert(not pending:status():has_finished(),
+              "owned mkdir completed before cancellation could be tested")
+  pending:cancel(async.CancellationReason.simple(
+    "cancel owned mkdir while it is in flight"))
+  local terminal = async.join<nil, value>(pending)
+  test.assert(terminal:as_string() == "cancelled",
+              "owned mkdir caller did not finish cancelled")
+
+  local clean = false
+  local attempts = 0
+  while not clean and attempts < 1000 do
+    clean = fs.lstat(directory) == nil
+    if not clean then async.yield() end
+    attempts = attempts + 1
+  end
+  test.assert(clean,
+              "cancelled owned mkdir leaked its newly created directory")
+end
+
+function test_compiler_io_cancellation_terminates_and_reaps_child(
+    _context: test.Context)
+  test_runtime.run(cancellation_contract)
+end
+
+function test_compiler_io_cancelled_tmpname_releases_reservation(
+    _context: test.Context)
+  test_runtime.run(cancelled_tmpname_releases_reservation)
+end
+
+function test_compiler_io_cancelled_owned_unlink_releases_reservation(
+    _context: test.Context)
+  test_runtime.run(cancelled_owned_unlink_releases_reservation)
+end
+
+function test_compiler_io_cancelled_owned_mkdir_removes_directory(
+    _context: test.Context)
+  test_runtime.run(cancelled_owned_mkdir_removes_directory)
+end

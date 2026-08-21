@@ -1,0 +1,41 @@
+local os = import "os"
+local async = import "async"
+local fs = import "fs"
+local strings = import "string"
+local application = import "server.application"
+local dispatcher = import "server.dispatcher"
+local framing = import "server.framing"
+local protocol = import "server.protocol"
+
+local function log_error(message: string)
+  os.stderr:write("titan-language-server: " .. message .. "\n")
+end
+
+function main(_args: {string}): integer
+  local server = application.create(fs.pwd())
+  defer server:close()
+  return protocol.run(
+    os.stdin, os.stdout,
+    function (request: dispatcher.SemanticRequest): dispatcher.SemanticOutcome
+      return server:handle(request)
+    end)
+catch
+  if error is protocol.ProtocolError then
+    local failure = error as protocol.ProtocolError
+    log_error(failure.message)
+  elseif error is framing.FrameError then
+    local failure = error as framing.FrameError
+    log_error(failure.message)
+  elseif error is async.OperationError then
+    local failure = error as async.OperationError
+    log_error(failure.operation .. ": " .. failure.message ..
+              " (" .. failure.name .. ")")
+  else
+    local details = strings.tostring(error)
+    if #traceback > 0 then
+      details = details .. "\nstack traceback:\n" .. traceback
+    end
+    log_error(details)
+  end
+  return 1
+end

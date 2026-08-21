@@ -1,0 +1,857 @@
+-- The graph is deliberately independent from filesystem and compiler APIs.
+-- Callers normalize those boundaries, then provide immutable stamps, manifests,
+-- imports, and a typed annotated-AST value.
+
+record FileStamp
+  const path: string
+  const modified_seconds: integer
+  const modified_nanoseconds: integer
+  const size: integer
+end
+
+record Manifest
+  -- Public imports depend only on public_digest. source_digest represents the
+  -- complete source-collaboration surface, including the public surface.
+  const public_digest: string
+  const source_digest: string
+end
+
+union Provenance
+  project
+  external_source
+  external_binary
+end
+
+union ImportVisibility
+  ordinary
+  source_required
+end
+
+record ImportEdge
+  const module_name: string
+  const visibility: ImportVisibility
+end
+
+record ReverseImport
+  const importer: string
+  const visibility: ImportVisibility
+end
+
+record CheckToken
+  const module_name: string
+  const generation: integer
+  const revision: integer
+end
+
+record ChangeReport
+  const changed: boolean
+  const generation: integer
+  const invalidated: {string}
+end
+
+record CommitAccepted
+  const invalidated: {string}
+end
+
+union CommitResult
+  accepted: CommitAccepted
+  stale
+end
+
+local record ProjectEntry<A>
+  stamps: {FileStamp}
+  manifest: Manifest?
+  ast: A?
+  imports: {ImportEdge}
+  dirty: boolean
+  checking: boolean
+  revision: integer
+end
+
+local record ExternalEntry
+  stamps: {FileStamp}
+  manifest: Manifest
+  imports: {ImportEdge}
+end
+
+-- Only the project variant has an AST field. External variants cannot retain
+-- an AST accidentally; they carry only file/manifest and graph metadata.
+local union Entry<A>
+  project: ProjectEntry<A>
+  external_source: ExternalEntry
+  external_binary: ExternalEntry
+end
+
+record Graph<A>
+  local current_generation: integer
+  local modules: {string: Entry<A>}
+  local names: {string}
+  local reverse: {string: {ReverseImport}}
+end
+
+local function copy_stamps(stamps: {FileStamp}): {FileStamp}
+  local result: {FileStamp} = {}
+  for index = 1, #stamps do
+    local stamp = stamps[index]
+    local position = #result + 1
+    while position > 1 and stamp.path < result[position - 1].path do
+      result[position] = result[position - 1]
+      position = position - 1
+    end
+    result[position] = stamp
+  end
+  return result
+end
+
+local function copy_manifest(manifest: Manifest): Manifest
+  return Manifest.new(manifest.public_digest, manifest.source_digest)
+end
+
+local function source_required(visibility: ImportVisibility): boolean
+  case visibility
+  when ordinary then return false
+  when source_required then return true
+  end
+end
+
+local function visibility_rank(visibility: ImportVisibility): integer
+  if source_required(visibility) then return 1 end
+  return 0
+end
+
+local function same_visibility(left: ImportVisibility,
+                               right: ImportVisibility): boolean
+  return source_required(left) == source_required(right)
+end
+
+local function copy_visibility(
+    visibility: ImportVisibility): ImportVisibility
+  if source_required(visibility) then
+    return ImportVisibility.source_required()
+  end
+  return ImportVisibility.ordinary()
+end
+
+local function edge_less(left: ImportEdge, right: ImportEdge): boolean
+  if left.module_name ~= right.module_name then
+    return left.module_name < right.module_name
+  end
+  return visibility_rank(left.visibility) < visibility_rank(right.visibility)
+end
+
+local function same_edge(left: ImportEdge, right: ImportEdge): boolean
+  return left.module_name == right.module_name and
+         same_visibility(left.visibility, right.visibility)
+end
+
+local function normalize_imports(imports: {ImportEdge}): {ImportEdge}
+  local result: {ImportEdge} = {}
+  for index = 1, #imports do
+    local source = imports[index]
+    local edge = ImportEdge.new(
+      source.module_name, copy_visibility(source.visibility))
+    local duplicate = false
+    local position = #result + 1
+    for current = 1, #result do
+      if same_edge(result[current], edge) then
+        duplicate = true
+        break
+      end
+      if edge_less(edge, result[current]) then
+        position = current
+        break
+      end
+    end
+    if not duplicate then
+      for current = #result, position, -1 do
+        result[current + 1] = result[current]
+      end
+      result[position] = edge
+    end
+  end
+  return result
+end
+
+local function copy_imports(imports: {ImportEdge}): {ImportEdge}
+  local result: {ImportEdge} = {}
+  for index = 1, #imports do
+    local edge = imports[index]
+    result[index] = ImportEdge.new(
+      edge.module_name, copy_visibility(edge.visibility))
+  end
+  return result
+end
+
+local function copy_reverse(imports: {ReverseImport}): {ReverseImport}
+  local result: {ReverseImport} = {}
+  for index = 1, #imports do
+    local edge = imports[index]
+    result[index] = ReverseImport.new(
+      edge.importer, copy_visibility(edge.visibility))
+  end
+  return result
+end
+
+local function same_stamps(left: {FileStamp}, right: {FileStamp}): boolean
+  if #left ~= #right then return false end
+  for index = 1, #left do
+    local a = left[index]
+    local b = right[index]
+    if a.path ~= b.path or
+       a.modified_seconds ~= b.modified_seconds or
+       a.modified_nanoseconds ~= b.modified_nanoseconds or
+       a.size ~= b.size then
+      return false
+    end
+  end
+  return true
+end
+
+local function same_manifest(left: Manifest, right: Manifest): boolean
+  return left.public_digest == right.public_digest and
+         left.source_digest == right.source_digest
+end
+
+local function same_imports(left: {ImportEdge}, right: {ImportEdge}): boolean
+  if #left ~= #right then return false end
+  for index = 1, #left do
+    if not same_edge(left[index], right[index]) then return false end
+  end
+  return true
+end
+
+local function relevant_manifest_changed(old_manifest: Manifest?,
+                                         new_manifest: Manifest,
+                                         visibility: ImportVisibility): boolean
+  if old_manifest == nil then return true end
+  if old_manifest.public_digest ~= new_manifest.public_digest then return true end
+  return source_required(visibility) and
+         old_manifest.source_digest ~= new_manifest.source_digest
+end
+
+local function entry_imports<A>(entry: Entry<A>): {ImportEdge}
+  case entry
+  when project: project then return project.imports
+  when external_source: external then return external.imports
+  when external_binary: external then return external.imports
+  end
+end
+
+local function entry_manifest<A>(entry: Entry<A>): Manifest?
+  case entry
+  when project: project then return project.manifest
+  when external_source: external then return external.manifest
+  when external_binary: external then return external.manifest
+  end
+end
+
+local function entry_stamps<A>(entry: Entry<A>): {FileStamp}
+  case entry
+  when project: project then return project.stamps
+  when external_source: external then return external.stamps
+  when external_binary: external then return external.stamps
+  end
+end
+
+local function same_provenance<A>(entry: Entry<A>,
+                                  provenance: Provenance): boolean
+  case entry
+  when project then
+    case provenance
+    when project then return true
+    else return false
+    end
+  when external_source then
+    case provenance
+    when external_source then return true
+    else return false
+    end
+  when external_binary then
+    case provenance
+    when external_binary then return true
+    else return false
+    end
+  end
+end
+
+function create<A>(): Graph<A>
+  return Graph<A>.new(0, {}, {}, {})
+end
+
+function Graph:generation(): integer
+  return self.current_generation
+end
+
+local function Graph:add_name(module_name: string)
+  local position = #self.names + 1
+  while position > 1 and module_name < self.names[position - 1] do
+    self.names[position] = self.names[position - 1]
+    position = position - 1
+  end
+  self.names[position] = module_name
+end
+
+local function Graph:remove_name(module_name: string)
+  for index = 1, #self.names do
+    if self.names[index] == module_name then
+      for following = index, #self.names - 1 do
+        self.names[following] = self.names[following + 1]
+      end
+      self.names[#self.names] = nil
+      return
+    end
+  end
+end
+
+local function Graph:advance_generation()
+  self.current_generation = self.current_generation + 1
+  -- Every outstanding token names an older disk snapshot. Make dirty modules
+  -- immediately restartable; the generation comparison rejects old results.
+  for index = 1, #self.names do
+    local entry? = self.modules[self.names[index]]
+    if entry ~= nil then
+      case entry
+      when project: project then
+        if project.dirty then project.checking = false end
+      else
+      end
+    end
+  end
+end
+
+local function reverse_less(left: ReverseImport,
+                            right: ReverseImport): boolean
+  if left.importer ~= right.importer then
+    return left.importer < right.importer
+  end
+  return visibility_rank(left.visibility) < visibility_rank(right.visibility)
+end
+
+local function Graph:add_reverse(imported: string, edge: ReverseImport)
+  local bucket? = self.reverse[imported]
+  if bucket == nil then
+    bucket = {}
+    self.reverse[imported] = bucket
+  end
+  for index = 1, #bucket do
+    local current = bucket[index]
+    if current.importer == edge.importer and
+       same_visibility(current.visibility, edge.visibility) then
+      return
+    end
+  end
+  local position = #bucket + 1
+  while position > 1 and reverse_less(edge, bucket[position - 1]) do
+    bucket[position] = bucket[position - 1]
+    position = position - 1
+  end
+  bucket[position] = edge
+end
+
+local function Graph:remove_reverse(imported: string, importer: string,
+                                    visibility: ImportVisibility)
+  local bucket? = self.reverse[imported]
+  if bucket == nil then return end
+  for index = 1, #bucket do
+    local current = bucket[index]
+    if current.importer == importer and
+       same_visibility(current.visibility, visibility) then
+      for following = index, #bucket - 1 do
+        bucket[following] = bucket[following + 1]
+      end
+      bucket[#bucket] = nil
+      if #bucket == 0 then self.reverse[imported] = nil end
+      return
+    end
+  end
+end
+
+local function Graph:detach_imports(importer: string,
+                                    imports: {ImportEdge})
+  for index = 1, #imports do
+    local edge = imports[index]
+    self:remove_reverse(edge.module_name, importer, edge.visibility)
+  end
+end
+
+local function Graph:attach_imports(importer: string,
+                                    imports: {ImportEdge})
+  for index = 1, #imports do
+    local edge = imports[index]
+    self:add_reverse(edge.module_name, ReverseImport.new(
+      importer, copy_visibility(edge.visibility)))
+  end
+end
+
+local function Graph:set_imports(module_name: string, entry: Entry<A>,
+                                 imports: {ImportEdge})
+  local old_imports = entry_imports(entry)
+  self:detach_imports(module_name, old_imports)
+  case entry
+  when project: project then project.imports = imports
+  when external_source: external then external.imports = imports
+  when external_binary: external then external.imports = imports
+  end
+  self:attach_imports(module_name, imports)
+end
+
+local function Graph:dirty_project(module_name: string): boolean
+  local entry? = self.modules[module_name]
+  if entry == nil then return false end
+  case entry
+  when project: project then
+    if project.dirty then
+      -- A second invalidation is still a new work revision. This matters after
+      -- a failed check has been blocked for the current refresh: a dependency
+      -- change must make that module eligible again without requiring another
+      -- filesystem generation.
+      project.revision = project.revision + 1
+      project.checking = false
+      return true
+    end
+    project.dirty = true
+    project.checking = false
+    project.revision = project.revision + 1
+    return true
+  else
+    return false
+  end
+end
+
+local function add_sorted_name(names: {string}, module_name: string)
+  for index = 1, #names do
+    if names[index] == module_name then return end
+    if module_name < names[index] then
+      for following = #names, index, -1 do
+        names[following + 1] = names[following]
+      end
+      names[index] = module_name
+      return
+    end
+  end
+  names[#names + 1] = module_name
+end
+
+local function name_set(names: {string}): {string: boolean}
+  local result: {string: boolean} = {}
+  for index = 1, #names do result[names[index]] = true end
+  return result
+end
+
+local function Graph:invalidate_importers(
+    module_name: string, old_manifest: Manifest?, new_manifest: Manifest?,
+    force: boolean, satisfied_projects: {string: boolean}): {string}
+  local invalidated: {string} = {}
+  local bucket? = self.reverse[module_name]
+  if bucket == nil then return invalidated end
+
+  -- External modules cannot be rechecked independently by this graph. Walk
+  -- through their reverse edges until reaching project roots, then let those
+  -- projects' newly computed manifests drive the ordinary fixed point. This is
+  -- deliberately iterative and cycle-safe because external metadata may
+  -- contain dependency cycles even when a source project would reject one.
+  local pending: {string} = {}
+  local queued: {string: boolean} = {}
+  local visited_projects: {string: boolean} = {}
+
+  local invalidate_or_enqueue: (string) -> () = function (importer: string)
+    local entry? = self.modules[importer]
+    if entry == nil then return end
+    case entry
+    when project then
+      if visited_projects[importer] then return end
+      visited_projects[importer] = true
+      if not satisfied_projects[importer] and self:dirty_project(importer) then
+        add_sorted_name(invalidated, importer)
+      end
+    when external_source then
+      if not queued[importer] then
+        queued[importer] = true
+        pending[#pending + 1] = importer
+      end
+    when external_binary then
+      if not queued[importer] then
+        queued[importer] = true
+        pending[#pending + 1] = importer
+      end
+    end
+  end
+
+  for index = 1, #bucket do
+    local reverse = bucket[index]
+    local changed = force or new_manifest == nil
+    if not changed then
+      changed = relevant_manifest_changed(
+        old_manifest, new_manifest, reverse.visibility)
+    end
+    if changed then invalidate_or_enqueue(reverse.importer) end
+  end
+
+  local next_pending = 1
+  while next_pending <= #pending do
+    local external_name = pending[next_pending]
+    next_pending = next_pending + 1
+    local external_reverse? = self.reverse[external_name]
+    if external_reverse ~= nil then
+      -- Once an upstream external may have changed, its own public/source
+      -- surface is unknown until a project analysis encounters it again.
+      -- Conservatively cross every external edge, but stop at project roots.
+      for index = 1, #external_reverse do
+        invalidate_or_enqueue(external_reverse[index].importer)
+      end
+    end
+  end
+  return invalidated
+end
+
+function Graph:module_names(): {string}
+  local result: {string} = {}
+  for index = 1, #self.names do result[index] = self.names[index] end
+  return result
+end
+
+function Graph:has_module(module_name: string): boolean
+  return self.modules[module_name] ~= nil
+end
+
+function Graph:provenance(module_name: string): Provenance?
+  local entry? = self.modules[module_name]
+  if entry == nil then return nil end
+  case entry
+  when project then return Provenance.project()
+  when external_source then return Provenance.external_source()
+  when external_binary then return Provenance.external_binary()
+  end
+end
+
+function Graph:file_stamps(module_name: string): {FileStamp}
+  local entry? = self.modules[module_name]
+  if entry == nil then return {} end
+  return copy_stamps(entry_stamps(entry))
+end
+
+function Graph:manifest(module_name: string): Manifest?
+  local entry? = self.modules[module_name]
+  if entry == nil then return nil end
+  local manifest? = entry_manifest(entry)
+  if manifest == nil then return nil end
+  return copy_manifest(manifest)
+end
+
+function Graph:direct_imports(module_name: string): {ImportEdge}
+  local entry? = self.modules[module_name]
+  if entry == nil then return {} end
+  return copy_imports(entry_imports(entry))
+end
+
+function Graph:reverse_imports(module_name: string): {ReverseImport}
+  local imports? = self.reverse[module_name]
+  if imports == nil then return {} end
+  return copy_reverse(imports)
+end
+
+function Graph:is_dirty(module_name: string): boolean
+  local entry? = self.modules[module_name]
+  if entry == nil then return false end
+  case entry
+  when project: project then return project.dirty
+  else return false
+  end
+end
+
+function Graph:dirty_modules(): {string}
+  local result: {string} = {}
+  for index = 1, #self.names do
+    local module_name = self.names[index]
+    if self:is_dirty(module_name) then
+      result[#result + 1] = module_name
+    end
+  end
+  return result
+end
+
+function Graph:project_ast(module_name: string): A?
+  local entry? = self.modules[module_name]
+  if entry == nil then return nil end
+  case entry
+  when project: project then
+    if project.dirty then return nil end
+    return project.ast
+  else
+    return nil
+  end
+end
+
+function Graph:observe_project(module_name: string,
+                               stamps: {FileStamp}): ChangeReport
+  local normalized = copy_stamps(stamps)
+  local existing? = self.modules[module_name]
+  if existing ~= nil then
+    case existing
+    when project: project then
+      if same_stamps(project.stamps, normalized) then
+        return ChangeReport.new(false, self.current_generation, {})
+      end
+      self:advance_generation()
+      project.stamps = normalized
+      self:dirty_project(module_name)
+      return ChangeReport.new(true, self.current_generation, {})
+    else
+    end
+  end
+
+  self:advance_generation()
+  if existing ~= nil then
+    self:detach_imports(module_name, entry_imports(existing))
+  else
+    self:add_name(module_name)
+  end
+  self.modules[module_name] = Entry<A>.project(ProjectEntry<A>.new(
+    normalized, nil, nil, {}, true, false, 1))
+  local invalidated = self:invalidate_importers(
+    module_name, nil, nil, true, {})
+  return ChangeReport.new(true, self.current_generation, invalidated)
+end
+
+function Graph:invalidate_project(module_name: string): ChangeReport
+  local entry? = self.modules[module_name]
+  if entry == nil then
+    return ChangeReport.new(false, self.current_generation, {})
+  end
+  case entry
+  when project then
+    self:advance_generation()
+    self:dirty_project(module_name)
+    return ChangeReport.new(true, self.current_generation, {})
+  else
+    return ChangeReport.new(false, self.current_generation, {})
+  end
+end
+
+function Graph:begin_project_check(module_name: string): CheckToken?
+  local entry? = self.modules[module_name]
+  if entry == nil then return nil end
+  case entry
+  when project: project then
+    if not project.dirty or project.checking then return nil end
+    project.checking = true
+    return CheckToken.new(
+      module_name, self.current_generation, project.revision)
+  else
+    return nil
+  end
+end
+
+-- Abandon an analysis result without changing the saved revision. This is
+-- used for compiler failures and exceptions so a later refresh can retry the
+-- same dirty input, while an obsolete token cannot clear a newer check.
+function Graph:abort_project_check(token: CheckToken): boolean
+  if token.generation ~= self.current_generation then return false end
+  local entry? = self.modules[token.module_name]
+  if entry == nil then return false end
+  case entry
+  when project: project then
+    if not project.dirty or not project.checking or
+       project.revision ~= token.revision then
+      return false
+    end
+    project.checking = false
+    return true
+  else
+    return false
+  end
+end
+
+function Graph:commit_project(token: CheckToken, manifest: Manifest,
+                              imports: {ImportEdge}, ast: A): CommitResult
+  if token.generation ~= self.current_generation then
+    return CommitResult.stale()
+  end
+  local entry? = self.modules[token.module_name]
+  if entry == nil then return CommitResult.stale() end
+  case entry
+  when project: project then
+    if not project.dirty or not project.checking or
+       project.revision ~= token.revision then
+      return CommitResult.stale()
+    end
+
+    local old_manifest? = project.manifest
+    local normalized_imports = normalize_imports(imports)
+    self:set_imports(token.module_name, entry, normalized_imports)
+    project.manifest = copy_manifest(manifest)
+    project.ast = ast
+    project.dirty = false
+    project.checking = false
+    local invalidated = self:invalidate_importers(
+      token.module_name, old_manifest, project.manifest, false, {})
+    return CommitResult.accepted(CommitAccepted.new(invalidated))
+  else
+    return CommitResult.stale()
+  end
+end
+
+local function Graph:upsert_external(
+    module_name: string, provenance: Provenance, stamps: {FileStamp},
+    manifest: Manifest, imports: {ImportEdge}, advance: boolean,
+    satisfied_projects: {string: boolean}): ChangeReport
+  local normalized_stamps = copy_stamps(stamps)
+  local normalized_imports = normalize_imports(imports)
+  local existing? = self.modules[module_name]
+  local old_manifest: Manifest?
+  local force = existing == nil
+  if existing ~= nil then
+    old_manifest = entry_manifest(existing)
+    force = not same_provenance(existing, provenance)
+    if not force and
+       same_stamps(entry_stamps(existing), normalized_stamps) and
+       old_manifest ~= nil and same_manifest(old_manifest, manifest) and
+       same_imports(entry_imports(existing), normalized_imports) then
+      return ChangeReport.new(false, self.current_generation, {})
+    end
+  end
+
+  if advance then self:advance_generation() end
+  if existing ~= nil then
+    self:detach_imports(module_name, entry_imports(existing))
+  else
+    self:add_name(module_name)
+  end
+  local external = ExternalEntry.new(
+    normalized_stamps, copy_manifest(manifest), normalized_imports)
+  case provenance
+  when external_source then
+    self.modules[module_name] = Entry<A>.external_source(external)
+  when external_binary then
+    self.modules[module_name] = Entry<A>.external_binary(external)
+  when project then
+    -- This private helper is only called by the two external entry points.
+    raise "project provenance passed to external cache"
+  end
+  self:attach_imports(module_name, normalized_imports)
+  local invalidated = self:invalidate_importers(
+    module_name, old_manifest, manifest, force, satisfied_projects)
+  return ChangeReport.new(true, self.current_generation, invalidated)
+end
+
+function Graph:upsert_external_source(
+    module_name: string, stamps: {FileStamp}, manifest: Manifest,
+    imports: {ImportEdge}): ChangeReport
+  return self:upsert_external(module_name, Provenance.external_source(),
+                              stamps, manifest, imports, true, {})
+end
+
+function Graph:upsert_external_binary(
+    module_name: string, stamps: {FileStamp}, manifest: Manifest,
+    imports: {ImportEdge}): ChangeReport
+  return self:upsert_external(module_name, Provenance.external_binary(),
+                              stamps, manifest, imports, true, {})
+end
+
+-- Publish metadata produced from the already-validated current analysis
+-- generation. Unlike observing new disk stamps, this derived cache write must
+-- not create a new generation or invalidate project results that were produced
+-- by that same analysis.
+function Graph:publish_external_source(
+    module_name: string, stamps: {FileStamp}, manifest: Manifest,
+    imports: {ImportEdge}, satisfied_project_names: {string}): ChangeReport
+  return self:upsert_external(
+    module_name, Provenance.external_source(), stamps, manifest, imports,
+    false, name_set(satisfied_project_names))
+end
+
+function Graph:publish_external_binary(
+    module_name: string, stamps: {FileStamp}, manifest: Manifest,
+    imports: {ImportEdge}, satisfied_project_names: {string}): ChangeReport
+  return self:upsert_external(
+    module_name, Provenance.external_binary(), stamps, manifest, imports,
+    false, name_set(satisfied_project_names))
+end
+
+-- A changed or missing external provider has an unknown new manifest. Force a
+-- reverse walk through any external metadata nodes to every first project
+-- consumer. Project-to-project propagation remains manifest driven.
+function Graph:invalidate_external_change(module_name: string): {string}
+  return self:invalidate_importers(module_name, nil, nil, true, {})
+end
+
+function Graph:reachable_external_modules(): {string}
+  local result: {string} = {}
+  local pending: {string} = {}
+  local queued: {string: boolean} = {}
+
+  local enqueue: (string) -> () = function (module_name: string)
+    if not queued[module_name] then
+      queued[module_name] = true
+      pending[#pending + 1] = module_name
+    end
+  end
+
+  for index = 1, #self.names do
+    local entry? = self.modules[self.names[index]]
+    if entry ~= nil then
+      case entry
+      when project: project then
+        for import_index = 1, #project.imports do
+          enqueue(project.imports[import_index].module_name)
+        end
+      else
+      end
+    end
+  end
+
+  local next_pending = 1
+  while next_pending <= #pending do
+    local module_name = pending[next_pending]
+    next_pending = next_pending + 1
+    local entry? = self.modules[module_name]
+    if entry ~= nil then
+      case entry
+      when project then
+        -- Every project root was seeded above.
+      when external_source: external then
+        add_sorted_name(result, module_name)
+        for index = 1, #external.imports do
+          enqueue(external.imports[index].module_name)
+        end
+      when external_binary: external then
+        add_sorted_name(result, module_name)
+        for index = 1, #external.imports do
+          enqueue(external.imports[index].module_name)
+        end
+      end
+    end
+  end
+  return result
+end
+
+-- Drop derived metadata proven unreachable from every project entry. This is
+-- not a disk observation and therefore does not advance the generation.
+function Graph:prune_external(module_name: string): boolean
+  local entry? = self.modules[module_name]
+  if entry == nil then return false end
+  case entry
+  when project then return false
+  else
+  end
+  self:detach_imports(module_name, entry_imports(entry))
+  self.modules[module_name] = nil
+  self:remove_name(module_name)
+  return true
+end
+
+function Graph:remove_module(module_name: string): ChangeReport
+  local entry? = self.modules[module_name]
+  if entry == nil then
+    return ChangeReport.new(false, self.current_generation, {})
+  end
+  self:advance_generation()
+  self:detach_imports(module_name, entry_imports(entry))
+  self.modules[module_name] = nil
+  self:remove_name(module_name)
+  -- Keep incoming reverse edges: importers still name the now-missing module,
+  -- and adding a provider for that logical name must invalidate them again.
+  local invalidated = self:invalidate_importers(
+    module_name, entry_manifest(entry), nil, true, {})
+  return ChangeReport.new(true, self.current_generation, invalidated)
+end

@@ -1,0 +1,182 @@
+local json = import "server.json"
+
+record Error
+  code: integer
+  message: string
+end
+
+union Decision
+  unhandled
+  result: json.Value
+  failure: Error
+  notification
+  exit: integer
+end
+
+local union Phase
+  before_initialize
+  awaiting_initialized
+  running
+  shutdown
+  exited
+end
+
+record Lifecycle
+  local phase: Phase
+end
+
+local INVALID_REQUEST = -32600
+local INVALID_PARAMS = -32602
+local SERVER_NOT_INITIALIZED = -32002
+
+function create(): Lifecycle
+  return Lifecycle.new(Phase.before_initialize())
+end
+
+function Lifecycle:phase_name(): string
+  case self.phase
+  when before_initialize then return "before_initialize"
+  when awaiting_initialized then return "awaiting_initialized"
+  when running then return "running"
+  when shutdown then return "shutdown"
+  when exited then return "exited"
+  end
+  return "exited"
+end
+
+local function fail(code: integer, message: string): Decision
+  return Decision.failure(Error.new(code, message))
+end
+
+local function initialize_result(): json.Value
+  local capabilities = json.from_object({
+    json.Member.new("definitionProvider", json.from_boolean(true)),
+    json.Member.new("referencesProvider", json.from_boolean(true)),
+    json.Member.new("renameProvider", json.from_boolean(true)),
+    json.Member.new("hoverProvider", json.from_boolean(true)),
+    json.Member.new("foldingRangeProvider", json.from_boolean(true)),
+  })
+  return json.from_object({
+    json.Member.new("capabilities", capabilities),
+  })
+end
+
+local function object_params(params: json.Value?): boolean
+  if params == nil then return false end
+  return json.as_object(params) ~= nil
+end
+
+local function absent_or_null_params(params: json.Value?): boolean
+  if params == nil then return true end
+  return json.is_null(params)
+end
+
+local function Lifecycle:handle_exit(is_request: boolean): Decision
+  if is_request then
+    return fail(INVALID_REQUEST, "exit must be sent as a notification")
+  end
+
+  local code = 1
+  case self.phase
+  when shutdown then code = 0
+  else code = 1
+  end
+  self.phase = Phase.exited()
+  return Decision.exit(code)
+end
+
+local function Lifecycle:handle_initialize(
+    is_request: boolean, params: json.Value?): Decision
+  if not is_request then
+    return fail(INVALID_REQUEST, "initialize must be sent as a request")
+  end
+
+  case self.phase
+  when before_initialize then
+    if not object_params(params) then
+      return fail(INVALID_PARAMS, "initialize params must be an object")
+    end
+    self.phase = Phase.awaiting_initialized()
+    return Decision.result(initialize_result())
+  else
+    return fail(INVALID_REQUEST, "initialize may only be sent once")
+  end
+end
+
+local function Lifecycle:handle_initialized(
+    is_request: boolean, params: json.Value?): Decision
+  if is_request then
+    return fail(INVALID_REQUEST, "initialized must be sent as a notification")
+  end
+  if not object_params(params) then
+    return fail(INVALID_PARAMS, "initialized params must be an object")
+  end
+
+  case self.phase
+  when awaiting_initialized then
+    self.phase = Phase.running()
+  else
+    -- Notification errors have no response. Leave the state unchanged.
+  end
+  return Decision.notification()
+end
+
+local function Lifecycle:handle_shutdown(
+    is_request: boolean, params: json.Value?): Decision
+  if not is_request then
+    return fail(INVALID_REQUEST, "shutdown must be sent as a request")
+  end
+  if not absent_or_null_params(params) then
+    return fail(INVALID_PARAMS, "shutdown does not accept params")
+  end
+
+  case self.phase
+  when before_initialize then
+    return fail(SERVER_NOT_INITIALIZED,
+                "server has not received an initialize request")
+  when awaiting_initialized then
+    self.phase = Phase.shutdown()
+    return Decision.result(json.null())
+  when running then
+    self.phase = Phase.shutdown()
+    return Decision.result(json.null())
+  else
+    return fail(INVALID_REQUEST, "server has already shut down")
+  end
+end
+
+function Lifecycle:dispatch(method: string, is_request: boolean,
+                            params: json.Value?): Decision
+  if method == "exit" then return self:handle_exit(is_request) end
+  if method == "initialize" then
+    return self:handle_initialize(is_request, params)
+  end
+
+  case self.phase
+  when before_initialize then
+    if is_request then
+      return fail(SERVER_NOT_INITIALIZED,
+                  "server has not received an initialize request")
+    end
+    return Decision.notification()
+  when shutdown then
+    if is_request then
+      return fail(INVALID_REQUEST, "server has already shut down")
+    end
+    return Decision.notification()
+  when exited then
+    if is_request then
+      return fail(INVALID_REQUEST, "server has already exited")
+    end
+    return Decision.notification()
+  else
+  end
+
+  if method == "initialized" then
+    return self:handle_initialized(is_request, params)
+  end
+  if method == "shutdown" then
+    return self:handle_shutdown(is_request, params)
+  end
+  return Decision.unhandled()
+end

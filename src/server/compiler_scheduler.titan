@@ -1,0 +1,91 @@
+local async = import "async"
+
+-- All compiler bridge instances share one embedded Lua state. Compiler calls
+-- temporarily replace process-global driver/type registries, so only one may
+-- own that state at a time even when an analysis cooperatively yields.
+
+local record Waiter
+  task: async.Task<value, value>
+  queued: boolean
+  granted: boolean
+end
+
+record Permit
+  local release_owner: () -> ()
+  local released: boolean
+end
+
+record Scheduler
+  local active: boolean
+  local waiters: {Waiter}
+end
+
+function create(): Scheduler
+  return Scheduler.new(false, {})
+end
+
+local function Scheduler:grant_next()
+  while #self.waiters > 0 do
+    local waiter = self.waiters[1]
+    for index = 1, #self.waiters - 1 do
+      self.waiters[index] = self.waiters[index + 1]
+    end
+    self.waiters[#self.waiters] = nil
+    if waiter.queued and not waiter.granted then
+      -- Keep queued true until the resumed Task accepts ownership. Its
+      -- cancellation action can therefore detect a granted-but-not-yet-run
+      -- permit and hand it to the following waiter.
+      waiter.granted = true
+      waiter.task:resume()
+      return
+    end
+  end
+  self.active = false
+end
+
+local function Scheduler:abandon(waiter: Waiter)
+  if not waiter.queued then return end
+  waiter.queued = false
+  if waiter.granted then
+    -- active represents this reservation already. Transfer it instead of
+    -- clearing the scheduler while an older owner is still unwinding.
+    self:grant_next()
+  end
+end
+
+local function Scheduler:release_owner()
+  if not self.active then raise "compiler scheduler released without an owner" end
+  self:grant_next()
+end
+
+function Scheduler:acquire(): Permit
+  if not self.active then
+    self.active = true
+    return Permit.new(function () self:release_owner() end, false)
+  end
+
+  local waiter = Waiter.new(async.running(), true, false)
+  self.waiters[#self.waiters + 1] = waiter
+  local abandon = function () self:abandon(waiter) end
+  do
+    while not waiter.granted do async.suspend(abandon) end
+    waiter.queued = false
+    return Permit.new(function () self:release_owner() end, false)
+  catch
+    self:abandon(waiter)
+    raise
+  end
+end
+
+function Permit:release()
+  if self.released then return end
+  self.released = true
+  self.release_owner()
+end
+
+local shared_scheduler: Scheduler? = nil
+
+function acquire(): Permit
+  if shared_scheduler == nil then shared_scheduler = create() end
+  return (shared_scheduler as Scheduler):acquire()
+end

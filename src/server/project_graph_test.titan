@@ -1,0 +1,429 @@
+local test = import "test"
+local graph = import "server.project_graph"
+
+record TestAst
+  const label: string
+end
+
+local function stamp(path: string, seconds: integer): graph.FileStamp
+  return graph.FileStamp.new(path, seconds, 0, 10)
+end
+
+local function manifest(public_digest: string,
+                        source_digest: string): graph.Manifest
+  return graph.Manifest.new(public_digest, source_digest)
+end
+
+local function ordinary(module_name: string): graph.ImportEdge
+  return graph.ImportEdge.new(
+    module_name, graph.ImportVisibility.ordinary())
+end
+
+local function source_required(module_name: string): graph.ImportEdge
+  return graph.ImportEdge.new(
+    module_name, graph.ImportVisibility.source_required())
+end
+
+local function commit(cache: graph.Graph<TestAst>, module_name: string,
+                      output: graph.Manifest, imports: {graph.ImportEdge},
+                      label: string): {string}
+  local token? = cache:begin_project_check(module_name)
+  test.assert(token ~= nil, "expected a dirty project module to be checkable")
+  case cache:commit_project(token, output, imports, TestAst.new(label))
+  when accepted: accepted then return accepted.invalidated
+  when stale then
+    test.assert(false, "fresh project result was rejected as stale")
+    return {}
+  end
+end
+
+local function assert_names(actual: {string}, expected: {string},
+                            subject: string)
+  test.assert(#actual == #expected,
+              subject .. " had the wrong number of modules")
+  for index = 1, #expected do
+    test.assert(actual[index] == expected[index],
+                subject .. " differed at position " .. index)
+  end
+end
+
+function test_project_graph_retains_asts_only_for_project_modules(
+    _context: test.Context)
+  local cache = graph.create<TestAst>()
+  cache:observe_project("app.main", {stamp("app/main.titan", 1)})
+  commit(cache, "app.main", manifest("main-public", "main-source"), {},
+         "annotated-main")
+
+  cache:upsert_external_source(
+    "vendor.source", {stamp("vendor/source.titan", 2)},
+    manifest("source-public", "source-all"), {})
+  cache:upsert_external_binary(
+    "vendor.binary", {stamp("vendor/binary.so", 3)},
+    manifest("binary-public", "binary-public"), {})
+
+  local ast? = cache:project_ast("app.main")
+  test.assert(ast ~= nil and ast.label == "annotated-main",
+              "project module did not retain its typed annotated AST")
+  test.assert(cache:project_ast("vendor.source") == nil and
+              cache:project_ast("vendor.binary") == nil,
+              "external metadata exposed an AST cache")
+
+  case cache:provenance("app.main")
+  when project then
+  else test.assert(false, "project provenance was not retained")
+  end
+  case cache:provenance("vendor.source")
+  when external_source then
+  else test.assert(false, "external source provenance was not retained")
+  end
+  case cache:provenance("vendor.binary")
+  when external_binary then
+  else test.assert(false, "external binary provenance was not retained")
+  end
+  assert_names(cache:module_names(),
+               {"app.main", "vendor.binary", "vendor.source"},
+               "deterministic module order")
+end
+
+function test_project_graph_folder_membership_and_stamps_dirty_input(
+    _context: test.Context)
+  local cache = graph.create<TestAst>()
+  cache:observe_project("pkg.folder", {
+    stamp("pkg/folder/z.titan", 1),
+    stamp("pkg/folder/folder.titan", 1),
+  })
+  commit(cache, "pkg.folder", manifest("public", "source"), {}, "first")
+  local generation = cache:generation()
+
+  local unchanged = cache:observe_project("pkg.folder", {
+    stamp("pkg/folder/folder.titan", 1),
+    stamp("pkg/folder/z.titan", 1),
+  })
+  test.assert(not unchanged.changed and cache:generation() == generation and
+              not cache:is_dirty("pkg.folder"),
+              "reordered equal membership dirtied the folder module")
+
+  local changed = cache:observe_project("pkg.folder", {
+    stamp("pkg/folder/folder.titan", 1),
+    stamp("pkg/folder/a.titan", 1),
+    stamp("pkg/folder/z.titan", 1),
+  })
+  test.assert(changed.changed and cache:is_dirty("pkg.folder") and
+              cache:project_ast("pkg.folder") == nil,
+              "adding a folder contributor did not invalidate the module")
+  local files = cache:file_stamps("pkg.folder")
+  test.assert(#files == 3 and files[1].path == "pkg/folder/a.titan" and
+              files[2].path == "pkg/folder/folder.titan" and
+              files[3].path == "pkg/folder/z.titan",
+              "folder members were not normalized deterministically")
+end
+
+function test_project_graph_rejects_stale_generations(
+    _context: test.Context)
+  local cache = graph.create<TestAst>()
+  cache:observe_project("app.one", {stamp("app/one.titan", 1)})
+  local stale? = cache:begin_project_check("app.one")
+  test.assert(stale ~= nil, "initial project check did not start")
+
+  cache:observe_project("app.two", {stamp("app/two.titan", 1)})
+  case cache:commit_project(
+      stale, manifest("one", "one"), {}, TestAst.new("stale"))
+  when stale then
+  else test.assert(false, "older project generation was published")
+  end
+  test.assert(cache:is_dirty("app.one") and
+              cache:project_ast("app.one") == nil,
+              "stale completion mutated the project cache")
+
+  commit(cache, "app.one", manifest("one", "one"), {}, "fresh")
+  local ast? = cache:project_ast("app.one")
+  test.assert(ast ~= nil and ast.label == "fresh",
+              "fresh replacement did not populate the cache")
+end
+
+function test_project_graph_rejects_results_invalidated_within_generation(
+    _context: test.Context)
+  local cache = graph.create<TestAst>()
+  cache:observe_project("app.dep", {stamp("app/dep.titan", 1)})
+  cache:observe_project("app.client", {stamp("app/client.titan", 1)})
+  commit(cache, "app.dep", manifest("dep-1", "dep-1"), {}, "dep-1")
+  commit(cache, "app.client", manifest("client", "client"),
+         {ordinary("app.dep")}, "client")
+
+  cache:invalidate_project("app.dep")
+  cache:invalidate_project("app.client")
+  local dependency? = cache:begin_project_check("app.dep")
+  local client? = cache:begin_project_check("app.client")
+  test.assert(dependency ~= nil and client ~= nil,
+              "same-generation checks did not start")
+  case cache:commit_project(
+      dependency, manifest("dep-2", "dep-2"), {}, TestAst.new("dep-2"))
+  when accepted: accepted then
+    assert_names(accepted.invalidated, {"app.client"},
+                 "in-flight importer invalidation")
+  when stale then
+    test.assert(false, "dependency result unexpectedly became stale")
+  end
+
+  case cache:commit_project(
+      client, manifest("client", "client"), {ordinary("app.dep")},
+      TestAst.new("obsolete-client"))
+  when stale then
+  else
+    test.assert(false,
+                "dependency-invalidated result was published in its generation")
+  end
+  test.assert(cache:is_dirty("app.client"),
+              "stale importer completion cleared its invalidation")
+end
+
+function test_project_graph_tracks_direct_and_reverse_import_modes(
+    _context: test.Context)
+  local cache = graph.create<TestAst>()
+  cache:observe_project("app.client", {stamp("app/client.titan", 1)})
+  cache:observe_project("app.friend", {stamp("app/friend.titan", 1)})
+  cache:upsert_external_source(
+    "dep", {stamp("vendor/dep.titan", 1)}, manifest("p1", "s1"), {})
+  commit(cache, "app.client", manifest("client", "client"),
+         {ordinary("dep"), ordinary("dep")}, "client")
+  commit(cache, "app.friend", manifest("friend", "friend"),
+         {source_required("dep")}, "friend")
+
+  local direct = cache:direct_imports("app.client")
+  test.assert(#direct == 1 and direct[1].module_name == "dep",
+              "duplicate direct imports were not normalized")
+  case direct[1].visibility
+  when ordinary then
+  else test.assert(false, "ordinary import mode was lost")
+  end
+
+  local reverse = cache:reverse_imports("dep")
+  test.assert(#reverse == 2 and reverse[1].importer == "app.client" and
+              reverse[2].importer == "app.friend",
+              "reverse imports were missing or nondeterministic")
+  case reverse[2].visibility
+  when source_required then
+  else test.assert(false, "source-required reverse edge was lost")
+  end
+end
+
+function test_project_graph_stops_at_unchanged_relevant_manifests(
+    _context: test.Context)
+  local cache = graph.create<TestAst>()
+  cache:observe_project("app.client", {stamp("app/client.titan", 1)})
+  cache:observe_project("app.friend", {stamp("app/friend.titan", 1)})
+  cache:observe_project("app.top", {stamp("app/top.titan", 1)})
+  cache:upsert_external_source(
+    "dep", {stamp("vendor/dep.titan", 1)}, manifest("p1", "s1"), {})
+  commit(cache, "app.client", manifest("client-p", "client-s"),
+         {ordinary("dep")}, "client")
+  commit(cache, "app.friend", manifest("friend-p", "friend-s"),
+         {source_required("dep")}, "friend")
+  commit(cache, "app.top", manifest("top-p", "top-s"),
+         {ordinary("app.friend")}, "top")
+
+  local source_only = cache:upsert_external_source(
+    "dep", {stamp("vendor/dep.titan", 2)}, manifest("p1", "s2"), {})
+  assert_names(source_only.invalidated, {"app.friend"},
+               "source-only manifest change")
+  test.assert(not cache:is_dirty("app.client") and
+              not cache:is_dirty("app.top"),
+              "source-only change crossed an ordinary or transitive edge")
+
+  local stopped = commit(cache, "app.friend",
+                         manifest("friend-p", "friend-s"),
+                         {source_required("dep")}, "friend-rechecked")
+  test.assert(#stopped == 0 and not cache:is_dirty("app.top"),
+              "unchanged importer manifest did not stop propagation")
+
+  local public_change = cache:upsert_external_source(
+    "dep", {stamp("vendor/dep.titan", 3)}, manifest("p2", "s3"), {})
+  assert_names(public_change.invalidated, {"app.client", "app.friend"},
+               "public manifest change")
+  local next = commit(cache, "app.friend",
+                      manifest("friend-p2", "friend-s2"),
+                      {source_required("dep")}, "friend-changed")
+  assert_names(next, {"app.top"}, "recursive manifest propagation")
+end
+
+function test_project_graph_handles_cycles_without_eager_recursion(
+    _context: test.Context)
+  local cache = graph.create<TestAst>()
+  cache:observe_project("cycle.a", {stamp("cycle/a.titan", 1)})
+  cache:observe_project("cycle.b", {stamp("cycle/b.titan", 1)})
+  commit(cache, "cycle.a", manifest("a1", "a1"),
+         {ordinary("cycle.b")}, "a1")
+  commit(cache, "cycle.b", manifest("b1", "b1"),
+         {ordinary("cycle.a")}, "b1")
+  -- The first commit happened before B's reverse edge existed, so normalize
+  -- the graph once before exercising the invalidation cycle.
+  cache:invalidate_project("cycle.a")
+  commit(cache, "cycle.a", manifest("a1", "a1"),
+         {ordinary("cycle.b")}, "a1-stable")
+
+  cache:invalidate_project("cycle.a")
+  local b_dirty = commit(cache, "cycle.a", manifest("a2", "a2"),
+                         {ordinary("cycle.b")}, "a2")
+  assert_names(b_dirty, {"cycle.b"}, "first cycle edge")
+  local a_dirty = commit(cache, "cycle.b", manifest("b2", "b2"),
+                         {ordinary("cycle.a")}, "b2")
+  assert_names(a_dirty, {"cycle.a"}, "second cycle edge")
+  local stopped = commit(cache, "cycle.a", manifest("a2", "a2"),
+                         {ordinary("cycle.b")}, "a2-again")
+  test.assert(#stopped == 0 and not cache:is_dirty("cycle.b"),
+              "stable manifest did not terminate a cyclic invalidation wave")
+end
+
+function test_project_graph_add_replace_and_remove_invalidate_importers(
+    _context: test.Context)
+  local cache = graph.create<TestAst>()
+  cache:observe_project("app.client", {stamp("app/client.titan", 1)})
+  commit(cache, "app.client", manifest("client", "client"),
+         {ordinary("dep")}, "client")
+
+  local added = cache:upsert_external_binary(
+    "dep", {stamp("lib/dep.so", 1)}, manifest("dep", "dep"), {})
+  assert_names(added.invalidated, {"app.client"},
+               "adding a provider for an imported name")
+  commit(cache, "app.client", manifest("client", "client"),
+         {ordinary("dep")}, "client-with-dep")
+
+  local replaced = cache:observe_project(
+    "dep", {stamp("dep.titan", 1)})
+  assert_names(replaced.invalidated, {"app.client"},
+               "replacing external provider with project source")
+  test.assert(cache:is_dirty("dep") and cache:project_ast("dep") == nil,
+              "replacement project module was not scheduled for checking")
+  commit(cache, "dep", manifest("dep", "dep-source"), {}, "dep-project")
+  commit(cache, "app.client", manifest("client", "client"),
+         {ordinary("dep")}, "client-project-dep")
+
+  local removed = cache:remove_module("dep")
+  assert_names(removed.invalidated, {"app.client"},
+               "removing an imported module")
+  test.assert(not cache:has_module("dep") and
+              cache:reverse_imports("dep")[1].importer == "app.client",
+              "removal lost unresolved incoming reverse edges")
+end
+
+function test_project_graph_crosses_external_reverse_dependencies(
+    _context: test.Context)
+  local cache = graph.create<TestAst>()
+  cache:upsert_external_source(
+    "vendor.inner", {stamp("vendor/inner.titan", 1)},
+    manifest("inner-p1", "inner-s1"), {})
+  cache:upsert_external_source(
+    "vendor.outer", {stamp("vendor/outer.titan", 1)},
+    manifest("outer-p1", "outer-s1"), {ordinary("vendor.inner")})
+  cache:observe_project("app.main", {stamp("app/main.titan", 1)})
+  commit(cache, "app.main", manifest("main-p1", "main-s1"),
+         {ordinary("vendor.outer")}, "main")
+
+  local changed = cache:upsert_external_source(
+    "vendor.inner", {stamp("vendor/inner.titan", 2)},
+    manifest("inner-p2", "inner-s2"), {})
+  assert_names(changed.invalidated, {"app.main"},
+               "transitive external public change")
+  test.assert(cache:is_dirty("app.main"),
+              "external dependency chain did not reach its project consumer")
+end
+
+function test_project_graph_dirties_a_converging_external_importer_once(
+    _context: test.Context)
+  local cache = graph.create<TestAst>()
+  cache:upsert_external_source(
+    "vendor.inner", {stamp("vendor/inner.titan", 1)},
+    manifest("inner-p1", "inner-s1"), {})
+  cache:upsert_external_source(
+    "vendor.left", {stamp("vendor/left.titan", 1)},
+    manifest("left-p1", "left-s1"), {ordinary("vendor.inner")})
+  cache:upsert_external_source(
+    "vendor.right", {stamp("vendor/right.titan", 1)},
+    manifest("right-p1", "right-s1"), {ordinary("vendor.inner")})
+  cache:observe_project("app.main", {stamp("app/main.titan", 1)})
+  commit(cache, "app.main", manifest("main-p1", "main-s1"),
+         {ordinary("vendor.left"), ordinary("vendor.right")}, "main")
+
+  local changed = cache:upsert_external_source(
+    "vendor.inner", {stamp("vendor/inner.titan", 2)},
+    manifest("inner-p2", "inner-s2"), {})
+  assert_names(changed.invalidated, {"app.main"},
+               "converging external invalidation")
+  local token? = cache:begin_project_check("app.main")
+  test.assert(token ~= nil and token.revision == 2,
+              "one invalidation wave advanced the project revision twice")
+end
+
+function test_project_graph_honors_visibility_before_external_reverse_walk(
+    _context: test.Context)
+  local cache = graph.create<TestAst>()
+  cache:upsert_external_source(
+    "vendor.inner", {stamp("vendor/inner.titan", 1)},
+    manifest("inner-p1", "inner-s1"), {})
+  cache:upsert_external_source(
+    "vendor.outer", {stamp("vendor/outer.titan", 1)},
+    manifest("outer-p1", "outer-s1"), {ordinary("vendor.inner")})
+  cache:observe_project("app.main", {stamp("app/main.titan", 1)})
+  commit(cache, "app.main", manifest("main-p1", "main-s1"),
+         {ordinary("vendor.outer")}, "main")
+
+  local ordinary_only = cache:upsert_external_source(
+    "vendor.inner", {stamp("vendor/inner.titan", 2)},
+    manifest("inner-p1", "inner-s2"), {})
+  test.assert(#ordinary_only.invalidated == 0 and
+              not cache:is_dirty("app.main"),
+              "source-only change crossed an ordinary external edge")
+
+  cache:upsert_external_source(
+    "vendor.outer", {stamp("vendor/outer.titan", 2)},
+    manifest("outer-p1", "outer-s1"), {source_required("vendor.inner")})
+  local source_visible = cache:upsert_external_source(
+    "vendor.inner", {stamp("vendor/inner.titan", 3)},
+    manifest("inner-p1", "inner-s3"), {})
+  assert_names(source_visible.invalidated, {"app.main"},
+               "source-required external change")
+end
+
+function test_project_graph_reachability_and_derived_publication_are_generation_safe(
+    _context: test.Context)
+  local cache = graph.create<TestAst>()
+  cache:upsert_external_binary(
+    "vendor.inner", {stamp("vendor/inner.a", 1)},
+    manifest("inner-p1", "inner-p1"), {})
+  cache:upsert_external_binary(
+    "vendor.outer", {stamp("vendor/outer.a", 1)},
+    manifest("outer-p1", "outer-p1"), {ordinary("vendor.inner")})
+  cache:upsert_external_binary(
+    "vendor.unused", {stamp("vendor/unused.a", 1)},
+    manifest("unused", "unused"), {})
+  cache:observe_project("app.main", {stamp("app/main.titan", 1)})
+  commit(cache, "app.main", manifest("main-p1", "main-s1"),
+         {ordinary("vendor.outer")}, "main-1")
+  assert_names(cache:reachable_external_modules(),
+               {"vendor.inner", "vendor.outer"},
+               "reachable external closure")
+  local generation = cache:generation()
+  test.assert(cache:prune_external("vendor.unused") and
+              cache:generation() == generation and
+              not cache:has_module("vendor.unused"),
+              "derived external pruning changed the disk generation")
+
+  cache:observe_project("app.main", {stamp("app/main.titan", 2)})
+  local token? = cache:begin_project_check("app.main")
+  test.assert(token ~= nil, "changed project did not capture a check token")
+  local request_generation = cache:generation()
+  cache:publish_external_binary(
+    "vendor.outer", {stamp("vendor/outer.a", 1)},
+    manifest("outer-p2", "outer-p2"), {ordinary("vendor.inner")},
+    {"app.main"})
+  test.assert(cache:generation() == request_generation,
+              "analysis-derived external metadata advanced the generation")
+  case cache:commit_project(
+      token, manifest("main-p2", "main-s2"),
+      {ordinary("vendor.outer")}, TestAst.new("main-2"))
+  when accepted then
+  when stale then
+    test.assert(false,
+                "same-analysis external publication invalidated its project token")
+  end
+end

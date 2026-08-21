@@ -1,0 +1,83 @@
+local test = import "test"
+local json = import "server.json"
+local lifecycle = import "server.lifecycle"
+
+function test_lifecycle_completes_initialize_shutdown_exit(
+    _context: test.Context)
+  local server = lifecycle.create()
+  test.assert(server:phase_name() == "before_initialize",
+              "lifecycle started in the wrong phase")
+
+  case server:dispatch("initialize", true, json.new_object())
+  when result: result then
+    local object? = json.as_object(result)
+    local capabilities? = json.as_object(object:get("capabilities"))
+    test.assert(capabilities ~= nil and #capabilities.members == 5,
+                "initialize advertised the wrong capability count")
+    test.assert(json.as_boolean(capabilities:get("definitionProvider")) and
+                json.as_boolean(capabilities:get("referencesProvider")) and
+                json.as_boolean(capabilities:get("renameProvider")) and
+                json.as_boolean(capabilities:get("hoverProvider")) and
+                json.as_boolean(capabilities:get("foldingRangeProvider")),
+                "initialize omitted a supported semantic capability")
+    test.assert(capabilities:get("completionProvider") == nil,
+                "initialize advertised out-of-scope completion")
+  else
+    test.assert(false, "initialize did not produce a result")
+  end
+  test.assert(server:phase_name() == "awaiting_initialized",
+              "initialize did not advance the lifecycle")
+
+  case server:dispatch("initialized", false, json.new_object())
+  when notification then
+  else
+    test.assert(false, "initialized was not accepted as a notification")
+  end
+  test.assert(server:phase_name() == "running",
+              "initialized did not enter the running phase")
+
+  case server:dispatch("shutdown", true, nil)
+  when result: result then
+    test.assert(json.is_null(result), "shutdown result was not null")
+  else
+    test.assert(false, "shutdown did not produce a result")
+  end
+
+  case server:dispatch("exit", false, nil)
+  when exit: code then
+    test.assert(code == 0, "orderly shutdown/exit returned failure")
+  else
+    test.assert(false, "exit did not terminate the lifecycle")
+  end
+  test.assert(server:phase_name() == "exited",
+              "exit did not enter the exited phase")
+end
+
+function test_lifecycle_enforces_order_and_message_kinds(
+    _context: test.Context)
+  local server = lifecycle.create()
+  case server:dispatch("workspace/symbol", true, nil)
+  when failure: failure then
+    test.assert(failure.code == -32002,
+                "pre-initialize request used the wrong error code")
+  else
+    test.assert(false, "pre-initialize request was accepted")
+  end
+
+  case server:dispatch("initialize", true, json.null())
+  when failure: failure then
+    test.assert(failure.code == -32602,
+                "invalid initialize params used the wrong error code")
+  else
+    test.assert(false, "initialize accepted non-object params")
+  end
+  test.assert(server:phase_name() == "before_initialize",
+              "failed initialize changed lifecycle state")
+
+  case server:dispatch("exit", false, nil)
+  when exit: code then
+    test.assert(code == 1, "exit without shutdown returned success")
+  else
+    test.assert(false, "early exit did not terminate the lifecycle")
+  end
+end

@@ -1,0 +1,119 @@
+local test = import "test"
+local strings = import "string"
+local source_text = import "server.source_text"
+
+local function expect_position(source: string, offset: integer,
+                               line: integer, character: integer)
+  local position?, failure? = source_text.position_for_offset(source, offset)
+  test.assert(failure == nil and position ~= nil,
+              "valid byte offset did not produce an LSP position")
+  test.assert(position.line == line and position.character == character,
+              "byte offset produced the wrong UTF-16 position")
+  local roundtrip?, reverse_failure? =
+    source_text.offset_for_position(source, position)
+  test.assert(reverse_failure == nil and roundtrip == offset,
+              "UTF-16 position did not round-trip to its byte offset")
+end
+
+function test_source_text_converts_utf8_bytes_and_utf16_positions(
+    _context: test.Context)
+  local source = "a😀b\r\nβ\rc\nd"
+  expect_position(source, 0, 0, 0)
+  expect_position(source, 1, 0, 1)
+  expect_position(source, 5, 0, 3)
+  expect_position(source, 6, 0, 4)
+  expect_position(source, 8, 1, 0)
+  expect_position(source, 10, 1, 1)
+  expect_position(source, 11, 2, 0)
+  expect_position(source, 13, 3, 0)
+  expect_position(source, 14, 3, 1)
+
+  local span?, failure? = source_text.span_for_offsets(source, 1, 10)
+  test.assert(failure == nil and span ~= nil,
+              "valid byte span did not convert")
+  test.assert(span.start.line == 0 and span.start.character == 1 and
+              span.finish.line == 1 and span.finish.character == 1,
+              "byte span produced the wrong LSP endpoints")
+  local offsets?, reverse_failure? =
+    source_text.offsets_for_span(source, span)
+  test.assert(reverse_failure == nil and offsets ~= nil and
+              offsets.start == 1 and offsets.finish == 10,
+              "LSP span did not round-trip to byte offsets")
+end
+
+function test_source_text_rejects_split_scalars_surrogates_and_crlf(
+    _context: test.Context)
+  local source = "a😀b\r\nc"
+  local split_utf8?, split_utf8_error? =
+    source_text.position_for_offset(source, 2)
+  test.assert(split_utf8 == nil and split_utf8_error ~= nil and
+              strings.find(split_utf8_error.message, "UTF-8 scalar") ~= nil,
+              "byte offset inside an astral scalar was accepted")
+
+  local split_surrogate?, split_surrogate_error? =
+    source_text.offset_for_position(
+      source, source_text.Position.new(0, 2))
+  test.assert(split_surrogate == nil and split_surrogate_error ~= nil and
+              strings.find(split_surrogate_error.message,
+                           "surrogate pair") ~= nil,
+              "LSP position inside an astral surrogate pair was accepted")
+
+  local split_crlf?, split_crlf_error? =
+    source_text.position_for_offset(source, 7)
+  test.assert(split_crlf == nil and split_crlf_error ~= nil and
+              strings.find(split_crlf_error.message, "CRLF") ~= nil,
+              "byte offset inside CRLF was accepted")
+
+  local past_line?, past_line_error? = source_text.offset_for_position(
+    source, source_text.Position.new(0, 5))
+  test.assert(past_line == nil and past_line_error ~= nil,
+              "UTF-16 position past line end was accepted")
+end
+
+function test_source_text_normalizes_file_uris_and_paths(
+    _context: test.Context)
+  local path?, path_error? = source_text.file_uri_to_path(
+    "file:///workspace/a%20folder/../caf%C3%A9.titan")
+  test.assert(path_error == nil and path == "/workspace/café.titan",
+              "encoded file URI did not decode and normalize")
+
+  local local_path?, local_error? = source_text.file_uri_to_path(
+    "file://localhost/workspace/a%20b.titan")
+  test.assert(local_error == nil and
+              local_path == "/workspace/a b.titan",
+              "localhost file URI did not normalize")
+
+  local uri?, uri_error? = source_text.path_to_file_uri(
+    "/workspace/./a b/../café.titan")
+  test.assert(uri_error == nil and
+              uri == "file:///workspace/caf%C3%A9.titan",
+              "path did not normalize and percent encode")
+
+  local resolved?, resolve_error? = source_text.resolve_path(
+    "/workspace/project", "src/../lib/main.titan")
+  test.assert(resolve_error == nil and
+              resolved == "/workspace/project/lib/main.titan",
+              "relative path resolution was not lexical and deterministic")
+  test.assert(source_text.relative_path(
+                "/workspace/project", resolved) == "lib/main.titan",
+              "normalized child path did not become relative to its root")
+end
+
+function test_source_text_rejects_malformed_or_nonlocal_file_uris(
+    _context: test.Context)
+  local malformed?, malformed_error? =
+    source_text.file_uri_to_path("file:///workspace/bad%2.titan")
+  test.assert(malformed == nil and malformed_error ~= nil and
+              strings.find(malformed_error.message, "percent escape") ~= nil,
+              "truncated percent escape was accepted")
+
+  local nonhex?, nonhex_error? =
+    source_text.file_uri_to_path("file:///workspace/bad%XZ.titan")
+  test.assert(nonhex == nil and nonhex_error ~= nil,
+              "non-hexadecimal percent escape was accepted")
+
+  local remote?, remote_error? =
+    source_text.file_uri_to_path("file://example.com/workspace/main.titan")
+  test.assert(remote == nil and remote_error ~= nil,
+              "non-local file URI authority was accepted")
+end

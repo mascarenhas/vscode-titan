@@ -1,0 +1,252 @@
+local json = import "server.json"
+local lifecycle = import "server.lifecycle"
+
+record DispatchResult
+  response: string?
+  exit_code: integer?
+end
+
+-- LSP narrows JSON-RPC request ids to strings and signed 32-bit integers.
+-- Keeping that restriction nominal prevents dynamic JSON values from leaking
+-- into request ownership and cancellation bookkeeping.
+union RequestId
+  integer_id: integer
+  string_id: string
+end
+
+record SemanticRequest
+  id: RequestId
+  method: string
+  params: json.Value?
+end
+
+record SemanticError
+  code: integer
+  message: string
+end
+
+union SemanticOutcome
+  result: json.Value
+  failure: SemanticError
+end
+
+union Route
+  immediate: DispatchResult
+  semantic: SemanticRequest
+  cancel: RequestId
+  shutdown: DispatchResult
+  exit: integer
+end
+
+record Dispatcher
+  local lifecycle_state: lifecycle.Lifecycle
+end
+
+local PARSE_ERROR = -32700
+local INVALID_REQUEST = -32600
+local METHOD_NOT_FOUND = -32601
+local MIN_REQUEST_ID = -2147483648
+local MAX_REQUEST_ID = 2147483647
+
+function create(): Dispatcher
+  return Dispatcher.new(lifecycle.create())
+end
+
+function Dispatcher:phase_name(): string
+  return self.lifecycle_state:phase_name()
+end
+
+function RequestId:equals(other: RequestId): boolean
+  case self
+  when integer_id: left then
+    case other
+    when integer_id: right then return left == right
+    else return false
+    end
+  when string_id: left then
+    case other
+    when string_id: right then return left == right
+    else return false
+    end
+  end
+  return false
+end
+
+function RequestId:to_json(): json.Value
+  case self
+  when integer_id: item then return json.from_integer(item)
+  when string_id: item then return json.from_string(item)
+  end
+  return json.null()
+end
+
+local function no_response(): DispatchResult
+  return DispatchResult.new(nil, nil)
+end
+
+function result_response(id: RequestId, result: json.Value): DispatchResult
+  local envelope = json.from_object({
+    json.Member.new("jsonrpc", json.from_string("2.0")),
+    json.Member.new("id", id:to_json()),
+    json.Member.new("result", result),
+  })
+  return DispatchResult.new(json.encode(envelope), nil)
+end
+
+function failure_response(id: RequestId?, code: integer,
+                          message: string): DispatchResult
+  local failure = json.from_object({
+    json.Member.new("code", json.from_integer(code)),
+    json.Member.new("message", json.from_string(message)),
+  })
+  local response_id = json.null()
+  if id ~= nil then response_id = id:to_json() end
+  local envelope = json.from_object({
+    json.Member.new("jsonrpc", json.from_string("2.0")),
+    json.Member.new("id", response_id),
+    json.Member.new("error", failure),
+  })
+  return DispatchResult.new(json.encode(envelope), nil)
+end
+
+local function object_string(object: json.Object, key: string): string?
+  local item? = object:get(key)
+  if item == nil then return nil end
+  return json.as_string(item)
+end
+
+local function request_id(item: json.Value): RequestId?
+  local number? = json.as_integer(item)
+  if number ~= nil then
+    local actual: integer = number
+    if actual < MIN_REQUEST_ID or actual > MAX_REQUEST_ID then return nil end
+    return RequestId.integer_id(actual)
+  end
+  local text? = json.as_string(item)
+  if text ~= nil then return RequestId.string_id(text) end
+  return nil
+end
+
+local function valid_envelope_params(method: string,
+                                     params: json.Value?): boolean
+  if params == nil then return true end
+  if json.as_object(params) ~= nil or json.as_array(params) ~= nil then
+    return true
+  end
+  -- LSP's void lifecycle requests commonly arrive with omitted or null params.
+  if json.is_null(params) and (method == "shutdown" or method == "exit") then
+    return true
+  end
+  return false
+end
+
+local function cancel_id(params: json.Value?): RequestId?
+  if params == nil then return nil end
+  local object? = json.as_object(params)
+  if object == nil then return nil end
+  local item? = object:get("id")
+  if item == nil then return nil end
+  return request_id(item)
+end
+
+local function immediate(result: DispatchResult): Route
+  return Route.immediate(result)
+end
+
+local function Dispatcher:route_call(object: json.Object): Route
+  local protocol? = object_string(object, "jsonrpc")
+  local method? = object_string(object, "method")
+  local raw_id? = object:get("id")
+  if protocol ~= "2.0" or method == nil then
+    -- A notification is still a valid Request object without an id. An object
+    -- with the wrong JSON-RPC version is not a notification, so it receives the
+    -- required Invalid Request response with a null id.
+    return immediate(failure_response(
+      nil, INVALID_REQUEST, "Invalid Request"))
+  end
+
+  local actual_method: string = method
+  local id: RequestId? = nil
+  if raw_id ~= nil then
+    id = request_id(raw_id)
+    if id == nil then
+      return immediate(failure_response(
+        nil, INVALID_REQUEST, "Invalid Request"))
+    end
+  end
+  local is_request = id ~= nil
+  local params? = object:get("params")
+  if not valid_envelope_params(actual_method, params) then
+    if not is_request then return immediate(no_response()) end
+    return immediate(failure_response(
+      id, INVALID_REQUEST, "Invalid Request"))
+  end
+
+  -- Exit is a void notification. Reject structured params before mutating the
+  -- lifecycle, while still accepting the interoperable omitted/null forms.
+  if actual_method == "exit" and params ~= nil and not json.is_null(params) then
+    if not is_request then return immediate(no_response()) end
+    return immediate(failure_response(
+      id, INVALID_REQUEST, "Invalid Request"))
+  end
+
+  local decision = self.lifecycle_state:dispatch(
+    actual_method, is_request, params)
+  case decision
+  when result: result then
+    if not is_request then return immediate(no_response()) end
+    local reply = result_response(id, result)
+    if actual_method == "shutdown" then return Route.shutdown(reply) end
+    return immediate(reply)
+  when failure: failure then
+    if not is_request then return immediate(no_response()) end
+    return immediate(failure_response(id, failure.code, failure.message))
+  when notification then
+    return immediate(no_response())
+  when exit: code then
+    return Route.exit(code)
+  when unhandled then
+    if actual_method == "$/cancelRequest" then
+      if is_request then
+        return immediate(failure_response(
+          id, METHOD_NOT_FOUND, "Method not found"))
+      end
+      local target? = cancel_id(params)
+      if target == nil then
+        -- JSON-RPC notifications never receive error responses.
+        return immediate(no_response())
+      end
+      return Route.cancel(target)
+    end
+    if not is_request then return immediate(no_response()) end
+    return Route.semantic(SemanticRequest.new(id, actual_method, params))
+  end
+  return immediate(no_response())
+end
+
+function Dispatcher:route(source: string): Route
+  local parsed?, failure? = json.parse(source)
+  if parsed == nil then
+    return immediate(failure_response(nil, PARSE_ERROR, "Parse error"))
+  end
+  local object? = json.as_object(parsed)
+  if object == nil then
+    return immediate(failure_response(
+      nil, INVALID_REQUEST, "Invalid Request"))
+  end
+  return self:route_call(object)
+end
+
+-- Synchronous compatibility facade for protocol-unit callers. The async
+-- coordinator consumes route() and owns semantic request Tasks.
+function Dispatcher:dispatch(source: string): DispatchResult
+  case self:route(source)
+  when immediate: result then return result
+  when semantic: request then
+    return failure_response(request.id, METHOD_NOT_FOUND, "Method not found")
+  when cancel then return no_response()
+  when shutdown: result then return result
+  when exit: code then return DispatchResult.new(nil, code)
+  end
+  return no_response()
+end

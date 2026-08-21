@@ -1,0 +1,244 @@
+local io = import "io"
+local strings = import "string"
+local math = import "titan.math"
+
+-- LSP messages use HTTP-like ASCII headers followed by an exact byte count.
+-- A FrameReader owns every byte read past one message so callers never lose a
+-- prefix of the next message when the operating system returns both at once.
+record FrameError
+  message: string
+end
+
+record FrameReader
+  local buffer: string
+end
+
+local MAX_HEADER_BYTES = 65536
+local MAX_CONTENT_BYTES = 16777216
+
+local function reject<T>(message: string): T
+  raise FrameError.new(message)
+end
+
+function reader(): FrameReader
+  return FrameReader.new("")
+end
+
+function frame(body: string): string
+  return "Content-Length: " .. #body .. "\r\n\r\n" .. body
+end
+
+function FrameReader:feed(bytes: string)
+  if #bytes > 0 then self.buffer = self.buffer .. bytes end
+end
+
+function FrameReader:pending_bytes(): integer
+  return #self.buffer
+end
+
+local function trim_optional_whitespace(subject: string): string
+  local first = 1
+  while first <= #subject do
+    local byte: integer = strings.byte(subject, first)
+    if byte ~= 32 and byte ~= 9 then break end
+    first = first + 1
+  end
+
+  local last = #subject
+  while last >= first do
+    local byte: integer = strings.byte(subject, last)
+    if byte ~= 32 and byte ~= 9 then break end
+    last = last - 1
+  end
+  return strings.sub(subject, first, last)
+end
+
+local function valid_header_name(name: string): boolean
+  if #name == 0 then return false end
+  for index = 1, #name do
+    local byte: integer = strings.byte(name, index)
+    local alpha: boolean = (byte >= 65 and byte <= 90) or
+                           (byte >= 97 and byte <= 122)
+    local digit: boolean = byte >= 48 and byte <= 57
+    local punctuation: boolean = byte == 33 or byte == 35 or byte == 36 or
+      byte == 37 or byte == 38 or byte == 39 or byte == 42 or
+      byte == 43 or byte == 45 or byte == 46 or byte == 94 or
+      byte == 95 or byte == 96 or byte == 124 or byte == 126
+    if not alpha and not digit and not punctuation then return false end
+  end
+  return true
+end
+
+local function validate_partial_header_line_endings(subject: string)
+  for index = 1, #subject do
+    local byte: integer = strings.byte(subject, index)
+    if byte == 10 then
+      if index == 1 or strings.byte(subject, index - 1) ~= 13 then
+        reject<value>("LSP header lines must end with CRLF")
+      end
+    elseif byte == 13 and index < #subject and
+           strings.byte(subject, index + 1) ~= 10 then
+      reject<value>("LSP header lines must end with CRLF")
+    end
+  end
+end
+
+local function decimal_length(text: string): integer
+  if #text == 0 then
+    return reject<integer>("Content-Length is empty")
+  end
+  local result = 0
+  for index = 1, #text do
+    local byte: integer = strings.byte(text, index)
+    if byte < 48 or byte > 57 then
+      return reject<integer>("Content-Length must be an unsigned decimal integer")
+    end
+    local digit = byte - 48
+    if result > (math.maxinteger - digit) // 10 then
+      return reject<integer>("Content-Length is too large")
+    end
+    result = result * 10 + digit
+  end
+  return result
+end
+
+local function valid_header_value(subject: string): boolean
+  for index = 1, #subject do
+    local byte: integer = strings.byte(subject, index)
+    if byte ~= 9 and (byte < 32 or byte > 126) then return false end
+  end
+  return true
+end
+
+local function validate_content_type(subject: string)
+  local semicolon?: integer = strings.find(subject, ";")
+  local mime = subject
+  local parameter: string? = nil
+  if semicolon ~= nil then
+    mime = strings.sub(subject, 1, semicolon - 1)
+    parameter = strings.sub(subject, semicolon + 1)
+  end
+  mime = strings.lower(trim_optional_whitespace(mime))
+  if mime ~= "application/vscode-jsonrpc" then
+    reject<value>("unsupported LSP Content-Type")
+  end
+  if parameter == nil then return end
+  if strings.find(parameter, ";") ~= nil then
+    reject<value>("unsupported LSP Content-Type parameter")
+  end
+
+  local equals?: integer = strings.find(parameter, "=")
+  if equals == nil then
+    reject<value>("invalid LSP Content-Type parameter")
+  end
+  local name = strings.lower(trim_optional_whitespace(
+    strings.sub(parameter, 1, equals - 1)))
+  local encoding = strings.lower(trim_optional_whitespace(
+    strings.sub(parameter, equals + 1)))
+  if name ~= "charset" or
+     (encoding ~= "utf-8" and encoding ~= "utf8") then
+    reject<value>("LSP Content-Type must use UTF-8")
+  end
+end
+
+local function parse_headers(headers: string): integer
+  local content_length: integer? = nil
+  local content_type_seen = false
+  local position = 1
+  while position <= #headers do
+    local line_end?: integer = strings.find(headers, "\r\n", position)
+    local line = ""
+    if line_end then
+      line = strings.sub(headers, position, line_end - 1)
+      position = line_end + 2
+    else
+      line = strings.sub(headers, position)
+      position = #headers + 1
+    end
+
+    if #line == 0 then
+      return reject<integer>("empty line inside LSP headers")
+    end
+    if strings.find(line, "\r") or strings.find(line, "\n") then
+      return reject<integer>("LSP header lines must end with CRLF")
+    end
+
+    local colon?: integer = strings.find(line, ":")
+    if colon == nil then
+      return reject<integer>("LSP header line is missing ':'")
+    end
+    local name = strings.sub(line, 1, colon - 1)
+    if not valid_header_name(name) then
+      return reject<integer>("invalid LSP header name")
+    end
+    local header_value =
+      trim_optional_whitespace(strings.sub(line, colon + 1))
+    if not valid_header_value(header_value) then
+      return reject<integer>("LSP header values must be ASCII")
+    end
+    if strings.lower(name) == "content-length" then
+      if content_length ~= nil then
+        return reject<integer>("duplicate Content-Length header")
+      end
+      content_length = decimal_length(header_value)
+    elseif strings.lower(name) == "content-type" then
+      if content_type_seen then
+        return reject<integer>("duplicate Content-Type header")
+      end
+      content_type_seen = true
+      validate_content_type(header_value)
+    end
+  end
+
+  if content_length == nil then
+    return reject<integer>("missing Content-Length header")
+  end
+  return content_length
+end
+
+function FrameReader:next(): string?
+  local header_first?: integer, header_last?: integer =
+    strings.find(self.buffer, "\r\n\r\n")
+  if header_first == nil then
+    validate_partial_header_line_endings(self.buffer)
+    if #self.buffer > MAX_HEADER_BYTES then
+      return reject<string>("LSP header block exceeds 65536 bytes")
+    end
+    return nil
+  end
+
+  local first: integer = header_first
+  local last: integer = header_last
+  if first - 1 > MAX_HEADER_BYTES then
+    return reject<string>("LSP header block exceeds 65536 bytes")
+  end
+  local content_length = parse_headers(strings.sub(self.buffer, 1, first - 1))
+  if content_length > MAX_CONTENT_BYTES then
+    return reject<string>("LSP message body exceeds 16777216 bytes")
+  end
+  local body_first = last + 1
+  local available = #self.buffer - body_first + 1
+  if available < content_length then return nil end
+
+  local body_last = body_first + content_length - 1
+  local body = strings.sub(self.buffer, body_first, body_last)
+  self.buffer = strings.sub(self.buffer, body_last + 1)
+  return body
+end
+
+function FrameReader:read(source: io.Reader): string?
+  while true do
+    local body? = self:next()
+    if body ~= nil then return body end
+
+    local chunk? = source:read()
+    if chunk == nil then
+      if #self.buffer > 0 then
+        return reject<string>("unexpected EOF in LSP frame")
+      end
+      return nil
+    end
+    self:feed(chunk)
+  end
+  return nil
+end

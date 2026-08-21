@@ -1,0 +1,62 @@
+local async = import "async"
+
+-- A single-consumer, unbounded protocol queue. Producers never yield, so a
+-- Task terminal listener can publish exactly one response safely. The one
+-- consumer is the protocol writer Task.
+record ResponseQueue
+  local items: {string}
+  local waiter: async.Task?
+  local stopped: boolean
+end
+
+function create(): ResponseQueue
+  return ResponseQueue.new({}, nil, false)
+end
+
+local function ResponseQueue:wake()
+  local waiter? = self.waiter
+  if waiter == nil then return end
+  self.waiter = nil
+  waiter:resume()
+end
+
+function ResponseQueue:push(message: string)
+  if self.stopped then raise "protocol response queue is stopped" end
+  self.items[#self.items + 1] = message
+  self:wake()
+end
+
+function ResponseQueue:stop()
+  if self.stopped then return end
+  self.stopped = true
+  self:wake()
+end
+
+function ResponseQueue:pending(): integer
+  return #self.items
+end
+
+function ResponseQueue:take(): string?
+  while #self.items == 0 do
+    if self.stopped then return nil end
+    if self.waiter ~= nil then
+      raise "protocol response queue already has a waiting consumer"
+    end
+
+    local current = async.running()
+    self.waiter = current
+    local detach = function ()
+      if self.waiter == current then self.waiter = nil end
+    end
+    defer detach()
+    async.suspend(detach)
+  end
+
+  local count = #self.items
+  local message = self.items[1]
+  for index = 1, count - 1 do
+    self.items[index] = self.items[index + 1]
+  end
+  self.items[count] = nil
+  return message
+end

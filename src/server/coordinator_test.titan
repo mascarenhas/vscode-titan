@@ -1,0 +1,235 @@
+local test = import "test"
+local timer = import "timer"
+local coordinator = import "server.coordinator"
+local dispatcher = import "server.dispatcher"
+local json = import "server.json"
+local response_queue = import "server.response_queue"
+local test_runtime = import "server.test_runtime"
+
+local function response_object(source: string): json.Object
+  local parsed?, failure? = json.parse(source)
+  test.assert(failure == nil and parsed ~= nil,
+              "coordinator produced invalid response JSON")
+  local object? = json.as_object(parsed)
+  test.assert(object ~= nil, "coordinator response was not an object")
+  return object
+end
+
+local function error_code(source: string): integer
+  local object = response_object(source)
+  local failure? = json.as_object(object:get("error"))
+  test.assert(failure ~= nil, "response did not contain an error object")
+  local code? = json.as_integer(failure:get("code"))
+  test.assert(code ~= nil, "response error did not contain an integer code")
+  return code
+end
+
+local function initialize(server: coordinator.Coordinator,
+                          output: response_queue.ResponseQueue)
+  server:handle(
+    [[{"jsonrpc":"2.0","id":0,"method":"initialize","params":{}}]])
+  output:take()
+  server:handle(
+    [[{"jsonrpc":"2.0","method":"initialized","params":{}}]])
+end
+
+local function completes_yielding_semantic_requests()
+    local output = response_queue.create()
+    local handler: coordinator.SemanticHandler = function (
+        request: dispatcher.SemanticRequest): dispatcher.SemanticOutcome
+      timer.yield()
+      return dispatcher.SemanticOutcome.result(json.from_object({
+        json.Member.new("method", json.from_string(request.method)),
+      }))
+    end
+    local server = coordinator.create(output, handler)
+    defer server:cancel_all("yielding request test cleanup")
+    initialize(server, output)
+
+    server:handle(
+      [[{"jsonrpc":"2.0","id":"work","method":"workspace/symbol",]] ..
+      [["params":{}}]])
+    test.assert(server:active_count() == 1,
+                "semantic request was not tracked as a Task")
+    while server:active_count() > 0 do timer.yield() end
+
+    local response = response_object(output:take())
+    test.assert(json.as_string(response:get("id")) == "work",
+                "semantic response changed its string request id")
+    local result? = json.as_object(response:get("result"))
+    test.assert(result ~= nil and
+                json.as_string(result:get("method")) == "workspace/symbol",
+                "yielding semantic handler result was lost")
+    test.assert(output:pending() == 0,
+                "semantic request produced more than one response")
+end
+
+function test_coordinator_completes_yielding_semantic_requests(
+    _context: test.Context)
+  test_runtime.run(completes_yielding_semantic_requests)
+end
+
+local function completes_second_request_while_first_is_suspended()
+    local output = response_queue.create()
+    local slow_started = false
+    local release_slow = false
+    local handler: coordinator.SemanticHandler = function (
+        request: dispatcher.SemanticRequest): dispatcher.SemanticOutcome
+      if request.method == "textDocument/hover" then
+        slow_started = true
+        while not release_slow do timer.yield() end
+      end
+      return dispatcher.SemanticOutcome.result(json.from_object({
+        json.Member.new("method", json.from_string(request.method)),
+      }))
+    end
+    local server = coordinator.create(output, handler)
+    defer server:cancel_all("responsive request test cleanup")
+    initialize(server, output)
+
+    server:handle(
+      [[{"jsonrpc":"2.0","id":"slow","method":"textDocument/hover",]] ..
+      [["params":{}}]])
+    while not slow_started do timer.yield() end
+    server:handle(
+      [[{"jsonrpc":"2.0","id":"fast","method":"workspace/symbol",]] ..
+      [["params":{}}]])
+    while output:pending() == 0 do timer.yield() end
+
+    local fast = response_object(output:take())
+    test.assert(json.as_string(fast:get("id")) == "fast" and
+                server:active_count() == 1,
+                "second request did not complete while first was suspended")
+    release_slow = true
+    while server:active_count() > 0 do timer.yield() end
+    local slow = response_object(output:take())
+    test.assert(json.as_string(slow:get("id")) == "slow" and
+                output:pending() == 0,
+                "suspended first request did not finish exactly once")
+end
+
+function test_coordinator_services_request_while_another_is_suspended(
+    _context: test.Context)
+  test_runtime.run(completes_second_request_while_first_is_suspended)
+end
+
+local function cancels_and_joins_one_request()
+    local output = response_queue.create()
+    local started = false
+    local cleaned = false
+    local handler: coordinator.SemanticHandler = function (
+        _request: dispatcher.SemanticRequest): dispatcher.SemanticOutcome
+      started = true
+      defer cleaned = true
+      while true do timer.yield() end
+      return dispatcher.SemanticOutcome.result(json.null())
+    end
+    local server = coordinator.create(output, handler)
+    defer server:cancel_all("cancellation test cleanup")
+    initialize(server, output)
+
+    server:handle(
+      [[{"jsonrpc":"2.0","id":7,"method":"workspace/symbol",]] ..
+      [["params":{}}]])
+    while not started do timer.yield() end
+    server:handle(
+      [[{"jsonrpc":"2.0","method":"$/cancelRequest",]] ..
+      [["params":{"id":7}}]])
+
+    test.assert(cleaned,
+                "cancelRequest returned before handler cleanup completed")
+    test.assert(server:active_count() == 0,
+                "cancelled request remained tracked")
+    local response = output:take()
+    test.assert(error_code(response) == -32800,
+                "cancelled request did not return RequestCancelled")
+    test.assert(json.as_integer(response_object(response):get("id")) == 7,
+                "cancellation response changed the request id")
+    test.assert(output:pending() == 0,
+                "cancelled request produced more than one terminal response")
+end
+
+function test_coordinator_cancels_and_joins_one_request(
+    _context: test.Context)
+  test_runtime.run(cancels_and_joins_one_request)
+end
+
+local function shutdown_cancels_all_before_reply()
+    local output = response_queue.create()
+    local started = 0
+    local cleaned = 0
+    local handler: coordinator.SemanticHandler = function (
+        _request: dispatcher.SemanticRequest): dispatcher.SemanticOutcome
+      started = started + 1
+      defer cleaned = cleaned + 1
+      while true do timer.yield() end
+      return dispatcher.SemanticOutcome.result(json.null())
+    end
+    local server = coordinator.create(output, handler)
+    defer server:cancel_all("shutdown test cleanup")
+    initialize(server, output)
+
+    server:handle(
+      [[{"jsonrpc":"2.0","id":1,"method":"workspace/symbol",]] ..
+      [["params":{}}]])
+    server:handle(
+      [[{"jsonrpc":"2.0","id":"two","method":"textDocument/hover",]] ..
+      [["params":{}}]])
+    while started < 2 do timer.yield() end
+    server:handle(
+      [[{"jsonrpc":"2.0","id":99,"method":"shutdown"}]])
+
+    test.assert(cleaned == 2 and server:active_count() == 0,
+                "shutdown did not cancel and join every semantic Task")
+    local first = output:take()
+    local second = output:take()
+    local shutdown = response_object(output:take())
+    test.assert(error_code(first) == -32800 and
+                error_code(second) == -32800,
+                "shutdown did not publish cancellation responses")
+    test.assert(json.as_integer(shutdown:get("id")) == 99 and
+                json.is_null(shutdown:get("result")),
+                "shutdown response was not published after cancellations")
+    test.assert(output:pending() == 0,
+                "shutdown produced duplicate terminal responses")
+end
+
+function test_coordinator_shutdown_cancels_all_before_reply(
+    _context: test.Context)
+  test_runtime.run(shutdown_cancels_all_before_reply)
+end
+
+local function rejects_duplicate_active_request_ids()
+    local output = response_queue.create()
+    local handler: coordinator.SemanticHandler = function (
+        _request: dispatcher.SemanticRequest): dispatcher.SemanticOutcome
+      while true do timer.yield() end
+      return dispatcher.SemanticOutcome.result(json.null())
+    end
+    local server = coordinator.create(output, handler)
+    defer server:cancel_all("duplicate id test cleanup")
+    initialize(server, output)
+
+    local request =
+      [[{"jsonrpc":"2.0","id":4,"method":"workspace/symbol",]] ..
+      [["params":{}}]]
+    server:handle(request)
+    server:handle(request)
+    test.assert(error_code(output:take()) == -32600,
+                "duplicate active request id was not rejected")
+    test.assert(server:active_count() == 1,
+                "duplicate id created a second semantic Task")
+
+    server:handle(
+      [[{"jsonrpc":"2.0","method":"$/cancelRequest",]] ..
+      [["params":{"id":4}}]])
+    test.assert(error_code(output:take()) == -32800,
+                "original duplicate-id request was not cancellable")
+    test.assert(output:pending() == 0,
+                "duplicate-id handling produced extra responses")
+end
+
+function test_coordinator_rejects_duplicate_active_request_ids(
+    _context: test.Context)
+  test_runtime.run(rejects_duplicate_active_request_ids)
+end
