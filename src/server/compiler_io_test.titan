@@ -100,6 +100,8 @@ local function filesystem_contract()
   local kind: string = metadata["kind"]
   local size: integer = metadata["size"]
   local mode: integer = metadata["mode"]
+  local device: integer = metadata["device"]
+  local inode: integer = metadata["inode"]
   local modified_seconds: integer = metadata["modified_seconds"]
   local modified_nanoseconds: integer = metadata["modified_nanoseconds"]
   test.assert(kind == "file" and size == #bytes and
@@ -108,6 +110,23 @@ local function filesystem_contract()
   test.assert(modified_seconds >= 0 and modified_nanoseconds >= 0 and
               modified_nanoseconds < 1000000000,
               "stat returned an invalid modification timestamp")
+
+  local hard_link = directory .. "/source-hard-link"
+  defer remove_path(hard_link)
+  local hard_linked = strategy:run({
+    [1] = "ln", [2] = source, [3] = hard_link,
+  }, nil)
+  test.assert(bool_field(hard_linked, "ok"),
+              "could not create hard-link fixture: " ..
+              string_field(hard_linked, "diagnostic"))
+  local hard_link_metadata?: {string: value} = strategy:stat(hard_link)
+  test.assert(hard_link_metadata ~= nil,
+              "stat omitted an existing hard link")
+  local hard_device: integer = hard_link_metadata["device"]
+  local hard_inode: integer = hard_link_metadata["inode"]
+  test.assert(hard_device == device and hard_inode == inode,
+              "stat did not preserve physical identity through a hard link")
+  remove_path(hard_link)
 
   local raw_entries?, list_error? = strategy:list(directory)
   test.assert(raw_entries ~= nil and list_error == nil,

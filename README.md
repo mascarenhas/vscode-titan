@@ -59,7 +59,7 @@ On a headless Linux machine, run the Extension Host under a virtual display:
 xvfb-run -a make verify
 ```
 
-GitHub CI runs that gate in an Ubuntu 22.04 container on the same
+GitHub CI runs that gate directly on the same Ubuntu 24.04
 `ubicloud-standard-2` runners used by Titan. Because both repositories are
 private, the vscode-titan repository must define an Actions secret named
 `SSH_PRIVATE_KEY`; its public half must be registered as a read-only deploy key

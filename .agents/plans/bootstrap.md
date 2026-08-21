@@ -260,16 +260,18 @@ has evidence before moving to Done.
   checked-module checkpoints without embedding compiler Lua modules.
 - The resolver context owns one I/O strategy. Ordinary `titanc` uses the Lua
   implementation; the server supplies a Titan-record proxy backed by Titan
-  async filesystem/process APIs and `async.yield`. No Titan standard-library
-  API change was required.
+  async filesystem/process APIs and `async.yield`. The one focused Titan
+  standard-library surface addition exposes `fs.Stat.device` and `fs.Stat.inode`
+  as opaque equality-only fields so async compiler I/O preserves hard-link
+  identity; it adds no new I/O operation.
 - Parser/checker-private metadata supplies exact source spans, declaration
   identity, localness, surface type arguments, named arguments, and original
   and coerced types. The bridge normalizes those tables once into typed Titan
   records and unions.
 - The Makefile selects Titan's static provider and exports the embedded Lua C
-  API. Packages are host/architecture-specific; Linux CI builds in an Ubuntu
-  22.04 container on an Ubicloud runner and rejects binaries importing GLIBC
-  symbols newer than 2.35.
+  API. Packages are host/architecture-specific; Linux CI runs directly on an
+  Ubuntu 24.04 Ubicloud runner and rejects binaries importing GLIBC symbols
+  newer than 2.39.
 - Codex's supported plugin surface is a bundled skill and deterministic query
   script. Marketplace-level `lspServers` registration is not part of the
   supported manifest contract.
