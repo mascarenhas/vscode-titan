@@ -20,6 +20,8 @@ record Hover
   const original_type: bridge.TypeInfo?
   const coerced_type: bridge.TypeInfo?
   const local_declaration: boolean?
+  const callable_signature: bridge.CallableSignature?
+  const summary_markdown: string?
 end
 
 local record SavedFile
@@ -375,6 +377,7 @@ function Features:hover(filename: string,
     end
   end
   if inferred == nil then inferred = occurrence.type_info end
+  local summary_markdown? = self.index:hover_summary(occurrence)
 
   local local_declaration: boolean? = nil
   local definition? = self.index:definition(occurrence.symbol_id)
@@ -389,11 +392,13 @@ function Features:hover(filename: string,
   end
 
   if inferred == nil and declared == nil and original == nil and
-     local_declaration == nil then
+     local_declaration == nil and occurrence.callable_signature == nil and
+     summary_markdown == nil then
     return nil
   end
   return Hover.new(copy_span(occurrence.span), inferred, declared,
-                   original, coerced, local_declaration)
+                   original, coerced, local_declaration,
+                   occurrence.callable_signature, summary_markdown)
 end
 
 local function write_type_line(output: strings.StringWriter, label: string,
@@ -408,11 +413,27 @@ end
 
 function Hover:markdown(): string
   local output = strings.writer()
-  write_type_line(output, "Inferred type", self.inferred_type)
-  write_type_line(output, "Declared type", self.declared_type)
-  if self.original_type ~= nil and self.coerced_type ~= nil then
-    write_type_line(output, "Original type", self.original_type)
-    write_type_line(output, "Coerced type", self.coerced_type)
+  local displayed_type? = self.inferred_type
+  if displayed_type == nil then displayed_type = self.declared_type end
+  if displayed_type == nil then displayed_type = self.original_type end
+  if self.summary_markdown ~= nil then
+    output:write(self.summary_markdown)
+  elseif self.callable_signature ~= nil then
+    output:write("- Signature: `")
+    output:write(self.callable_signature.display)
+    output:write("`\n")
+  else
+    write_type_line(output, "Type", displayed_type)
+  end
+  if self.summary_markdown ~= nil and
+     ((self.coerced_type ~= nil and displayed_type ~= nil and
+       not same_type(self.coerced_type, displayed_type)) or
+      self.local_declaration ~= nil) then
+    output:write("\n")
+  end
+  if self.coerced_type ~= nil and displayed_type ~= nil and
+     not same_type(self.coerced_type, displayed_type) then
+    write_type_line(output, "Cast to", self.coerced_type)
   end
   if self.local_declaration ~= nil then
     output:write("- Declaration: ")

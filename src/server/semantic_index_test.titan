@@ -13,12 +13,13 @@ local function occurrence(filename: string, line: integer,
                           start_column: integer, finish_column: integer,
                           name: string, declaration_id: string?,
                           role: bridge.OccurrenceRole,
-                          is_local: boolean): bridge.SymbolOccurrence
+                          is_local: boolean, summary_id: integer?):
+    bridge.SymbolOccurrence
   local start = location(filename, line, start_column)
   return bridge.SymbolOccurrence.new(
     name, declaration_id, role, start,
     bridge.SourceSpan.new(start, location(filename, line, finish_column)),
-    is_local, nil)
+    is_local, nil, nil, summary_id)
 end
 
 local function missing_span(filename: string, line: integer, column: integer,
@@ -36,13 +37,31 @@ local function project(module_name: string, filename: string,
 end
 
 local function project_snapshot(module_name: string, filename: string,
-                                symbols: {bridge.SymbolOccurrence}):
+                                symbols: {bridge.SymbolOccurrence},
+                                hover_summaries: {bridge.HoverSummary}?):
     bridge.ModuleSnapshot
   return bridge.ModuleSnapshot.new(
     module_name,
     bridge.Provenance.project_source(
       bridge.SourceProvenance.new(filename, {filename})),
-    nil, {}, symbols, {}, {})
+    nil, {}, symbols, {}, {}, hover_summaries)
+end
+
+local function record_hover_summary(id: integer, title: string,
+                                    field: string): bridge.HoverSummary
+  local section = bridge.HoverSummarySection.new("Fields", {field})
+  return bridge.HoverSummary.new(
+    id, bridge.HoverSummaryKind.record_summary(), title, {section})
+end
+
+local function one_module_index(
+    module_name: string, filename: string, contents: string,
+    symbols: {bridge.SymbolOccurrence},
+    summaries: {bridge.HoverSummary}): indexer.Index
+  local saved = project(module_name, filename, contents)
+  local compiler_snapshot = project_snapshot(
+    module_name, filename, symbols, summaries)
+  return indexer.build({saved}, {compiler_snapshot})
 end
 
 local function assert_role(actual: bridge.OccurrenceRole,
@@ -109,6 +128,116 @@ function test_semantic_index_joins_exported_identities_across_modules(
   test.assert(#all == 2 and all[1].filename == a_file and
               all[2].filename == b_file,
               "symbol occurrences were not complete and deterministic")
+end
+
+function test_semantic_index_caches_snapshot_local_hover_summaries(
+    _context: test.Context)
+  local filename = "/workspace/summary.titan"
+  local identity = "export:summary:Box"
+  local summaries = {
+    record_hover_summary(1, "summary.Box<integer>", "item: integer"),
+    record_hover_summary(2, "summary.Box<string>", "item: string"),
+  }
+  local symbols = {
+    occurrence(filename, 1, 1, 4, "Box", identity,
+               bridge.OccurrenceRole.definition(), false, 1),
+    occurrence(filename, 2, 1, 4, "Box", identity,
+               bridge.OccurrenceRole.reference(), false, 1),
+    occurrence(filename, 3, 1, 4, "Box", identity,
+               bridge.OccurrenceRole.reference(), false, 2),
+    occurrence(filename, 4, 1, 4, "Box", identity,
+               bridge.OccurrenceRole.reference(), false),
+  }
+  local index = one_module_index(
+    "summary", filename, "Box\nBox\nBox\nBox\n", symbols, summaries)
+  local items = index:file_occurrences(filename)
+  local integer_summary =
+    "**record** `summary.Box<integer>`\n\n" ..
+    "Fields\n\n- `item: integer`\n"
+  test.assert(#items == 4 and
+              index:hover_summary(items[1]) == integer_summary and
+              index:hover_summary(items[2]) == integer_summary,
+              "equal occurrence views did not share cached summary text")
+  test.assert(index:hover_summary(items[3]) ==
+                "**record** `summary.Box<string>`\n\n" ..
+                "Fields\n\n- `item: string`\n" and
+              index:hover_summary(items[4]) == nil and
+              index:hover_summary_count() == 2,
+              "distinct or absent occurrence views borrowed another summary")
+
+  local other_filename = "/workspace/other-summary.titan"
+  local summary_project = project("summary", filename, "Box\n")
+  local other_project = project("other", other_filename, "Box\n")
+  local summary_symbol = occurrence(
+    filename, 1, 1, 4, "Box", identity,
+    bridge.OccurrenceRole.definition(), false, 1)
+  local other_symbol = occurrence(
+    other_filename, 1, 1, 4, "Box", "export:other:Box",
+    bridge.OccurrenceRole.definition(), false, 1)
+  local summary_snapshot = project_snapshot(
+    "summary", filename, {summary_symbol}, {summaries[1]})
+  local other_summary = record_hover_summary(
+    1, "other.Box<float>", "item: float")
+  local other_snapshot = project_snapshot(
+    "other", other_filename, {other_symbol}, {other_summary})
+  local scoped = indexer.build(
+    {summary_project, other_project}, {summary_snapshot, other_snapshot})
+  local summary_items = scoped:file_occurrences(filename)
+  local other_items = scoped:file_occurrences(other_filename)
+  test.assert(scoped:hover_summary(summary_items[1]) ==
+                integer_summary and
+              scoped:hover_summary(other_items[1]) ==
+                "**record** `other.Box<float>`\n\n" ..
+                "Fields\n\n- `item: float`\n" and
+              scoped:hover_summary_count() == 2,
+              "snapshot-local summary ids collided across modules")
+
+  expect_index_error(function ()
+    local invalid = occurrence(
+      filename, 1, 1, 4, "Box", identity,
+      bridge.OccurrenceRole.definition(), false, 0)
+    one_module_index(
+      "summary", filename, "Box\n", {invalid}, summaries)
+  end, "non-positive hover summary id")
+
+  expect_index_error(function ()
+    local invalid = occurrence(
+      filename, 1, 1, 4, "Box", identity,
+      bridge.OccurrenceRole.definition(), false, 3)
+    one_module_index(
+      "summary", filename, "Box\n", {invalid}, summaries)
+  end, "unknown hover summary id")
+
+  expect_index_error(function ()
+    local valid = occurrence(
+      filename, 1, 1, 4, "Box", identity,
+      bridge.OccurrenceRole.definition(), false, 1)
+    local invalid = bridge.HoverSummary.new(
+      2, bridge.HoverSummaryKind.record_summary(), "summary.Box", {})
+    one_module_index(
+      "summary", filename, "Box\n", {valid}, {invalid})
+  end, "registry slot")
+end
+
+function test_semantic_index_yields_while_rendering_large_hover_summaries(
+    _context: test.Context)
+  local count = 2050
+  local lines: {string} = {}
+  for index = 1, count do
+    lines[index] = "field" .. index .. ": integer"
+  end
+  local section = bridge.HoverSummarySection.new("Fields", lines)
+  local summary = bridge.HoverSummary.new(
+    1, bridge.HoverSummaryKind.record_summary(), "large.Record", {section})
+  local filename = "/workspace/large-summary.titan"
+  local saved = project("large_summary", filename, "\n")
+  local compiler_snapshot = project_snapshot(
+    "large_summary", filename, {}, {summary})
+  local yields = 0
+  local index = indexer.build_with_yield(
+    {saved}, {compiler_snapshot}, function () yields = yields + 1 end)
+  test.assert(index:hover_summary_count() == 1 and yields >= 2,
+              "large cached summary rendering did not cooperatively yield")
 end
 
 function test_semantic_index_keeps_shadowed_locals_nominally_distinct(

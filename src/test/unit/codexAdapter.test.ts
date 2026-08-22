@@ -1,7 +1,14 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import {
+  mkdir,
+  mkdtemp,
+  readFile,
+  realpath,
+  rm,
+  writeFile
+} from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { pathToFileURL } from "node:url";
@@ -140,6 +147,7 @@ describe("Codex Titan LSP query adapter", () => {
       "--server-arg", "--semantic",
       "--server-arg", "--semantic-marker",
       "--server-arg", semanticMarker,
+      "--server-arg", "--indexing-progress",
       "--timeout-ms", "2000"
     ];
 
@@ -243,13 +251,14 @@ describe("Codex Titan LSP query adapter", () => {
       assert.equal(semanticEvents[4].newName, "solution");
 
       const lifecycleEvents = await readEvents(lifecycleMarker);
+      const physicalRoot = await realpath(root);
       assert.equal(lifecycleEvents.length, cases.length * 3);
       for (let index = 0; index < lifecycleEvents.length; index += 3) {
         assert.deepEqual(
           lifecycleEvents.slice(index, index + 3).map((event) => event.event),
           ["initialize", "shutdown", "exit"]
         );
-        assert.equal(lifecycleEvents[index].cwd, root);
+        assert.equal(lifecycleEvents[index].cwd, physicalRoot);
         assert.equal(lifecycleEvents[index].rootPath, root);
         assert.equal(lifecycleEvents[index].rootUri, pathToFileURL(root).href);
       }

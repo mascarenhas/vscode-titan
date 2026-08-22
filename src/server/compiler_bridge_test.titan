@@ -10,6 +10,18 @@ local test_runtime = import "server.test_runtime"
 local type EmptyFunction = () -> ()
 local type FixtureInstaller = (string) -> value
 
+local function run_bridge(body: EmptyFunction)
+  do
+    test_runtime.run(body)
+  catch
+    if error is bridge.BridgeError then
+      local failure = error as bridge.BridgeError
+      raise failure.module_name .. ": " .. failure.message
+    end
+    raise
+  end
+end
+
 local function new_fixture_installer(): FixtureInstaller
   return lua.load([==[
 return function(mode)
@@ -279,7 +291,14 @@ return function(mode)
               },
             },
           },
-          _type = { _tag = "Type.Function" },
+          _paramnames = {},
+          _type = {
+            _tag = "Type.Function",
+            params = {},
+            rettypes = {},
+            varargtype = false,
+            flexrettype = false,
+          },
         },
       }
       local header_dependencies = {}
@@ -332,7 +351,14 @@ return function(mode)
           block = { _tag = "Ast.StatBlock",
                     loc = { filename = "/external/main.titan", line = 1, col = 1 },
                     stats = {} },
-          _type = { _tag = "Type.Function" },
+          _paramnames = {},
+          _type = {
+            _tag = "Type.Function",
+            params = {},
+            rettypes = {},
+            varargtype = false,
+            flexrettype = false,
+          },
         }},
         type = module_type("fixture.external"),
         filename = "/external/main.titan",
@@ -342,6 +368,14 @@ return function(mode)
       local context = assert(options.context)
       context.checked_source_modules[
         #context.checked_source_modules + 1] = name
+      if mode == "progress" then
+        -- The real compiler reports every completed source module. Exercise
+        -- both noise classes the bridge must exclude from saved-file counts:
+        -- an external module and a duplicate project checkpoint.
+        context.io:yield("fixture.external")
+        context.io:yield(name)
+        context.io:yield(name)
+      end
       return true, module_type(name), {}, {}
     end
   end
@@ -774,6 +808,70 @@ function test_compiler_bridge_reuses_unchanged_full_ast_incrementally(
   test_runtime.run(runs_incremental_full_ast_cache)
 end
 
+local function reports_dirty_saved_file_progress()
+  with_fixture("progress", function ()
+    local compiler = bridge.load()
+    local first = bridge.ProjectModule.new("fixture.first", {
+      bridge.SourceFile.new("/workspace/first.titan", ""),
+      bridge.SourceFile.new("/workspace/first_part.titan", ""),
+    })
+    local second = bridge.ProjectModule.new("fixture.second", {
+      bridge.SourceFile.new("/workspace/second.titan", ""),
+    })
+    local observed: {bridge.AnalysisProgress} = {}
+    local analysis = compiler:analyze_incremental(
+      {first, second},
+      {"fixture.first", "fixture.first", "fixture.second"}, {},
+      function (progress: bridge.AnalysisProgress)
+        observed[#observed + 1] = progress
+      end)
+
+    test.assert(#analysis.diagnostics == 0,
+                "progress fixture compiler analysis failed")
+    test.assert(#observed == 3 and
+                observed[1].completed_files == 0 and
+                observed[1].total_files == 3 and
+                observed[2].completed_files == 2 and
+                observed[2].total_files == 3 and
+                observed[3].completed_files == 3 and
+                observed[3].total_files == 3,
+                "dirty progress did not count saved files exactly once")
+  end)
+end
+
+function test_compiler_bridge_reports_exact_dirty_saved_file_progress(
+    _context: test.Context)
+  test_runtime.run(reports_dirty_saved_file_progress)
+end
+
+local function completes_progress_for_failed_root_without_yield()
+  with_fixture("invalid-source", function ()
+    local compiler = bridge.load()
+    local observed: {bridge.AnalysisProgress} = {}
+    local analysis = compiler:analyze_incremental({
+      bridge.ProjectModule.new("fixture.failed", {
+        bridge.SourceFile.new("/workspace/failed.titan", ""),
+        bridge.SourceFile.new("/workspace/failed_part.titan", ""),
+      }),
+    }, {"fixture.failed"}, {}, function (progress: bridge.AnalysisProgress)
+      observed[#observed + 1] = progress
+    end)
+    test.assert(#analysis.diagnostics == 1,
+                "failed progress fixture lost its compiler diagnostic")
+    test.assert(#observed == 2 and
+                observed[1].completed_files == 0 and
+                observed[1].total_files == 2 and
+                observed[2].completed_files == 2 and
+                observed[2].total_files == 2,
+                "failed root vanished before saved-file progress completed")
+  end)
+end
+
+function test_compiler_bridge_completes_progress_for_nonyielding_failed_root(
+    _context: test.Context)
+  test_runtime.run(completes_progress_for_failed_root_without_yield)
+end
+
 local function reparses_source_required_external_for_cached_project()
   preload_real_compiler()
   local external_root = fs.tmpname()
@@ -991,7 +1089,7 @@ end
 
 function test_compiler_bridge_normalizes_generic_nominal_and_member_metadata(
     _context: test.Context)
-  test_runtime.run(normalizes_generic_nominal_member_metadata)
+  run_bridge(normalizes_generic_nominal_member_metadata)
 end
 
 local function excludes_lowered_generic_case_payloads_from_exact_spans()
@@ -1043,7 +1141,7 @@ end
 
 function test_compiler_bridge_excludes_lowered_generic_case_payloads_from_exact_spans(
     _context: test.Context)
-  test_runtime.run(excludes_lowered_generic_case_payloads_from_exact_spans)
+  run_bridge(excludes_lowered_generic_case_payloads_from_exact_spans)
 end
 
 local function drives_shadowing_and_record_definition_features_from_compiler()
@@ -1223,6 +1321,762 @@ end
 function test_compiler_bridge_excludes_foreign_and_external_declarations_from_features(
     _context: test.Context)
   test_runtime.run(excludes_foreign_and_external_declarations_from_features)
+end
+
+local function preserves_imported_callable_hover_signatures()
+  preload_real_compiler()
+  local external_root = fs.tmpname()
+  fs.unlink(external_root)
+  fs.mkdir(external_root)
+  local external_file = external_root .. "/hover_external.titan"
+  fs.write_file(external_file, [[local ffi = foreign import "titan/ffi.h"
+record Counter
+  amount: integer
+end
+function Counter:add(delta: integer): integer
+  return self.amount + delta
+end
+function Counter.create(initial: integer): Counter
+  return Counter.new(initial)
+end
+function choose(first: integer, second: integer): integer
+  return first + second
+end
+foreign function native_add(left: ffi.titan_ffi_int,
+                            right: ffi.titan_ffi_int): ffi.titan_ffi_int
+  return left + right
+end
+]])
+  defer do
+    fs.unlink(external_file)
+    fs.rmdir(external_root)
+  end
+
+  local filename = "/workspace/hover_consumer.titan"
+  local source = [[local external = import "hover_external.titan"
+function run(): integer
+  local counter = external.Counter.create(1)
+  local selected = external.choose(1, 2)
+  local advanced = counter:add(3)
+  local native: integer = external.native_add(4, 5)
+  return selected + advanced + native
+end
+]]
+  local projects = {bridge.ProjectModule.new("hover_consumer", {
+    bridge.SourceFile.new(filename, source),
+  })}
+  local compiler = bridge.load()
+  compiler:configure_paths(external_root, nil, nil)
+  local analysis = compiler:analyze("hover_consumer", projects)
+  local diagnostic_messages = strings.writer()
+  for index = 1, #analysis.diagnostics do
+    diagnostic_messages:write(analysis.diagnostics[index].message .. "\n")
+  end
+  test.assert(#analysis.diagnostics == 0,
+              "compiler rejected callable-hover fixture: " ..
+              diagnostic_messages:drain())
+  local external? = analysis:find_module("hover_external")
+  test.assert(external ~= nil and #external.nodes == 0 and
+              #external.symbols == 0,
+              "external callable AST escaped the compiler boundary")
+
+  local model = features.build(projects, analysis.modules)
+  local top_level? = model:hover(
+    filename, source_text.Position.new(1, 10))
+  test.assert(top_level ~= nil and top_level:markdown() ==
+                "- Signature: `hover_consumer.run(): integer`\n" ..
+                "- Declaration: non-local\n",
+              "top-level function declaration hover lost its signature")
+
+  local associated? = model:hover(
+    filename, source_text.Position.new(2, 37))
+  test.assert(associated ~= nil and associated:markdown() ==
+                "- Signature: `hover_external.Counter.create(" ..
+                "initial: integer): hover_external.Counter`\n" ..
+                "- Declaration: non-local\n",
+              "imported record-function hover lost its named signature")
+
+  local ordinary? = model:hover(
+    filename, source_text.Position.new(3, 30))
+  test.assert(ordinary ~= nil and ordinary:markdown() ==
+                "- Signature: `hover_external.choose(" ..
+                "first: integer, second: integer): integer`\n" ..
+                "- Declaration: non-local\n",
+              "imported function hover lost its named signature")
+
+  local method? = model:hover(
+    filename, source_text.Position.new(4, 28))
+  test.assert(method ~= nil and method:markdown() ==
+                "- Signature: `hover_external.Counter:add(" ..
+                "delta: integer): integer`\n" ..
+                "- Declaration: non-local\n",
+              "method-call name hover lost its resolved method signature")
+
+  local foreign_hover? = model:hover(
+    filename, source_text.Position.new(5, 37))
+  test.assert(foreign_hover ~= nil and
+              foreign_hover.callable_signature ~= nil and
+              foreign_hover.callable_signature.display ==
+                "hover_external.native_add(left: titan_ffi_int, " ..
+                "right: titan_ffi_int): titan_ffi_int",
+              "source-imported foreign function lost its exact signature")
+end
+
+function test_compiler_bridge_preserves_imported_callable_hover_signatures(
+    _context: test.Context)
+  test_runtime.run(preserves_imported_callable_hover_signatures)
+end
+
+local function preserves_generic_callable_hover_signatures()
+  preload_real_compiler()
+  local filename = "/workspace/generic_callable_hover.titan"
+  local source = [[record Box<T>
+  item: T
+end
+function Box:get(): T
+  return self.item
+end
+function identity<T>(item: T): T
+  return item
+end
+function use(box: Box<integer>): integer
+  return box:get()
+end
+]]
+  local project = bridge.ProjectModule.new("generic_callable_hover", {
+    bridge.SourceFile.new(filename, source),
+  })
+  local analysis = bridge.load():analyze(
+    "generic_callable_hover", {project})
+  local diagnostic_messages = strings.writer()
+  for index = 1, #analysis.diagnostics do
+    diagnostic_messages:write(analysis.diagnostics[index].message .. "\n")
+  end
+  test.assert(#analysis.diagnostics == 0,
+              "compiler rejected generic callable-hover fixture: " ..
+              diagnostic_messages:drain())
+  local model = features.build({project}, analysis.modules)
+
+  local declaration? = model:hover(
+    filename, source_text.Position.new(6, 10))
+  test.assert(declaration ~= nil and declaration:markdown() ==
+                "- Signature: `generic_callable_hover.identity<T>(" ..
+                  "item: T): T`\n" ..
+                "- Declaration: non-local\n",
+              "generic function declaration hover lost its surface signature")
+
+  local method_declaration? = model:hover(
+    filename, source_text.Position.new(3, 14))
+  test.assert(method_declaration ~= nil and
+              method_declaration:markdown() ==
+                "- Signature: `generic_callable_hover.Box:get(): T`\n" ..
+                "- Declaration: non-local\n",
+              "generic owner method declaration hover was erased")
+
+  local method_call? = model:hover(
+    filename, source_text.Position.new(10, 14))
+  test.assert(method_call ~= nil and method_call:markdown() ==
+                "- Signature: `generic_callable_hover.Box:get(): integer`\n" ..
+                "- Declaration: non-local\n",
+              "generic method-call name hover lost its applied signature")
+end
+
+function test_compiler_bridge_preserves_generic_callable_hover_signatures(
+    _context: test.Context)
+  run_bridge(preserves_generic_callable_hover_signatures)
+end
+
+local function preserves_contextual_aggregate_and_module_hover_summaries()
+  preload_real_compiler()
+  local provider_filename = "/workspace/summary_provider.titan"
+  local provider_source = [[local const secret: integer = 7
+answer = 42
+record Box<T>
+  item: T
+end
+type BoxAlias = Box
+local type Hidden = integer
+local type HiddenBox = Box
+local function Box:hidden(): T return self.item end
+function Box:get(): T return self.item end
+function exposed(): integer return answer end
+]]
+  local consumer_filename = "/workspace/summary_consumer.titan"
+  local consumer_source = [[local public = import "summary_provider"
+local source = import "summary_provider.titan"
+function compare(left: public.Box<integer>, right: source.Box<integer>): public.Box<integer>
+  return left
+end
+]]
+  local projects = {
+    bridge.ProjectModule.new("summary_provider", {
+      bridge.SourceFile.new(provider_filename, provider_source),
+    }),
+    bridge.ProjectModule.new("summary_consumer", {
+      bridge.SourceFile.new(consumer_filename, consumer_source),
+    }),
+  }
+  local compiler = bridge.load()
+  local analysis = compiler:analyze("summary_consumer", projects)
+  local diagnostic_messages = strings.writer()
+  for index = 1, #analysis.diagnostics do
+    diagnostic_messages:write(analysis.diagnostics[index].message .. "\n")
+  end
+  test.assert(#analysis.diagnostics == 0,
+              "compiler rejected contextual hover-summary fixture: " ..
+              diagnostic_messages:drain())
+  local consumer_snapshot? = analysis:find_module("summary_consumer")
+  test.assert(consumer_snapshot ~= nil and
+              consumer_snapshot.hover_summaries ~= nil and
+              #consumer_snapshot.hover_summaries == 4,
+              "contextual hover views were not snapshot-interned")
+  local public_box: integer? = nil
+  local source_box: integer? = nil
+  local repeated_box: integer? = nil
+  local public_module: integer? = nil
+  local source_module: integer? = nil
+  local repeated_public_module: integer? = nil
+  local repeated_source_module: integer? = nil
+  for index = 1, #consumer_snapshot.symbols do
+    local symbol = consumer_snapshot.symbols[index]
+    if symbol.location.filename == consumer_filename then
+      if symbol.name == "Box" and symbol.location.line == 3 then
+        if symbol.location.column == 31 then public_box = symbol.summary_id
+        elseif symbol.location.column == 59 then source_box = symbol.summary_id
+        elseif symbol.location.column == 81 then
+          repeated_box = symbol.summary_id
+        end
+      elseif symbol.name == "public" then
+        if symbol.location.line == 1 and symbol.location.column == 7 then
+          public_module = symbol.summary_id
+        elseif symbol.location.line == 3 and symbol.location.column == 24 then
+          repeated_public_module = symbol.summary_id
+        end
+      elseif symbol.name == "source" then
+        if symbol.location.line == 2 and symbol.location.column == 7 then
+          source_module = symbol.summary_id
+        elseif symbol.location.line == 3 and symbol.location.column == 52 then
+          repeated_source_module = symbol.summary_id
+        end
+      end
+    end
+  end
+  test.assert(public_box ~= nil and public_box == repeated_box and
+              source_box ~= nil and source_box ~= public_box and
+              public_module ~= nil and
+              public_module == repeated_public_module and
+              source_module ~= nil and
+              source_module == repeated_source_module and
+              source_module ~= public_module,
+              "repeated or contextual occurrences used the wrong summary id")
+  local model = features.build(projects, analysis.modules)
+
+  local defining? = model:hover(
+    provider_filename, source_text.Position.new(2, 8))
+  local defining_markdown = defining ~= nil and defining:markdown() or "<nil>"
+  test.assert(defining ~= nil and defining:markdown() ==
+                "**record** `summary_provider.Box<T>`\n\n" ..
+                "Fields\n\n" ..
+                "- `item: T`\n\n" ..
+                "Functions\n\n" ..
+                "- `summary_provider.Box<T>.new(" ..
+                  "item: T): summary_provider.Box<T>`\n\n" ..
+                "Methods\n\n" ..
+                "- `summary_provider.Box<T>:get(): T`\n" ..
+                "- `local summary_provider.Box<T>:hidden(): T`\n\n" ..
+                "- Declaration: non-local\n",
+              "defining aggregate hover lost its full generic view:\n" ..
+              defining_markdown)
+
+  local ordinary? = model:hover(
+    consumer_filename, source_text.Position.new(2, 31))
+  local ordinary_markdown = ordinary ~= nil and ordinary:markdown() or "<nil>"
+  local expected_public =
+    "**record** `summary_provider.Box<integer>`\n\n" ..
+    "Fields\n\n" ..
+    "- `item: integer`\n\n" ..
+    "Functions\n\n" ..
+    "- `summary_provider.Box<integer>.new(" ..
+      "item: integer): summary_provider.Box<integer>`\n\n" ..
+    "Methods\n\n" ..
+    "- `summary_provider.Box<integer>:get(): integer`\n\n" ..
+    "- Declaration: non-local\n"
+  test.assert(ordinary ~= nil and ordinary:markdown() == expected_public,
+              "ordinary import exposed local or unspecialized members:\n" ..
+              ordinary_markdown)
+
+  local source? = model:hover(
+    consumer_filename, source_text.Position.new(2, 59))
+  local source_markdown = source ~= nil and source:markdown() or "<nil>"
+  test.assert(source ~= nil and source:markdown() ==
+                "**record** `summary_provider.Box<integer>`\n\n" ..
+                "Fields\n\n" ..
+                "- `item: integer`\n\n" ..
+                "Functions\n\n" ..
+                "- `summary_provider.Box<integer>.new(" ..
+                  "item: integer): summary_provider.Box<integer>`\n\n" ..
+                "Methods\n\n" ..
+                "- `summary_provider.Box<integer>:get(): integer`\n" ..
+                "- `local summary_provider.Box<integer>:hidden(): integer`\n\n" ..
+                "- Declaration: non-local\n",
+              "direct-source import lost its local specialized members:\n" ..
+              source_markdown)
+
+  local public_module? = model:hover(
+    consumer_filename, source_text.Position.new(0, 7))
+  local public_module_markdown = public_module ~= nil and
+    public_module:markdown() or "<nil>"
+  local expected_public_module =
+    "**module** `summary_provider`\n\n" ..
+    "Members\n\n" ..
+    "- `record Box<T>`\n" ..
+    "- `answer: integer`\n" ..
+    "- `summary_provider.exposed(): integer`\n" ..
+    "- `type BoxAlias<T> = summary_provider.Box<T>`\n\n" ..
+    "- Declaration: local\n"
+  test.assert(public_module ~= nil and
+              public_module:markdown() == expected_public_module and
+              strings.find(public_module:markdown(), "Fields") == nil and
+              strings.find(public_module:markdown(), ".new") == nil,
+              "module hover recursively expanded or reordered members:\n" ..
+              public_module_markdown)
+
+  local source_module? = model:hover(
+    consumer_filename, source_text.Position.new(1, 7))
+  local source_module_markdown = source_module ~= nil and
+    source_module:markdown() or "<nil>"
+  test.assert(source_module ~= nil and source_module:markdown() ==
+                "**module** `summary_provider`\n\n" ..
+                "Members\n\n" ..
+                "- `record Box<T>`\n" ..
+                "- `answer: integer`\n" ..
+                "- `summary_provider.exposed(): integer`\n" ..
+                "- `local const secret: integer`\n" ..
+                "- `type BoxAlias<T> = summary_provider.Box<T>`\n" ..
+                "- `local type Hidden = integer`\n" ..
+                "- `local type HiddenBox<T> = summary_provider.Box<T>`\n\n" ..
+                "- Declaration: local\n",
+              "direct-source module hover lost its source-only members:\n" ..
+              source_module_markdown)
+
+  local repeated? = model:hover(
+    consumer_filename, source_text.Position.new(2, 81))
+  test.assert(repeated ~= nil and repeated:markdown() == expected_public,
+              "repeated generic view did not reuse normalized summary text")
+end
+
+function test_compiler_bridge_preserves_contextual_aggregate_and_module_hover_summaries(
+    _context: test.Context)
+  run_bridge(
+    preserves_contextual_aggregate_and_module_hover_summaries)
+end
+
+local function keeps_source_visibility_nontransitive_through_aliases()
+  preload_real_compiler()
+  local provider_filename =
+    "/workspace/summary_visibility_provider.titan"
+  local provider_source = [[record Box
+  local hidden: integer
+  shown: integer
+end
+local function Box:secret(): integer return self.hidden end
+function Box:visible(): integer return self.shown end
+]]
+  local facade_filename =
+    "/workspace/summary_visibility_facade.titan"
+  local facade_source = [[local provider = import "summary_visibility_provider"
+type Box = provider.Box
+]]
+  local consumer_filename =
+    "/workspace/summary_visibility_consumer.titan"
+  local consumer_source =
+    [[local facade = import "summary_visibility_facade.titan"
+local direct = import "summary_visibility_provider.titan"
+function compare(left: facade.Box, right: direct.Box): integer
+  return left.shown + right.hidden
+end
+]]
+  local projects = {
+    bridge.ProjectModule.new("summary_visibility_provider", {
+      bridge.SourceFile.new(provider_filename, provider_source),
+    }),
+    bridge.ProjectModule.new("summary_visibility_facade", {
+      bridge.SourceFile.new(facade_filename, facade_source),
+    }),
+    bridge.ProjectModule.new("summary_visibility_consumer", {
+      bridge.SourceFile.new(consumer_filename, consumer_source),
+    }),
+  }
+  local analysis = bridge.load():analyze(
+    "summary_visibility_consumer", projects)
+  local diagnostic_messages = strings.writer()
+  for index = 1, #analysis.diagnostics do
+    diagnostic_messages:write(analysis.diagnostics[index].message .. "\n")
+  end
+  test.assert(#analysis.diagnostics == 0,
+              "compiler rejected nontransitive visibility fixture: " ..
+              diagnostic_messages:drain())
+  local model = features.build(projects, analysis.modules)
+
+  local reexported? = model:hover(
+    consumer_filename, source_text.Position.new(2, 31))
+  local reexported_markdown = reexported ~= nil and
+    reexported:markdown() or "<nil>"
+  test.assert(reexported ~= nil and
+              strings.find(reexported_markdown, "shown: integer") ~= nil and
+              strings.find(reexported_markdown, ":visible()") ~= nil and
+              strings.find(reexported_markdown, "hidden") == nil and
+              strings.find(reexported_markdown, ":secret()") == nil,
+              "source visibility leaked through a facade alias:\n" ..
+              reexported_markdown)
+
+  local direct? = model:hover(
+    consumer_filename, source_text.Position.new(2, 50))
+  local direct_markdown = direct ~= nil and direct:markdown() or "<nil>"
+  test.assert(direct ~= nil and
+              strings.find(direct_markdown, "local hidden: integer") ~= nil and
+              strings.find(direct_markdown, "local " ..
+                "summary_visibility_provider.Box:secret()") ~= nil,
+              "direct source import lost owner-local members:\n" ..
+              direct_markdown)
+end
+
+function test_compiler_bridge_keeps_source_visibility_nontransitive_through_aliases(
+    _context: test.Context)
+  run_bridge(keeps_source_visibility_nontransitive_through_aliases)
+end
+
+local function keeps_function_valued_module_variables_as_bare_types()
+  preload_real_compiler()
+  local provider_filename =
+    "/workspace/function_variable_provider.titan"
+  local provider_source = [[callback: (integer) -> integer =
+  function(item) return item + 1 end
+function declared(item: integer): integer
+  return item * 2
+end
+]]
+  local consumer_filename =
+    "/workspace/function_variable_consumer.titan"
+  local consumer_source =
+    [[local provider = import "function_variable_provider"
+function apply(item: integer): integer
+  return provider.callback(provider.declared(item))
+end
+]]
+  local projects = {
+    bridge.ProjectModule.new("function_variable_provider", {
+      bridge.SourceFile.new(provider_filename, provider_source),
+    }),
+    bridge.ProjectModule.new("function_variable_consumer", {
+      bridge.SourceFile.new(consumer_filename, consumer_source),
+    }),
+  }
+  local analysis = bridge.load():analyze(
+    "function_variable_consumer", projects)
+  local diagnostic_messages = strings.writer()
+  for index = 1, #analysis.diagnostics do
+    diagnostic_messages:write(analysis.diagnostics[index].message .. "\n")
+  end
+  test.assert(#analysis.diagnostics == 0,
+              "compiler rejected function-valued module-variable fixture: " ..
+              diagnostic_messages:drain())
+
+  local model = features.build(projects, analysis.modules)
+  local module_hover? = model:hover(
+    consumer_filename, source_text.Position.new(0, 7))
+  local markdown = module_hover ~= nil and
+    module_hover:markdown() or "<nil>"
+  test.assert(module_hover ~= nil and markdown ==
+                "**module** `function_variable_provider`\n\n" ..
+                "Members\n\n" ..
+                "- `callback: (integer) -> integer`\n" ..
+                "- `function_variable_provider.declared(" ..
+                  "item: integer): integer`\n\n" ..
+                "- Declaration: local\n",
+              "module hover confused a function-valued variable with " ..
+              "a named function declaration:\n" .. markdown)
+end
+
+function test_compiler_bridge_keeps_function_valued_module_variables_as_bare_types(
+    _context: test.Context)
+  run_bridge(keeps_function_valued_module_variables_as_bare_types)
+end
+
+local function preserves_cached_manifest_callable_hover_signatures()
+  preload_real_compiler()
+  local external_root = fs.tmpname()
+  fs.unlink(external_root)
+  fs.mkdir(external_root)
+  local external_file = external_root .. "/hover_manifest.titan"
+  fs.write_file(external_file, [[record Parcel
+  amount: integer
+end
+function Parcel.create(initial: integer): Parcel
+  return Parcel.new(initial)
+end
+function Parcel:increase(delta: integer): integer
+  return self.amount + delta
+end
+union Choice
+  numbered: integer
+  empty
+end
+function Choice.from_ordinal(ordinal: integer): Choice
+  return Choice.numbered(ordinal)
+end
+function Choice:label(prefix: string): string
+  return prefix
+end
+interface Formatter
+  prefix: string
+  function format(subject: string, maximum: integer?): string
+end
+function combine(left: integer, right: integer): integer
+  return left + right
+end
+]])
+  defer do
+    fs.unlink(external_file)
+    fs.rmdir(external_root)
+  end
+
+  local seed_filename = "/workspace/hover_manifest_seed.titan"
+  local seed = bridge.ProjectModule.new("hover_manifest_seed", {
+    bridge.SourceFile.new(seed_filename,
+      "local cached = import \"hover_manifest\"\n" ..
+      "function seed(): integer return cached.combine(1, 2) end\n"),
+  })
+  local initial_compiler = bridge.load()
+  initial_compiler:configure_paths(external_root, nil, nil)
+  local initial = initial_compiler:analyze("hover_manifest_seed", {seed})
+  local initial_external? = initial:find_module("hover_manifest")
+  test.assert(#initial.diagnostics == 0 and initial_external ~= nil and
+              initial_external.manifest ~= nil,
+              "initial external callable manifest was not serialized")
+  local external_module = initial_external as bridge.ModuleSnapshot
+  local external_manifest = external_module.manifest as bridge.Manifest
+  local cached_external = bridge.CachedSourceInterface.new(
+    "hover_manifest", external_manifest.serialized,
+    external_file, {external_file}, external_module.imports,
+    external_module.c_header_dependencies)
+
+  -- A syntax error makes an accidental source reload observable. The second
+  -- Compiler must resolve every declaration below from the serialized cache.
+  fs.write_file(external_file, "function broken(: integer) end\n")
+  local filename = "/workspace/hover_manifest_consumer.titan"
+  local source = [[local cached = import "hover_manifest"
+function use(formatter: cached.Formatter,
+             parcel: cached.Parcel,
+             choice: cached.Choice): integer
+  local combined = cached.combine(1, 2)
+  local created = cached.Parcel.create(3)
+  local grown = parcel:increase(4)
+  local selected = cached.Choice.from_ordinal(5)
+  local variant = cached.Choice.numbered(6)
+  local label = choice:label(">")
+  local text = formatter:format(label, 20)
+  return 0
+end
+]]
+  local consumer = bridge.ProjectModule.new("hover_manifest_consumer", {
+    bridge.SourceFile.new(filename, source),
+  })
+  local reloaded_compiler = bridge.load()
+  reloaded_compiler:configure_paths(external_root, nil, nil)
+  local reloaded = reloaded_compiler:analyze_incremental(
+    {consumer}, {"hover_manifest_consumer"}, {cached_external})
+  local diagnostic_messages = strings.writer()
+  for index = 1, #reloaded.diagnostics do
+    diagnostic_messages:write(reloaded.diagnostics[index].message .. "\n")
+  end
+  test.assert(#reloaded.diagnostics == 0,
+              "compiler did not use serialized callable manifest: " ..
+              diagnostic_messages:drain())
+  local cached_snapshot? = reloaded:find_module("hover_manifest")
+  test.assert(cached_snapshot ~= nil and #cached_snapshot.nodes == 0 and
+              #cached_snapshot.symbols == 0,
+              "serialized external manifest unexpectedly retained an AST")
+  local cached_summaries? = cached_snapshot.hover_summaries
+  test.assert(cached_summaries == nil or #cached_summaries == 0,
+              "serialized external snapshot retained hover summaries")
+  local model = features.build({consumer}, reloaded.modules)
+
+  local module_hover? = model:hover(
+    filename, source_text.Position.new(0, 7))
+  test.assert(module_hover ~= nil and module_hover:markdown() ==
+                "**module** `hover_manifest`\n\n" ..
+                "Members\n\n" ..
+                "- `union Choice`\n" ..
+                "- `record Parcel`\n" ..
+                "- `hover_manifest.combine(" ..
+                  "left: integer, right: integer): integer`\n" ..
+                "- `interface Formatter`\n\n" ..
+                "- Declaration: local\n" and
+              strings.find(module_hover:markdown(), "Variants") == nil and
+              strings.find(module_hover:markdown(), ".new") == nil,
+              "cached module hover expanded or lost manifest members")
+
+  local interface_hover? = model:hover(
+    filename, source_text.Position.new(1, 32))
+  test.assert(interface_hover ~= nil and interface_hover:markdown() ==
+                "**interface** `hover_manifest.Formatter`\n\n" ..
+                "Fields\n\n" ..
+                "- `const prefix: string`\n\n" ..
+                "Methods\n\n" ..
+                "- `hover_manifest.Formatter:format(" ..
+                  "subject: string, maximum: integer?): string`\n\n" ..
+                "- Declaration: non-local\n",
+              "cached interface hover lost fields or named methods")
+
+  local parcel_hover? = model:hover(
+    filename, source_text.Position.new(2, 29))
+  test.assert(parcel_hover ~= nil and parcel_hover:markdown() ==
+                "**record** `hover_manifest.Parcel`\n\n" ..
+                "Fields\n\n" ..
+                "- `amount: integer`\n\n" ..
+                "Functions\n\n" ..
+                "- `hover_manifest.Parcel.create(" ..
+                  "initial: integer): hover_manifest.Parcel`\n" ..
+                "- `hover_manifest.Parcel.new(" ..
+                  "amount: integer): hover_manifest.Parcel`\n\n" ..
+                "Methods\n\n" ..
+                "- `hover_manifest.Parcel:increase(" ..
+                  "delta: integer): integer`\n\n" ..
+                "- Declaration: non-local\n",
+              "cached record hover lost normalized manifest members")
+
+  local choice_hover? = model:hover(
+    filename, source_text.Position.new(3, 29))
+  test.assert(choice_hover ~= nil and choice_hover:markdown() ==
+                "**union** `hover_manifest.Choice`\n\n" ..
+                "Variants\n\n" ..
+                "- `empty`\n" ..
+                "- `numbered(payload: integer)`\n\n" ..
+                "Functions\n\n" ..
+                "- `hover_manifest.Choice.from_ordinal(" ..
+                  "ordinal: integer): hover_manifest.Choice`\n\n" ..
+                "Methods\n\n" ..
+                "- `hover_manifest.Choice:label(" ..
+                  "prefix: string): string`\n\n" ..
+                "- Declaration: non-local\n" and
+              strings.find(choice_hover:markdown(),
+                           "Choice.numbered") == nil,
+              "cached union hover duplicated synthesized constructors")
+
+  local ordinary? = model:hover(filename, source_text.Position.new(4, 29))
+  test.assert(ordinary ~= nil and ordinary:markdown() ==
+                "- Signature: `hover_manifest.combine(" ..
+                "left: integer, right: integer): integer`\n" ..
+                "- Declaration: non-local\n",
+              "deserialized ModuleMember lost parameter labels")
+
+  local record_static? = model:hover(
+    filename, source_text.Position.new(5, 33))
+  test.assert(record_static ~= nil and record_static:markdown() ==
+                "- Signature: `hover_manifest.Parcel.create(" ..
+                "initial: integer): hover_manifest.Parcel`\n" ..
+                "- Declaration: non-local\n",
+              "deserialized record StaticMethod lost parameter labels")
+
+  local record_method? = model:hover(
+    filename, source_text.Position.new(6, 25))
+  test.assert(record_method ~= nil and record_method:markdown() ==
+                "- Signature: `hover_manifest.Parcel:increase(" ..
+                "delta: integer): integer`\n" ..
+                "- Declaration: non-local\n",
+              "deserialized record Method lost parameter labels")
+
+  local union_static? = model:hover(
+    filename, source_text.Position.new(7, 36))
+  test.assert(union_static ~= nil and union_static:markdown() ==
+                "- Signature: `hover_manifest.Choice.from_ordinal(" ..
+                "ordinal: integer): hover_manifest.Choice`\n" ..
+                "- Declaration: non-local\n",
+              "deserialized union StaticMethod lost parameter labels")
+
+  local variant? = model:hover(filename, source_text.Position.new(8, 34))
+  test.assert(variant ~= nil and variant:markdown() ==
+                "- Signature: `hover_manifest.Choice.numbered(" ..
+                "integer): hover_manifest.Choice`\n" ..
+                "- Declaration: non-local\n",
+              "union variant constructor invented a parameter label")
+
+  local union_method? = model:hover(filename, source_text.Position.new(9, 24))
+  test.assert(union_method ~= nil and union_method:markdown() ==
+                "- Signature: `hover_manifest.Choice:label(" ..
+                "prefix: string): string`\n" ..
+                "- Declaration: non-local\n",
+              "deserialized union Method lost parameter labels")
+
+  local interface_method? = model:hover(
+    filename, source_text.Position.new(10, 27))
+  test.assert(interface_method ~= nil and interface_method:markdown() ==
+                "- Signature: `hover_manifest.Formatter:format(" ..
+                "subject: string, maximum: integer?): string`\n" ..
+                "- Declaration: non-local\n",
+              "deserialized interface Method lost parameter labels")
+end
+
+function test_compiler_bridge_preserves_cached_manifest_callable_hover_signatures(
+    _context: test.Context)
+  test_runtime.run(preserves_cached_manifest_callable_hover_signatures)
+end
+
+local function preserves_direct_c_callable_hover_signatures()
+  preload_real_compiler()
+  local include_root = fs.tmpname()
+  fs.unlink(include_root)
+  fs.mkdir(include_root)
+  local header = include_root .. "/hover_callable.h"
+  fs.write_file(header,
+    "int hover_named_sum(int left, int right);\n" ..
+    "int hover_unnamed_sum(int, int);\n")
+  defer do
+    fs.unlink(header)
+    fs.rmdir(include_root)
+  end
+
+  local filename = "/workspace/hover_c_consumer.titan"
+  local source = [[local native = foreign import "hover_callable.h"
+function run(): integer
+  local named: integer = native.hover_named_sum(1, 2)
+  local unnamed: integer = native.hover_unnamed_sum(3, 4)
+  return named + unnamed
+end
+]]
+  local project = bridge.ProjectModule.new("hover_c_consumer", {
+    bridge.SourceFile.new(filename, source),
+  })
+  local compiler = bridge.load()
+  compiler:configure_paths(nil, nil, {include_root})
+  local analysis = compiler:analyze("hover_c_consumer", {project})
+  local diagnostic_messages = strings.writer()
+  for index = 1, #analysis.diagnostics do
+    diagnostic_messages:write(analysis.diagnostics[index].message .. "\n")
+  end
+  test.assert(#analysis.diagnostics == 0,
+              "compiler rejected direct-C hover fixture: " ..
+              diagnostic_messages:drain())
+  local model = features.build({project}, analysis.modules)
+
+  local named? = model:hover(filename, source_text.Position.new(2, 40))
+  test.assert(named ~= nil and named:markdown() ==
+                "- Signature: `native.hover_named_sum(" ..
+                "left: int, right: int): int`\n" ..
+                "- Declaration: non-local\n",
+              "direct C function lost its written alias or parameter names")
+
+  local unnamed? = model:hover(filename, source_text.Position.new(3, 42))
+  test.assert(unnamed ~= nil and unnamed:markdown() ==
+                "- Signature: `native.hover_unnamed_sum(int, int): int`\n" ..
+                "- Declaration: non-local\n",
+              "unnamed C prototype invented parameter labels")
+end
+
+function test_compiler_bridge_preserves_direct_c_callable_hover_signatures(
+    _context: test.Context)
+  test_runtime.run(preserves_direct_c_callable_hover_signatures)
 end
 
 local function symbol_identity(module: bridge.ModuleSnapshot,

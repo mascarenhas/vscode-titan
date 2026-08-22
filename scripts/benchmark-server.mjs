@@ -13,8 +13,9 @@ const SHUTDOWN_TIMEOUT_MS = 5_000;
 const TERMINATION_GRACE_MS = 2_000;
 const INDEXING_STATUS_METHOD = "titan/indexingStatus";
 const BENCHMARK_FILE = "src/server/application.titan";
-const BENCHMARK_MARKER = "self:start_indexing()";
-const BENCHMARK_SYMBOL = "start_indexing";
+const BENCHMARK_MARKER = 'self:start_refresh(true, "semantic_request")';
+const BENCHMARK_SYMBOL = "start_refresh";
+const LOG_LEVELS = new Set(["off", "error", "info", "debug", "trace"]);
 
 class BenchmarkError extends Error {}
 
@@ -25,6 +26,7 @@ function usage() {
     "options:",
     "  --server PATH       native server (default: bin/titan-language-server)",
     "  --root PATH         vscode-titan workspace (default: repository root)",
+    "  --log-level LEVEL   server log emission (default: debug, like VS Code)",
     `  --timeout-ms N      indexing/message timeout (default: ${DEFAULT_TIMEOUT_MS})`,
     "  --help              show this help"
   ].join("\n");
@@ -38,6 +40,7 @@ function parseArguments(argv) {
   const options = {
     root: repositoryRoot,
     server: undefined,
+    logLevel: "debug",
     timeoutMs: DEFAULT_TIMEOUT_MS
   };
 
@@ -48,6 +51,7 @@ function parseArguments(argv) {
       process.exit(0);
     }
     if (argument === "--server" || argument === "--root" ||
+        argument === "--log-level" ||
         argument === "--timeout-ms") {
       const value = argv[index + 1];
       if (value === undefined) {
@@ -58,6 +62,13 @@ function parseArguments(argv) {
         options.server = value;
       } else if (argument === "--root") {
         options.root = path.resolve(value);
+      } else if (argument === "--log-level") {
+        if (!LOG_LEVELS.has(value)) {
+          throw new BenchmarkError(
+            "--log-level must be off, error, info, debug, or trace"
+          );
+        }
+        options.logLevel = value;
       } else {
         const timeoutMs = Number(value);
         if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0) {
@@ -256,13 +267,23 @@ class ProtocolClient {
 }
 
 function validateIndexingStatus(value, receivedAt) {
+  const hasCompletedFiles = value?.completed_files !== undefined;
+  const hasTotalFiles = value?.total_files !== undefined;
   if (typeof value !== "object" || value === null || Array.isArray(value) ||
       !["indexing", "ready", "failed"].includes(value.state) ||
       typeof value.initial !== "boolean" ||
       !Number.isSafeInteger(value.epoch) || value.epoch < 0 ||
       (value.generation !== undefined &&
        (!Number.isSafeInteger(value.generation) || value.generation < 0)) ||
-      (value.message !== undefined && typeof value.message !== "string")) {
+      (value.message !== undefined && typeof value.message !== "string") ||
+      hasCompletedFiles !== hasTotalFiles ||
+      (hasCompletedFiles &&
+       (value.state !== "indexing" ||
+        !Number.isSafeInteger(value.completed_files) ||
+        value.completed_files < 0 ||
+        !Number.isSafeInteger(value.total_files) ||
+        value.total_files < 0 ||
+        value.completed_files > value.total_files))) {
     throw new BenchmarkError(`invalid ${INDEXING_STATUS_METHOD} notification`);
   }
   return {
@@ -271,6 +292,8 @@ function validateIndexingStatus(value, receivedAt) {
     epoch: value.epoch,
     generation: value.generation,
     message: value.message,
+    completedFiles: value.completed_files,
+    totalFiles: value.total_files,
     receivedAt
   };
 }
@@ -286,13 +309,25 @@ function indexingCycleAfter(client, startIndex, initial, subject) {
   if (indexing.state !== "indexing" || indexing.initial !== initial) {
     throw new BenchmarkError(`${subject} did not begin with its busy status`);
   }
-  if (statuses.length === 1) return undefined;
-
-  const terminal = statuses[1];
-  if (terminal.state === "indexing" || terminal.initial !== indexing.initial ||
-      terminal.epoch < indexing.epoch) {
-    throw new BenchmarkError(`${subject} emitted an invalid status sequence`);
+  let terminal;
+  const progress = [];
+  for (let index = 0; index < statuses.length; index += 1) {
+    const status = statuses[index];
+    if (status.state === "indexing") {
+      if (terminal !== undefined || status.initial !== indexing.initial ||
+          status.epoch < indexing.epoch) {
+        throw new BenchmarkError(`${subject} emitted an invalid status sequence`);
+      }
+      progress.push(status);
+    } else {
+      if (terminal !== undefined || status.initial !== indexing.initial ||
+          status.epoch < indexing.epoch) {
+        throw new BenchmarkError(`${subject} emitted an invalid status sequence`);
+      }
+      terminal = status;
+    }
   }
+  if (terminal === undefined) return undefined;
   if (terminal.state === "failed") {
     throw new BenchmarkError(
       `${subject} failed${terminal.message ? `: ${terminal.message}` : ""}`
@@ -301,10 +336,19 @@ function indexingCycleAfter(client, startIndex, initial, subject) {
   if (!Number.isSafeInteger(terminal.generation)) {
     throw new BenchmarkError(`${subject} ready status omitted its generation`);
   }
-  if (statuses.length > 2) {
-    throw new BenchmarkError(`${subject} emitted more than one status cycle`);
-  }
-  return { indexing, ready: terminal };
+  return { indexing, progress, ready: terminal };
+}
+
+function progressSummary(cycle) {
+  const updates = cycle.progress.filter(
+    (status) => status.completedFiles !== undefined
+  );
+  const latest = updates.at(-1);
+  return {
+    updates: updates.length,
+    completedFiles: latest?.completedFiles,
+    totalFiles: latest?.totalFiles
+  };
 }
 
 async function validateInputs(options) {
@@ -411,7 +455,7 @@ async function startServer(options) {
     cwd: options.root,
     env: {
       ...process.env,
-      TITAN_LANGUAGE_SERVER_LOG_LEVEL: "off"
+      TITAN_LANGUAGE_SERVER_LOG_LEVEL: options.logLevel
     },
     stdio: ["pipe", "pipe", "pipe"]
   });
@@ -660,6 +704,7 @@ async function benchmark(options) {
     return {
       server: options.server,
       workspace: options.root,
+      logLevel: options.logLevel,
       target: {
         file: target.relativeFile,
         symbol: target.symbol,
@@ -672,7 +717,8 @@ async function benchmark(options) {
           : roundMilliseconds(cpuDelta),
         peakRssKiB: coldEndResources.peakRssKiB,
         epoch: initialReady.epoch,
-        generation: initialReady.generation
+        generation: initialReady.generation,
+        progress: progressSummary(initialCycle)
       },
       immediateHover: {
         latencyMs: roundMilliseconds(
@@ -697,7 +743,8 @@ async function benchmark(options) {
           ? undefined
           : roundMilliseconds(refreshCpuDelta),
         epoch: refreshReady.epoch,
-        generation: refreshReady.generation
+        generation: refreshReady.generation,
+        progress: progressSummary(refreshCycle)
       }
     };
   } catch (cause) {

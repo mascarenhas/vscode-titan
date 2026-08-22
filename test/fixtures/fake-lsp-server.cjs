@@ -17,6 +17,7 @@ const hangSemantic = fixtureArguments.includes("--hang-semantic");
 const omitIndexingGeneration = fixtureArguments.includes(
   "--omit-indexing-generation"
 );
+const emitIndexingProgress = fixtureArguments.includes("--indexing-progress");
 const semanticMarkerPath = argumentValue("--semantic-marker");
 const indexingDelayMs = Number(argumentValue("--indexing-delay-ms") ?? 0);
 const hangInitializeAndStayAlive =
@@ -109,10 +110,31 @@ function handleMessage(message) {
       initial: true,
       epoch: 0
     });
+    if (emitIndexingProgress) {
+      notify("titan/indexingStatus", {
+        state: "indexing", initial: true, epoch: 0,
+        completed_files: 0, total_files: 2
+      });
+      notify("titan/indexingStatus", {
+        state: "indexing", initial: true, epoch: 0,
+        completed_files: 2, total_files: 2
+      });
+      notify("titan/indexingStatus", {
+        state: "indexing", initial: true, epoch: 1
+      });
+      notify("titan/indexingStatus", {
+        state: "indexing", initial: true, epoch: 1,
+        completed_files: 0, total_files: 1
+      });
+      notify("titan/indexingStatus", {
+        state: "indexing", initial: true, epoch: 1,
+        completed_files: 1, total_files: 1
+      });
+    }
     const readyStatus = {
         state: "ready",
         initial: true,
-        epoch: 0
+        epoch: emitIndexingProgress ? 1 : 0
       };
     if (!omitIndexingGeneration) readyStatus.generation = 1;
     const ready = () => notify("titan/indexingStatus", readyStatus);

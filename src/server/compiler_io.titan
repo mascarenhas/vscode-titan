@@ -1,8 +1,21 @@
 local async = import "async"
 local fs = import "fs"
 local iteration = import "titan.iteration"
+local json = import "server.json"
+local logging = import "server.logging"
 local system = import "os"
 local strings = import "string"
+
+type CheckpointListener = (string?) -> ()
+
+local record CompilerProgress
+  attempt: integer
+  root_module: string
+  completed_modules: integer
+  timing: boolean
+  started_wall_seconds: integer
+  started_cpu: float
+end
 
 -- The compiler sees this record only through its ordinary Lua userdata proxy.
 -- Every argument/result crossing that boundary therefore uses Lua-native
@@ -12,6 +25,12 @@ record CompilerIO
   -- private inert field gives the strategy the ordinary record proxy that the
   -- compiler validates and invokes; it carries no semantic state.
   local proxy_marker: boolean
+  -- The compiler calls yield only after publishing one checked source module.
+  -- This state belongs to server observability, remains invisible through the
+  -- Lua proxy, and is reset at every bridge attempt boundary.
+  local next_attempt: integer
+  local progress: CompilerProgress?
+  local checkpoint_listener: CheckpointListener?
 end
 
 local function failure_message(failure: value): string
@@ -28,7 +47,53 @@ local function failure_message(failure: value): string
 end
 
 function create(): CompilerIO
-  return CompilerIO.new(false)
+  return CompilerIO.new(false, 0, nil, nil)
+end
+
+-- The bridge installs this only for the lifetime of one incremental analysis.
+-- The compiler cannot reach it directly because it is not a record method.
+function set_checkpoint_listener(strategy: CompilerIO,
+                                 listener: CheckpointListener?)
+  strategy.checkpoint_listener = listener
+end
+
+local function CompilerIO:begin_attempt(root_module: string): integer
+  self.next_attempt = self.next_attempt + 1
+  local timing = false
+  local started_wall_seconds = 0
+  local started_cpu = 0.0
+  do
+    if logging.enabled("debug") then
+      started_wall_seconds = logging.wall_clock()
+      started_cpu = logging.clock()
+      timing = true
+    end
+  catch
+    -- Optional telemetry cannot prevent a compiler attempt from starting.
+  end
+  self.progress = CompilerProgress.new(
+    self.next_attempt, root_module, 0, timing, started_wall_seconds,
+    started_cpu)
+  return self.next_attempt
+end
+
+local function CompilerIO:finish_attempt(attempt: integer): integer
+  local progress? = self.progress
+  if progress == nil or progress.attempt ~= attempt then return 0 end
+  local completed = progress.completed_modules
+  self.progress = nil
+  return completed
+end
+
+-- Bridge-owned attempt lifecycle stays a typed module operation. The compiler
+-- receives only CompilerIO's ordinary public I/O methods through its userdata
+-- proxy; it cannot start, finish, or inspect server observability state.
+function begin_attempt(strategy: CompilerIO, root_module: string): integer
+  return strategy:begin_attempt(root_module)
+end
+
+function finish_attempt(strategy: CompilerIO, attempt: integer): integer
+  return strategy:finish_attempt(attempt)
 end
 
 local function checked_path(path: string): (string?, string?)
@@ -319,7 +384,41 @@ function CompilerIO:tmpname(): (string?, string?)
   end
 end
 
-function CompilerIO:yield()
+function CompilerIO:yield(module_name: string?)
+  local progress? = self.progress
+  if progress ~= nil then
+    progress.completed_modules = progress.completed_modules + 1
+    -- Enqueue before yielding: a cancellation delivered at this checkpoint
+    -- must not hide the fully published module which made the Task yieldable.
+    -- Debug-only clocks/serialization are best-effort too: telemetry must not
+    -- change compiler control flow even if a platform clock or encoder fails.
+    do
+      if progress.timing and logging.enabled("debug") then
+        local fields: {json.Member} = {
+          json.Member.new("attempt", json.from_integer(progress.attempt)),
+          json.Member.new("root_module", json.from_string(
+            progress.root_module)),
+          json.Member.new("completed_modules", json.from_integer(
+            progress.completed_modules)),
+          json.Member.new("wall_ms", json.from_number(
+            logging.elapsed_wall_ms(progress.started_wall_seconds))),
+          json.Member.new("cpu_ms", json.from_number(
+            logging.elapsed_ms(progress.started_cpu))),
+        }
+        if module_name ~= nil then
+          fields[#fields + 1] = json.Member.new(
+            "module_name", json.from_string(module_name))
+        end
+        logging.emit("debug", "compiler.module.complete", fields)
+      end
+    catch
+    end
+  end
+  -- Checkpoint observation is intentionally non-yielding and best-effort.
+  -- Enqueue it before the cooperative yield so cancellation cannot hide a
+  -- source module which the compiler has already fully published.
+  local listener? = self.checkpoint_listener
+  if listener ~= nil then do listener(module_name) catch end end
   async.yield()
 end
 

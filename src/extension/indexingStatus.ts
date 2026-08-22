@@ -1,5 +1,8 @@
 import * as vscode from "vscode";
-import { IndexingStatusModel } from "./indexingProtocol";
+import {
+  IndexingStatusModel,
+  presentBusyIndexing
+} from "./indexingProtocol";
 
 export { INDEXING_STATUS_NOTIFICATION } from "./indexingProtocol";
 
@@ -32,14 +35,12 @@ export class WorkspaceIndexingStatus implements vscode.Disposable {
       : vscode.LanguageStatusSeverity.Information;
     item.text = display.kind === "failed"
       ? "$(error) Titan indexing failed"
-      : "$(sync~spin) Titan indexing";
+      : presentBusyIndexing(display, this.workspaceName).text;
     if (display.kind === "failed") {
       item.detail = display.message ??
         `Titan could not index ${this.workspaceName}`;
     } else {
-      item.detail = display.initial
-        ? `Building saved-file project state for ${this.workspaceName}`
-        : `Refreshing saved-file project state for ${this.workspaceName}`;
+      item.detail = presentBusyIndexing(display, this.workspaceName).detail;
     }
     return true;
   }

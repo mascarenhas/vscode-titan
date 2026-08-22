@@ -14,6 +14,7 @@ local record Fake
   maximum_active_polls: integer
   poll_count: integer
   clear_count: integer
+  poll_failures: integer
 end
 
 local function Fake:canonicalize(path: string): string
@@ -64,6 +65,11 @@ local function Fake:poll(): {project_watcher.BackendEvent}
     self.operations[#self.operations + 1] = "poll:end"
   end
 
+  if self.poll_failures > 0 then
+    self.poll_failures = self.poll_failures - 1
+    raise "deliberate transient poll failure"
+  end
+
   local current = async.running()
   local detach = function ()
     if self.waiter == current then self.waiter = nil end
@@ -108,7 +114,7 @@ end
 local function wait_until(predicate: () -> boolean, message: string)
   for _attempt = 1, 200 do
     if predicate() then return end
-    timer.yield()
+    timer.sleep(1)
   end
   test.assert(false, message)
 end
@@ -130,7 +136,7 @@ local function describe_change(change: project_watcher.PathChange): string
 end
 
 local function fake_lifecycle_and_coalescing()
-  local fake = Fake.new({}, {}, {}, nil, 0, 0, 0, 0)
+  local fake = Fake.new({}, {}, {}, nil, 0, 0, 0, 0, 0)
   local received: {project_watcher.RediscoveryBatch} = {}
   local owner?: project_watcher.ProjectWatcher
   owner = project_watcher.start_with_backend(
@@ -214,6 +220,61 @@ local function fake_lifecycle_and_coalescing()
               "project watcher stop was not idempotent")
 end
 
+
+local function retries_transient_poll_failure()
+  local fake = Fake.new({}, {}, {}, nil, 0, 0, 0, 0, 1)
+  local received: {project_watcher.RediscoveryBatch} = {}
+  local owner = project_watcher.start_with_backend(
+    fake:backend(), scope({"/project"}, {}),
+    function (batch: project_watcher.RediscoveryBatch)
+      received[#received + 1] = batch
+    end)
+  defer owner:stop()
+
+  wait_until(function (): boolean return #received == 1 end,
+             "transient poll failure was not reported")
+  test.assert(#received[1].failures == 1 and
+              received[1].failures[1].operation == "project_watcher.poll",
+              "transient poll failure lost its typed report")
+  fake:push({project_watcher.BackendEvent.modified("/project/main.titan")})
+  wait_until(function (): boolean return #received == 2 end,
+             "watcher did not poll again after a transient failure")
+  test.assert(#received[2].changes == 1 and
+              project_watcher.change_path(received[2].changes[1]) ==
+                "/project/main.titan" and
+              fake.maximum_active_polls == 1,
+              "poll retry lost the later event or overlapped backend polls")
+end
+
+function test_project_watcher_retries_transient_poll_failure(
+    _context: test.Context)
+  test_runtime.run(retries_transient_poll_failure)
+end
+
+local function backs_off_persistent_poll_failures()
+  local fake = Fake.new({}, {}, {}, nil, 0, 0, 0, 0, 100)
+  local failures = 0
+  local owner = project_watcher.start_with_backend(
+    fake:backend(), scope({"/project"}, {}),
+    function (batch: project_watcher.RediscoveryBatch)
+      failures = failures + #batch.failures
+    end)
+
+  wait_until(function (): boolean return failures >= 1 end,
+             "persistent poll failure was not reported")
+  timer.sleep(40)
+  test.assert(fake.poll_count <= 2 and failures <= 2,
+              "persistent poll failures retried without bounded backoff")
+  owner:stop()
+  test.assert(fake.active_polls == 0 and owner:is_stopped(),
+              "backoff sleep prevented prompt watcher shutdown")
+end
+
+function test_project_watcher_backs_off_persistent_poll_failures(
+    _context: test.Context)
+  test_runtime.run(backs_off_persistent_poll_failures)
+end
+
 function test_project_watcher_owns_one_poll_and_coalesces_hints(
     _context: test.Context)
   test_runtime.run(fake_lifecycle_and_coalescing)
@@ -235,7 +296,10 @@ local function real_saved_file_hint()
   fs.mkdir(root)
   defer remove_if_present(root)
 
-  local changed = root .. "/changed.titan"
+  -- Directory watchers report canonical paths. The desktop harness places
+  -- TMPDIR below a /home -> /var/home symlink, so compare against the
+  -- canonical parent even though the child does not exist yet.
+  local changed = fs.realpath(root) .. "/changed.titan"
   local late = root .. "/late.titan"
   defer remove_if_present(changed)
   defer remove_if_present(late)

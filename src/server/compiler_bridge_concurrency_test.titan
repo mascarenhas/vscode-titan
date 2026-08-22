@@ -4,7 +4,7 @@ local lua = import "titan.lua"
 local strings = import "string"
 local test = import "test"
 local timer = import "timer"
-local bridge = import "server.compiler_bridge"
+local bridge = import "server.compiler_bridge.titan"
 local test_runtime = import "server.test_runtime"
 
 local DRIVER_MODULE = "titan-compiler.driver"
@@ -418,4 +418,127 @@ end
 function test_compiler_bridge_lua_proxy_can_call_yielding_titan_io_strategy(
     _context: test.Context)
   test_runtime.run(lua_proxy_resumes_titan_async_method)
+end
+
+local function large_hover_summary_normalization_yields()
+  local count = 4096
+  local pending: {bridge.PendingSummaryLine} = {}
+  for index = 1, count do
+    local name = strings.format("member_%05d", count - index + 1)
+    pending[index] = bridge.PendingSummaryLine.new(
+      0, name, "line " .. name)
+  end
+
+  local started = false
+  local finished = false
+  local normalized: {string} = {}
+  local normalization = async.run<nil, value>(function (): nil
+    started = true
+    defer finished = true
+    normalized = bridge.summary_lines(
+      pending, bridge.NormalizationWork.new(0))
+    return nil
+  end)
+
+  local observer_turns = 0
+  local observer = async.run<nil, value>(function (): nil
+    while not started do async.yield() end
+    while not finished do
+      observer_turns = observer_turns + 1
+      async.yield()
+    end
+    return nil
+  end)
+
+  join_nil(normalization, "large hover-summary normalization")
+  join_nil(observer, "hover-summary normalization observer")
+  test.assert(observer_turns >= 10,
+              "large hover-summary normalization starved another Task")
+  test.assert(#normalized == count and
+              normalized[1] == "line member_00001" and
+              normalized[count] == "line member_04096",
+              "yielding hover-summary normalization changed sort output")
+end
+
+function test_compiler_bridge_yields_during_large_hover_summary_normalization(
+    _context: test.Context)
+  test_runtime.run(large_hover_summary_normalization_yields)
+end
+
+local function large_diagnostic_normalization_yields()
+  local module_count = 512
+  local diagnostic_count = 4096
+  local projects: {string: bridge.ProjectModule} = {}
+  local entries: {string: value} = {}
+  for index = 1, module_count do
+    local name = strings.format("module_%05d", index)
+    local filename = "/workspace/" .. name .. ".titan"
+    projects[name] = bridge.ProjectModule.new(name, {
+      bridge.SourceFile.new(filename, "-- fixture\n"),
+    })
+    entries[name] = true
+  end
+  local raw: {integer: value} = {}
+  for index = 1, diagnostic_count do
+    local owner = (index - 1) % module_count + 1
+    raw[index] = strings.format(
+      "/workspace/module_%05d.titan:1:1: type error: broken", owner)
+  end
+
+  local started = false
+  local finished = false
+  local phase = 0
+  local diagnostics: {bridge.Diagnostic} = {}
+  local failed: {string: boolean} = {}
+  local names: {string} = {}
+  local normalization = async.run<nil, value>(function (): nil
+    started = true
+    defer finished = true
+    local work = bridge.NormalizationWork.new(0)
+    phase = 1
+    local normalized = bridge.normalize_diagnostics(raw, work)
+    phase = 2
+    bridge.append_diagnostics(diagnostics, normalized, work)
+    phase = 3
+    failed = bridge.failed_projects(
+      "module_00001", diagnostics, projects, false, work)
+    phase = 4
+    names = bridge.sorted_entry_names(entries, work)
+    return nil
+  end)
+
+  local observer_turns = 0
+  local phase_turns: {integer} = {0, 0, 0, 0}
+  local observer = async.run<nil, value>(function (): nil
+    while not started do async.yield() end
+    while not finished do
+      observer_turns = observer_turns + 1
+      if phase >= 1 and phase <= 4 then
+        phase_turns[phase] = phase_turns[phase] + 1
+      end
+      async.yield()
+    end
+    return nil
+  end)
+  join_nil(normalization, "large diagnostic normalization")
+  join_nil(observer, "diagnostic normalization observer")
+
+  test.assert(observer_turns >= 10,
+              "large diagnostic normalization starved another Task")
+  test.assert(phase_turns[1] > 0 and phase_turns[2] > 0 and
+              phase_turns[3] > 0 and phase_turns[4] > 0,
+              "a diagnostic normalization phase did not yield cooperatively")
+  test.assert(#diagnostics == diagnostic_count and
+              failed["module_00001"] and
+              failed["module_00512"],
+              "diagnostic ownership indexing changed failed modules")
+  test.assert(#names == module_count and
+              names[1] == "module_00001" and
+              names[module_count] == "module_00512",
+              "cooperative entry-name merge sort changed ordering")
+end
+
+function test_compiler_bridge_yields_during_large_diagnostic_normalization(
+    _context: test.Context)
+  test_runtime.run(large_diagnostic_normalization_yields)
 end

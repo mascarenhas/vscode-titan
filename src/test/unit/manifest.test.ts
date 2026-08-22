@@ -122,7 +122,7 @@ describe("extension manifest", () => {
       "debug",
       "trace"
     ]);
-    assert.equal(properties["titan.languageServer.logLevel"].default, "info");
+    assert.equal(properties["titan.languageServer.logLevel"].default, "debug");
 
     assert.deepEqual(properties["titan.trace.server"].enum, [
       "off",
@@ -148,6 +148,27 @@ describe("extension manifest", () => {
     for (const asset of assets) {
       assert.ok(existsSync(path.resolve(repositoryRoot, asset)), asset);
     }
+  });
+
+  test("keeps the actual-usage benchmark on one saved semantic target", () => {
+    const benchmark = readFileSync(
+      path.join(repositoryRoot, "scripts/benchmark-server.mjs"),
+      "utf8"
+    );
+    const file = /const BENCHMARK_FILE = "([^"]+)";/.exec(benchmark)?.[1];
+    const marker = /const BENCHMARK_MARKER = '([^']+)';/.exec(benchmark)?.[1];
+    const symbol = /const BENCHMARK_SYMBOL = "([^"]+)";/.exec(benchmark)?.[1];
+    assert.ok(file, "benchmark file constant is missing");
+    assert.ok(marker, "benchmark marker constant is missing");
+    assert.ok(symbol, "benchmark symbol constant is missing");
+    assert.ok(marker.includes(symbol), "benchmark marker omits its symbol");
+
+    const target = readFileSync(path.join(repositoryRoot, file), "utf8");
+    assert.equal(
+      target.split(marker).length - 1,
+      1,
+      "benchmark marker must identify exactly one saved source occurrence"
+    );
   });
 });
 

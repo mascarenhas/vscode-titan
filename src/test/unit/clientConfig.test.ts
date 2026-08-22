@@ -12,11 +12,13 @@ import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { afterEach, describe, test } from "node:test";
 import {
+  DEFAULT_SERVER_LOG_LEVEL,
   SERVER_BASENAME,
   SERVER_LOG_LEVEL_ENVIRONMENT_VARIABLE,
   ServerConfigurationError,
   createServerLaunchOptions,
   ensureServerExecutable,
+  formatServerStartup,
   formatStartupError,
   packagedServerName,
   readCompilerDiscoveryConfiguration,
@@ -52,7 +54,7 @@ describe("server configuration", () => {
     assert.deepEqual(configuration, {
       configuredPath: "tools/titan-language-server",
       arguments: ["--trace", "messages"],
-      logLevel: "info"
+      logLevel: DEFAULT_SERVER_LOG_LEVEL
     });
     assert.notEqual(configuration.arguments, argumentsSetting);
   });
@@ -76,10 +78,9 @@ describe("server configuration", () => {
   });
 
   test("validates the server log level", () => {
-    assert.equal(
-      readServerConfiguration("", [], "debug").logLevel,
-      "debug"
-    );
+    for (const level of ["off", "error", "info", "debug", "trace"] as const) {
+      assert.equal(readServerConfiguration("", [], level).logLevel, level);
+    }
     assert.throws(
       () => readServerConfiguration("", [], "verbose"),
       (error: unknown) =>
@@ -231,7 +232,7 @@ describe("server launch validation", () => {
       options: {
         cwd: "/workspace/project",
         env: {
-          TITAN_LANGUAGE_SERVER_LOG_LEVEL: "info",
+          TITAN_LANGUAGE_SERVER_LOG_LEVEL: "debug",
           TITAN_TEST_ENV: "configured"
         }
       }
@@ -256,7 +257,7 @@ describe("server launch validation", () => {
     );
     assert.deepEqual(inherited.options.env, {
       ...sourceEnvironment,
-      TITAN_LANGUAGE_SERVER_LOG_LEVEL: "info"
+      TITAN_LANGUAGE_SERVER_LOG_LEVEL: "debug"
     });
 
     const configured = createServerLaunchOptions(
@@ -272,7 +273,7 @@ describe("server launch validation", () => {
     assert.deepEqual(configured.options.env, {
       LUA_PATH: "/opt/titan/compiler/?.lua;;",
       LUA_CPATH: "/opt/titan/compiler/?.so;;",
-      TITAN_LANGUAGE_SERVER_LOG_LEVEL: "info",
+      TITAN_LANGUAGE_SERVER_LOG_LEVEL: "debug",
       TITAN_TEST_ENV: "preserved"
     });
     assert.deepEqual(sourceEnvironment, {
@@ -295,6 +296,14 @@ describe("server launch validation", () => {
     assert.equal(
       launch.options.env[SERVER_LOG_LEVEL_ENVIRONMENT_VARIABLE],
       "trace"
+    );
+  });
+
+  test("attributes the configured emission level before server startup", () => {
+    assert.equal(
+      formatServerStartup("/bin/titan-language-server", "trace"),
+      "Starting Titan language server: /bin/titan-language-server " +
+        "(configured server log emission: trace)"
     );
   });
 

@@ -1,4 +1,5 @@
 local strings = import "string"
+local iteration = import "titan.iteration"
 local bridge = import "server.compiler_bridge"
 local json = import "server.json"
 local logging = import "server.logging"
@@ -20,6 +21,8 @@ record Occurrence
   const byte_span: source_text.ByteSpan
   const is_local: boolean
   const type_info: bridge.TypeInfo?
+  const callable_signature: bridge.CallableSignature?
+  const summary_id: integer?
 end
 
 record Error
@@ -49,6 +52,7 @@ record Index
   local definitions: {string: Occurrence}
   local filenames: {string}
   local coordinates: {string: source_text.CoordinateIndex}
+  local summaries: {string: string}
 end
 
 local function fail<T>(module_name: string?, filename: string?,
@@ -104,6 +108,17 @@ local function optional_type_key(info: bridge.TypeInfo?): string
   return "\1" .. info.tag .. "\0" .. info.display
 end
 
+local function optional_signature_key(
+    signature: bridge.CallableSignature?): string
+  if signature == nil then return "" end
+  return "\1" .. signature.display
+end
+
+local function optional_summary_key(summary_id: integer?): integer
+  if summary_id == nil then return 0 end
+  return summary_id
+end
+
 local function occurrence_less(left: Occurrence,
                                right: Occurrence): boolean
   if left.filename ~= right.filename then
@@ -126,7 +141,16 @@ local function occurrence_less(left: Occurrence,
   end
   if left.name ~= right.name then return left.name < right.name end
   if left.is_local ~= right.is_local then return not left.is_local end
-  return optional_type_key(left.type_info) < optional_type_key(right.type_info)
+  local left_type = optional_type_key(left.type_info)
+  local right_type = optional_type_key(right.type_info)
+  if left_type ~= right_type then return left_type < right_type end
+  local left_signature = optional_signature_key(left.callable_signature)
+  local right_signature = optional_signature_key(right.callable_signature)
+  if left_signature ~= right_signature then
+    return left_signature < right_signature
+  end
+  return optional_summary_key(left.summary_id) <
+    optional_summary_key(right.summary_id)
 end
 
 local function same_occurrence(left: Occurrence,
@@ -139,7 +163,10 @@ local function same_occurrence(left: Occurrence,
          left.byte_span.start == right.byte_span.start and
          left.byte_span.finish == right.byte_span.finish and
          left.is_local == right.is_local and
-         same_type(left.type_info, right.type_info)
+         same_type(left.type_info, right.type_info) and
+         optional_signature_key(left.callable_signature) ==
+           optional_signature_key(right.callable_signature) and
+         left.summary_id == right.summary_id
 end
 
 -- Stable bottom-up merge sort avoids both recursion depth and the quadratic
@@ -340,6 +367,92 @@ local function project_files(projects: {bridge.ProjectModule},
   return files, modules, coordinates
 end
 
+local function summary_key(module_name: string, summary_id: integer): string
+  return module_name .. "\0" .. strings.tostring(summary_id)
+end
+
+local function summary_kind_label(kind: bridge.HoverSummaryKind): string
+  case kind
+  when module_summary then return "module"
+  when record_summary then return "record"
+  when union_summary then return "union"
+  when interface_summary then return "interface"
+  end
+end
+
+local function render_hover_summary(summary: bridge.HoverSummary,
+                                    yield_state: YieldState): string
+  local output = strings.writer()
+  output:write("**")
+  output:write(summary_kind_label(summary.kind))
+  output:write("** `")
+  output:write(summary.title)
+  output:write("`\n")
+  for section_index = 1, #summary.sections do
+    account_work(yield_state)
+    local section = summary.sections[section_index]
+    output:write("\n")
+    output:write(section.heading)
+    output:write("\n\n")
+    for line_index = 1, #section.lines do
+      account_work(yield_state)
+      output:write("- `")
+      output:write(section.lines[line_index])
+      output:write("`\n")
+    end
+  end
+  return output:drain()
+end
+
+local function project_snapshot(snapshot: bridge.ModuleSnapshot): boolean
+  case snapshot.provenance
+  when project_source then return true
+  else return false
+  end
+end
+
+local function append_snapshot_summaries(
+    target: {string: string}, snapshot: bridge.ModuleSnapshot,
+    projects: {string: boolean}, yield_state: YieldState)
+  if not project_snapshot(snapshot) then return end
+  if not projects[snapshot.module_name] then
+    fail<value>(snapshot.module_name, nil,
+      "project compiler snapshot has no matching saved project module")
+  end
+  local summaries? = snapshot.hover_summaries
+  if summaries == nil then return end
+  for index = 1, #summaries do
+    account_work(yield_state)
+    local summary = summaries[index]
+    if summary.id ~= index then
+      fail<value>(snapshot.module_name, nil,
+        "hover summary id does not match its snapshot-local registry slot")
+    end
+    local key = summary_key(snapshot.module_name, summary.id)
+    if target[key] ~= nil then
+      fail<value>(snapshot.module_name, nil,
+        "duplicate snapshot-local hover summary id")
+    end
+    target[key] = render_hover_summary(summary, yield_state)
+  end
+end
+
+local function validated_summary_id(snapshot: bridge.ModuleSnapshot,
+                                    symbol: bridge.SymbolOccurrence): integer?
+  local id? = symbol.summary_id
+  if id == nil then return nil end
+  if id <= 0 then
+    return fail<integer>(snapshot.module_name, symbol.location.filename,
+      "compiler occurrence has a non-positive hover summary id")
+  end
+  local summaries? = snapshot.hover_summaries
+  if summaries == nil or id > #summaries or summaries[id].id ~= id then
+    return fail<integer>(snapshot.module_name, symbol.location.filename,
+      "compiler occurrence references an unknown hover summary id")
+  end
+  return id
+end
+
 local function append_snapshot_occurrences(
     target: {Occurrence}, snapshot: bridge.ModuleSnapshot,
     files: {string: SavedFile}, projects: {string: boolean},
@@ -358,6 +471,7 @@ local function append_snapshot_occurrences(
   for index = 1, #snapshot.symbols do
     account_work(yield_state)
     local symbol = snapshot.symbols[index]
+    local summary_id? = validated_summary_id(snapshot, symbol)
     local saved? = files[symbol.location.filename]
     -- A compiler declaration object from an imported module can be reachable
     -- from a project AST. It is not owned by this snapshot and must not leak
@@ -376,7 +490,8 @@ local function append_snapshot_occurrences(
       target[#target + 1] = Occurrence.new(
         SymbolId.new(symbol.declaration_id), snapshot.module_name,
         symbol.location.filename, symbol.name, symbol.role, span, bytes,
-        symbol.is_local, symbol.type_info)
+        symbol.is_local, symbol.type_info, symbol.callable_signature,
+        summary_id)
     end
   end
 end
@@ -415,8 +530,11 @@ local function build_internal(projects: {bridge.ProjectModule},
   local files, project_names, coordinates =
     project_files(projects, yield_state)
   local raw: {Occurrence} = {}
+  local summaries: {string: string} = {}
   for index = 1, #snapshots do
     account_work(yield_state)
+    append_snapshot_summaries(
+      summaries, snapshots[index], project_names, yield_state)
     append_snapshot_occurrences(
       raw, snapshots[index], files, project_names, yield_state)
   end
@@ -464,7 +582,7 @@ local function build_internal(projects: {bridge.ProjectModule},
       logging.elapsed_ms(started))),
   })
   return Index.new(
-    by_file, by_symbol, definitions, filenames, coordinates)
+    by_file, by_symbol, definitions, filenames, coordinates, summaries)
 end
 
 function build(projects: {bridge.ProjectModule},
@@ -493,6 +611,20 @@ end
 function Index:coordinate_index(filename: string):
     source_text.CoordinateIndex?
   return self.coordinates[filename]
+end
+
+function Index:hover_summary(occurrence: Occurrence): string?
+  local summary_id? = occurrence.summary_id
+  if summary_id == nil then return nil end
+  return self.summaries[summary_key(occurrence.module_name, summary_id)]
+end
+
+function Index:hover_summary_count(): integer
+  local count = 0
+  for _ in iteration.pairs<string, string>(self.summaries) do
+    count = count + 1
+  end
+  return count
 end
 
 function Index:file_occurrences(filename: string): {Occurrence}

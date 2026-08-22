@@ -5,7 +5,8 @@ local lua = import "titan.lua"
 local system = import "os"
 local strings = import "string"
 local test = import "test"
-local compiler_io = import "server.compiler_io"
+local compiler_io = import "server.compiler_io.titan"
+local logging = import "server.logging"
 local test_runtime = import "server.test_runtime"
 
 local function temporary_root(): string
@@ -324,7 +325,7 @@ return function(strategy, path)
   local entries, list_error = strategy:list(path:match("^(.*)/"))
   assert(entries and list_error == nil and type(entries) == "table",
          "list did not cross as an ordinary Lua table")
-  strategy:yield()
+  strategy:yield("fixture.module")
   return metadata.kind, metadata.size, #entries
 end
 ]==], "=compiler_io_lua_proxy", nil)() as
@@ -342,6 +343,55 @@ end
 function test_compiler_io_lua_proxy_calls_async_methods_and_yields(
     _context: test.Context)
   test_runtime.run(lua_proxy_yield_contract)
+end
+
+local function compiler_progress_contract()
+  local previous_level = logging.level()
+  defer logging.configure(previous_level)
+  test.assert(logging.configure("debug"),
+              "compiler progress test could not enable debug logging")
+  local strategy = compiler_io.create()
+  local checkpoints: {string} = {}
+  compiler_io.set_checkpoint_listener(
+    strategy, function (module_name: string?)
+      if module_name ~= nil then
+        checkpoints[#checkpoints + 1] = module_name
+      end
+      if module_name == "project.raise" then
+        raise "deliberate progress listener failure"
+      end
+    end)
+  local first_attempt = strategy:begin_attempt("project.main")
+  test.assert(first_attempt == 1,
+              "compiler progress did not start at attempt one")
+
+  strategy:yield("project.dependency")
+  strategy:yield(nil)
+  strategy:yield("project.raise")
+  test.assert(strategy:finish_attempt(first_attempt) == 3,
+              "compiler progress did not count one checkpoint per yield")
+  test.assert(#checkpoints == 2 and
+              checkpoints[1] == "project.dependency" and
+              checkpoints[2] == "project.raise",
+              "compiler checkpoint listener lost source module names")
+  test.assert(strategy:finish_attempt(first_attempt) == 0,
+              "compiler progress finish was not idempotent")
+
+  compiler_io.set_checkpoint_listener(strategy, nil)
+  strategy:yield("project.ignored")
+  test.assert(#checkpoints == 2,
+              "cleared compiler checkpoint listener was still invoked")
+
+  local second_attempt = strategy:begin_attempt("project.other")
+  test.assert(second_attempt == 2,
+              "compiler progress did not advance the attempt number")
+  test.assert(strategy:finish_attempt(second_attempt) == 0,
+              "compiler progress reported a checkpoint before a yield")
+end
+
+function test_compiler_io_tracks_bounded_source_module_checkpoints(
+    _context: test.Context)
+  test_runtime.run(compiler_progress_contract)
 end
 
 local function cancellation_contract()

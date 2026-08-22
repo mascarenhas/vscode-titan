@@ -16,14 +16,6 @@ local CHECKER_MODULE = "titan-compiler.checker"
 local TYPES_MODULE = "titan-compiler.types"
 local DRIVER_MODULE = "titan-compiler.driver"
 
-local function string_array(items: {string}): json.Value
-  local values: {json.Value} = {}
-  for index = 1, #items do
-    values[index] = json.from_string(items[index])
-  end
-  return json.from_array(values)
-end
-
 record BridgeError
   module_name: string
   message: string
@@ -65,6 +57,35 @@ end
 record TypeInfo
   tag: string
   display: string
+end
+
+-- A named callable keeps its declaration-shaped surface at the dynamic
+-- compiler boundary. Function types deliberately omit parameter names, so a
+-- flattened TypeInfo cannot reconstruct this text later in hover handling.
+record CallableSignature
+  display: string
+end
+
+-- Hover summaries are normalized while compiler-owned declaration graphs are
+-- still available. The semantic index renders and caches these typed values;
+-- hover requests never walk the dynamic compiler graph.
+union HoverSummaryKind
+  module_summary
+  record_summary
+  union_summary
+  interface_summary
+end
+
+record HoverSummarySection
+  heading: string
+  lines: {string}
+end
+
+record HoverSummary
+  id: integer
+  kind: HoverSummaryKind
+  title: string
+  sections: {HoverSummarySection}
 end
 
 record AdjustmentInfo
@@ -125,6 +146,8 @@ record SymbolOccurrence
   exact_span: SourceSpan?
   is_local: boolean
   type_info: TypeInfo?
+  callable_signature: CallableSignature?
+  summary_id: integer?
 end
 
 record Import
@@ -201,6 +224,7 @@ record ModuleSnapshot
   symbols: {SymbolOccurrence}
   imports: {Import}
   c_header_dependencies: {CHeaderDependency}
+  hover_summaries: {HoverSummary}?
 end
 
 record Analysis
@@ -209,6 +233,15 @@ record Analysis
   modules: {ModuleSnapshot}
   contextual_resolutions: {ContextualResolution}
 end
+
+-- Progress counts the saved source files in one exact dirty project workset.
+-- Compiler-only external modules never enter this total.
+record AnalysisProgress
+  const completed_files: integer
+  const total_files: integer
+end
+
+type ProgressListener = (AnalysisProgress) -> ()
 
 -- Only unchanged external source modules use this serialized boundary. Clean
 -- project modules retain their complete compiler-owned entries privately in
@@ -859,6 +892,908 @@ local function optional_type(compiler: Compiler, node: {string: value},
   return render_type(compiler, candidate, subject .. "." .. field)
 end
 
+local function required_value_list(candidate: value, subject: string):
+    {integer: value}
+  if not (candidate is {integer: value}) then
+    return fail<{integer: value}>(
+      TYPES_MODULE, subject .. " must be a Lua array")
+  end
+  return candidate as {integer: value}
+end
+
+local function optional_name_list(candidate: value, subject: string):
+    {string}?
+  if candidate == nil or candidate == false then return nil end
+  return required_string_list(candidate, TYPES_MODULE, subject)
+end
+
+local function write_type_parameters(
+    compiler: Compiler, output: strings.StringWriter, candidate: value,
+    subject: string)
+  if candidate == nil or candidate == false then return end
+  local parameters = required_value_list(candidate, subject)
+  if #parameters == 0 then return end
+  output:write("<")
+  for index = 1, #parameters do
+    if index > 1 then output:write(", ") end
+    output:write(render_type(
+      compiler, parameters[index], subject .. "[" .. index .. "]").display)
+  end
+  output:write(">")
+end
+
+local function write_callable_results(
+    compiler: Compiler, output: strings.StringWriter,
+    results: {integer: value}, flexible: value, subject: string)
+  output:write(": ")
+  local parenthesized = #results ~= 1 or
+    (flexible ~= nil and flexible ~= false)
+  if parenthesized then output:write("(") end
+  for index = 1, #results do
+    if index > 1 then output:write(", ") end
+    output:write(render_type(
+      compiler, results[index], subject .. ".rettypes[" .. index .. "]").display)
+  end
+  if flexible ~= nil and flexible ~= false then
+    if #results > 0 then output:write(", ") end
+    output:write("...: ")
+    output:write(render_type(
+      compiler, flexible, subject .. ".flexrettype").display)
+  end
+  if parenthesized then output:write(")") end
+end
+
+local function render_callable_type(
+    compiler: Compiler, candidate: value, owner: string,
+    separator: string, name: string, supplied_names: value,
+    subject: string, display_owner: string?): CallableSignature?
+  local raw = required_map(candidate, TYPES_MODULE, subject)
+  local tag = required_string(raw["_tag"], TYPES_MODULE, subject .. "._tag")
+  local type_parameters: value = raw["typeparams"]
+  if tag == "Type.FunctionScheme" then
+    candidate = raw["signature"]
+    raw = required_map(candidate, TYPES_MODULE, subject .. ".signature")
+    tag = required_string(
+      raw["_tag"], TYPES_MODULE, subject .. ".signature._tag")
+  elseif tag == "Type.Method" or tag == "Type.StaticMethod" then
+    owner = required_string(raw["fqtn"], TYPES_MODULE, subject .. ".fqtn")
+    separator = tag == "Type.Method" and ":" or "."
+    name = required_string(raw["name"], TYPES_MODULE, subject .. ".name")
+    supplied_names = raw["paramnames"]
+  end
+  if display_owner ~= nil then owner = display_owner end
+  local c_function = tag == "Type.CFunction"
+  if tag ~= "Type.Function" and tag ~= "Type.Method"
+      and tag ~= "Type.StaticMethod" and not c_function then
+    return nil
+  end
+
+  local parameters = required_value_list(
+    raw["params"], subject .. ".params")
+  local results: {integer: value} = {}
+  if not c_function then
+    results = required_value_list(
+      raw["rettypes"], subject .. ".rettypes")
+  end
+  local names? = optional_name_list(
+    supplied_names, subject .. ".paramnames")
+  if names ~= nil and #names ~= #parameters then
+    return fail<CallableSignature>(
+      TYPES_MODULE, subject .. ".paramnames must match params")
+  end
+
+  local output = strings.writer()
+  output:write(owner)
+  output:write(separator)
+  output:write(name)
+  write_type_parameters(
+    compiler, output, type_parameters, subject .. ".typeparams")
+  output:write("(")
+  for index = 1, #parameters do
+    if index > 1 then output:write(", ") end
+    if names ~= nil then
+      output:write(names[index])
+      output:write(": ")
+    end
+    output:write(render_type(
+      compiler, parameters[index],
+      subject .. ".params[" .. index .. "]").display)
+  end
+  local variable: value = raw["varargtype"]
+  if c_function and optional_boolean(
+      raw["vararg"], TYPES_MODULE, subject .. ".vararg") then
+    if #parameters > 0 then output:write(", ") end
+    output:write("...")
+  elseif variable ~= nil and variable ~= false then
+    if #parameters > 0 then output:write(", ") end
+    output:write("...: ")
+    output:write(render_type(
+      compiler, variable, subject .. ".varargtype").display)
+  end
+  output:write(")")
+  if c_function then
+    local result: value = raw["ret"]
+    output:write(": ")
+    if type_tag(result, subject .. ".ret") == "Type.CVoid" then
+      output:write("()")
+    else
+      output:write(render_type(
+        compiler, result, subject .. ".ret").display)
+    end
+  else
+    write_callable_results(
+      compiler, output, results, raw["flexrettype"], subject)
+  end
+  return CallableSignature.new(output:drain())
+end
+
+local function written_module_alias(candidate: value): string?
+  if not (candidate is {string: value}) then return nil end
+  local node = candidate as {string: value}
+  if node["_tag"] ~= "Ast.VarDot" then return nil end
+  local expression: value = node["exp"]
+  if not (expression is {string: value}) then return nil end
+  local exp = expression as {string: value}
+  if exp["_tag"] ~= "Ast.ExpVar" then return nil end
+  local variable: value = exp["var"]
+  if not (variable is {string: value}) then return nil end
+  local var = variable as {string: value}
+  if var["_tag"] ~= "Ast.VarName" or not (var["name"] is string) then
+    return nil
+  end
+  return var["name"] as string
+end
+
+local function callable_signature(
+    compiler: Compiler, module_name: string, candidate: value,
+    source_node: value, subject: string): CallableSignature?
+  if candidate == nil or candidate == false then return nil end
+  local raw = required_map(candidate, DRIVER_MODULE, subject)
+  local tag = required_string(raw["_tag"], DRIVER_MODULE, subject .. "._tag")
+  if tag == "Ast.TopLevelFunc" or tag == "Ast.TopLevelForeignFunc" then
+    local declared: value = raw["_declared_type"]
+    local field = "._declared_type"
+    if declared == nil or declared == false then
+      declared = raw["_type"]
+      field = "._type"
+    end
+    return render_callable_type(
+      compiler, declared, module_name, ".",
+      required_string(raw["name"], DRIVER_MODULE, subject .. ".name"),
+      raw["_paramnames"], subject .. field, nil)
+  elseif tag == "Ast.TopLevelMethod" or tag == "Ast.TopLevelStatic"
+      or tag == "Ast.InterfaceMethod" then
+    local declared: value = raw["_declared_type"]
+    local field = "._declared_type"
+    if declared == nil or declared == false then
+      declared = raw["_type"]
+      field = "._type"
+    end
+    return render_callable_type(
+      compiler, declared, module_name, ".", "", nil,
+      subject .. field, nil)
+  elseif tag == "Type.ModuleMember" then
+    local owner = required_string(
+      raw["modname"], TYPES_MODULE, subject .. ".modname")
+    local member_type = required_map(
+      raw["type"], TYPES_MODULE, subject .. ".type")
+    if member_type["_tag"] == "Type.CFunction" and
+       raw["_foreign_source"] ~= true then
+      local alias? = written_module_alias(source_node)
+      if alias ~= nil then owner = alias end
+    end
+    return render_callable_type(
+      compiler, member_type, owner,
+      ".", required_string(
+        raw["name"], TYPES_MODULE, subject .. ".name"),
+      raw["paramnames"], subject .. ".type", nil)
+  elseif tag == "Type.Method" or tag == "Type.StaticMethod" then
+    return render_callable_type(
+      compiler, candidate, module_name, ".", "", nil, subject, nil)
+  end
+  return nil
+end
+
+local record PendingSummaryLine
+  rank: integer
+  name: string
+  display: string
+end
+
+-- Compiler graph normalization runs after the Lua compiler has published a
+-- checked module. Share one deterministic operation budget across every
+-- snapshot in that attempt so many individually small modules cannot starve
+-- protocol Tasks any more than one large aggregate can.
+local NORMALIZATION_YIELD_CADENCE = 1024
+
+local record NormalizationWork
+  pending: integer
+end
+
+local function NormalizationWork:account()
+  self.pending = self.pending + 1
+  if self.pending < NORMALIZATION_YIELD_CADENCE then return end
+  self.pending = 0
+  async.yield()
+end
+
+local function summary_line_less(left: PendingSummaryLine,
+                                 right: PendingSummaryLine): boolean
+  if left.rank ~= right.rank then return left.rank < right.rank end
+  if left.name ~= right.name then return left.name < right.name end
+  return left.display < right.display
+end
+
+-- Summaries can contain every member of a large module or aggregate. Keep the
+-- normalization O(n log n), just like semantic occurrence normalization.
+local function sort_summary_lines(items: {PendingSummaryLine},
+                                  work: NormalizationWork)
+  local count = #items
+  if count < 2 then return end
+  local source = items
+  local target: {PendingSummaryLine} = {}
+  local source_is_input = true
+  local width = 1
+  while width < count do
+    local first = 1
+    while first <= count do
+      local left = first
+      local left_finish = first + width - 1
+      if left_finish > count then left_finish = count end
+      local right = left_finish + 1
+      local right_finish = right + width - 1
+      if right_finish > count then right_finish = count end
+      local output = first
+      while left <= left_finish and right <= right_finish do
+        work:account()
+        if summary_line_less(source[right], source[left]) then
+          target[output] = source[right]
+          right = right + 1
+        else
+          target[output] = source[left]
+          left = left + 1
+        end
+        output = output + 1
+      end
+      while left <= left_finish do
+        work:account()
+        target[output] = source[left]
+        left = left + 1
+        output = output + 1
+      end
+      while right <= right_finish do
+        work:account()
+        target[output] = source[right]
+        right = right + 1
+        output = output + 1
+      end
+      first = right_finish + 1
+    end
+    local swap = source
+    source = target
+    target = swap
+    source_is_input = not source_is_input
+    if width > count // 2 then width = count else width = width * 2 end
+  end
+  if not source_is_input then
+    for index = 1, count do
+      work:account()
+      items[index] = source[index]
+    end
+  end
+end
+
+local function summary_lines(items: {PendingSummaryLine},
+                             work: NormalizationWork): {string}
+  sort_summary_lines(items, work)
+  local result: {string} = {}
+  for index = 1, #items do
+    work:account()
+    result[index] = items[index].display
+  end
+  return result
+end
+
+local function visibility_prefix(raw: {string: value}): string
+  if optional_boolean(raw["islocal"], TYPES_MODULE, "member.islocal") then
+    return "local "
+  end
+  return ""
+end
+
+local function field_summary_line(compiler: Compiler, candidate: value,
+                                  subject: string): PendingSummaryLine
+  local raw = required_map(candidate, TYPES_MODULE, subject)
+  if type_tag(candidate, subject) ~= "Type.Field" then
+    return fail<PendingSummaryLine>(TYPES_MODULE,
+      subject .. " must be a Type.Field")
+  end
+  local name = required_string(raw["name"], TYPES_MODULE, subject .. ".name")
+  local output = strings.writer()
+  output:write(visibility_prefix(raw))
+  if optional_boolean(raw["isconst"], TYPES_MODULE, subject .. ".isconst") then
+    output:write("const ")
+  end
+  output:write(name)
+  output:write(": ")
+  output:write(render_type(
+    compiler, raw["type"], subject .. ".type").display)
+  return PendingSummaryLine.new(0, name, output:drain())
+end
+
+local function variant_summary_line(compiler: Compiler, candidate: value,
+                                    subject: string): PendingSummaryLine
+  local raw = required_map(candidate, TYPES_MODULE, subject)
+  if type_tag(candidate, subject) ~= "Type.Variant" then
+    return fail<PendingSummaryLine>(TYPES_MODULE,
+      subject .. " must be a Type.Variant")
+  end
+  local name = required_string(raw["name"], TYPES_MODULE, subject .. ".name")
+  local output = strings.writer()
+  output:write(visibility_prefix(raw))
+  output:write(name)
+  local payload: value = raw["payload"]
+  if payload ~= nil and payload ~= false then
+    output:write("(payload: ")
+    output:write(render_type(
+      compiler, payload, subject .. ".payload").display)
+    output:write(")")
+  end
+  return PendingSummaryLine.new(0, name, output:drain())
+end
+
+local function aggregate_callable_line(
+    compiler: Compiler, candidate: value, owner: string,
+    subject: string): PendingSummaryLine
+  local raw = required_map(candidate, TYPES_MODULE, subject)
+  local name = required_string(raw["name"], TYPES_MODULE, subject .. ".name")
+  local signature? = render_callable_type(
+    compiler, candidate, owner, ".", name, raw["paramnames"],
+    subject, owner)
+  if signature == nil then
+    return fail<PendingSummaryLine>(TYPES_MODULE,
+      subject .. " must be a method or associated function")
+  end
+  return PendingSummaryLine.new(
+    0, name, visibility_prefix(raw) .. signature.display)
+end
+
+local function specialized_owner(compiler: Compiler, candidate: value,
+                                 arguments: {integer: value}?,
+                                 subject: string): value
+  if arguments == nil or #arguments == 0 then return candidate end
+  local raw = required_map(candidate, TYPES_MODULE, subject)
+  local scope: value = raw["scope"]
+  if scope == nil or scope == false then return candidate end
+  local raw_substitute = checked_function(
+    compiler.types, TYPES_MODULE, "substitute", compiler.type_of)
+  local substitute = raw_substitute as (value, value, value) -> value
+  local specialized: value = nil
+  do
+    specialized = substitute(candidate, scope, arguments)
+  catch
+    return fail<value>(TYPES_MODULE,
+      "cannot specialize " .. subject .. ": " .. strings.tostring(error))
+  end
+  return specialized
+end
+
+local function registered_owner(compiler: Compiler, fqtn: string): value
+  local registry: value = compiler.types["registry"]
+  if registry is {string: value} then
+    return (registry as {string: value})[fqtn]
+  end
+  return nil
+end
+
+local function unwrap_summary_descriptor(compiler: Compiler,
+                                         candidate: value,
+                                         subject: string): value
+  if candidate == nil or candidate == false or
+     not (candidate is {string: value}) then return nil end
+  local raw = candidate as {string: value}
+  local raw_tag: value = raw["_tag"]
+  if not (raw_tag is string) then return nil end
+  local tag = raw_tag as string
+  if tag == "Type.Module" or tag == "Type.Record" or
+     tag == "Type.Union" or tag == "Type.Interface" then
+    return candidate
+  elseif tag == "Type.ModuleMember" or tag == "Checker.TypeMember" then
+    return unwrap_summary_descriptor(
+      compiler, raw["type"], subject .. ".type")
+  elseif tag == "Type.Nominal" then
+    local fqtn = required_string(
+      raw["fqtn"], TYPES_MODULE, subject .. ".fqtn")
+    return registered_owner(compiler, fqtn)
+  elseif tag == "Type.GenericAlias" then
+    local fqtn = required_string(
+      raw["target_owner_fqtn"], TYPES_MODULE,
+      subject .. ".target_owner_fqtn")
+    return registered_owner(compiler, fqtn)
+  elseif tag == "Ast.TopLevelImport" then
+    local resolved: value = raw["_declared_type"]
+    local field = "._declared_type"
+    if resolved == nil or resolved == false then
+      resolved = raw["_type"]
+      field = "._type"
+    end
+    return unwrap_summary_descriptor(
+      compiler, resolved, subject .. field)
+  elseif tag == "Ast.TopLevelRecord" or tag == "Ast.TopLevelUnion" or
+         tag == "Ast.TopLevelInterface" then
+    local nested = unwrap_summary_descriptor(
+      compiler, raw["_type"], subject .. "._type")
+    if nested is {string: value} then
+      local nested_raw = nested as {string: value}
+      if nested_raw["name"] is string then
+        local canonical = registered_owner(
+          compiler, nested_raw["name"] as string)
+        if canonical ~= nil and canonical ~= false then return canonical end
+      end
+    end
+    return nested
+  end
+  return nil
+end
+
+local function occurrence_type_arguments(source_node: value,
+                                         owner_name: string,
+                                         subject: string): {integer: value}?
+  if not (source_node is {string: value}) then return nil end
+  local raw = source_node as {string: value}
+  local namespace_arguments: value = raw["_generic_namespace_arguments"]
+  if namespace_arguments ~= nil and namespace_arguments ~= false then
+    return required_value_list(
+      namespace_arguments, subject .. "._generic_namespace_arguments")
+  end
+  local surface_arguments: value = raw["_surface_typeargs"]
+  if surface_arguments ~= nil and surface_arguments ~= false then
+    local surface = required_value_list(
+      surface_arguments, subject .. "._surface_typeargs")
+    if #surface > 0 then
+      local arguments: {integer: value} = {}
+      local resolved_surface = true
+      for index = 1, #surface do
+        local argument = required_map(
+          surface[index], DRIVER_MODULE,
+          subject .. "._surface_typeargs[" .. index .. "]")
+        local resolved: value = argument["_resolved_typearg"]
+        if resolved == nil or resolved == false then
+          -- Keep accepting an explicitly annotated syntax node at the
+          -- compiler boundary. Current compiler lowering publishes the
+          -- private resolved-typearg edge because ordinary type syntax does
+          -- not otherwise retain its checked Type descriptor.
+          resolved = argument["_type"]
+        end
+        if resolved == nil or resolved == false then
+          -- Lowered generic syntax may retain surface arguments that were not
+          -- individually annotated. Prefer the resolved nominal below; if it
+          -- is absent too, the canonical generic owner is still a useful view.
+          resolved_surface = false
+          break
+        end
+        arguments[index] = resolved
+      end
+      if resolved_surface then return arguments end
+    end
+  end
+  local annotated: value = raw["_type"]
+  if annotated is {string: value} then
+    local annotated_raw = annotated as {string: value}
+    if annotated_raw["_tag"] == "Type.Nominal" and
+       annotated_raw["fqtn"] == owner_name then
+      local arguments: value = annotated_raw["args"]
+      if arguments == nil or arguments == false then return {} end
+      return required_value_list(arguments, subject .. "._type.args")
+    end
+  end
+  return nil
+end
+
+local function applied_owner_title(compiler: Compiler, owner: value,
+                                   arguments: {integer: value}?,
+                                   subject: string): string
+  if arguments == nil or #arguments == 0 then
+    return render_type(compiler, owner, subject).display
+  end
+  local raw = required_map(owner, TYPES_MODULE, subject)
+  local output = strings.writer()
+  output:write(required_string(
+    raw["name"], TYPES_MODULE, subject .. ".name"))
+  output:write("<")
+  for index = 1, #arguments do
+    if index > 1 then output:write(", ") end
+    output:write(render_type(
+      compiler, arguments[index],
+      subject .. ".arguments[" .. index .. "]").display)
+  end
+  output:write(">")
+  return output:drain()
+end
+
+local function aggregate_summary(
+    compiler: Compiler, descriptor: value,
+    arguments: {integer: value}?, include_local: boolean, subject: string,
+    work: NormalizationWork):
+    (HoverSummaryKind?, string?, {HoverSummarySection}?)
+  local raw = required_map(descriptor, TYPES_MODULE, subject)
+  local tag = type_tag(descriptor, subject)
+  if tag ~= "Type.Record" and tag ~= "Type.Union" and
+     tag ~= "Type.Interface" then return nil, nil, nil end
+  local specialized = specialized_owner(
+    compiler, descriptor, arguments, subject)
+  raw = required_map(specialized, TYPES_MODULE, subject .. " specialized")
+  local title = applied_owner_title(
+    compiler, descriptor, arguments, subject)
+  local sections: {HoverSummarySection} = {}
+
+  if tag == "Type.Union" then
+    local variants: {PendingSummaryLine} = {}
+    local variant_names: {string: boolean} = {}
+    local raw_variants = required_value_list(
+      raw["variants"], subject .. ".variants")
+    for index = 1, #raw_variants do
+      work:account()
+      local variant_raw = required_map(
+        raw_variants[index], TYPES_MODULE,
+        subject .. ".variants[" .. index .. "]")
+      local line = variant_summary_line(
+        compiler, raw_variants[index],
+        subject .. ".variants[" .. index .. "]")
+      variant_names[line.name] = true
+      if include_local or not optional_boolean(
+          variant_raw["islocal"], TYPES_MODULE,
+          subject .. ".variants[" .. index .. "].islocal") then
+        variants[#variants + 1] = line
+      end
+    end
+    if #variants > 0 then
+      sections[#sections + 1] = HoverSummarySection.new(
+        "Variants", summary_lines(variants, work))
+    end
+
+    local functions: {PendingSummaryLine} = {}
+    local raw_functions = required_map(
+      raw["functions"], TYPES_MODULE, subject .. ".functions")
+    for name, candidate in iteration.pairs<string, value>(raw_functions) do
+      work:account()
+      local candidate_raw = required_map(
+        candidate, TYPES_MODULE, subject .. ".functions['" .. name .. "']")
+      if not variant_names[name] and (include_local or not optional_boolean(
+          candidate_raw["islocal"], TYPES_MODULE,
+          subject .. ".functions['" .. name .. "'].islocal")) then
+        functions[#functions + 1] = aggregate_callable_line(
+          compiler, candidate, title,
+          subject .. ".functions['" .. name .. "']")
+      end
+    end
+    if #functions > 0 then
+      sections[#sections + 1] = HoverSummarySection.new(
+        "Functions", summary_lines(functions, work))
+    end
+  else
+    local fields: {PendingSummaryLine} = {}
+    local raw_fields = required_value_list(raw["fields"], subject .. ".fields")
+    for index = 1, #raw_fields do
+      work:account()
+      local field_raw = required_map(
+        raw_fields[index], TYPES_MODULE,
+        subject .. ".fields[" .. index .. "]")
+      if include_local or not optional_boolean(
+          field_raw["islocal"], TYPES_MODULE,
+          subject .. ".fields[" .. index .. "].islocal") then
+        fields[#fields + 1] = field_summary_line(
+          compiler, raw_fields[index],
+          subject .. ".fields[" .. index .. "]")
+      end
+    end
+    if #fields > 0 then
+      sections[#sections + 1] = HoverSummarySection.new(
+        "Fields", summary_lines(fields, work))
+    end
+
+    if tag == "Type.Record" then
+      local functions: {PendingSummaryLine} = {}
+      local raw_functions = required_map(
+        raw["functions"], TYPES_MODULE, subject .. ".functions")
+      for name, candidate in iteration.pairs<string, value>(raw_functions) do
+        work:account()
+        local candidate_raw = required_map(
+          candidate, TYPES_MODULE,
+          subject .. ".functions['" .. name .. "']")
+        if include_local or not optional_boolean(
+            candidate_raw["islocal"], TYPES_MODULE,
+            subject .. ".functions['" .. name .. "'].islocal") then
+          functions[#functions + 1] = aggregate_callable_line(
+            compiler, candidate, title,
+            subject .. ".functions['" .. name .. "']")
+        end
+      end
+      if #functions > 0 then
+        sections[#sections + 1] = HoverSummarySection.new(
+          "Functions", summary_lines(functions, work))
+      end
+    end
+  end
+
+  local methods: {PendingSummaryLine} = {}
+  if tag == "Type.Interface" then
+    local raw_methods = required_value_list(
+      raw["methods"], subject .. ".methods")
+    for index = 1, #raw_methods do
+      work:account()
+      local candidate_raw = required_map(
+        raw_methods[index], TYPES_MODULE,
+        subject .. ".methods[" .. index .. "]")
+      if include_local or not optional_boolean(
+          candidate_raw["islocal"], TYPES_MODULE,
+          subject .. ".methods[" .. index .. "].islocal") then
+        methods[#methods + 1] = aggregate_callable_line(
+          compiler, raw_methods[index], title,
+          subject .. ".methods[" .. index .. "]")
+      end
+    end
+  else
+    local raw_methods = required_map(
+      raw["methods"], TYPES_MODULE, subject .. ".methods")
+    for name, candidate in iteration.pairs<string, value>(raw_methods) do
+      work:account()
+      local candidate_raw = required_map(
+        candidate, TYPES_MODULE,
+        subject .. ".methods['" .. name .. "']")
+      if include_local or not optional_boolean(
+          candidate_raw["islocal"], TYPES_MODULE,
+          subject .. ".methods['" .. name .. "'].islocal") then
+        methods[#methods + 1] = aggregate_callable_line(
+          compiler, candidate, title,
+          subject .. ".methods['" .. name .. "']")
+      end
+    end
+  end
+  if #methods > 0 then
+    sections[#sections + 1] = HoverSummarySection.new(
+      "Methods", summary_lines(methods, work))
+  end
+
+  if tag == "Type.Record" then
+    return HoverSummaryKind.record_summary(), title, sections
+  elseif tag == "Type.Union" then
+    return HoverSummaryKind.union_summary(), title, sections
+  end
+  return HoverSummaryKind.interface_summary(), title, sections
+end
+
+local function append_type_parameters(
+    compiler: Compiler, output: strings.StringWriter, raw: {string: value},
+    subject: string)
+  write_type_parameters(
+    compiler, output, raw["typeparams"], subject .. ".typeparams")
+end
+
+local function module_nominal_line(
+    compiler: Compiler, raw: {string: value}, member_name: string,
+    kind: string, subject: string, force_local: boolean): string
+  local output = strings.writer()
+  if force_local then output:write("local ")
+  else output:write(visibility_prefix(raw)) end
+  output:write(kind)
+  output:write(" ")
+  output:write(member_name)
+  append_type_parameters(compiler, output, raw, subject)
+  return output:drain()
+end
+
+local function append_module_member(
+    compiler: Compiler, module_name: string, candidate: value,
+    rank: integer, subject: string, target: {PendingSummaryLine})
+  local raw = required_map(candidate, TYPES_MODULE, subject)
+  local tag = type_tag(candidate, subject)
+  if tag ~= "Type.ModuleMember" and tag ~= "Type.ModuleVariable" then
+    return fail<value>(TYPES_MODULE,
+      subject .. " must be a module member")
+  end
+  local name = required_string(raw["name"], TYPES_MODULE, subject .. ".name")
+  local member_type: value = raw["type"]
+  local member_raw = required_map(
+    member_type, TYPES_MODULE, subject .. ".type")
+  local member_tag = type_tag(member_type, subject .. ".type")
+  local display = ""
+  if member_tag == "Type.Record" then
+    display = module_nominal_line(
+      compiler, member_raw, name, "record", subject .. ".type", false)
+  elseif member_tag == "Type.Union" then
+    display = module_nominal_line(
+      compiler, member_raw, name, "union", subject .. ".type", false)
+  elseif member_tag == "Type.Interface" then
+    display = module_nominal_line(
+      compiler, member_raw, name, "interface", subject .. ".type", false)
+  elseif tag == "Type.ModuleMember" and
+         (member_tag == "Type.Function" or
+          member_tag == "Type.FunctionScheme" or
+          member_tag == "Type.CFunction") then
+    local signature? = render_callable_type(
+      compiler, member_type, module_name, ".", name,
+      raw["paramnames"], subject .. ".type", nil)
+    if signature == nil then
+      return fail<value>(TYPES_MODULE,
+        subject .. " callable has no signature")
+    end
+    display = visibility_prefix(raw) .. signature.display
+  else
+    local output = strings.writer()
+    output:write(visibility_prefix(raw))
+    if optional_boolean(
+        raw["isconst"], TYPES_MODULE, subject .. ".isconst") then
+      output:write("const ")
+    end
+    output:write(name)
+    output:write(": ")
+    output:write(render_type(
+      compiler, member_type, subject .. ".type").display)
+    display = output:drain()
+  end
+  target[#target + 1] = PendingSummaryLine.new(rank, name, display)
+end
+
+local function append_module_type_members(
+    compiler: Compiler, candidate: value, rank: integer,
+    subject: string, target: {PendingSummaryLine},
+    seen: {string: boolean}, source_only: boolean,
+    work: NormalizationWork)
+  if candidate == nil or candidate == false then return end
+  local raw = required_map(candidate, TYPES_MODULE, subject)
+  for name, member in iteration.pairs<string, value>(raw) do
+    work:account()
+    if not seen[name] then
+      -- A source interface may decorate the public entry by name as well as
+      -- expose genuinely source-only type members. The public view wins.
+      seen[name] = true
+      local member_subject = subject .. "['" .. name .. "']"
+      local member_raw = required_map(
+        member, TYPES_MODULE, member_subject)
+      local tag = type_tag(member, member_subject)
+      local display = ""
+      if tag == "Type.Record" then
+        display = module_nominal_line(
+          compiler, member_raw, name, "record", member_subject, source_only)
+      elseif tag == "Type.Union" then
+        display = module_nominal_line(
+          compiler, member_raw, name, "union", member_subject, source_only)
+    elseif tag == "Type.Interface" then
+        display = module_nominal_line(
+          compiler, member_raw, name, "interface", member_subject, source_only)
+    else
+        local output = strings.writer()
+        if source_only then output:write("local ")
+        else output:write(visibility_prefix(member_raw)) end
+      output:write("type ")
+      output:write(name)
+      if tag == "Type.GenericAlias" then
+        append_type_parameters(
+          compiler, output, member_raw, member_subject)
+        local rendered = render_type(
+          compiler, member, member_subject).display
+        local equals? = strings.find(rendered, " = ")
+        if equals == nil then
+          return fail<value>(TYPES_MODULE,
+            member_subject .. " generic alias has no rendered target")
+        end
+        output:write(strings.sub(rendered, equals))
+      else
+        output:write(" = ")
+        output:write(render_type(
+          compiler, member, member_subject).display)
+      end
+      display = output:drain()
+    end
+      target[#target + 1] = PendingSummaryLine.new(rank, name, display)
+    end
+  end
+end
+
+local function module_summary(
+    compiler: Compiler, descriptor: value, include_source: boolean,
+    subject: string, work: NormalizationWork):
+    (HoverSummaryKind?, string?, {HoverSummarySection}?)
+  if type_tag(descriptor, subject) ~= "Type.Module" then
+    return nil, nil, nil
+  end
+  local raw = required_map(descriptor, TYPES_MODULE, subject)
+  local module_name = required_string(
+    raw["name"], TYPES_MODULE, subject .. ".name")
+  local members: {PendingSummaryLine} = {}
+  local value_members_seen: {string: boolean} = {}
+  local public_members: {integer: value} = {}
+  if raw["members"] ~= nil and raw["members"] ~= false then
+    public_members = required_value_list(
+      raw["members"], subject .. ".members")
+  end
+  for index = 1, #public_members do
+    work:account()
+    local member_subject = subject .. ".members[" .. index .. "]"
+    local member_raw = required_map(
+      public_members[index], TYPES_MODULE, member_subject)
+    local name = required_string(
+      member_raw["name"], TYPES_MODULE, member_subject .. ".name")
+    if not value_members_seen[name] then
+      value_members_seen[name] = true
+      append_module_member(
+        compiler, module_name, public_members[index], 0,
+        member_subject, members)
+    end
+  end
+  local source_members: value = raw["source_members"]
+  if include_source and source_members ~= nil and source_members ~= false then
+    local source_list = required_value_list(
+      source_members, subject .. ".source_members")
+    for index = 1, #source_list do
+      work:account()
+      local member_subject = subject .. ".source_members[" .. index .. "]"
+      local member_raw = required_map(
+        source_list[index], TYPES_MODULE, member_subject)
+      local name = required_string(
+        member_raw["name"], TYPES_MODULE, member_subject .. ".name")
+      if not value_members_seen[name] then
+        value_members_seen[name] = true
+        append_module_member(
+          compiler, module_name, source_list[index], 1,
+          member_subject, members)
+      end
+    end
+  end
+  local type_members_seen: {string: boolean} = {}
+  append_module_type_members(
+    compiler, raw["type_members"], 2,
+    subject .. ".type_members", members, type_members_seen, false, work)
+  if include_source then
+    append_module_type_members(
+      compiler, raw["source_type_members"], 3,
+      subject .. ".source_type_members", members, type_members_seen, true,
+      work)
+  end
+  local sections: {HoverSummarySection} = {}
+  if #members > 0 then
+    sections[1] = HoverSummarySection.new(
+      "Members", summary_lines(members, work))
+  end
+  return HoverSummaryKind.module_summary(), module_name, sections
+end
+
+local function source_import_declaration(candidate: value): boolean
+  if not (candidate is {string: value}) then return false end
+  local raw = candidate as {string: value}
+  if raw["_tag"] ~= "Ast.TopLevelImport" then return false end
+  return raw["_source_import"] == true or raw["source_required"] == true
+end
+
+local function source_import_name(candidate: value): string?
+  if not source_import_declaration(candidate) then return nil end
+  local raw = candidate as {string: value}
+  local modname: value = raw["modname"]
+  if modname is string then return modname as string end
+  return nil
+end
+
+local function source_import_module(candidate: value): string?
+  if not (candidate is {string: value}) then return nil end
+  local raw = candidate as {string: value}
+  local tag: value = raw["_tag"]
+  local imported? = source_import_name(candidate)
+  if imported ~= nil then return imported end
+  imported = source_import_name(raw["_module_decl"])
+  if imported ~= nil then return imported end
+  imported = source_import_name(raw["_import_decl"])
+  if imported ~= nil then return imported end
+  imported = source_import_name(raw["_decl"])
+  if imported ~= nil then return imported end
+  if tag == "Ast.VarDot" then
+    return source_import_module(raw["exp"])
+  elseif tag == "Ast.ExpVar" then
+    return source_import_module(raw["var"])
+  end
+  return nil
+end
+
 local function adjustment_info(compiler: Compiler, candidate: value,
                                subject: string): AdjustmentInfo
   local raw = required_map(candidate, TYPES_MODULE, subject)
@@ -1102,6 +2037,11 @@ local function declaration_local(candidate: value): boolean
 end
 
 local function semantic_declaration(node: {string: value}, tag: string): value
+  if tag == "Ast.ExpMethodRef" or tag == "Ast.ArgsMethod"
+      or tag == "Ast.ArgsNamedMethod" then
+    local declared: value = node["_declared_method"]
+    if declared ~= nil and declared ~= false then return declared end
+  end
   local declaration: value = node["_decl"]
   if declaration ~= nil and declaration ~= false then return declaration end
   if tag == "Ast.ExpMethodRef" or tag == "Ast.ArgsMethod"
@@ -1116,17 +2056,163 @@ end
 local record Walker
   compiler: Compiler
   module_name: string
+  local work: NormalizationWork
   nodes: {Node}
   symbols: {SymbolOccurrence}
   imports: {Import}
-  local seen: {value}
+  local seen: {value: boolean}
+  local hover_summaries: {HoverSummary}
+  local summary_ids: {string: integer}
+  local summary_views: {string: integer}
+end
+
+local function summary_kind_key(kind: HoverSummaryKind): string
+  case kind
+  when module_summary then return "module"
+  when record_summary then return "record"
+  when union_summary then return "union"
+  when interface_summary then return "interface"
+  end
+end
+
+local function append_summary_key_part(output: strings.StringWriter,
+                                       candidate: string)
+  output:write(strings.tostring(#candidate))
+  output:write(":")
+  output:write(candidate)
+end
+
+local function summary_content_key(kind: HoverSummaryKind, title: string,
+                                   sections: {HoverSummarySection},
+                                   work: NormalizationWork): string
+  local output = strings.writer()
+  append_summary_key_part(output, summary_kind_key(kind))
+  append_summary_key_part(output, title)
+  for section_index = 1, #sections do
+    work:account()
+    local section = sections[section_index]
+    append_summary_key_part(output, section.heading)
+    for line_index = 1, #section.lines do
+      work:account()
+      append_summary_key_part(output, section.lines[line_index])
+    end
+    append_summary_key_part(output, "")
+  end
+  return output:drain()
+end
+
+local function Walker:intern_summary(kind: HoverSummaryKind, title: string,
+                                     sections: {HoverSummarySection}): integer
+  local key = summary_content_key(kind, title, sections, self.work)
+  local old? = self.summary_ids[key]
+  if old ~= nil then return old end
+  local id = #self.hover_summaries + 1
+  self.hover_summaries[id] = HoverSummary.new(id, kind, title, sections)
+  self.summary_ids[key] = id
+  return id
+end
+
+local function summary_argument_key(compiler: Compiler,
+                                    arguments: {integer: value}?,
+                                    subject: string): string
+  if arguments == nil or #arguments == 0 then return "" end
+  local output = strings.writer()
+  for index = 1, #arguments do
+    append_summary_key_part(output, render_type(
+      compiler, arguments[index],
+      subject .. "[" .. index .. "]").display)
+  end
+  return output:drain()
+end
+
+local function summary_view_key(descriptor: value, descriptor_tag: string,
+                                include_source: boolean,
+                                argument_key: string,
+                                subject: string): string
+  local raw = required_map(descriptor, TYPES_MODULE, subject)
+  local output = strings.writer()
+  append_summary_key_part(output, descriptor_tag)
+  append_summary_key_part(output, required_string(
+    raw["name"], TYPES_MODULE, subject .. ".name"))
+  append_summary_key_part(output, include_source and "source" or "public")
+  append_summary_key_part(output, argument_key)
+  return output:drain()
+end
+
+local function aggregate_owner_module(name: string,
+                                      subject: string): string
+  local split = 0
+  for index = 1, #name do
+    if strings.byte(name, index) == 46 then split = index end
+  end
+  if split == 0 or split == #name then
+    return fail<string>(TYPES_MODULE,
+      subject .. " name '" .. name .. "' is not fully qualified")
+  end
+  return strings.sub(name, 1, split - 1)
+end
+
+local function summary_descriptor_module(descriptor: value,
+                                         descriptor_tag: string,
+                                         subject: string): string
+  local raw = required_map(descriptor, TYPES_MODULE, subject)
+  local name = required_string(
+    raw["name"], TYPES_MODULE, subject .. ".name")
+  if descriptor_tag == "Type.Module" then return name end
+  return aggregate_owner_module(name, subject)
+end
+
+local function Walker:summary_id(candidate: value, source_node: value,
+                                  subject: string): integer?
+  local descriptor = unwrap_summary_descriptor(
+    self.compiler, candidate, subject)
+  if descriptor == nil or descriptor == false then return nil end
+  local kind: HoverSummaryKind? = nil
+  local title: string? = nil
+  local sections: {HoverSummarySection}? = nil
+  local descriptor_tag = type_tag(descriptor, subject)
+  local descriptor_module = summary_descriptor_module(
+    descriptor, descriptor_tag, subject)
+  local imported_module? = source_import_module(candidate)
+  if imported_module == nil then
+    imported_module = source_import_module(source_node)
+  end
+  -- Source imports grant private visibility only in the module named by that
+  -- import. An alias/re-export may normalize to an owner in another module,
+  -- but source visibility is deliberately non-transitive.
+  local include_source = descriptor_module == self.module_name or
+    imported_module == descriptor_module
+  local arguments: {integer: value}? = nil
+  if descriptor_tag ~= "Type.Module" then
+    local descriptor_raw = required_map(descriptor, TYPES_MODULE, subject)
+    local owner_name = required_string(
+      descriptor_raw["name"], TYPES_MODULE, subject .. ".name")
+    arguments = occurrence_type_arguments(
+      source_node, owner_name, subject .. " occurrence")
+  end
+  local argument_key = summary_argument_key(
+    self.compiler, arguments, subject .. " arguments")
+  local view_key = summary_view_key(
+    descriptor, descriptor_tag, include_source, argument_key, subject)
+  local memoized? = self.summary_views[view_key]
+  if memoized ~= nil then return memoized end
+  if descriptor_tag == "Type.Module" then
+    kind, title, sections = module_summary(
+      self.compiler, descriptor, include_source, subject, self.work)
+  else
+    kind, title, sections = aggregate_summary(
+      self.compiler, descriptor, arguments, include_source, subject,
+      self.work)
+  end
+  if kind == nil or title == nil or sections == nil then return nil end
+  local summary_id = self:intern_summary(kind, title, sections)
+  self.summary_views[view_key] = summary_id
+  return summary_id
 end
 
 local function Walker:already_seen(candidate: value): boolean
-  for index = 1, #self.seen do
-    if self.seen[index] == candidate then return true end
-  end
-  self.seen[#self.seen + 1] = candidate
+  if self.seen[candidate] then return true end
+  self.seen[candidate] = true
   return false
 end
 
@@ -1176,9 +2262,24 @@ local function Walker:add_occurrence(node: {string: value}, tag: string,
 
   local span: SourceSpan? = nil
   span = exact_occurrence_span(node, tag, name)
+  local signature_candidate: value = declaration
+  if tag == "Ast.TopLevelFunc" or tag == "Ast.TopLevelForeignFunc"
+      or tag == "Ast.TopLevelMethod" or tag == "Ast.TopLevelStatic"
+      or tag == "Ast.InterfaceMethod" then
+    -- Declaration occurrences own the frozen surface callable metadata. The
+    -- semantic identity may instead be an erased Type.Method descriptor.
+    signature_candidate = node
+  elseif signature_candidate == nil or signature_candidate == false then
+    signature_candidate = node
+  end
   self.symbols[#self.symbols + 1] = SymbolOccurrence.new(
     name, declaration_id, occurrence_role(role_name), location, span,
-    localness, optional_type(self.compiler, node, "_type", tag))
+    localness, optional_type(self.compiler, node, "_type", tag),
+    callable_signature(
+      self.compiler, self.module_name, signature_candidate,
+      node, tag .. " callable declaration"),
+    self:summary_id(
+      signature_candidate, node, tag .. " hover summary declaration"))
 end
 
 local function Walker:add_bound_occurrence(name: string, declaration: value,
@@ -1188,7 +2289,9 @@ local function Walker:add_bound_occurrence(name: string, declaration: value,
     self.module_name, declaration)
   self.symbols[#self.symbols + 1] = SymbolOccurrence.new(
     name, declaration_id, role, location,
-    exact_name_span(location, name), declaration_local(declaration), nil)
+    exact_name_span(location, name), declaration_local(declaration), nil, nil,
+    self:summary_id(
+      declaration, declaration, "bound hover summary declaration"))
 end
 
 local function Walker:add_import(node: {string: value},
@@ -1246,6 +2349,7 @@ local function Walker:visit_node(candidate: value, parent_id: integer?,
                                  role_name: string, local_hint: boolean?,
                                  synthetic_parent: boolean)
   if self:already_seen(candidate) then return end
+  self.work:account()
   local raw = required_map(candidate, DRIVER_MODULE, "AST node")
   local tag = required_string(raw["_tag"], DRIVER_MODULE, "AST node._tag")
   if strings.sub(tag, 1, 4) ~= "Ast." then
@@ -1363,15 +2467,54 @@ local function Walker:visit_node(candidate: value, parent_id: integer?,
 end
 
 local function walk_ast(compiler: Compiler, module_name: string,
-                        candidate: value):
-    ({Node}, {SymbolOccurrence}, {Import})
+                        candidate: value, work: NormalizationWork):
+    ({Node}, {SymbolOccurrence}, {Import}, {HoverSummary})
   if compiler.type_of(candidate) ~= "table" then
     raise BridgeError.new(
       DRIVER_MODULE, "annotated AST root must be a Lua table")
   end
-  local walker = Walker.new(compiler, module_name, {}, {}, {}, {})
+  local walker = Walker.new(
+    compiler, module_name, work, {}, {}, {}, {}, {}, {}, {})
   walker:visit_any(candidate, nil, "reference", nil, false)
-  return walker.nodes, walker.symbols, walker.imports
+  return walker.nodes, walker.symbols, walker.imports,
+         walker.hover_summaries
+end
+
+-- External annotated ASTs exist only long enough to recover dependency edges.
+-- Avoid normalizing nodes, occurrences, and especially aggregate summaries
+-- that the snapshot must immediately discard.
+local function imports_from_ast(compiler: Compiler, candidate: value,
+                                work: NormalizationWork): {Import}
+  if compiler.type_of(candidate) ~= "table" then
+    raise BridgeError.new(
+      DRIVER_MODULE, "annotated AST root must be a Lua table")
+  end
+  local imports: {Import} = {}
+  local roots = candidate as {integer: value}
+  for index = 1, #roots do
+    work:account()
+    local root: value = roots[index]
+    if root is {string: value} then
+      local raw = root as {string: value}
+      if raw["_tag"] == "Ast.TopLevelImport" then
+        local location? = semantic_location(raw, "Ast.TopLevelImport")
+        if location ~= nil then
+          imports[#imports + 1] = Import.new(
+            required_string(
+              raw["localname"], DRIVER_MODULE,
+              "Ast.TopLevelImport.localname"),
+            required_string(
+              raw["modname"], DRIVER_MODULE,
+              "Ast.TopLevelImport.modname"),
+            optional_boolean(
+              raw["source_required"], DRIVER_MODULE,
+              "Ast.TopLevelImport.source_required"),
+            location)
+        end
+      end
+    end
+  end
+  return imports
 end
 
 local function diagnostic_body(message: string, start: integer): string
@@ -1379,9 +2522,11 @@ local function diagnostic_body(message: string, start: integer): string
   return strings.sub(message, start)
 end
 
-local function parse_diagnostic(message: string): Diagnostic
+local function parse_diagnostic(message: string,
+                                work: NormalizationWork): Diagnostic
   local search = 1
   while search <= #message do
+    work:account()
     local first: integer? = strings.find(message, ":", search)
     if not first then break end
     local second: integer? = strings.find(message, ":", first + 1)
@@ -1408,7 +2553,8 @@ local function parse_diagnostic(message: string): Diagnostic
   return Diagnostic.new(DiagnosticKind.compiler(), message, nil)
 end
 
-local function normalize_diagnostics(candidate: value): {Diagnostic}
+local function normalize_diagnostics(candidate: value,
+                                     work: NormalizationWork): {Diagnostic}
   if candidate == nil or candidate == false then
     return fail<{Diagnostic}>(
       DRIVER_MODULE, "compiler error list must be a Lua table")
@@ -1420,8 +2566,10 @@ local function normalize_diagnostics(candidate: value): {Diagnostic}
   local raw = candidate as {integer: value}
   local diagnostics: {Diagnostic} = {}
   for index = 1, #raw do
-    diagnostics[index] = parse_diagnostic(required_string(
-      raw[index], DRIVER_MODULE, "compiler error " .. index))
+    work:account()
+    diagnostics[index] = parse_diagnostic(
+      required_string(
+        raw[index], DRIVER_MODULE, "compiler error " .. index), work)
   end
   return diagnostics
 end
@@ -1530,6 +2678,14 @@ local function requested_modules(names: {string},
   return requested, ordered
 end
 
+local function emit_analysis_progress(listener: ProgressListener,
+                                      completed_files: integer,
+                                      total_files: integer)
+  -- UI telemetry cannot affect compiler control flow. In particular, a
+  -- protocol/client listener is not another cancellation boundary.
+  do listener(AnalysisProgress.new(completed_files, total_files)) catch end
+end
+
 local function cached_source_map(cached: {CachedSourceInterface},
                                  projects: {string: ProjectModule}):
     ({string: CachedSourceInterface}, {string: value})
@@ -1617,7 +2773,8 @@ local function snapshot_module(compiler: Compiler, module_name: string,
                                candidate: value,
                                projects: {string: ProjectModule},
                                cached: {string: CachedSourceInterface},
-                               valid_manifest: boolean): ModuleSnapshot
+                               valid_manifest: boolean,
+                               work: NormalizationWork): ModuleSnapshot
   local entry = required_map(
     candidate, DRIVER_MODULE, "driver.imported['" .. module_name .. "']")
   local origin = provenance(entry, module_name, projects)
@@ -1634,6 +2791,7 @@ local function snapshot_module(compiler: Compiler, module_name: string,
   local nodes: {Node} = {}
   local symbols: {SymbolOccurrence} = {}
   local imports: {Import} = {}
+  local hover_summaries: {HoverSummary} = {}
   local header_dependencies = normalize_c_header_dependencies(
     entry["c_header_dependencies"],
     "driver.imported['" .. module_name .. "'].c_header_dependencies")
@@ -1643,29 +2801,31 @@ local function snapshot_module(compiler: Compiler, module_name: string,
       return fail<ModuleSnapshot>(DRIVER_MODULE,
         "project source '" .. module_name .. "' has no annotated AST")
     end
-    nodes, symbols, imports = walk_ast(compiler, module_name, raw_ast)
+    nodes, symbols, imports, hover_summaries = walk_ast(
+      compiler, module_name, raw_ast, work)
     if valid_manifest then compiler.project_asts[module_name] = raw_ast end
   elseif cached[module_name] ~= nil then
     local cached_source = cached[module_name]
     for index = 1, #cached_source.imports do
+      work:account()
       imports[index] = cached_source.imports[index]
     end
   elseif raw_ast ~= nil and raw_ast ~= false then
     -- External ASTs exist only for this transient compiler attempt. Normalize
-    -- their dependency edges, then immediately discard nodes and symbols.
-    local _nodes, _symbols, discovered = walk_ast(
-      compiler, module_name, raw_ast)
-    imports = discovered
+    -- their dependency edges, then immediately discard the compiler graph.
+    imports = imports_from_ast(compiler, raw_ast, work)
   else
     local dependencies: {string} = {}
     local raw_dependencies: value = entry["deps"]
     if raw_dependencies is {string: value} then
       for dependency, enabled in iteration.pairs<string, value>(
           raw_dependencies as {string: value}) do
+        work:account()
         if enabled then
           local position = #dependencies + 1
           while position > 1 and
               dependencies[position - 1] > dependency do
+            work:account()
             dependencies[position] = dependencies[position - 1]
             position = position - 1
           end
@@ -1681,6 +2841,7 @@ local function snapshot_module(compiler: Compiler, module_name: string,
     when project_source then
     end
     for index = 1, #dependencies do
+      work:account()
       imports[index] = Import.new(
         dependencies[index], dependencies[index], false,
         SourceLocation.new(filename, 1, 1))
@@ -1688,10 +2849,11 @@ local function snapshot_module(compiler: Compiler, module_name: string,
   end
   return ModuleSnapshot.new(
     module_name, origin, manifest, nodes, symbols, imports,
-    header_dependencies)
+    header_dependencies, hover_summaries)
 end
 
-local function normalize_contextual_resolutions(context: value):
+local function normalize_contextual_resolutions(
+    context: value, work: NormalizationWork):
     {ContextualResolution}
   local raw_context = required_map(
     context, DRIVER_MODULE, "compiler resolver context")
@@ -1700,6 +2862,7 @@ local function normalize_contextual_resolutions(context: value):
     "compiler resolver contextual_resolutions")
   local result: {ContextualResolution} = {}
   for key, candidate in iteration.pairs<string, value>(raw_resolutions) do
+    work:account()
     local raw = required_map(candidate, DRIVER_MODULE,
       "compiler contextual resolution '" .. key .. "'")
     local owner = required_string(
@@ -1735,6 +2898,7 @@ local function normalize_contextual_resolutions(context: value):
     local identity = exposer .. "\0" .. owner .. "\0" ..
                      kind .. "\0" .. provider_file
     while position > 1 do
+      work:account()
       local previous = result[position - 1]
       local previous_kind = "dynamic"
       local previous_file = ""
@@ -1781,8 +2945,10 @@ catch
     "compiler installation discovery failed: " .. strings.tostring(error))
 end
 
-local function append_diagnostics(target: {Diagnostic}, source: {Diagnostic})
+local function append_diagnostics(target: {Diagnostic}, source: {Diagnostic},
+                                  work: NormalizationWork)
   for index = 1, #source do
+    work:account()
     target[#target + 1] = source[index]
   end
 end
@@ -1796,40 +2962,87 @@ local record AttemptResult
   failed: {string: boolean}
 end
 
-local function module_for_filename(projects: {string: ProjectModule},
-                                   filename: string): string?
+local function project_filename_owners(projects: {string: ProjectModule},
+                                       work: NormalizationWork):
+    {string: string}
+  local owners: {string: string} = {}
   for name, project in iteration.pairs<string, ProjectModule>(projects) do
     for index = 1, #project.files do
-      if project.files[index].filename == filename then return name end
+      work:account()
+      owners[project.files[index].filename] = name
     end
   end
-  return nil
+  return owners
 end
 
-local function sorted_entry_names(entries: {string: value}): {string}
+local function sort_strings(items: {string}, work: NormalizationWork)
+  local count = #items
+  if count < 2 then return end
+  local source = items
+  local target: {string} = {}
+  local source_is_input = true
+  local width = 1
+  while width < count do
+    local first = 1
+    while first <= count do
+      local left = first
+      local middle = first + width
+      local right = middle
+      local finish = first + width + width - 1
+      if middle > count + 1 then middle = count + 1 end
+      if finish > count then finish = count end
+      for output = first, finish do
+        work:account()
+        if left < middle and
+           (right > finish or source[left] <= source[right]) then
+          target[output] = source[left]
+          left = left + 1
+        else
+          target[output] = source[right]
+          right = right + 1
+        end
+      end
+      first = finish + 1
+    end
+    local swap = source
+    source = target
+    target = swap
+    source_is_input = not source_is_input
+    width = width * 2
+  end
+  if not source_is_input then
+    for index = 1, count do
+      work:account()
+      items[index] = source[index]
+    end
+  end
+end
+
+local function sorted_entry_names(entries: {string: value},
+                                  work: NormalizationWork): {string}
   local result: {string} = {}
   for name in iteration.pairs<string, value>(entries) do
-    local position = #result + 1
-    while position > 1 and result[position - 1] > name do
-      result[position] = result[position - 1]
-      position = position - 1
-    end
-    result[position] = name
+    work:account()
+    result[#result + 1] = name
   end
+  sort_strings(result, work)
   return result
 end
 
 local function failed_projects(root_module: string,
                                diagnostics: {Diagnostic},
                                projects: {string: ProjectModule},
-                               loader_failed: boolean): {string: boolean}
+                               loader_failed: boolean,
+                               work: NormalizationWork): {string: boolean}
   local failed: {string: boolean} = {}
+  local owners = project_filename_owners(projects, work)
   if loader_failed then failed[root_module] = true end
   for index = 1, #diagnostics do
+    work:account()
     local diagnostic = diagnostics[index]
     local owner?: string = nil
     if diagnostic.location ~= nil then
-      owner = module_for_filename(projects, diagnostic.location.filename)
+      owner = owners[diagnostic.location.filename]
     end
     if owner == nil then owner = root_module end
     failed[owner as string] = true
@@ -1849,15 +3062,12 @@ local function failed_project_snapshot(project: ProjectModule): ModuleSnapshot
     nil, {}, {}, {}, {})
 end
 
-local function Compiler:run_attempt(
+local function Compiler:run_attempt_inner(
     root_module: string, projects: {string: ProjectModule},
     overrides: {string: value},
     pending: {string: boolean}, cached: {string: CachedSourceInterface},
     raw_cached_interfaces: {string: value}): AttemptResult
-  local started = logging.clock()
-  logging.emit("debug", "compiler.attempt.start", {
-    json.Member.new("root_module", json.from_string(root_module)),
-  })
+  local normalization_work = NormalizationWork.new(0)
   local options: {string: value} = { ["io"] = self.io }
   local roots: {string: value} = {[root_module] = true}
   local active_overrides: {string: value} = {}
@@ -1912,10 +3122,15 @@ local function Compiler:run_attempt(
   local ok = required_boolean(
     raw_ok, DRIVER_MODULE, "compiler loader result")
   if not ok then
-    diagnostics[#diagnostics + 1] = parse_diagnostic(required_string(
-      interface_or_error, DRIVER_MODULE, "compiler loader error"))
+    diagnostics[#diagnostics + 1] = parse_diagnostic(
+      required_string(
+        interface_or_error, DRIVER_MODULE, "compiler loader error"),
+      normalization_work)
   else
-    append_diagnostics(diagnostics, normalize_diagnostics(raw_errors))
+    append_diagnostics(
+      diagnostics,
+      normalize_diagnostics(raw_errors, normalization_work),
+      normalization_work)
   end
 
   local raw_context = required_map(
@@ -1929,15 +3144,19 @@ local function Compiler:run_attempt(
   local finalize = raw_finalize as (value) -> (value, value)
   local finalized, raw_final_errors = finalize(context)
   if finalized == nil or finalized == false then
-    append_diagnostics(diagnostics, normalize_diagnostics(raw_final_errors))
+    append_diagnostics(
+      diagnostics,
+      normalize_diagnostics(raw_final_errors, normalization_work),
+      normalization_work)
   end
   local contextual_resolutions: {ContextualResolution} = {}
   if finalized ~= nil and finalized ~= false then
-    contextual_resolutions = normalize_contextual_resolutions(context)
+    contextual_resolutions = normalize_contextual_resolutions(
+      context, normalization_work)
   end
 
   local failed = failed_projects(
-    root_module, diagnostics, projects, not ok)
+    root_module, diagnostics, projects, not ok, normalization_work)
   local checked_set: {string: boolean} = {}
   for index = 1, #checked do checked_set[checked[index]] = true end
   -- A loader that fails before publishing a module cannot add the root to the
@@ -1947,7 +3166,7 @@ local function Compiler:run_attempt(
 
   local modules: {ModuleSnapshot} = {}
   local entries: {string: value} = {}
-  local names = sorted_entry_names(imported)
+  local names = sorted_entry_names(imported, normalization_work)
   for index = 1, #names do
     local name = names[index]
     local is_project = projects[name] ~= nil
@@ -1955,39 +3174,138 @@ local function Compiler:run_attempt(
       local valid = #diagnostics == 0
       if is_project then valid = failed[name] ~= true end
       modules[#modules + 1] = snapshot_module(
-        self, name, imported[name], projects, cached, valid)
+        self, name, imported[name], projects, cached, valid,
+        normalization_work)
       if is_project and valid then entries[name] = imported[name] end
     end
   end
   if checked_set[root_module] and imported[root_module] == nil then
     modules[#modules + 1] = failed_project_snapshot(projects[root_module])
   end
-  local result = AttemptResult.new(
+  return AttemptResult.new(
     diagnostics, modules, contextual_resolutions, checked, entries, failed)
-  logging.emit("debug", "compiler.attempt.complete", {
-    json.Member.new("root_module", json.from_string(root_module)),
-    json.Member.new("checked_modules", string_array(checked)),
-    json.Member.new("snapshots", json.from_integer(#modules)),
-    json.Member.new("diagnostics", json.from_integer(#diagnostics)),
-    json.Member.new("cpu_ms", json.from_number(
-      logging.elapsed_ms(started))),
-  })
+end
+
+local function emit_attempt_terminal(
+    strategy: compiler_io.CompilerIO, attempt: integer, root_module: string,
+    outcome: string, result: AttemptResult?, debugging: boolean,
+    started_wall: integer, started_cpu: float)
+  local checkpoints = compiler_io.finish_attempt(strategy, attempt)
+  do
+    if debugging then
+      local checked = 0
+      local snapshots = 0
+      local diagnostics = 0
+      if result ~= nil then
+        checked = #result.checked
+        snapshots = #result.modules
+        diagnostics = #result.diagnostics
+      end
+      logging.emit("debug", "compiler.attempt.end", {
+        json.Member.new("attempt", json.from_integer(attempt)),
+        json.Member.new("root_module", json.from_string(root_module)),
+        json.Member.new("outcome", json.from_string(outcome)),
+        json.Member.new("checked_modules", json.from_integer(checked)),
+        json.Member.new("completed_modules", json.from_integer(checkpoints)),
+        json.Member.new("snapshots", json.from_integer(snapshots)),
+        json.Member.new("diagnostics", json.from_integer(diagnostics)),
+        json.Member.new("wall_ms", json.from_number(
+          logging.elapsed_wall_ms(started_wall))),
+        json.Member.new("cpu_ms", json.from_number(
+          logging.elapsed_ms(started_cpu))),
+      })
+    end
+  catch
+  end
+end
+
+local function Compiler:run_attempt(
+    root_module: string, projects: {string: ProjectModule},
+    overrides: {string: value},
+    pending: {string: boolean}, cached: {string: CachedSourceInterface},
+    raw_cached_interfaces: {string: value}): AttemptResult
+  local attempt = compiler_io.begin_attempt(self.io, root_module)
+  local debugging = logging.enabled("debug")
+  local started_cpu = 0.0
+  local started_wall = 0
+  do
+    if debugging then
+      started_cpu = logging.clock()
+      started_wall = logging.wall_clock()
+      logging.emit("debug", "compiler.attempt.start", {
+        json.Member.new("attempt", json.from_integer(attempt)),
+        json.Member.new("root_module", json.from_string(root_module)),
+      })
+    end
+  catch
+    debugging = false
+  end
+
+  local result?: AttemptResult = nil
+  do
+    result = self:run_attempt_inner(
+      root_module, projects, overrides, pending, cached,
+      raw_cached_interfaces)
+  catch
+    local outcome = "failed"
+    if error is async.CancellationReason then outcome = "cancelled" end
+    emit_attempt_terminal(
+      self.io, attempt, root_module, outcome, nil, debugging,
+      started_wall, started_cpu)
+    raise
+  end
+  emit_attempt_terminal(
+    self.io, attempt, root_module, "complete", result, debugging,
+    started_wall, started_cpu)
   return result
 end
 
 function Compiler:analyze_incremental(
     project_modules: {ProjectModule}, dirty_modules: {string},
-    cached_sources: {CachedSourceInterface}): Analysis
+    cached_sources: {CachedSourceInterface},
+    progress_listener: ProgressListener?): Analysis
   local started = logging.clock()
   logging.emit("debug", "compiler.analysis.start", {
     json.Member.new("project_modules", json.from_integer(#project_modules)),
-    json.Member.new("dirty_modules", string_array(dirty_modules)),
+    json.Member.new("dirty_modules", json.from_integer(#dirty_modules)),
     json.Member.new("cached_sources", json.from_integer(#cached_sources)),
   })
   local overrides, projects = project_loader_inputs(project_modules)
   local requested, ordered = requested_modules(dirty_modules, projects)
   local cached, raw_cached_interfaces = cached_source_map(
     cached_sources, projects)
+
+  -- The compiler strategy reports every completed source module, including
+  -- transitive external modules and possible repeats across root attempts.
+  -- Reduce that stream to this request's unique dirty project modules and
+  -- advance by their saved constituent-file counts exactly once.
+  compiler_io.set_checkpoint_listener(self.io, nil)
+  defer compiler_io.set_checkpoint_listener(self.io, nil)
+  local mark_completed: (string) -> () = function (_name: string) end
+  if progress_listener ~= nil then
+    local notify: ProgressListener = progress_listener
+    local file_counts: {string: integer} = {}
+    local total_files = 0
+    for index = 1, #ordered do
+      local name = ordered[index]
+      local count = #projects[name].files
+      file_counts[name] = count
+      total_files = total_files + count
+    end
+    local completed: {string: boolean} = {}
+    local completed_files = 0
+    emit_analysis_progress(notify, 0, total_files)
+    mark_completed = function (module_name: string)
+      if completed[module_name] or not requested[module_name] then return end
+      completed[module_name] = true
+      completed_files = completed_files + file_counts[module_name]
+      emit_analysis_progress(notify, completed_files, total_files)
+    end
+    compiler_io.set_checkpoint_listener(
+      self.io, function (module_name: string?)
+        if module_name ~= nil then mark_completed(module_name) end
+      end)
+  end
   local permit = compiler_scheduler.acquire()
   defer permit:release()
 
@@ -2014,16 +3332,33 @@ function Compiler:analyze_incremental(
   local pending: {string: boolean} = {}
   for index = 1, #ordered do pending[ordered[index]] = true end
   local diagnostics: {Diagnostic} = {}
+  local result_normalization_work = NormalizationWork.new(0)
   local snapshots: {string: ModuleSnapshot} = {}
   local contextual_resolutions: {ContextualResolution} = {}
 
   for index = 1, #ordered do
     local root = ordered[index]
     if pending[root] then
-      local attempt = self:run_attempt(
-        root, projects, overrides, pending, cached,
-        raw_cached_interfaces)
-      append_diagnostics(diagnostics, attempt.diagnostics)
+      local attempt_result?: AttemptResult = nil
+      do
+        attempt_result = self:run_attempt(
+          root, projects, overrides, pending, cached,
+          raw_cached_interfaces)
+      catch
+        -- A non-cancellation compiler failure terminally processes this root
+        -- even when it fails before the driver's normal publish/yield point.
+        -- Cancellation makes no such completion claim.
+        if not (error is async.CancellationReason) then mark_completed(root) end
+        raise
+      end
+      local finished: AttemptResult = attempt_result
+      for checked_index = 1, #finished.checked do
+        mark_completed(finished.checked[checked_index])
+      end
+      if finished.failed[root] then mark_completed(root) end
+      local attempt = finished
+      append_diagnostics(
+        diagnostics, attempt.diagnostics, result_normalization_work)
       for module_index = 1, #attempt.modules do
         local snapshot = attempt.modules[module_index]
         snapshots[snapshot.module_name] = snapshot

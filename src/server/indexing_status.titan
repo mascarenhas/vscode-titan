@@ -12,6 +12,8 @@ record Status
   const epoch: integer
   const generation: integer?
   const message: string?
+  const completed_files: integer?
+  const total_files: integer?
 end
 
 type Listener = (Status) -> ()
@@ -24,7 +26,27 @@ function state_name(state: State): string
   end
 end
 
+local function validate_progress(status: Status)
+  local completed? = status.completed_files
+  local total? = status.total_files
+  if completed == nil and total == nil then return end
+  if completed == nil or total == nil then
+    raise "indexing progress requires completed_files and total_files"
+  end
+  if state_name(status.state) ~= "indexing" then
+    raise "indexing progress is only valid while indexing"
+  end
+  if completed < 0 or total < 0 or
+     completed > 9007199254740991 or total > 9007199254740991 then
+    raise "indexing progress must use nonnegative safe integers"
+  end
+  if completed > total then
+    raise "indexing progress cannot exceed total_files"
+  end
+end
+
 function notification(status: Status): string
+  validate_progress(status)
   local params: {json.Member} = {
     json.Member.new("state", json.from_string(state_name(status.state))),
     json.Member.new("initial", json.from_boolean(status.initial)),
@@ -37,6 +59,12 @@ function notification(status: Status): string
   if status.message ~= nil then
     params[#params + 1] = json.Member.new(
       "message", json.from_string(status.message))
+  end
+  if status.completed_files ~= nil then
+    params[#params + 1] = json.Member.new(
+      "completed_files", json.from_integer(status.completed_files))
+    params[#params + 1] = json.Member.new(
+      "total_files", json.from_integer(status.total_files))
   end
   return json.encode(json.from_object({
     json.Member.new("jsonrpc", json.from_string("2.0")),

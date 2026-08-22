@@ -1,6 +1,7 @@
 local async = import "async"
 local fs = import "fs"
 local strings = import "string"
+local timer = import "timer"
 
 -- These directories are the complete watch authority for one project. Callers
 -- discover them from the project source/configuration roots; this module never
@@ -196,16 +197,39 @@ local function ProjectWatcher:report_poll_failure(failure: value)
 end
 
 local function ProjectWatcher:poll_loop(): nil
+  local retry_delay = 25
   while not self.stopped and #self.active_order > 0 do
     local events: {BackendEvent}? = nil
     do
       events = self.backend.poll()
     catch
+      if self.poll_cancel_expected or self.stopped then
+        self.poll_task = nil
+        return nil
+      end
       self:report_poll_failure(error)
-      self.poll_task = nil
-      return nil
+      -- A transient backend error must not silently retire all saved-file
+      -- invalidation, while a persistent error must not spin at full speed.
+      -- timer.sleep is cancellable, so reconcile/close can still join promptly.
+      do
+        timer.sleep(retry_delay)
+      catch
+        if error is async.CancellationReason and
+           (self.poll_cancel_expected or self.stopped) then
+          self.poll_task = nil
+          return nil
+        end
+        raise
+      end
+      if retry_delay < 1000 then
+        retry_delay = retry_delay * 2
+        if retry_delay > 1000 then retry_delay = 1000 end
+      end
     end
-    self:publish(events)
+    if events ~= nil then
+      retry_delay = 25
+      self:publish(events)
+    end
   end
   self.poll_task = nil
   return nil

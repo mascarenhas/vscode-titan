@@ -10,6 +10,7 @@ local configured_rank = 0
 local configured_name = "off"
 local output: response_queue.ResponseQueue? = nil
 local writer: async.Task<nil, value>? = nil
+local STRING_SAMPLE_LIMIT = 8
 
 local function level_rank(level: string): integer?
   if level == "off" then return 0 end
@@ -46,6 +47,37 @@ end
 
 function elapsed_ms(started: float): float
   return (os.clock() - started) * 1000.0
+end
+
+-- Calendar seconds are coarse but portable. VS Code adds millisecond receive
+-- timestamps, while this server-side value measures multi-second indexing
+-- phases even when CPU time excludes async waits and compiler child processes.
+function wall_clock(): integer
+  return os.time()
+end
+
+function elapsed_wall_ms(started: integer): float
+  local elapsed = wall_clock() - started
+  if elapsed < 0 then return 0.0 end
+  return elapsed * 1000.0
+end
+
+-- Debug records must stay useful without becoming proportional to the size of
+-- a large project. Keep both the encoded record and the eager work performed
+-- by a disabled logging call bounded while retaining the complete item count.
+function summarize_strings(items: {string}): json.Value
+  local sample: {json.Value} = {}
+  local limit = #items
+  if limit > STRING_SAMPLE_LIMIT then limit = STRING_SAMPLE_LIMIT end
+  for index = 1, limit do
+    sample[index] = json.from_string(items[index])
+  end
+  return json.from_object({
+    json.Member.new("count", json.from_integer(#items)),
+    json.Member.new("sample", json.from_array(sample)),
+    json.Member.new("truncated", json.from_boolean(
+      #items > STRING_SAMPLE_LIMIT)),
+  })
 end
 
 local function write_records(queue: response_queue.ResponseQueue): nil

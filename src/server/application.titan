@@ -39,9 +39,21 @@ end
 
 type RenameAnalyzer = (
   project_service.Snapshot, {bridge.ProjectModule}) -> bridge.Analysis
+type ProjectLoader = (
+  string, bridge.ProgressListener?, project_service.SnapshotListener?) ->
+  (project_service.Service?, project_service.Error?)
+
+local record RefreshChain
+  const id: integer
+  const reason: string
+  const first_pass: integer
+  const started_wall: integer
+  const started_cpu: float
+end
 
 record Application
   local const project_root: string
+  local const project_loader: ProjectLoader
   local service: project_service.Service?
   local watcher: project_watcher.ProjectWatcher?
   local watch_filter: WatchFilter?
@@ -50,8 +62,10 @@ record Application
   local refresh_failure: Error?
   local change_epoch: integer
   local completed_epoch: integer
-  local refresh_chain_active: boolean
+  local active_refresh_epoch: integer?
+  local refresh_chain: RefreshChain?
   local refresh_chain_initial: boolean
+  local refresh_chains: integer
   local refresh_passes: integer
   local view_builds: integer
   local indexing_listener: indexing_status.Listener?
@@ -64,6 +78,7 @@ end
 local record IndexingMetrics
   const refresh_passes: integer
   const view_builds: integer
+  const refresh_chain_active: boolean
 end
 
 local INVALID_PARAMS = -32602
@@ -146,10 +161,28 @@ local function titan_source_path(path: string): boolean
   return #path >= 6 and strings.sub(path, #path - 5) == ".titan"
 end
 
+local MAX_LOGGED_WATCH_PATHS = 32
+local MAX_LOGGED_MESSAGE_BYTES = 4096
+
+local function bounded_log_message(message: string): string
+  if #message <= MAX_LOGGED_MESSAGE_BYTES then return message end
+  local finish = MAX_LOGGED_MESSAGE_BYTES - 3
+  -- Avoid cutting a well-formed UTF-8 scalar before JSON encoding. Invalid
+  -- input still remains best-effort and is rejected by logging.format.
+  while finish > 0 do
+    local following = strings.byte(message, finish + 1)
+    if following < 128 or following > 191 then break end
+    finish = finish - 1
+  end
+  return strings.sub(message, 1, finish) .. "..."
+end
+
 local function watch_path_array(changes: {project_watcher.PathChange}):
     json.Value
   local values: {json.Value} = {}
-  for index = 1, #changes do
+  local limit = #changes
+  if limit > MAX_LOGGED_WATCH_PATHS then limit = MAX_LOGGED_WATCH_PATHS end
+  for index = 1, limit do
     values[index] = json.from_string(
       project_watcher.change_path(changes[index]))
   end
@@ -214,6 +247,26 @@ local function build_watch_filter(snapshot: project_service.Snapshot):
     known_directories[rebase_path(
       directory, source_root, canonical_source_root)] = true
   end
+  return WatchFilter.new(
+    source_roots, configuration_paths, known_directories)
+end
+
+-- A failed configuration load or source discovery cannot provide a Snapshot
+-- from which to derive the full watcher scope. Keep the project directory and
+-- its conventional configuration path observable from before the first load;
+-- a later save can then repair the project without requiring an unrelated LSP
+-- request to retry indexing.
+local function provisional_watch_filter(project_root: string): WatchFilter
+  local expected_config = child_path(project_root, "titan-config.lua")
+  local configuration_paths: {string: boolean} = {}
+  configuration_paths[expected_config] = true
+  configuration_paths[canonical_file_path(expected_config)] = true
+  local source_roots = {project_root}
+  local canonical_root = canonical_directory(project_root)
+  if canonical_root ~= project_root then source_roots[2] = canonical_root end
+  local known_directories: {string: boolean} = {}
+  known_directories[project_root] = true
+  known_directories[canonical_root] = true
   return WatchFilter.new(
     source_roots, configuration_paths, known_directories)
 end
@@ -332,7 +385,10 @@ local function Application:watch_callback(
   end
   if logging.enabled("debug") then
     logging.emit("debug", "project.watch.batch", {
+      json.Member.new("changes", json.from_integer(#batch.changes)),
       json.Member.new("paths", watch_path_array(batch.changes)),
+      json.Member.new("paths_truncated", json.from_boolean(
+        #batch.changes > MAX_LOGGED_WATCH_PATHS)),
       json.Member.new("failures", json.from_integer(#batch.failures)),
       json.Member.new("watch_set_changed", json.from_boolean(
         batch.watch_set_changed)),
@@ -360,7 +416,19 @@ function Application:note_saved_change()
     json.Member.new("refresh_active", json.from_boolean(
       self.refresh_task ~= nil)),
   })
-  self:start_indexing()
+  self:start_refresh(false, "saved_change")
+end
+
+local function Application:ensure_provisional_watcher()
+  if self.watcher ~= nil then return end
+  -- Publish the filter before starting the poll Task so even a callback on the
+  -- first scheduler turn classifies project-root noise conservatively.
+  self.watch_filter = provisional_watch_filter(self.project_root)
+  self.watcher = project_watcher.start(
+    project_watcher.DirectoryScope.new({}, {self.project_root}),
+    function (batch: project_watcher.RediscoveryBatch)
+      self:watch_callback(batch)
+    end)
 end
 
 local function Application:reconcile_watcher(
@@ -387,11 +455,14 @@ end
 local function Application:install_view(
     snapshot: project_service.Snapshot): View
   self.view_builds = self.view_builds + 1
+  -- Establish the saved-tree watcher before any validation or yielding semantic
+  -- view construction. A failed initial compiler snapshot must still be able to
+  -- observe the save which repairs it.
+  self:reconcile_watcher(snapshot)
   local projects, snapshots = project_inputs(snapshot)
   local view = View.new(
     snapshot, semantic_features.build_with_yield(
       projects, snapshots, function () async.yield() end))
-  self:reconcile_watcher(snapshot)
   return view
 end
 
@@ -399,8 +470,15 @@ local function Application:refresh_once(): RefreshOutcome
   do
     local service? = self.service
     if service == nil then
-      local loaded?, load_error? = project_service.load_default(
-        self.project_root)
+      self:ensure_provisional_watcher()
+      local loaded?, load_error? = self.project_loader(
+        self.project_root,
+        function (progress: bridge.AnalysisProgress)
+          self:emit_compiler_progress(progress)
+        end,
+        function (snapshot: project_service.Snapshot)
+          self:reconcile_watcher(snapshot)
+        end)
       if loaded == nil then
         local message = "cannot load Titan project"
         if load_error ~= nil then
@@ -412,7 +490,10 @@ local function Application:refresh_once(): RefreshOutcome
       return RefreshOutcome.ready(self:install_view(loaded:latest()))
     end
 
-    local report?, refresh_error? = service:refresh()
+    local report?, refresh_error? = service:refresh_with_snapshot_listener(
+      function (snapshot: project_service.Snapshot)
+        self:reconcile_watcher(snapshot)
+      end)
     if report == nil then
       local message = "cannot refresh Titan project"
       if refresh_error ~= nil then
@@ -444,28 +525,93 @@ local function Application:status_generation(): integer?
 end
 
 local function Application:emit_indexing_status(
-    state: indexing_status.State, message: string?)
+    state: indexing_status.State, message: string?,
+    completed_files: integer?, total_files: integer?)
   if self.closed then return end
   local listener? = self.indexing_listener
   if listener == nil then return end
+  local epoch = self.change_epoch
+  if indexing_status.state_name(state) == "indexing" and
+     self.active_refresh_epoch ~= nil then
+    epoch = self.active_refresh_epoch
+  end
   listener(indexing_status.Status.new(
-    state, self.refresh_chain_initial, self.change_epoch,
-    self:status_generation(), message))
+    state, self.refresh_chain_initial, epoch,
+    self:status_generation(), message, completed_files, total_files))
 end
 
-local function Application:begin_refresh_chain()
-  if self.refresh_chain_active then return end
-  self.refresh_chain_active = true
+local function Application:emit_compiler_progress(
+    progress: bridge.AnalysisProgress)
+  -- A compiler can outlive its owning protocol listener while close/cancel is
+  -- unwinding. Only an active refresh pass may publish progress.
+  if self.refresh_chain == nil or self.active_refresh_epoch == nil then return end
+  self:emit_indexing_status(
+    indexing_status.State.indexing(), nil,
+    progress.completed_files, progress.total_files)
+end
+
+local function Application:begin_refresh_chain(reason: string)
+  if self.refresh_chain ~= nil then return end
   self.refresh_chain_initial = self.completed_view == nil
-  logging.emit("debug", "indexing.chain.start", {
+  local first_pass = self.refresh_passes
+  self.refresh_chains = self.refresh_chains + 1
+  local chain = RefreshChain.new(
+    self.refresh_chains, reason, first_pass, logging.wall_clock(),
+    logging.clock())
+  self.refresh_chain = chain
+  logging.emit("info", "indexing.chain.start", {
+    json.Member.new("chain", json.from_integer(chain.id)),
+    json.Member.new("reason", json.from_string(chain.reason)),
     json.Member.new("epoch", json.from_integer(self.change_epoch)),
     json.Member.new("initial", json.from_boolean(
       self.refresh_chain_initial)),
   })
-  self:emit_indexing_status(indexing_status.State.indexing(), nil)
+  self:emit_indexing_status(indexing_status.State.indexing(), nil, nil, nil)
 end
 
-local function Application:start_refresh(force: boolean):
+local function Application:complete_refresh_chain(
+    outcome: string, attempted_epoch: integer, message: string?)
+  local chain? = self.refresh_chain
+  if chain == nil then return end
+  -- Clear control state before best-effort telemetry. A platform clock or
+  -- malformed diagnostic field must never keep a completed chain active.
+  self.refresh_chain = nil
+  do
+    local fields: {json.Member} = {
+      json.Member.new("chain", json.from_integer(chain.id)),
+      json.Member.new("reason", json.from_string(chain.reason)),
+      json.Member.new("outcome", json.from_string(outcome)),
+      json.Member.new("initial", json.from_boolean(
+        self.refresh_chain_initial)),
+      json.Member.new("attempted_epoch", json.from_integer(
+        attempted_epoch)),
+      json.Member.new("completed_epoch", json.from_integer(
+        self.completed_epoch)),
+      json.Member.new("pending_epoch", json.from_integer(self.change_epoch)),
+      json.Member.new("passes", json.from_integer(
+        self.refresh_passes - chain.first_pass)),
+      json.Member.new("wall_ms", json.from_number(
+        logging.elapsed_wall_ms(chain.started_wall))),
+      json.Member.new("cpu_ms", json.from_number(
+        logging.elapsed_ms(chain.started_cpu))),
+    }
+    local generation? = self:status_generation()
+    if generation ~= nil then
+      fields[#fields + 1] = json.Member.new(
+        "generation", json.from_integer(generation))
+    end
+    if message ~= nil then
+      fields[#fields + 1] = json.Member.new(
+        "message", json.from_string(bounded_log_message(message)))
+    end
+    local level = "info"
+    if outcome == "failed" then level = "error" end
+    logging.emit(level, "indexing.chain.complete", fields)
+  catch
+  end
+end
+
+local function Application:start_refresh(force: boolean, reason: string):
     async.Task<RefreshOutcome, value>?
   if self.closed or self.refresh_task ~= nil then return self.refresh_task end
   if not force and self.completed_view ~= nil and
@@ -473,31 +619,52 @@ local function Application:start_refresh(force: boolean):
     return nil
   end
 
-  self:begin_refresh_chain()
   local target_epoch = self.change_epoch
+  self.active_refresh_epoch = target_epoch
+  self:begin_refresh_chain(reason)
+  if reason == "coalesced_follow_up" then
+    -- A refresh chain stays continuously busy, but progress belongs to one
+    -- exact saved epoch/workset. Clear the preceding pass's N/M immediately so
+    -- the client cannot display a completed old workset during this scan.
+    self:emit_indexing_status(indexing_status.State.indexing(), nil, nil, nil)
+  end
+  local chain = self.refresh_chain as RefreshChain
   local task = async.run<RefreshOutcome, value>(function (): RefreshOutcome
     local started = logging.clock()
     self.refresh_passes = self.refresh_passes + 1
     logging.emit("debug", "indexing.pass.start", {
+      json.Member.new("chain", json.from_integer(chain.id)),
+      json.Member.new("chain_reason", json.from_string(chain.reason)),
+      json.Member.new("trigger", json.from_string(reason)),
       json.Member.new("epoch", json.from_integer(target_epoch)),
       json.Member.new("force", json.from_boolean(force)),
       json.Member.new("pass", json.from_integer(self.refresh_passes)),
+      json.Member.new("follow_up", json.from_boolean(
+        self.refresh_passes > chain.first_pass + 1)),
     })
     local outcome: RefreshOutcome? = nil
     do
       outcome = self:refresh_once()
     catch
       self.refresh_task = nil
-      self.refresh_chain_active = false
-      if error is async.CancellationReason then raise end
+      self.active_refresh_epoch = nil
+      if error is async.CancellationReason then
+        self:complete_refresh_chain("cancelled", target_epoch, nil)
+        raise
+      end
+      -- Preserve the original exceptional value. Its normalization is not
+      -- allowed to become another failure merely to enrich telemetry.
+      self:complete_refresh_chain("failed", target_epoch, nil)
       raise
     end
 
     local completed = outcome as RefreshOutcome
     local outcome_name = "unknown"
+    local outcome_message: string? = nil
     case completed
     when failure: failure then
       outcome_name = "failed"
+      outcome_message = failure.message
       self.refresh_failure = failure
     when ready: view then
       outcome_name = "ready"
@@ -510,6 +677,8 @@ local function Application:start_refresh(force: boolean):
     end
 
     logging.emit("debug", "indexing.pass.complete", {
+      json.Member.new("chain", json.from_integer(chain.id)),
+      json.Member.new("trigger", json.from_string(reason)),
       json.Member.new("epoch", json.from_integer(target_epoch)),
       json.Member.new("outcome", json.from_string(outcome_name)),
       json.Member.new("pending_epoch", json.from_integer(self.change_epoch)),
@@ -518,13 +687,15 @@ local function Application:start_refresh(force: boolean):
     })
 
     self.refresh_task = nil
+    self.active_refresh_epoch = nil
     if not self.closed and self.change_epoch > target_epoch then
       -- Start at most one next-turn pass for every burst. Epoch comparison,
       -- rather than clearing a boolean, preserves a hint delivered at any
       -- yielding point in scan, analysis, view construction, or reconciliation.
-      self:start_refresh(false)
+      self:start_refresh(false, "coalesced_follow_up")
     else
-      self.refresh_chain_active = false
+      self:complete_refresh_chain(
+        outcome_name, target_epoch, outcome_message)
       case completed
       when failure: failure then
         self:emit_indexing_status(
@@ -542,7 +713,7 @@ end
 -- Idempotently ensure that the initial or watcher-requested index is running.
 -- The initialized lifecycle hook calls this without waiting for project I/O.
 function Application:start_indexing()
-  self:start_refresh(false)
+  self:start_refresh(false, "initialized")
 end
 
 function Application:set_indexing_listener(listener: indexing_status.Listener?)
@@ -550,13 +721,24 @@ function Application:set_indexing_listener(listener: indexing_status.Listener?)
 end
 
 local function Application:indexing_metrics(): IndexingMetrics
-  return IndexingMetrics.new(self.refresh_passes, self.view_builds)
+  return IndexingMetrics.new(
+    self.refresh_passes, self.view_builds, self.refresh_chain ~= nil)
 end
 
 local function Application:snapshot_for_testing(): project_service.Snapshot?
   local service? = self.service
   if service == nil then return nil end
   return service:latest()
+end
+
+local function Application:watched_directories_for_testing(): {string}
+  local watcher? = self.watcher
+  if watcher == nil then return {} end
+  return watcher:watched_directories()
+end
+
+local function Application:change_epoch_for_testing(): integer
+  return self.change_epoch
 end
 
 local function Application:stop_watching_for_testing()
@@ -599,7 +781,7 @@ local function Application:current_view(): (View?, Error?)
   -- Each request starts a shared background revalidation for intentionally
   -- unwatched external inputs. It never waits: use the latest completed View,
   -- or let the feature return its empty/null result during the initial index.
-  self:start_refresh(true)
+  self:start_refresh(true, "semantic_request")
   local failure? = self.refresh_failure
   if failure ~= nil then return nil, failure end
   local completed? = self.completed_view
@@ -618,7 +800,7 @@ local function Application:fresh_view(): (View?, Error?)
     return nil, Error.new("language server application is closed")
   end
   local task? = self.refresh_task
-  if task == nil then task = self:start_refresh(true) end
+  if task == nil then task = self:start_refresh(true, "rename") end
   if task == nil then
     local completed? = self.completed_view
     if completed ~= nil then return completed, nil end
@@ -800,8 +982,8 @@ end
 
 function create(project_root: string): Application
   return Application.new(
-    project_root, nil, nil, nil, nil, nil, nil, 1, 0, false, false, 0, 0, nil,
-    false, default_rename_analyzer)
+    project_root, project_service.load_default, nil, nil, nil, nil, nil, nil,
+    1, 0, nil, nil, false, 0, 0, 0, nil, false, default_rename_analyzer)
 end
 
 -- Dependency-injected constructor used by the project/application integration
@@ -810,8 +992,8 @@ end
 function create_with_service(project_root: string,
                              service: project_service.Service): Application
   local application = Application.new(
-    project_root, service, nil, nil, nil, nil, nil, 0, 0, false, false, 0, 0,
-    nil, false,
+    project_root, project_service.load_default, service, nil, nil, nil, nil,
+    nil, 0, 0, nil, nil, false, 0, 0, 0, nil, false,
     default_rename_analyzer)
   application.completed_view = application:install_view(service:latest())
   return application
@@ -822,16 +1004,27 @@ end
 local function create_unindexed_with_service(
     project_root: string, service: project_service.Service): Application
   return Application.new(
-    project_root, service, nil, nil, nil, nil, nil, 1, 0, false, false, 0, 0,
-    nil, false, default_rename_analyzer)
+    project_root, project_service.load_default, service, nil, nil, nil, nil,
+    nil, 1, 0, nil, nil, false, 0, 0, 0, nil, false,
+    default_rename_analyzer)
+end
+
+-- Source-imported application tests use an analyzer-backed loader to exercise
+-- the complete cold-start watcher boundary without loading process-global
+-- compiler Lua modules.
+local function create_with_project_loader(
+    project_root: string, project_loader: ProjectLoader): Application
+  return Application.new(
+    project_root, project_loader, nil, nil, nil, nil, nil, nil, 1, 0, nil,
+    nil, false, 0, 0, 0, nil, false, default_rename_analyzer)
 end
 
 function create_with_service_and_rename_analyzer(
     project_root: string, service: project_service.Service,
     rename_analyzer: RenameAnalyzer): Application
   local application = Application.new(
-    project_root, service, nil, nil, nil, nil, nil, 0, 0, false, false, 0, 0,
-    nil, false,
+    project_root, project_service.load_default, service, nil, nil, nil, nil,
+    nil, 0, 0, nil, nil, false, 0, 0, 0, nil, false,
     rename_analyzer)
   application.completed_view = application:install_view(service:latest())
   return application
@@ -861,6 +1054,7 @@ function Application:close()
   self.closed = true
   self.indexing_listener = nil
 
+  local attempted_epoch? = self.active_refresh_epoch
   local refresh? = self.refresh_task
   if refresh ~= nil then
     if not refresh:status():has_finished() then
@@ -870,6 +1064,12 @@ function Application:close()
     async.join(refresh)
     self.refresh_task = nil
   end
+  if self.refresh_chain ~= nil then
+    if attempted_epoch == nil then attempted_epoch = self.change_epoch end
+    self:complete_refresh_chain(
+      "cancelled", attempted_epoch as integer, nil)
+  end
+  self.active_refresh_epoch = nil
 
   local watcher? = self.watcher
   self.watcher = nil

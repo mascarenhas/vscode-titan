@@ -271,6 +271,76 @@ suite("Titan extension", () => {
       betaGloballyReconfigured[6].pid,
       betaReadded[3].pid
     );
+
+    await vscode.workspace.getConfiguration(
+      "titan.languageServer",
+      alpha.uri
+    ).update(
+      "logLevel",
+      "trace",
+      vscode.ConfigurationTarget.WorkspaceFolder
+    );
+
+    const alphaLogReconfigured = await assertStableEventSequence(
+      alphaMarkerPath,
+      [
+        "initialize",
+        "shutdown",
+        "exit",
+        "initialize",
+        "shutdown",
+        "exit",
+        "initialize",
+        "shutdown",
+        "exit",
+        "initialize"
+      ]
+    );
+    assert.equal(alphaLogReconfigured[9].serverLogLevel, "trace");
+    assert.notEqual(
+      alphaLogReconfigured[9].pid,
+      alphaGloballyReconfigured[6].pid
+    );
+    await assertStableEventSequence(
+      betaMarkerPath,
+      [
+        "initialize",
+        "shutdown",
+        "exit",
+        "initialize",
+        "shutdown",
+        "exit",
+        "initialize"
+      ]
+    );
+
+    await vscode.workspace.getConfiguration(
+      "titan.languageServer",
+      alpha.uri
+    ).update(
+      "logLevel",
+      undefined,
+      vscode.ConfigurationTarget.WorkspaceFolder
+    );
+    const alphaLogRestored = await assertStableEventSequence(
+      alphaMarkerPath,
+      [
+        "initialize",
+        "shutdown",
+        "exit",
+        "initialize",
+        "shutdown",
+        "exit",
+        "initialize",
+        "shutdown",
+        "exit",
+        "initialize",
+        "shutdown",
+        "exit",
+        "initialize"
+      ]
+    );
+    assert.equal(alphaLogRestored[12].serverLogLevel, "info");
   });
 
   test("enables protocol tracing without restarting workspace clients",

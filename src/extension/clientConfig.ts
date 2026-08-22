@@ -9,6 +9,8 @@ export const SERVER_LOG_LEVEL_ENVIRONMENT_VARIABLE =
 
 export type ServerLogLevel = "off" | "error" | "info" | "debug" | "trace";
 
+export const DEFAULT_SERVER_LOG_LEVEL: ServerLogLevel = "debug";
+
 const SERVER_LOG_LEVELS = new Set<ServerLogLevel>([
   "off",
   "error",
@@ -47,7 +49,7 @@ export class ServerConfigurationError extends Error {
 export function readServerConfiguration(
   configuredPath: unknown,
   configuredArguments: unknown,
-  configuredLogLevel: unknown = "info"
+  configuredLogLevel: unknown = DEFAULT_SERVER_LOG_LEVEL
 ): ServerConfiguration {
   if (typeof configuredPath !== "string") {
     throw new ServerConfigurationError(
@@ -174,7 +176,7 @@ export function createServerLaunchOptions(
     luaPath: "",
     luaCPath: ""
   },
-  logLevel: ServerLogLevel = "info"
+  logLevel: ServerLogLevel = DEFAULT_SERVER_LOG_LEVEL
 ): ServerLaunchOptions {
   const childEnvironment = { ...environment };
   childEnvironment[SERVER_LOG_LEVEL_ENVIRONMENT_VARIABLE] = logLevel;
@@ -193,6 +195,14 @@ export function createServerLaunchOptions(
       env: childEnvironment
     }
   };
+}
+
+export function formatServerStartup(
+  command: string,
+  logLevel: ServerLogLevel
+): string {
+  return `Starting Titan language server: ${command} ` +
+    `(configured server log emission: ${logLevel})`;
 }
 
 export function formatStartupError(

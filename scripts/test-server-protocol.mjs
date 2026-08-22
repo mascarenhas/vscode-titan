@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { pathToFileURL } from "node:url";
@@ -38,6 +38,7 @@ class FrameReader {
     this.indexingStatuses = [];
     this.indexingStatusCursor = 0;
     this.lastIndexingEpoch = undefined;
+    this.lastIndexingProgress = [];
   }
 
   async read(milliseconds = 5_000) {
@@ -89,6 +90,32 @@ function collect(stream) {
   return () => Buffer.concat(chunks);
 }
 
+async function makePhysicalTemporaryRoot(prefix) {
+  // The standalone server indexes from its physical process cwd. Keep request
+  // URIs in that same namespace on hosts where os.tmpdir() traverses a
+  // directory symlink (the VS Code client performs this mapping itself).
+  return realpath(await mkdtemp(path.join(os.tmpdir(), prefix)));
+}
+
+function structuredLogRecords(buffer) {
+  const prefix = "titan-language-server ";
+  const output = buffer.toString("utf8");
+  assert.ok(output.endsWith("\n"), "structured stderr lacked a final newline");
+  const lines = output.slice(0, -1).split("\n");
+  assert.ok(lines.length > 0, "server emitted no structured stderr records");
+  return lines.map((line) => {
+    assert.ok(
+      line.startsWith(prefix),
+      `server emitted unstructured stderr: ${line}`
+    );
+    const record = JSON.parse(line.slice(prefix.length));
+    assert.ok(record !== null && typeof record === "object");
+    assert.equal(typeof record.level, "string");
+    assert.equal(typeof record.event, "string");
+    return record;
+  });
+}
+
 function launch(cwd = process.cwd(), logLevel = "off") {
   return spawn(path.resolve(server), [], {
     cwd,
@@ -134,6 +161,25 @@ function validateIndexingStatus(status) {
   if (status.message !== undefined) {
     assert.equal(typeof status.message, "string");
   }
+  const hasCompleted = status.completed_files !== undefined;
+  const hasTotal = status.total_files !== undefined;
+  assert.equal(
+    hasCompleted,
+    hasTotal,
+    "indexing status supplied only one saved-file progress field"
+  );
+  if (hasCompleted) {
+    assert.equal(
+      status.state,
+      "indexing",
+      "terminal indexing status retained saved-file progress"
+    );
+    assert.ok(Number.isSafeInteger(status.completed_files));
+    assert.ok(Number.isSafeInteger(status.total_files));
+    assert.ok(status.completed_files >= 0);
+    assert.ok(status.total_files >= 0);
+    assert.ok(status.completed_files <= status.total_files);
+  }
 }
 
 async function nextIndexingStatus(responses) {
@@ -161,18 +207,59 @@ async function waitForIndexing(
   let acceptedCycles = 0;
   while (acceptedCycles < cycleCount) {
     let indexing;
+    let activeWorkset;
+    const progress = [];
     while (true) {
       const status = await nextIndexingStatus(responses);
       if (status.state === "indexing") {
-        assert.equal(indexing, undefined, "indexing cycle emitted busy twice");
         assert.equal(status.message, undefined);
-        indexing = status;
+        if (indexing === undefined) {
+          assert.equal(status.completed_files, undefined);
+          assert.equal(status.total_files, undefined);
+          indexing = status;
+          continue;
+        }
+
+        assert.equal(status.initial, indexing.initial);
+        assert.ok(status.epoch >= indexing.epoch);
+        if (status.completed_files === undefined) {
+          assert.ok(
+            status.epoch > indexing.epoch,
+            "bare busy reset did not advance the saved epoch"
+          );
+          if (activeWorkset !== undefined) {
+            assert.ok(
+              status.epoch > activeWorkset.epoch,
+              "bare busy reset retained the preceding workset epoch"
+            );
+          }
+          indexing = status;
+          activeWorkset = undefined;
+          continue;
+        }
+        if (status.completed_files === 0) {
+          activeWorkset = {
+            epoch: status.epoch,
+            total: status.total_files,
+            completed: 0
+          };
+        } else {
+          assert.ok(activeWorkset, "workset progress lacked an initial 0/M");
+          assert.equal(status.epoch, activeWorkset.epoch);
+          assert.equal(status.total_files, activeWorkset.total);
+          assert.ok(status.completed_files >= activeWorkset.completed);
+          activeWorkset.completed = status.completed_files;
+        }
+        progress.push(status);
         continue;
       }
 
       assert.ok(indexing, "indexing completion lacked busy status");
       assert.equal(status.initial, indexing.initial);
       assert.ok(status.epoch >= indexing.epoch);
+      if (progress.length > 0) {
+        assert.ok(status.epoch >= progress[progress.length - 1].epoch);
+      }
       if (status.state === "failed") {
         assert.equal(typeof status.message, "string");
         assert.ok(status.message.length > 0);
@@ -190,6 +277,7 @@ async function waitForIndexing(
         break;
       }
       assert.equal(status.state, expectedState);
+      responses.lastIndexingProgress = progress;
       terminal = status;
       acceptedCycles += 1;
       break;
@@ -198,8 +286,41 @@ async function waitForIndexing(
   return terminal;
 }
 
+async function testCoalescedIndexingResetStatus() {
+  const responses = {
+    indexingStatuses: [
+      { state: "indexing", initial: true, epoch: 7 },
+      {
+        state: "indexing", initial: true, epoch: 7,
+        completed_files: 0, total_files: 2
+      },
+      {
+        state: "indexing", initial: true, epoch: 7,
+        completed_files: 2, total_files: 2
+      },
+      { state: "indexing", initial: true, epoch: 8 },
+      {
+        state: "indexing", initial: true, epoch: 8,
+        completed_files: 0, total_files: 1
+      },
+      {
+        state: "indexing", initial: true, epoch: 8,
+        completed_files: 1, total_files: 1
+      },
+      { state: "ready", initial: true, epoch: 8, generation: 2 }
+    ],
+    indexingStatusCursor: 0,
+    lastIndexingEpoch: undefined,
+    lastIndexingProgress: []
+  };
+  const terminal = await waitForIndexing(responses);
+  assert.equal(terminal.epoch, 8);
+  assert.equal(responses.lastIndexingProgress.at(-1).completed_files, 1);
+  assert.equal(responses.indexingStatusCursor, responses.indexingStatuses.length);
+}
+
 async function testLifecycle() {
-  const root = await mkdtemp(path.join(os.tmpdir(), "vscode-titan-lazy-"));
+  const root = await makePhysicalTemporaryRoot("vscode-titan-lazy-");
   // Lifecycle-only sessions must not touch project configuration or load the
   // compiler. This file intentionally fails if the lazy boundary regresses.
   await writeFile(
@@ -330,7 +451,7 @@ async function writeSavedGeneration(
 }
 
 async function testSavedProjectSemantics() {
-  const root = await mkdtemp(path.join(os.tmpdir(), "vscode-titan-project-"));
+  const root = await makePhysicalTemporaryRoot("vscode-titan-project-");
   const filename = path.join(root, "sample.titan");
   const sourceLines = [
     "function answer(item: integer): integer",
@@ -470,11 +591,11 @@ async function testSavedProjectSemantics() {
     );
     assert.equal(coercionHover.result.contents.kind, "markdown");
     assert.match(coercionHover.result.contents.value,
-      /Inferred type: `integer`/);
+      /Type: `integer`/);
     assert.match(coercionHover.result.contents.value,
-      /Original type: `integer`/);
-    assert.match(coercionHover.result.contents.value,
-      /Coerced type: `float`/);
+      /Cast to: `float`/);
+    assert.doesNotMatch(coercionHover.result.contents.value,
+      /Inferred type|Declared type|Original type|Coerced type/);
     assert.match(coercionHover.result.contents.value, /Declaration: local/);
     assert.deepEqual(coercionHover.result.range, {
       start: { line: 7, character: coercedItem },
@@ -573,7 +694,7 @@ async function testSavedProjectSemantics() {
 }
 
 async function testConfigCannotWriteProtocolStdout() {
-  const root = await mkdtemp(path.join(os.tmpdir(), "vscode-titan-config-"));
+  const root = await makePhysicalTemporaryRoot("vscode-titan-config-");
   const filename = path.join(root, "sample.titan");
   await writeFile(filename, "function answer(): integer return 42 end\n", "utf8");
   await writeFile(
@@ -629,7 +750,7 @@ async function testConfigCannotWriteProtocolStdout() {
 }
 
 async function testCrossModuleFolderAndIncrementalSemantics() {
-  const root = await mkdtemp(path.join(os.tmpdir(), "vscode-titan-modules-"));
+  const root = await makePhysicalTemporaryRoot("vscode-titan-modules-");
   const sourceRoot = path.join(root, "src");
   const libraryRoot = path.join(sourceRoot, "library");
   await mkdir(libraryRoot, { recursive: true });
@@ -805,6 +926,168 @@ async function testCrossModuleFolderAndIncrementalSemantics() {
   }
 }
 
+async function testDebugCompilerProgress() {
+  const root = await makePhysicalTemporaryRoot("vscode-titan-progress-");
+  const moduleRoot = path.join(root, "sample");
+  await mkdir(moduleRoot);
+  await writeFile(
+    path.join(moduleRoot, "sample.titan"),
+    "function answer(): integer return 42 end\n",
+    "utf8"
+  );
+  await writeFile(
+    path.join(moduleRoot, "part.titan"),
+    "function doubled(): integer return answer() * 2 end\n",
+    "utf8"
+  );
+
+  const child = launch(root, "debug");
+  const exit = exitOf(child);
+  const stderr = collect(child.stderr);
+  const responses = new FrameReader(child.stdout);
+  try {
+    await request(child, responses, 1, "initialize", {});
+    child.stdin.write(frame({
+      jsonrpc: "2.0",
+      method: "initialized",
+      params: {}
+    }));
+    await waitForIndexing(responses);
+    assert.ok(
+      responses.lastIndexingProgress.some((status) =>
+        status.completed_files === 0 && status.total_files === 2
+      ),
+      "cold folder-module index did not announce its two saved files"
+    );
+    const finalProgress = responses.lastIndexingProgress.at(-1);
+    assert.ok(finalProgress, "cold folder-module index emitted no progress");
+    assert.equal(finalProgress.completed_files, 2);
+    assert.equal(finalProgress.total_files, 2);
+
+    const shutdown = await request(
+      child,
+      responses,
+      "shutdown",
+      "shutdown",
+      null
+    );
+    assert.equal(shutdown.result, null);
+    child.stdin.write(frame({ jsonrpc: "2.0", method: "exit" }));
+    assert.deepEqual(await awaitExit(exit), { code: 0, signal: null });
+    await responses.finish();
+    assert.equal(responses.buffer.length, 0, "debug logs polluted stdout");
+
+    const records = structuredLogRecords(stderr());
+    const serverStart = records.find((record) => record.event === "server.start");
+    assert.ok(serverStart, "debug session lacked server.start");
+    assert.equal(serverStart.log_level, "debug");
+
+    const chainIndex = records.findIndex(
+      (record) => record.event === "indexing.chain.start"
+    );
+    assert.ok(chainIndex >= 0, "debug session lacked indexing.chain.start");
+    const chain = records[chainIndex];
+    assert.equal(chain.level, "info");
+    assert.ok(Number.isInteger(chain.chain));
+    assert.equal(chain.reason, "initialized");
+    assert.ok(Number.isInteger(chain.epoch));
+    assert.equal(chain.initial, true);
+
+    const startIndex = records.findIndex(
+      (record) => record.event === "compiler.attempt.start"
+    );
+    assert.ok(startIndex > chainIndex, "compiler attempt preceded indexing start");
+    const start = records[startIndex];
+    assert.equal(start.level, "debug");
+    assert.ok(Number.isInteger(start.attempt));
+    assert.equal(start.root_module, "sample");
+
+    const completeIndex = records.findIndex((record, index) =>
+      index > startIndex &&
+      record.event === "compiler.attempt.end" &&
+      record.attempt === start.attempt
+    );
+    assert.ok(completeIndex > startIndex, "compiler attempt never completed");
+    const complete = records[completeIndex];
+    assert.equal(complete.level, "debug");
+    assert.equal(complete.root_module, start.root_module);
+    assert.equal(complete.outcome, "complete");
+    assert.ok(Number.isInteger(complete.checked_modules));
+    assert.ok(Number.isInteger(complete.completed_modules));
+    assert.ok(Number.isFinite(complete.wall_ms));
+    assert.ok(complete.wall_ms >= 0);
+
+    const progress = records
+      .map((record, index) => ({ record, index }))
+      .filter(({ record }) =>
+        record.event === "compiler.module.complete" &&
+        record.attempt === start.attempt
+      );
+    assert.equal(
+      progress.length,
+      complete.completed_modules,
+      "progress records were not bounded by the attempt summary"
+    );
+    assert.equal(
+      progress.length,
+      complete.checked_modules,
+      "compiler did not emit one progress record per completed source module"
+    );
+    assert.ok(progress.length > 0, "compiler attempt emitted no progress");
+    for (let index = 0; index < progress.length; index += 1) {
+      const entry = progress[index];
+      assert.ok(
+        entry.index > startIndex && entry.index < completeIndex,
+        "compiler progress was outside its attempt boundary"
+      );
+      assert.equal(entry.record.level, "debug");
+      assert.equal(entry.record.root_module, start.root_module);
+      assert.equal(typeof entry.record.module_name, "string");
+      assert.equal(entry.record.completed_modules, index + 1);
+      assert.ok(Number.isFinite(entry.record.wall_ms));
+      assert.ok(entry.record.wall_ms >= 0);
+      assert.ok(Number.isFinite(entry.record.cpu_ms));
+      assert.ok(entry.record.cpu_ms >= 0);
+    }
+    assert.equal(progress.at(-1).record.module_name, "sample");
+
+    const chainCompleteIndex = records.findIndex((record, index) =>
+      index > completeIndex &&
+      record.event === "indexing.chain.complete" &&
+      record.chain === chain.chain
+    );
+    assert.ok(
+      chainCompleteIndex > completeIndex,
+      "initial indexing chain lacked a matching terminal record"
+    );
+    const chainComplete = records[chainCompleteIndex];
+    assert.equal(chainComplete.level, "info");
+    assert.equal(chainComplete.reason, "initialized");
+    assert.equal(chainComplete.outcome, "ready");
+    assert.equal(chainComplete.message, undefined);
+    assert.equal(chainComplete.initial, true);
+    assert.ok(Number.isInteger(chainComplete.attempted_epoch));
+    assert.ok(Number.isInteger(chainComplete.completed_epoch));
+    assert.ok(Number.isInteger(chainComplete.pending_epoch));
+    assert.ok(Number.isInteger(chainComplete.passes));
+    assert.ok(chainComplete.passes >= 1);
+    assert.ok(Number.isFinite(chainComplete.wall_ms));
+    assert.ok(chainComplete.wall_ms >= 0);
+    assert.ok(Number.isFinite(chainComplete.cpu_ms));
+    assert.ok(chainComplete.cpu_ms >= 0);
+    assert.ok(Number.isInteger(chainComplete.generation));
+  } catch (cause) {
+    const diagnostic = stderr().toString("utf8").trim();
+    throw new Error(
+      `${cause.message}${diagnostic.length > 0 ? `; stderr: ${diagnostic}` : ""}`,
+      { cause }
+    );
+  } finally {
+    if (child.exitCode === null && child.signalCode === null) child.kill();
+    await rm(root, { recursive: true, force: true });
+  }
+}
+
 async function testTruncatedFrame() {
   const child = launch(process.cwd(), "error");
   const stdout = collect(child.stdout);
@@ -827,9 +1110,11 @@ async function testTruncatedFrame() {
   }
 }
 
+await testCoalescedIndexingResetStatus();
 await testLifecycle();
 await testSavedProjectSemantics();
 await testConfigCannotWriteProtocolStdout();
 await testCrossModuleFolderAndIncrementalSemantics();
+await testDebugCompilerProgress();
 await testTruncatedFrame();
 console.log("native server protocol transcript passed");

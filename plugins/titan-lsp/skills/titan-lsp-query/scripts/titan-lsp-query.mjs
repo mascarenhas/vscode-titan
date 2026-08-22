@@ -450,6 +450,8 @@ async function request(child, reader, id, method, params) {
 
 async function waitForIndexing(reader) {
   let indexing;
+  let activeEpoch;
+  let activeWorkset;
   while (true) {
     const message = await reader.read("language-server indexing");
     if (message.id !== undefined) {
@@ -461,13 +463,23 @@ async function waitForIndexing(reader) {
     if (message.method !== INDEXING_STATUS_NOTIFICATION) continue;
 
     const params = message.params;
+    const hasCompletedFiles = params?.completed_files !== undefined;
+    const hasTotalFiles = params?.total_files !== undefined;
     if (params === null || typeof params !== "object" || Array.isArray(params) ||
         !["indexing", "ready", "failed"].includes(params.state) ||
         typeof params.initial !== "boolean" ||
         !Number.isSafeInteger(params.epoch) || params.epoch < 0 ||
         (params.generation !== undefined &&
          (!Number.isSafeInteger(params.generation) || params.generation < 0)) ||
-        (params.message !== undefined && typeof params.message !== "string")) {
+        (params.message !== undefined && typeof params.message !== "string") ||
+        hasCompletedFiles !== hasTotalFiles ||
+        (hasCompletedFiles &&
+         (params.state !== "indexing" ||
+          !Number.isSafeInteger(params.completed_files) ||
+          params.completed_files < 0 ||
+          !Number.isSafeInteger(params.total_files) ||
+          params.total_files < 0 ||
+          params.completed_files > params.total_files))) {
       throw new QueryError(
         "protocol_error",
         `language server sent an invalid ${INDEXING_STATUS_NOTIFICATION} notification`
@@ -475,21 +487,63 @@ async function waitForIndexing(reader) {
     }
     if (indexing === undefined) {
       if (params.state !== "indexing" || !params.initial ||
-          params.message !== undefined) {
+          params.message !== undefined || hasCompletedFiles) {
         throw new QueryError(
           "protocol_error",
           "language-server initial indexing omitted its busy status"
         );
       }
       indexing = params;
+      activeEpoch = params.epoch;
       continue;
     }
-    if (params.state === "indexing" || params.initial !== indexing.initial ||
-        params.epoch < indexing.epoch) {
+    if (params.initial !== indexing.initial || params.epoch < activeEpoch) {
       throw new QueryError(
         "protocol_error",
         "language-server initial indexing emitted an invalid status sequence"
       );
+    }
+    if (params.state === "indexing") {
+      if (params.message !== undefined) {
+        throw new QueryError(
+          "protocol_error",
+          "language-server initial indexing emitted an invalid status sequence"
+        );
+      }
+      if (!hasCompletedFiles) {
+        if (params.epoch <= activeEpoch) {
+          throw new QueryError(
+            "protocol_error",
+            "language-server initial indexing emitted an invalid status sequence"
+          );
+        }
+        activeEpoch = params.epoch;
+        activeWorkset = undefined;
+        continue;
+      }
+      if (params.epoch !== activeEpoch) {
+        throw new QueryError(
+          "protocol_error",
+          "language-server initial indexing emitted an invalid status sequence"
+        );
+      }
+      if (params.completed_files === 0) {
+        activeWorkset = {
+          totalFiles: params.total_files,
+          completedFiles: 0
+        };
+        continue;
+      }
+      if (activeWorkset === undefined ||
+          params.total_files !== activeWorkset.totalFiles ||
+          params.completed_files < activeWorkset.completedFiles) {
+        throw new QueryError(
+          "protocol_error",
+          "language-server initial indexing emitted an invalid status sequence"
+        );
+      }
+      activeWorkset.completedFiles = params.completed_files;
+      continue;
     }
     if (params.state === "ready") {
       if (!Number.isSafeInteger(params.generation) ||

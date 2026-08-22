@@ -9,8 +9,10 @@ import {
   State
 } from "vscode-languageclient/node";
 import {
+  DEFAULT_SERVER_LOG_LEVEL,
   createServerLaunchOptions,
   ensureServerExecutable,
+  formatServerStartup,
   formatStartupError,
   readCompilerDiscoveryConfiguration,
   readServerConfiguration,
@@ -220,7 +222,7 @@ class TitanClientManager {
       const serverConfiguration = readServerConfiguration(
         configuration.get<unknown>("path", ""),
         configuration.get<unknown>("arguments", []),
-        configuration.get<unknown>("logLevel", "info")
+        configuration.get<unknown>("logLevel", DEFAULT_SERVER_LOG_LEVEL)
       );
       const compilerDiscovery = readCompilerDiscoveryConfiguration(
         compilerConfiguration.get<unknown>("luaPath", ""),
@@ -301,6 +303,10 @@ class TitanClientManager {
       this.clients.set(key, client);
       this.indexingStatuses.set(key, status);
       this.indexingSubscriptions.set(key, statusSubscription);
+      workspaceOutput.info(formatServerStartup(
+        command,
+        serverConfiguration.logLevel
+      ));
       await withTimeout(
         client.start(),
         CLIENT_START_TIMEOUT_MILLISECONDS,

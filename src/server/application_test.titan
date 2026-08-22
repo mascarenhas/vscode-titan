@@ -258,11 +258,21 @@ local function assert_null_result(outcome: dispatcher.SemanticOutcome,
 end
 
 local function wait_until(predicate: () -> boolean, message: string)
-  for _attempt = 1, 400 do
+  -- Worker-pool filesystem operations need a wall-clock allowance. Counting
+  -- immediate scheduler turns made this expire in well under a second under
+  -- load, without indicating a product liveness failure.
+  for _attempt = 1, 5000 do
     if predicate() then return end
-    timer.yield()
+    timer.sleep(1)
   end
   test.assert(false, message)
+end
+
+local function contains_string(items: {string}, expected: string): boolean
+  for index = 1, #items do
+    if items[index] == expected then return true end
+  end
+  return false
 end
 
 local function join_outcome(
@@ -322,6 +332,36 @@ local function with_unindexed_application(
   with_application_state(false, body)
 end
 
+local function with_cold_application(
+    body: (string, YieldingAnalyzer, application.Application) -> ())
+  local root = fs.tmpname()
+  fs.unlink(root)
+  fs.mkdir(root)
+  local filename = root .. "/main.titan"
+  fs.write_file(filename,
+    "function answer(): integer\n" ..
+    "  return 1\n" ..
+    "end\n")
+  defer do
+    if fs.lstat(filename) ~= nil then fs.unlink(filename) end
+    if fs.lstat(root) ~= nil then fs.rmdir(root) end
+  end
+
+  local analyzer = YieldingAnalyzer.new(0, false, false, false, false)
+  local app = application.create_with_project_loader(
+    root,
+    function (project_root: string,
+              _progress_listener: bridge.ProgressListener?,
+              snapshot_listener: project_service.SnapshotListener?):
+        (project_service.Service?, project_service.Error?)
+      return project_service.load_with_analyzer(
+        project_root, "/sdk/lib/titan/0.26", analyzer:analyze, nil,
+        snapshot_listener)
+    end)
+  defer app:close()
+  body(filename, analyzer, app)
+end
+
 local function returns_empty_results_while_initial_index_runs()
   with_unindexed_application(function (
       filename: string, _analyzer: YieldingAnalyzer,
@@ -357,6 +397,231 @@ local function returns_empty_results_while_initial_index_runs()
   end)
 end
 
+local function catches_save_while_cold_index_is_blocked()
+  with_cold_application(function (
+      filename: string, analyzer: YieldingAnalyzer,
+      app: application.Application)
+    local statuses: {indexing_status.Status} = {}
+    app:set_indexing_listener(function (status: indexing_status.Status)
+      statuses[#statuses + 1] = status
+    end)
+    analyzer.block = true
+    analyzer.started = false
+    app:start_indexing()
+    wait_until(function (): boolean return analyzer.started end,
+               "cold index analyzer did not start")
+    test.assert(#app:watched_directories_for_testing() > 0,
+                "cold index did not register its watcher before analysis")
+
+    local epoch_before = app:change_epoch_for_testing()
+    local changed = "function answer(): integer return 123456 end\n"
+    fs.write_file(filename, changed)
+    wait_until(function (): boolean
+      return app:change_epoch_for_testing() > epoch_before
+    end, "watcher did not observe a save during cold analysis")
+
+    analyzer.block = false
+    wait_until(function (): boolean
+      local metrics = app:indexing_metrics()
+      return metrics.refresh_passes >= 2 and
+             not metrics.refresh_chain_active
+    end, "save during cold analysis did not reach a replacement generation")
+    local snapshot? = app:snapshot_for_testing()
+    test.assert(snapshot ~= nil,
+                "cold index did not retain its recovered project service")
+    local saved = snapshot as project_service.Snapshot
+    test.assert(#saved.project_modules == 1 and
+                #saved.project_modules[1].source_files == 1 and
+                saved.project_modules[1].source_files[1].contents == changed,
+                "cold index published the pre-save project snapshot")
+    test.assert(#statuses > 0 and
+                indexing_status.state_name(statuses[#statuses].state) ==
+                  "ready",
+                "cold save recovery did not finish ready")
+  end)
+end
+
+local function recovers_initial_error_from_later_save()
+  with_cold_application(function (
+      filename: string, analyzer: YieldingAnalyzer,
+      app: application.Application)
+    local statuses: {indexing_status.Status} = {}
+    app:set_indexing_listener(function (status: indexing_status.Status)
+      statuses[#statuses + 1] = status
+    end)
+    analyzer.fail = true
+    app:start_indexing()
+    wait_until(function (): boolean
+      return #statuses > 0 and
+             indexing_status.state_name(statuses[#statuses].state) ==
+               "failed" and
+             not app:indexing_metrics().refresh_chain_active
+    end, "cold index did not publish its initial failure")
+    test.assert(#app:watched_directories_for_testing() > 0,
+                "initial compiler failure discarded the project watcher")
+
+    local epoch_before = app:change_epoch_for_testing()
+    local changed = "function answer(): integer return 654321 end\n"
+    analyzer.fail = false
+    fs.write_file(filename, changed)
+    wait_until(function (): boolean
+      return app:change_epoch_for_testing() > epoch_before
+    end, "watcher did not observe the save which repaired initial failure")
+    wait_until(function (): boolean
+      return analyzer.runs >= 2 and #statuses > 0 and
+             indexing_status.state_name(statuses[#statuses].state) ==
+               "ready" and
+             not app:indexing_metrics().refresh_chain_active
+    end, "save did not recover the initially failed cold index")
+
+    local snapshot? = app:snapshot_for_testing()
+    test.assert(snapshot ~= nil,
+                "recovered cold index did not retain its project service")
+    local saved = snapshot as project_service.Snapshot
+    test.assert(#saved.project_modules == 1 and
+                #saved.project_modules[1].source_files == 1 and
+                saved.project_modules[1].source_files[1].contents == changed,
+                "initial-error recovery published the pre-save snapshot")
+  end)
+end
+
+local function recovers_configuration_load_failure_from_later_save()
+  local root = fs.tmpname()
+  fs.unlink(root)
+  fs.mkdir(root)
+  local filename = root .. "/main.titan"
+  local config_file = root .. "/titan-config.lua"
+  fs.write_file(filename, "function answer(): integer return 1 end\n")
+  fs.write_file(config_file, "return {\n")
+  defer do
+    if fs.lstat(config_file) ~= nil then fs.unlink(config_file) end
+    if fs.lstat(filename) ~= nil then fs.unlink(filename) end
+    if fs.lstat(root) ~= nil then fs.rmdir(root) end
+  end
+
+  local analyzer = YieldingAnalyzer.new(0, false, false, false, false)
+  local app = application.create_with_project_loader(
+    root,
+    function (project_root: string,
+              _progress_listener: bridge.ProgressListener?,
+              snapshot_listener: project_service.SnapshotListener?):
+        (project_service.Service?, project_service.Error?)
+      return project_service.load_with_analyzer(
+        project_root, "/sdk/lib/titan/0.26", analyzer:analyze, nil,
+        snapshot_listener)
+    end)
+  defer app:close()
+
+  local statuses: {indexing_status.Status} = {}
+  app:set_indexing_listener(function (status: indexing_status.Status)
+    statuses[#statuses + 1] = status
+  end)
+  app:start_indexing()
+  wait_until(function (): boolean
+    return #statuses > 0 and
+           indexing_status.state_name(statuses[#statuses].state) ==
+             "failed" and
+           not app:indexing_metrics().refresh_chain_active
+  end, "invalid cold configuration did not finish with a failure")
+  test.assert(
+    contains_string(app:watched_directories_for_testing(), fs.realpath(root)),
+    "configuration failure did not retain a provisional project watcher")
+
+  fs.write_file(config_file,
+    "return { source_modules_root = \".\" }\n")
+  -- Inject the exact saved-file hint deterministically. ProjectWatcher tests
+  -- separately cover delivery from the filesystem backend; this regression
+  -- exercises the Application lifecycle after a pre-Service load failure.
+  app:watch_callback(project_watcher.RediscoveryBatch.new({
+    project_watcher.PathChange.modified(config_file),
+  }, {}, false))
+  wait_until(function (): boolean
+    return analyzer.runs > 0 and #statuses > 0 and
+           indexing_status.state_name(statuses[#statuses].state) == "ready" and
+           not app:indexing_metrics().refresh_chain_active
+  end, "saved valid configuration did not recover the cold project")
+  local snapshot? = app:snapshot_for_testing()
+  test.assert(snapshot ~= nil,
+              "configuration recovery did not publish the saved project")
+  local saved = snapshot as project_service.Snapshot
+  test.assert(#saved.project_modules == 1,
+              "configuration recovery published the wrong project")
+end
+
+local function reconciles_expanded_scope_before_existing_analysis()
+  local workspace = fs.tmpname()
+  fs.unlink(workspace)
+  fs.mkdir(workspace)
+  local root = workspace .. "/project"
+  local old_root = workspace .. "/old_source"
+  local next_root = workspace .. "/next_source"
+  fs.mkdir(root)
+  fs.mkdir(old_root)
+  fs.mkdir(next_root)
+  local config_file = root .. "/titan-config.lua"
+  local old_filename = old_root .. "/main.titan"
+  local next_filename = next_root .. "/main.titan"
+  fs.write_file(config_file,
+    "return { source_modules_root = \"../old_source\" }\n")
+  fs.write_file(old_filename, "function answer(): integer return 1 end\n")
+  fs.write_file(next_filename, "function answer(): integer return 2 end\n")
+  defer do
+    if fs.lstat(config_file) ~= nil then fs.unlink(config_file) end
+    if fs.lstat(old_filename) ~= nil then fs.unlink(old_filename) end
+    if fs.lstat(next_filename) ~= nil then fs.unlink(next_filename) end
+    if fs.lstat(old_root) ~= nil then fs.rmdir(old_root) end
+    if fs.lstat(next_root) ~= nil then fs.rmdir(next_root) end
+    if fs.lstat(root) ~= nil then fs.rmdir(root) end
+    if fs.lstat(workspace) ~= nil then fs.rmdir(workspace) end
+  end
+
+  local analyzer = YieldingAnalyzer.new(0, false, false, false, false)
+  local service?, service_error? = project_service.load_with_analyzer(
+    root, "/sdk/lib/titan/0.26", analyzer:analyze)
+  test.assert(service_error == nil and service ~= nil,
+              "scope-expansion fixture project did not load")
+  if service == nil then raise "scope-expansion fixture Service is missing" end
+  local app = application.create_with_service(root, service)
+  defer app:close()
+
+  local statuses: {indexing_status.Status} = {}
+  app:set_indexing_listener(function (status: indexing_status.Status)
+    statuses[#statuses + 1] = status
+  end)
+  analyzer.block = true
+  analyzer.started = false
+  fs.write_file(config_file,
+    "return { source_modules_root = \"../next_source\" }\n")
+  app:note_saved_change()
+  wait_until(function (): boolean return analyzer.started end,
+             "expanded-scope analyzer did not start")
+  test.assert(
+    contains_string(
+      app:watched_directories_for_testing(), fs.realpath(next_root)),
+    "new source root was not watched before existing-Service analysis")
+
+  local changed = "function answer(): integer return 987654 end\n"
+  fs.write_file(next_filename, changed)
+  app:watch_callback(project_watcher.RediscoveryBatch.new({
+    project_watcher.PathChange.modified(next_filename),
+  }, {}, false))
+  analyzer.block = false
+  wait_until(function (): boolean
+    return analyzer.runs >= 3 and #statuses > 0 and
+           indexing_status.state_name(statuses[#statuses].state) == "ready" and
+           not app:indexing_metrics().refresh_chain_active
+  end, "save in expanded watcher scope did not reach a follow-up generation")
+  local snapshot? = app:snapshot_for_testing()
+  test.assert(snapshot ~= nil,
+              "expanded-scope refresh did not retain a project snapshot")
+  local saved = snapshot as project_service.Snapshot
+  test.assert(saved.config.source_modules_root == next_root and
+              #saved.project_modules == 1 and
+              #saved.project_modules[1].source_files == 1 and
+              saved.project_modules[1].source_files[1].contents == changed,
+              "expanded-scope save published the pre-save snapshot")
+end
+
 local function coalesces_continuous_hints_after_publishing_one_pass()
   with_unindexed_application(function (
       filename: string, analyzer: YieldingAnalyzer,
@@ -379,7 +644,7 @@ local function coalesces_continuous_hints_after_publishing_one_pass()
                 "hint burst started an overlapping refresh pass")
     analyzer.block = false
 
-    wait_until(function (): boolean return #statuses == 2 end,
+    wait_until(function (): boolean return #statuses == 3 end,
                "coalesced refresh chain did not reach ready")
     local metrics = app:indexing_metrics()
     test.assert(metrics.refresh_passes == 2,
@@ -387,9 +652,61 @@ local function coalesces_continuous_hints_after_publishing_one_pass()
     test.assert(metrics.view_builds == 1,
                 "unchanged follow-up generation rebuilt semantic Features")
     test.assert(indexing_status.state_name(statuses[1].state) == "indexing" and
-                indexing_status.state_name(statuses[2].state) == "ready" and
-                statuses[2].epoch == 101,
-                "coalesced chain emitted an intermediate or stale status")
+                indexing_status.state_name(statuses[2].state) == "indexing" and
+                statuses[2].completed_files == nil and
+                statuses[2].total_files == nil and
+                statuses[2].epoch == 101 and
+                indexing_status.state_name(statuses[3].state) == "ready" and
+                statuses[3].epoch == 101,
+                "coalesced chain did not reset and finish the pending epoch")
+  end)
+end
+
+local function keeps_progress_on_the_active_pass_epoch()
+  with_unindexed_application(function (
+      filename: string, analyzer: YieldingAnalyzer,
+      app: application.Application)
+    local statuses: {indexing_status.Status} = {}
+    app:set_indexing_listener(function (status: indexing_status.Status)
+      statuses[#statuses + 1] = status
+    end)
+    fs.write_file(
+      filename, "function answer(): integer return 123456 end\n")
+    analyzer.block = true
+    analyzer.started = false
+    app:start_indexing()
+    wait_until(function (): boolean return analyzer.started end,
+               "progress epoch fixture analyzer did not start")
+
+    app:emit_compiler_progress(bridge.AnalysisProgress.new(0, 1))
+    app:note_saved_change()
+    app:emit_compiler_progress(bridge.AnalysisProgress.new(1, 1))
+    analyzer.block = false
+    wait_until(function (): boolean return #statuses == 5 end,
+               "progress epoch fixture did not reach ready")
+
+    test.assert(indexing_status.state_name(statuses[1].state) == "indexing" and
+                statuses[1].completed_files == nil and
+                statuses[1].total_files == nil and
+                statuses[1].epoch == 1,
+                "indexing chain did not emit its bounded busy state")
+    test.assert(statuses[2].completed_files == 0 and
+                statuses[2].total_files == 1 and
+                statuses[2].epoch == 1 and
+                statuses[3].completed_files == 1 and
+                statuses[3].total_files == 1 and
+                statuses[3].epoch == 1,
+                "watch hint relabeled in-flight compiler work to a newer epoch")
+    test.assert(indexing_status.state_name(statuses[4].state) == "indexing" and
+                statuses[4].epoch == 2 and
+                statuses[4].completed_files == nil and
+                statuses[4].total_files == nil,
+                "coalesced follow-up retained the preceding pass progress")
+    test.assert(indexing_status.state_name(statuses[5].state) == "ready" and
+                statuses[5].epoch == 2 and
+                statuses[5].completed_files == nil and
+                statuses[5].total_files == nil,
+                "coalesced follow-up did not publish the newer terminal epoch")
   end)
 end
 
@@ -414,15 +731,19 @@ local function retries_failure_when_a_later_epoch_is_pending()
     app:note_saved_change()
     analyzer.fail = false
     analyzer.block = false
-    wait_until(function (): boolean return #statuses == 2 end,
+    wait_until(function (): boolean return #statuses == 3 end,
                "later epoch did not retry the failed refresh")
 
     test.assert(analyzer.runs == runs_before + 2 and
                 app:indexing_metrics().refresh_passes == 2,
                 "later epoch did not run exactly one replacement analysis")
     test.assert(indexing_status.state_name(statuses[1].state) == "indexing" and
-                indexing_status.state_name(statuses[2].state) == "ready" and
-                statuses[2].epoch == 2,
+                indexing_status.state_name(statuses[2].state) == "indexing" and
+                statuses[2].completed_files == nil and
+                statuses[2].total_files == nil and
+                statuses[2].epoch == 2 and
+                indexing_status.state_name(statuses[3].state) == "ready" and
+                statuses[3].epoch == 2,
                 "recovering chain exposed an intermediate failed status")
   end)
 end
@@ -694,7 +1015,7 @@ local function serves_completed_view_during_yielding_recheck()
         "read-only request during watcher-dirty generation") == 0,
       "watcher-dirty generation reused the preceding completed View")
     analyzer.block = false
-    wait_until(function (): boolean return #statuses == 2 end,
+    wait_until(function (): boolean return #statuses == 3 end,
                "superseded refresh chain did not reach ready")
     test.assert(analyzer.finished,
                 "yielding compiler recheck did not finish")
@@ -841,12 +1162,16 @@ local function emits_no_indexing_status_after_close()
     test.assert(#statuses == 1 and
                 indexing_status.state_name(statuses[1].state) == "indexing",
                 "closing fixture did not begin an indexing chain")
+    test.assert(app:indexing_metrics().refresh_chain_active,
+                "closing fixture did not retain its active chain")
     app:close()
     app:start_indexing()
     app:note_saved_change()
     timer.yield()
     test.assert(#statuses == 1,
                 "application emitted indexing status after close")
+    test.assert(not app:indexing_metrics().refresh_chain_active,
+                "application close left an unterminated indexing chain")
   end)
 end
 
@@ -866,8 +1191,20 @@ function test_application_indexing_state_machine(_context: test.Context)
     run_indexing_case(
       "initial busy response", returns_empty_results_while_initial_index_runs)
     run_indexing_case(
+      "blocked cold save", catches_save_while_cold_index_is_blocked)
+    run_indexing_case(
+      "initial error save recovery", recovers_initial_error_from_later_save)
+    run_indexing_case(
+      "configuration load save recovery",
+      recovers_configuration_load_failure_from_later_save)
+    run_indexing_case(
+      "existing refresh scope expansion",
+      reconciles_expanded_scope_before_existing_analysis)
+    run_indexing_case(
       "continuous hint coalescing",
       coalesces_continuous_hints_after_publishing_one_pass)
+    run_indexing_case(
+      "active pass progress epoch", keeps_progress_on_the_active_pass_epoch)
     run_indexing_case(
       "later epoch failure retry", retries_failure_when_a_later_epoch_is_pending)
     run_indexing_case(

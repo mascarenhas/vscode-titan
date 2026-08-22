@@ -78,6 +78,10 @@ unchanged refresh, run:
 node scripts/benchmark-server.mjs --server bin/titan-language-server
 ```
 
+The benchmark defaults to the extension's `debug` server-emission level so its
+numbers represent normal VS Code use. Pass `--log-level off` only when measuring
+the lower bound without structured-log overhead.
+
 ## Run the extension during development
 
 1. Open this repository in VS Code.
@@ -93,7 +97,7 @@ per workspace folder. These settings can override discovery:
   workspace folder.
 - `titan.languageServer.arguments`: extra process arguments.
 - `titan.languageServer.logLevel`: structured server diagnostics written to
-  stderr (`off`, `error`, `info`, `debug`, or `trace`; default `info`).
+  stderr (`off`, `error`, `info`, `debug`, or `trace`; default `debug`).
 - `titan.compiler.luaPath`: optional `LUA_PATH` override for compiler modules.
 - `titan.compiler.luaCPath`: optional `LUA_CPATH` override for native Lua
   dependencies.
@@ -104,8 +108,8 @@ compiler installation at runtime. Compatibility requires both the matching
 Titan ABI and `titan-compiler.driver.LANGUAGE_SERVER_API_VERSION == 3`; API 3
 includes the compiler's typed semantic metadata, incremental-analysis hooks,
 C-header dependency restat contract, and the resolver-scoped I/O strategy with
-checked-module yield sequencing. The ABI alone is not the language-server API
-contract. If the compiler is not in the compiled defaults,
+named completed-module yield checkpoints. The ABI alone is not the
+language-server API contract. If the compiler is not in the compiled defaults,
 configure both paths explicitly. `LUA_CPATH` must include
 both the Titan ABI provider directory (for example
 `/opt/titan/lib/titan/0.26/?.so`) and the Lua native module directory (for
@@ -124,21 +128,36 @@ VS Code's most-specific workspace folder exclusively owns semantic requests for
 its documents.
 
 While the server builds or refreshes saved-file project state, VS Code shows a
-busy **Titan indexing** language-status item for that workspace folder. It
-disappears when the generation is ready. An indexing failure remains visible
-as an error and opens the language-server output when selected. Read-only
-language features stay responsive during indexing and return their ordinary
-empty result until an initial generation is available.
+busy **Titan indexing N/M files** language-status item for that workspace
+folder once the active saved-file workset is known. It disappears when the
+generation is ready. An indexing failure remains visible as an error and opens
+the language-server output when selected. Read-only language features stay
+responsive during indexing and return their ordinary empty result until an
+initial generation is available.
 
 ### Language-server diagnostics and protocol tracing
 
 Run **Titan: Show Language Server Output** from the Command Palette to reveal
 the shared log. Every server and client record is prefixed with its workspace
 folder in a multi-root window. Server stderr is structured and routed at its
-declared severity; malformed or unstructured stderr remains an error. To retain
-`debug` or `trace` server records, set `titan.languageServer.logLevel` and set
-the **Titan Language Server** output channel's VS Code log level to the same or
-a more verbose level.
+declared severity; malformed or unstructured stderr remains an error. The
+extension launches the server with `debug` emission by default, so the **Titan
+Language Server** output channel's VS Code log-level selector is the only
+control needed to switch between normal and debug output. The channel still
+filters records without restarting the server. To collect trace records, first
+set
+`titan.languageServer.logLevel` to `trace`, which restarts each affected server,
+then set the output channel to Trace. Explicit `off`, `error`, `info`, `debug`,
+and `trace` emission overrides remain available when reducing server-side work
+or collecting deeper diagnostics.
+
+Indexing always emits an `indexing.chain.start` record and a paired
+`indexing.chain.complete` record, including the trigger, pass count, generation,
+wall time, and CPU time. Starts and successful terminals are Info; failed
+terminals are Error. Debug adds scan/analysis phase records and one bounded
+`compiler.module.complete` checkpoint after each source module the compiler has
+fully published. A graph generation counts project-graph changes; it is not a
+refresh-pass counter.
 
 Client/server protocol tracing is separately opt-in and does not restart the
 server. Set `titan.trace.server` to `messages` for message summaries, or
@@ -208,6 +227,14 @@ Semantic requests use files saved on disk. Unsaved editor buffers are not
 silently compiled. Completion, foreign-definition navigation, navigation into
 external source modules, and watching external source trees are outside the
 first-version scope.
+
+Hover presents a named declaration signature, including parameter names, for
+functions, methods, associated functions, and supported foreign callables.
+Function-valued variables retain their bare function type. Record, union, and
+interface hovers summarize the members visible at that occurrence; module
+hovers summarize visible top-level members without recursively expanding
+nominal types. These summaries are normalized and cached with the immutable
+semantic index rather than rebuilt by individual hover requests.
 
 A read-only request starts a shared saved-file refresh without waiting. Before
 the initial index is ready it returns the feature's ordinary empty result; an

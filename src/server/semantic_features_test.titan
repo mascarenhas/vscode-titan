@@ -25,14 +25,16 @@ local function occurrence(filename: string, line: integer,
                           name: string, declaration_id: string?,
                           role: bridge.OccurrenceRole,
                           is_local: boolean,
-                          type_info: bridge.TypeInfo?):
+                          type_info: bridge.TypeInfo?,
+                          callable_signature: bridge.CallableSignature?,
+                          summary_id: integer?):
     bridge.SymbolOccurrence
   local start = location(filename, line, start_column)
   return bridge.SymbolOccurrence.new(
     name, declaration_id, role, start,
     bridge.SourceSpan.new(
       start, location(filename, line, finish_column)),
-    is_local, type_info)
+    is_local, type_info, callable_signature, summary_id)
 end
 
 local function node(id: integer, tag: string, kind: bridge.NodeKind,
@@ -67,13 +69,14 @@ end
 
 local function snapshot(module_name: string, main_file: string,
                         source_files: {string}, nodes: {bridge.Node},
-                        symbols: {bridge.SymbolOccurrence}):
+                        symbols: {bridge.SymbolOccurrence},
+                        hover_summaries: {bridge.HoverSummary}?):
     bridge.ModuleSnapshot
   return bridge.ModuleSnapshot.new(
     module_name,
     bridge.Provenance.project_source(
       bridge.SourceProvenance.new(main_file, source_files)),
-    nil, nodes, symbols, {}, {})
+    nil, nodes, symbols, {}, {}, hover_summaries)
 end
 
 local function external_snapshot(module_name: string, filename: string,
@@ -259,12 +262,9 @@ function test_semantic_features_hover_preserves_compiler_type_views(
               hover.local_declaration == true,
               "hover lost typed compiler metadata or local status")
   test.assert(hover:markdown() ==
-    "- Inferred type: `float`\n" ..
-    "- Declared type: `float`\n" ..
-    "- Original type: `integer`\n" ..
-    "- Coerced type: `float`\n" ..
+    "- Type: `float`\n" ..
     "- Declaration: local\n",
-    "hover markdown did not distinguish original and coerced types")
+    "hover markdown repeated equivalent declared and inferred types")
 end
 
 function test_semantic_features_hover_matches_nodes_after_unicode_prefix(
@@ -328,6 +328,78 @@ function test_semantic_features_hover_reads_unnamed_adjustment_ancestors(
               hover.coerced_type ~= nil and
               hover.coerced_type.display == "float",
               "hover ignored coercion metadata on an unnamed ancestor")
+  test.assert(hover:markdown() ==
+                "- Type: `integer`\n" ..
+                "- Cast to: `float`\n" ..
+                "- Declaration: local\n",
+              "hover did not render the distinct enclosing cast target")
+end
+
+function test_semantic_features_hover_prefers_named_callable_signatures(
+    _context: test.Context)
+  local filename = "/workspace/callable_hover.titan"
+  local function_type = bridge.TypeInfo.new(
+    "Type.Function", "(integer) -> string")
+  local model = features.build({project("sample", {
+    bridge.SourceFile.new(filename,
+      "function render(value: integer): string\n" ..
+      "end\n" ..
+      "local callback: (integer) -> string = " ..
+      "function(value) return \"\" end\n"),
+  })}, {snapshot("sample", filename, {filename}, {}, {
+    occurrence(filename, 1, 10, 16, "render", "export:sample:render",
+               bridge.OccurrenceRole.definition(), false, function_type,
+               bridge.CallableSignature.new(
+                 "sample.render(value: integer): string")),
+    occurrence(filename, 3, 7, 15, "callback", "ast:sample:callback",
+               bridge.OccurrenceRole.definition(), true, function_type),
+  })})
+
+  local callable? = model:hover(filename, source_text.Position.new(0, 11))
+  test.assert(callable ~= nil and callable:markdown() ==
+                "- Signature: `sample.render(value: integer): string`\n" ..
+                "- Declaration: non-local\n",
+              "named function hover fell back to a bare function type")
+
+  local variable? = model:hover(filename, source_text.Position.new(2, 8))
+  test.assert(variable ~= nil and variable:markdown() ==
+                "- Type: `(integer) -> string`\n" ..
+                "- Declaration: local\n",
+              "ordinary function-valued variable did not keep its bare type")
+end
+
+function test_semantic_features_hover_appends_cached_aggregate_summary(
+    _context: test.Context)
+  local filename = "/workspace/aggregate_hover.titan"
+  local record_type = bridge.TypeInfo.new(
+    "Type.Record", "sample.Box<integer>")
+  local symbol = occurrence(
+    filename, 1, 1, 4, "Box", "export:sample:Box",
+    bridge.OccurrenceRole.definition(), false, record_type,
+    bridge.CallableSignature.new("wrong.signature(): nil"), 1)
+  local fields = bridge.HoverSummarySection.new(
+    "Fields", {"value: integer"})
+  local methods = bridge.HoverSummarySection.new(
+    "Methods", {"sample.Box<integer>:get(): integer"})
+  local summary = bridge.HoverSummary.new(
+    1, bridge.HoverSummaryKind.record_summary(), "sample.Box<integer>",
+    {fields, methods})
+  local saved = project("sample", {
+    bridge.SourceFile.new(filename, "Box\n"),
+  })
+  local compiler_snapshot = snapshot(
+    "sample", filename, {filename}, {}, {symbol}, {summary})
+  local model = features.build({saved}, {compiler_snapshot})
+
+  local hover? = model:hover(filename, source_text.Position.new(0, 1))
+  test.assert(hover ~= nil and hover:markdown() ==
+                "**record** `sample.Box<integer>`\n\n" ..
+                "Fields\n\n" ..
+                "- `value: integer`\n\n" ..
+                "Methods\n\n" ..
+                "- `sample.Box<integer>:get(): integer`\n\n" ..
+                "- Declaration: non-local\n",
+              "hover rebuilt or failed to append its cached summary")
 end
 
 function test_semantic_features_hover_reports_imported_terms(
@@ -385,7 +457,7 @@ function test_semantic_features_hover_reports_imported_terms(
               member.range.finish.character == 16,
               "hover lost the type, localness, or range of an imported term")
   test.assert(member:markdown() ==
-                "- Inferred type: `float`\n" ..
+                "- Type: `float`\n" ..
                 "- Declaration: non-local\n",
               "imported-term hover did not produce stable Markdown")
 end

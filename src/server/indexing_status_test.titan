@@ -9,3 +9,48 @@ function test_indexing_status_encodes_bounded_protocol_notification(
     [[{"jsonrpc":"2.0","method":"titan/indexingStatus","params":{"state":"failed","initial":true,"epoch":3,"generation":9,"message":"compiler unavailable"}}]],
     "indexing status notification did not preserve its typed lifecycle")
 end
+
+function test_indexing_status_encodes_saved_file_progress(
+    _context: test.Context)
+  local status = indexing.Status.new(
+    indexing.State.indexing(), false, 4, 10, nil, 7, 12)
+  test.assert(indexing.notification(status) ==
+    [[{"jsonrpc":"2.0","method":"titan/indexingStatus","params":{"state":"indexing","initial":false,"epoch":4,"generation":10,"completed_files":7,"total_files":12}}]],
+    "indexing status notification omitted saved-file progress")
+end
+
+local function assert_rejects_progress(status: indexing.Status,
+                                       message: string)
+  local rejected = false
+  do
+    indexing.notification(status)
+  catch
+    rejected = true
+  end
+  test.assert(rejected, message)
+end
+
+function test_indexing_status_rejects_invalid_saved_file_progress(
+    _context: test.Context)
+  assert_rejects_progress(
+    indexing.Status.new(
+      indexing.State.indexing(), true, 1, nil, nil, 0, nil),
+    "indexing status accepted a partial progress pair")
+  assert_rejects_progress(
+    indexing.Status.new(
+      indexing.State.ready(), true, 1, 1, nil, 1, 1),
+    "ready status accepted indexing-only progress")
+  assert_rejects_progress(
+    indexing.Status.new(
+      indexing.State.indexing(), true, 1, nil, nil, -1, 1),
+    "indexing status accepted negative progress")
+  assert_rejects_progress(
+    indexing.Status.new(
+      indexing.State.indexing(), true, 1, nil, nil,
+      9007199254740992, 9007199254740992),
+    "indexing status accepted progress outside the safe integer range")
+  assert_rejects_progress(
+    indexing.Status.new(
+      indexing.State.indexing(), true, 1, nil, nil, 2, 1),
+    "indexing status accepted completed progress above its total")
+end

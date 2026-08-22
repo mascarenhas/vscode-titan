@@ -109,6 +109,12 @@ type ExternalResolver = (
   {compiler_bridge.ExternalResolution}
 type HeaderRestater = ({compiler_bridge.CHeaderDependency}) ->
                       {compiler_bridge.CHeaderDependency}
+-- Lifecycle owners use the saved snapshot after discovery to establish their
+-- watcher before compiler analysis begins. The cold loader immediately scans
+-- once more after its first callback, closing the initial
+-- scan-to-registration gap, and publishes that post-registration snapshot
+-- before analysis.
+type SnapshotListener = (Snapshot) -> ()
 
 record Counters
   const file_reads: integer
@@ -123,14 +129,6 @@ record RefreshReport
   const committed_modules: {string}
   const failed_modules: {string}
   const dirty_modules: {string}
-end
-
-local function string_array(items: {string}): json.Value
-  local values: {json.Value} = {}
-  for index = 1, #items do
-    values[index] = json.from_string(items[index])
-  end
-  return json.from_array(values)
 end
 
 local record ProjectState
@@ -842,7 +840,8 @@ local function Service:scan_or_raise(): Snapshot
       #snapshot.project_modules)),
     json.Member.new("project_directories", json.from_integer(
       #snapshot.project_directories)),
-    json.Member.new("dirty_modules", string_array(snapshot.dirty_modules)),
+    json.Member.new("dirty_modules", logging.summarize_strings(
+      snapshot.dirty_modules)),
     json.Member.new("config_changed", json.from_boolean(config_changed)),
     json.Member.new("cpu_ms", json.from_number(
       logging.elapsed_ms(started))),
@@ -999,7 +998,8 @@ local function Service:prepare_work_avoiding(
   logging.emit("debug", "analysis.workset", {
     json.Member.new("generation", json.from_integer(request.generation)),
     json.Member.new("root_module", json.from_string(request.root_module)),
-    json.Member.new("dirty_modules", string_array(request.dirty_modules)),
+    json.Member.new("dirty_modules", logging.summarize_strings(
+      request.dirty_modules)),
     json.Member.new("cached_sources", json.from_integer(
       #request.cached_sources)),
     json.Member.new("external_fingerprints", json.from_integer(
@@ -1558,7 +1558,8 @@ local function Service:analyze_or_raise(
   logging.emit("debug", "analysis.start", {
     json.Member.new("generation", json.from_integer(request.generation)),
     json.Member.new("root_module", json.from_string(request.root_module)),
-    json.Member.new("dirty_modules", string_array(request.dirty_modules)),
+    json.Member.new("dirty_modules", logging.summarize_strings(
+      request.dirty_modules)),
   })
   local analysis = self.analyzer(request)
   local report = self:commit_or_raise(request, analysis)
@@ -1566,10 +1567,12 @@ local function Service:analyze_or_raise(
     json.Member.new("generation", json.from_integer(report.generation)),
     json.Member.new("root_module", json.from_string(request.root_module)),
     json.Member.new("stale", json.from_boolean(report.stale)),
-    json.Member.new("committed_modules", string_array(
+    json.Member.new("committed_modules", logging.summarize_strings(
       report.committed_modules)),
-    json.Member.new("failed_modules", string_array(report.failed_modules)),
-    json.Member.new("remaining_dirty", string_array(report.dirty_modules)),
+    json.Member.new("failed_modules", logging.summarize_strings(
+      report.failed_modules)),
+    json.Member.new("remaining_dirty", logging.summarize_strings(
+      report.dirty_modules)),
     json.Member.new("cpu_ms", json.from_number(
       logging.elapsed_ms(started))),
   })
@@ -1669,14 +1672,16 @@ local function Service:analyze_to_fixed_point(): (RefreshReport?, Error?)
     json.Member.new("iterations", json.from_integer(iteration_count)),
     json.Member.new("analyzed", json.from_boolean(report.analyzed)),
     json.Member.new("stale", json.from_boolean(report.stale)),
-    json.Member.new("committed_modules", string_array(committed)),
-    json.Member.new("failed_modules", string_array(failed)),
-    json.Member.new("remaining_dirty", string_array(report.dirty_modules)),
+    json.Member.new("committed_modules", logging.summarize_strings(committed)),
+    json.Member.new("failed_modules", logging.summarize_strings(failed)),
+    json.Member.new("remaining_dirty", logging.summarize_strings(
+      report.dirty_modules)),
   })
   return report, nil
 end
 
-function Service:refresh(): (RefreshReport?, Error?)
+local function Service:refresh_internal(snapshot_listener: SnapshotListener?):
+    (RefreshReport?, Error?)
   local started = logging.clock()
   logging.emit("debug", "project.refresh.start", {
     json.Member.new("generation", json.from_integer(
@@ -1691,6 +1696,10 @@ function Service:refresh(): (RefreshReport?, Error?)
         logging.elapsed_ms(started))),
     })
     return nil, scan_error
+  end
+  if snapshot_listener ~= nil then
+    local listener: SnapshotListener = snapshot_listener
+    listener(scanned)
   end
   local report?, refresh_error? = self:analyze_to_fixed_point()
   if report == nil then
@@ -1713,6 +1722,19 @@ function Service:refresh(): (RefreshReport?, Error?)
       logging.elapsed_ms(started))),
   })
   return report, nil
+end
+
+-- Preserve the long-standing no-argument refresh API for callers which do not
+-- own watcher scope. Application uses the notifying variant to reconcile the
+-- just-discovered saved tree before compiler work can yield for an extended
+-- period.
+function Service:refresh(): (RefreshReport?, Error?)
+  return self:refresh_internal(nil)
+end
+
+function Service:refresh_with_snapshot_listener(
+    snapshot_listener: SnapshotListener): (RefreshReport?, Error?)
+  return self:refresh_internal(snapshot_listener)
 end
 
 function Service:counters(): Counters
@@ -1825,7 +1847,8 @@ end
 local function load_with_services(
     project_root: string, installed_binary_modules_root: string,
     analyzer: Analyzer, external_resolver: ExternalResolver?,
-    header_restater: HeaderRestater?):
+    header_restater: HeaderRestater?,
+    snapshot_listener: SnapshotListener?):
     (Service?, Error?)
   local service?: Service
   local failure?: Error
@@ -1839,6 +1862,24 @@ local function load_with_services(
       external_resolver as ExternalResolver, header_restater)
   end
   if service == nil then return nil, failure end
+
+  if snapshot_listener ~= nil then
+    local listener: SnapshotListener = snapshot_listener
+    do
+      -- Register from the first complete discovery before compiler work can
+      -- yield for an extended period. A second scan after registration catches
+      -- a save in the finite interval between that discovery and the watcher.
+      listener(service:latest())
+      local rescanned?, scan_error? = service:scan()
+      if rescanned == nil then return nil, scan_error end
+      listener(rescanned)
+    catch
+      if error is async.CancellationReason then raise end
+      if error is Error then return nil, error as Error end
+      return nil, Error.new(project_root, strings.tostring(error))
+    end
+  end
+
   local report?, refresh_error? = service:analyze_to_fixed_point()
   if report == nil then return nil, refresh_error end
   return service, nil
@@ -1847,21 +1888,23 @@ end
 function load_with_analyzer(project_root: string,
                             installed_binary_modules_root: string,
                             analyzer: Analyzer,
-                            header_restater: HeaderRestater?):
+                            header_restater: HeaderRestater?,
+                            snapshot_listener: SnapshotListener?):
     (Service?, Error?)
   return load_with_services(
     project_root, installed_binary_modules_root, analyzer, nil,
-    header_restater)
+    header_restater, snapshot_listener)
 end
 
 function load_with_analyzer_and_resolver(
     project_root: string, installed_binary_modules_root: string,
     analyzer: Analyzer, external_resolver: ExternalResolver,
-    header_restater: HeaderRestater?):
+    header_restater: HeaderRestater?,
+    snapshot_listener: SnapshotListener?):
     (Service?, Error?)
   return load_with_services(
     project_root, installed_binary_modules_root, analyzer,
-    external_resolver, header_restater)
+    external_resolver, header_restater, snapshot_listener)
 end
 
 local function load_compiler(project_root: string):
@@ -1882,7 +1925,9 @@ end
 
 local function load_with_compiler(
     project_root: string, installed_binary_modules_root: string,
-    compiler: compiler_bridge.Compiler): (Service?, Error?)
+    compiler: compiler_bridge.Compiler,
+    progress_listener: compiler_bridge.ProgressListener?,
+    snapshot_listener: SnapshotListener?): (Service?, Error?)
   local analyzer: Analyzer = function (
       request: AnalysisRequest): compiler_bridge.Analysis
     compiler:configure_paths(
@@ -1891,7 +1936,7 @@ local function load_with_compiler(
       request.config.extra_ffi_include_dirs)
     return compiler:analyze_incremental(
       request.project_modules, request.dirty_modules,
-      request.cached_sources)
+      request.cached_sources, progress_listener)
   end
   local external_resolver: ExternalResolver = function (
       config: project_config.ProjectConfig, project_modules: {string},
@@ -1909,18 +1954,25 @@ local function load_with_compiler(
   end
   return load_with_services(
     project_root, installed_binary_modules_root, analyzer,
-    external_resolver, header_restater)
+    external_resolver, header_restater, snapshot_listener)
 end
 
 function load(project_root: string,
-              installed_binary_modules_root: string): (Service?, Error?)
+              installed_binary_modules_root: string,
+              progress_listener: compiler_bridge.ProgressListener?,
+              snapshot_listener: SnapshotListener?):
+    (Service?, Error?)
   local compiler?, failure? = load_compiler(project_root)
   if compiler == nil then return nil, failure end
   return load_with_compiler(
-    project_root, installed_binary_modules_root, compiler)
+    project_root, installed_binary_modules_root, compiler,
+    progress_listener, snapshot_listener)
 end
 
-function load_default(project_root: string): (Service?, Error?)
+function load_default(
+    project_root: string,
+    progress_listener: compiler_bridge.ProgressListener?,
+    snapshot_listener: SnapshotListener?): (Service?, Error?)
   local compiler?, failure? = load_compiler(project_root)
   if compiler == nil then return nil, failure end
   local installed_root?: string
@@ -1934,5 +1986,7 @@ function load_default(project_root: string): (Service?, Error?)
     end
     return nil, Error.new(project_root, strings.tostring(error))
   end
-  return load_with_compiler(project_root, installed_root, compiler)
+  return load_with_compiler(
+    project_root, installed_root, compiler, progress_listener,
+    snapshot_listener)
 end
