@@ -67,7 +67,25 @@ describe("extension manifest", () => {
     assert.equal(manifest.scripts.package, "make package");
   });
 
-  test("contributes language-server and compiler discovery settings", () => {
+  test("contributes a command that reveals language-server output", () => {
+    const manifest = readJson("package.json") as {
+      contributes: {
+        commands: Array<{
+          command: string;
+          title: string;
+          category: string;
+        }>;
+      };
+    };
+
+    assert.deepEqual(manifest.contributes.commands, [{
+      command: "titan.showLanguageServerOutput",
+      title: "Show Language Server Output",
+      category: "Titan"
+    }]);
+  });
+
+  test("contributes language-server observability and compiler settings", () => {
     const manifest = readJson("package.json") as {
       contributes: {
         configuration: {
@@ -75,6 +93,7 @@ describe("extension manifest", () => {
             type: string;
             default: unknown;
             scope: string;
+            enum?: string[];
           }>;
         };
       };
@@ -84,6 +103,7 @@ describe("extension manifest", () => {
     for (const setting of [
       "titan.languageServer.path",
       "titan.languageServer.arguments",
+      "titan.languageServer.logLevel",
       "titan.compiler.luaPath",
       "titan.compiler.luaCPath"
     ]) {
@@ -94,6 +114,23 @@ describe("extension manifest", () => {
     assert.equal(properties["titan.compiler.luaPath"].default, "");
     assert.equal(properties["titan.compiler.luaCPath"].type, "string");
     assert.equal(properties["titan.compiler.luaCPath"].default, "");
+
+    assert.deepEqual(properties["titan.languageServer.logLevel"].enum, [
+      "off",
+      "error",
+      "info",
+      "debug",
+      "trace"
+    ]);
+    assert.equal(properties["titan.languageServer.logLevel"].default, "info");
+
+    assert.deepEqual(properties["titan.trace.server"].enum, [
+      "off",
+      "messages",
+      "verbose"
+    ]);
+    assert.equal(properties["titan.trace.server"].default, "off");
+    assert.equal(properties["titan.trace.server"].scope, "window");
   });
 
   test("points every contributed language asset at a checked-in file", () => {

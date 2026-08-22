@@ -1,0 +1,73 @@
+local async = import "async"
+local test = import "test"
+local strings = import "string"
+local json = import "server.json"
+local logging = import "server.logging.titan"
+local response_queue = import "server.response_queue"
+local test_runtime = import "server.test_runtime"
+
+function test_structured_logging_filters_levels_and_encodes_fields(
+    _context: test.Context)
+  defer logging.configure("info")
+
+  test.assert(logging.configure("error"),
+              "logging rejected a supported level")
+  test.assert(logging.format("info", "filtered", nil) == nil,
+              "logging emitted a filtered level")
+  local rendered? = logging.format("error", "project.failure", {
+    json.Member.new("generation", json.from_integer(7)),
+    json.Member.new("message", json.from_string("bad saved project")),
+  })
+  test.assert(
+    rendered ==
+      [[titan-language-server {"level":"error","event":"project.failure","generation":7,"message":"bad saved project"}]],
+    "structured logging did not produce a stable stderr record")
+
+  test.assert(not logging.configure("noisy"),
+              "logging accepted an unknown level")
+  test.assert(logging.level() == "error",
+              "invalid configuration changed the active logging level")
+end
+
+function test_structured_logging_drops_unencodable_diagnostic_data(
+    _context: test.Context)
+  local previous_level = logging.level()
+  defer logging.configure(previous_level)
+  test.assert(logging.configure("debug"),
+              "logging rejected debug level")
+
+  local malformed_path = "/project/" .. strings.char(0xff) .. ".titan"
+  local fields = {
+    json.Member.new("path", json.from_string(malformed_path)),
+  }
+  test.assert(logging.format("debug", "project.watch.batch", fields) == nil,
+              "logging formatted invalid UTF-8 diagnostic data")
+
+  -- emit is called from non-yielding watcher/task callbacks. The assertion is
+  -- reaching this line: malformed optional telemetry must be a no-op rather
+  -- than an exception, whether or not the writer has been started.
+  logging.emit("debug", "project.watch.batch", fields)
+  test.assert(true, "logging emit did not return")
+end
+
+function test_structured_logging_close_does_not_surface_writer_failure(
+    _context: test.Context)
+  test_runtime.run(function ()
+    local queue = response_queue.create()
+    local writer = async.run<nil, value>(function (): nil
+      async.yield()
+      raise "synthetic stderr writer failure"
+    end)
+
+    logging.stop_writer(queue, writer)
+    test.assert(writer:status():has_finished(),
+                "logging close did not join the failed writer")
+    local stopped = false
+    do
+      queue:push("after close")
+    catch
+      stopped = true
+    end
+    test.assert(stopped, "logging close did not stop its output queue")
+  end)
+end

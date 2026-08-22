@@ -1,7 +1,7 @@
 local test = import "test"
 local strings = import "string"
 local bridge = import "server.compiler_bridge"
-local indexer = import "server.semantic_index"
+local indexer = import "server.semantic_index.titan"
 local source_text = import "server.source_text"
 
 local function location(filename: string, line: integer,
@@ -316,4 +316,92 @@ function test_semantic_index_treats_import_alias_as_a_declaration(
   local uses = index:occurrences(indexer.SymbolId.new(identity), false)
   test.assert(#uses == 1, "include-declaration omitted the wrong roles")
   assert_role(uses[1].role, "type_reference")
+end
+
+function test_semantic_index_large_build_has_bounded_sort_and_yields(
+    _context: test.Context)
+  -- Deliberately not a power of two: the final merge pass must preserve the
+  -- short tail as well as meeting the comparison budget.
+  local count = 2053
+  local filename = "/workspace/stress.titan"
+  local output = strings.writer()
+  local in_source_order: {bridge.SymbolOccurrence} = {}
+  for line = 1, count do
+    local name = "item" .. line
+    output:write(name)
+    output:write("\n")
+    in_source_order[line] = occurrence(
+      filename, line, 1, #name + 1, name,
+      "export:stress:" .. name,
+      bridge.OccurrenceRole.definition(), false)
+  end
+  local contents = output:drain()
+  local reverse_order: {bridge.SymbolOccurrence} = {}
+  for index = 1, count do
+    reverse_order[index] = in_source_order[count - index + 1]
+  end
+
+  local yield_count = 0
+  local index = indexer.build_with_yield({
+    project("stress", filename, contents),
+  }, {
+    project_snapshot("stress", filename, reverse_order),
+  }, function () yield_count = yield_count + 1 end)
+  local items = index:file_occurrences(filename)
+  test.assert(#items == count and
+              items[1].byte_span.start == 0 and
+              items[count].name == "item" .. count,
+              "large semantic build did not retain deterministic source order")
+  local levels = 0
+  local width = 1
+  while width < count do
+    levels = levels + 1
+    width = width * 2
+  end
+  -- Coordinate decoding, project/file/snapshot collection, each merge-sort
+  -- output, normalization, and bucket construction all share one counter.
+  -- This exact oracle catches a missing yield account in any large loop.
+  local expected_work = #contents + 3 + count * (levels + 3)
+  test.assert(yield_count == expected_work // 1024,
+              "large semantic build did not account all bounded work")
+
+  local reversed: {indexer.Occurrence} = {}
+  for item_index = 1, count do
+    reversed[item_index] = items[count - item_index + 1]
+  end
+  local comparisons = indexer.sort_occurrences(reversed)
+  test.assert(comparisons > count and comparisons <= count * levels,
+              "occurrence ordering exceeded an n log n comparison budget")
+  for item_index = 2, count do
+    test.assert(
+      reversed[item_index - 1].byte_span.start <
+        reversed[item_index].byte_span.start,
+      "merge sort did not restore deterministic occurrence order")
+  end
+end
+
+function test_semantic_index_shares_yield_budget_across_small_files(
+    _context: test.Context)
+  local projects: {bridge.ProjectModule} = {}
+  local snapshots: {bridge.ModuleSnapshot} = {}
+  for index = 1, 8 do
+    local module_name = "small" .. index
+    local filename = "/workspace/small" .. index .. ".titan"
+    local name = "item" .. index
+    local contents = strings.rep(" ", 900) .. name .. "\n"
+    projects[index] = project(module_name, filename, contents)
+    snapshots[index] = project_snapshot(module_name, filename, {
+      occurrence(filename, 1, 901, 901 + #name, name,
+                 "export:" .. module_name .. ":" .. name,
+                 bridge.OccurrenceRole.definition(), false),
+    })
+  end
+
+  local yield_count = 0
+  local index = indexer.build_with_yield(
+    projects, snapshots, function () yield_count = yield_count + 1 end)
+  test.assert(#index:file_names() == 8,
+              "small-file semantic build lost indexed files")
+  test.assert(yield_count == 7,
+              "coordinate work did not share one bounded yield budget")
 end

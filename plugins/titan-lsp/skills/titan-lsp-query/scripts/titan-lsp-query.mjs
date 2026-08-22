@@ -20,8 +20,10 @@ const POSITION_OPERATIONS = new Set([
 ]);
 const MAX_LSP_INTEGER = 2_147_483_647;
 const MAX_FRAME_BYTES = 64 * 1024 * 1024;
-const DEFAULT_TIMEOUT_MS = 15_000;
+const DEFAULT_TIMEOUT_MS = 300_000;
+const MAX_TIMEOUT_MS = 600_000;
 const TERMINATION_GRACE_MS = 1_000;
+const INDEXING_STATUS_NOTIFICATION = "titan/indexingStatus";
 
 let activeChild;
 let interruptedSignal;
@@ -102,6 +104,7 @@ class FrameReader {
     this.iterator = stream[Symbol.asyncIterator]();
     this.buffer = Buffer.alloc(0);
     this.timeoutMs = timeoutMs;
+    this.pendingNext = undefined;
   }
 
   async read(description) {
@@ -109,8 +112,13 @@ class FrameReader {
       const message = this.extract();
       if (message !== undefined) return message;
 
+      if (this.pendingNext === undefined) {
+        this.pendingNext = this.iterator.next().finally(() => {
+          this.pendingNext = undefined;
+        });
+      }
       const next = await withTimeout(
-        this.iterator.next(),
+        this.pendingNext,
         description,
         this.timeoutMs
       );
@@ -271,7 +279,7 @@ function parseArguments(argv) {
     server: values.get("--server") ?? "titan-language-server",
     serverArguments,
     timeoutMs: values.has("--timeout-ms")
-      ? parseInteger(values.get("--timeout-ms"), "--timeout-ms", 120_000)
+      ? parseInteger(values.get("--timeout-ms"), "--timeout-ms", MAX_TIMEOUT_MS)
       : DEFAULT_TIMEOUT_MS
   };
 }
@@ -440,6 +448,71 @@ async function request(child, reader, id, method, params) {
   }
 }
 
+async function waitForIndexing(reader) {
+  let indexing;
+  while (true) {
+    const message = await reader.read("language-server indexing");
+    if (message.id !== undefined) {
+      throw new QueryError(
+        "protocol_error",
+        `language server responded with unexpected id ${JSON.stringify(message.id)}`
+      );
+    }
+    if (message.method !== INDEXING_STATUS_NOTIFICATION) continue;
+
+    const params = message.params;
+    if (params === null || typeof params !== "object" || Array.isArray(params) ||
+        !["indexing", "ready", "failed"].includes(params.state) ||
+        typeof params.initial !== "boolean" ||
+        !Number.isSafeInteger(params.epoch) || params.epoch < 0 ||
+        (params.generation !== undefined &&
+         (!Number.isSafeInteger(params.generation) || params.generation < 0)) ||
+        (params.message !== undefined && typeof params.message !== "string")) {
+      throw new QueryError(
+        "protocol_error",
+        `language server sent an invalid ${INDEXING_STATUS_NOTIFICATION} notification`
+      );
+    }
+    if (indexing === undefined) {
+      if (params.state !== "indexing" || !params.initial ||
+          params.message !== undefined) {
+        throw new QueryError(
+          "protocol_error",
+          "language-server initial indexing omitted its busy status"
+        );
+      }
+      indexing = params;
+      continue;
+    }
+    if (params.state === "indexing" || params.initial !== indexing.initial ||
+        params.epoch < indexing.epoch) {
+      throw new QueryError(
+        "protocol_error",
+        "language-server initial indexing emitted an invalid status sequence"
+      );
+    }
+    if (params.state === "ready") {
+      if (!Number.isSafeInteger(params.generation) ||
+          params.message !== undefined) {
+        throw new QueryError(
+          "protocol_error",
+          "language-server initial ready status is incomplete"
+        );
+      }
+      return;
+    }
+    if (params.state === "failed") {
+      const detail = typeof params.message === "string" && params.message.length > 0
+        ? `: ${params.message}`
+        : "";
+      throw new QueryError(
+        "indexing_failed",
+        `language-server indexing failed${detail}`
+      );
+    }
+  }
+}
+
 function closedPromise(child) {
   return new Promise((resolve) => {
     child.once("close", (code, signal) => resolve({ code, signal }));
@@ -526,6 +599,7 @@ async function query(options) {
     nextId += 1;
     initialized = true;
     await writeMessage(child, { jsonrpc: "2.0", method: "initialized", params: {} });
+    await waitForIndexing(reader);
 
     const textDocument = { uri: options.uri };
     const position = POSITION_OPERATIONS.has(options.operation)

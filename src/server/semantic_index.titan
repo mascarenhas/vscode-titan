@@ -1,5 +1,7 @@
 local strings = import "string"
 local bridge = import "server.compiler_bridge"
+local json = import "server.json"
+local logging = import "server.logging"
 local source_text = import "server.source_text"
 
 -- Symbol identity is nominal at the server boundary even though the compiler
@@ -26,9 +28,19 @@ record Error
   const message: string
 end
 
+type Yield = () -> ()
+
+local YIELD_CADENCE = 1024
+
+local record YieldState
+  const yield_now: Yield?
+  work: integer
+end
+
 local record SavedFile
   const module_name: string
   const contents: string
+  const coordinates: source_text.CoordinateIndex
 end
 
 record Index
@@ -36,6 +48,7 @@ record Index
   local by_symbol: {string: {Occurrence}}
   local definitions: {string: Occurrence}
   local filenames: {string}
+  local coordinates: {string: source_text.CoordinateIndex}
 end
 
 local function fail<T>(module_name: string?, filename: string?,
@@ -47,6 +60,14 @@ local function fail_span(module_name: string?, filename: string?,
                          message: string):
     (source_text.Span, source_text.ByteSpan)
   raise Error.new(module_name, filename, message)
+end
+
+local function account_work(state: YieldState)
+  if state.yield_now == nil then return end
+  state.work = state.work + 1
+  if state.work < YIELD_CADENCE then return end
+  state.work = 0
+  state.yield_now()
 end
 
 local function role_rank(role: bridge.OccurrenceRole): integer
@@ -121,69 +142,105 @@ local function same_occurrence(left: Occurrence,
          same_type(left.type_info, right.type_info)
 end
 
-local function insert_sorted(items: {Occurrence}, item: Occurrence)
-  local position = #items + 1
-  while position > 1 and occurrence_less(item, items[position - 1]) do
-    items[position] = items[position - 1]
-    position = position - 1
-  end
-  items[position] = item
-end
+-- Stable bottom-up merge sort avoids both recursion depth and the quadratic
+-- shifts of insertion sort. Returning the comparison count gives the
+-- source-collaborating regression test a deterministic complexity oracle.
+local function sort_occurrences(items: {Occurrence},
+                                yield_state: YieldState?): integer
+  local count = #items
+  if count < 2 then return 0 end
 
-local function line_start(source: string, target_line: integer,
-                          module_name: string, filename: string): integer
-  if target_line < 1 then
-    return fail<integer>(module_name, filename,
-      "compiler span has a non-positive line")
-  end
-  local line = 1
-  local index = 1
-  while line < target_line do
-    if index > #source then
-      return fail<integer>(module_name, filename,
-        "compiler span line is outside the saved source")
+  local source = items
+  local target: {Occurrence} = {}
+  local source_is_input = true
+  local comparisons = 0
+  local width = 1
+  while width < count do
+    local first = 1
+    while first <= count do
+      local left = first
+      local left_finish = first + width - 1
+      if left_finish > count then left_finish = count end
+      local right = left_finish + 1
+      local right_finish = right + width - 1
+      if right_finish > count then right_finish = count end
+      local output = first
+
+      while left <= left_finish and right <= right_finish do
+        if yield_state ~= nil then account_work(yield_state) end
+        comparisons = comparisons + 1
+        if occurrence_less(source[right], source[left]) then
+          target[output] = source[right]
+          right = right + 1
+        else
+          -- Equal values stay in input order, making the sort stable even
+          -- before exact duplicates are collapsed.
+          target[output] = source[left]
+          left = left + 1
+        end
+        output = output + 1
+      end
+      while left <= left_finish do
+        if yield_state ~= nil then account_work(yield_state) end
+        target[output] = source[left]
+        left = left + 1
+        output = output + 1
+      end
+      while right <= right_finish do
+        if yield_state ~= nil then account_work(yield_state) end
+        target[output] = source[right]
+        right = right + 1
+        output = output + 1
+      end
+      first = right_finish + 1
     end
-    local byte: integer = strings.byte(source, index)
-    -- Match titan-compiler.location exactly: only LF advances the compiler
-    -- line, while a preceding CR remains part of that line's byte columns.
-    if byte == 0x0a then
-      index = index + 1
-      line = line + 1
+
+    local swap = source
+    source = target
+    target = swap
+    source_is_input = not source_is_input
+    if width > count // 2 then
+      width = count
     else
-      index = index + 1
+      width = width * 2
     end
   end
-  return index
-end
 
-local function line_finish(source: string, start_index: integer): integer
-  local index = start_index
-  while index <= #source do
-    local byte: integer = strings.byte(source, index)
-    if byte == 0x0a then return index end
-    index = index + 1
+  if not source_is_input then
+    for index = 1, count do
+      if yield_state ~= nil then account_work(yield_state) end
+      items[index] = source[index]
+    end
   end
-  return #source + 1
+  return comparisons
 end
 
 -- Compiler locations are one-based byte columns. Convert them to a zero-based
 -- byte offset first; SourceText remains the sole owner of UTF-8/UTF-16
 -- validation and conversion.
-local function location_offset(source: string,
+local function location_offset(coordinates: source_text.CoordinateIndex,
                                location: bridge.SourceLocation,
                                module_name: string): integer
+  if location.line < 1 then
+    return fail<integer>(module_name, location.filename,
+      "compiler span has a non-positive line")
+  end
   if location.column < 1 then
     return fail<integer>(module_name, location.filename,
       "compiler span has a non-positive column")
   end
-  local start_index = line_start(
-    source, location.line, module_name, location.filename)
-  local target_index = start_index + location.column - 1
-  if target_index > line_finish(source, start_index) then
+  local start_offset? = coordinates:lf_line_start(location.line)
+  if start_offset == nil then
+    return fail<integer>(module_name, location.filename,
+      "compiler span line is outside the saved source")
+  end
+  local target_offset? = coordinates:offset_for_lf_byte_position(
+    location.line, location.column)
+  if target_offset == nil then
     return fail<integer>(module_name, location.filename,
       "compiler span column is outside its saved source line")
   end
-  return target_index - 1
+  return target_offset
 end
 
 local function validate_span(module_name: string, saved: SavedFile,
@@ -213,9 +270,10 @@ local function validate_span(module_name: string, saved: SavedFile,
       "identifier span crosses a source line")
   end
 
-  local start_offset = location_offset(saved.contents, exact.start, module_name)
+  local start_offset = location_offset(
+    saved.coordinates, exact.start, module_name)
   local finish_offset = location_offset(
-    saved.contents, exact.finish, module_name)
+    saved.coordinates, exact.finish, module_name)
   if finish_offset < start_offset then
     return fail_span(
       module_name, symbol.location.filename,
@@ -229,8 +287,8 @@ local function validate_span(module_name: string, saved: SavedFile,
       "' at the compiler's exact span")
   end
 
-  local span?, span_error? = source_text.span_for_offsets(
-    saved.contents, start_offset, finish_offset)
+  local span?, span_error? = saved.coordinates:span_for_offsets(
+    start_offset, finish_offset)
   if span == nil then
     local detail = "invalid UTF-8 boundary"
     if span_error ~= nil then detail = span_error.message end
@@ -241,11 +299,25 @@ local function validate_span(module_name: string, saved: SavedFile,
   return span, source_text.ByteSpan.new(start_offset, finish_offset)
 end
 
-local function project_files(projects: {bridge.ProjectModule}):
-    ({string: SavedFile}, {string: boolean})
+local function index_coordinates(contents: string,
+                                 yield_state: YieldState):
+    source_text.CoordinateIndex
+  if yield_state.yield_now ~= nil then
+    return source_text.coordinate_index_with_account(
+      contents, function () account_work(yield_state) end)
+  end
+  return source_text.coordinate_index(contents)
+end
+
+local function project_files(projects: {bridge.ProjectModule},
+                             yield_state: YieldState):
+    ({string: SavedFile}, {string: boolean},
+     {string: source_text.CoordinateIndex})
   local files: {string: SavedFile} = {}
   local modules: {string: boolean} = {}
+  local coordinates: {string: source_text.CoordinateIndex} = {}
   for project_index = 1, #projects do
+    account_work(yield_state)
     local project = projects[project_index]
     if modules[project.module_name] then
       fail<value>(project.module_name, nil,
@@ -253,20 +325,25 @@ local function project_files(projects: {bridge.ProjectModule}):
     end
     modules[project.module_name] = true
     for file_index = 1, #project.files do
+      account_work(yield_state)
       local file = project.files[file_index]
       if files[file.filename] ~= nil then
         fail<value>(project.module_name, file.filename,
           "saved source file belongs to more than one project module")
       end
-      files[file.filename] = SavedFile.new(project.module_name, file.contents)
+      local indexed = index_coordinates(file.contents, yield_state)
+      files[file.filename] = SavedFile.new(
+        project.module_name, file.contents, indexed)
+      coordinates[file.filename] = indexed
     end
   end
-  return files, modules
+  return files, modules, coordinates
 end
 
 local function append_snapshot_occurrences(
     target: {Occurrence}, snapshot: bridge.ModuleSnapshot,
-    files: {string: SavedFile}, projects: {string: boolean})
+    files: {string: SavedFile}, projects: {string: boolean},
+    yield_state: YieldState)
   case snapshot.provenance
   when project_source then
   else
@@ -279,6 +356,7 @@ local function append_snapshot_occurrences(
   end
 
   for index = 1, #snapshot.symbols do
+    account_work(yield_state)
     local symbol = snapshot.symbols[index]
     local saved? = files[symbol.location.filename]
     -- A compiler declaration object from an imported module can be reachable
@@ -295,17 +373,19 @@ local function append_snapshot_occurrences(
           "compiler occurrence has an empty identifier")
       end
       local span, bytes = validate_span(snapshot.module_name, saved, symbol)
-      insert_sorted(target, Occurrence.new(
+      target[#target + 1] = Occurrence.new(
         SymbolId.new(symbol.declaration_id), snapshot.module_name,
         symbol.location.filename, symbol.name, symbol.role, span, bytes,
-        symbol.is_local, symbol.type_info))
+        symbol.is_local, symbol.type_info)
     end
   end
 end
 
-local function normalize_occurrences(items: {Occurrence}): {Occurrence}
+local function normalize_occurrences(items: {Occurrence},
+                                     yield_state: YieldState): {Occurrence}
   local result: {Occurrence} = {}
   for index = 1, #items do
+    account_work(yield_state)
     local item = items[index]
     local previous? = result[#result]
     if previous ~= nil and same_occurrence(previous, item) then
@@ -323,21 +403,32 @@ local function normalize_occurrences(items: {Occurrence}): {Occurrence}
   return result
 end
 
-function build(projects: {bridge.ProjectModule},
-               snapshots: {bridge.ModuleSnapshot}): Index
-  local files, project_names = project_files(projects)
+local function build_internal(projects: {bridge.ProjectModule},
+                              snapshots: {bridge.ModuleSnapshot},
+                              yield_now: Yield?): Index
+  local started = logging.clock()
+  logging.emit("debug", "semantic_index.build.start", {
+    json.Member.new("project_modules", json.from_integer(#projects)),
+    json.Member.new("snapshots", json.from_integer(#snapshots)),
+  })
+  local yield_state = YieldState.new(yield_now, 0)
+  local files, project_names, coordinates =
+    project_files(projects, yield_state)
   local raw: {Occurrence} = {}
   for index = 1, #snapshots do
+    account_work(yield_state)
     append_snapshot_occurrences(
-      raw, snapshots[index], files, project_names)
+      raw, snapshots[index], files, project_names, yield_state)
   end
-  local occurrences = normalize_occurrences(raw)
+  local comparisons = sort_occurrences(raw, yield_state)
+  local occurrences = normalize_occurrences(raw, yield_state)
   local by_file: {string: {Occurrence}} = {}
   local by_symbol: {string: {Occurrence}} = {}
   local definitions: {string: Occurrence} = {}
   local filenames: {string} = {}
 
   for index = 1, #occurrences do
+    account_work(yield_state)
     local occurrence = occurrences[index]
     local file_bucket? = by_file[occurrence.filename]
     if file_bucket == nil then
@@ -364,7 +455,27 @@ function build(projects: {bridge.ProjectModule},
       definitions[key] = occurrence
     end
   end
-  return Index.new(by_file, by_symbol, definitions, filenames)
+  logging.emit("info", "semantic_index.build.complete", {
+    json.Member.new("files", json.from_integer(#filenames)),
+    json.Member.new("raw_occurrences", json.from_integer(#raw)),
+    json.Member.new("occurrences", json.from_integer(#occurrences)),
+    json.Member.new("comparisons", json.from_integer(comparisons)),
+    json.Member.new("cpu_ms", json.from_number(
+      logging.elapsed_ms(started))),
+  })
+  return Index.new(
+    by_file, by_symbol, definitions, filenames, coordinates)
+end
+
+function build(projects: {bridge.ProjectModule},
+               snapshots: {bridge.ModuleSnapshot}): Index
+  return build_internal(projects, snapshots, nil)
+end
+
+function build_with_yield(projects: {bridge.ProjectModule},
+                          snapshots: {bridge.ModuleSnapshot},
+                          yield_now: Yield): Index
+  return build_internal(projects, snapshots, yield_now)
 end
 
 local function copy_occurrences(items: {Occurrence}): {Occurrence}
@@ -377,6 +488,11 @@ function Index:file_names(): {string}
   local result: {string} = {}
   for index = 1, #self.filenames do result[index] = self.filenames[index] end
   return result
+end
+
+function Index:coordinate_index(filename: string):
+    source_text.CoordinateIndex?
+  return self.coordinates[filename]
 end
 
 function Index:file_occurrences(filename: string): {Occurrence}

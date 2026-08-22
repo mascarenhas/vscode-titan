@@ -1,0 +1,46 @@
+local json = import "server.json"
+
+union State
+  indexing
+  ready
+  failed
+end
+
+record Status
+  const state: State
+  const initial: boolean
+  const epoch: integer
+  const generation: integer?
+  const message: string?
+end
+
+type Listener = (Status) -> ()
+
+function state_name(state: State): string
+  case state
+  when indexing then return "indexing"
+  when ready then return "ready"
+  when failed then return "failed"
+  end
+end
+
+function notification(status: Status): string
+  local params: {json.Member} = {
+    json.Member.new("state", json.from_string(state_name(status.state))),
+    json.Member.new("initial", json.from_boolean(status.initial)),
+    json.Member.new("epoch", json.from_integer(status.epoch)),
+  }
+  if status.generation ~= nil then
+    params[#params + 1] = json.Member.new(
+      "generation", json.from_integer(status.generation))
+  end
+  if status.message ~= nil then
+    params[#params + 1] = json.Member.new(
+      "message", json.from_string(status.message))
+  end
+  return json.encode(json.from_object({
+    json.Member.new("jsonrpc", json.from_string("2.0")),
+    json.Member.new("method", json.from_string("titan/indexingStatus")),
+    json.Member.new("params", json.from_object(params)),
+  }))
+end

@@ -5,6 +5,8 @@ local strings = import "string"
 local async = import "async"
 local compiler_io = import "server.compiler_io"
 local compiler_scheduler = import "server.compiler_scheduler"
+local json = import "server.json"
+local logging = import "server.logging"
 
 local COMPILER_ABI = "0.26"
 local COMPILER_LANGUAGE_SERVER_API = 3
@@ -13,6 +15,14 @@ local PARSER_MODULE = "titan-compiler.parser"
 local CHECKER_MODULE = "titan-compiler.checker"
 local TYPES_MODULE = "titan-compiler.types"
 local DRIVER_MODULE = "titan-compiler.driver"
+
+local function string_array(items: {string}): json.Value
+  local values: {json.Value} = {}
+  for index = 1, #items do
+    values[index] = json.from_string(items[index])
+  end
+  return json.from_array(values)
+end
 
 record BridgeError
   module_name: string
@@ -1844,6 +1854,10 @@ local function Compiler:run_attempt(
     overrides: {string: value},
     pending: {string: boolean}, cached: {string: CachedSourceInterface},
     raw_cached_interfaces: {string: value}): AttemptResult
+  local started = logging.clock()
+  logging.emit("debug", "compiler.attempt.start", {
+    json.Member.new("root_module", json.from_string(root_module)),
+  })
   local options: {string: value} = { ["io"] = self.io }
   local roots: {string: value} = {[root_module] = true}
   local active_overrides: {string: value} = {}
@@ -1948,13 +1962,28 @@ local function Compiler:run_attempt(
   if checked_set[root_module] and imported[root_module] == nil then
     modules[#modules + 1] = failed_project_snapshot(projects[root_module])
   end
-  return AttemptResult.new(
+  local result = AttemptResult.new(
     diagnostics, modules, contextual_resolutions, checked, entries, failed)
+  logging.emit("debug", "compiler.attempt.complete", {
+    json.Member.new("root_module", json.from_string(root_module)),
+    json.Member.new("checked_modules", string_array(checked)),
+    json.Member.new("snapshots", json.from_integer(#modules)),
+    json.Member.new("diagnostics", json.from_integer(#diagnostics)),
+    json.Member.new("cpu_ms", json.from_number(
+      logging.elapsed_ms(started))),
+  })
+  return result
 end
 
 function Compiler:analyze_incremental(
     project_modules: {ProjectModule}, dirty_modules: {string},
     cached_sources: {CachedSourceInterface}): Analysis
+  local started = logging.clock()
+  logging.emit("debug", "compiler.analysis.start", {
+    json.Member.new("project_modules", json.from_integer(#project_modules)),
+    json.Member.new("dirty_modules", string_array(dirty_modules)),
+    json.Member.new("cached_sources", json.from_integer(#cached_sources)),
+  })
   local overrides, projects = project_loader_inputs(project_modules)
   local requested, ordered = requested_modules(dirty_modules, projects)
   local cached, raw_cached_interfaces = cached_source_map(
@@ -2036,8 +2065,16 @@ function Compiler:analyze_incremental(
   for index = 1, #external_names do
     modules[#modules + 1] = snapshots[external_names[index]]
   end
-  return Analysis.new(
+  local result = Analysis.new(
     ordered[1], diagnostics, modules, contextual_resolutions)
+  logging.emit("debug", "compiler.analysis.complete", {
+    json.Member.new("root_module", json.from_string(ordered[1])),
+    json.Member.new("diagnostics", json.from_integer(#diagnostics)),
+    json.Member.new("snapshots", json.from_integer(#modules)),
+    json.Member.new("cpu_ms", json.from_number(
+      logging.elapsed_ms(started))),
+  })
+  return result
 catch
   if error is async.CancellationReason then raise end
   if error is BridgeError then raise end

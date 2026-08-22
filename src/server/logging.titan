@@ -1,0 +1,123 @@
+local async = import "async"
+local os = import "os"
+local json = import "server.json"
+local response_queue = import "server.response_queue"
+
+-- Structured diagnostics are always written to stderr. The leading component
+-- token lets the VS Code client distinguish records from unstructured native
+-- dependency errors without parsing arbitrary stderr as JSON.
+local configured_rank = 0
+local configured_name = "off"
+local output: response_queue.ResponseQueue? = nil
+local writer: async.Task<nil, value>? = nil
+
+local function level_rank(level: string): integer?
+  if level == "off" then return 0 end
+  if level == "error" then return 1 end
+  if level == "info" then return 2 end
+  if level == "debug" then return 3 end
+  if level == "trace" then return 4 end
+  return nil
+end
+
+function configure(level: string?): boolean
+  local requested = "info"
+  if level ~= nil and level ~= "" then requested = level end
+  local rank? = level_rank(requested)
+  if rank == nil then return false end
+  configured_rank = rank
+  configured_name = requested
+  return true
+end
+
+function level(): string
+  return configured_name
+end
+
+function enabled(level: string): boolean
+  local rank? = level_rank(level)
+  if rank == nil or configured_rank == 0 then return false end
+  return rank <= configured_rank
+end
+
+function clock(): float
+  return os.clock()
+end
+
+function elapsed_ms(started: float): float
+  return (os.clock() - started) * 1000.0
+end
+
+local function write_records(queue: response_queue.ResponseQueue): nil
+  while true do
+    local entry? = queue:take()
+    if entry == nil then return nil end
+    os.stderr:write(entry .. "\n")
+  end
+  return nil
+end
+
+-- Producers include task-terminal listeners and compiler scheduler ownership
+-- transitions, where yielding is forbidden. They only serialize and enqueue;
+-- this one Task owns every potentially yielding stderr write.
+function start()
+  if writer ~= nil then return end
+  local queue = response_queue.create()
+  output = queue
+  writer = async.run<nil, value>(function (): nil
+    return write_records(queue)
+  end)
+end
+
+local function stop_writer(queue: response_queue.ResponseQueue,
+                           task: async.Task<nil, value>)
+  queue:stop()
+  -- Stderr logging is best-effort. In particular, an EPIPE or other terminal
+  -- writer failure during teardown must not replace the protocol/server result
+  -- that caused close to run.
+  async.join<nil, value>(task)
+end
+
+function close()
+  local queue? = output
+  local task? = writer
+  output = nil
+  writer = nil
+  if queue == nil or task == nil then return end
+  stop_writer(queue, task)
+end
+
+function format(level: string, event: string,
+                fields: {json.Member}?): string?
+  do
+    if not enabled(level) then return nil end
+    local members: {json.Member} = {
+      json.Member.new("level", json.from_string(level)),
+      json.Member.new("event", json.from_string(event)),
+    }
+    if fields ~= nil then
+      for index = 1, #fields do
+        members[#members + 1] = fields[index]
+      end
+    end
+    return "titan-language-server " .. json.encode(json.from_object(members))
+  catch
+    -- Diagnostic data can originate in filesystem/native errors and is not
+    -- guaranteed to be valid UTF-8. A malformed optional log record must never
+    -- terminate the watcher, compiler owner, or task-terminal callback that
+    -- attempted to emit it.
+    return nil
+  end
+end
+
+function emit(level: string, event: string, fields: {json.Member}?)
+  do
+    local rendered? = format(level, event, fields)
+    local queue? = output
+    if rendered ~= nil and queue ~= nil then queue:push(rendered) end
+  catch
+    -- The queue may have just been stopped during teardown. Logging is
+    -- deliberately best-effort and cannot change the caller's control flow.
+    return
+  end
+end

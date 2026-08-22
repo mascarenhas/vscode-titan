@@ -1,11 +1,13 @@
 local async = import "async"
 local fs = import "fs"
-local os = import "os"
 local strings = import "string"
 local bridge = import "server.compiler_bridge"
 local dispatcher = import "server.dispatcher"
+local indexing_status = import "server.indexing_status"
 local json = import "server.json"
+local logging = import "server.logging"
 local lsp = import "server.lsp_types"
+local project_discovery = import "server.project_discovery"
 local project_service = import "server.project_service"
 local project_watcher = import "server.project_watcher"
 local semantic_features = import "server.semantic_features"
@@ -24,6 +26,17 @@ local union RefreshOutcome
   failure: Error
 end
 
+-- Watch backends publish canonical paths, while project configuration retains
+-- its lexical identity (including configured symlinks). Build both identities
+-- while reconciling registrations so the poll callback itself only performs
+-- bounded string/table work and cannot be cancelled between a hint and its
+-- epoch increment.
+local record WatchFilter
+  const source_roots: {string}
+  const configuration_paths: {string: boolean}
+  const known_directories: {string: boolean}
+end
+
 type RenameAnalyzer = (
   project_service.Snapshot, {bridge.ProjectModule}) -> bridge.Analysis
 
@@ -31,12 +44,26 @@ record Application
   local const project_root: string
   local service: project_service.Service?
   local watcher: project_watcher.ProjectWatcher?
+  local watch_filter: WatchFilter?
   local refresh_task: async.Task<RefreshOutcome, value>?
   local completed_view: View?
   local refresh_failure: Error?
-  local dirty_hint: boolean
+  local change_epoch: integer
+  local completed_epoch: integer
+  local refresh_chain_active: boolean
+  local refresh_chain_initial: boolean
+  local refresh_passes: integer
+  local view_builds: integer
+  local indexing_listener: indexing_status.Listener?
   local closed: boolean
   local const rename_analyzer: RenameAnalyzer
+end
+
+-- Source-imported application tests use these counters to assert coalescing and
+-- immutable View reuse without timing or compiler-performance assumptions.
+local record IndexingMetrics
+  const refresh_passes: integer
+  const view_builds: integer
 end
 
 local INVALID_PARAMS = -32602
@@ -81,6 +108,162 @@ local function parent_directory(path: string): string
   return strings.sub(path, 1, slash - 1)
 end
 
+local function child_path(parent: string, name: string): string
+  if parent == "/" then return "/" .. name end
+  return parent .. "/" .. name
+end
+
+local function leaf_name(path: string): string
+  local parent = parent_directory(path)
+  if parent == "/" then return strings.sub(path, 2) end
+  return strings.sub(path, #parent + 2)
+end
+
+local function canonical_directory(path: string): string
+  do
+    return fs.realpath(path)
+  catch
+    if error is async.CancellationReason then raise end
+    return path
+  end
+end
+
+-- File events preserve the watched directory's canonical identity even for a
+-- create/delete whose leaf cannot itself be resolved. Canonicalize the parent
+-- and retain that leaf instead of calling realpath on the event target.
+local function canonical_file_path(path: string): string
+  return child_path(
+    canonical_directory(parent_directory(path)), leaf_name(path))
+end
+
+local function path_within(root: string, path: string): boolean
+  if path == root then return true end
+  if root == "/" then return strings.sub(path, 1, 1) == "/" end
+  return strings.sub(path, 1, #root + 1) == root .. "/"
+end
+
+local function titan_source_path(path: string): boolean
+  return #path >= 6 and strings.sub(path, #path - 5) == ".titan"
+end
+
+local function watch_path_array(changes: {project_watcher.PathChange}):
+    json.Value
+  local values: {json.Value} = {}
+  for index = 1, #changes do
+    values[index] = json.from_string(
+      project_watcher.change_path(changes[index]))
+  end
+  return json.from_array(values)
+end
+
+-- Mirror project discovery's lexical directory boundary. Names such as build
+-- and tmp are valid module components and must remain observable; their
+-- non-Titan artifacts are filtered separately by watch_path_relevant.
+local function source_directory_path(root: string, path: string): boolean
+  if not path_within(root, path) then return false end
+  if path == root then return true end
+  local start = #root + 2
+  if root == "/" then start = 2 end
+  local component_start = start
+  for index = start, #path + 1 do
+    if index == #path + 1 or strings.byte(path, index) == 47 then
+      if not project_discovery.valid_module_component(
+          strings.sub(path, component_start, index - 1)) then
+        return false
+      end
+      component_start = index + 1
+    end
+  end
+  return true
+end
+
+local function rebase_path(path: string, source_root: string,
+                           observed_root: string): string
+  if path == source_root then return observed_root end
+  if source_root == "/" then
+    if observed_root == "/" then return path end
+    return observed_root .. path
+  end
+  return observed_root .. strings.sub(path, #source_root + 1)
+end
+
+local function build_watch_filter(snapshot: project_service.Snapshot):
+    WatchFilter
+  local source_root = snapshot.config.source_modules_root
+  local source_roots = {source_root}
+  local canonical_source_root = canonical_directory(source_root)
+  if canonical_source_root ~= source_root then
+    source_roots[#source_roots + 1] = canonical_source_root
+  end
+
+  local configuration_paths: {string: boolean} = {}
+  local expected_config = child_path(
+    snapshot.config.project_root, "titan-config.lua")
+  configuration_paths[expected_config] = true
+  configuration_paths[canonical_file_path(expected_config)] = true
+  local config_file? = snapshot.config.config_file
+  if config_file ~= nil then
+    configuration_paths[config_file] = true
+    configuration_paths[canonical_file_path(config_file)] = true
+  end
+
+  local known_directories: {string: boolean} = {}
+  for index = 1, #snapshot.project_directories do
+    local directory = snapshot.project_directories[index]
+    known_directories[directory] = true
+    known_directories[rebase_path(
+      directory, source_root, canonical_source_root)] = true
+  end
+  return WatchFilter.new(
+    source_roots, configuration_paths, known_directories)
+end
+
+-- The directory watcher is intentionally broader than the saved project: it
+-- must observe a new source directory or a newly created configuration file.
+-- A created extensionless valid component is conservatively a possible new
+-- directory; subsequent modifications are ignored unless discovery cached it
+-- as a directory. Dotted/editor paths and non-Titan artifacts remain
+-- irrelevant because discovery would prune the same component. This function
+-- must remain non-yielding: ProjectWatcher reconciliation may cancel its poll
+-- Task immediately after a callback, and every accepted hint must increment
+-- the Application epoch first.
+local function watch_change_relevant(filter: WatchFilter,
+                                     change: project_watcher.PathChange):
+    boolean
+  local path = project_watcher.change_path(change)
+  if filter.configuration_paths[path] then return true end
+  for index = 1, #filter.source_roots do
+    local source_root = filter.source_roots[index]
+    if path_within(source_root, path) then
+      if titan_source_path(path) then
+        return source_directory_path(
+          source_root, parent_directory(path))
+      end
+      if not source_directory_path(source_root, path) then return false end
+      if filter.known_directories[path] then return true end
+      case change
+      when created then
+        -- A new extensionless valid path may be a source directory. One
+        -- conservative refresh discovers its type and caches it if so;
+        -- repeated file modifications/deletion remain irrelevant.
+        return true
+      else
+        return false
+      end
+    end
+  end
+  return false
+end
+
+-- Source-imported tests validate lexical and canonical parity through the
+-- same immutable filter construction used by reconciliation. Production
+-- callbacks call watch_change_relevant directly and never enter this helper.
+local function relevant_watch_change(snapshot: project_service.Snapshot,
+                                     change: project_watcher.PathChange):
+    boolean
+  return watch_change_relevant(build_watch_filter(snapshot), change)
+end
+
 local function watcher_scope(snapshot: project_service.Snapshot):
     project_watcher.DirectoryScope
   local configuration = {snapshot.config.project_root}
@@ -122,15 +305,41 @@ local function project_inputs(snapshot: project_service.Snapshot):
 end
 
 local function log_watch_failure(failure: project_watcher.WatchFailure)
-  os.stderr:write(
-    "titan-language-server: " .. failure.operation .. ": " ..
-    failure.message .. " (" .. failure.name .. ", " .. failure.code ..
-    ")\n")
+  logging.emit("error", "project.watch.failure", {
+    json.Member.new("operation", json.from_string(failure.operation)),
+    json.Member.new("name", json.from_string(failure.name)),
+    json.Member.new("code", json.from_integer(failure.code)),
+    json.Member.new("message", json.from_string(failure.message)),
+  })
 end
 
 local function Application:watch_callback(
     batch: project_watcher.RediscoveryBatch)
-  if #batch.paths > 0 or batch.watch_set_changed then
+  local relevant = batch.watch_set_changed
+  local filter? = self.watch_filter
+  if not relevant and filter ~= nil then
+    for index = 1, #batch.changes do
+      if watch_change_relevant(filter, batch.changes[index]) then
+        relevant = true
+        break
+      end
+    end
+  elseif not relevant and #batch.changes > 0 then
+    -- A watcher should never exist without its prepared filter. If lifecycle
+    -- code changes that invariant, prefer a bounded extra refresh to losing a
+    -- saved-file invalidation.
+    relevant = true
+  end
+  if logging.enabled("debug") then
+    logging.emit("debug", "project.watch.batch", {
+      json.Member.new("paths", watch_path_array(batch.changes)),
+      json.Member.new("failures", json.from_integer(#batch.failures)),
+      json.Member.new("watch_set_changed", json.from_boolean(
+        batch.watch_set_changed)),
+      json.Member.new("relevant", json.from_boolean(relevant)),
+    })
+  end
+  if relevant then
     -- Watch events are hints only. The next semantic request rediscovers the
     -- complete saved project and never consumes editor notification text.
     self:note_saved_change()
@@ -144,15 +353,22 @@ end
 -- deterministically inject the same coalesced hint without depending on kernel
 -- event timing.
 function Application:note_saved_change()
-  self.dirty_hint = true
+  if self.closed then return end
+  self.change_epoch = self.change_epoch + 1
+  logging.emit("debug", "indexing.saved_change", {
+    json.Member.new("epoch", json.from_integer(self.change_epoch)),
+    json.Member.new("refresh_active", json.from_boolean(
+      self.refresh_task ~= nil)),
+  })
+  self:start_indexing()
 end
 
-local function Application:install_view(
-    snapshot: project_service.Snapshot): View
-  local projects, snapshots = project_inputs(snapshot)
-  local view = View.new(
-    snapshot, semantic_features.build(projects, snapshots))
-
+local function Application:reconcile_watcher(
+    snapshot: project_service.Snapshot)
+  -- Canonicalization may yield or fail, so finish it before changing watcher
+  -- registrations. The callback retains the preceding immutable filter until
+  -- a complete replacement is ready.
+  local next_filter = build_watch_filter(snapshot)
   local scope = watcher_scope(snapshot)
   if self.watcher == nil then
     self.watcher = project_watcher.start(
@@ -163,13 +379,23 @@ local function Application:install_view(
   else
     self.watcher:reconcile(scope)
   end
+  -- Cooperative scheduling cannot run the newly started poll callback between
+  -- the successful reconcile return and this non-yielding assignment.
+  self.watch_filter = next_filter
+end
+
+local function Application:install_view(
+    snapshot: project_service.Snapshot): View
+  self.view_builds = self.view_builds + 1
+  local projects, snapshots = project_inputs(snapshot)
+  local view = View.new(
+    snapshot, semantic_features.build_with_yield(
+      projects, snapshots, function () async.yield() end))
+  self:reconcile_watcher(snapshot)
   return view
 end
 
 local function Application:refresh_once(): RefreshOutcome
-  -- Clear only the hint observed before this refresh. A callback that arrives
-  -- while filesystem operations yield sets it again for the following pass.
-  self.dirty_hint = false
   do
     local service? = self.service
     if service == nil then
@@ -180,7 +406,6 @@ local function Application:refresh_once(): RefreshOutcome
         if load_error ~= nil then
           message = load_error.path .. ": " .. load_error.message
         end
-        self.dirty_hint = true
         return RefreshOutcome.failure(Error.new(message))
       end
       self.service = loaded
@@ -193,47 +418,151 @@ local function Application:refresh_once(): RefreshOutcome
       if refresh_error ~= nil then
         message = refresh_error.path .. ": " .. refresh_error.message
       end
-      self.dirty_hint = true
       return RefreshOutcome.failure(Error.new(message))
     end
-    return RefreshOutcome.ready(self:install_view(service:latest()))
+    local snapshot = service:latest()
+    local completed? = self.completed_view
+    if completed ~= nil and
+       completed.snapshot.generation == report.generation then
+      -- A refresh still rediscovers directories and external inputs. When its
+      -- semantic generation did not change, retain the immutable Features and
+      -- only reconcile the broader watcher scope.
+      self:reconcile_watcher(snapshot)
+      return RefreshOutcome.ready(completed)
+    end
+    return RefreshOutcome.ready(self:install_view(snapshot))
   catch
-    self.dirty_hint = true
     if error is async.CancellationReason then raise end
     return RefreshOutcome.failure(runtime_error(error))
   end
 end
 
-local function Application:start_refresh():
-    async.Task<RefreshOutcome, value>
-  local task = async.run<RefreshOutcome, value>(
-    function (): RefreshOutcome
-      defer self.refresh_task = nil
-      while true do
-        local outcome = self:refresh_once()
-        case outcome
-        when failure: failure then
-          -- A known failed refresh invalidates the fallback view for future
-          -- requests. The request that initiated this refresh joins it and
-          -- receives the failure; a later request may retry from disk.
-          self.refresh_failure = failure
-          return outcome
-        when ready: view then
-          -- If a watcher callback ran across a yielding scan/reconcile, its
-          -- coalesced hint describes state that may be newer than this View.
-          -- Repeat before publishing instead of serving a stale generation.
-          if not self.dirty_hint then
-            self.completed_view = view
-            self.refresh_failure = nil
-            return outcome
-          end
-        end
+local function Application:status_generation(): integer?
+  local completed? = self.completed_view
+  if completed == nil then return nil end
+  return completed.snapshot.generation
+end
+
+local function Application:emit_indexing_status(
+    state: indexing_status.State, message: string?)
+  if self.closed then return end
+  local listener? = self.indexing_listener
+  if listener == nil then return end
+  listener(indexing_status.Status.new(
+    state, self.refresh_chain_initial, self.change_epoch,
+    self:status_generation(), message))
+end
+
+local function Application:begin_refresh_chain()
+  if self.refresh_chain_active then return end
+  self.refresh_chain_active = true
+  self.refresh_chain_initial = self.completed_view == nil
+  logging.emit("debug", "indexing.chain.start", {
+    json.Member.new("epoch", json.from_integer(self.change_epoch)),
+    json.Member.new("initial", json.from_boolean(
+      self.refresh_chain_initial)),
+  })
+  self:emit_indexing_status(indexing_status.State.indexing(), nil)
+end
+
+local function Application:start_refresh(force: boolean):
+    async.Task<RefreshOutcome, value>?
+  if self.closed or self.refresh_task ~= nil then return self.refresh_task end
+  if not force and self.completed_view ~= nil and
+     self.completed_epoch >= self.change_epoch then
+    return nil
+  end
+
+  self:begin_refresh_chain()
+  local target_epoch = self.change_epoch
+  local task = async.run<RefreshOutcome, value>(function (): RefreshOutcome
+    local started = logging.clock()
+    self.refresh_passes = self.refresh_passes + 1
+    logging.emit("debug", "indexing.pass.start", {
+      json.Member.new("epoch", json.from_integer(target_epoch)),
+      json.Member.new("force", json.from_boolean(force)),
+      json.Member.new("pass", json.from_integer(self.refresh_passes)),
+    })
+    local outcome: RefreshOutcome? = nil
+    do
+      outcome = self:refresh_once()
+    catch
+      self.refresh_task = nil
+      self.refresh_chain_active = false
+      if error is async.CancellationReason then raise end
+      raise
+    end
+
+    local completed = outcome as RefreshOutcome
+    local outcome_name = "unknown"
+    case completed
+    when failure: failure then
+      outcome_name = "failed"
+      self.refresh_failure = failure
+    when ready: view then
+      outcome_name = "ready"
+      -- Publish every successful pass even when a later hint arrived. Retain
+      -- the immutable generation while the single coalesced follow-up runs;
+      -- current_view still withholds it while change_epoch remains newer.
+      self.completed_view = view
+      self.completed_epoch = target_epoch
+      self.refresh_failure = nil
+    end
+
+    logging.emit("debug", "indexing.pass.complete", {
+      json.Member.new("epoch", json.from_integer(target_epoch)),
+      json.Member.new("outcome", json.from_string(outcome_name)),
+      json.Member.new("pending_epoch", json.from_integer(self.change_epoch)),
+      json.Member.new("cpu_ms", json.from_number(
+        logging.elapsed_ms(started))),
+    })
+
+    self.refresh_task = nil
+    if not self.closed and self.change_epoch > target_epoch then
+      -- Start at most one next-turn pass for every burst. Epoch comparison,
+      -- rather than clearing a boolean, preserves a hint delivered at any
+      -- yielding point in scan, analysis, view construction, or reconciliation.
+      self:start_refresh(false)
+    else
+      self.refresh_chain_active = false
+      case completed
+      when failure: failure then
+        self:emit_indexing_status(
+          indexing_status.State.failed(), failure.message)
+      when ready: view then
+        self:emit_indexing_status(indexing_status.State.ready(), nil)
       end
-      return RefreshOutcome.failure(
-        Error.new("project refresh loop terminated unexpectedly"))
-    end)
+    end
+    return completed
+  end)
   self.refresh_task = task
   return task
+end
+
+-- Idempotently ensure that the initial or watcher-requested index is running.
+-- The initialized lifecycle hook calls this without waiting for project I/O.
+function Application:start_indexing()
+  self:start_refresh(false)
+end
+
+function Application:set_indexing_listener(listener: indexing_status.Listener?)
+  self.indexing_listener = listener
+end
+
+local function Application:indexing_metrics(): IndexingMetrics
+  return IndexingMetrics.new(self.refresh_passes, self.view_builds)
+end
+
+local function Application:snapshot_for_testing(): project_service.Snapshot?
+  local service? = self.service
+  if service == nil then return nil end
+  return service:latest()
+end
+
+local function Application:stop_watching_for_testing()
+  local watcher? = self.watcher
+  self.watcher = nil
+  if watcher ~= nil then watcher:stop() end
 end
 
 local function joined_view(task: async.Task<RefreshOutcome, value>):
@@ -254,12 +583,11 @@ local function joined_view(task: async.Task<RefreshOutcome, value>):
   return nil, Error.new("project refresh produced no result")
 end
 
--- Read-only feature requests may use the newest completed saved-file
--- generation only when another request already has a newer refresh underway.
--- The request which starts a refresh still joins it, so a newly discovered
--- configuration/compiler failure is surfaced instead of silently falling
--- back. This keeps the server responsive at cooperative compiler boundaries
--- without weakening rename's disk-validation contract.
+-- Read-only features may use a completed View while an unchanged-epoch check
+-- revalidates intentionally unwatched external inputs. A watcher hint advances
+-- change_epoch, so the preceding View is no longer eligible until that saved
+-- generation is published. A terminal refresh failure likewise remains
+-- authoritative while a later retry is in flight.
 local function Application:current_view(): (View?, Error?)
   if self.closed then
     return nil, Error.new("language server application is closed")
@@ -268,13 +596,17 @@ local function Application:current_view(): (View?, Error?)
   -- Refreshing on every semantic request also revalidates external imports,
   -- whose trees are intentionally not watched. Concurrent requests share the
   -- same refresh Task instead of starting overlapping scans or compiler runs.
-  local task? = self.refresh_task
-  if task ~= nil and self.refresh_failure == nil then
-    local completed? = self.completed_view
-    if completed ~= nil then return completed, nil end
+  -- Each request starts a shared background revalidation for intentionally
+  -- unwatched external inputs. It never waits: use the latest completed View,
+  -- or let the feature return its empty/null result during the initial index.
+  self:start_refresh(true)
+  local failure? = self.refresh_failure
+  if failure ~= nil then return nil, failure end
+  local completed? = self.completed_view
+  if completed ~= nil and self.completed_epoch >= self.change_epoch then
+    return completed, nil
   end
-  if task == nil then task = self:start_refresh() end
-  return joined_view(task)
+  return nil, nil
 end
 
 -- Rename produces edits against saved bytes, so it must never use the
@@ -286,8 +618,18 @@ local function Application:fresh_view(): (View?, Error?)
     return nil, Error.new("language server application is closed")
   end
   local task? = self.refresh_task
-  if task == nil then task = self:start_refresh() end
-  return joined_view(task)
+  if task == nil then task = self:start_refresh(true) end
+  if task == nil then
+    local completed? = self.completed_view
+    if completed ~= nil then return completed, nil end
+    return nil, Error.new("project refresh did not start")
+  end
+  local view?, view_error? = joined_view(task)
+  if view == nil then return nil, view_error end
+  if self.completed_epoch < self.change_epoch or self.refresh_task ~= nil then
+    return nil, Error.new("saved Titan project changed while indexing; retry")
+  end
+  return view, nil
 end
 
 local function parse_error(item: lsp.Error?): dispatcher.SemanticOutcome
@@ -326,7 +668,12 @@ local function Application:handle_definition(
   local params?, params_error? = lsp.parse_document_position(request.params)
   if params == nil then return parse_error(params_error) end
   local view?, view_error? = self:current_view()
-  if view == nil then return failure(REQUEST_FAILED, view_error.message) end
+  if view == nil then
+    if view_error ~= nil then
+      return failure(REQUEST_FAILED, view_error.message)
+    end
+    return dispatcher.SemanticOutcome.result(json.null())
+  end
   return dispatcher.SemanticOutcome.result(location_result(
     view.features:definition(params.path, params.position)))
 end
@@ -336,7 +683,12 @@ local function Application:handle_references(
   local params?, params_error? = lsp.parse_references(request.params)
   if params == nil then return parse_error(params_error) end
   local view?, view_error? = self:current_view()
-  if view == nil then return failure(REQUEST_FAILED, view_error.message) end
+  if view == nil then
+    if view_error ~= nil then
+      return failure(REQUEST_FAILED, view_error.message)
+    end
+    return dispatcher.SemanticOutcome.result(json.from_array({}))
+  end
   return dispatcher.SemanticOutcome.result(locations_result(
     view.features:references(
       params.document.path, params.document.position,
@@ -348,7 +700,12 @@ local function Application:handle_hover(
   local params?, params_error? = lsp.parse_document_position(request.params)
   if params == nil then return parse_error(params_error) end
   local view?, view_error? = self:current_view()
-  if view == nil then return failure(REQUEST_FAILED, view_error.message) end
+  if view == nil then
+    if view_error ~= nil then
+      return failure(REQUEST_FAILED, view_error.message)
+    end
+    return dispatcher.SemanticOutcome.result(json.null())
+  end
   local hover? = view.features:hover(params.path, params.position)
   if hover == nil then
     return dispatcher.SemanticOutcome.result(json.null())
@@ -362,7 +719,12 @@ local function Application:handle_folding(
   local params?, params_error? = lsp.parse_document(request.params)
   if params == nil then return parse_error(params_error) end
   local view?, view_error? = self:current_view()
-  if view == nil then return failure(REQUEST_FAILED, view_error.message) end
+  if view == nil then
+    if view_error ~= nil then
+      return failure(REQUEST_FAILED, view_error.message)
+    end
+    return dispatcher.SemanticOutcome.result(json.from_array({}))
+  end
   return dispatcher.SemanticOutcome.result(folding_result(
     view.features:folding_ranges(params.path)))
 end
@@ -438,8 +800,8 @@ end
 
 function create(project_root: string): Application
   return Application.new(
-    project_root, nil, nil, nil, nil, nil, false, false,
-    default_rename_analyzer)
+    project_root, nil, nil, nil, nil, nil, nil, 1, 0, false, false, 0, 0, nil,
+    false, default_rename_analyzer)
 end
 
 -- Dependency-injected constructor used by the project/application integration
@@ -448,17 +810,28 @@ end
 function create_with_service(project_root: string,
                              service: project_service.Service): Application
   local application = Application.new(
-    project_root, service, nil, nil, nil, nil, false, false,
+    project_root, service, nil, nil, nil, nil, nil, 0, 0, false, false, 0, 0,
+    nil, false,
     default_rename_analyzer)
   application.completed_view = application:install_view(service:latest())
   return application
+end
+
+-- Source-imported tests exercise the real refresh state machine while leaving
+-- the already loaded Service without a published semantic View.
+local function create_unindexed_with_service(
+    project_root: string, service: project_service.Service): Application
+  return Application.new(
+    project_root, service, nil, nil, nil, nil, nil, 1, 0, false, false, 0, 0,
+    nil, false, default_rename_analyzer)
 end
 
 function create_with_service_and_rename_analyzer(
     project_root: string, service: project_service.Service,
     rename_analyzer: RenameAnalyzer): Application
   local application = Application.new(
-    project_root, service, nil, nil, nil, nil, false, false,
+    project_root, service, nil, nil, nil, nil, nil, 0, 0, false, false, 0, 0,
+    nil, false,
     rename_analyzer)
   application.completed_view = application:install_view(service:latest())
   return application
@@ -486,6 +859,7 @@ end
 function Application:close()
   if self.closed then return end
   self.closed = true
+  self.indexing_listener = nil
 
   local refresh? = self.refresh_task
   if refresh ~= nil then
@@ -499,5 +873,6 @@ function Application:close()
 
   local watcher? = self.watcher
   self.watcher = nil
+  self.watch_filter = nil
   if watcher ~= nil then watcher:stop() end
 end

@@ -7,9 +7,9 @@ description: Query saved Titan project files for definitions, references, hover,
 
 Use the deterministic client at
 `scripts/titan-lsp-query.mjs`, resolved relative to this `SKILL.md`. It launches
-`titan-language-server` from `PATH`, performs one saved-file query, shuts the
-server down, and writes one JSON object to stdout. Server and client diagnostics
-remain on stderr.
+`titan-language-server` from `PATH`, waits for its initial saved-file index,
+performs one query, shuts the server down, and writes one JSON object to stdout.
+Server and client diagnostics remain on stderr.
 
 Run it with an absolute project root and a project `.titan` file:
 

@@ -1,4 +1,6 @@
 local async = import "async"
+local json = import "server.json"
+local logging = import "server.logging"
 
 -- All compiler bridge instances share one embedded Lua state. Compiler calls
 -- temporarily replace process-global driver/type registries, so only one may
@@ -36,6 +38,10 @@ local function Scheduler:grant_next()
       -- cancellation action can therefore detect a granted-but-not-yet-run
       -- permit and hand it to the following waiter.
       waiter.granted = true
+      logging.emit("trace", "compiler.scheduler.grant", {
+        json.Member.new("remaining_waiters", json.from_integer(
+          #self.waiters)),
+      })
       waiter.task:resume()
       return
     end
@@ -61,15 +67,29 @@ end
 function Scheduler:acquire(): Permit
   if not self.active then
     self.active = true
+    logging.emit("trace", "compiler.scheduler.acquire", {
+      json.Member.new("waited", json.from_boolean(false)),
+      json.Member.new("queued", json.from_integer(0)),
+    })
     return Permit.new(function () self:release_owner() end, false)
   end
 
   local waiter = Waiter.new(async.running(), true, false)
   self.waiters[#self.waiters + 1] = waiter
+  local started = logging.clock()
+  logging.emit("debug", "compiler.scheduler.wait", {
+    json.Member.new("queued", json.from_integer(#self.waiters)),
+  })
   local abandon = function () self:abandon(waiter) end
   do
     while not waiter.granted do async.suspend(abandon) end
     waiter.queued = false
+    logging.emit("debug", "compiler.scheduler.acquire", {
+      json.Member.new("waited", json.from_boolean(true)),
+      json.Member.new("wait_cpu_ms", json.from_number(
+        logging.elapsed_ms(started))),
+      json.Member.new("queued", json.from_integer(#self.waiters)),
+    })
     return Permit.new(function () self:release_owner() end, false)
   catch
     self:abandon(waiter)
@@ -80,6 +100,7 @@ end
 function Permit:release()
   if self.released then return end
   self.released = true
+  logging.emit("trace", "compiler.scheduler.release", nil)
   self.release_owner()
 end
 

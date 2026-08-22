@@ -23,10 +23,18 @@ interface FixtureEvent {
   arguments: string[];
   luaPath?: string;
   luaCPath?: string;
+  serverLogLevel?: string;
   rootPath?: string | null;
   rootUri?: string | null;
   workspaceFolders?: Array<{ uri: string; name: string }> | null;
+  trace?: string;
   signal?: string;
+}
+
+interface TraceFixtureEvent {
+  event: "trace";
+  pid: number;
+  value: string;
 }
 
 interface SemanticFixtureEvent {
@@ -51,6 +59,8 @@ suite("Titan extension", () => {
   let beta: vscode.WorkspaceFolder;
   let alphaMarkerPath: string;
   let betaMarkerPath: string;
+  let alphaTraceMarkerPath: string;
+  let betaTraceMarkerPath: string;
   let alphaSettingsPath: string;
   let originalAlphaSettings: string;
 
@@ -71,6 +81,8 @@ suite("Titan extension", () => {
       ".titan-lsp-test",
       "events.jsonl"
     );
+    alphaTraceMarkerPath = `${alphaMarkerPath}.trace`;
+    betaTraceMarkerPath = `${betaMarkerPath}.trace`;
     await Promise.all([
       resetMarker(alphaMarkerPath),
       resetMarker(betaMarkerPath)
@@ -89,6 +101,16 @@ suite("Titan extension", () => {
     await vscode.workspace.getConfiguration("titan.languageServer").update(
       "path",
       nodeExecutable,
+      vscode.ConfigurationTarget.Global
+    );
+    await vscode.workspace.getConfiguration("titan.languageServer").update(
+      "logLevel",
+      "info",
+      vscode.ConfigurationTarget.Global
+    );
+    await vscode.workspace.getConfiguration("titan").update(
+      "trace.server",
+      "off",
       vscode.ConfigurationTarget.Global
     );
     await vscode.workspace.getConfiguration("titan.compiler").update(
@@ -250,6 +272,63 @@ suite("Titan extension", () => {
       betaReadded[3].pid
     );
   });
+
+  test("enables protocol tracing without restarting workspace clients",
+    async function () {
+      this.timeout(20_000);
+      await Promise.all([
+        rm(alphaTraceMarkerPath, { force: true }),
+        rm(betaTraceMarkerPath, { force: true })
+      ]);
+      const [alphaBefore, betaBefore] = await Promise.all([
+        readEvents(alphaMarkerPath),
+        readEvents(betaMarkerPath)
+      ]);
+      const traceConfiguration = vscode.workspace.getConfiguration("titan");
+
+      try {
+        await traceConfiguration.update(
+          "trace.server",
+          "messages",
+          vscode.ConfigurationTarget.Global
+        );
+        await Promise.all([
+          waitForTraceValue(alphaTraceMarkerPath, "messages", 10_000),
+          waitForTraceValue(betaTraceMarkerPath, "messages", 10_000)
+        ]);
+
+        await traceConfiguration.update(
+          "trace.server",
+          "verbose",
+          vscode.ConfigurationTarget.Global
+        );
+        await Promise.all([
+          waitForTraceValue(alphaTraceMarkerPath, "verbose", 10_000),
+          waitForTraceValue(betaTraceMarkerPath, "verbose", 10_000)
+        ]);
+
+        await vscode.commands.executeCommand(
+          "titan.showLanguageServerOutput"
+        );
+      } finally {
+        await traceConfiguration.update(
+          "trace.server",
+          "off",
+          vscode.ConfigurationTarget.Global
+        );
+      }
+
+      await Promise.all([
+        waitForTraceValue(alphaTraceMarkerPath, "off", 10_000),
+        waitForTraceValue(betaTraceMarkerPath, "off", 10_000)
+      ]);
+      const [alphaAfter, betaAfter] = await Promise.all([
+        readEvents(alphaMarkerPath),
+        readEvents(betaMarkerPath)
+      ]);
+      assert.deepEqual(alphaAfter, alphaBefore);
+      assert.deepEqual(betaAfter, betaBefore);
+    });
 
   test("loads Titan highlighting in the Extension Host", async function () {
     this.timeout(10_000);
@@ -948,6 +1027,8 @@ function assertInitialization(
   assert.deepEqual(event.arguments, ["--fixture-token", token]);
   assert.equal(event.luaPath, luaPath);
   assert.equal(event.luaCPath, luaCPath);
+  assert.equal(event.serverLogLevel, "info");
+  assert.equal(event.trace, "off");
   assert.equal(event.rootPath, folder.uri.fsPath);
   assert.equal(event.rootUri, folder.uri.toString());
   assert.deepEqual(event.workspaceFolders, [{
@@ -1077,6 +1158,42 @@ async function readEvents(file: string): Promise<FixtureEvent[]> {
       .split("\n")
       .filter((line) => line.length > 0)
       .map((line) => JSON.parse(line) as FixtureEvent);
+  } catch (error) {
+    if (isMissingFileError(error) || error instanceof SyntaxError) {
+      return [];
+    }
+    throw error;
+  }
+}
+
+async function waitForTraceValue(
+  file: string,
+  value: string,
+  timeoutMilliseconds: number
+): Promise<TraceFixtureEvent> {
+  const deadline = Date.now() + timeoutMilliseconds;
+  let observed: TraceFixtureEvent[] = [];
+  while (Date.now() < deadline) {
+    observed = await readTraceEvents(file);
+    const match = observed.find((event) => event.value === value);
+    if (match !== undefined) {
+      return match;
+    }
+    await delay(50);
+  }
+  assert.fail(
+    `timed out waiting for trace ${value} in ${file}; observed ` +
+      observed.map((event) => event.value).join(", ")
+  );
+}
+
+async function readTraceEvents(file: string): Promise<TraceFixtureEvent[]> {
+  try {
+    const contents = await readFile(file, "utf8");
+    return contents
+      .split("\n")
+      .filter((line) => line.length > 0)
+      .map((line) => JSON.parse(line) as TraceFixtureEvent);
   } catch (error) {
     if (isMissingFileError(error) || error instanceof SyntaxError) {
       return [];

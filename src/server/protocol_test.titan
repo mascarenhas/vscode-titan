@@ -45,22 +45,42 @@ local function runs_reader_coordinator_and_single_writer()
     framing.frame(semantic) .. framing.frame(cancel) ..
     framing.frame(shutdown) .. framing.frame(exit))
   local output = strings.writer()
+  local notification_sink?: protocol.NotificationSink = nil
+  local initialized_calls = 0
   local handler: coordinator.SemanticHandler = function (
       _request: dispatcher.SemanticRequest): dispatcher.SemanticOutcome
     while true do timer.yield() end
     return dispatcher.SemanticOutcome.result(json.null())
   end
 
-  test.assert(protocol.run(input, output, handler) == 0,
+  test.assert(protocol.run(
+      input, output, handler,
+      function ()
+        initialized_calls = initialized_calls + 1
+        local sink? = notification_sink
+        test.assert(sink ~= nil,
+                    "notification sink was not bound before initialized")
+        if sink == nil then raise "notification sink is missing" end
+        sink(
+          [[{"jsonrpc":"2.0","method":"titan/indexingStatus","params":{"state":"indexing"}}]])
+      end,
+      function (sink: protocol.NotificationSink)
+        notification_sink = sink
+      end) == 0,
               "orderly protocol transcript returned failure")
   local frames = framing.reader()
   frames:feed(output:drain())
   local initialize_response = response_object(frames:next())
+  local indexing_notification = response_object(frames:next())
   local cancellation_response = frames:next()
   local shutdown_response = response_object(frames:next())
 
   test.assert(json.as_integer(initialize_response:get("id")) == 1,
               "initialize response was lost or reordered")
+  test.assert(initialized_calls == 1 and
+              json.as_string(indexing_notification:get("method")) ==
+                "titan/indexingStatus",
+              "initialized hook did not publish its server notification")
   test.assert(response_error_code(cancellation_response) == -32800 and
               json.as_string(
                 response_object(cancellation_response):get("id")) == "work",

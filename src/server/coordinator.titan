@@ -1,24 +1,29 @@
 local async = import "async"
 local dispatcher = import "server.dispatcher"
 local json = import "server.json"
+local logging = import "server.logging"
 local response_queue = import "server.response_queue"
 
 type SemanticHandler = (dispatcher.SemanticRequest) ->
   dispatcher.SemanticOutcome
+type InitializedHandler = () -> ()
 
 local type RemoveListener = () -> ()
 
 local record ActiveRequest
   id: dispatcher.RequestId
+  method: string
   task: async.Task<dispatcher.SemanticOutcome, value>
   remove_listener: RemoveListener?
   responded: boolean
+  started: float
 end
 
 record Coordinator
   local router: dispatcher.Dispatcher
   local output: response_queue.ResponseQueue
   local handler: SemanticHandler
+  local initialized_handler: InitializedHandler?
   local active: {ActiveRequest}
 end
 
@@ -34,10 +39,12 @@ local function method_not_found(
 end
 
 function create(output: response_queue.ResponseQueue,
-                handler: SemanticHandler?): Coordinator
+                handler: SemanticHandler?,
+                initialized_handler: InitializedHandler?): Coordinator
   local actual = method_not_found
   if handler ~= nil then actual = handler end
-  return Coordinator.new(dispatcher.create(), output, actual, {})
+  return Coordinator.new(
+    dispatcher.create(), output, actual, initialized_handler, {})
 end
 
 function Coordinator:phase_name(): string
@@ -84,8 +91,11 @@ local function Coordinator:complete(
   if remove ~= nil then remove() end
   self:remove(active)
 
+  local status_name = "unknown"
+
   case status
   when succeeded: outcome then
+    status_name = "succeeded"
     case outcome
     when result: result then
       self:publish(dispatcher.result_response(active.id, result))
@@ -94,15 +104,25 @@ local function Coordinator:complete(
         active.id, failure.code, failure.message))
     end
   when failed then
+    status_name = "failed"
     self:publish(dispatcher.failure_response(
       active.id, INTERNAL_ERROR, "Internal error"))
   when cancelled then
+    status_name = "cancelled"
     self:publish(dispatcher.failure_response(
       active.id, REQUEST_CANCELLED, "Request cancelled"))
   else
     self:publish(dispatcher.failure_response(
       active.id, INTERNAL_ERROR, "Internal error"))
   end
+  logging.emit("debug", "request.complete", {
+    json.Member.new("id", active.id:to_json()),
+    json.Member.new("method", json.from_string(active.method)),
+    json.Member.new("status", json.from_string(status_name)),
+    json.Member.new("cpu_ms", json.from_number(
+      logging.elapsed_ms(active.started))),
+    json.Member.new("active_requests", json.from_integer(#self.active)),
+  })
 end
 
 local function Coordinator:start(request: dispatcher.SemanticRequest)
@@ -116,8 +136,14 @@ local function Coordinator:start(request: dispatcher.SemanticRequest)
     function (): dispatcher.SemanticOutcome
       return self.handler(request)
     end)
-  local active = ActiveRequest.new(request.id, task, nil, false)
+  local active = ActiveRequest.new(
+    request.id, request.method, task, nil, false, logging.clock())
   self.active[#self.active + 1] = active
+  logging.emit("debug", "request.start", {
+    json.Member.new("id", request.id:to_json()),
+    json.Member.new("method", json.from_string(request.method)),
+    json.Member.new("active_requests", json.from_integer(#self.active)),
+  })
   active.remove_listener = task:add_terminal_listener(
     function (status: async.TaskStatus<dispatcher.SemanticOutcome, value>)
       self:complete(active, status)
@@ -128,6 +154,10 @@ local function Coordinator:cancel(id: dispatcher.RequestId)
   local active? = self:find(id)
   if active == nil then return end
   local task = active.task
+  logging.emit("debug", "request.cancel", {
+    json.Member.new("id", id:to_json()),
+    json.Member.new("method", json.from_string(active.method)),
+  })
   if not task:status():has_finished() then
     task:cancel(async.CancellationReason.simple("LSP request cancelled"))
   end
@@ -148,6 +178,12 @@ function Coordinator:cancel_all(reason: string)
       task:cancel(async.CancellationReason.simple(reason))
     end
   end
+  if #snapshot > 0 then
+    logging.emit("debug", "request.cancel_all", {
+      json.Member.new("count", json.from_integer(#snapshot)),
+      json.Member.new("reason", json.from_string(reason)),
+    })
+  end
   for index = 1, #snapshot do
     async.join(snapshot[index].task)
   end
@@ -156,10 +192,23 @@ end
 -- Handle one already-framed JSON body. A nonnil result is the process exit
 -- code requested by the LSP exit notification.
 function Coordinator:handle(source: string): integer?
+  local phase_before = self.router:phase_name()
   case self.router:route(source)
   when immediate: result then
     self:publish(result)
+    local phase_after = self.router:phase_name()
+    if phase_after ~= phase_before then
+      logging.emit("info", "lifecycle.transition", {
+        json.Member.new("from", json.from_string(phase_before)),
+        json.Member.new("to", json.from_string(phase_after)),
+      })
+    end
     return result.exit_code
+  when initialized then
+    local handler? = self.initialized_handler
+    if handler ~= nil then handler() end
+    logging.emit("info", "lifecycle.initialized", nil)
+    return nil
   when semantic: request then
     self:start(request)
     return nil
@@ -169,8 +218,12 @@ function Coordinator:handle(source: string): integer?
   when shutdown: result then
     self:cancel_all("language server shutdown")
     self:publish(result)
+    logging.emit("info", "lifecycle.shutdown", nil)
     return nil
   when exit: code then
+    logging.emit("info", "lifecycle.exit", {
+      json.Member.new("code", json.from_integer(code)),
+    })
     return code
   end
   return nil

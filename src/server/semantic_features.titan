@@ -25,6 +25,18 @@ end
 local record SavedFile
   const module_name: string
   const contents: string
+  const coordinates: source_text.CoordinateIndex
+end
+
+type Yield = () -> ()
+
+local function semantic_index_for(projects: {bridge.ProjectModule},
+                                  snapshots: {bridge.ModuleSnapshot},
+                                  yield_now: Yield?): indexer.Index
+  if yield_now ~= nil then
+    return indexer.build_with_yield(projects, snapshots, yield_now)
+  end
+  return indexer.build(projects, snapshots)
 end
 
 local record RenameAnchor
@@ -113,7 +125,8 @@ local function copy_projects(source: {bridge.ProjectModule}):
   return result
 end
 
-local function saved_files(projects: {bridge.ProjectModule}):
+local function saved_files(projects: {bridge.ProjectModule},
+                           index: indexer.Index):
     {string: SavedFile}
   local result: {string: SavedFile} = {}
   local modules: {string: boolean} = {}
@@ -131,21 +144,30 @@ local function saved_files(projects: {bridge.ProjectModule}):
           "saved source file belongs to more than one project module: " ..
           file.filename)
       end
+      local coordinates? = index:coordinate_index(file.filename)
+      if coordinates == nil then
+        return fail<{string: SavedFile}>(
+          "semantic index omitted saved source coordinates: " ..
+          file.filename)
+      end
       result[file.filename] = SavedFile.new(
-        module.module_name, file.contents)
+        module.module_name, file.contents, coordinates)
     end
   end
   return result
 end
 
-function build(projects: {bridge.ProjectModule},
-               snapshots: {bridge.ModuleSnapshot}): Features
+local function build_internal(projects: {bridge.ProjectModule},
+                              snapshots: {bridge.ModuleSnapshot},
+                              yield_now: Yield?): Features
   local owned_projects = copy_projects(projects)
   local owned_snapshots: {bridge.ModuleSnapshot} = {}
   for index = 1, #snapshots do owned_snapshots[index] = snapshots[index] end
+  local index = semantic_index_for(
+    owned_projects, owned_snapshots, yield_now)
   return Features.new(
-    owned_projects, owned_snapshots, saved_files(owned_projects),
-    indexer.build(owned_projects, owned_snapshots))
+    owned_projects, owned_snapshots,
+    saved_files(owned_projects, index), index)
 catch
   if error is indexer.Error then
     local failure = error as indexer.Error
@@ -161,6 +183,18 @@ catch
     raise Error.new(context .. failure.message)
   end
   raise
+end
+
+
+function build(projects: {bridge.ProjectModule},
+               snapshots: {bridge.ModuleSnapshot}): Features
+  return build_internal(projects, snapshots, nil)
+end
+
+function build_with_yield(projects: {bridge.ProjectModule},
+                          snapshots: {bridge.ModuleSnapshot},
+                          yield_now: Yield): Features
+  return build_internal(projects, snapshots, yield_now)
 end
 
 local function location_for(occurrence: indexer.Occurrence): Location
@@ -207,25 +241,15 @@ local function same_type(left: bridge.TypeInfo?,
   return left.tag == right.tag and left.display == right.display
 end
 
-local function compiler_offset(source: string,
+local function compiler_offset(coordinates: source_text.CoordinateIndex,
                                location: bridge.SourceLocation): integer?
   if location.line < 1 or location.column < 1 then return nil end
-  local index = 1
-  local line = 1
-  while line < location.line do
-    if index > #source then return nil end
-    local byte: integer = strings.byte(source, index)
-    index = index + 1
-    if byte == 0x0a then line = line + 1 end
-  end
-
-  local target = index + location.column - 1
-  local finish = index
-  while finish <= #source and strings.byte(source, finish) ~= 0x0a do
-    finish = finish + 1
-  end
+  local start? = coordinates:lf_line_start(location.line)
+  local finish? = coordinates:lf_line_finish(location.line)
+  if start == nil or finish == nil then return nil end
+  local target = start + location.column - 1
   if target > finish then return nil end
-  return target - 1
+  return target
 end
 
 local function matching_hover_node(snapshot: bridge.ModuleSnapshot,
@@ -239,7 +263,7 @@ local function matching_hover_node(snapshot: bridge.ModuleSnapshot,
     if not node.synthetic and location ~= nil and node.name ~= nil and
        location.filename == occurrence.filename and
        node.name == occurrence.name and
-       compiler_offset(saved.contents, location) == occurrence.byte_span.start
+       compiler_offset(saved.coordinates, location) == occurrence.byte_span.start
     then
       local score = 0
       if node.inferred_type ~= nil then score = score + 1 end
@@ -283,7 +307,7 @@ local function node_covers_occurrence(node: bridge.Node, saved: SavedFile,
                                       occurrence: indexer.Occurrence): boolean
   local location? = node.location
   if location ~= nil and location.filename == occurrence.filename and
-     compiler_offset(saved.contents, location) == occurrence.byte_span.start
+     compiler_offset(saved.coordinates, location) == occurrence.byte_span.start
   then
     return true
   end
@@ -293,8 +317,8 @@ local function node_covers_occurrence(node: bridge.Node, saved: SavedFile,
      span.finish.filename ~= occurrence.filename then
     return false
   end
-  local start? = compiler_offset(saved.contents, span.start)
-  local finish? = compiler_offset(saved.contents, span.finish)
+  local start? = compiler_offset(saved.coordinates, span.start)
+  local finish? = compiler_offset(saved.coordinates, span.finish)
   return start ~= nil and finish ~= nil and
          start <= occurrence.byte_span.start and
          occurrence.byte_span.start < finish
@@ -420,21 +444,21 @@ local function foldable_tag(tag: string): boolean
     tag == "Ast.StatCase"
 end
 
-local function lsp_span_for_compiler_span(source: string,
+local function lsp_span_for_compiler_span(saved: SavedFile,
                                            span: bridge.SourceSpan):
     source_text.Span
   if span.start.filename ~= span.finish.filename then
     return fail<source_text.Span>(
       "compiler structural span crosses source files")
   end
-  local start? = compiler_offset(source, span.start)
-  local finish? = compiler_offset(source, span.finish)
+  local start? = compiler_offset(saved.coordinates, span.start)
+  local finish? = compiler_offset(saved.coordinates, span.finish)
   if start == nil or finish == nil or finish < start then
     return fail<source_text.Span>(
       "compiler structural span is outside the saved source")
   end
-  local converted?, conversion_error? = source_text.span_for_offsets(
-    source, start, finish)
+  local converted?, conversion_error? = saved.coordinates:span_for_offsets(
+    start, finish)
   if converted == nil then
     local detail = "invalid UTF-8 boundary"
     if conversion_error ~= nil then detail = conversion_error.message end
@@ -542,13 +566,12 @@ local function skip_short_string(source: string, index: integer): integer
   return #source + 1
 end
 
-local function insert_comment_fold(source: string, start_offset: integer,
+local function insert_comment_fold(coordinates: source_text.CoordinateIndex,
+                                   source: string, start_offset: integer,
                                    finish_offset: integer,
                                    ranges: {lsp.FoldingRange})
-  local start?, start_error? = source_text.position_for_offset(
-    source, start_offset)
-  local finish?, finish_error? = source_text.position_for_offset(
-    source, finish_offset)
+  local start?, start_error? = coordinates:position_for_offset(start_offset)
+  local finish?, finish_error? = coordinates:position_for_offset(finish_offset)
   if start_error ~= nil or finish_error ~= nil or
       start == nil or finish == nil then
     return
@@ -571,8 +594,9 @@ local function insert_comment_fold(source: string, start_offset: integer,
     start.line, nil, end_line, nil, "comment"))
 end
 
-local function insert_long_comment_folds(source: string,
+local function insert_long_comment_folds(saved: SavedFile,
                                          ranges: {lsp.FoldingRange})
+  local source = saved.contents
   local index = 1
   while index <= #source do
     local byte: integer = strings.byte(source, index)
@@ -598,7 +622,8 @@ local function insert_long_comment_folds(source: string,
       else
         local finish? = long_bracket_finish(source, comment)
         if finish == nil then return end
-        insert_comment_fold(source, index - 1, finish - 1, ranges)
+        insert_comment_fold(
+          saved.coordinates, source, index - 1, finish - 1, ranges)
         index = finish
       end
     else
@@ -619,7 +644,7 @@ function Features:folding_ranges(filename: string): {lsp.FoldingRange}
     local span? = node.source_span
     if not node.synthetic and span ~= nil and foldable_tag(node.tag) and
        span.start.filename == filename then
-      local converted = lsp_span_for_compiler_span(saved.contents, span)
+      local converted = lsp_span_for_compiler_span(saved, span)
       -- The compiler's half-open finish is the start of the closing `end` or
       -- `until`. LSP folding endLine is inclusive, so leave that closing line
       -- visible and fold through the preceding line.
@@ -630,7 +655,7 @@ function Features:folding_ranges(filename: string): {lsp.FoldingRange}
       end
     end
   end
-  insert_long_comment_folds(saved.contents, result)
+  insert_long_comment_folds(saved, result)
   return result
 end
 
@@ -667,10 +692,11 @@ end
 local function replace_anchor_offsets(anchors: {PendingRenameAnchor},
                                       contents: string): {RenameAnchor}
   local result: {RenameAnchor} = {}
+  local coordinates = source_text.coordinate_index(contents)
   for index = 1, #anchors do
     local anchor = anchors[index]
-    local span?, failure? = source_text.span_for_offsets(
-      contents, anchor.after_start, anchor.after_finish)
+    local span?, failure? = coordinates:span_for_offsets(
+      anchor.after_start, anchor.after_finish)
     if span == nil then
       local detail = "invalid post-rename UTF-8 boundary"
       if failure ~= nil then detail = failure.message end

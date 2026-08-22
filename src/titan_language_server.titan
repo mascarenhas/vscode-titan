@@ -7,10 +7,62 @@ local lua = import "titan.lua"
 local application = import "server.application"
 local dispatcher = import "server.dispatcher"
 local framing = import "server.framing"
+local indexing_status = import "server.indexing_status"
+local json = import "server.json"
+local logging = import "server.logging"
 local protocol = import "server.protocol"
 
-local function log_error(message: string)
-  os.stderr:write("titan-language-server: " .. message .. "\n")
+local function serve(root: string): integer
+  logging.emit("info", "server.start", {
+    json.Member.new("root", json.from_string(root)),
+    json.Member.new("log_level", json.from_string(logging.level())),
+  })
+  local result = 1
+  do
+    local server = application.create(root)
+    defer server:close()
+    result = protocol.run(
+      os.stdin, os.stdout,
+      function (request: dispatcher.SemanticRequest): dispatcher.SemanticOutcome
+        return server:handle(request)
+      end,
+      function () server:start_indexing() end,
+      function (sink: protocol.NotificationSink)
+        server:set_indexing_listener(function (status: indexing_status.Status)
+          sink(indexing_status.notification(status))
+        end)
+      end)
+  catch
+    if error is protocol.ProtocolError then
+      local failure = error as protocol.ProtocolError
+      logging.emit("error", "server.failure", {
+        json.Member.new("message", json.from_string(failure.message)),
+      })
+    elseif error is framing.FrameError then
+      local failure = error as framing.FrameError
+      logging.emit("error", "server.failure", {
+        json.Member.new("message", json.from_string(failure.message)),
+      })
+    elseif error is async.OperationError then
+      local failure = error as async.OperationError
+      logging.emit("error", "server.failure", {
+        json.Member.new("operation", json.from_string(failure.operation)),
+        json.Member.new("message", json.from_string(failure.message)),
+        json.Member.new("name", json.from_string(failure.name)),
+      })
+    else
+      local details = strings.tostring(error)
+      if #traceback > 0 then
+        details = details .. "\nstack traceback:\n" .. traceback
+      end
+      logging.emit("error", "server.failure", {
+        json.Member.new("message", json.from_string(details)),
+      })
+    end
+    result = 1
+  end
+  logging.emit("info", "server.stop", nil)
+  return result
 end
 
 function main(args: {string}): integer
@@ -20,30 +72,20 @@ function main(args: {string}): integer
     io.print("LUA_CPATH=" .. cpath)
     return 0
   end
-  local server = application.create(fs.pwd())
-  defer server:close()
-  return protocol.run(
-    os.stdin, os.stdout,
-    function (request: dispatcher.SemanticRequest): dispatcher.SemanticOutcome
-      return server:handle(request)
-    end)
-catch
-  if error is protocol.ProtocolError then
-    local failure = error as protocol.ProtocolError
-    log_error(failure.message)
-  elseif error is framing.FrameError then
-    local failure = error as framing.FrameError
-    log_error(failure.message)
-  elseif error is async.OperationError then
-    local failure = error as async.OperationError
-    log_error(failure.operation .. ": " .. failure.message ..
-              " (" .. failure.name .. ")")
-  else
-    local details = strings.tostring(error)
-    if #traceback > 0 then
-      details = details .. "\nstack traceback:\n" .. traceback
-    end
-    log_error(details)
+  local requested_level? = os.getenv("TITAN_LANGUAGE_SERVER_LOG_LEVEL")
+  local valid_level = logging.configure(requested_level)
+  local invalid_level = ""
+  if not valid_level then
+    if requested_level ~= nil then invalid_level = requested_level end
+    logging.configure("info")
   end
-  return 1
+  logging.start()
+  defer logging.close()
+  if not valid_level then
+    logging.emit("error", "logging.invalid_level", {
+      json.Member.new("requested", json.from_string(invalid_level)),
+      json.Member.new("fallback", json.from_string("info")),
+    })
+  end
+  return serve(fs.pwd())
 end

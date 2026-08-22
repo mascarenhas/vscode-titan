@@ -349,6 +349,89 @@ describe("Codex Titan LSP query adapter", () => {
     }
   });
 
+  test("shuts down cleanly after an indexing timeout", {
+    timeout: 10_000
+  }, async () => {
+    const temporary = await mkdtemp(path.join(
+      os.tmpdir(), "titan-codex-index-timeout-"));
+    const root = path.join(temporary, "project");
+    const file = path.join(root, "sample.titan");
+    const lifecycleMarker = path.join(temporary, "lifecycle.jsonl");
+    await mkdir(root);
+    await writeFile(file, "function answer(): integer return 42 end\n", "utf8");
+    try {
+      const run = await runAdapter([
+        "definition",
+        "--root", root,
+        "--file", file,
+        "--line", "0",
+        "--character", "10",
+        "--server", process.execPath,
+        "--server-arg", fakeServer,
+        "--server-arg", lifecycleMarker,
+        "--server-arg", "--semantic",
+        "--server-arg", "--indexing-delay-ms",
+        "--server-arg", "500",
+        "--timeout-ms", "100"
+      ]);
+      assert.deepEqual(
+        { code: run.code, signal: run.signal },
+        { code: 1, signal: null }
+      );
+      const output = parseSingleJsonLine<AdapterFailure>(run.stdout);
+      assert.equal(output.error.code, "timeout");
+      assert.match(output.error.message, /language-server indexing/);
+
+      const events = await readEvents(lifecycleMarker);
+      assert.deepEqual(
+        events.map((event) => event.event),
+        ["initialize", "shutdown", "exit"]
+      );
+    } finally {
+      await rm(temporary, { recursive: true, force: true });
+    }
+  });
+
+  test("rejects an incomplete indexing ready status and shuts down", async () => {
+    const temporary = await mkdtemp(path.join(
+      os.tmpdir(), "titan-codex-index-status-"));
+    const root = path.join(temporary, "project");
+    const file = path.join(root, "sample.titan");
+    const lifecycleMarker = path.join(temporary, "lifecycle.jsonl");
+    await mkdir(root);
+    await writeFile(file, "function answer(): integer return 42 end\n", "utf8");
+    try {
+      const run = await runAdapter([
+        "definition",
+        "--root", root,
+        "--file", file,
+        "--line", "0",
+        "--character", "10",
+        "--server", process.execPath,
+        "--server-arg", fakeServer,
+        "--server-arg", lifecycleMarker,
+        "--server-arg", "--semantic",
+        "--server-arg", "--omit-indexing-generation",
+        "--timeout-ms", "2000"
+      ]);
+      assert.deepEqual(
+        { code: run.code, signal: run.signal },
+        { code: 1, signal: null }
+      );
+      const output = parseSingleJsonLine<AdapterFailure>(run.stdout);
+      assert.equal(output.error.code, "protocol_error");
+      assert.match(output.error.message, /ready status is incomplete/);
+
+      const events = await readEvents(lifecycleMarker);
+      assert.deepEqual(
+        events.map((event) => event.event),
+        ["initialize", "shutdown", "exit"]
+      );
+    } finally {
+      await rm(temporary, { recursive: true, force: true });
+    }
+  });
+
   test("force-kills and reaps a server that ignores shutdown and SIGTERM", {
     timeout: 10_000
   }, async () => {

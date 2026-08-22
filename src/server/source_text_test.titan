@@ -1,6 +1,6 @@
 local test = import "test"
 local strings = import "string"
-local source_text = import "server.source_text"
+local source_text = import "server.source_text.titan"
 
 local function expect_position(source: string, offset: integer,
                                line: integer, character: integer)
@@ -68,6 +68,20 @@ function test_source_text_rejects_split_scalars_surrogates_and_crlf(
     source, source_text.Position.new(0, 5))
   test.assert(past_line == nil and past_line_error ~= nil,
               "UTF-16 position past line end was accepted")
+
+  local malformed = "ok" .. strings.char(0xff) .. "tail"
+  local before_malformed?, before_malformed_error? =
+    source_text.position_for_offset(malformed, 2)
+  test.assert(before_malformed_error == nil and
+              before_malformed ~= nil and
+              before_malformed.character == 2,
+              "boundary before malformed UTF-8 did not remain addressable")
+  local after_malformed?, malformed_error? =
+    source_text.position_for_offset(malformed, 3)
+  test.assert(after_malformed == nil and malformed_error ~= nil and
+              strings.find(malformed_error.message,
+                           "leading byte") ~= nil,
+              "coordinate after malformed UTF-8 did not retain decoder error")
 end
 
 function test_source_text_normalizes_file_uris_and_paths(
@@ -116,4 +130,59 @@ function test_source_text_rejects_malformed_or_nonlocal_file_uris(
     source_text.file_uri_to_path("file://example.com/workspace/main.titan")
   test.assert(remote == nil and remote_error ~= nil,
               "non-local file URI authority was accepted")
+end
+
+function test_source_text_coordinate_index_has_bounded_lookup_work(
+    _context: test.Context)
+  local line_count = 4096
+  local output = strings.writer()
+  local starts: {integer} = {}
+  local offset = 0
+  for line = 1, line_count do
+    starts[line] = offset
+    output:write("a😀b")
+    offset = offset + 6
+    if line % 3 == 0 then
+      output:write("\r\n")
+      offset = offset + 2
+    elseif line % 3 == 1 then
+      output:write("\r")
+      offset = offset + 1
+    else
+      output:write("\n")
+      offset = offset + 1
+    end
+  end
+  local source = output:drain()
+
+  local yield_count = 0
+  local coordinates, work = source_text.coordinate_index_with_work(
+    source, function () yield_count = yield_count + 1 end)
+  local build_steps = source_text.coordinate_work_steps(work)
+  test.assert(build_steps <= #source,
+              "coordinate construction rescanned source bytes")
+  test.assert(yield_count == build_steps // 1024 and yield_count > 0,
+              "coordinate construction did not yield at its bounded cadence")
+
+  for line = line_count, 1, -1 do
+    local start_offset = starts[line] + 1
+    local finish_offset = starts[line] + 5
+    local span?, failure? = coordinates:span_for_offsets(
+      start_offset, finish_offset)
+    test.assert(failure == nil and span ~= nil and
+                span.start.line == line - 1 and
+                span.start.character == 1 and
+                span.finish.line == line - 1 and
+                span.finish.character == 3,
+                "indexed UTF-16 span conversion produced wrong coordinates")
+    local bytes?, reverse_failure? = coordinates:offsets_for_span(span)
+    test.assert(reverse_failure == nil and bytes ~= nil and
+                bytes.start == start_offset and
+                bytes.finish == finish_offset,
+                "indexed UTF-16 coordinates did not round-trip")
+  end
+
+  local lookup_steps = source_text.coordinate_work_steps(work) - build_steps
+  test.assert(lookup_steps <= line_count * 40,
+              "coordinate lookup performed full-prefix scans")
 end

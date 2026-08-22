@@ -3,11 +3,16 @@ local io = import "io"
 local strings = import "string"
 local framing = import "server.framing"
 local coordinator = import "server.coordinator"
+local json = import "server.json"
+local logging = import "server.logging"
 local response_queue = import "server.response_queue"
 
 record ProtocolError
   message: string
 end
+
+type NotificationSink = (string) -> ()
+type NotificationBinder = (NotificationSink) -> ()
 
 local record InputDelivery
   body: string
@@ -102,6 +107,9 @@ local function read_messages(source: io.Reader, queue: InputQueue): nil
       queue:push(InputEvent.eof())
       return nil
     end
+    logging.emit("trace", "protocol.receive", {
+      json.Member.new("bytes", json.from_integer(#body)),
+    })
     local delivery = InputDelivery.new(body, false, nil)
     queue:push(InputEvent.message(delivery))
     -- Do not submit another stdin read until the coordinator has processed
@@ -128,16 +136,21 @@ local function write_messages(target: io.Writer,
   while true do
     local message? = queue:take()
     if message == nil then return nil end
+    logging.emit("trace", "protocol.send", {
+      json.Member.new("bytes", json.from_integer(#message)),
+    })
     target:write(framing.frame(message))
   end
   return nil
 end
 
 local function new_session(source: io.Reader, target: io.Writer,
-                           handler: coordinator.SemanticHandler?): Session
+                           handler: coordinator.SemanticHandler?,
+                           initialized_handler: coordinator.InitializedHandler?):
+    Session
   local input = new_input_queue()
   local output = response_queue.create()
-  local server = coordinator.create(output, handler)
+  local server = coordinator.create(output, handler, initialized_handler)
   local writer = async.run<nil, value>(function (): nil
     return write_messages(target, output)
   end)
@@ -177,9 +190,21 @@ local function Session:close()
 end
 
 function run(source: io.Reader, target: io.Writer,
-             handler: coordinator.SemanticHandler?): integer
-  local session = new_session(source, target, handler)
+             handler: coordinator.SemanticHandler?,
+             initialized_handler: coordinator.InitializedHandler?,
+             notification_binder: NotificationBinder?): integer
+  local session = new_session(
+    source, target, handler, initialized_handler)
+  logging.emit("debug", "protocol.session.start", nil)
+  defer logging.emit("debug", "protocol.session.stop", nil)
   defer session:close()
+  local notifications_active = true
+  defer notifications_active = false
+  if notification_binder ~= nil then
+    notification_binder(function (message: string)
+      if notifications_active then session.output:push(message) end
+    end)
+  end
 
   while true do
     case session.input:take()

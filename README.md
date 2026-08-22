@@ -70,6 +70,14 @@ Use `make help` for focused targets. In particular, `make server-test` runs the
 native Titan suite and `make extension-test` runs the extension unit tests. A
 successful compilation by itself is not a successful test run.
 
+To measure the production server against this repository's saved Titan source,
+including cold-index wall/CPU time, peak RSS, request responsiveness, and an
+unchanged refresh, run:
+
+```sh
+node scripts/benchmark-server.mjs --server bin/titan-language-server
+```
+
 ## Run the extension during development
 
 1. Open this repository in VS Code.
@@ -84,6 +92,8 @@ per workspace folder. These settings can override discovery:
 - `titan.languageServer.path`: absolute path, or a path relative to the
   workspace folder.
 - `titan.languageServer.arguments`: extra process arguments.
+- `titan.languageServer.logLevel`: structured server diagnostics written to
+  stderr (`off`, `error`, `info`, `debug`, or `trace`; default `info`).
 - `titan.compiler.luaPath`: optional `LUA_PATH` override for compiler modules.
 - `titan.compiler.luaCPath`: optional `LUA_CPATH` override for native Lua
   dependencies.
@@ -112,6 +122,29 @@ server's working directory and protocol paths; returned project locations are
 mapped back to the lexical workspace URI. In a nested multi-root workspace,
 VS Code's most-specific workspace folder exclusively owns semantic requests for
 its documents.
+
+While the server builds or refreshes saved-file project state, VS Code shows a
+busy **Titan indexing** language-status item for that workspace folder. It
+disappears when the generation is ready. An indexing failure remains visible
+as an error and opens the language-server output when selected. Read-only
+language features stay responsive during indexing and return their ordinary
+empty result until an initial generation is available.
+
+### Language-server diagnostics and protocol tracing
+
+Run **Titan: Show Language Server Output** from the Command Palette to reveal
+the shared log. Every server and client record is prefixed with its workspace
+folder in a multi-root window. Server stderr is structured and routed at its
+declared severity; malformed or unstructured stderr remains an error. To retain
+`debug` or `trace` server records, set `titan.languageServer.logLevel` and set
+the **Titan Language Server** output channel's VS Code log level to the same or
+a more verbose level.
+
+Client/server protocol tracing is separately opt-in and does not restart the
+server. Set `titan.trace.server` to `messages` for message summaries, or
+to `verbose` for full payloads. Both modes write to the same per-workspace-
+prefixed output channel; `verbose` traces can include source text and other
+workspace data. Restore the setting to `off` after collecting a trace.
 
 ### Project configuration
 
@@ -176,11 +209,13 @@ silently compiled. Completion, foreign-definition navigation, navigation into
 external source modules, and watching external source trees are outside the
 first-version scope.
 
-The read request that starts a saved-file refresh waits for that refresh, so it
-reports configuration or compilation failures instead of silently falling
-back. While the compiler is cooperatively yielding, later read-only requests
-may use the immutable preceding completed generation; rename always waits for
-the stable newest generation and revalidates disk state after preflight.
+A read-only request starts a shared saved-file refresh without waiting. Before
+the initial index is ready it returns the feature's ordinary empty result; an
+unchanged background revalidation can serve the immutable completed generation.
+A watcher hint makes that preceding generation ineligible until the changed
+saved state has been checked, and a known compiler/configuration failure remains
+authoritative during retry. Rename always waits for the stable newest generation
+and revalidates disk state after preflight.
 
 Server stdout is reserved exclusively for `Content-Length`-framed JSON-RPC.
 Diagnostics and debug logs go to stderr.

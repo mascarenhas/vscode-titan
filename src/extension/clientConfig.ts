@@ -4,10 +4,23 @@ import * as path from "node:path";
 
 export const PACKAGED_SERVER_DIRECTORY = "bin";
 export const SERVER_BASENAME = "titan-language-server";
+export const SERVER_LOG_LEVEL_ENVIRONMENT_VARIABLE =
+  "TITAN_LANGUAGE_SERVER_LOG_LEVEL";
+
+export type ServerLogLevel = "off" | "error" | "info" | "debug" | "trace";
+
+const SERVER_LOG_LEVELS = new Set<ServerLogLevel>([
+  "off",
+  "error",
+  "info",
+  "debug",
+  "trace"
+]);
 
 export interface ServerConfiguration {
   configuredPath: string;
   arguments: string[];
+  logLevel: ServerLogLevel;
 }
 
 export interface CompilerDiscoveryConfiguration {
@@ -33,7 +46,8 @@ export class ServerConfigurationError extends Error {
 
 export function readServerConfiguration(
   configuredPath: unknown,
-  configuredArguments: unknown
+  configuredArguments: unknown,
+  configuredLogLevel: unknown = "info"
 ): ServerConfiguration {
   if (typeof configuredPath !== "string") {
     throw new ServerConfigurationError(
@@ -48,9 +62,18 @@ export function readServerConfiguration(
     );
   }
 
+  if (typeof configuredLogLevel !== "string" ||
+      !SERVER_LOG_LEVELS.has(configuredLogLevel as ServerLogLevel)) {
+    throw new ServerConfigurationError(
+      "titan.languageServer.logLevel must be one of " +
+      "off, error, info, debug, or trace"
+    );
+  }
+
   return {
     configuredPath: configuredPath.trim(),
-    arguments: [...configuredArguments] as string[]
+    arguments: [...configuredArguments] as string[],
+    logLevel: configuredLogLevel as ServerLogLevel
   };
 }
 
@@ -150,9 +173,11 @@ export function createServerLaunchOptions(
   compilerDiscovery: CompilerDiscoveryConfiguration = {
     luaPath: "",
     luaCPath: ""
-  }
+  },
+  logLevel: ServerLogLevel = "info"
 ): ServerLaunchOptions {
   const childEnvironment = { ...environment };
+  childEnvironment[SERVER_LOG_LEVEL_ENVIRONMENT_VARIABLE] = logLevel;
   if (compilerDiscovery.luaPath.length > 0) {
     childEnvironment.LUA_PATH = compilerDiscovery.luaPath;
   }

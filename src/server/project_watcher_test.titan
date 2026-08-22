@@ -120,6 +120,15 @@ local function contains(items: {string}, wanted: string): boolean
   return false
 end
 
+local function describe_change(change: project_watcher.PathChange): string
+  case change
+  when created: path then return "created:" .. path
+  when modified: path then return "modified:" .. path
+  when deleted: path then return "deleted:" .. path
+  end
+  return "unknown"
+end
+
 local function fake_lifecycle_and_coalescing()
   local fake = Fake.new({}, {}, {}, nil, 0, 0, 0, 0)
   local received: {project_watcher.RediscoveryBatch} = {}
@@ -154,10 +163,12 @@ local function fake_lifecycle_and_coalescing()
               "reconciliation overlapped old and new polls")
 
   fake:push({
-    project_watcher.BackendEvent.changed("/project/b/file.titan"),
-    project_watcher.BackendEvent.changed("/project/b/file.titan"),
+    project_watcher.BackendEvent.created("/project/b/file.titan"),
+    project_watcher.BackendEvent.modified("/project/b/file.titan"),
+    project_watcher.BackendEvent.created("/project/b/newdir"),
+    project_watcher.BackendEvent.modified("/project/b/newdir"),
     project_watcher.BackendEvent.deleted("/project/b"),
-    project_watcher.BackendEvent.changed("/config/titan-config.lua"),
+    project_watcher.BackendEvent.modified("/config/titan-config.lua"),
     project_watcher.BackendEvent.failed(project_watcher.WatchFailure.new(
       5, "EIO", "input/output error", "fs.watcher")),
   })
@@ -165,11 +176,15 @@ local function fake_lifecycle_and_coalescing()
              "coalesced watcher batch was not published")
 
   local batch = received[1]
-  test.assert(#batch.paths == 3 and
-              batch.paths[1] == "/project/b/file.titan" and
-              batch.paths[2] == "/project/b" and
-              batch.paths[3] == "/config/titan-config.lua",
-              "watcher did not coalesce duplicate path hints in order")
+  test.assert(#batch.changes == 4 and
+              describe_change(batch.changes[1]) ==
+                "created:/project/b/file.titan" and
+              describe_change(batch.changes[2]) ==
+                "created:/project/b/newdir" and
+              describe_change(batch.changes[3]) == "deleted:/project/b" and
+              describe_change(batch.changes[4]) ==
+                "modified:/config/titan-config.lua",
+              "watcher did not preserve created paths while coalescing")
   test.assert(#batch.failures == 1 and
               batch.failures[1].operation == "fs.watcher",
               "watcher did not preserve a typed polling failure")
@@ -232,8 +247,10 @@ local function real_saved_file_hint()
     function (batch: project_watcher.RediscoveryBatch)
       callbacks = callbacks + 1
       local matched = false
-      for index = 1, #batch.paths do
-        if batch.paths[index] == changed then matched = true end
+      for index = 1, #batch.changes do
+        if project_watcher.change_path(batch.changes[index]) == changed then
+          matched = true
+        end
       end
       if matched then path_callbacks = path_callbacks + 1 end
     end)

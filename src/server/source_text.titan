@@ -115,138 +115,412 @@ local function utf16_width(codepoint: integer): integer
   return 1
 end
 
-local function position_for_offset_or_raise(source: string,
-                                             byte_offset: integer): Position
-  if byte_offset < 0 or byte_offset > #source then
-    return fail<Position>("byte offset is outside the source text", byte_offset)
-  end
-
-  local target = byte_offset + 1
-  local index = 1
-  local line = 0
-  local character = 0
-  while index <= #source do
-    if index == target then return Position.new(line, character) end
-    local byte: integer = strings.byte(source, index)
-    if byte == 0x0d then
-      if index + 1 <= #source and
-         strings.byte(source, index + 1) == 0x0a then
-        if target == index + 1 then
-          return fail<Position>(
-            "byte offset splits a CRLF line ending", byte_offset)
-        end
-        index = index + 2
-      else
-        index = index + 1
-      end
-      line = line + 1
-      character = 0
-    elseif byte == 0x0a then
-      index = index + 1
-      line = line + 1
-      character = 0
-    else
-      local decoded = decode(source, index)
-      if target > index and target < decoded.next_index then
-        return fail<Position>(
-          "byte offset splits a UTF-8 scalar", byte_offset)
-      end
-      character = character + utf16_width(decoded.scalar)
-      index = decoded.next_index
-    end
-  end
-  return Position.new(line, character)
+-- A line keeps only the non-ASCII scalar checkpoints where byte and UTF-16
+-- coordinates diverge. ASCII offsets therefore convert in O(1) after the
+-- line lookup, while Unicode offsets need only a binary search through that
+-- line's compact checkpoints.
+local record ScalarCheckpoint
+  const byte_start: integer
+  const byte_finish: integer
+  const utf16_start: integer
+  const utf16_finish: integer
 end
 
-function position_for_offset(source: string, byte_offset: integer):
-    (Position?, Error?)
+local record IndexedLine
+  const start_offset: integer
+  const content_finish_offset: integer
+  const next_start_offset: integer
+  const utf16_length: integer
+  const checkpoints: {ScalarCheckpoint}
+end
+
+-- Source-private deterministic instrumentation lets the stress tests assert
+-- an operation budget instead of depending on machine-specific wall time.
+local record CoordinateWork
+  steps: integer
+end
+
+type Yield = () -> ()
+type WorkAccount = () -> ()
+
+local YIELD_CADENCE = 1024
+
+record CoordinateIndex
+  local const source: string
+  local const lines: {IndexedLine}
+  local const lf_line_starts: {integer}
+  local const lf_line_finishes: {integer}
+  local const valid_finish_offset: integer
+  local const valid_finish_position: Position
+  local const failure: Error?
+  local const work: CoordinateWork?
+end
+
+local function count_step(work: CoordinateWork?)
+  if work ~= nil then work.steps = work.steps + 1 end
+end
+
+local function account_yield_work(yield_now: Yield?, work: integer): integer
+  if yield_now == nil then return 0 end
+  local next_work = work + 1
+  if next_work < YIELD_CADENCE then return next_work end
+  yield_now()
+  return 0
+end
+
+local function account_coordinate_work(work: CoordinateWork?,
+                                       yield_now: Yield?,
+                                       account_now: WorkAccount?,
+                                       yield_work: integer): integer
+  count_step(work)
+  if account_now ~= nil then
+    account_now()
+    return yield_work
+  end
+  return account_yield_work(yield_now, yield_work)
+end
+
+local function try_decode(source: string, index: integer):
+    (CodePoint?, Error?)
   do
-    return position_for_offset_or_raise(source, byte_offset), nil
+    return decode(source, index), nil
   catch
     if error is Error then return nil, error as Error end
     raise
   end
 end
 
-local function offset_for_position_or_raise(source: string,
-                                             position: Position): integer
-  if position.line < 0 or position.character < 0 then
-    return fail<integer>("LSP positions cannot be negative", nil)
-  end
-
-  local index = 1
-  local line = 0
+local function build_coordinate_index(source: string,
+                                      work: CoordinateWork?,
+                                      yield_now: Yield?,
+                                      account_now: WorkAccount?): CoordinateIndex
+  local lines: {IndexedLine} = {}
+  local lf_line_starts: {integer} = {0}
+  local lf_line_finishes: {integer} = {}
+  local checkpoints: {ScalarCheckpoint} = {}
+  local line_start_offset = 0
   local character = 0
-  while true do
-    if line == position.line and character == position.character then
-      return index - 1
-    end
-    if index > #source then
-      if line < position.line then
-        return fail<integer>("LSP line is outside the source text", nil)
-      end
-      return fail<integer>("LSP character is outside its line", nil)
-    end
+  local index = 1
+  local failure?: Error
+  local valid_finish_offset = #source
+  local valid_finish_position = Position.new(0, 0)
+  local yield_work = 0
 
+  while index <= #source do
+    yield_work = account_coordinate_work(
+      work, yield_now, account_now, yield_work)
     local byte: integer = strings.byte(source, index)
-    if byte == 0x0d or byte == 0x0a then
-      if line == position.line then
-        return fail<integer>("LSP character is outside its line", index - 1)
-      end
-      if byte == 0x0d and index + 1 <= #source and
+    if byte == 0x0d then
+      local content_finish_offset = index - 1
+      local next_start_offset = index
+      if index + 1 <= #source and
          strings.byte(source, index + 1) == 0x0a then
+        -- The LF is the compiler's line ending. Its zero-based byte offset is
+        -- the current one-based CR index.
+        lf_line_finishes[#lf_line_finishes + 1] = index
+        lf_line_starts[#lf_line_starts + 1] = index + 1
+        next_start_offset = index + 1
         index = index + 2
       else
         index = index + 1
       end
-      line = line + 1
+      lines[#lines + 1] = IndexedLine.new(
+        line_start_offset, content_finish_offset, next_start_offset,
+        character, checkpoints)
+      line_start_offset = next_start_offset
       character = 0
+      checkpoints = {}
+    elseif byte == 0x0a then
+      local finish_offset = index - 1
+      local next_start_offset = index
+      lf_line_finishes[#lf_line_finishes + 1] = finish_offset
+      lf_line_starts[#lf_line_starts + 1] = next_start_offset
+      lines[#lines + 1] = IndexedLine.new(
+        line_start_offset, finish_offset, next_start_offset,
+        character, checkpoints)
+      line_start_offset = next_start_offset
+      character = 0
+      checkpoints = {}
+      index = index + 1
     else
-      local decoded = decode(source, index)
+      local decoded?, decode_error? = try_decode(source, index)
+      if decoded == nil then
+        failure = decode_error
+        valid_finish_offset = index - 1
+        valid_finish_position = Position.new(#lines, character)
+        lines[#lines + 1] = IndexedLine.new(
+          line_start_offset, valid_finish_offset, valid_finish_offset,
+          character, checkpoints)
+        break
+      end
       local width = utf16_width(decoded.scalar)
-      if line == position.line and
-         position.character > character and
-         position.character < character + width then
-        return fail<integer>(
-          "LSP character splits a UTF-16 surrogate pair", index - 1)
+      if decoded.next_index ~= index + 1 then
+        checkpoints[#checkpoints + 1] = ScalarCheckpoint.new(
+          index - 1, decoded.next_index - 1,
+          character, character + width)
       end
       character = character + width
       index = decoded.next_index
     end
   end
-end
 
-function offset_for_position(source: string, position: Position):
-    (integer?, Error?)
-  do
-    return offset_for_position_or_raise(source, position), nil
-  catch
-    if error is Error then return nil, error as Error end
-    raise
+  if failure == nil then
+    lines[#lines + 1] = IndexedLine.new(
+      line_start_offset, #source, #source, character, checkpoints)
+    valid_finish_position = Position.new(#lines - 1, character)
+  else
+    -- UTF-16 queries after the first malformed scalar reproduce the decoder
+    -- failure, but compiler LF-byte locations still need a complete line
+    -- table. Finish that raw byte table without attempting another decode.
+    while index <= #source do
+      yield_work = account_coordinate_work(
+        work, yield_now, account_now, yield_work)
+      if strings.byte(source, index) == 0x0a then
+        lf_line_finishes[#lf_line_finishes + 1] = index - 1
+        lf_line_starts[#lf_line_starts + 1] = index
+      end
+      index = index + 1
+    end
   end
+  lf_line_finishes[#lf_line_finishes + 1] = #source
+
+  return CoordinateIndex.new(
+    source, lines, lf_line_starts, lf_line_finishes,
+    valid_finish_offset, valid_finish_position, failure, work)
 end
 
-function span_for_offsets(source: string, start_offset: integer,
-                          finish_offset: integer): (Span?, Error?)
+function coordinate_index(source: string): CoordinateIndex
+  return build_coordinate_index(source, nil, nil, nil)
+end
+
+function coordinate_index_with_yield(source: string,
+                                     yield_now: Yield): CoordinateIndex
+  return build_coordinate_index(source, nil, yield_now, nil)
+end
+
+-- Let a caller share one work budget across coordinate construction and its
+-- surrounding operation. The callback accounts one decoded scalar or line
+-- ending and decides when the actual cooperative yield occurs.
+function coordinate_index_with_account(source: string,
+                                       account_now: WorkAccount):
+    CoordinateIndex
+  return build_coordinate_index(source, nil, nil, account_now)
+end
+
+local function coordinate_index_with_work(source: string, yield_now: Yield?):
+    (CoordinateIndex, CoordinateWork)
+  local work = CoordinateWork.new(0)
+  return build_coordinate_index(source, work, yield_now, nil), work
+end
+
+local function coordinate_work_steps(work: CoordinateWork): integer
+  return work.steps
+end
+
+local function position_less(left: Position, right: Position): boolean
+  return left.line < right.line or
+         (left.line == right.line and left.character < right.character)
+end
+
+local function indexed_line_for_offset(self: CoordinateIndex,
+                                       byte_offset: integer):
+    (IndexedLine, integer)
+  local low = 1
+  local high = #self.lines
+  local found = 1
+  while low <= high do
+    count_step(self.work)
+    local middle = (low + high) // 2
+    if self.lines[middle].start_offset <= byte_offset then
+      found = middle
+      low = middle + 1
+    else
+      high = middle - 1
+    end
+  end
+  return self.lines[found], found
+end
+
+local function completed_byte_checkpoints(
+    self: CoordinateIndex, line: IndexedLine,
+    byte_offset: integer): integer
+  local low = 1
+  local high = #line.checkpoints
+  local completed = 0
+  while low <= high do
+    count_step(self.work)
+    local middle = (low + high) // 2
+    if line.checkpoints[middle].byte_finish <= byte_offset then
+      completed = middle
+      low = middle + 1
+    else
+      high = middle - 1
+    end
+  end
+  return completed
+end
+
+function CoordinateIndex:position_for_offset(byte_offset: integer):
+    (Position?, Error?)
+  if byte_offset < 0 or byte_offset > #self.source then
+    return nil, Error.new(
+      "byte offset is outside the source text", byte_offset)
+  end
+  if self.failure ~= nil and byte_offset > self.valid_finish_offset then
+    return nil, self.failure
+  end
+
+  local line, line_number = indexed_line_for_offset(self, byte_offset)
+  if byte_offset > line.content_finish_offset then
+    return nil, Error.new(
+      "byte offset splits a CRLF line ending", byte_offset)
+  end
+
+  local completed = completed_byte_checkpoints(self, line, byte_offset)
+  local next_checkpoint? = line.checkpoints[completed + 1]
+  if next_checkpoint ~= nil and
+     byte_offset > next_checkpoint.byte_start and
+     byte_offset < next_checkpoint.byte_finish then
+    return nil, Error.new("byte offset splits a UTF-8 scalar", byte_offset)
+  end
+
+  local adjustment = 0
+  if completed > 0 then
+    local checkpoint = line.checkpoints[completed]
+    adjustment = checkpoint.utf16_finish -
+      (checkpoint.byte_finish - line.start_offset)
+  end
+  return Position.new(
+    line_number - 1,
+    byte_offset - line.start_offset + adjustment), nil
+end
+
+local function completed_utf16_checkpoints(
+    self: CoordinateIndex, line: IndexedLine,
+    character: integer): integer
+  local low = 1
+  local high = #line.checkpoints
+  local completed = 0
+  while low <= high do
+    count_step(self.work)
+    local middle = (low + high) // 2
+    if line.checkpoints[middle].utf16_finish <= character then
+      completed = middle
+      low = middle + 1
+    else
+      high = middle - 1
+    end
+  end
+  return completed
+end
+
+function CoordinateIndex:offset_for_position(position: Position):
+    (integer?, Error?)
+  if position.line < 0 or position.character < 0 then
+    return nil, Error.new("LSP positions cannot be negative", nil)
+  end
+  if self.failure ~= nil and
+     position_less(self.valid_finish_position, position) then
+    return nil, self.failure
+  end
+  if position.line + 1 > #self.lines then
+    return nil, Error.new("LSP line is outside the source text", nil)
+  end
+
+  local line = self.lines[position.line + 1]
+  if position.character > line.utf16_length then
+    local ending_offset?: integer
+    if line.next_start_offset > line.content_finish_offset then
+      ending_offset = line.content_finish_offset
+    end
+    return nil, Error.new("LSP character is outside its line", ending_offset)
+  end
+
+  local completed = completed_utf16_checkpoints(
+    self, line, position.character)
+  local next_checkpoint? = line.checkpoints[completed + 1]
+  if next_checkpoint ~= nil and
+     position.character > next_checkpoint.utf16_start and
+     position.character < next_checkpoint.utf16_finish then
+    return nil, Error.new(
+      "LSP character splits a UTF-16 surrogate pair",
+      next_checkpoint.byte_start)
+  end
+
+  local adjustment = 0
+  if completed > 0 then
+    local checkpoint = line.checkpoints[completed]
+    adjustment = checkpoint.byte_finish - line.start_offset -
+      checkpoint.utf16_finish
+  end
+  return line.start_offset + position.character + adjustment, nil
+end
+
+function CoordinateIndex:span_for_offsets(start_offset: integer,
+                                          finish_offset: integer):
+    (Span?, Error?)
   if finish_offset < start_offset then
     return nil, Error.new("span finish precedes its start", finish_offset)
   end
-  local start?, start_error? = position_for_offset(source, start_offset)
+  local start?, start_error? = self:position_for_offset(start_offset)
   if start == nil then return nil, start_error end
-  local finish?, finish_error? = position_for_offset(source, finish_offset)
+  local finish?, finish_error? = self:position_for_offset(finish_offset)
   if finish == nil then return nil, finish_error end
   return Span.new(start, finish), nil
 end
 
-function offsets_for_span(source: string, span: Span): (ByteSpan?, Error?)
-  local start?, start_error? = offset_for_position(source, span.start)
+function CoordinateIndex:offsets_for_span(span: Span): (ByteSpan?, Error?)
+  local start?, start_error? = self:offset_for_position(span.start)
   if start == nil then return nil, start_error end
-  local finish?, finish_error? = offset_for_position(source, span.finish)
+  local finish?, finish_error? = self:offset_for_position(span.finish)
   if finish == nil then return nil, finish_error end
   if finish < start then
     return nil, Error.new("span finish precedes its start", finish)
   end
   return ByteSpan.new(start, finish), nil
+end
+
+-- Compiler locations count only LF and use one-based byte columns. These
+-- constant-time accessors let semantic indexing share the same per-file scan
+-- without teaching SourceText about compiler records.
+function CoordinateIndex:lf_line_start(line: integer): integer?
+  if line < 1 or line > #self.lf_line_starts then return nil end
+  return self.lf_line_starts[line]
+end
+
+function CoordinateIndex:lf_line_finish(line: integer): integer?
+  if line < 1 or line > #self.lf_line_finishes then return nil end
+  return self.lf_line_finishes[line]
+end
+
+function CoordinateIndex:offset_for_lf_byte_position(
+    line: integer, column: integer): integer?
+  if line < 1 or column < 1 then return nil end
+  local start? = self:lf_line_start(line)
+  local finish? = self:lf_line_finish(line)
+  if start == nil or finish == nil then return nil end
+  local target = start + column - 1
+  if target > finish then return nil end
+  return target
+end
+
+function position_for_offset(source: string, byte_offset: integer):
+    (Position?, Error?)
+  return coordinate_index(source):position_for_offset(byte_offset)
+end
+
+function offset_for_position(source: string, position: Position):
+    (integer?, Error?)
+  return coordinate_index(source):offset_for_position(position)
+end
+
+function span_for_offsets(source: string, start_offset: integer,
+                          finish_offset: integer): (Span?, Error?)
+  return coordinate_index(source):span_for_offsets(start_offset, finish_offset)
+end
+
+function offsets_for_span(source: string, span: Span): (ByteSpan?, Error?)
+  return coordinate_index(source):offsets_for_span(span)
 end
 
 local function is_hex(byte: integer): boolean

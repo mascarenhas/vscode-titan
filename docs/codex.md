@@ -61,7 +61,8 @@ documentation for the current Codex plugin workflow.
 When a definition, reference, hover, folding, or rename-preview request applies
 to saved Titan source, Codex can use the skill's
 `scripts/titan-lsp-query.mjs`. The script launches `titan-language-server` from
-`PATH`, performs one query, shuts it down, and emits one JSON object on stdout.
+`PATH`, waits for the initial saved-file index, performs one query, shuts it
+down, and emits one JSON object on stdout.
 For direct development testing from this checkout:
 
 ```sh

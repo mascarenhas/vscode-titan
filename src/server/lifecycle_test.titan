@@ -12,9 +12,11 @@ function test_lifecycle_completes_initialize_shutdown_exit(
   when result: result then
     local object? = json.as_object(result)
     local capabilities? = json.as_object(object:get("capabilities"))
-    test.assert(capabilities ~= nil and #capabilities.members == 5,
+    test.assert(capabilities ~= nil and #capabilities.members == 6,
                 "initialize advertised the wrong capability count")
-    test.assert(json.as_boolean(capabilities:get("definitionProvider")) and
+    test.assert(json.as_string(capabilities:get("positionEncoding")) ==
+                  "utf-16" and
+                json.as_boolean(capabilities:get("definitionProvider")) and
                 json.as_boolean(capabilities:get("referencesProvider")) and
                 json.as_boolean(capabilities:get("renameProvider")) and
                 json.as_boolean(capabilities:get("hoverProvider")) and
@@ -29,12 +31,20 @@ function test_lifecycle_completes_initialize_shutdown_exit(
               "initialize did not advance the lifecycle")
 
   case server:dispatch("initialized", false, json.new_object())
-  when notification then
+  when initialized then
   else
     test.assert(false, "initialized was not accepted as a notification")
   end
   test.assert(server:phase_name() == "running",
               "initialized did not enter the running phase")
+
+  case server:dispatch("initialized", false, json.new_object())
+  when notification then
+  else
+    test.assert(false, "duplicate initialized was treated as accepted")
+  end
+  test.assert(server:phase_name() == "running",
+              "duplicate initialized changed lifecycle state")
 
   case server:dispatch("shutdown", true, nil)
   when result: result then
@@ -56,6 +66,14 @@ end
 function test_lifecycle_enforces_order_and_message_kinds(
     _context: test.Context)
   local server = lifecycle.create()
+  case server:dispatch("initialized", false, json.new_object())
+  when notification then
+  else
+    test.assert(false, "early initialized was treated as accepted")
+  end
+  test.assert(server:phase_name() == "before_initialize",
+              "early initialized changed lifecycle state")
+
   case server:dispatch("workspace/symbol", true, nil)
   when failure: failure then
     test.assert(failure.code == -32002,

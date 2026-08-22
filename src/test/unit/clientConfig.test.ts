@@ -13,6 +13,7 @@ import * as path from "node:path";
 import { afterEach, describe, test } from "node:test";
 import {
   SERVER_BASENAME,
+  SERVER_LOG_LEVEL_ENVIRONMENT_VARIABLE,
   ServerConfigurationError,
   createServerLaunchOptions,
   ensureServerExecutable,
@@ -50,7 +51,8 @@ describe("server configuration", () => {
 
     assert.deepEqual(configuration, {
       configuredPath: "tools/titan-language-server",
-      arguments: ["--trace", "messages"]
+      arguments: ["--trace", "messages"],
+      logLevel: "info"
     });
     assert.notEqual(configuration.arguments, argumentsSetting);
   });
@@ -70,6 +72,19 @@ describe("server configuration", () => {
       (error: unknown) =>
         error instanceof ServerConfigurationError &&
         /array of strings/.test(error.message)
+    );
+  });
+
+  test("validates the server log level", () => {
+    assert.equal(
+      readServerConfiguration("", [], "debug").logLevel,
+      "debug"
+    );
+    assert.throws(
+      () => readServerConfiguration("", [], "verbose"),
+      (error: unknown) =>
+        error instanceof ServerConfigurationError &&
+        /logLevel must be one of/.test(error.message)
     );
   });
 
@@ -215,7 +230,10 @@ describe("server launch validation", () => {
       args: ["--stdio"],
       options: {
         cwd: "/workspace/project",
-        env: { TITAN_TEST_ENV: "configured" }
+        env: {
+          TITAN_LANGUAGE_SERVER_LOG_LEVEL: "info",
+          TITAN_TEST_ENV: "configured"
+        }
       }
     });
     assert.notEqual(launch.args, args);
@@ -236,7 +254,10 @@ describe("server launch validation", () => {
       sourceEnvironment,
       { luaPath: "", luaCPath: "" }
     );
-    assert.deepEqual(inherited.options.env, sourceEnvironment);
+    assert.deepEqual(inherited.options.env, {
+      ...sourceEnvironment,
+      TITAN_LANGUAGE_SERVER_LOG_LEVEL: "info"
+    });
 
     const configured = createServerLaunchOptions(
       "/bin/titan-language-server",
@@ -251,6 +272,7 @@ describe("server launch validation", () => {
     assert.deepEqual(configured.options.env, {
       LUA_PATH: "/opt/titan/compiler/?.lua;;",
       LUA_CPATH: "/opt/titan/compiler/?.so;;",
+      TITAN_LANGUAGE_SERVER_LOG_LEVEL: "info",
       TITAN_TEST_ENV: "preserved"
     });
     assert.deepEqual(sourceEnvironment, {
@@ -258,6 +280,22 @@ describe("server launch validation", () => {
       LUA_CPATH: "inherited-lua-cpath",
       TITAN_TEST_ENV: "preserved"
     });
+  });
+
+  test("passes the configured server log level through the launch environment", () => {
+    const launch = createServerLaunchOptions(
+      "/bin/titan-language-server",
+      [],
+      "/workspace/project",
+      { [SERVER_LOG_LEVEL_ENVIRONMENT_VARIABLE]: "inherited" },
+      { luaPath: "", luaCPath: "" },
+      "trace"
+    );
+
+    assert.equal(
+      launch.options.env[SERVER_LOG_LEVEL_ENVIRONMENT_VARIABLE],
+      "trace"
+    );
   });
 
   test("formats actionable startup errors", () => {

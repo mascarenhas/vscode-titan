@@ -35,9 +35,12 @@ class FrameReader {
   constructor(stream) {
     this.iterator = stream[Symbol.asyncIterator]();
     this.buffer = Buffer.alloc(0);
+    this.indexingStatuses = [];
+    this.indexingStatusCursor = 0;
+    this.lastIndexingEpoch = undefined;
   }
 
-  async read() {
+  async read(milliseconds = 5_000) {
     while (true) {
       const headerEnd = this.buffer.indexOf("\r\n\r\n");
       if (headerEnd >= 0) {
@@ -58,7 +61,8 @@ class FrameReader {
 
       const next = await withTimeout(
         this.iterator.next(),
-        "a framed server response"
+        "a framed server response",
+        milliseconds
       );
       if (next.done) {
         throw new Error(`server stdout ended with ${this.buffer.length} pending bytes`);
@@ -85,17 +89,113 @@ function collect(stream) {
   return () => Buffer.concat(chunks);
 }
 
-function launch(cwd = process.cwd()) {
+function launch(cwd = process.cwd(), logLevel = "off") {
   return spawn(path.resolve(server), [], {
     cwd,
-    env: process.env,
+    env: {
+      ...process.env,
+      TITAN_LANGUAGE_SERVER_LOG_LEVEL: logLevel
+    },
     stdio: ["pipe", "pipe", "pipe"]
   });
 }
 
-async function exitOf(child) {
-  const [code, signal] = await withTimeout(once(child, "close"), "server exit");
-  return { code, signal };
+function exitOf(child) {
+  return once(child, "close").then(([code, signal]) => ({ code, signal }));
+}
+
+function awaitExit(exit) {
+  return withTimeout(exit, "server exit");
+}
+
+async function responseFor(responses, id, milliseconds = 5_000) {
+  while (true) {
+    const message = await responses.read(milliseconds);
+    if (message.id === undefined && typeof message.method === "string") {
+      if (message.method === "titan/indexingStatus") {
+        responses.indexingStatuses.push(message.params);
+      }
+      continue;
+    }
+    assert.equal(message.jsonrpc, "2.0");
+    assert.equal(message.id, id);
+    return message;
+  }
+}
+
+function validateIndexingStatus(status) {
+  assert.ok(status !== null && typeof status === "object");
+  assert.ok(Number.isInteger(status.epoch));
+  assert.equal(typeof status.initial, "boolean");
+  assert.ok(["indexing", "ready", "failed"].includes(status.state));
+  if (status.generation !== undefined) {
+    assert.ok(Number.isInteger(status.generation));
+  }
+  if (status.message !== undefined) {
+    assert.equal(typeof status.message, "string");
+  }
+}
+
+async function nextIndexingStatus(responses) {
+  if (responses.indexingStatusCursor >= responses.indexingStatuses.length) {
+    const message = await responses.read(30_000);
+    assert.equal(message.jsonrpc, "2.0");
+    assert.equal(message.id, undefined);
+    assert.equal(message.method, "titan/indexingStatus");
+    responses.indexingStatuses.push(message.params);
+  }
+  const status = responses.indexingStatuses[responses.indexingStatusCursor];
+  responses.indexingStatusCursor += 1;
+  validateIndexingStatus(status);
+  return status;
+}
+
+async function waitForIndexing(
+  responses,
+  expectedState = "ready",
+  cycleCount = 1,
+  minimumEpoch
+) {
+  assert.ok(Number.isInteger(cycleCount) && cycleCount >= 1);
+  let terminal;
+  let acceptedCycles = 0;
+  while (acceptedCycles < cycleCount) {
+    let indexing;
+    while (true) {
+      const status = await nextIndexingStatus(responses);
+      if (status.state === "indexing") {
+        assert.equal(indexing, undefined, "indexing cycle emitted busy twice");
+        assert.equal(status.message, undefined);
+        indexing = status;
+        continue;
+      }
+
+      assert.ok(indexing, "indexing completion lacked busy status");
+      assert.equal(status.initial, indexing.initial);
+      assert.ok(status.epoch >= indexing.epoch);
+      if (status.state === "failed") {
+        assert.equal(typeof status.message, "string");
+        assert.ok(status.message.length > 0);
+      } else {
+        assert.equal(status.message, undefined);
+      }
+      if (status.state === "ready") {
+        assert.ok(Number.isInteger(status.generation));
+      }
+      responses.lastIndexingEpoch = Math.max(
+        responses.lastIndexingEpoch ?? status.epoch,
+        status.epoch
+      );
+      if (minimumEpoch !== undefined && status.epoch < minimumEpoch) {
+        break;
+      }
+      assert.equal(status.state, expectedState);
+      terminal = status;
+      acceptedCycles += 1;
+      break;
+    }
+  }
+  return terminal;
 }
 
 async function testLifecycle() {
@@ -131,7 +231,8 @@ async function testLifecycle() {
         referencesProvider: true,
         renameProvider: true,
         hoverProvider: true,
-        foldingRangeProvider: true
+        foldingRangeProvider: true,
+        positionEncoding: "utf-16"
       }
     });
 
@@ -150,7 +251,7 @@ async function testLifecycle() {
       })
     ]));
 
-    const shutdown = await responses.read();
+    const shutdown = await responseFor(responses, "shutdown");
     assert.equal(shutdown.jsonrpc, "2.0");
     assert.equal(shutdown.id, "shutdown");
     assert.equal(shutdown.result, null);
@@ -158,7 +259,7 @@ async function testLifecycle() {
     // The server must stop after exit even while the client side of stdin
     // remains open; teardown cannot wait for another read to reach EOF.
     child.stdin.write(frame({ jsonrpc: "2.0", method: "exit" }));
-    assert.deepEqual(await exit, { code: 0, signal: null });
+    assert.deepEqual(await awaitExit(exit), { code: 0, signal: null });
     await responses.finish();
     assert.equal(stderr().length, 0, stderr().toString("utf8"));
     assert.equal(responses.buffer.length, 0, "unexpected bytes after responses");
@@ -174,12 +275,58 @@ async function testLifecycle() {
   }
 }
 
-async function request(child, responses, id, method, params) {
+async function request(
+  child,
+  responses,
+  id,
+  method,
+  params,
+  milliseconds = 5_000
+) {
   child.stdin.write(frame({ jsonrpc: "2.0", id, method, params }));
-  const response = await responses.read();
-  assert.equal(response.jsonrpc, "2.0");
-  assert.equal(response.id, id);
+  return responseFor(responses, id, milliseconds);
+}
+
+async function semanticRequest(
+  child,
+  responses,
+  id,
+  method,
+  params,
+  { expectedIndexingState = "ready", indexingCycles } = {}
+) {
+  const response = await request(
+    child,
+    responses,
+    id,
+    method,
+    params,
+    30_000
+  );
+  const cycleCount = indexingCycles ??
+    (method === "textDocument/rename" ? 2 : 1);
+  await waitForIndexing(responses, expectedIndexingState, cycleCount);
   return response;
+}
+
+async function writeSavedGeneration(
+  responses,
+  filename,
+  contents,
+  expectedIndexingState = "ready"
+) {
+  const previousEpoch = responses.lastIndexingEpoch;
+  assert.ok(
+    Number.isInteger(previousEpoch),
+    "saved-generation wait requires completed initial indexing"
+  );
+  await writeFile(filename, contents, "utf8");
+  return waitForIndexing(
+    responses,
+    expectedIndexingState,
+    1,
+    previousEpoch + 1
+  );
 }
 
 async function testSavedProjectSemantics() {
@@ -221,6 +368,7 @@ async function testSavedProjectSemantics() {
       method: "initialized",
       params: {}
     }));
+    await waitForIndexing(responses);
 
     // V1 semantics are deliberately saved-file-only. Even if a client sends
     // text synchronization notifications that the server does not advertise,
@@ -257,7 +405,7 @@ async function testSavedProjectSemantics() {
       position: { line: 4, character: unicodeUse + 1 }
     };
 
-    const definition = await request(
+    const definition = await semanticRequest(
       child,
       responses,
       "definition",
@@ -277,7 +425,7 @@ async function testSavedProjectSemantics() {
       }
     });
 
-    const references = await request(
+    const references = await semanticRequest(
       child,
       responses,
       "references",
@@ -293,7 +441,7 @@ async function testSavedProjectSemantics() {
       location.range.start.character === unicodeUse
     ));
 
-    const hover = await request(
+    const hover = await semanticRequest(
       child,
       responses,
       "hover",
@@ -310,7 +458,7 @@ async function testSavedProjectSemantics() {
 
     const coercedItem = sourceLines[7].lastIndexOf("item");
     assert.ok(coercedItem >= 0, "coercion fixture has no item use");
-    const coercionHover = await request(
+    const coercionHover = await semanticRequest(
       child,
       responses,
       "coercion-hover",
@@ -333,7 +481,7 @@ async function testSavedProjectSemantics() {
       end: { line: 7, character: coercedItem + "item".length }
     });
 
-    const folding = await request(
+    const folding = await semanticRequest(
       child,
       responses,
       "folding",
@@ -347,7 +495,7 @@ async function testSavedProjectSemantics() {
       range.startLine === 3 && range.endLine === 4
     ));
 
-    const rename = await request(
+    const rename = await semanticRequest(
       child,
       responses,
       "rename",
@@ -382,13 +530,19 @@ async function testSavedProjectSemantics() {
 
     // A failed saved generation must not fall back to the previously checked
     // AST. The application refreshes from disk for each semantic request.
-    await writeFile(filename, "function answer(\n", "utf8");
-    const stale = await request(
+    await writeSavedGeneration(
+      responses,
+      filename,
+      "function answer(\n",
+      "failed"
+    );
+    const stale = await semanticRequest(
       child,
       responses,
       "stale",
       "textDocument/definition",
-      documentPosition
+      documentPosition,
+      { expectedIndexingState: "failed" }
     );
     assert.equal(stale.error.code, -32803);
     assert.match(stale.error.message, /current saved generation/);
@@ -402,7 +556,7 @@ async function testSavedProjectSemantics() {
     );
     assert.equal(shutdown.result, null);
     child.stdin.write(frame({ jsonrpc: "2.0", method: "exit" }));
-    assert.deepEqual(await exit, { code: 0, signal: null });
+    assert.deepEqual(await awaitExit(exit), { code: 0, signal: null });
     await responses.finish();
     assert.equal(stderr().length, 0, stderr().toString("utf8"));
     assert.equal(responses.buffer.length, 0, "unexpected bytes after responses");
@@ -439,7 +593,9 @@ async function testConfigCannotWriteProtocolStdout() {
       method: "initialized",
       params: {}
     }));
-    const rejected = await request(
+    const indexing = await waitForIndexing(responses, "failed");
+    assert.match(indexing.message, /cannot evaluate titan-config\.lua/);
+    const rejected = await semanticRequest(
       child,
       responses,
       "config-output",
@@ -447,7 +603,8 @@ async function testConfigCannotWriteProtocolStdout() {
       {
         textDocument: { uri: pathToFileURL(filename).href },
         position: { line: 0, character: 10 }
-      }
+      },
+      { expectedIndexingState: "failed" }
     );
     assert.equal(rejected.error.code, -32803);
     assert.match(rejected.error.message, /cannot evaluate titan-config\.lua/);
@@ -461,7 +618,7 @@ async function testConfigCannotWriteProtocolStdout() {
     );
     assert.equal(shutdown.result, null);
     child.stdin.write(frame({ jsonrpc: "2.0", method: "exit" }));
-    assert.deepEqual(await exit, { code: 0, signal: null });
+    assert.deepEqual(await awaitExit(exit), { code: 0, signal: null });
     await responses.finish();
     assert.equal(responses.buffer.length, 0, "config emitted unframed stdout");
     assert.equal(stderr().length, 0, stderr().toString("utf8"));
@@ -517,12 +674,13 @@ async function testCrossModuleFolderAndIncrementalSemantics() {
       method: "initialized",
       params: {}
     }));
+    await waitForIndexing(responses);
 
     const extraPosition = {
       textDocument: { uri: consumerUri },
       position: { line: 3, character: extraColumn + 1 }
     };
-    const definition = await request(
+    const definition = await semanticRequest(
       child,
       responses,
       "folder-definition",
@@ -542,7 +700,7 @@ async function testCrossModuleFolderAndIncrementalSemantics() {
       }
     });
 
-    const references = await request(
+    const references = await semanticRequest(
       child,
       responses,
       "cross-references",
@@ -555,7 +713,7 @@ async function testCrossModuleFolderAndIncrementalSemantics() {
       new Set([partUri, consumerUri])
     );
 
-    const rename = await request(
+    const rename = await semanticRequest(
       child,
       responses,
       "cross-rename",
@@ -569,7 +727,7 @@ async function testCrossModuleFolderAndIncrementalSemantics() {
       (edit) => edit.newText === "augment"
     ));
 
-    const externalDefinition = await request(
+    const externalDefinition = await semanticRequest(
       child,
       responses,
       "external-definition",
@@ -583,12 +741,12 @@ async function testCrossModuleFolderAndIncrementalSemantics() {
 
     // An implementation-only change keeps the public manifest stable, so the
     // clean consumer remains reusable and navigation still succeeds.
-    await writeFile(
+    await writeSavedGeneration(
+      responses,
       partFile,
-      "function extra(item: integer): integer return item + 200 end\n",
-      "utf8"
+      "function extra(item: integer): integer return item + 200 end\n"
     );
-    const unchangedManifest = await request(
+    const unchangedManifest = await semanticRequest(
       child,
       responses,
       "implementation-change",
@@ -600,23 +758,25 @@ async function testCrossModuleFolderAndIncrementalSemantics() {
 
     // A public interface change must invalidate and recheck the consumer in
     // the same refresh fixed point instead of serving its prior annotated AST.
-    await writeFile(
+    await writeSavedGeneration(
+      responses,
       partFile,
       "function extra(item: integer): string return \"broken\" end\n",
-      "utf8"
+      "failed"
     );
-    const changedManifest = await request(
+    const changedManifest = await semanticRequest(
       child,
       responses,
       "interface-change",
       "textDocument/definition",
-      extraPosition
+      extraPosition,
+      { expectedIndexingState: "failed" }
     );
     assert.equal(changedManifest.error.code, -32803);
     assert.match(changedManifest.error.message, /current saved generation/);
 
-    await writeFile(partFile, validPart, "utf8");
-    const recovered = await request(
+    await writeSavedGeneration(responses, partFile, validPart);
+    const recovered = await semanticRequest(
       child,
       responses,
       "recovered-generation",
@@ -635,7 +795,7 @@ async function testCrossModuleFolderAndIncrementalSemantics() {
     );
     assert.equal(shutdown.result, null);
     child.stdin.write(frame({ jsonrpc: "2.0", method: "exit" }));
-    assert.deepEqual(await exit, { code: 0, signal: null });
+    assert.deepEqual(await awaitExit(exit), { code: 0, signal: null });
     await responses.finish();
     assert.equal(responses.buffer.length, 0, "unexpected cross-module stdout");
     assert.equal(stderr().length, 0, stderr().toString("utf8"));
@@ -646,18 +806,22 @@ async function testCrossModuleFolderAndIncrementalSemantics() {
 }
 
 async function testTruncatedFrame() {
-  const child = launch();
+  const child = launch(process.cwd(), "error");
   const stdout = collect(child.stdout);
   const stderr = collect(child.stderr);
   const exit = exitOf(child);
   try {
     child.stdin.end(Buffer.from("Content-Length: 10\r\n\r\n{}", "ascii"));
-    assert.deepEqual(await exit, { code: 1, signal: null });
+    assert.deepEqual(await awaitExit(exit), { code: 1, signal: null });
     assert.equal(stdout().length, 0, "truncated input polluted stdout");
-    assert.match(
-      stderr().toString("utf8"),
-      /^titan-language-server: unexpected EOF in LSP frame\n$/
+    const diagnostic = stderr().toString("utf8");
+    assert.match(diagnostic, /^titan-language-server \{[^\n]+\}\n$/);
+    const record = JSON.parse(
+      diagnostic.trimEnd().slice("titan-language-server ".length)
     );
+    assert.equal(record.level, "error");
+    assert.equal(record.event, "server.failure");
+    assert.match(record.message, /unexpected EOF in LSP frame/);
   } finally {
     if (child.exitCode === null && child.signalCode === null) child.kill();
   }

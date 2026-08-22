@@ -18,6 +18,14 @@ import {
   resolveServerExecutable
 } from "./clientConfig";
 import {
+  ProtocolTraceController,
+  WorkspaceLogOutputChannel
+} from "./outputChannel";
+import {
+  INDEXING_STATUS_NOTIFICATION,
+  WorkspaceIndexingStatus
+} from "./indexingStatus";
+import {
   createWorkspaceDocumentSelector,
   createWorkspaceMiddleware,
   createWorkspaceUriConverters
@@ -25,6 +33,9 @@ import {
 
 const LANGUAGE_SERVER_CONFIGURATION_SECTION = "titan.languageServer";
 const COMPILER_CONFIGURATION_SECTION = "titan.compiler";
+const LANGUAGE_CLIENT_ID = "titan";
+const SHOW_LANGUAGE_SERVER_OUTPUT_COMMAND =
+  "titan.showLanguageServerOutput";
 const CLIENT_START_TIMEOUT_MILLISECONDS = 30_000;
 const FAILED_START_TERMINATION_TIMEOUT_MILLISECONDS = 2_000;
 
@@ -88,12 +99,17 @@ class TitanLanguageClient extends LanguageClient {
 
 class TitanClientManager {
   private readonly clients = new Map<string, TitanLanguageClient>();
+  private readonly indexingStatuses =
+    new Map<string, WorkspaceIndexingStatus>();
+  private readonly indexingSubscriptions =
+    new Map<string, vscode.Disposable>();
   private operation: Promise<void> = Promise.resolve();
   private disposed = false;
 
   public constructor(
     private readonly context: vscode.ExtensionContext,
-    private readonly outputChannel: vscode.LogOutputChannel
+    private readonly outputChannel: vscode.LogOutputChannel,
+    private readonly protocolTrace: ProtocolTraceController
   ) {}
 
   public start(): Promise<void> {
@@ -185,6 +201,11 @@ class TitanClientManager {
     folder: vscode.WorkspaceFolder,
     key: string
   ): Promise<void> {
+    const workspaceOutput = new WorkspaceLogOutputChannel(
+      this.outputChannel,
+      folder.name,
+      this.protocolTrace
+    );
     let command = "<unresolved>";
     let client: TitanLanguageClient | undefined;
     try {
@@ -198,7 +219,8 @@ class TitanClientManager {
       );
       const serverConfiguration = readServerConfiguration(
         configuration.get<unknown>("path", ""),
-        configuration.get<unknown>("arguments", [])
+        configuration.get<unknown>("arguments", []),
+        configuration.get<unknown>("logLevel", "info")
       );
       const compilerDiscovery = readCompilerDiscoveryConfiguration(
         compilerConfiguration.get<unknown>("luaPath", ""),
@@ -219,13 +241,17 @@ class TitanClientManager {
         serverConfiguration.arguments,
         physicalWorkspaceRoot,
         process.env,
-        compilerDiscovery
+        compilerDiscovery,
+        serverConfiguration.logLevel
       );
+      const documentSelector = createWorkspaceDocumentSelector(folder);
       const clientOptions: LanguageClientOptions = {
-        documentSelector: createWorkspaceDocumentSelector(folder),
+        diagnosticCollectionName: diagnosticCollectionName(folder),
+        documentSelector,
         middleware: createWorkspaceMiddleware(folder),
-        outputChannel: this.outputChannel,
+        outputChannel: workspaceOutput,
         revealOutputChannelOn: RevealOutputChannelOn.Error,
+        traceOutputChannel: workspaceOutput,
         uriConverters: createWorkspaceUriConverters(
           folder,
           physicalWorkspaceRoot
@@ -233,31 +259,63 @@ class TitanClientManager {
         workspaceFolder: folder
       };
       client = new TitanLanguageClient(
-        clientIdentifier(folder),
+        LANGUAGE_CLIENT_ID,
         `Titan Language Server (${folder.name})`,
         serverOptions,
         clientOptions
+      );
+
+      const status = new WorkspaceIndexingStatus(
+        `${diagnosticCollectionName(folder)}.indexing`,
+        folder.name,
+        [
+          {
+            language: "titan",
+            scheme: "file",
+            pattern: new vscode.RelativePattern(folder, "**/*")
+          }
+        ],
+        SHOW_LANGUAGE_SERVER_OUTPUT_COMMAND
+      );
+      const statusSubscription = vscode.Disposable.from(
+        client.onNotification(
+          INDEXING_STATUS_NOTIFICATION,
+          (params: unknown) => {
+            if (!status.update(params)) {
+              workspaceOutput.warn(
+                `Ignored invalid ${INDEXING_STATUS_NOTIFICATION} notification.`
+              );
+            }
+          }
+        ),
+        client.onDidChangeState((event) => {
+          if (event.newState !== State.Running) {
+            status.reset();
+          }
+        })
       );
 
       // Own the client before start() spawns its process. vscode-languageclient
       // v10 enters StartFailed when initialize rejects, and stop() refuses that
       // state even though the Node client can still own a live child process.
       this.clients.set(key, client);
+      this.indexingStatuses.set(key, status);
+      this.indexingSubscriptions.set(key, statusSubscription);
       await withTimeout(
         client.start(),
         CLIENT_START_TIMEOUT_MILLISECONDS,
         `Titan language server did not initialize within ${
           CLIENT_START_TIMEOUT_MILLISECONDS / 1_000} seconds`
       );
-      this.outputChannel.appendLine(
-        `[${folder.name}] Started Titan language server: ${command}`
+      workspaceOutput.info(
+        `Started Titan language server: ${command}`
       );
     } catch (cause) {
       if (client !== undefined) {
         await this.stopClient(key, client);
       }
       const message = formatStartupError(folder.name, cause);
-      this.outputChannel.appendLine(message);
+      workspaceOutput.error(message.replace(`[${folder.name}] `, ""));
       void vscode.window.showErrorMessage(
         `${message} See the Titan Language Server output for details.`
       );
@@ -280,14 +338,14 @@ class TitanClientManager {
         await client.stop();
       }
     } catch (cause) {
-      this.outputChannel.appendLine(
+      client.outputChannel.error(
         `Titan language server failed to stop cleanly: ${String(cause)}`
       );
       if (serverProcess !== undefined) {
         try {
           await terminateChildProcess(serverProcess);
         } catch (terminationCause) {
-          this.outputChannel.appendLine(
+          client.outputChannel.error(
             "Titan language server failed forced termination: " +
               String(terminationCause)
           );
@@ -296,6 +354,10 @@ class TitanClientManager {
     } finally {
       if (this.clients.get(key) === client) {
         this.clients.delete(key);
+        this.indexingSubscriptions.get(key)?.dispose();
+        this.indexingSubscriptions.delete(key);
+        this.indexingStatuses.get(key)?.dispose();
+        this.indexingStatuses.delete(key);
       }
     }
   }
@@ -430,7 +492,7 @@ function waitForClientState(
   });
 }
 
-function clientIdentifier(folder: vscode.WorkspaceFolder): string {
+function diagnosticCollectionName(folder: vscode.WorkspaceFolder): string {
   return `titan-${Buffer.from(folder.uri.toString()).toString("base64url")}`;
 }
 
@@ -439,10 +501,15 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     "Titan Language Server",
     { log: true }
   );
-  context.subscriptions.push(outputChannel);
+  const protocolTrace = new ProtocolTraceController();
+  context.subscriptions.push(outputChannel, protocolTrace);
 
-  clientManager = new TitanClientManager(context, outputChannel);
+  clientManager = new TitanClientManager(context, outputChannel, protocolTrace);
   context.subscriptions.push(
+    vscode.commands.registerCommand(
+      SHOW_LANGUAGE_SERVER_OUTPUT_COMMAND,
+      () => outputChannel.show()
+    ),
     vscode.workspace.onDidChangeWorkspaceFolders(() => {
       clientManager?.scheduleSynchronize();
     }),

@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
+import { readFile } from "node:fs/promises";
 import * as path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
@@ -15,7 +16,22 @@ const repositoryRoot = path.resolve(
   ".."
 );
 const server = path.resolve(serverArgument);
-const projectRoot = path.join(repositoryRoot, "test", "fixtures", "workspace");
+const projectRoot = repositoryRoot;
+const relativeSourceFile = path.join("src", "server", "application.titan");
+const sourceFile = path.join(projectRoot, relativeSourceFile);
+const sourceLines = (await readFile(sourceFile, "utf8")).split("\n");
+const callLine = sourceLines.findIndex((line) => line.includes("service:latest()"));
+assert.ok(callLine >= 0, "workspace fixture has no Service:latest call");
+const callCharacter = sourceLines[callLine].indexOf("latest") + 1;
+const declarationFile = path.join(
+  projectRoot, "src", "server", "project_service.titan"
+);
+const declarationLines = (await readFile(declarationFile, "utf8")).split("\n");
+const declarationLine = declarationLines.findIndex((line) =>
+  line.includes("function Service:latest()")
+);
+assert.ok(declarationLine >= 0, "workspace fixture has no Service:latest declaration");
+const declarationCharacter = declarationLines[declarationLine].indexOf("latest");
 const query = path.join(
   repositoryRoot,
   "plugins",
@@ -41,14 +57,18 @@ const child = spawn(process.execPath, [
   query,
   "definition",
   "--root", projectRoot,
-  "--file", "sample.titan",
-  "--line", "27",
-  "--character", "12",
+  "--file", relativeSourceFile,
+  "--line", String(callLine),
+  "--character", String(callCharacter),
   "--server", server,
-  "--timeout-ms", "120000"
+  "--timeout-ms", "300000"
 ], {
   cwd: repositoryRoot,
   detached: process.platform !== "win32",
+  env: {
+    ...process.env,
+    TITAN_LANGUAGE_SERVER_LOG_LEVEL: "off"
+  },
   stdio: ["ignore", "pipe", "pipe"]
 });
 
@@ -101,7 +121,7 @@ try {
   outcome = await withTimeout(Promise.race([
     close.then((status) => ({ status })),
     interruption.then(() => ({ status: undefined }))
-  ]), "native Codex adapter", 150_000);
+  ]), "native Codex adapter", 330_000);
 } finally {
   if (!closed) {
     terminate("SIGTERM");
@@ -142,15 +162,18 @@ assert.deepEqual({
   ok: true,
   operation: "definition",
   root: projectRoot,
-  file: path.join(projectRoot, "sample.titan"),
-  position: { line: 27, character: 12 },
+  file: sourceFile,
+  position: { line: callLine, character: callCharacter },
   result: {
-    uri: pathToFileURL(path.join(projectRoot, "sample.titan")).href,
+    uri: pathToFileURL(declarationFile).href,
     range: {
-      start: { line: 13, character: 15 },
-      end: { line: 13, character: 21 }
+      start: { line: declarationLine, character: declarationCharacter },
+      end: {
+        line: declarationLine,
+        character: declarationCharacter + "latest".length
+      }
     }
   }
 });
 
-console.log("native Codex adapter smoke passed");
+console.log("native Codex adapter workspace smoke passed");

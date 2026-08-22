@@ -17,11 +17,20 @@ record WatchFailure
   const operation: string
 end
 
--- A path is only a hint that saved disk state may have changed. Consumers must
--- rediscover membership and reread files rather than treating a hint as an
--- authoritative create/delete/modify operation.
+-- Preserve the backend event kind through batching. Consumers can then ignore
+-- repeated modifications of extensionless non-source files while still
+-- treating a newly created valid path as a possible source directory.
+union PathChange
+  created: string
+  modified: string
+  deleted: string
+end
+
+-- A change is only a hint that saved disk state may have changed. Consumers
+-- must still rediscover membership and reread files rather than treating it as
+-- authoritative project state.
 record RediscoveryBatch
-  const paths: {string}
+  const changes: {PathChange}
   const failures: {WatchFailure}
   const watch_set_changed: boolean
 end
@@ -29,7 +38,8 @@ end
 type RediscoveryCallback = (RediscoveryBatch) -> ()
 
 local union BackendEvent
-  changed: string
+  created: string
+  modified: string
   deleted: string
   failed: WatchFailure
 end
@@ -74,6 +84,36 @@ local function append_unique(paths: {string}, present: {string: boolean},
   if present[path] then return end
   present[path] = true
   paths[#paths + 1] = path
+end
+
+function change_path(change: PathChange): string
+  case change
+  when created: path then return path
+  when modified: path then return path
+  when deleted: path then return path
+  end
+  return ""
+end
+
+local function append_change(changes: {PathChange},
+                             positions: {string: integer},
+                             change: PathChange)
+  local path = change_path(change)
+  local position? = positions[path]
+  if position == nil then
+    changes[#changes + 1] = change
+    positions[path] = #changes
+  else
+    -- Keep stable first-seen path order. Once a create was observed it must
+    -- dominate later modifications from the same poll; otherwise a newly
+    -- created extensionless directory could be mistaken for an irrelevant
+    -- existing file. Without a create, retain the final modify/delete state.
+    case changes[position]
+    when created then return
+    else
+    end
+    changes[position] = change
+  end
 end
 
 local function normalized_scope(backend: Backend,
@@ -123,24 +163,26 @@ local function ProjectWatcher:retire_missing_registrations(): boolean
 end
 
 local function ProjectWatcher:publish(events: {BackendEvent})
-  local paths: {string} = {}
-  local present: {string: boolean} = {}
+  local changes: {PathChange} = {}
+  local positions: {string: integer} = {}
   local failures: {WatchFailure} = {}
   for index = 1, #events do
     case events[index]
-    when changed: path then
-      append_unique(paths, present, path)
+    when created: path then
+      append_change(changes, positions, PathChange.created(path))
+    when modified: path then
+      append_change(changes, positions, PathChange.modified(path))
     when deleted: path then
-      append_unique(paths, present, path)
+      append_change(changes, positions, PathChange.deleted(path))
     when failed: failure then
       failures[#failures + 1] = failure
     end
   end
 
   local watch_set_changed = self:retire_missing_registrations()
-  if #paths > 0 or #failures > 0 or watch_set_changed then
+  if #changes > 0 or #failures > 0 or watch_set_changed then
     self.callback(RediscoveryBatch.new(
-      paths, failures, watch_set_changed))
+      changes, failures, watch_set_changed))
   end
 end
 
@@ -315,9 +357,9 @@ local function fs_backend(): Backend
     for index = 1, #native do
       case native[index]
       when created: path then
-        events[#events + 1] = BackendEvent.changed(path)
+        events[#events + 1] = BackendEvent.created(path)
       when modified: path then
-        events[#events + 1] = BackendEvent.changed(path)
+        events[#events + 1] = BackendEvent.modified(path)
       when deleted: path then
         events[#events + 1] = BackendEvent.deleted(path)
       when error: failure then

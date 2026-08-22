@@ -1,12 +1,16 @@
 local async = import "async"
 local fs = import "fs"
+local os = import "os"
 local strings = import "string"
 local test = import "test"
 local timer = import "timer"
-local application = import "server.application"
+local application = import "server.application.titan"
 local bridge = import "server.compiler_bridge"
 local dispatcher = import "server.dispatcher"
+local indexing_status = import "server.indexing_status"
 local json = import "server.json"
+local logging = import "server.logging"
+local project_watcher = import "server.project_watcher"
 local project_service = import "server.project_service"
 local source_text = import "server.source_text"
 local test_runtime = import "server.test_runtime"
@@ -124,12 +128,13 @@ end
 local function YieldingAnalyzer:analyze(
     request: project_service.AnalysisRequest): bridge.Analysis
   self.runs = self.runs + 1
-  if self.fail then raise "deliberate project recheck failure" end
+  local should_fail = self.fail
   if self.block then
     self.started = true
     while self.block do timer.yield() end
     self.finished = true
   end
+  if should_fail then raise "deliberate project recheck failure" end
 
   local snapshots: {bridge.ModuleSnapshot} = {}
   for index = 1, #request.dirty_modules do
@@ -190,6 +195,28 @@ local function rename_request_for(path: string, id: integer,
     dispatcher.RequestId.integer_id(id), "textDocument/rename", params)
 end
 
+local function position_request_for(path: string, id: integer,
+                                    method: string, character: integer):
+    dispatcher.SemanticRequest
+  local uri?, uri_error? = source_text.path_to_file_uri(path)
+  test.assert(uri_error == nil and uri ~= nil,
+              "application fixture path did not become a file URI")
+  if uri == nil then raise "application fixture URI is missing" end
+  local document = json.from_object({
+    json.Member.new("uri", json.from_string(uri)),
+  })
+  local position = json.from_object({
+    json.Member.new("line", json.from_integer(0)),
+    json.Member.new("character", json.from_integer(character)),
+  })
+  local params = json.from_object({
+    json.Member.new("textDocument", document),
+    json.Member.new("position", position),
+  })
+  return dispatcher.SemanticRequest.new(
+    dispatcher.RequestId.integer_id(id), method, params)
+end
+
 local function result_array_length(
     outcome: dispatcher.SemanticOutcome, subject: string): integer
   case outcome
@@ -220,6 +247,24 @@ local function assert_failure(outcome: dispatcher.SemanticOutcome,
   end
 end
 
+local function assert_null_result(outcome: dispatcher.SemanticOutcome,
+                                  subject: string)
+  case outcome
+  when result: item then
+    test.assert(json.is_null(item), subject .. " did not return null")
+  when failure: failure then
+    test.assert(false, subject .. ": " .. failure.message)
+  end
+end
+
+local function wait_until(predicate: () -> boolean, message: string)
+  for _attempt = 1, 400 do
+    if predicate() then return end
+    timer.yield()
+  end
+  test.assert(false, message)
+end
+
 local function join_outcome(
     task: async.Task<dispatcher.SemanticOutcome, value>,
     subject: string): dispatcher.SemanticOutcome
@@ -234,7 +279,8 @@ local function join_outcome(
     dispatcher.SemanticError.new(-32603, subject .. " had no outcome"))
 end
 
-local function with_application(
+local function with_application_state(
+    indexed: boolean,
     body: (string, YieldingAnalyzer, application.Application) -> ())
   local root = fs.tmpname()
   fs.unlink(root)
@@ -255,31 +301,366 @@ local function with_application(
   test.assert(service_error == nil and service ~= nil,
               "application fixture project did not load")
   if service == nil then raise "application fixture Service is missing" end
-  local app = application.create_with_service(root, service)
-  defer app:close()
-  body(filename, analyzer, app)
+  local app?: application.Application
+  if indexed then
+    app = application.create_with_service(root, service)
+  else
+    app = application.create_unindexed_with_service(root, service)
+  end
+  local actual = app as application.Application
+  defer actual:close()
+  body(filename, analyzer, actual)
 end
 
-local function serves_completed_view_during_yielding_recheck()
-  with_application(function (filename: string, analyzer: YieldingAnalyzer,
-                             app: application.Application)
+local function with_application(
+    body: (string, YieldingAnalyzer, application.Application) -> ())
+  with_application_state(true, body)
+end
+
+local function with_unindexed_application(
+    body: (string, YieldingAnalyzer, application.Application) -> ())
+  with_application_state(false, body)
+end
+
+local function returns_empty_results_while_initial_index_runs()
+  with_unindexed_application(function (
+      filename: string, _analyzer: YieldingAnalyzer,
+      app: application.Application)
+    local statuses: {indexing_status.Status} = {}
+    app:set_indexing_listener(function (status: indexing_status.Status)
+      statuses[#statuses + 1] = status
+    end)
+
+    app:start_indexing()
+    app:start_indexing()
+    test.assert(
+      result_array_length(
+        app:handle(request_for(
+          filename, 30, "textDocument/foldingRange")),
+        "folding request during initial index") == 0,
+      "initial folding request did not return an empty result")
+    assert_null_result(
+      app:handle(position_request_for(
+        filename, 31, "textDocument/definition", 1)),
+      "definition request during initial index")
+
+    wait_until(function (): boolean return #statuses == 2 end,
+               "initial background index did not reach ready")
+    local metrics = app:indexing_metrics()
+    test.assert(metrics.refresh_passes == 1 and metrics.view_builds == 1,
+                "idempotent initial indexing started duplicate work")
+    test.assert(indexing_status.state_name(statuses[1].state) == "indexing" and
+                indexing_status.state_name(statuses[2].state) == "ready" and
+                statuses[1].initial and statuses[2].initial and
+                statuses[2].generation ~= nil,
+                "initial index emitted the wrong bounded status sequence")
+  end)
+end
+
+local function coalesces_continuous_hints_after_publishing_one_pass()
+  with_unindexed_application(function (
+      filename: string, analyzer: YieldingAnalyzer,
+      app: application.Application)
+    local statuses: {indexing_status.Status} = {}
+    app:set_indexing_listener(function (status: indexing_status.Status)
+      statuses[#statuses + 1] = status
+    end)
     fs.write_file(
       filename, "function answer(): integer return 123456 end\n")
     analyzer.block = true
     analyzer.started = false
     analyzer.finished = false
+    app:start_indexing()
+    wait_until(function (): boolean return analyzer.started end,
+               "coalescing fixture analyzer did not start")
 
-    -- The first request owns the refresh and therefore waits for its stable
-    -- result. The second request arrives after the analyzer has yielded and
-    -- may read the immutable preceding completed generation.
-    local owner = async.run<dispatcher.SemanticOutcome, value>(function ():
-        dispatcher.SemanticOutcome
-      return app:handle(request_for(
-        filename, 1, "textDocument/foldingRange"))
+    for _hint = 1, 100 do app:note_saved_change() end
+    test.assert(app:indexing_metrics().refresh_passes == 1,
+                "hint burst started an overlapping refresh pass")
+    analyzer.block = false
+
+    wait_until(function (): boolean return #statuses == 2 end,
+               "coalesced refresh chain did not reach ready")
+    local metrics = app:indexing_metrics()
+    test.assert(metrics.refresh_passes == 2,
+                "hint burst did not coalesce into exactly one follow-up pass")
+    test.assert(metrics.view_builds == 1,
+                "unchanged follow-up generation rebuilt semantic Features")
+    test.assert(indexing_status.state_name(statuses[1].state) == "indexing" and
+                indexing_status.state_name(statuses[2].state) == "ready" and
+                statuses[2].epoch == 101,
+                "coalesced chain emitted an intermediate or stale status")
+  end)
+end
+
+local function retries_failure_when_a_later_epoch_is_pending()
+  with_unindexed_application(function (
+      filename: string, analyzer: YieldingAnalyzer,
+      app: application.Application)
+    local statuses: {indexing_status.Status} = {}
+    app:set_indexing_listener(function (status: indexing_status.Status)
+      statuses[#statuses + 1] = status
     end)
-    while not analyzer.started do timer.yield() end
-    test.assert(not owner:status():has_finished(),
-                "refresh-owning request did not await the recheck")
+    fs.write_file(
+      filename, "function answer(): integer return 123456 end\n")
+    analyzer.block = true
+    analyzer.started = false
+    analyzer.fail = true
+    local runs_before = analyzer.runs
+    app:start_indexing()
+    wait_until(function (): boolean return analyzer.started end,
+               "failure retry fixture analyzer did not start")
+
+    app:note_saved_change()
+    analyzer.fail = false
+    analyzer.block = false
+    wait_until(function (): boolean return #statuses == 2 end,
+               "later epoch did not retry the failed refresh")
+
+    test.assert(analyzer.runs == runs_before + 2 and
+                app:indexing_metrics().refresh_passes == 2,
+                "later epoch did not run exactly one replacement analysis")
+    test.assert(indexing_status.state_name(statuses[1].state) == "indexing" and
+                indexing_status.state_name(statuses[2].state) == "ready" and
+                statuses[2].epoch == 2,
+                "recovering chain exposed an intermediate failed status")
+  end)
+end
+
+local function filters_irrelevant_watcher_hints()
+  with_application(function (filename: string, _analyzer: YieldingAnalyzer,
+                             app: application.Application)
+    app:stop_watching_for_testing()
+    local snapshot? = app:snapshot_for_testing()
+    test.assert(snapshot ~= nil, "watch filtering fixture has no snapshot")
+    local saved = snapshot as project_service.Snapshot
+    local source_root = saved.config.source_modules_root
+    local project_root = saved.config.project_root
+    local package_directory = source_root .. "/new_package"
+    local build_directory = source_root .. "/build"
+    local temp_directory = source_root .. "/tmp"
+    local editor_directory = source_root .. "/.editor"
+    local dotted_directory = source_root .. "/build.debug"
+    local makefile = source_root .. "/Makefile"
+    fs.write_file(makefile, "all:\n")
+    defer fs.unlink(makefile)
+    test.assert(application.relevant_watch_change(
+                  saved, project_watcher.PathChange.modified(filename)),
+                "saved Titan path was filtered out")
+    test.assert(application.relevant_watch_change(
+                  saved, project_watcher.PathChange.modified(source_root)),
+                "known source directory was filtered out")
+    test.assert(application.relevant_watch_change(
+                  saved, project_watcher.PathChange.modified(
+                    project_root .. "/titan-config.lua")),
+                "exact project configuration path was filtered out")
+    test.assert(not application.relevant_watch_change(
+                  saved, project_watcher.PathChange.modified(
+                    source_root .. "/main.o")) and
+                not application.relevant_watch_change(
+                  saved, project_watcher.PathChange.modified(
+                    source_root .. "/.main.titan.swp")) and
+                not application.relevant_watch_change(
+                  saved, project_watcher.PathChange.modified(
+                    project_root .. "/titan-config.lua.tmp")) and
+                not application.relevant_watch_change(
+                  saved, project_watcher.PathChange.modified(
+                    "/outside/project.titan")) and
+                not application.relevant_watch_change(
+                  saved, project_watcher.PathChange.modified(
+                    editor_directory)) and
+                not application.relevant_watch_change(
+                  saved, project_watcher.PathChange.modified(
+                    dotted_directory)) and
+                not application.relevant_watch_change(
+                  saved, project_watcher.PathChange.modified(
+                    dotted_directory .. "/generated.titan")) and
+                not application.relevant_watch_change(
+                  saved, project_watcher.PathChange.modified(
+                    build_directory .. "/generated.o")) and
+                not application.relevant_watch_change(
+                  saved, project_watcher.PathChange.modified(
+                    temp_directory .. "/main.titan.tmp")) and
+                not application.relevant_watch_change(
+                  saved, project_watcher.PathChange.modified(makefile)),
+                "unrelated build/editor path was treated as a project change")
+
+    local previous_log_level = logging.level()
+    defer logging.configure(previous_log_level)
+    test.assert(logging.configure("debug"),
+                "watch filtering fixture could not enable debug logging")
+    local malformed_path = source_root .. "/" .. strings.char(0xff)
+    local before = app:indexing_metrics().refresh_passes
+    app:watch_callback(project_watcher.RediscoveryBatch.new({
+      project_watcher.PathChange.modified(source_root .. "/main.o"),
+      project_watcher.PathChange.modified(
+        source_root .. "/.main.titan.swp"),
+      project_watcher.PathChange.modified(
+        dotted_directory .. "/generated.titan"),
+      project_watcher.PathChange.modified(malformed_path),
+      project_watcher.PathChange.modified(makefile),
+    }, {}, false))
+    timer.yield()
+    test.assert(app:indexing_metrics().refresh_passes == before,
+                "irrelevant watcher batch started a refresh")
+
+    local statuses: {indexing_status.Status} = {}
+    app:set_indexing_listener(function (status: indexing_status.Status)
+      statuses[#statuses + 1] = status
+    end)
+    app:watch_callback(project_watcher.RediscoveryBatch.new(
+      {project_watcher.PathChange.modified(filename)}, {}, false))
+    wait_until(function (): boolean return #statuses == 2 end,
+               "Titan watcher hint did not refresh")
+    app:watch_callback(project_watcher.RediscoveryBatch.new({}, {}, true))
+    wait_until(function (): boolean return #statuses == 4 end,
+               "watch-set retirement did not refresh")
+    test.assert(app:indexing_metrics().refresh_passes == before + 2,
+                "relevant watcher hints did not start bounded refreshes")
+
+    fs.mkdir(package_directory)
+    fs.mkdir(build_directory)
+    fs.mkdir(temp_directory)
+    defer do
+      fs.rmdir(temp_directory)
+      fs.rmdir(build_directory)
+      fs.rmdir(package_directory)
+    end
+    test.assert(application.relevant_watch_change(
+                  saved, project_watcher.PathChange.created(
+                    package_directory)) and
+                application.relevant_watch_change(
+                  saved, project_watcher.PathChange.created(
+                    build_directory)) and
+                application.relevant_watch_change(
+                  saved, project_watcher.PathChange.created(
+                    temp_directory)) and
+                application.relevant_watch_change(
+                  saved, project_watcher.PathChange.created(
+                    build_directory .. "/generated.titan")),
+                "valid-named new source directory was filtered out")
+  end)
+end
+
+local function classifies_canonical_symlink_watcher_paths()
+  local workspace = fs.tmpname()
+  fs.unlink(workspace)
+  fs.mkdir(workspace)
+  local actual_root = workspace .. "/actual"
+  local source_root = actual_root .. "/src"
+  local package_directory = source_root .. "/package"
+  local linked_root = workspace .. "/linked"
+  local filename = source_root .. "/main.titan"
+  local config_file = actual_root .. "/titan-config.lua"
+  fs.mkdir(actual_root)
+  fs.mkdir(source_root)
+  fs.mkdir(package_directory)
+  fs.write_file(filename, "function answer(): integer return 1 end\n")
+  fs.write_file(config_file,
+    "return { source_modules_root = './src' }\n")
+  local linker = os.spawn("/bin/ln", {"-s", actual_root, linked_root})
+  local link_input? = linker.stdin
+  if link_input ~= nil then link_input:close() end
+  local link_status = linker:wait()
+  local link_output? = linker.stdout
+  if link_output ~= nil then link_output:close() end
+  local link_error? = linker.stderr
+  if link_error ~= nil then link_error:close() end
+  test.assert(link_status.code == 0 and link_status.signal == nil,
+              "could not create project-root symlink fixture")
+  defer do
+    if fs.lstat(linked_root) ~= nil then fs.unlink(linked_root) end
+    if fs.lstat(filename) ~= nil then fs.unlink(filename) end
+    if fs.lstat(config_file) ~= nil then fs.unlink(config_file) end
+    if fs.lstat(package_directory) ~= nil then fs.rmdir(package_directory) end
+    if fs.lstat(source_root) ~= nil then fs.rmdir(source_root) end
+    if fs.lstat(actual_root) ~= nil then fs.rmdir(actual_root) end
+    if fs.lstat(workspace) ~= nil then fs.rmdir(workspace) end
+  end
+
+  local analyzer = YieldingAnalyzer.new(0, false, false, false, false)
+  local service?, service_error? = project_service.load_with_analyzer(
+    linked_root, "/sdk/lib/titan/0.26", analyzer:analyze)
+  test.assert(service_error == nil and service ~= nil,
+              "symlinked project fixture did not load")
+  if service == nil then raise "symlinked project Service is missing" end
+  local app = application.create_with_service(linked_root, service)
+  defer app:close()
+  local snapshot? = app:snapshot_for_testing()
+  test.assert(snapshot ~= nil, "symlinked project fixture has no snapshot")
+  local saved = snapshot as project_service.Snapshot
+
+  local canonical_source = fs.realpath(linked_root .. "/src")
+  local canonical_file = canonical_source .. "/main.titan"
+  local canonical_package = canonical_source .. "/package"
+  local canonical_config = fs.realpath(linked_root) .. "/titan-config.lua"
+  test.assert(canonical_source ~= saved.config.source_modules_root,
+              "symlink fixture did not retain its lexical configured root")
+  test.assert(application.relevant_watch_change(
+                saved, project_watcher.PathChange.modified(canonical_file)) and
+              application.relevant_watch_change(
+                saved,
+                project_watcher.PathChange.modified(canonical_source)) and
+              application.relevant_watch_change(
+                saved, project_watcher.PathChange.modified(canonical_config)),
+              "canonical watcher path did not map to symlinked project root")
+
+  app:stop_watching_for_testing()
+  fs.rmdir(package_directory)
+  test.assert(application.relevant_watch_change(
+                saved, project_watcher.PathChange.deleted(canonical_package)),
+              "deleted canonical source directory was filtered out")
+end
+
+local function reuses_view_for_unchanged_refresh_generation()
+  with_application(function (filename: string, _analyzer: YieldingAnalyzer,
+                             app: application.Application)
+    local statuses: {indexing_status.Status} = {}
+    app:set_indexing_listener(function (status: indexing_status.Status)
+      statuses[#statuses + 1] = status
+    end)
+    local before = app:indexing_metrics()
+    test.assert(
+      result_array_length(
+        app:handle(request_for(
+          filename, 32, "textDocument/foldingRange")),
+        "read-only request during no-op refresh") == 1,
+      "no-op refresh did not serve the completed View")
+    wait_until(function (): boolean return #statuses == 2 end,
+               "no-op refresh did not finish")
+    local after = app:indexing_metrics()
+    test.assert(after.refresh_passes == before.refresh_passes + 1 and
+                after.view_builds == before.view_builds,
+                "unchanged generation rebuilt the semantic View")
+    test.assert(not statuses[1].initial and not statuses[2].initial,
+                "ordinary revalidation was reported as an initial index")
+  end)
+end
+
+local function serves_completed_view_during_yielding_recheck()
+  with_application(function (filename: string, analyzer: YieldingAnalyzer,
+                             app: application.Application)
+    app:stop_watching_for_testing()
+    local statuses: {indexing_status.Status} = {}
+    app:set_indexing_listener(function (status: indexing_status.Status)
+      statuses[#statuses + 1] = status
+    end)
+    fs.write_file(
+      filename, "function answer(): integer return 123456 end\n")
+    analyzer.block = true
+    analyzer.started = false
+    analyzer.finished = false
+    local runs_before = analyzer.runs
+
+    -- A read-only request starts background revalidation but immediately uses
+    -- the immutable preceding completed generation.
+    local first = app:handle(request_for(
+      filename, 1, "textDocument/foldingRange"))
+    test.assert(
+      result_array_length(first, "request which started project recheck") == 1,
+      "request which started recheck did not use the completed View")
+    wait_until(function (): boolean return analyzer.started end,
+               "background project recheck did not start")
 
     local responsive = app:handle(request_for(
       filename, 2, "textDocument/foldingRange"))
@@ -287,8 +668,7 @@ local function serves_completed_view_during_yielding_recheck()
       result_array_length(
         responsive, "read-only request during project recheck") == 1,
       "responsive request did not use the preceding completed generation")
-    test.assert(not analyzer.finished and
-                not owner:status():has_finished(),
+    test.assert(not analyzer.finished,
                 "responsive request waited for the yielding recheck")
 
     -- Rename must not use the fallback because its edits target saved bytes.
@@ -304,19 +684,30 @@ local function serves_completed_view_during_yielding_recheck()
     -- A second save and its watcher hint while analysis is suspended supersede
     -- this candidate. ProjectService must discard the in-flight snapshot and
     -- recheck the newest bytes before Application can publish it.
-    local runs_before = analyzer.runs
     fs.write_file(
       filename, "function answer(): integer return 789 end\n")
     app:note_saved_change()
+    test.assert(
+      result_array_length(
+        app:handle(request_for(
+          filename, 9, "textDocument/foldingRange")),
+        "read-only request during watcher-dirty generation") == 0,
+      "watcher-dirty generation reused the preceding completed View")
     analyzer.block = false
-    while not analyzer.finished do timer.yield() end
-    local owner_outcome = join_outcome(owner, "refresh owner")
-    test.assert(result_array_length(owner_outcome, "refresh owner") == 0,
-                "refresh owner did not receive the stable newest generation")
-    test.assert(analyzer.runs >= runs_before + 1,
+    wait_until(function (): boolean return #statuses == 2 end,
+               "superseded refresh chain did not reach ready")
+    test.assert(analyzer.finished,
+                "yielding compiler recheck did not finish")
+    test.assert(analyzer.runs >= runs_before + 2,
                 "watcher-superseded refresh did not run another pass")
     assert_failure(join_outcome(rename, "fresh rename"),
                    "rename without a symbol")
+    test.assert(
+      result_array_length(
+        app:handle(request_for(
+          filename, 8, "textDocument/foldingRange")),
+        "request after superseded refresh") == 0,
+      "completed View did not advance to the newest saved generation")
   end)
 end
 
@@ -328,13 +719,6 @@ end
 local function preserves_shared_refresh_after_owner_cancellation()
   with_application(function (filename: string, analyzer: YieldingAnalyzer,
                              app: application.Application)
-    test.assert(
-      result_array_length(
-        app:handle(request_for(
-          filename, 4, "textDocument/foldingRange")),
-        "completed generation before refresh-owner cancellation") == 1,
-      "cancellation fixture did not begin with its older completed generation")
-
     fs.write_file(
       filename, "function answer(): integer return 123456 end\n")
     analyzer.block = true
@@ -342,13 +726,12 @@ local function preserves_shared_refresh_after_owner_cancellation()
     analyzer.finished = false
     local runs_before = analyzer.runs
 
-    -- This Task represents the coordinator-owned request which discovers and
-    -- starts the refresh. Cancelling the request must detach its join without
-    -- propagating cancellation to the independently rooted refresh Task.
+    -- A fresh rename request joins the independently rooted refresh. Cancelling
+    -- that request must detach its join without cancelling shared indexing.
     local owner = async.run<dispatcher.SemanticOutcome, value>(function ():
         dispatcher.SemanticOutcome
       return app:handle(request_for(
-        filename, 5, "textDocument/foldingRange"))
+        filename, 5, "textDocument/rename"))
     end)
     while not analyzer.started do timer.yield() end
     test.assert(analyzer.runs == runs_before + 1,
@@ -397,25 +780,105 @@ end
 local function rejects_fallback_after_refresh_failure()
   with_application(function (filename: string, analyzer: YieldingAnalyzer,
                              app: application.Application)
+    app:stop_watching_for_testing()
+    local statuses: {indexing_status.Status} = {}
+    app:set_indexing_listener(function (status: indexing_status.Status)
+      statuses[#statuses + 1] = status
+    end)
     fs.write_file(filename, "deliberately changed saved source\n")
     analyzer.fail = true
     assert_failure(app:handle(request_for(
-      filename, 10, "textDocument/foldingRange")),
-      "request which discovered refresh failure")
+      filename, 10, "textDocument/rename")),
+      "fresh request which discovered refresh failure")
+    test.assert(#statuses == 2 and
+                indexing_status.state_name(statuses[1].state) == "indexing" and
+                indexing_status.state_name(statuses[2].state) == "failed" and
+                statuses[2].message ~= nil,
+                "terminal refresh failure did not emit bounded status")
+
+    -- Starting a background retry must not clear the known failure and make
+    -- the preceding completed View serviceable again.
     assert_failure(app:handle(request_for(
       filename, 11, "textDocument/foldingRange")),
-      "request after known refresh failure")
+      "read-only request after known refresh failure")
+    test.assert(#statuses == 3 and
+                indexing_status.state_name(statuses[3].state) == "indexing",
+                "failure retry did not start a new indexing chain")
+    assert_failure(app:handle(request_for(
+      filename, 13, "textDocument/rename")),
+      "fresh request joining known-failure retry")
+    test.assert(#statuses == 4 and
+                indexing_status.state_name(statuses[4].state) == "failed",
+                "explicit retry did not report a second terminal failure")
 
     analyzer.fail = false
-    assert_result(app:handle(request_for(
-      filename, 12, "textDocument/foldingRange")),
-      "request after refresh recovery")
+    -- The saved source has no symbol at the rename position, so feature-level
+    -- failure is expected after the project refresh itself recovers.
+    assert_failure(app:handle(request_for(
+      filename, 12, "textDocument/rename")),
+      "fresh request after refresh recovery")
+    test.assert(#statuses == 6 and
+                indexing_status.state_name(statuses[5].state) == "indexing" and
+                indexing_status.state_name(statuses[6].state) == "ready",
+                "successful retry did not replace the failed state with ready")
   end)
 end
 
-function test_application_does_not_serve_fallback_after_refresh_failure(
+function test_application_fresh_requests_retry_after_refresh_failure(
     _context: test.Context)
   test_runtime.run(rejects_fallback_after_refresh_failure)
+end
+
+local function emits_no_indexing_status_after_close()
+  with_unindexed_application(function (
+      _filename: string, _analyzer: YieldingAnalyzer,
+      app: application.Application)
+    local statuses: {indexing_status.Status} = {}
+    app:set_indexing_listener(function (status: indexing_status.Status)
+      statuses[#statuses + 1] = status
+    end)
+    app:start_indexing()
+    test.assert(#statuses == 1 and
+                indexing_status.state_name(statuses[1].state) == "indexing",
+                "closing fixture did not begin an indexing chain")
+    app:close()
+    app:start_indexing()
+    app:note_saved_change()
+    timer.yield()
+    test.assert(#statuses == 1,
+                "application emitted indexing status after close")
+  end)
+end
+
+local function run_indexing_case(name: string, body: () -> ())
+  do body() catch
+    if error is async.OperationError then
+      local failure = error as async.OperationError
+      raise name .. ": " .. failure.operation .. ": " .. failure.name ..
+        ": " .. failure.message
+    end
+    raise name .. ": " .. strings.tostring(error)
+  end
+end
+
+function test_application_indexing_state_machine(_context: test.Context)
+  test_runtime.run(function ()
+    run_indexing_case(
+      "initial busy response", returns_empty_results_while_initial_index_runs)
+    run_indexing_case(
+      "continuous hint coalescing",
+      coalesces_continuous_hints_after_publishing_one_pass)
+    run_indexing_case(
+      "later epoch failure retry", retries_failure_when_a_later_epoch_is_pending)
+    run_indexing_case(
+      "watcher filtering", filters_irrelevant_watcher_hints)
+    run_indexing_case(
+      "canonical symlink paths", classifies_canonical_symlink_watcher_paths)
+    run_indexing_case(
+      "unchanged View reuse", reuses_view_for_unchanged_refresh_generation)
+    run_indexing_case(
+      "closed status suppression", emits_no_indexing_status_after_close)
+  end)
 end
 
 local function rejects_save_during_successful_rename_preflight()
@@ -451,7 +914,7 @@ local function rejects_save_during_successful_rename_preflight()
     test.assert(
       failure.code == -32803 and
       strings.find(failure.message,
-                   "saved Titan project changed during rename") ~= nil,
+                   "saved Titan project changed") ~= nil,
       "rename save race did not return the retryable RequestFailed error")
   end
   test.assert(saving.runs == 1,

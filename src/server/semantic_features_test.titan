@@ -124,6 +124,29 @@ function test_semantic_features_reports_index_build_context(
   test.assert(rejected, "invalid index unexpectedly built semantic features")
 end
 
+function test_semantic_features_reuses_indexed_file_coordinates(
+    _context: test.Context)
+  local files: {bridge.SourceFile} = {}
+  local filenames: {string} = {}
+  for index = 1, 8 do
+    local filename = "/workspace/reuse" .. index .. ".titan"
+    filenames[index] = filename
+    files[index] = bridge.SourceFile.new(
+      filename, strings.rep("a", 1100) .. "\n")
+  end
+
+  local yield_count = 0
+  local model = features.build_with_yield({
+    project("coordinate_reuse", files),
+  }, {
+    snapshot("coordinate_reuse", filenames[1], filenames, {}, {}),
+  }, function () yield_count = yield_count + 1 end)
+  test.assert(#model:folding_ranges(filenames[1]) == 0,
+              "coordinate-reuse fixture unexpectedly produced folds")
+  test.assert(yield_count == 8,
+              "semantic features rebuilt per-file coordinate indexes")
+end
+
 function test_semantic_features_definition_and_all_project_references(
     _context: test.Context)
   local main_file = "/workspace/pkg/pkg.titan"
@@ -242,6 +265,30 @@ function test_semantic_features_hover_preserves_compiler_type_views(
     "- Coerced type: `float`\n" ..
     "- Declaration: local\n",
     "hover markdown did not distinguish original and coerced types")
+end
+
+function test_semantic_features_hover_matches_nodes_after_unicode_prefix(
+    _context: test.Context)
+  local filename = "/workspace/unicode_hover.titan"
+  local integer_type = bridge.TypeInfo.new("Type.Integer", "integer")
+  local symbol = "ast:unicode-hover:count"
+  local model = features.build({project("unicode_hover", {
+    bridge.SourceFile.new(filename, "-- 😀 count\n"),
+  })}, {snapshot("unicode_hover", filename, {filename}, {
+    node(1, "Ast.VarName", bridge.NodeKind.variable(),
+         filename, 1, 9, "count", true, integer_type, nil,
+         nil, nil, nil),
+  }, {
+    occurrence(filename, 1, 9, 14, "count", symbol,
+               bridge.OccurrenceRole.reference(), true, integer_type),
+  })})
+
+  local hover? = model:hover(filename, source_text.Position.new(0, 7))
+  test.assert(hover ~= nil and hover.inferred_type ~= nil and
+              hover.inferred_type.display == "integer" and
+              hover.range.start.character == 6 and
+              hover.range.finish.character == 11,
+              "hover did not reuse UTF-16 coordinates for compiler byte columns")
 end
 
 function test_semantic_features_hover_reads_unnamed_adjustment_ancestors(

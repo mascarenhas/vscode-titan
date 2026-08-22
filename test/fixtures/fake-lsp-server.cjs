@@ -5,6 +5,7 @@
 const fs = require("node:fs");
 
 const markerPath = process.argv[2];
+const traceMarkerPath = markerPath ? `${markerPath}.trace` : undefined;
 const fixtureArguments = process.argv.slice(3);
 const rejectInitializeAndStayAlive = fixtureArguments.includes(
   "--initialize-error-stay-alive"
@@ -13,7 +14,11 @@ const ignoreShutdown = fixtureArguments.includes("--ignore-shutdown");
 const ignoreTerminate = fixtureArguments.includes("--ignore-terminate");
 const provideSemantics = fixtureArguments.includes("--semantic");
 const hangSemantic = fixtureArguments.includes("--hang-semantic");
+const omitIndexingGeneration = fixtureArguments.includes(
+  "--omit-indexing-generation"
+);
 const semanticMarkerPath = argumentValue("--semantic-marker");
+const indexingDelayMs = Number(argumentValue("--indexing-delay-ms") ?? 0);
 const hangInitializeAndStayAlive =
   process.env.TITAN_LSP_FIXTURE_HANG_ROOT === process.cwd();
 let input = Buffer.alloc(0);
@@ -66,7 +71,8 @@ function handleMessage(message) {
     recordEvent("initialize", {
       rootPath: message.params.rootPath,
       rootUri: message.params.rootUri,
-      workspaceFolders: message.params.workspaceFolders
+      workspaceFolders: message.params.workspaceFolders,
+      trace: message.params.trace
     });
     if (rejectInitializeAndStayAlive) {
       respondError(message.id, -32603, "fixture initialize failure");
@@ -97,6 +103,29 @@ function handleMessage(message) {
   } else if (message.method === "exit") {
     recordEvent("exit");
     process.exit(0);
+  } else if (message.method === "initialized" && provideSemantics) {
+    notify("titan/indexingStatus", {
+      state: "indexing",
+      initial: true,
+      epoch: 0
+    });
+    const readyStatus = {
+        state: "ready",
+        initial: true,
+        epoch: 0
+      };
+    if (!omitIndexingGeneration) readyStatus.generation = 1;
+    const ready = () => notify("titan/indexingStatus", readyStatus);
+    if (indexingDelayMs > 0) {
+      setTimeout(ready, indexingDelayMs);
+    } else {
+      ready();
+    }
+  } else if (message.method === "$/setTrace") {
+    appendEvent(traceMarkerPath, {
+      event: "trace",
+      value: message.params?.value
+    });
   } else if (provideSemantics && isSemanticMethod(message.method)) {
     recordSemanticRequest(message);
     if (!hangSemantic) respondToSemanticRequest(message);
@@ -130,6 +159,7 @@ function appendEvent(targetPath, details) {
       arguments: fixtureArguments,
       luaPath: process.env.LUA_PATH,
       luaCPath: process.env.LUA_CPATH,
+      serverLogLevel: process.env.TITAN_LANGUAGE_SERVER_LOG_LEVEL,
       ...details
     })}\n`);
   } catch (error) {
@@ -197,6 +227,12 @@ function respondError(id, code, message) {
     id,
     error: { code, message }
   }));
+  process.stdout.write(`Content-Length: ${body.length}\r\n\r\n`);
+  process.stdout.write(body);
+}
+
+function notify(method, params) {
+  const body = Buffer.from(JSON.stringify({ jsonrpc: "2.0", method, params }));
   process.stdout.write(`Content-Length: ${body.length}\r\n\r\n`);
   process.stdout.write(body);
 }
