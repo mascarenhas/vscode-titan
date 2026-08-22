@@ -51,6 +51,7 @@ record ExternalModule
   const origin: ExternalOrigin
   const manifest: project_graph.Manifest
   const stamps: {project_graph.FileStamp}
+  const analyzed_input_identity: string?
   const imports: {project_graph.ImportEdge}
   const compiler_imports: {compiler_bridge.Import}
   const c_header_dependencies: {compiler_bridge.CHeaderDependency}
@@ -759,6 +760,7 @@ local function Service:revalidate_external_files()
         end
         self.externals[name] = ExternalModule.new(
           name, external.origin, external.manifest, current,
+          external.analyzed_input_identity,
           external.imports, external.compiler_imports,
           external.c_header_dependencies)
         -- The old manifest cannot prove that changed external bytes kept the
@@ -870,18 +872,6 @@ local function bridge_project(state: ProjectState):
   return compiler_bridge.ProjectModule.new(state.module_name, files)
 end
 
-local function source_digest(files: {SourceFileSnapshot}): string
-  local output = strings.writer()
-  for index = 1, #files do
-    local file = files[index]
-    output:write(#file.filename .. ":")
-    output:write(file.filename)
-    output:write(#file.contents .. ":")
-    output:write(file.contents)
-  end
-  return output:drain()
-end
-
 local function stamp_digest(stamps: {project_graph.FileStamp}): string
   local output = strings.writer()
   for index = 1, #stamps do
@@ -894,19 +884,21 @@ local function stamp_digest(stamps: {project_graph.FileStamp}): string
   return output:drain()
 end
 
-local function source_with_header_digest(
-    source: string,
+local function analyzed_input_digest(
+    source_stamps: string,
     dependencies: {compiler_bridge.CHeaderDependency}): string
   local headers = header_dependency_digest(dependencies)
-  return #source .. ":" .. source .. #headers .. ":" .. headers
+  return #source_stamps .. ":" .. source_stamps ..
+         #headers .. ":" .. headers
 end
 
-local function graph_manifest(snapshot: compiler_bridge.ModuleSnapshot,
-                              source: string): project_graph.Manifest?
+local function graph_manifest(snapshot: compiler_bridge.ModuleSnapshot):
+    project_graph.Manifest?
   if snapshot.manifest == nil then return nil end
+  local source? = snapshot.manifest.source_serialized
+  if source == nil then return nil end
   return project_graph.Manifest.new(
-    snapshot.manifest.serialized,
-    source_with_header_digest(source, snapshot.c_header_dependencies))
+    snapshot.manifest.serialized, source)
 end
 
 local function Service:prepare_work_avoiding(
@@ -944,10 +936,11 @@ local function Service:prepare_work_avoiding(
     -- A stamp mismatch marks old serialized metadata as untrusted until this
     -- analysis encounters and republishes the external source. Binary provider
     -- resolution is always left to the compiler.
-    local trusted = external.manifest.source_digest ==
-                    source_with_header_digest(
-                      stamp_digest(external.stamps),
-                      external.c_header_dependencies)
+    local trusted = external.analyzed_input_identity ~= nil and
+                    external.analyzed_input_identity ==
+                      analyzed_input_digest(
+                        stamp_digest(external.stamps),
+                        external.c_header_dependencies)
     local header_fingerprint? =
       self.header_fingerprints[external.module_name]
     trusted = trusted and header_fingerprint ~= nil and
@@ -965,6 +958,7 @@ local function Service:prepare_work_avoiding(
         cached_sources[#cached_sources + 1] =
           compiler_bridge.CachedSourceInterface.new(
             external.module_name, external.manifest.public_digest,
+            external.manifest.source_digest,
             source.main_file, source.source_files,
             external.compiler_imports,
             external.c_header_dependencies)
@@ -1036,6 +1030,7 @@ local function external_candidate(
   if snapshot.manifest == nil then return nil end
   local stamps: {project_graph.FileStamp} = {}
   local origin?: ExternalOrigin
+  local analyzed_input_identity: string? = nil
   case snapshot.provenance
   when external_source: source then
     for index = 1, #source.source_files do
@@ -1048,6 +1043,8 @@ local function external_candidate(
     end
     origin = ExternalOrigin.source(ExternalSource.new(
       source.main_file, copy_strings(source.source_files)))
+    analyzed_input_identity = analyzed_input_digest(
+      stamp_digest(stamps), snapshot.c_header_dependencies)
   when dynamic_binary: binary then
     local stamp? = stamp_for(binary.provider_file)
     if stamp == nil then
@@ -1081,9 +1078,8 @@ local function external_candidate(
   return ExternalModule.new(
     snapshot.module_name, origin,
     project_graph.Manifest.new(snapshot.manifest.serialized,
-      source_with_header_digest(
-        stamp_digest(stamps), snapshot.c_header_dependencies)),
-    stamps, imports, snapshot.imports,
+      snapshot.manifest.source_serialized or snapshot.manifest.serialized),
+    stamps, analyzed_input_identity, imports, snapshot.imports,
     copy_header_dependencies(snapshot.c_header_dependencies))
 end
 
@@ -1474,8 +1470,7 @@ local function Service:commit_or_raise(
       local diagnostics? = module_diagnostics[name]
       if diagnostics == nil then diagnostics = {} end
       if #diagnostics == 0 and snapshot ~= nil then
-        local manifest? = graph_manifest(snapshot,
-                                         source_digest(state.source_files))
+        local manifest? = graph_manifest(snapshot)
         if manifest ~= nil then
           case self.graph:commit_project(
               token, manifest, graph_imports(snapshot), snapshot)

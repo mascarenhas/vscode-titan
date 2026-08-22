@@ -129,6 +129,37 @@ local function public_manifest(module: compiler_bridge.ProjectModule): string
   return "public:" .. module.module_name .. ":one"
 end
 
+local function source_manifest(
+    module: compiler_bridge.ProjectModule,
+    headers: {compiler_bridge.CHeaderDependency}): string
+  local output = strings.writer()
+  local public = public_manifest(module)
+  output:write(#public .. ":" .. public)
+  if strings.find(module_contents(module), "SOURCE_TWO") ~= nil then
+    output:write("10:source:two")
+  else
+    output:write("10:source:one")
+  end
+  for index = 1, #headers do
+    local header = headers[index]
+    output:write(#header.identity .. ":" .. header.identity)
+  end
+  return output:drain()
+end
+
+local function external_source_manifest(
+    name: string, public: string,
+    headers: {compiler_bridge.CHeaderDependency}): string
+  local output = strings.writer()
+  output:write(#public .. ":" .. public)
+  output:write(#name .. ":" .. name)
+  for index = 1, #headers do
+    local header = headers[index]
+    output:write(#header.identity .. ":" .. header.identity)
+  end
+  return output:drain()
+end
+
 local function search_header_identity(path: string): string
   local link? = fs.lstat(path)
   local target? = fs.stat(path)
@@ -203,7 +234,8 @@ local function successful_project(
   return compiler_bridge.ModuleSnapshot.new(
     module.module_name, project_provenance(module),
     compiler_bridge.Manifest.new(
-      module.module_name, public_manifest(module)),
+      module.module_name, public_manifest(module),
+      source_manifest(module, headers)),
     {}, {}, imports_for(module), headers)
 end
 
@@ -256,6 +288,17 @@ local function contains(names: {string}, name: string): boolean
     if names[index] == name then return true end
   end
   return false
+end
+
+local function display_names(names: {string}): string
+  local output = strings.writer()
+  output:write("[")
+  for index = 1, #names do
+    if index > 1 then output:write(", ") end
+    output:write(names[index])
+  end
+  output:write("]")
+  return output:drain()
 end
 
 local function RecordingAnalyzer:analyze(
@@ -329,7 +372,10 @@ local function RecordingAnalyzer:analyze(
         compiler_bridge.Provenance.external_source(
           compiler_bridge.SourceProvenance.new(
             self.external_main, self.external_files)),
-        compiler_bridge.Manifest.new("vendor.source", "vendor-public"),
+        compiler_bridge.Manifest.new(
+          "vendor.source", "vendor-public",
+          external_source_manifest(
+            "vendor.source", "vendor-public", external_headers)),
         {external_node(self.external_main)}, {}, external_imports,
         external_headers)
     end
@@ -340,7 +386,9 @@ local function RecordingAnalyzer:analyze(
       compiler_bridge.Provenance.external_source(
         compiler_bridge.SourceProvenance.new(
           self.external_dependency_main, self.external_dependency_files)),
-      compiler_bridge.Manifest.new("vendor.inner", "inner-public"),
+      compiler_bridge.Manifest.new(
+        "vendor.inner", "inner-public",
+        external_source_manifest("vendor.inner", "inner-public", {})),
       {external_node(self.external_dependency_main)}, {}, {}, {})
   end
   if app_uses_externals and self.binary_file ~= nil then
@@ -348,7 +396,7 @@ local function RecordingAnalyzer:analyze(
       "vendor.binary",
       compiler_bridge.Provenance.dynamic_binary(
         compiler_bridge.BinaryProvenance.new(self.binary_file)),
-      compiler_bridge.Manifest.new("vendor.binary", "binary-public"),
+      compiler_bridge.Manifest.new("vendor.binary", "binary-public", nil),
       {external_node(self.binary_file)}, {}, {}, {})
   end
   local contextual: {compiler_bridge.ContextualResolution} = {}
@@ -660,32 +708,76 @@ local function stops_propagation_at_unchanged_manifests()
                   "-- dependency implementation body changed and grew\n")
     local report?, failure? = service:refresh()
     test.assert(failure == nil and report ~= nil and not report.stale,
-                "source-only dependency refresh failed")
-    test.assert(#report.committed_modules == 2 and
+                "body-only dependency refresh failed")
+    test.assert(#report.committed_modules == 1 and
                 report.committed_modules[1] == "dep" and
-                report.committed_modules[2] == "friend" and
                 #report.dirty_modules == 0,
-                "source-only manifest change selected the wrong importers")
+                "body-only edit propagated beyond its provider")
     local after = service:counters()
     test.assert(after.file_reads == before.file_reads + 1,
                 "unchanged project modules were re-read from disk")
-    test.assert(after.analysis_runs == before.analysis_runs + 2 and
+    test.assert(after.analysis_runs == before.analysis_runs + 1 and
                 after.project_modules_submitted ==
-                  before.project_modules_submitted + 2 and
+                  before.project_modules_submitted + 1 and
                 analyzer.last_module_count == 4 and
                 #analyzer.last_dirty == 1 and
-                analyzer.last_dirty[1] == "friend" and
+                analyzer.last_dirty[1] == "dep" and
                 analyzer.last_cached_count == 0,
-                "manifest propagation did not analyze only dep then friend")
+                "body-only edit did not analyze exactly dep")
     local checked = analyzer.checked_modules
-    test.assert(#checked == 6 and checked[5] == "dep" and
-                checked[6] == "friend",
-                "fixed-point refresh rechecked an unrelated project module")
+    test.assert(#checked == 5 and checked[5] == "dep",
+                "body-only refresh rechecked an importer")
+
+    fixture:write("src/dep.titan",
+                  "-- private declaration changed\nSOURCE_TWO\n")
+    local source_report?, source_failure? = service:refresh()
+    test.assert(source_failure == nil and source_report ~= nil and
+                not source_report.stale and
+                #source_report.committed_modules == 2 and
+                source_report.committed_modules[1] == "dep" and
+                source_report.committed_modules[2] == "friend" and
+                #source_report.dirty_modules == 0,
+                "source-visible edit selected the wrong importers")
+    local after_source = service:counters()
+    test.assert(after_source.analysis_runs == after.analysis_runs + 2 and
+                after_source.project_modules_submitted ==
+                  after.project_modules_submitted + 2 and
+                #analyzer.checked_modules == 7 and
+                analyzer.checked_modules[6] == "dep" and
+                analyzer.checked_modules[7] == "friend" and
+                #analyzer.last_dirty == 1 and
+                analyzer.last_dirty[1] == "friend",
+                "source-visible edit did not stop after the direct source importer")
+
+    fixture:write("src/dep.titan",
+                  "-- public declaration changed\nSOURCE_TWO\nPUBLIC_TWO\n")
+    local public_report?, public_failure? = service:refresh()
+    test.assert(public_failure == nil and public_report ~= nil and
+                not public_report.stale and
+                #public_report.committed_modules == 3 and
+                public_report.committed_modules[1] == "client" and
+                public_report.committed_modules[2] == "dep" and
+                public_report.committed_modules[3] == "friend" and
+                #public_report.dirty_modules == 0,
+                "public edit selected the wrong importer set: " ..
+                display_names(public_report.committed_modules))
+    local after_public = service:counters()
+    test.assert(after_public.analysis_runs == after_source.analysis_runs + 2 and
+                after_public.project_modules_submitted ==
+                  after_source.project_modules_submitted + 3 and
+                #analyzer.checked_modules == 10 and
+                analyzer.checked_modules[8] == "dep" and
+                analyzer.checked_modules[9] == "client" and
+                analyzer.checked_modules[10] == "friend" and
+                #analyzer.last_dirty == 2 and
+                analyzer.last_dirty[1] == "client" and
+                analyzer.last_dirty[2] == "friend",
+                "public edit did not check both direct importers in one pass")
 
     local ordinary = service:direct_imports("client")
     local source = service:direct_imports("friend")
     test.assert(#ordinary == 1 and #source == 1,
-                "dependency imports disappeared after refresh")
+                "dependency imports disappeared after fixed-point refresh")
     assert_visibility(ordinary[1], false)
     assert_visibility(source[1], true)
     local reverse = service:reverse_imports("friend")
@@ -697,6 +789,128 @@ end
 function test_project_service_reuses_disk_snapshots_and_stops_unchanged_manifest_propagation(
     _context: test.Context)
   test_runtime.run(stops_propagation_at_unchanged_manifests)
+end
+
+local function rechecks_real_compiler_source_dependants_selectively()
+  with_fixture(function (fixture: Fixture)
+    fixture:mkdir("src")
+    configure_source_root(fixture)
+    local dependency = [[local function hidden(increment: integer): integer
+  return increment + 1
+end
+function answer(): integer return hidden(41) end
+]]
+    fixture:write("src/dep.titan", dependency)
+    fixture:write("src/client.titan", [[local dep = import "dep"
+function run(): integer return dep.answer() end
+]])
+    fixture:write("src/friend.titan", [[local dep = import "dep.titan"
+function run(): integer return dep.hidden(1) end
+]])
+
+    local service?, failure? = project_service.load_default(fixture.root)
+    test.assert(failure == nil and service ~= nil,
+                "real compiler project fixture did not load")
+    local initial = service:latest()
+    local initial_dep? = find_project(initial, "dep")
+    local initial_client? = find_project(initial, "client")
+    local initial_friend? = find_project(initial, "friend")
+    test.assert(initial_dep ~= nil and
+                initial_dep.compiler_snapshot ~= nil and
+                initial_dep.compiler_snapshot.manifest ~= nil and
+                initial_dep.compiler_snapshot.manifest.source_serialized ~=
+                  nil and
+                initial_client ~= nil and
+                initial_client.compiler_snapshot ~= nil and
+                initial_friend ~= nil and
+                initial_friend.compiler_snapshot ~= nil,
+                "real compiler fixture lost an initial module snapshot")
+    local before = service:counters()
+
+    fixture:write("src/dep.titan", "-- leading comment\n" .. dependency)
+    local comment_report?, comment_failure? = service:refresh()
+    test.assert(comment_failure == nil and comment_report ~= nil,
+                "comment-only real compiler refresh failed")
+    local after_comment = service:counters()
+    local comment_snapshot = service:latest()
+    local comment_dep? = find_project(comment_snapshot, "dep")
+    local comment_client? = find_project(comment_snapshot, "client")
+    local comment_friend? = find_project(comment_snapshot, "friend")
+    test.assert(comment_dep ~= nil and
+                comment_dep.compiler_snapshot ~= nil and
+                comment_dep.compiler_snapshot.manifest ~= nil and
+                comment_dep.compiler_snapshot.manifest.source_serialized ~= nil,
+                "comment-only refresh lost the provider source manifest")
+    local source_equal =
+      comment_dep.compiler_snapshot.manifest.source_serialized ==
+        initial_dep.compiler_snapshot.manifest.source_serialized
+    test.assert(not comment_report.stale and source_equal and
+                #comment_report.committed_modules == 1 and
+                comment_report.committed_modules[1] == "dep" and
+                #comment_report.dirty_modules == 0,
+                "comment-only edit committed " ..
+                display_names(comment_report.committed_modules) ..
+                " with dirty " ..
+                display_names(comment_report.dirty_modules) ..
+                "; analysis runs +" ..
+                (after_comment.analysis_runs - before.analysis_runs) ..
+                "; modules submitted +" ..
+                (after_comment.project_modules_submitted -
+                  before.project_modules_submitted) ..
+                "; source token equal=" .. strings.tostring(source_equal))
+    test.assert(after_comment.analysis_runs == before.analysis_runs + 1 and
+                after_comment.project_modules_submitted ==
+                  before.project_modules_submitted + 1 and
+                comment_client ~= nil and
+                comment_client.compiler_snapshot ==
+                  initial_client.compiler_snapshot and
+                comment_friend ~= nil and
+                comment_friend.compiler_snapshot ==
+                  initial_friend.compiler_snapshot,
+                "comment-only edit replaced an unchanged importer snapshot")
+
+    fixture:write("src/dep.titan", [[-- leading comment
+local function extra(): integer
+  return 0
+end
+]] .. dependency)
+    local private_report?, private_failure? = service:refresh()
+    test.assert(private_failure == nil and private_report ~= nil and
+                not private_report.stale and
+                #private_report.committed_modules == 2 and
+                private_report.committed_modules[1] == "dep" and
+                private_report.committed_modules[2] == "friend" and
+                #private_report.dirty_modules == 0,
+                "private-surface edit selected the wrong real compiler importers")
+    local after_private = service:counters()
+    local private_snapshot = service:latest()
+    local private_dep? = find_project(private_snapshot, "dep")
+    local private_client? = find_project(private_snapshot, "client")
+    local private_friend? = find_project(private_snapshot, "friend")
+    test.assert(private_dep ~= nil and
+                private_dep.compiler_snapshot ~= nil and
+                private_dep.compiler_snapshot.manifest ~= nil and
+                private_dep.compiler_snapshot.manifest.source_serialized ~= nil,
+                "private-surface refresh lost the provider source manifest")
+    test.assert(private_dep.compiler_snapshot.manifest.source_serialized ~=
+                  comment_dep.compiler_snapshot.manifest.source_serialized and
+                after_private.analysis_runs ==
+                  after_comment.analysis_runs + 2 and
+                after_private.project_modules_submitted ==
+                  after_comment.project_modules_submitted + 2 and
+                private_client ~= nil and
+                private_client.compiler_snapshot ==
+                  initial_client.compiler_snapshot and
+                private_friend ~= nil and
+                private_friend.compiler_snapshot ~=
+                  comment_friend.compiler_snapshot,
+                "private-surface edit did not recheck only its source importer")
+  end)
+end
+
+function test_project_service_uses_real_compiler_source_interfaces_for_selective_rechecking(
+    _context: test.Context)
+  test_runtime.run(rechecks_real_compiler_source_dependants_selectively)
 end
 
 local function revalidates_external_source_when_encountered_again()
@@ -728,7 +942,8 @@ local function revalidates_external_source_when_encountered_again()
                 "external mtime change did not schedule a project refresh")
     local after = service:counters()
     test.assert(after.file_reads == before.file_reads and
-                after.analysis_runs == before.analysis_runs + 1,
+                after.analysis_runs == before.analysis_runs + 1 and
+                analyzer.last_cached_count == 0,
                 "external revalidation re-read project sources or skipped analysis")
     local updated? = service:external_module("vendor.source")
     test.assert(updated ~= nil and #updated.stamps == 2 and
@@ -736,6 +951,14 @@ local function revalidates_external_source_when_encountered_again()
                 "encountered external source did not refresh all file stamps")
     test.assert(service:project_ast("vendor.source") == nil,
                 "external revalidation retained compiler semantic nodes")
+
+    fixture:write("src/app/main.titan",
+                  "-- unrelated saved app edit after external refresh\n")
+    local cached_report?, cached_failure? = service:refresh()
+    test.assert(cached_failure == nil and cached_report ~= nil and
+                not cached_report.stale and
+                analyzer.last_cached_count == 1,
+                "freshly reanalyzed external source did not become cacheable")
   end)
 end
 
@@ -1141,7 +1364,8 @@ local function invalidated_inflight_importer_rechecks_once()
     local before = service:counters()
     local checked_before = #analyzer.checked_modules
 
-    fixture:write("src/dep.titan", "-- dep implementation changed\n")
+    fixture:write("src/dep.titan",
+                  "-- dep private declaration changed\nSOURCE_TWO\n")
     fixture:write("src/friend.titan", "-- friend implementation changed\n")
     local report?, failure? = service:refresh()
     test.assert(failure == nil and report ~= nil and

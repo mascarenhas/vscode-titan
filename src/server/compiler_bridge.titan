@@ -160,6 +160,7 @@ end
 record Manifest
   module_name: string
   serialized: string
+  source_serialized: string?
 end
 
 record SourceProvenance
@@ -249,6 +250,7 @@ type ProgressListener = (AnalysisProgress) -> ()
 record CachedSourceInterface
   module_name: string
   serialized: string
+  source_serialized: string
   main_file: string
   source_files: {string}
   imports: {Import}
@@ -2575,7 +2577,8 @@ local function normalize_diagnostics(candidate: value,
 end
 
 local function serialize_manifest(compiler: Compiler, module_name: string,
-                                  candidate: value): Manifest
+                                  candidate: value,
+                                  source_serialized: string?): Manifest
   local raw_type = required_map(
     candidate, TYPES_MODULE, "module interface for '" .. module_name .. "'")
   local tag = required_string(
@@ -2599,7 +2602,8 @@ local function serialize_manifest(compiler: Compiler, module_name: string,
   end
   return Manifest.new(module_name, required_string(
     serialized, TYPES_MODULE,
-    "types.serialize result for '" .. module_name .. "'"))
+    "types.serialize result for '" .. module_name .. "'"),
+    source_serialized)
 end
 
 local function project_index(modules: {ProjectModule}): {string: ProjectModule}
@@ -2703,7 +2707,8 @@ local function cached_source_map(cached: {CachedSourceInterface},
         DRIVER_MODULE, "duplicate external cached interface '" ..
         item.module_name .. "'")
     end
-    if item.main_file == "" or item.serialized == "" then
+    if item.main_file == "" or item.serialized == "" or
+        item.source_serialized == "" then
       raise BridgeError.new(
         DRIVER_MODULE, "cached source interface '" .. item.module_name ..
         "' has an empty filename or manifest")
@@ -2782,10 +2787,35 @@ local function snapshot_module(compiler: Compiler, module_name: string,
   if valid_manifest then
     local cached_source? = cached[module_name]
     if cached_source ~= nil then
-      manifest = Manifest.new(module_name, cached_source.serialized)
+      manifest = Manifest.new(
+        module_name, cached_source.serialized,
+        cached_source.source_serialized)
     else
+      local source_serialized: string? = nil
+      case origin
+      when project_source then
+        source_serialized = required_string(
+          entry["source_manifest"], DRIVER_MODULE,
+          "compiler source manifest for '" .. module_name .. "'")
+        if source_serialized == "" then
+          return fail<ModuleSnapshot>(
+            DRIVER_MODULE, "compiler source manifest for '" ..
+            module_name .. "' must not be empty")
+        end
+      when external_source then
+        source_serialized = required_string(
+          entry["source_manifest"], DRIVER_MODULE,
+          "compiler source manifest for '" .. module_name .. "'")
+        if source_serialized == "" then
+          return fail<ModuleSnapshot>(
+            DRIVER_MODULE, "compiler source manifest for '" ..
+            module_name .. "' must not be empty")
+        end
+      when dynamic_binary then
+      when static_binary then
+      end
       manifest = serialize_manifest(
-        compiler, module_name, entry["type"])
+        compiler, module_name, entry["type"], source_serialized)
     end
   end
   local nodes: {Node} = {}

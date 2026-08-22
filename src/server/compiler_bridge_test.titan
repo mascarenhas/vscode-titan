@@ -40,6 +40,14 @@ return function(mode)
   local function module_type(name)
     return { _tag = "Type.Module", name = name }
   end
+  local function source_manifest(name)
+    if name == "fixture" then
+      if mode == "missing-source-manifest" then return nil end
+      if mode == "empty-source-manifest" then return "" end
+      if mode == "wrong-source-manifest" then return 42 end
+    end
+    return "Source(" .. string.format("%q", name) .. ")"
+  end
   local parser = {
     parse = function() return {} end,
     error_to_string = function(value) return tostring(value) end,
@@ -336,6 +344,7 @@ return function(mode)
         kind = "source",
         ast = ast,
         type = module_type(name),
+        source_manifest = source_manifest(name),
         filename = "/workspace/fixture.titan",
         source_files = { "/workspace/fixture.titan" },
         c_header_dependencies = header_dependencies,
@@ -361,10 +370,19 @@ return function(mode)
           },
         }},
         type = module_type("fixture.external"),
+        source_manifest = source_manifest("fixture.external"),
         filename = "/external/main.titan",
         source_files = { "/external/main.titan", "/external/part.titan" },
         c_header_dependencies = {},
       }
+      if mode == "binary-manifest" then
+        driver.imported["fixture.binary"] = {
+          kind = "dynamic",
+          type = module_type("fixture.binary"),
+          filename = "/binary/fixture.so",
+          c_header_dependencies = {},
+        }
+      end
       local context = assert(options.context)
       context.checked_source_modules[
         #context.checked_source_modules + 1] = name
@@ -469,6 +487,57 @@ function test_compiler_bridge_rejects_malformed_compiler_results(
                   "bad diagnostics result raised an untyped error")
     end
     test.assert(rejected, "non-table compiler diagnostics were accepted")
+  end)
+end
+
+local function expect_source_manifest_error(mode: string, expected: string)
+  with_fixture(mode, function ()
+    local compiler = bridge.load()
+    local rejected = false
+    do
+      compiler:analyze("fixture", {bridge.ProjectModule.new(
+        "fixture", {bridge.SourceFile.new(
+          "/workspace/fixture.titan", "saved fixture")})})
+    catch
+      rejected = true
+      test.assert(error is bridge.BridgeError,
+                  "malformed source manifest raised an untyped error")
+      local failure = error as bridge.BridgeError
+      test.assert(strings.find(failure.message, expected) ~= nil,
+                  failure.message)
+    end
+    test.assert(rejected, "malformed compiler source manifest was accepted")
+  end)
+end
+
+function test_compiler_bridge_rejects_missing_empty_and_wrong_source_manifests(
+    _context: test.Context)
+  expect_source_manifest_error(
+    "missing-source-manifest", "source manifest for 'fixture' must be a string")
+  expect_source_manifest_error(
+    "empty-source-manifest", "source manifest for 'fixture' must not be empty")
+  expect_source_manifest_error(
+    "wrong-source-manifest", "source manifest for 'fixture' must be a string")
+end
+
+function test_compiler_bridge_keeps_source_manifests_off_binary_snapshots(
+    _context: test.Context)
+  with_fixture("binary-manifest", function ()
+    local compiler = bridge.load()
+    local analysis = compiler:analyze("fixture", {bridge.ProjectModule.new(
+      "fixture", {bridge.SourceFile.new(
+        "/workspace/fixture.titan", "saved fixture")})})
+    local binary? = analysis:find_module("fixture.binary")
+    test.assert(binary ~= nil and binary.manifest ~= nil and
+                binary.manifest.source_serialized == nil,
+                "binary snapshot acquired a source-visible manifest")
+    case binary.provenance
+    when dynamic_binary: provenance then
+      test.assert(provenance.provider_file == "/binary/fixture.so",
+                  "binary manifest fixture lost its provider provenance")
+    else
+      test.assert(false, "binary manifest fixture used source provenance")
+    end
   end)
 end
 
@@ -631,14 +700,20 @@ function test_compiler_bridge_normalizes_annotated_ast_and_provenance(
     test.assert(project ~= nil and external ~= nil,
                 "compiler imported modules were not normalized")
     test.assert(project.manifest ~= nil and
-                strings.find(project.manifest.serialized, "fixture") ~= nil,
-                "project public manifest was not serialized")
+                strings.find(project.manifest.serialized, "fixture") ~= nil and
+                project.manifest.source_serialized ==
+                  "Source(\"fixture\")",
+                "project public/source manifests were not serialized")
     test.assert(#project.imports == 1 and
                 project.imports[1].module_name == "fixture.external" and
                 project.imports[1].source_required,
                 "Titan import metadata was not normalized")
     test.assert(#external.nodes == 0 and #external.symbols == 0,
                 "external source AST was exposed as project semantic state")
+    test.assert(external.manifest ~= nil and
+                external.manifest.source_serialized ==
+                  "Source(\"fixture.external\")",
+                "external source-visible manifest was not normalized")
     case external.provenance
     when external_source: source then
       test.assert(#source.source_files == 2 and
@@ -902,8 +977,11 @@ local function reparses_source_required_external_for_cached_project()
               "initial external source manifest was not normalized")
   local external_module: bridge.ModuleSnapshot = external
   local external_manifest: bridge.Manifest = external_module.manifest
+  test.assert(external_manifest.source_serialized ~= nil,
+              "external cache seed lost its source-visible manifest")
   local cached_external = bridge.CachedSourceInterface.new(
     "bridge_cached_external", external_manifest.serialized,
+    external_manifest.source_serialized,
     external_file, {external_file}, external_module.imports,
     external_module.c_header_dependencies)
 
@@ -923,7 +1001,10 @@ local function reparses_source_required_external_for_cached_project()
     incremental:find_module("bridge_cached_external")
   test.assert(refreshed_external ~= nil and
               #refreshed_external.nodes == 0 and
-              #refreshed_external.symbols == 0,
+              #refreshed_external.symbols == 0 and
+              refreshed_external.manifest ~= nil and
+              refreshed_external.manifest.source_serialized ==
+                external_manifest.source_serialized,
               "external source was not transiently reparsed and discarded")
   test.assert(not compiler:has_project_ast("bridge_cached_external"),
               "external annotated AST leaked into the project cache")
@@ -1856,8 +1937,11 @@ end
               "initial external callable manifest was not serialized")
   local external_module = initial_external as bridge.ModuleSnapshot
   local external_manifest = external_module.manifest as bridge.Manifest
+  test.assert(external_manifest.source_serialized ~= nil,
+              "external callable cache seed lost its source manifest")
   local cached_external = bridge.CachedSourceInterface.new(
     "hover_manifest", external_manifest.serialized,
+    external_manifest.source_serialized,
     external_file, {external_file}, external_module.imports,
     external_module.c_header_dependencies)
 
@@ -1895,7 +1979,10 @@ end
               diagnostic_messages:drain())
   local cached_snapshot? = reloaded:find_module("hover_manifest")
   test.assert(cached_snapshot ~= nil and #cached_snapshot.nodes == 0 and
-              #cached_snapshot.symbols == 0,
+              #cached_snapshot.symbols == 0 and
+              cached_snapshot.manifest ~= nil and
+              cached_snapshot.manifest.source_serialized ==
+                external_manifest.source_serialized,
               "serialized external manifest unexpectedly retained an AST")
   local cached_summaries? = cached_snapshot.hover_summaries
   test.assert(cached_summaries == nil or #cached_summaries == 0,
@@ -2091,6 +2178,43 @@ local function symbol_identity(module: bridge.ModuleSnapshot,
     end
   end
   return identity
+end
+
+local function preserves_source_manifest_across_trivia_shifts()
+  preload_real_compiler()
+  local filename = "/workspace/private_identity.titan"
+  local source = [[local secret = 41
+local function hidden(increment: integer): integer
+  return secret + increment
+end
+function answer(): integer return hidden(1) end
+]]
+  local initial = bridge.load():analyze("private_identity", {
+    bridge.ProjectModule.new("private_identity", {
+      bridge.SourceFile.new(filename, source),
+    }),
+  })
+  local shifted = bridge.load():analyze("private_identity", {
+    bridge.ProjectModule.new("private_identity", {
+      bridge.SourceFile.new(filename, "-- leading comment\n" .. source),
+    }),
+  })
+  test.assert(#initial.diagnostics == 0 and #shifted.diagnostics == 0,
+              "private identity fixtures did not compile")
+  local initial_module? = initial:find_module("private_identity")
+  local shifted_module? = shifted:find_module("private_identity")
+  test.assert(initial_module ~= nil and shifted_module ~= nil and
+              initial_module.manifest ~= nil and
+              shifted_module.manifest ~= nil,
+              "private identity fixtures lost their module snapshots")
+  test.assert(initial_module.manifest.source_serialized ==
+                shifted_module.manifest.source_serialized,
+              "leading trivia changed the source-visible interface")
+end
+
+function test_compiler_bridge_preserves_source_manifest_across_leading_comments(
+    _context: test.Context)
+  test_runtime.run(preserves_source_manifest_across_trivia_shifts)
 end
 
 local function preserves_alias_and_named_parameter_rename_metadata()
