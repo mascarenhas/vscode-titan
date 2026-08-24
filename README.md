@@ -167,22 +167,21 @@ workspace data. Restore the setting to `off` after collecting a trace.
 
 ### Project configuration
 
-An optional `titan-config.lua` at the workspace root must return one literal
-Lua table. Relative paths are resolved from that root:
+An optional `titan-config.lua` at the workspace root assigns configuration
+values as globals. Relative paths are resolved from that root:
 
 ```lua
-return {
-  source_modules_root = "src",
-  binary_modules_root = ".titan/lib/titan/0.26",
-  extra_ffi_include_dirs = { "include", "vendor/include" },
-}
+source_modules_root = "src"
+binary_modules_root = ".titan/lib/titan/0.26"
+extra_ffi_include_dirs = { "include", "vendor/include" }
 ```
 
 All fields are optional. The source root defaults to the workspace root, the
 binary root defaults to the compatible compiler installation, and the FFI
-include list defaults to empty. Unknown fields are rejected. Configuration
-runs without Lua globals, so it can construct the returned data but cannot
-write unframed bytes to the language server's stdout or mutate compiler state.
+include list defaults to empty. Unknown fields and returned values are
+rejected. Configuration runs in an otherwise empty Lua environment, so it can
+assign these values but cannot write unframed bytes to the language server's
+stdout or mutate compiler state.
 
 Project discovery intentionally ignores symlinked files and directories below
 the configured source root in version 1. This keeps project identity and the
@@ -239,10 +238,15 @@ semantic index rather than rebuilt by individual hover requests.
 A read-only request starts a shared saved-file refresh without waiting. Before
 the initial index is ready it returns the feature's ordinary empty result; an
 unchanged background revalidation can serve the immutable completed generation.
-A watcher hint makes that preceding generation ineligible until the changed
-saved state has been checked, and a known compiler/configuration failure remains
-authoritative during retry. Rename always waits for the stable newest generation
-and revalidates disk state after preflight.
+A watcher hint classified as a saved-project change makes that preceding
+generation ineligible until the changed saved state has been checked. A known
+compiler/configuration failure remains authoritative during retry. Rename always
+waits for the stable newest generation and revalidates disk state after
+preflight.
+
+A saved module rejected by the compiler has no semantic data for that
+generation, but it does not prevent independently valid project modules from
+forming the immutable semantic view.
 
 Server stdout is reserved exclusively for `Content-Length`-framed JSON-RPC.
 Diagnostics and debug logs go to stderr.

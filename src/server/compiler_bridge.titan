@@ -138,6 +138,12 @@ union OccurrenceRole
   import_alias
 end
 
+union DeclarationVisibility
+  block
+  module
+  exported
+end
+
 record SymbolOccurrence
   name: string
   declaration_id: string?
@@ -145,6 +151,7 @@ record SymbolOccurrence
   location: SourceLocation
   exact_span: SourceSpan?
   is_local: boolean
+  visibility: DeclarationVisibility
   type_info: TypeInfo?
   callable_signature: CallableSignature?
   summary_id: integer?
@@ -1312,6 +1319,12 @@ local function unwrap_summary_descriptor(compiler: Compiler,
       raw["target_owner_fqtn"], TYPES_MODULE,
       subject .. ".target_owner_fqtn")
     return registered_owner(compiler, fqtn)
+  elseif tag == "Ast.Decl" and raw["name"] == "self" and
+         (raw["_name_loc"] == nil or raw["_name_loc"] == false) then
+    -- `self` is a lexical value declaration, but its nominal type is the
+    -- record or union whose complete cached summary is useful at the use site.
+    return unwrap_summary_descriptor(
+      compiler, raw["_type"], subject .. "._type")
   elseif tag == "Ast.TopLevelImport" then
     local resolved: value = raw["_declared_type"]
     local field = "._declared_type"
@@ -2038,6 +2051,28 @@ local function declaration_local(candidate: value): boolean
   return node_is_local(raw)
 end
 
+local function declaration_visibility(candidate: value,
+                                      localness: boolean):
+    DeclarationVisibility
+  if candidate ~= nil and candidate ~= false then
+    local raw = required_map(candidate, DRIVER_MODULE, "symbol declaration")
+    local tag = required_string(
+      raw["_tag"], DRIVER_MODULE, "symbol declaration._tag")
+    if tag == "Checker.Parameter" or tag == "Ast.TypeParam" or
+       tag == "Type.Parameter" or tag == "Type.TypeParameter" then
+      return DeclarationVisibility.block()
+    elseif tag == "Ast.Decl" then
+      -- Module variables and aggregate fields resolve through `_decl` to a
+      -- top-level/member descriptor before this helper. A remaining Ast.Decl
+      -- is therefore a lexical binding: local, parameter, loop binding, or
+      -- the implicit method receiver.
+      return DeclarationVisibility.block()
+    end
+  end
+  if localness then return DeclarationVisibility.module() end
+  return DeclarationVisibility.exported()
+end
+
 local function semantic_declaration(node: {string: value}, tag: string): value
   if tag == "Ast.ExpMethodRef" or tag == "Ast.ArgsMethod"
       or tag == "Ast.ArgsNamedMethod" then
@@ -2274,9 +2309,14 @@ local function Walker:add_occurrence(node: {string: value}, tag: string,
   elseif signature_candidate == nil or signature_candidate == false then
     signature_candidate = node
   end
+  local visibility_candidate: value = declaration
+  if visibility_candidate == nil or visibility_candidate == false then
+    visibility_candidate = node
+  end
   self.symbols[#self.symbols + 1] = SymbolOccurrence.new(
     name, declaration_id, occurrence_role(role_name), location, span,
-    localness, optional_type(self.compiler, node, "_type", tag),
+    localness, declaration_visibility(visibility_candidate, localness),
+    optional_type(self.compiler, node, "_type", tag),
     callable_signature(
       self.compiler, self.module_name, signature_candidate,
       node, tag .. " callable declaration"),
@@ -2289,9 +2329,12 @@ local function Walker:add_bound_occurrence(name: string, declaration: value,
                                             role: OccurrenceRole)
   local declaration_id = declaration_identity(
     self.module_name, declaration)
+  local localness = declaration_local(declaration)
   self.symbols[#self.symbols + 1] = SymbolOccurrence.new(
     name, declaration_id, role, location,
-    exact_name_span(location, name), declaration_local(declaration), nil, nil,
+    exact_name_span(location, name), localness,
+    declaration_visibility(declaration, localness),
+    nil, nil,
     self:summary_id(
       declaration, declaration, "bound hover summary declaration"))
 end
@@ -3203,6 +3246,22 @@ local function Compiler:run_attempt_inner(
     if not is_project or checked_set[name] then
       local valid = #diagnostics == 0
       if is_project then valid = failed[name] ~= true end
+      if is_project and valid and #diagnostics > 0 then
+        local entry = required_map(
+          imported[name], DRIVER_MODULE,
+          "driver.imported['" .. name .. "']")
+        -- A diagnostic in a source dependency makes every source module that
+        -- depends on it invalid. The compiler consequently omits those
+        -- modules' source manifests even when no diagnostic points into their
+        -- own files. Preserve malformed-manifest contract checks, but treat
+        -- this documented omission as the compiler's transitive-failure
+        -- signal instead of trying to serialize an invalid module.
+        if entry["source_manifest"] == nil or
+            entry["source_manifest"] == false then
+          valid = false
+          failed[name] = true
+        end
+      end
       modules[#modules + 1] = snapshot_module(
         self, name, imported[name], projects, cached, valid,
         normalization_work)

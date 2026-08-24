@@ -375,6 +375,17 @@ return function(mode)
         source_files = { "/external/main.titan", "/external/part.titan" },
         c_header_dependencies = {},
       }
+      if mode == "dependency-diagnostic" then
+        driver.imported[name].source_manifest = nil
+        driver.imported["fixture.dependency"] = {
+          kind = "source",
+          ast = ast,
+          type = module_type("fixture.dependency"),
+          filename = "/workspace/dependency.titan",
+          source_files = { "/workspace/dependency.titan" },
+          c_header_dependencies = {},
+        }
+      end
       if mode == "binary-manifest" then
         driver.imported["fixture.binary"] = {
           kind = "dynamic",
@@ -386,6 +397,13 @@ return function(mode)
       local context = assert(options.context)
       context.checked_source_modules[
         #context.checked_source_modules + 1] = name
+      if mode == "dependency-diagnostic" then
+        context.checked_source_modules[
+          #context.checked_source_modules + 1] = "fixture.dependency"
+        return true, module_type(name), {
+          "/workspace/dependency.titan:1:1: unknown variable 'missing'",
+        }, {}
+      end
       if mode == "progress" then
         -- The real compiler reports every completed source module. Exercise
         -- both noise classes the bridge must exclude from saved-file counts:
@@ -518,6 +536,29 @@ function test_compiler_bridge_rejects_missing_empty_and_wrong_source_manifests(
     "empty-source-manifest", "source manifest for 'fixture' must not be empty")
   expect_source_manifest_error(
     "wrong-source-manifest", "source manifest for 'fixture' must be a string")
+end
+
+function test_compiler_bridge_accepts_missing_manifest_after_dependency_error(
+    _context: test.Context)
+  with_fixture("dependency-diagnostic", function ()
+    local compiler = bridge.load()
+    local analysis = compiler:analyze("fixture", {
+      bridge.ProjectModule.new("fixture", {bridge.SourceFile.new(
+        "/workspace/fixture.titan", "saved fixture")}),
+      bridge.ProjectModule.new("fixture.dependency", {bridge.SourceFile.new(
+        "/workspace/dependency.titan", "invalid dependency")}),
+    })
+    local root? = analysis:find_module("fixture")
+    local dependency? = analysis:find_module("fixture.dependency")
+    test.assert(#analysis.diagnostics == 1 and root ~= nil and
+                dependency ~= nil,
+                "dependency error did not produce failed project snapshots")
+    test.assert(root.manifest == nil and dependency.manifest == nil,
+                "failed dependency closure acquired a valid manifest")
+    test.assert(not compiler:has_project_ast("fixture") and
+                not compiler:has_project_ast("fixture.dependency"),
+                "failed dependency closure entered the incremental cache")
+  end)
 end
 
 function test_compiler_bridge_keeps_source_manifests_off_binary_snapshots(
@@ -1466,7 +1507,7 @@ end
     filename, source_text.Position.new(1, 10))
   test.assert(top_level ~= nil and top_level:markdown() ==
                 "- Signature: `hover_consumer.run(): integer`\n" ..
-                "- Declaration: non-local\n",
+                "- Visibility: exported\n",
               "top-level function declaration hover lost its signature")
 
   local associated? = model:hover(
@@ -1474,7 +1515,7 @@ end
   test.assert(associated ~= nil and associated:markdown() ==
                 "- Signature: `hover_external.Counter.create(" ..
                 "initial: integer): hover_external.Counter`\n" ..
-                "- Declaration: non-local\n",
+                "- Visibility: exported\n",
               "imported record-function hover lost its named signature")
 
   local ordinary? = model:hover(
@@ -1482,7 +1523,7 @@ end
   test.assert(ordinary ~= nil and ordinary:markdown() ==
                 "- Signature: `hover_external.choose(" ..
                 "first: integer, second: integer): integer`\n" ..
-                "- Declaration: non-local\n",
+                "- Visibility: exported\n",
               "imported function hover lost its named signature")
 
   local method? = model:hover(
@@ -1490,7 +1531,7 @@ end
   test.assert(method ~= nil and method:markdown() ==
                 "- Signature: `hover_external.Counter:add(" ..
                 "delta: integer): integer`\n" ..
-                "- Declaration: non-local\n",
+                "- Visibility: exported\n",
               "method-call name hover lost its resolved method signature")
 
   local foreign_hover? = model:hover(
@@ -1538,12 +1579,27 @@ end
               diagnostic_messages:drain())
   local model = features.build({project}, analysis.modules)
 
+  local owner? = model:hover(
+    filename, source_text.Position.new(0, 8))
+  local receiver? = model:hover(
+    filename, source_text.Position.new(4, 10))
+  local owner_summary: string? = nil
+  local receiver_summary: string? = nil
+  if owner ~= nil then owner_summary = owner.summary_markdown end
+  if receiver ~= nil then receiver_summary = receiver.summary_markdown end
+  test.assert(owner_summary ~= nil and receiver_summary == owner_summary,
+              "implicit self did not reuse its aggregate hover summary")
+  test.assert(receiver ~= nil and receiver_summary ~= nil and
+              receiver:markdown() == receiver_summary ..
+                "\n- Visibility: block\n",
+              "implicit self hover lost its members or block visibility")
+
   local declaration? = model:hover(
     filename, source_text.Position.new(6, 10))
   test.assert(declaration ~= nil and declaration:markdown() ==
                 "- Signature: `generic_callable_hover.identity<T>(" ..
                   "item: T): T`\n" ..
-                "- Declaration: non-local\n",
+                "- Visibility: exported\n",
               "generic function declaration hover lost its surface signature")
 
   local method_declaration? = model:hover(
@@ -1551,14 +1607,14 @@ end
   test.assert(method_declaration ~= nil and
               method_declaration:markdown() ==
                 "- Signature: `generic_callable_hover.Box:get(): T`\n" ..
-                "- Declaration: non-local\n",
+                "- Visibility: exported\n",
               "generic owner method declaration hover was erased")
 
   local method_call? = model:hover(
     filename, source_text.Position.new(10, 14))
   test.assert(method_call ~= nil and method_call:markdown() ==
                 "- Signature: `generic_callable_hover.Box:get(): integer`\n" ..
-                "- Declaration: non-local\n",
+                "- Visibility: exported\n",
               "generic method-call name hover lost its applied signature")
 end
 
@@ -1665,7 +1721,7 @@ end
                 "Methods\n\n" ..
                 "- `summary_provider.Box<T>:get(): T`\n" ..
                 "- `local summary_provider.Box<T>:hidden(): T`\n\n" ..
-                "- Declaration: non-local\n",
+                "- Visibility: exported\n",
               "defining aggregate hover lost its full generic view:\n" ..
               defining_markdown)
 
@@ -1681,7 +1737,7 @@ end
       "item: integer): summary_provider.Box<integer>`\n\n" ..
     "Methods\n\n" ..
     "- `summary_provider.Box<integer>:get(): integer`\n\n" ..
-    "- Declaration: non-local\n"
+    "- Visibility: exported\n"
   test.assert(ordinary ~= nil and ordinary:markdown() == expected_public,
               "ordinary import exposed local or unspecialized members:\n" ..
               ordinary_markdown)
@@ -1699,7 +1755,7 @@ end
                 "Methods\n\n" ..
                 "- `summary_provider.Box<integer>:get(): integer`\n" ..
                 "- `local summary_provider.Box<integer>:hidden(): integer`\n\n" ..
-                "- Declaration: non-local\n",
+                "- Visibility: exported\n",
               "direct-source import lost its local specialized members:\n" ..
               source_markdown)
 
@@ -1714,7 +1770,7 @@ end
     "- `answer: integer`\n" ..
     "- `summary_provider.exposed(): integer`\n" ..
     "- `type BoxAlias<T> = summary_provider.Box<T>`\n\n" ..
-    "- Declaration: local\n"
+    "- Visibility: module\n"
   test.assert(public_module ~= nil and
               public_module:markdown() == expected_public_module and
               strings.find(public_module:markdown(), "Fields") == nil and
@@ -1736,7 +1792,7 @@ end
                 "- `type BoxAlias<T> = summary_provider.Box<T>`\n" ..
                 "- `local type Hidden = integer`\n" ..
                 "- `local type HiddenBox<T> = summary_provider.Box<T>`\n\n" ..
-                "- Declaration: local\n",
+                "- Visibility: module\n",
               "direct-source module hover lost its source-only members:\n" ..
               source_module_markdown)
 
@@ -1874,7 +1930,7 @@ end
                 "- `callback: (integer) -> integer`\n" ..
                 "- `function_variable_provider.declared(" ..
                   "item: integer): integer`\n\n" ..
-                "- Declaration: local\n",
+                "- Visibility: module\n",
               "module hover confused a function-valued variable with " ..
               "a named function declaration:\n" .. markdown)
 end
@@ -1999,7 +2055,7 @@ end
                 "- `hover_manifest.combine(" ..
                   "left: integer, right: integer): integer`\n" ..
                 "- `interface Formatter`\n\n" ..
-                "- Declaration: local\n" and
+                "- Visibility: module\n" and
               strings.find(module_hover:markdown(), "Variants") == nil and
               strings.find(module_hover:markdown(), ".new") == nil,
               "cached module hover expanded or lost manifest members")
@@ -2013,7 +2069,7 @@ end
                 "Methods\n\n" ..
                 "- `hover_manifest.Formatter:format(" ..
                   "subject: string, maximum: integer?): string`\n\n" ..
-                "- Declaration: non-local\n",
+                "- Visibility: exported\n",
               "cached interface hover lost fields or named methods")
 
   local parcel_hover? = model:hover(
@@ -2030,7 +2086,7 @@ end
                 "Methods\n\n" ..
                 "- `hover_manifest.Parcel:increase(" ..
                   "delta: integer): integer`\n\n" ..
-                "- Declaration: non-local\n",
+                "- Visibility: exported\n",
               "cached record hover lost normalized manifest members")
 
   local choice_hover? = model:hover(
@@ -2046,7 +2102,7 @@ end
                 "Methods\n\n" ..
                 "- `hover_manifest.Choice:label(" ..
                   "prefix: string): string`\n\n" ..
-                "- Declaration: non-local\n" and
+                "- Visibility: exported\n" and
               strings.find(choice_hover:markdown(),
                            "Choice.numbered") == nil,
               "cached union hover duplicated synthesized constructors")
@@ -2055,7 +2111,7 @@ end
   test.assert(ordinary ~= nil and ordinary:markdown() ==
                 "- Signature: `hover_manifest.combine(" ..
                 "left: integer, right: integer): integer`\n" ..
-                "- Declaration: non-local\n",
+                "- Visibility: exported\n",
               "deserialized ModuleMember lost parameter labels")
 
   local record_static? = model:hover(
@@ -2063,7 +2119,7 @@ end
   test.assert(record_static ~= nil and record_static:markdown() ==
                 "- Signature: `hover_manifest.Parcel.create(" ..
                 "initial: integer): hover_manifest.Parcel`\n" ..
-                "- Declaration: non-local\n",
+                "- Visibility: exported\n",
               "deserialized record StaticMethod lost parameter labels")
 
   local record_method? = model:hover(
@@ -2071,7 +2127,7 @@ end
   test.assert(record_method ~= nil and record_method:markdown() ==
                 "- Signature: `hover_manifest.Parcel:increase(" ..
                 "delta: integer): integer`\n" ..
-                "- Declaration: non-local\n",
+                "- Visibility: exported\n",
               "deserialized record Method lost parameter labels")
 
   local union_static? = model:hover(
@@ -2079,21 +2135,21 @@ end
   test.assert(union_static ~= nil and union_static:markdown() ==
                 "- Signature: `hover_manifest.Choice.from_ordinal(" ..
                 "ordinal: integer): hover_manifest.Choice`\n" ..
-                "- Declaration: non-local\n",
+                "- Visibility: exported\n",
               "deserialized union StaticMethod lost parameter labels")
 
   local variant? = model:hover(filename, source_text.Position.new(8, 34))
   test.assert(variant ~= nil and variant:markdown() ==
                 "- Signature: `hover_manifest.Choice.numbered(" ..
                 "integer): hover_manifest.Choice`\n" ..
-                "- Declaration: non-local\n",
+                "- Visibility: exported\n",
               "union variant constructor invented a parameter label")
 
   local union_method? = model:hover(filename, source_text.Position.new(9, 24))
   test.assert(union_method ~= nil and union_method:markdown() ==
                 "- Signature: `hover_manifest.Choice:label(" ..
                 "prefix: string): string`\n" ..
-                "- Declaration: non-local\n",
+                "- Visibility: exported\n",
               "deserialized union Method lost parameter labels")
 
   local interface_method? = model:hover(
@@ -2101,7 +2157,7 @@ end
   test.assert(interface_method ~= nil and interface_method:markdown() ==
                 "- Signature: `hover_manifest.Formatter:format(" ..
                 "subject: string, maximum: integer?): string`\n" ..
-                "- Declaration: non-local\n",
+                "- Visibility: exported\n",
               "deserialized interface Method lost parameter labels")
 end
 
@@ -2151,13 +2207,13 @@ end
   test.assert(named ~= nil and named:markdown() ==
                 "- Signature: `native.hover_named_sum(" ..
                 "left: int, right: int): int`\n" ..
-                "- Declaration: non-local\n",
+                "- Visibility: exported\n",
               "direct C function lost its written alias or parameter names")
 
   local unnamed? = model:hover(filename, source_text.Position.new(3, 42))
   test.assert(unnamed ~= nil and unnamed:markdown() ==
                 "- Signature: `native.hover_unnamed_sum(int, int): int`\n" ..
-                "- Declaration: non-local\n",
+                "- Visibility: exported\n",
               "unnamed C prototype invented parameter labels")
 end
 

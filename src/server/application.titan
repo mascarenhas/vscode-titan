@@ -37,6 +37,26 @@ local record WatchFilter
   const known_directories: {string: boolean}
 end
 
+local union WatchDisposition
+  irrelevant
+  relevant
+  possible_directory: string
+end
+
+-- A raw create hint does not carry a file kind. Own possible new-directory
+-- paths independently of the watcher poll Task so asynchronous lstat cannot
+-- lose an already-published hint when registrations are reconciled.
+local record DirectoryProbes
+  pending: {string: boolean}
+  order: {string}
+  next_index: integer
+  task: async.Task<nil, value>?
+end
+
+local function new_directory_probes(): DirectoryProbes
+  return DirectoryProbes.new({}, {}, 1, nil)
+end
+
 type RenameAnalyzer = (
   project_service.Snapshot, {bridge.ProjectModule}) -> bridge.Analysis
 type ProjectLoader = (
@@ -70,6 +90,7 @@ record Application
   local view_builds: integer
   local indexing_listener: indexing_status.Listener?
   local closed: boolean
+  local directory_probes: DirectoryProbes
   local const rename_analyzer: RenameAnalyzer
 end
 
@@ -273,44 +294,57 @@ end
 
 -- The directory watcher is intentionally broader than the saved project: it
 -- must observe a new source directory or a newly created configuration file.
--- A created extensionless valid component is conservatively a possible new
--- directory; subsequent modifications are ignored unless discovery cached it
--- as a directory. Dotted/editor paths and non-Titan artifacts remain
--- irrelevant because discovery would prune the same component. This function
--- must remain non-yielding: ProjectWatcher reconciliation may cancel its poll
--- Task immediately after a callback, and every accepted hint must increment
--- the Application epoch first.
-local function watch_change_relevant(filter: WatchFilter,
-                                     change: project_watcher.PathChange):
-    boolean
+-- A created extensionless valid component needs an asynchronous kind probe;
+-- subsequent modifications are ignored unless discovery cached it as a
+-- directory. Dotted/editor paths and non-Titan artifacts remain irrelevant
+-- because discovery would prune the same component. Classification itself is
+-- non-yielding so every hint is either accepted or copied into Application-
+-- owned probe state before the ProjectWatcher callback returns.
+local function watch_change_disposition(filter: WatchFilter,
+                                        change: project_watcher.PathChange):
+    WatchDisposition
   local path = project_watcher.change_path(change)
-  if filter.configuration_paths[path] then return true end
+  if filter.configuration_paths[path] then
+    return WatchDisposition.relevant()
+  end
   for index = 1, #filter.source_roots do
     local source_root = filter.source_roots[index]
     if path_within(source_root, path) then
       if titan_source_path(path) then
-        return source_directory_path(
-          source_root, parent_directory(path))
+        if source_directory_path(source_root, parent_directory(path)) then
+          return WatchDisposition.relevant()
+        end
+        return WatchDisposition.irrelevant()
       end
-      if not source_directory_path(source_root, path) then return false end
-      if filter.known_directories[path] then return true end
+      if not source_directory_path(source_root, path) then
+        return WatchDisposition.irrelevant()
+      end
+      if filter.known_directories[path] then
+        return WatchDisposition.relevant()
+      end
       case change
       when created then
-        -- A new extensionless valid path may be a source directory. One
-        -- conservative refresh discovers its type and caches it if so;
-        -- repeated file modifications/deletion remain irrelevant.
-        return true
+        return WatchDisposition.possible_directory(path)
       else
-        return false
+        return WatchDisposition.irrelevant()
       end
     end
   end
-  return false
+  return WatchDisposition.irrelevant()
 end
 
--- Source-imported tests validate lexical and canonical parity through the
--- same immutable filter construction used by reconciliation. Production
--- callbacks call watch_change_relevant directly and never enter this helper.
+local function watch_change_relevant(filter: WatchFilter,
+                                     change: project_watcher.PathChange):
+    boolean
+  case watch_change_disposition(filter, change)
+  when irrelevant then return false
+  else return true
+  end
+end
+
+-- Source-imported tests validate lexical and canonical eligibility through the
+-- same immutable filter construction used by reconciliation. A possible new
+-- directory counts as eligible here; production verifies its kind first.
 local function relevant_watch_change(snapshot: project_service.Snapshot,
                                      change: project_watcher.PathChange):
     boolean
@@ -330,31 +364,41 @@ end
 
 local function project_inputs(snapshot: project_service.Snapshot):
     ({bridge.ProjectModule}, {bridge.ModuleSnapshot})
-  if #snapshot.dirty_modules > 0 then
-    raise Error.new(
-      "Titan project has no complete compiler snapshot for the current " ..
-      "saved generation")
-  end
   local projects: {bridge.ProjectModule} = {}
   local snapshots: {bridge.ModuleSnapshot} = {}
   for module_index = 1, #snapshot.project_modules do
     local module = snapshot.project_modules[module_index]
-    if module.dirty or module.compiler_snapshot == nil or
-       #module.diagnostics > 0 then
-      raise Error.new(
-        "Titan project module '" .. module.module_name ..
-        "' has no compiler snapshot for the current saved generation")
-    end
     local files: {bridge.SourceFile} = {}
     for file_index = 1, #module.source_files do
       local file = module.source_files[file_index]
-      files[file_index] = bridge.SourceFile.new(file.filename, file.contents)
+      files[file_index] = bridge.SourceFile.new(
+        file.filename, file.contents)
     end
-    projects[module_index] = bridge.ProjectModule.new(
+    -- Retain every saved module in Features even when it has no semantic
+    -- snapshot. Besides providing source coordinates, this makes rename
+    -- preflight compile the complete saved project and therefore reject an
+    -- edit if an invalid module could contain an unindexed reference.
+    projects[#projects + 1] = bridge.ProjectModule.new(
       module.module_name, files)
-    snapshots[#snapshots + 1] = module.compiler_snapshot
+    if not module.dirty then
+      if module.compiler_snapshot == nil or #module.diagnostics > 0 then
+        raise Error.new(
+          "clean Titan project module '" .. module.module_name ..
+          "' has no valid compiler snapshot for the current saved " ..
+          "generation")
+      end
+      snapshots[#snapshots + 1] = module.compiler_snapshot
+    end
   end
   return projects, snapshots
+end
+
+local function same_module_names(left: {string}, right: {string}): boolean
+  if #left ~= #right then return false end
+  for index = 1, #left do
+    if left[index] ~= right[index] then return false end
+  end
+  return true
 end
 
 local function log_watch_failure(failure: project_watcher.WatchFailure)
@@ -366,15 +410,71 @@ local function log_watch_failure(failure: project_watcher.WatchFailure)
   })
 end
 
+local function Application:run_directory_probes(): nil
+  local probes = self.directory_probes
+  defer do
+    probes.pending = {}
+    probes.order = {}
+    probes.next_index = 1
+    probes.task = nil
+  end
+
+  while not self.closed and probes.next_index <= #probes.order do
+    -- Bound each wave before its first yield. Continuous compiler-temporary
+    -- churn can append another wave, but cannot postpone a confirmed source
+    -- directory's invalidation indefinitely.
+    local wave_finish = #probes.order
+    local relevant = false
+    while not self.closed and probes.next_index <= wave_finish do
+      local path = probes.order[probes.next_index]
+      probes.next_index = probes.next_index + 1
+      probes.pending[path] = nil
+
+      -- An absent path was an ephemeral create/delete and cannot contribute to
+      -- the saved project. Discovery also uses lstat and ignores symlinks, so
+      -- only an extant directory needs a refresh. Metadata failures remain
+      -- conservative; cancellation belongs to Application.close.
+      local possible_directory = true
+      do
+        local metadata? = fs.lstat(path)
+        possible_directory = metadata ~= nil and
+                             metadata.kind == "directory"
+      catch
+        if error is async.CancellationReason then raise end
+      end
+      if possible_directory then relevant = true end
+    end
+
+    if relevant and not self.closed then self:note_saved_change() end
+  end
+  return nil
+end
+
+local function Application:probe_possible_directory(path: string)
+  if self.closed then return end
+  local probes = self.directory_probes
+  if probes.pending[path] then return end
+  probes.pending[path] = true
+  probes.order[#probes.order + 1] = path
+  if probes.task ~= nil then return end
+  probes.task = async.run<nil, value>(
+    function (): nil return self:run_directory_probes() end)
+end
+
 local function Application:watch_callback(
     batch: project_watcher.RediscoveryBatch)
   local relevant = batch.watch_set_changed
+  local possible_directories: {string} = {}
   local filter? = self.watch_filter
   if not relevant and filter ~= nil then
     for index = 1, #batch.changes do
-      if watch_change_relevant(filter, batch.changes[index]) then
+      case watch_change_disposition(filter, batch.changes[index])
+      when relevant then
         relevant = true
         break
+      when possible_directory: path then
+        possible_directories[#possible_directories + 1] = path
+      when irrelevant then
       end
     end
   elseif not relevant and #batch.changes > 0 then
@@ -382,6 +482,13 @@ local function Application:watch_callback(
     -- code changes that invariant, prefer a bounded extra refresh to losing a
     -- saved-file invalidation.
     relevant = true
+  end
+  local queued_directory_probes = 0
+  if not relevant then
+    for index = 1, #possible_directories do
+      self:probe_possible_directory(possible_directories[index])
+    end
+    queued_directory_probes = #possible_directories
   end
   if logging.enabled("debug") then
     logging.emit("debug", "project.watch.batch", {
@@ -392,6 +499,8 @@ local function Application:watch_callback(
       json.Member.new("failures", json.from_integer(#batch.failures)),
       json.Member.new("watch_set_changed", json.from_boolean(
         batch.watch_set_changed)),
+      json.Member.new("directory_probes", json.from_integer(
+        queued_directory_probes)),
       json.Member.new("relevant", json.from_boolean(relevant)),
     })
   end
@@ -503,13 +612,17 @@ local function Application:refresh_once(): RefreshOutcome
     end
     local snapshot = service:latest()
     local completed? = self.completed_view
-    if completed ~= nil and
-       completed.snapshot.generation == report.generation then
+    if completed ~= nil and completed.snapshot.generation ==
+         report.generation and #report.committed_modules == 0 and
+       same_module_names(
+         completed.snapshot.dirty_modules, snapshot.dirty_modules) then
       -- A refresh still rediscovers directories and external inputs. When its
-      -- semantic generation did not change, retain the immutable Features and
-      -- only reconcile the broader watcher scope.
+      -- semantic generation and clean/dirty membership did not change and no
+      -- project result committed, retain the immutable Features. A repeated
+      -- diagnostic-only retry can update Snapshot metadata but cannot make a
+      -- dirty module's excluded compiler snapshot usable.
       self:reconcile_watcher(snapshot)
-      return RefreshOutcome.ready(completed)
+      return RefreshOutcome.ready(View.new(snapshot, completed.features))
     end
     return RefreshOutcome.ready(self:install_view(snapshot))
   catch
@@ -739,6 +852,10 @@ end
 
 local function Application:change_epoch_for_testing(): integer
   return self.change_epoch
+end
+
+local function Application:directory_probe_active_for_testing(): boolean
+  return self.directory_probes.task ~= nil
 end
 
 local function Application:stop_watching_for_testing()
@@ -983,7 +1100,8 @@ end
 function create(project_root: string): Application
   return Application.new(
     project_root, project_service.load_default, nil, nil, nil, nil, nil, nil,
-    1, 0, nil, nil, false, 0, 0, 0, nil, false, default_rename_analyzer)
+    1, 0, nil, nil, false, 0, 0, 0, nil, false,
+    new_directory_probes(), default_rename_analyzer)
 end
 
 -- Dependency-injected constructor used by the project/application integration
@@ -994,7 +1112,7 @@ function create_with_service(project_root: string,
   local application = Application.new(
     project_root, project_service.load_default, service, nil, nil, nil, nil,
     nil, 0, 0, nil, nil, false, 0, 0, 0, nil, false,
-    default_rename_analyzer)
+    new_directory_probes(), default_rename_analyzer)
   application.completed_view = application:install_view(service:latest())
   return application
 end
@@ -1006,7 +1124,7 @@ local function create_unindexed_with_service(
   return Application.new(
     project_root, project_service.load_default, service, nil, nil, nil, nil,
     nil, 1, 0, nil, nil, false, 0, 0, 0, nil, false,
-    default_rename_analyzer)
+    new_directory_probes(), default_rename_analyzer)
 end
 
 -- Source-imported application tests use an analyzer-backed loader to exercise
@@ -1016,7 +1134,8 @@ local function create_with_project_loader(
     project_root: string, project_loader: ProjectLoader): Application
   return Application.new(
     project_root, project_loader, nil, nil, nil, nil, nil, nil, 1, 0, nil,
-    nil, false, 0, 0, 0, nil, false, default_rename_analyzer)
+    nil, false, 0, 0, 0, nil, false, new_directory_probes(),
+    default_rename_analyzer)
 end
 
 function create_with_service_and_rename_analyzer(
@@ -1025,7 +1144,7 @@ function create_with_service_and_rename_analyzer(
   local application = Application.new(
     project_root, project_service.load_default, service, nil, nil, nil, nil,
     nil, 0, 0, nil, nil, false, 0, 0, 0, nil, false,
-    rename_analyzer)
+    new_directory_probes(), rename_analyzer)
   application.completed_view = application:install_view(service:latest())
   return application
 end
@@ -1053,6 +1172,19 @@ function Application:close()
   if self.closed then return end
   self.closed = true
   self.indexing_listener = nil
+
+  local directory_probe? = self.directory_probes.task
+  if directory_probe ~= nil then
+    if not directory_probe:status():has_finished() then
+      directory_probe:cancel(async.CancellationReason.simple(
+        "language server application is closing"))
+    end
+    async.join(directory_probe)
+    self.directory_probes.task = nil
+  end
+  self.directory_probes.pending = {}
+  self.directory_probes.order = {}
+  self.directory_probes.next_index = 1
 
   local attempted_epoch? = self.active_refresh_epoch
   local refresh? = self.refresh_task

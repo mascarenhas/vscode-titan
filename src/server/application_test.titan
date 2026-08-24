@@ -10,8 +10,10 @@ local dispatcher = import "server.dispatcher"
 local indexing_status = import "server.indexing_status"
 local json = import "server.json"
 local logging = import "server.logging"
+local project_graph = import "server.project_graph"
 local project_watcher = import "server.project_watcher"
 local project_service = import "server.project_service"
+local semantic_features = import "server.semantic_features"
 local source_text = import "server.source_text"
 local test_runtime = import "server.test_runtime"
 
@@ -21,6 +23,11 @@ local record YieldingAnalyzer
   started: boolean
   finished: boolean
   fail: boolean
+end
+
+local record RecoveringAnalyzer
+  fail: boolean
+  runs: integer
 end
 
 local record SavingRenameAnalyzer
@@ -39,7 +46,7 @@ local function occurrence(filename: string, line: integer,
     bridge.SourceSpan.new(
       start,
       bridge.SourceLocation.new(filename, line, finish_column)),
-    true, nil)
+    true, bridge.DeclarationVisibility.block(), nil)
 end
 
 local function find_project(request: project_service.AnalysisRequest,
@@ -148,6 +155,34 @@ local function YieldingAnalyzer:analyze(
                 "application analyzer lost a dirty project module")
     if module == nil then raise "dirty project module is missing" end
     snapshots[index] = project_snapshot(module)
+  end
+  return bridge.Analysis.new(request.root_module, {}, snapshots, {})
+end
+
+local function RecoveringAnalyzer:analyze(
+    request: project_service.AnalysisRequest): bridge.Analysis
+  self.runs = self.runs + 1
+  local module? = find_project(
+    request, request.dirty_modules[1])
+  test.assert(module ~= nil,
+              "recovering analyzer lost its dirty project module")
+  if module == nil then raise "recovering analyzer module is missing" end
+  if self.fail then
+    return bridge.Analysis.new(request.root_module, {
+      bridge.Diagnostic.new(
+        bridge.DiagnosticKind.syntax(), "deliberate saved-source error",
+        bridge.SourceLocation.new(module.files[1].filename, 1, 1)),
+    }, {}, {})
+  end
+
+  local snapshots: {bridge.ModuleSnapshot} = {}
+  for index = 1, #request.dirty_modules do
+    local dirty? = find_project(
+      request, request.dirty_modules[index])
+    test.assert(dirty ~= nil,
+                "recovering analyzer lost a repaired project module")
+    if dirty == nil then raise "repaired project module is missing" end
+    snapshots[#snapshots + 1] = project_snapshot(dirty)
   end
   return bridge.Analysis.new(request.root_module, {}, snapshots, {})
 end
@@ -532,7 +567,7 @@ local function recovers_configuration_load_failure_from_later_save()
     "configuration failure did not retain a provisional project watcher")
 
   fs.write_file(config_file,
-    "return { source_modules_root = \".\" }\n")
+    "source_modules_root = \".\"\n")
   -- Inject the exact saved-file hint deterministically. ProjectWatcher tests
   -- separately cover delivery from the filesystem backend; this regression
   -- exercises the Application lifecycle after a pre-Service load failure.
@@ -566,7 +601,7 @@ local function reconciles_expanded_scope_before_existing_analysis()
   local old_filename = old_root .. "/main.titan"
   local next_filename = next_root .. "/main.titan"
   fs.write_file(config_file,
-    "return { source_modules_root = \"../old_source\" }\n")
+    "source_modules_root = \"../old_source\"\n")
   fs.write_file(old_filename, "function answer(): integer return 1 end\n")
   fs.write_file(next_filename, "function answer(): integer return 2 end\n")
   defer do
@@ -595,7 +630,7 @@ local function reconciles_expanded_scope_before_existing_analysis()
   analyzer.block = true
   analyzer.started = false
   fs.write_file(config_file,
-    "return { source_modules_root = \"../next_source\" }\n")
+    "source_modules_root = \"../next_source\"\n")
   app:note_saved_change()
   wait_until(function (): boolean return analyzer.started end,
              "expanded-scope analyzer did not start")
@@ -829,6 +864,20 @@ local function filters_irrelevant_watcher_hints()
     test.assert(app:indexing_metrics().refresh_passes == before,
                 "irrelevant watcher batch started a refresh")
 
+    local compiler_temporary = source_root .. "/XXcompiler"
+    fs.write_file(compiler_temporary, "temporary reservation")
+    defer fs.unlink(compiler_temporary)
+    local epoch_before_temporary = app:change_epoch_for_testing()
+    app:watch_callback(project_watcher.RediscoveryBatch.new({
+      project_watcher.PathChange.created(compiler_temporary),
+    }, {}, false))
+    wait_until(function (): boolean
+      return not app:directory_probe_active_for_testing()
+    end, "extensionless regular-file probe did not finish")
+    test.assert(app:indexing_metrics().refresh_passes == before and
+                app:change_epoch_for_testing() == epoch_before_temporary,
+                "compiler-style temporary file scheduled a refresh")
+
     local statuses: {indexing_status.Status} = {}
     app:set_indexing_listener(function (status: indexing_status.Status)
       statuses[#statuses + 1] = status
@@ -864,6 +913,185 @@ local function filters_irrelevant_watcher_hints()
                   saved, project_watcher.PathChange.created(
                     build_directory .. "/generated.titan")),
                 "valid-named new source directory was filtered out")
+    local before_directory = app:indexing_metrics().refresh_passes
+    app:watch_callback(project_watcher.RediscoveryBatch.new({
+      project_watcher.PathChange.created(compiler_temporary),
+      project_watcher.PathChange.created(source_root .. "/XXvanished"),
+      project_watcher.PathChange.created(package_directory),
+    }, {}, false))
+    wait_until(function (): boolean
+      local metrics = app:indexing_metrics()
+      return not app:directory_probe_active_for_testing() and
+             metrics.refresh_passes == before_directory + 1 and
+             not metrics.refresh_chain_active
+    end, "new source-directory probe did not schedule one refresh")
+    test.assert(app:indexing_metrics().refresh_passes == before_directory + 1,
+                "new source-directory probe scheduled repeated refreshes")
+  end)
+end
+
+local function builds_semantics_from_independently_valid_modules()
+  with_application(function (
+      _filename: string, _analyzer: YieldingAnalyzer,
+      app: application.Application)
+    app:stop_watching_for_testing()
+    local snapshot? = app:snapshot_for_testing()
+    test.assert(snapshot ~= nil,
+                "partial semantic-view fixture has no snapshot")
+    local saved = snapshot as project_service.Snapshot
+    test.assert(#saved.project_modules == 1,
+                "partial semantic-view fixture has unexpected modules")
+    local valid = saved.project_modules[1]
+    local original_stamp = valid.source_files[1].stamp
+    local failed_filename = saved.config.source_modules_root ..
+                            "/failed.titan"
+    local failed_source = project_service.SourceFileSnapshot.new(
+      failed_filename, "function broken(:\n",
+      project_graph.FileStamp.new(
+        failed_filename, original_stamp.modified_seconds,
+        original_stamp.modified_nanoseconds, 18))
+    local failed = project_service.ProjectModule.new(
+      "failed", {failed_source}, valid.compiler_snapshot, {}, true)
+    local partial = project_service.Snapshot.new(
+      saved.generation, saved.config, saved.discovery_issues,
+      saved.project_directories, {valid, failed}, saved.external_modules,
+      {"failed"})
+
+    local projects, snapshots = application.project_inputs(partial)
+    test.assert(#projects == 2 and projects[1].module_name ==
+                  valid.module_name and projects[2].module_name == "failed" and
+                #snapshots == 1 and snapshots[1].module_name ==
+                  valid.module_name,
+                "partial semantic inputs lost saved source or retained a " ..
+                "dirty module's stale compiler snapshot")
+    local features = semantic_features.build(projects, snapshots)
+    test.assert(#features:folding_ranges(valid.source_files[1].filename) == 1,
+                "valid module lost its compiler-backed semantics")
+    test.assert(#features:folding_ranges(failed_filename) == 0 and
+                features:hover(
+                  failed_filename, source_text.Position.new(0, 0)) == nil,
+                "dirty module exposed stale compiler semantics")
+
+    -- A clean module without a checked snapshot is an internal service
+    -- inconsistency, not a recoverable source diagnostic.
+    local malformed = project_service.ProjectModule.new(
+      "malformed", valid.source_files, nil, {}, false)
+    local inconsistent = project_service.Snapshot.new(
+      saved.generation, saved.config, saved.discovery_issues,
+      saved.project_directories, {malformed}, saved.external_modules, {})
+    local rejected = false
+    do
+      application.project_inputs(inconsistent)
+    catch
+      rejected = error is application.Error
+    end
+    test.assert(rejected,
+                "clean module without a compiler snapshot was accepted")
+  end)
+end
+
+local function publishes_recovered_partial_module_at_same_generation()
+  local root = fs.tmpname()
+  fs.unlink(root)
+  fs.mkdir(root)
+  local filename = root .. "/main.titan"
+  fs.write_file(filename,
+    "function answer(): integer\n" ..
+    "  return 1\n" ..
+    "end\n")
+  defer do
+    if fs.lstat(filename) ~= nil then fs.unlink(filename) end
+    if fs.lstat(root) ~= nil then fs.rmdir(root) end
+  end
+
+  local analyzer = RecoveringAnalyzer.new(true, 0)
+  local service?, service_error? = project_service.load_with_analyzer(
+    root, "/sdk/lib/titan/0.26", analyzer:analyze)
+  test.assert(service_error == nil and service ~= nil,
+              "partial recovery fixture project did not load")
+  if service == nil then raise "partial recovery Service is missing" end
+  local app = application.create_with_service(root, service)
+  defer app:close()
+  app:stop_watching_for_testing()
+
+  local initial? = app:snapshot_for_testing()
+  test.assert(initial ~= nil and #initial.dirty_modules == 1,
+              "diagnostic module did not produce a partial initial View")
+  local before = app:indexing_metrics()
+  local runs_before = analyzer.runs
+  analyzer.fail = false
+  test.assert(
+    result_array_length(
+      app:handle(request_for(
+        filename, 40, "textDocument/foldingRange")),
+      "folding request on partial View") == 0,
+    "partial View exposed a dirty module's structural AST")
+  wait_until(function (): boolean
+    return analyzer.runs == runs_before + 1 and
+           not app:indexing_metrics().refresh_chain_active
+  end, "same-generation module repair did not finish")
+
+  local repaired? = app:snapshot_for_testing()
+  local after = app:indexing_metrics()
+  test.assert(repaired ~= nil and #repaired.dirty_modules == 0 and
+              after.view_builds == before.view_builds + 1,
+              "same-generation repair reused the partial semantic View")
+  test.assert(
+    result_array_length(
+      app:handle(request_for(
+        filename, 41, "textDocument/foldingRange")),
+      "folding request after partial repair") == 1,
+    "repaired module did not enter the semantic View")
+end
+
+local function ignores_extensionless_temporary_during_active_refresh()
+  with_application(function (
+      filename: string, analyzer: YieldingAnalyzer,
+      app: application.Application)
+    app:stop_watching_for_testing()
+    local snapshot? = app:snapshot_for_testing()
+    test.assert(snapshot ~= nil,
+                "active temporary-file fixture has no snapshot")
+    local saved = snapshot as project_service.Snapshot
+    local temporary = saved.config.source_modules_root .. "/XXcompiler"
+    fs.write_file(temporary, "temporary reservation")
+    defer do
+      analyzer.block = false
+      if fs.lstat(temporary) ~= nil then fs.unlink(temporary) end
+    end
+
+    local metrics_before = app:indexing_metrics()
+    local epoch_before = app:change_epoch_for_testing()
+    local runs_before = analyzer.runs
+    fs.write_file(
+      filename, "function answer(): integer return 123456 end\n")
+    analyzer.block = true
+    analyzer.started = false
+    app:note_saved_change()
+    wait_until(function (): boolean return analyzer.started end,
+               "active temporary-file fixture analyzer did not start")
+
+    app:watch_callback(project_watcher.RediscoveryBatch.new({
+      project_watcher.PathChange.created(temporary),
+    }, {}, false))
+    wait_until(function (): boolean
+      return not app:directory_probe_active_for_testing()
+    end, "active extensionless regular-file probe did not finish")
+    test.assert(
+      app:change_epoch_for_testing() == epoch_before + 1 and
+      app:indexing_metrics().refresh_passes ==
+        metrics_before.refresh_passes + 1,
+      "compiler-style temporary queued a follow-up refresh")
+
+    analyzer.block = false
+    wait_until(function (): boolean
+      return not app:indexing_metrics().refresh_chain_active
+    end, "active temporary-file fixture did not finish")
+    test.assert(
+      analyzer.runs == runs_before + 1 and
+      app:indexing_metrics().refresh_passes ==
+        metrics_before.refresh_passes + 1,
+      "compiler-style temporary caused repeated analysis")
   end)
 end
 
@@ -882,7 +1110,7 @@ local function classifies_canonical_symlink_watcher_paths()
   fs.mkdir(package_directory)
   fs.write_file(filename, "function answer(): integer return 1 end\n")
   fs.write_file(config_file,
-    "return { source_modules_root = './src' }\n")
+    "source_modules_root = './src'\n")
   local linker = os.spawn("/bin/ln", {"-s", actual_root, linked_root})
   local link_input? = linker.stdin
   if link_input ~= nil then link_input:close() end
@@ -1213,6 +1441,15 @@ function test_application_indexing_state_machine(_context: test.Context)
       "later epoch failure retry", retries_failure_when_a_later_epoch_is_pending)
     run_indexing_case(
       "watcher filtering", filters_irrelevant_watcher_hints)
+    run_indexing_case(
+      "active extensionless temporary",
+      ignores_extensionless_temporary_during_active_refresh)
+    run_indexing_case(
+      "partial semantic view",
+      builds_semantics_from_independently_valid_modules)
+    run_indexing_case(
+      "same-generation partial repair",
+      publishes_recovered_partial_module_at_same_generation)
     run_indexing_case(
       "canonical symlink paths", classifies_canonical_symlink_watcher_paths)
     run_indexing_case(

@@ -571,7 +571,7 @@ async function testSavedProjectSemantics() {
     );
     assert.equal(hover.result.contents.kind, "markdown");
     assert.match(hover.result.contents.value, /integer/);
-    assert.match(hover.result.contents.value, /Declaration: non-local/);
+    assert.match(hover.result.contents.value, /Visibility: exported/);
     assert.deepEqual(hover.result.range, {
       start: { line: 4, character: unicodeUse },
       end: { line: 4, character: unicodeUse + "answer".length }
@@ -596,7 +596,7 @@ async function testSavedProjectSemantics() {
       /Cast to: `float`/);
     assert.doesNotMatch(coercionHover.result.contents.value,
       /Inferred type|Declared type|Original type|Coerced type/);
-    assert.match(coercionHover.result.contents.value, /Declaration: local/);
+    assert.match(coercionHover.result.contents.value, /Visibility: block/);
     assert.deepEqual(coercionHover.result.range, {
       start: { line: 7, character: coercedItem },
       end: { line: 7, character: coercedItem + "item".length }
@@ -649,24 +649,39 @@ async function testSavedProjectSemantics() {
     );
     assert.equal(unsupported.error.code, -32601);
 
-    // A failed saved generation must not fall back to the previously checked
-    // AST. The application refreshes from disk for each semantic request.
+    // An invalid saved module must not fall back to its previously checked
+    // AST or fail the whole workspace. It remains in the saved project used by
+    // rename preflight, but contributes no semantic snapshot until repaired.
     await writeSavedGeneration(
       responses,
       filename,
       "function answer(\n",
-      "failed"
+      "ready"
     );
-    const stale = await semanticRequest(
+    const partial = await semanticRequest(
       child,
       responses,
-      "stale",
+      "partial",
       "textDocument/definition",
-      documentPosition,
-      { expectedIndexingState: "failed" }
+      documentPosition
     );
-    assert.equal(stale.error.code, -32803);
-    assert.match(stale.error.message, /current saved generation/);
+    assert.equal(partial.error, undefined);
+    assert.equal(partial.result, null);
+
+    await writeSavedGeneration(
+      responses,
+      filename,
+      sourceLines.join("\n"),
+      "ready"
+    );
+    const recovered = await semanticRequest(
+      child,
+      responses,
+      "recovered",
+      "textDocument/definition",
+      documentPosition
+    );
+    assert.deepEqual(recovered.result, definition.result);
 
     const shutdown = await request(
       child,
@@ -756,7 +771,7 @@ async function testCrossModuleFolderAndIncrementalSemantics() {
   await mkdir(libraryRoot, { recursive: true });
   await writeFile(
     path.join(root, "titan-config.lua"),
-    "return { source_modules_root = 'src' }\n",
+    "source_modules_root = 'src'\n",
     "utf8"
   );
   const mainFile = path.join(libraryRoot, "library.titan");
@@ -877,24 +892,23 @@ async function testCrossModuleFolderAndIncrementalSemantics() {
     assert.equal(unchangedManifest.error, undefined);
     assert.equal(unchangedManifest.result.uri, partUri);
 
-    // A public interface change must invalidate and recheck the consumer in
-    // the same refresh fixed point instead of serving its prior annotated AST.
+    // A public interface change invalidates and rechecks the consumer in the
+    // same refresh fixed point. The changed provider remains indexed, while
+    // the now-invalid consumer contributes no stale semantic snapshot.
     await writeSavedGeneration(
       responses,
       partFile,
-      "function extra(item: integer): string return \"broken\" end\n",
-      "failed"
+      "function extra(item: integer): string return \"broken\" end\n"
     );
     const changedManifest = await semanticRequest(
       child,
       responses,
       "interface-change",
       "textDocument/definition",
-      extraPosition,
-      { expectedIndexingState: "failed" }
+      extraPosition
     );
-    assert.equal(changedManifest.error.code, -32803);
-    assert.match(changedManifest.error.message, /current saved generation/);
+    assert.equal(changedManifest.error, undefined);
+    assert.equal(changedManifest.result, null);
 
     await writeSavedGeneration(responses, partFile, validPart);
     const recovered = await semanticRequest(

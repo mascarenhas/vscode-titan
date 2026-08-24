@@ -105,22 +105,18 @@ local function normalize_include_dirs(config_file: string, base: string,
   return result
 end
 
-local function normalize_table(config_file: string, project_root: string,
-                               default_binary_root: string,
-                               candidate: value): ProjectConfig
-  if not (candidate is {value: value}) then
-    return fail<ProjectConfig>(
-      config_file, "titan-config.lua must return one Lua table")
-  end
-
+local function normalize_environment(config_file: string,
+                                     project_root: string,
+                                     default_binary_root: string,
+                                     environment: {value: value}):
+    ProjectConfig
   local raw_source_root: value = nil
   local raw_binary_root: value = nil
   local raw_include_dirs: value = nil
-  local raw = candidate as {value: value}
-  for key, item in iteration.pairs(raw) do
+  for key, item in iteration.pairs(environment) do
     if not (key is string) then
       return fail<ProjectConfig>(
-        config_file, "titan-config.lua keys must be strings")
+        config_file, "titan-config.lua global names must be strings")
     end
     local name = key as string
     if name == "source_modules_root" then
@@ -166,24 +162,31 @@ local function load_or_raise(project_root: string,
       config_file, "titan-config.lua is not a regular file")
   end
 
-  local candidate: value = nil
+  local environment: {value: value} = {}
+  local returned: value = nil
   do
     -- Configuration is data, not an extension hook. Evaluate it with an
     -- empty environment so workspace code cannot write protocol-corrupting
     -- bytes through print/io (or mutate the embedded compiler Lua state).
-    -- A valid file needs only Lua literals and `return { ... }`.
+    -- A valid file needs only assignments and Lua literals. The environment
+    -- itself is the result; accepting a returned table would silently support
+    -- a second, incompatible configuration format.
     local source = fs.read_file(config_file)
-    local environment: {string: value} = {}
     local chunk = lua.load(source, "@" .. config_file, environment)
-    candidate = chunk()
+    returned = chunk()
   catch
     if error is async.CancellationReason then raise end
     return fail<ProjectConfig>(
       config_file,
       "cannot evaluate titan-config.lua: " .. strings.tostring(error))
   end
-  return normalize_table(
-    config_file, root, default_binary_root, candidate)
+  if returned ~= nil then
+    return fail<ProjectConfig>(
+      config_file,
+      "titan-config.lua must use global assignments and return no value")
+  end
+  return normalize_environment(
+    config_file, root, default_binary_root, environment)
 end
 
 -- The caller supplies the installed ABI directory reported by the compatible

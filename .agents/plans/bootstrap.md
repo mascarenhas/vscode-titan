@@ -137,7 +137,9 @@ refresh failure invalidates the fallback until a later refresh succeeds.
 ### Configuration
 
 Read an optional project-root `titan-config.lua` in the embedded Lua state and
-normalize it immediately to a typed record. Support:
+normalize it immediately to a typed record. Evaluate it in an otherwise empty
+environment and read configuration from its global assignments; it does not
+return a table. Support:
 
 - `source_modules_root`, defaulting to the project root;
 - `extra_ffi_include_dirs`, expressed as an ordinary Lua array table such as
