@@ -431,6 +431,72 @@ suite("Titan extension", () => {
     );
   });
 
+  test("surfaces saved diagnostics and clears them when the client reloads",
+    async function () {
+      this.timeout(30_000);
+      await resetMarker(alphaMarkerPath);
+      const diagnosticArguments = [
+        "../fake-lsp-server.cjs",
+        ".titan-lsp-test/events.jsonl",
+        "--diagnostics",
+        "--fixture-token",
+        "alpha-diagnostics"
+      ];
+      await vscode.workspace.getConfiguration(
+        "titan.languageServer",
+        alpha.uri
+      ).update(
+        "arguments",
+        diagnosticArguments,
+        vscode.ConfigurationTarget.WorkspaceFolder
+      );
+      await waitForInitializationToken(
+        alphaMarkerPath,
+        "alpha-diagnostics",
+        10_000
+      );
+
+      const documentUri = vscode.Uri.joinPath(alpha.uri, "sample.titan");
+      const published = await waitForDocumentDiagnostics(
+        documentUri,
+        (items) => items.length === 1,
+        10_000
+      );
+      assert.equal(published[0].message, "fixture saved-source type error");
+      assert.equal(published[0].source, "Titan");
+      assert.equal(published[0].code, "type");
+      assert.equal(published[0].severity, vscode.DiagnosticSeverity.Error);
+      assert.equal(published[0].range.start.line, 1);
+      assert.equal(published[0].range.start.character, 2);
+      assert.equal(published[0].range.end.line, 1);
+      assert.equal(published[0].range.end.character, 2);
+
+      await vscode.workspace.getConfiguration(
+        "titan.languageServer",
+        alpha.uri
+      ).update(
+        "arguments",
+        [
+          "../fake-lsp-server.cjs",
+          ".titan-lsp-test/events.jsonl",
+          "--fixture-token",
+          "alpha-after-diagnostics"
+        ],
+        vscode.ConfigurationTarget.WorkspaceFolder
+      );
+      await waitForInitializationToken(
+        alphaMarkerPath,
+        "alpha-after-diagnostics",
+        10_000
+      );
+      await waitForDocumentDiagnostics(
+        documentUri,
+        (items) => items.length === 0,
+        10_000
+      );
+    }
+  );
+
   test("maps a remote workspace across the stdio URI boundary", () => {
     const remoteFolder: vscode.WorkspaceFolder = {
       index: 0,
@@ -1234,6 +1300,24 @@ async function readEvents(file: string): Promise<FixtureEvent[]> {
     }
     throw error;
   }
+}
+
+async function waitForDocumentDiagnostics(
+  uri: vscode.Uri,
+  predicate: (items: readonly vscode.Diagnostic[]) => boolean,
+  timeoutMilliseconds: number
+): Promise<readonly vscode.Diagnostic[]> {
+  const deadline = Date.now() + timeoutMilliseconds;
+  let observed: readonly vscode.Diagnostic[] = [];
+  while (Date.now() < deadline) {
+    observed = vscode.languages.getDiagnostics(uri);
+    if (predicate(observed)) return observed;
+    await delay(50);
+  }
+  assert.fail(
+    `timed out waiting for diagnostics for ${uri.toString()}; observed ` +
+      observed.map((item) => item.message).join(", ")
+  );
 }
 
 async function waitForTraceValue(

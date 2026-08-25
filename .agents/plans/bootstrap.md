@@ -109,13 +109,17 @@ LSP open/change notifications do not become semantic input in V1. A request is
 answered from the newest completed generation derived from files on disk.
 Changes are detected through project `.titan` watchers and coalesced.
 
-Every read-only request starts or shares a background refresh and returns
-without joining it. It may use the immutable preceding completed generation
-while revalidating intentionally unwatched external inputs; after a saved-file
-hint it returns the feature's empty/null result until that saved generation is
-published. Rename always joins and performs its second disk-generation check.
-A known refresh failure invalidates the fallback until a later refresh
-succeeds.
+An unchanged read-only request uses the immutable completed generation without
+starting a source-tree scan. A saved-file watcher hint starts one coalesced
+background refresh; while its newer epoch is pending, read-only requests keep
+using the preceding immutable generation without joining. Intentionally
+unwatched external inputs are revalidated by the next saved-project refresh or
+strict rename refresh. Rename always joins and performs its second
+disk-generation check. A known refresh failure is authoritative only for that
+exact saved epoch, and unchanged read-only requests do not retry it. A later
+saved hint supersedes the failure while its repair refresh runs, so read-only
+requests may again use the preceding immutable view; a strict rename instead
+joins its explicit retry.
 
 - File content change invalidates its owning module.
 - Creating or deleting a constituent of a folder module invalidates that whole
@@ -159,11 +163,17 @@ return a table. Support:
 - `source_modules_root`, defaulting to the project root;
 - `extra_ffi_include_dirs`, expressed as an ordinary Lua array table such as
   `{ "./include" }`;
+- `extra_ffi_cppflags`, expressed as a shell-word string parsed with the
+  compiler's existing `TITAN_EXTRA_CPPFLAGS` rules and appended after the
+  inherited preprocessing flags;
 - `binary_modules_root`, defaulting to the installed Titan library-versioned
   tree.
 
-Paths are resolved relative to the configuration file. Configuration changes
-invalidate project discovery and the module graph.
+Paths are resolved relative to the configuration file. FFI flags are installed
+only while that workspace owns the shared compiler state and the inherited
+driver table is restored before another compiler runs. Configuration changes,
+including a flags-only change, invalidate project discovery and the module
+graph.
 
 ## Implementation phases and gates
 
@@ -249,8 +259,10 @@ through the compiled server.
   through definitions, references, hover, folding, and rename previews.
 - Run the full Make/npm/Titan gates, inspect the packaged contents and native
   dependencies, and review scope against every acceptance criterion.
-- Commit exact paths to `main`. If Titan changed, finish its separate tests and
-  open its PR only after this repository is wrapped.
+- Commit exact paths to a feature branch and open a reviewed pull request. If
+  Titan changed, publish its separately tested prerequisite branch first and
+  pin the exact compiler commit in this repository's CI until that prerequisite
+  lands.
 
 Gate: a clean checkout can reproduce the executable and VSIX, Titan and
 JavaScript suites pass, VS Code and Codex both connect, and every Project item
@@ -295,22 +307,48 @@ has evidence before moving to Done.
   supported manifest contract.
 - Project analysis states distinguish pending work from a current diagnostic.
   Failed revisions leave the compiler queue and partial semantic index until a
-  relevant observed input changes; repeated semantic requests only revalidate
-  intentionally unwatched inputs.
+  relevant observed input changes. Repeated semantic requests reuse the settled
+  ready generation or failure without rescanning; intentionally unwatched
+  inputs are revalidated by the next saved-project refresh or strict rename.
 - Compiler-observed provider identities close first binary and contextual
   discovery races without forcing a duplicate whole-project pass when the
   installed provider remained stable. The bridge retains and revalidates every
   binary provider observation, requires one consistent binary kind/path across
   attempts, and still permits a later source-required import to select source
   for the final snapshot.
-- On the final integrated native server, the actual-usage vscode-titan
+- On the earlier forced-refresh integrated server, the actual-usage vscode-titan
   benchmark cold-indexed all 47 saved files in one compiler analysis and 27
   root attempts: 9,175.704 ms wall, 9,140 ms child CPU, and 805,836 KiB peak
   server RSS. A hover issued before readiness returned the intentional no-data
   result in 3.271 ms; ready hover and method definition took 1.275 ms and
-  1.450 ms, and an unchanged refresh took 20.153 ms with no progress work. The
+  1.450 ms, and the then-required unchanged refresh took 20.153 ms with no
+  progress work. The
   cold run published 48 progress updates through 47/47 files, while the
   unchanged refresh published none. The bounded-cache comparison which
   isolated the language-server change measured 18,058.798 ms and 54 attempts
   with the redundant pass versus 8,894.386 ms and 27 attempts without it, a
   50.75% cold-wall reduction.
+- With the Titan checkout's production FFI configuration and the refreshed
+  0.6.0 compiler, one persistent-server confirmation indexed generation 89's
+  143 saved files in one initial epoch: 262,698.682 ms wall, 177,610 ms child
+  CPU, and 2,952,360 KiB peak RSS. There was no duplicate pass or dirty-watch
+  restart. Ready `uv.sleep` hover/definition took 1.429/1.704 ms;
+  `async.titan` and `fs.titan` hovers took 3.344/3.800 ms; and the
+  `os.titan` source-import definition took 4.122 ms. The unchanged request pair
+  emitted zero indexing statuses and consumed zero sampled child CPU.
+- The final exclusive-attribution trace is
+  `/tmp/vscode-titan-cold-profile-phases.json`, SHA-256
+  `5ac2b57223cb87483010a3d8156261ff94ff6f991ddcddac64d0dd2879dcae31`.
+  It indexed the same 143 saved files in one generation and took 314,637.283 ms
+  wall, 185,590 ms sampled child CPU, and 2,757,148 KiB peak server RSS. Source
+  self time decomposed into 959.517 ms parsing, 65,897.188 ms checking and
+  direct probe orchestration, and 2,110.215 ms other driver work; bridge
+  normalization used 4,325.915 ms and complete header processing plus Titan
+  FFI conversion used 89,690.821 ms. `titan.uv` accounted for 18,335.078 ms:
+  57.657 ms parsing, 17,231.156 ms checking/probes, 640.401 ms other work, and
+  405.864 ms normalization. Its first attributable call used 17,823.844 ms;
+  27 later calls used 511.234 ms in total. The ready hover/source-import
+  definition probes all succeeded, and the unchanged request batch completed
+  in 14.600 ms with zero indexing-status notifications. The persistent-success
+  probe stream recorded 10 hits and 1,075 misses after the isolated toolchain
+  rebuild; deterministic negative-result reuse is tracked as P0 in Titan #108.

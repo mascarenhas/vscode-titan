@@ -16,6 +16,7 @@ record ProjectConfig
   source_modules_root: string
   binary_modules_root: string
   extra_ffi_include_dirs: {string}
+  extra_ffi_cppflags: string?
 end
 
 local function fail<T>(path: string, message: string): T
@@ -58,6 +59,15 @@ local function optional_path(config_file: string, base: string,
   end
   return resolve_config_path(
     config_file, base, candidate as string, field)
+end
+
+local function optional_string(config_file: string, candidate: value,
+                               field: string): string?
+  if candidate == nil then return nil end
+  if not (candidate is string) then
+    return fail<string>(config_file, field .. " must be a string")
+  end
+  return candidate as string
 end
 
 local function normalize_include_dirs(config_file: string, base: string,
@@ -113,6 +123,7 @@ local function normalize_environment(config_file: string,
   local raw_source_root: value = nil
   local raw_binary_root: value = nil
   local raw_include_dirs: value = nil
+  local raw_cppflags: value = nil
   for key, item in iteration.pairs(environment) do
     if not (key is string) then
       return fail<ProjectConfig>(
@@ -125,6 +136,8 @@ local function normalize_environment(config_file: string,
       raw_binary_root = item
     elseif name == "extra_ffi_include_dirs" then
       raw_include_dirs = item
+    elseif name == "extra_ffi_cppflags" then
+      raw_cppflags = item
     else
       return fail<ProjectConfig>(
         config_file, "unknown titan-config.lua field '" .. name .. "'")
@@ -139,8 +152,11 @@ local function normalize_environment(config_file: string,
     "binary_modules_root", default_binary_root)
   local include_dirs = normalize_include_dirs(
     config_file, project_root, raw_include_dirs)
+  local cppflags: string? = optional_string(
+    config_file, raw_cppflags, "extra_ffi_cppflags")
   return ProjectConfig.new(
-    project_root, config_file, source_root, binary_root, include_dirs)
+    project_root, config_file, source_root, binary_root, include_dirs,
+    cppflags)
 end
 
 local function load_or_raise(project_root: string,
@@ -155,7 +171,7 @@ local function load_or_raise(project_root: string,
 
   local metadata? = fs.stat(config_file)
   if metadata == nil then
-    return ProjectConfig.new(root, nil, root, default_binary_root, {})
+    return ProjectConfig.new(root, nil, root, default_binary_root, {}, nil)
   end
   if metadata.kind ~= "file" then
     return fail<ProjectConfig>(

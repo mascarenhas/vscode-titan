@@ -2,6 +2,7 @@ local async = import "async"
 local fs = import "fs"
 local strings = import "string"
 local bridge = import "server.compiler_bridge"
+local diagnostics = import "server.diagnostics"
 local dispatcher = import "server.dispatcher"
 local indexing_status = import "server.indexing_status"
 local json = import "server.json"
@@ -80,6 +81,7 @@ record Application
   local refresh_task: async.Task<RefreshOutcome, value>?
   local completed_view: View?
   local refresh_failure: Error?
+  local failed_epoch: integer?
   local change_epoch: integer
   local completed_epoch: integer
   local active_refresh_epoch: integer?
@@ -92,6 +94,7 @@ record Application
   local closed: boolean
   local directory_probes: DirectoryProbes
   local const rename_analyzer: RenameAnalyzer
+  local const diagnostic_publisher: diagnostics.Publisher
 end
 
 -- Source-imported application tests use these counters to assert coalescing and
@@ -511,8 +514,8 @@ local function Application:watch_callback(
     })
   end
   if relevant then
-    -- Watch events are hints only. The next semantic request rediscovers the
-    -- complete saved project and never consumes editor notification text.
+    -- Watch events are hints only. Start rediscovery of the complete saved
+    -- project immediately and never consume editor notification text.
     self:note_saved_change()
   end
   for index = 1, #batch.failures do
@@ -735,9 +738,16 @@ end
 local function Application:start_refresh(force: boolean, reason: string):
     async.Task<RefreshOutcome, value>?
   if self.closed or self.refresh_task ~= nil then return self.refresh_task end
-  if not force and self.completed_view ~= nil and
-     self.completed_epoch >= self.change_epoch then
-    return nil
+  if not force then
+    if self.completed_view ~= nil and
+       self.completed_epoch >= self.change_epoch then
+      return nil
+    end
+    local failed_epoch? = self.failed_epoch
+    if self.refresh_failure ~= nil and failed_epoch ~= nil and
+       failed_epoch >= self.change_epoch then
+      return nil
+    end
   end
 
   local target_epoch = self.change_epoch
@@ -751,81 +761,105 @@ local function Application:start_refresh(force: boolean, reason: string):
   end
   local chain = self.refresh_chain as RefreshChain
   local task = async.run<RefreshOutcome, value>(function (): RefreshOutcome
-    local started = logging.clock()
-    self.refresh_passes = self.refresh_passes + 1
-    logging.emit("debug", "indexing.pass.start", {
-      json.Member.new("chain", json.from_integer(chain.id)),
-      json.Member.new("chain_reason", json.from_string(chain.reason)),
-      json.Member.new("trigger", json.from_string(reason)),
-      json.Member.new("epoch", json.from_integer(target_epoch)),
-      json.Member.new("force", json.from_boolean(force)),
-      json.Member.new("pass", json.from_integer(self.refresh_passes)),
-      json.Member.new("follow_up", json.from_boolean(
-        self.refresh_passes > chain.first_pass + 1)),
-    })
-    local outcome: RefreshOutcome? = nil
     do
-      outcome = self:refresh_once()
+      local started = logging.clock()
+      self.refresh_passes = self.refresh_passes + 1
+      logging.emit("debug", "indexing.pass.start", {
+        json.Member.new("chain", json.from_integer(chain.id)),
+        json.Member.new("chain_reason", json.from_string(chain.reason)),
+        json.Member.new("trigger", json.from_string(reason)),
+        json.Member.new("epoch", json.from_integer(target_epoch)),
+        json.Member.new("force", json.from_boolean(force)),
+        json.Member.new("pass", json.from_integer(self.refresh_passes)),
+        json.Member.new("follow_up", json.from_boolean(
+          self.refresh_passes > chain.first_pass + 1)),
+      })
+      local completed = self:refresh_once()
+      local outcome_name = "unknown"
+      local outcome_message: string? = nil
+      local diagnostic_publications: {diagnostics.Publication}? = nil
+      case completed
+      when failure: failure then
+        outcome_name = "failed"
+        outcome_message = failure.message
+        self.refresh_failure = failure
+        self.failed_epoch = target_epoch
+      when ready: view then
+        outcome_name = "ready"
+        -- Publish every successful pass even when a later hint arrived. Retain
+        -- and serve that immutable generation while the single coalesced
+        -- follow-up runs.
+        self.completed_view = view
+        self.completed_epoch = target_epoch
+        self.refresh_failure = nil
+        self.failed_epoch = nil
+        if self.diagnostic_publisher:enabled() and
+           self.change_epoch == target_epoch then
+          diagnostic_publications = diagnostics.from_snapshot_with_yield(
+            view.snapshot)
+        end
+      end
+
+      case completed
+      when failure then
+        -- A failed refresh cannot validate diagnostics from the preceding saved
+        -- epoch. Clear them while the watcher waits for a repair.
+        self.diagnostic_publisher:clear()
+      when ready then
+        -- Building UTF-16 coordinates can yield. Publish only if no newer save
+        -- arrived during that work; the coalesced follow-up owns the replacement.
+        if diagnostic_publications ~= nil and
+           self.change_epoch == target_epoch then
+          self.diagnostic_publisher:publish(diagnostic_publications)
+        end
+      end
+
+      logging.emit("debug", "indexing.pass.complete", {
+        json.Member.new("chain", json.from_integer(chain.id)),
+        json.Member.new("trigger", json.from_string(reason)),
+        json.Member.new("epoch", json.from_integer(target_epoch)),
+        json.Member.new("outcome", json.from_string(outcome_name)),
+        json.Member.new("pending_epoch", json.from_integer(self.change_epoch)),
+        json.Member.new("cpu_ms", json.from_number(
+          logging.elapsed_ms(started))),
+      })
+
+      self.refresh_task = nil
+      self.active_refresh_epoch = nil
+      if not self.closed and self.change_epoch > target_epoch then
+        -- Start at most one next-turn pass for every burst. Epoch comparison,
+        -- rather than clearing a boolean, preserves a hint delivered at any
+        -- yielding point in scan, analysis, view construction, or reconciliation.
+        self:start_refresh(false, "coalesced_follow_up")
+      else
+        self:complete_refresh_chain(
+          outcome_name, target_epoch, outcome_message)
+        case completed
+        when failure: failure then
+          self:emit_indexing_status(
+            indexing_status.State.failed(), failure.message)
+        when ready: view then
+          self:emit_indexing_status(indexing_status.State.ready(), nil)
+        end
+      end
+      return completed
     catch
+      -- Cover refresh, diagnostic conversion/publication, logging, and status
+      -- delivery with the same terminal cleanup. No post-refresh exception may
+      -- strand the active epoch or suppress all later saved-file refreshes.
       self.refresh_task = nil
       self.active_refresh_epoch = nil
       if error is async.CancellationReason then
         self:complete_refresh_chain("cancelled", target_epoch, nil)
         raise
       end
+      -- Terminal cleanup must not depend on any best-effort output path.
+      do self.diagnostic_publisher:clear() catch end
       -- Preserve the original exceptional value. Its normalization is not
       -- allowed to become another failure merely to enrich telemetry.
       self:complete_refresh_chain("failed", target_epoch, nil)
       raise
     end
-
-    local completed = outcome as RefreshOutcome
-    local outcome_name = "unknown"
-    local outcome_message: string? = nil
-    case completed
-    when failure: failure then
-      outcome_name = "failed"
-      outcome_message = failure.message
-      self.refresh_failure = failure
-    when ready: view then
-      outcome_name = "ready"
-      -- Publish every successful pass even when a later hint arrived. Retain
-      -- the immutable generation while the single coalesced follow-up runs;
-      -- current_view still withholds it while change_epoch remains newer.
-      self.completed_view = view
-      self.completed_epoch = target_epoch
-      self.refresh_failure = nil
-    end
-
-    logging.emit("debug", "indexing.pass.complete", {
-      json.Member.new("chain", json.from_integer(chain.id)),
-      json.Member.new("trigger", json.from_string(reason)),
-      json.Member.new("epoch", json.from_integer(target_epoch)),
-      json.Member.new("outcome", json.from_string(outcome_name)),
-      json.Member.new("pending_epoch", json.from_integer(self.change_epoch)),
-      json.Member.new("cpu_ms", json.from_number(
-        logging.elapsed_ms(started))),
-    })
-
-    self.refresh_task = nil
-    self.active_refresh_epoch = nil
-    if not self.closed and self.change_epoch > target_epoch then
-      -- Start at most one next-turn pass for every burst. Epoch comparison,
-      -- rather than clearing a boolean, preserves a hint delivered at any
-      -- yielding point in scan, analysis, view construction, or reconciliation.
-      self:start_refresh(false, "coalesced_follow_up")
-    else
-      self:complete_refresh_chain(
-        outcome_name, target_epoch, outcome_message)
-      case completed
-      when failure: failure then
-        self:emit_indexing_status(
-          indexing_status.State.failed(), failure.message)
-      when ready: view then
-        self:emit_indexing_status(indexing_status.State.ready(), nil)
-      end
-    end
-    return completed
   end)
   self.refresh_task = task
   return task
@@ -839,6 +873,22 @@ end
 
 function Application:set_indexing_listener(listener: indexing_status.Listener?)
   self.indexing_listener = listener
+end
+
+function Application:set_diagnostics_listener(listener: diagnostics.Listener?)
+  self.diagnostic_publisher:set_listener(listener)
+  local completed? = self.completed_view
+  if not self.closed and listener ~= nil and completed ~= nil then
+    self.diagnostic_publisher:publish(
+      diagnostics.from_snapshot_with_yield(completed.snapshot))
+  end
+end
+
+-- The LSP shutdown request must empty active Problems entries before the
+-- protocol writer is stopped. Disable the listener after that replacement so
+-- a still-unwinding refresh cannot republish after shutdown.
+function Application:stop_diagnostics()
+  self.diagnostic_publisher:stop()
 end
 
 local function Application:indexing_metrics(): IndexingMetrics
@@ -890,29 +940,31 @@ local function joined_view(task: async.Task<RefreshOutcome, value>):
   return nil, Error.new("project refresh produced no result")
 end
 
--- Read-only features may use a completed View while an unchanged-epoch check
--- revalidates intentionally unwatched external inputs. A watcher hint advances
--- change_epoch, so the preceding View is no longer eligible until that saved
--- generation is published. A terminal refresh failure likewise remains
--- authoritative while a later retry is in flight.
+-- Read-only features use the last completed immutable View without probing
+-- disk again. Saved project watcher hints start one coalesced refresh; while
+-- it is running, the preceding View remains serviceable rather than blocking
+-- requests or returning empty results. Intentionally unwatched external inputs
+-- are revalidated by the next saved-project refresh or strict rename refresh.
+-- A terminal refresh failure is authoritative for that saved epoch and is not
+-- retried by unchanged read-only requests; a later saved hint or strict rename
+-- may retry it.
 local function Application:current_view(): (View?, Error?)
   if self.closed then
     return nil, Error.new("language server application is closed")
   end
 
-  -- Refreshing on every semantic request also revalidates external imports,
-  -- whose trees are intentionally not watched. Concurrent requests share the
-  -- same refresh Task instead of starting overlapping scans or compiler runs.
-  -- Each request starts a shared background revalidation for intentionally
-  -- unwatched external inputs. It never waits: use the latest completed View,
-  -- or let the feature return its empty/null result during the initial index.
-  self:start_refresh(true, "semantic_request")
+  -- This joins/starts work only when a saved watcher epoch is pending. An
+  -- unchanged hover/definition/folding request must not rescan the entire
+  -- source tree merely to return an already immutable semantic generation.
+  self:start_refresh(false, "semantic_request")
   local failure? = self.refresh_failure
-  if failure ~= nil then return nil, failure end
-  local completed? = self.completed_view
-  if completed ~= nil and self.completed_epoch >= self.change_epoch then
-    return completed, nil
+  local failed_epoch? = self.failed_epoch
+  if failure ~= nil and failed_epoch ~= nil and
+     failed_epoch >= self.change_epoch then
+    return nil, failure
   end
+  local completed? = self.completed_view
+  if completed ~= nil then return completed, nil end
   return nil, nil
 end
 
@@ -1043,7 +1095,8 @@ local function default_rename_analyzer(
   compiler:configure_paths(
     snapshot.config.source_modules_root,
     snapshot.config.binary_modules_root,
-    snapshot.config.extra_ffi_include_dirs)
+    snapshot.config.extra_ffi_include_dirs,
+    snapshot.config.extra_ffi_cppflags)
   return compiler:analyze(snapshot.project_modules[1].module_name, projects)
 end
 
@@ -1108,8 +1161,8 @@ end
 function create(project_root: string): Application
   return Application.new(
     project_root, project_service.load_default, nil, nil, nil, nil, nil, nil,
-    1, 0, nil, nil, false, 0, 0, 0, nil, false,
-    new_directory_probes(), default_rename_analyzer)
+    nil, 1, 0, nil, nil, false, 0, 0, 0, nil, false,
+    new_directory_probes(), default_rename_analyzer, diagnostics.create())
 end
 
 -- Dependency-injected constructor used by the project/application integration
@@ -1119,8 +1172,8 @@ function create_with_service(project_root: string,
                              service: project_service.Service): Application
   local application = Application.new(
     project_root, project_service.load_default, service, nil, nil, nil, nil,
-    nil, 0, 0, nil, nil, false, 0, 0, 0, nil, false,
-    new_directory_probes(), default_rename_analyzer)
+    nil, nil, 0, 0, nil, nil, false, 0, 0, 0, nil, false,
+    new_directory_probes(), default_rename_analyzer, diagnostics.create())
   application.completed_view = application:install_view(service:latest())
   return application
 end
@@ -1131,8 +1184,8 @@ local function create_unindexed_with_service(
     project_root: string, service: project_service.Service): Application
   return Application.new(
     project_root, project_service.load_default, service, nil, nil, nil, nil,
-    nil, 1, 0, nil, nil, false, 0, 0, 0, nil, false,
-    new_directory_probes(), default_rename_analyzer)
+    nil, nil, 1, 0, nil, nil, false, 0, 0, 0, nil, false,
+    new_directory_probes(), default_rename_analyzer, diagnostics.create())
 end
 
 -- Source-imported application tests use an analyzer-backed loader to exercise
@@ -1141,9 +1194,9 @@ end
 local function create_with_project_loader(
     project_root: string, project_loader: ProjectLoader): Application
   return Application.new(
-    project_root, project_loader, nil, nil, nil, nil, nil, nil, 1, 0, nil,
-    nil, false, 0, 0, 0, nil, false, new_directory_probes(),
-    default_rename_analyzer)
+    project_root, project_loader, nil, nil, nil, nil, nil, nil, nil, 1, 0,
+    nil, nil, false, 0, 0, 0, nil, false, new_directory_probes(),
+    default_rename_analyzer, diagnostics.create())
 end
 
 function create_with_service_and_rename_analyzer(
@@ -1151,8 +1204,8 @@ function create_with_service_and_rename_analyzer(
     rename_analyzer: RenameAnalyzer): Application
   local application = Application.new(
     project_root, project_service.load_default, service, nil, nil, nil, nil,
-    nil, 0, 0, nil, nil, false, 0, 0, 0, nil, false,
-    new_directory_probes(), rename_analyzer)
+    nil, nil, 0, 0, nil, nil, false, 0, 0, 0, nil, false,
+    new_directory_probes(), rename_analyzer, diagnostics.create())
   application.completed_view = application:install_view(service:latest())
   return application
 end
@@ -1179,6 +1232,7 @@ end
 function Application:close()
   if self.closed then return end
   self.closed = true
+  self.diagnostic_publisher:stop()
   self.indexing_listener = nil
 
   local directory_probe? = self.directory_probes.task

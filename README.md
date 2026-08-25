@@ -72,7 +72,7 @@ successful compilation by itself is not a successful test run.
 
 To measure the production server against this repository's saved Titan source,
 including cold-index wall/CPU time, peak RSS, request responsiveness, and an
-unchanged refresh, run:
+unchanged hover/definition pair that must not start indexing, run:
 
 ```sh
 node scripts/benchmark-server.mjs --server bin/titan-language-server
@@ -81,6 +81,64 @@ node scripts/benchmark-server.mjs --server bin/titan-language-server
 The benchmark defaults to the extension's `debug` server-emission level so its
 numbers represent normal VS Code use. Pass `--log-level off` only when measuring
 the lower bound without structured-log overhead.
+
+An alternate saved target and additional ready-state probes can exercise a
+larger workspace in the same persistent server session. Probe positions are
+zero-based LSP line/character coordinates. The benchmark canonicalizes the
+workspace root and requires target files to be direct regular files below it;
+target paths that traverse symlinks are rejected, matching project discovery.
+
+```sh
+node scripts/benchmark-server.mjs \
+  --server bin/titan-language-server --root ../titan \
+  --file titan/timer.titan --marker 'uv.sleep(milliseconds)' --symbol sleep \
+  --probe hover:titan/async.titan:7:16 \
+  --probe definition:titan/os.titan:196:15
+```
+
+The per-file cold-start breakdown requires compiler trace records:
+
+```sh
+node scripts/benchmark-server.mjs \
+  --server bin/titan-language-server --root ../titan \
+  --file titan/timer.titan --marker 'uv.sleep(milliseconds)' --symbol sleep \
+  --log-level trace
+```
+
+With trace logging enabled, `coldProfile.modules` reports each module's own
+compiler CPU plus language-server normalization without charging recursive
+dependencies to its importer. A row's `inclusiveCpuMs` retains recursive timing
+context, but those overlapping values are deliberately not added to the module
+totals. Within `selfCpuMs`, `parseCpuMs` and `checkCpuMs` attribute the
+compiler's parsing and checking work, while `otherCpuMs` is the remaining
+direct compiler work; apart from displayed rounding, those three fields sum to
+`selfCpuMs`. Structurally impossible trace records whose parse and check work
+exceeds self-time are rejected instead of concealing overlap. Per-identity
+`firstCallCpuMs`, `reuseTotalCpuMs`, `reuseCalls`,
+`reuseAverageCpuMs`, and `reuseMaxCpuMs` separate the first observed attributed
+operation from later reuse work. Source self-time and normalization are separate
+streams, as are complete header processing and downstream FFI conversion: the
+first value combines the first record from each stream, while reuse statistics
+combine every remaining record. `reuseCalls` counts those remaining attributable
+records, and the average and maximum use that same set. The trace has no call ID,
+so these fields do not claim that a source record is correlated with a particular
+normalization record or that a header request is correlated with a particular
+conversion record.
+
+`coldProfile.headers` attributes only each header's complete processing time
+plus downstream FFI conversion. Component header phases remain visible for
+diagnosis but are not added again. `coldProfile.probeCaches` summarizes
+persistent-success disk-cache lookups by their real `baseline` or `candidate`
+probe stage; hit rates are fractions from zero to one. Its `persistentSuccess`
+section also ranks the modules responsible for those disk-cache hits and misses,
+so a cold run's avoidable C compiler probes are visible without retaining every
+individual trace key in memory.
+
+Module and header durations are process-CPU attribution, not Task-exclusive
+clocks. An async suspension can therefore let unrelated server Task CPU enter an
+active interval. The benchmark sends only its intentional empty immediate-hover
+responsiveness probe before the index is ready; all data-bearing semantic probes
+wait for readiness, so the cold-start rows principally isolate compiler work.
 
 ## Run the extension during development
 
@@ -135,6 +193,12 @@ the language-server output when selected. Read-only language features stay
 responsive during indexing and return their ordinary empty result until an
 initial generation is available.
 
+Compiler errors from each completed saved-file generation appear in VS Code's
+**Problems** view. Their locations are converted from compiler byte columns
+using the saved source text; unsaved editor contents are not diagnostic input.
+Repairing or deleting a file, changing the configured source root, or stopping
+the workspace language client clears the corresponding stale entries.
+
 ### Language-server diagnostics and protocol tracing
 
 Run **Titan: Show Language Server Output** from the Command Palette to reveal
@@ -174,14 +238,23 @@ values as globals. Relative paths are resolved from that root:
 source_modules_root = "src"
 binary_modules_root = ".titan/lib/titan/0.6"
 extra_ffi_include_dirs = { "include", "vendor/include" }
+extra_ffi_cppflags = "-DPROJECT_FFI=1 '-Ivendor path/include'"
 ```
 
 All fields are optional. The source root defaults to the workspace root, the
 binary root defaults to the compatible compiler installation, and the FFI
-include list defaults to empty. Unknown fields and returned values are
-rejected. Configuration runs in an otherwise empty Lua environment, so it can
-assign these values but cannot write unframed bytes to the language server's
-stdout or mutate compiler state.
+include list defaults to empty. `extra_ffi_cppflags` is parsed with the
+compiler's existing `TITAN_EXTRA_CPPFLAGS` shell-word rules and appended to
+the value inherited by the workspace-isolated server process. It accepts the
+same ordered `-I`/`-D` preprocessing arguments used by `titanc`. Unknown fields
+and returned values are rejected. Configuration runs in an otherwise empty
+Lua environment, so it can assign these values but cannot write unframed bytes
+to the language server's stdout or mutate compiler state.
+
+This setting controls language-server analysis only. Keep the normal build's
+`TITAN_EXTRA_CPPFLAGS` equivalent when invoking `titanc`; otherwise editor
+semantics and command-line compilation can intentionally see different C
+preprocessing environments.
 
 Project discovery intentionally ignores symlinked files and directories below
 the configured source root in version 1. This keeps project identity and the
@@ -235,14 +308,18 @@ hovers summarize visible top-level members without recursively expanding
 nominal types. These summaries are normalized and cached with the immutable
 semantic index rather than rebuilt by individual hover requests.
 
-A read-only request starts a shared saved-file refresh without waiting. Before
-the initial index is ready it returns the feature's ordinary empty result; an
-unchanged background revalidation can serve the immutable completed generation.
-A watcher hint classified as a saved-project change makes that preceding
-generation ineligible until the changed saved state has been checked. A known
-compiler/configuration failure remains authoritative during retry. Rename always
-waits for the stable newest generation and revalidates disk state after
-preflight.
+An unchanged read-only request uses the immutable completed generation without
+rescanning the project. Before the initial index is ready it returns the
+feature's ordinary empty result. A watcher hint classified as a saved-project
+change starts one coalesced refresh; read-only requests keep using the preceding
+immutable generation while that work runs. Intentionally unwatched external
+inputs are revalidated by the next saved-project refresh or strict rename
+refresh. A known compiler/configuration failure remains authoritative for its
+exact saved epoch and is not retried by unchanged read-only requests. A later
+saved hint supersedes that failure while its repair refresh runs, allowing
+read-only requests to use the preceding immutable generation; a strict rename
+instead joins its explicit retry. Rename always waits for the stable newest
+generation and revalidates disk state after preflight.
 
 A saved module rejected by the compiler has no semantic data for that
 generation, but it does not prevent independently valid project modules from

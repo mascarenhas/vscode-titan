@@ -1,0 +1,235 @@
+local async = import "async"
+local strings = import "string"
+local bridge = import "server.compiler_bridge"
+local json = import "server.json"
+local lsp = import "server.lsp_types"
+local project_service = import "server.project_service"
+local source_text = import "server.source_text"
+
+record Item
+  const kind: bridge.DiagnosticKind
+  const message: string
+  const range: source_text.Span
+end
+
+record Publication
+  const uri: string
+  const items: {Item}
+end
+
+type Listener = (Publication) -> ()
+local type Yield = () -> ()
+
+record Publisher
+  local listener: Listener?
+  local published_order: {string}
+end
+
+local record ProjectFile
+  const filename: string
+  const contents: string
+  const diagnostics: {bridge.Diagnostic}
+end
+
+function create(): Publisher
+  return Publisher.new(nil, {})
+end
+
+function Publisher:set_listener(listener: Listener?)
+  self.listener = listener
+end
+
+function Publisher:enabled(): boolean
+  return self.listener ~= nil
+end
+
+local function notify(listener: Listener, publication: Publication)
+  -- Diagnostics are best-effort output owned by the protocol sink. A stopped
+  -- writer or an encoding error must not unwind the indexing Task that owns
+  -- the completed saved generation.
+  do listener(publication) catch end
+end
+
+local function diagnostic_code(kind: bridge.DiagnosticKind): string
+  case kind
+  when syntax then return "syntax"
+  when type_error then return "type"
+  when compiler then return "compiler"
+  end
+end
+
+local function item_key(item: Item): string
+  -- Length-prefix the free-form message so separator characters inside it
+  -- cannot alias another diagnostic. Fixed-count numeric fields make the rest
+  -- of the key unambiguous while retaining O(n) per-file deduplication.
+  return diagnostic_code(item.kind) .. ":" ..
+    strings.tostring(item.range.start.line) .. ":" ..
+    strings.tostring(item.range.start.character) .. ":" ..
+    strings.tostring(item.range.finish.line) .. ":" ..
+    strings.tostring(item.range.finish.character) .. ":" ..
+    strings.tostring(#item.message) .. ":" .. item.message
+end
+
+function notification(publication: Publication): string
+  local encoded: {json.Value} = {}
+  for index = 1, #publication.items do
+    local item = publication.items[index]
+    encoded[index] = json.from_object({
+      json.Member.new("range", lsp.range_value(item.range)),
+      json.Member.new("severity", json.from_integer(1)),
+      json.Member.new("code", json.from_string(
+        diagnostic_code(item.kind))),
+      json.Member.new("source", json.from_string("Titan")),
+      json.Member.new("message", json.from_string(item.message)),
+    })
+  end
+  return json.encode(json.from_object({
+    json.Member.new("jsonrpc", json.from_string("2.0")),
+    json.Member.new(
+      "method", json.from_string("textDocument/publishDiagnostics")),
+    json.Member.new("params", json.from_object({
+      json.Member.new("uri", json.from_string(publication.uri)),
+      json.Member.new("diagnostics", json.from_array(encoded)),
+    })),
+  }))
+end
+
+local function project_files(snapshot: project_service.Snapshot):
+    ({ProjectFile}, {string: ProjectFile})
+  local ordered: {ProjectFile} = {}
+  local by_path: {string: ProjectFile} = {}
+  for module_index = 1, #snapshot.project_modules do
+    local module = snapshot.project_modules[module_index]
+    for file_index = 1, #module.source_files do
+      local source = module.source_files[file_index]
+      local file = ProjectFile.new(source.filename, source.contents, {})
+      ordered[#ordered + 1] = file
+      by_path[source.filename] = file
+    end
+  end
+  return ordered, by_path
+end
+
+local function attach_diagnostics(
+    snapshot: project_service.Snapshot,
+    by_path: {string: ProjectFile})
+  for module_index = 1, #snapshot.project_modules do
+    local module = snapshot.project_modules[module_index]
+    local fallback? = module.source_files[1]
+    for diagnostic_index = 1, #module.diagnostics do
+      local diagnostic = module.diagnostics[diagnostic_index]
+      local owner?: ProjectFile = nil
+      if diagnostic.location ~= nil then
+        -- Exact catalog membership is the external-source boundary. A
+        -- compiler error located in an external source/header or generated
+        -- probe must never become a project document diagnostic.
+        owner = by_path[diagnostic.location.filename]
+      elseif fallback ~= nil then
+        -- Location-free compiler failures are already assigned to their
+        -- attempted project module by ProjectService. Anchor them at that
+        -- module's first saved constituent.
+        owner = by_path[fallback.filename]
+      end
+      if owner ~= nil then
+        owner.diagnostics[#owner.diagnostics + 1] = diagnostic
+      end
+    end
+  end
+end
+
+local function position_for_diagnostic(
+    coordinates: source_text.CoordinateIndex,
+    diagnostic: bridge.Diagnostic): source_text.Position
+  local location? = diagnostic.location
+  if location == nil then return source_text.Position.new(0, 0) end
+  local offset? = coordinates:offset_for_lf_byte_position(
+    location.line, location.column)
+  if offset == nil then return source_text.Position.new(0, 0) end
+  local position?, position_error? = coordinates:position_for_offset(offset)
+  if position == nil then return source_text.Position.new(0, 0) end
+  return position
+end
+
+local function build(snapshot: project_service.Snapshot,
+                     yield_now: Yield?): {Publication}
+  local ordered, by_path = project_files(snapshot)
+  attach_diagnostics(snapshot, by_path)
+  local publications: {Publication} = {}
+  for file_index = 1, #ordered do
+    local file = ordered[file_index]
+    if #file.diagnostics > 0 then
+      local coordinates = source_text.coordinate_index(file.contents)
+      if yield_now ~= nil then
+        coordinates = source_text.coordinate_index_with_yield(
+          file.contents, yield_now)
+      end
+      local items: {Item} = {}
+      local seen: {string: boolean} = {}
+      for diagnostic_index = 1, #file.diagnostics do
+        local diagnostic = file.diagnostics[diagnostic_index]
+        local position = position_for_diagnostic(coordinates, diagnostic)
+        local candidate = Item.new(
+          diagnostic.kind, diagnostic.message,
+          source_text.Span.new(position, position))
+        local key = item_key(candidate)
+        if not seen[key] then
+          seen[key] = true
+          items[#items + 1] = candidate
+        end
+      end
+      local uri?, uri_error? = source_text.path_to_file_uri(file.filename)
+      if uri ~= nil then
+        publications[#publications + 1] = Publication.new(uri, items)
+      end
+    end
+  end
+  return publications
+end
+
+function from_snapshot(snapshot: project_service.Snapshot): {Publication}
+  return build(snapshot, nil)
+end
+
+function from_snapshot_with_yield(
+    snapshot: project_service.Snapshot): {Publication}
+  return build(snapshot, function () async.yield() end)
+end
+
+-- Publication and replacement are nonyielding. The refresh owner can build a
+-- candidate asynchronously, recheck its saved epoch, and then atomically
+-- replace the client-visible diagnostic set.
+function Publisher:publish(publications: {Publication})
+  local listener? = self.listener
+  if listener == nil then return end
+
+  local next_published: {string: boolean} = {}
+  local next_order: {string} = {}
+  for index = 1, #publications do
+    local publication = publications[index]
+    notify(listener, publication)
+    next_published[publication.uri] = true
+    next_order[#next_order + 1] = publication.uri
+  end
+  for index = 1, #self.published_order do
+    local uri = self.published_order[index]
+    if not next_published[uri] then
+      notify(listener, Publication.new(uri, {}))
+    end
+  end
+  self.published_order = next_order
+end
+
+function Publisher:clear()
+  local listener? = self.listener
+  if listener ~= nil then
+    for index = 1, #self.published_order do
+      notify(listener, Publication.new(self.published_order[index], {}))
+    end
+  end
+  self.published_order = {}
+end
+
+function Publisher:stop()
+  self:clear()
+  self.listener = nil
+end

@@ -39,6 +39,8 @@ class FrameReader {
     this.indexingStatusCursor = 0;
     this.lastIndexingEpoch = undefined;
     this.lastIndexingProgress = [];
+    this.diagnosticPublications = [];
+    this.diagnosticPublicationCursor = 0;
   }
 
   async read(milliseconds = 5_000) {
@@ -139,15 +141,48 @@ async function responseFor(responses, id, milliseconds = 5_000) {
   while (true) {
     const message = await responses.read(milliseconds);
     if (message.id === undefined && typeof message.method === "string") {
-      if (message.method === "titan/indexingStatus") {
-        responses.indexingStatuses.push(message.params);
-      }
+      collectNotification(responses, message);
       continue;
     }
     assert.equal(message.jsonrpc, "2.0");
     assert.equal(message.id, id);
     return message;
   }
+}
+
+function validateDiagnosticPublication(params) {
+  assert.ok(params !== null && typeof params === "object");
+  assert.equal(typeof params.uri, "string");
+  assert.ok(Array.isArray(params.diagnostics));
+  for (const diagnostic of params.diagnostics) {
+    assert.ok(diagnostic !== null && typeof diagnostic === "object");
+    assert.equal(diagnostic.severity, 1);
+    assert.ok(["syntax", "type", "compiler"].includes(diagnostic.code));
+    assert.equal(diagnostic.source, "Titan");
+    assert.equal(typeof diagnostic.message, "string");
+    for (const position of [
+      diagnostic.range?.start,
+      diagnostic.range?.end
+    ]) {
+      assert.ok(position !== null && typeof position === "object");
+      assert.ok(Number.isInteger(position.line) && position.line >= 0);
+      assert.ok(Number.isInteger(position.character) && position.character >= 0);
+    }
+  }
+}
+
+function collectNotification(responses, message) {
+  assert.equal(message.jsonrpc, "2.0");
+  if (message.method === "titan/indexingStatus") {
+    responses.indexingStatuses.push(message.params);
+    return;
+  }
+  if (message.method === "textDocument/publishDiagnostics") {
+    validateDiagnosticPublication(message.params);
+    responses.diagnosticPublications.push(message.params);
+    return;
+  }
+  assert.fail(`unexpected server notification ${message.method}`);
 }
 
 function validateIndexingStatus(status) {
@@ -183,17 +218,32 @@ function validateIndexingStatus(status) {
 }
 
 async function nextIndexingStatus(responses) {
-  if (responses.indexingStatusCursor >= responses.indexingStatuses.length) {
+  while (responses.indexingStatusCursor >= responses.indexingStatuses.length) {
     const message = await responses.read(30_000);
-    assert.equal(message.jsonrpc, "2.0");
     assert.equal(message.id, undefined);
-    assert.equal(message.method, "titan/indexingStatus");
-    responses.indexingStatuses.push(message.params);
+    assert.equal(typeof message.method, "string");
+    collectNotification(responses, message);
   }
   const status = responses.indexingStatuses[responses.indexingStatusCursor];
   responses.indexingStatusCursor += 1;
   validateIndexingStatus(status);
   return status;
+}
+
+async function nextDiagnosticPublication(responses) {
+  while (responses.diagnosticPublicationCursor >=
+         responses.diagnosticPublications.length) {
+    const message = await responses.read(30_000);
+    assert.equal(message.id, undefined);
+    assert.equal(typeof message.method, "string");
+    collectNotification(responses, message);
+  }
+  const publication = responses.diagnosticPublications[
+    responses.diagnosticPublicationCursor
+  ];
+  responses.diagnosticPublicationCursor += 1;
+  validateDiagnosticPublication(publication);
+  return publication;
 }
 
 async function waitForIndexing(
@@ -425,8 +475,11 @@ async function semanticRequest(
     30_000
   );
   const cycleCount = indexingCycles ??
-    (method === "textDocument/rename" ? 2 : 1);
-  await waitForIndexing(responses, expectedIndexingState, cycleCount);
+    (method === "textDocument/rename" ? 2 : 0);
+  assert.ok(Number.isInteger(cycleCount) && cycleCount >= 0);
+  if (cycleCount > 0) {
+    await waitForIndexing(responses, expectedIndexingState, cycleCount);
+  }
   return response;
 }
 
@@ -658,6 +711,11 @@ async function testSavedProjectSemantics() {
       "function answer(\n",
       "ready"
     );
+    const publishedFailure = await nextDiagnosticPublication(responses);
+    assert.equal(publishedFailure.uri, uri);
+    assert.equal(publishedFailure.diagnostics.length, 1);
+    assert.equal(publishedFailure.diagnostics[0].code, "syntax");
+    assert.match(publishedFailure.diagnostics[0].message, /syntax error/);
     const partial = await semanticRequest(
       child,
       responses,
@@ -674,6 +732,9 @@ async function testSavedProjectSemantics() {
       sourceLines.join("\n"),
       "ready"
     );
+    const repairedDiagnostics = await nextDiagnosticPublication(responses);
+    assert.equal(repairedDiagnostics.uri, uri);
+    assert.deepEqual(repairedDiagnostics.diagnostics, []);
     const recovered = await semanticRequest(
       child,
       responses,
@@ -683,6 +744,18 @@ async function testSavedProjectSemantics() {
     );
     assert.deepEqual(recovered.result, definition.result);
 
+    // Diagnostic publication follows completed saved generations directly;
+    // it must not depend on a hover/definition request to flush Problems.
+    await writeSavedGeneration(
+      responses,
+      filename,
+      "function answer(\n",
+      "ready"
+    );
+    const beforeShutdown = await nextDiagnosticPublication(responses);
+    assert.equal(beforeShutdown.uri, uri);
+    assert.equal(beforeShutdown.diagnostics.length, 1);
+
     const shutdown = await request(
       child,
       responses,
@@ -691,6 +764,9 @@ async function testSavedProjectSemantics() {
       null
     );
     assert.equal(shutdown.result, null);
+    const shutdownClear = await nextDiagnosticPublication(responses);
+    assert.equal(shutdownClear.uri, uri);
+    assert.deepEqual(shutdownClear.diagnostics, []);
     child.stdin.write(frame({ jsonrpc: "2.0", method: "exit" }));
     assert.deepEqual(await awaitExit(exit), { code: 0, signal: null });
     await responses.finish();
@@ -758,6 +834,186 @@ async function testConfigCannotWriteProtocolStdout() {
     await responses.finish();
     assert.equal(responses.buffer.length, 0, "config emitted unframed stdout");
     assert.equal(stderr().length, 0, stderr().toString("utf8"));
+  } finally {
+    if (child.exitCode === null && child.signalCode === null) child.kill();
+    await rm(root, { recursive: true, force: true });
+  }
+}
+
+async function testSourceImportCppflagsAndUnchangedRequests() {
+  const root = await makePhysicalTemporaryRoot("vscode-titan-source-config-");
+  const sourceRoot = path.join(root, "src");
+  const includeRoot = path.join(root, "include");
+  await mkdir(sourceRoot);
+  await mkdir(includeRoot);
+  await writeFile(
+    path.join(root, "titan-config.lua"),
+    [
+      'source_modules_root = "src"',
+      'extra_ffi_include_dirs = { "include" }',
+      "extra_ffi_cppflags = \"-DVSCODE_TITAN_PROTOCOL_FLAG=17 " +
+        "-UVSCODE_TITAN_PROTOCOL_FLAG " +
+        "'-DVSCODE_TITAN_PROTOCOL_FLAG=42'\"",
+      ""
+    ].join("\n"),
+    "utf8"
+  );
+  await writeFile(
+    path.join(includeRoot, "vscode_titan_protocol_guard.h"),
+    [
+      "#if !defined(VSCODE_TITAN_PROTOCOL_FLAG)",
+      "#error project preprocessing flag is missing",
+      "#elif VSCODE_TITAN_PROTOCOL_FLAG != 42",
+      "#error project preprocessing flag has the wrong value",
+      "#endif",
+      "typedef int vscode_titan_protocol_int;",
+      ""
+    ].join("\n"),
+    "utf8"
+  );
+
+  const providerLines = [
+    "local function secret(item: integer): integer",
+    "  return item + 1",
+    "end",
+    ""
+  ];
+  const consumerLines = [
+    'local provider = import "provider.titan"',
+    "function answer(): integer",
+    "  return provider.secret(41)",
+    "end",
+    ""
+  ];
+  const guardedLines = [
+    'local c = foreign import "vscode_titan_protocol_guard.h"',
+    "function guarded_answer(item: integer): integer",
+    "  local converted: c.vscode_titan_protocol_int = item",
+    "  return converted",
+    "end",
+    ""
+  ];
+  const providerFile = path.join(sourceRoot, "provider.titan");
+  const consumerFile = path.join(sourceRoot, "consumer.titan");
+  const guardedFile = path.join(sourceRoot, "guarded.titan");
+  await writeFile(providerFile, providerLines.join("\n"), "utf8");
+  await writeFile(consumerFile, consumerLines.join("\n"), "utf8");
+  await writeFile(guardedFile, guardedLines.join("\n"), "utf8");
+
+  const providerUri = pathToFileURL(providerFile).href;
+  const consumerUri = pathToFileURL(consumerFile).href;
+  const guardedUri = pathToFileURL(guardedFile).href;
+  const secretColumn = consumerLines[2].indexOf("secret");
+  const guardedColumn = guardedLines[1].indexOf("guarded_answer");
+  assert.ok(secretColumn >= 0 && guardedColumn >= 0);
+
+  const child = launch(root);
+  const exit = exitOf(child);
+  const stderr = collect(child.stderr);
+  const responses = new FrameReader(child.stdout);
+  try {
+    await request(child, responses, 1, "initialize", {});
+    child.stdin.write(frame({
+      jsonrpc: "2.0",
+      method: "initialized",
+      params: {}
+    }));
+    await waitForIndexing(responses);
+    const unchangedStatusStart = responses.indexingStatuses.length;
+
+    const sourcePosition = {
+      textDocument: { uri: consumerUri },
+      position: { line: 2, character: secretColumn + 1 }
+    };
+    const definition = await semanticRequest(
+      child,
+      responses,
+      "source-import-definition",
+      "textDocument/definition",
+      sourcePosition
+    );
+    assert.equal(definition.error, undefined, JSON.stringify(definition.error));
+    assert.deepEqual(definition.result, {
+      uri: providerUri,
+      range: {
+        start: { line: 0, character: 15 },
+        end: { line: 0, character: 21 }
+      }
+    });
+
+    const references = await semanticRequest(
+      child,
+      responses,
+      "source-import-references",
+      "textDocument/references",
+      { ...sourcePosition, context: { includeDeclaration: true } }
+    );
+    assert.equal(references.error, undefined, JSON.stringify(references.error));
+    assert.equal(references.result.length, 2);
+    assert.deepEqual(
+      new Set(references.result.map((location) => location.uri)),
+      new Set([providerUri, consumerUri])
+    );
+
+    const guardedHover = await semanticRequest(
+      child,
+      responses,
+      "configured-ffi-hover",
+      "textDocument/hover",
+      {
+        textDocument: { uri: guardedUri },
+        position: { line: 1, character: guardedColumn + 1 }
+      }
+    );
+    assert.equal(
+      guardedHover.error,
+      undefined,
+      JSON.stringify(guardedHover.error)
+    );
+    assert.ok(
+      guardedHover.result,
+      "project preprocessing configuration did not produce a semantic snapshot"
+    );
+    assert.equal(guardedHover.result.contents.kind, "markdown");
+    assert.match(guardedHover.result.contents.value, /guarded_answer/);
+
+    const folding = await semanticRequest(
+      child,
+      responses,
+      "unchanged-folding",
+      "textDocument/foldingRange",
+      { textDocument: { uri: consumerUri } }
+    );
+    assert.equal(folding.error, undefined, JSON.stringify(folding.error));
+    assert.ok(Array.isArray(folding.result));
+
+    const shutdown = await request(
+      child,
+      responses,
+      "source-config-shutdown",
+      "shutdown",
+      null
+    );
+    assert.equal(shutdown.result, null);
+    // The shutdown response is an ordering barrier for every preceding
+    // semantic request and notification. An unchanged definition, references,
+    // hover, or folding request must not start an indexing chain.
+    assert.equal(
+      responses.indexingStatuses.length,
+      unchangedStatusStart,
+      "unchanged read-only requests emitted indexing notifications"
+    );
+    child.stdin.write(frame({ jsonrpc: "2.0", method: "exit" }));
+    assert.deepEqual(await awaitExit(exit), { code: 0, signal: null });
+    await responses.finish();
+    assert.equal(responses.buffer.length, 0, "unexpected source/config stdout");
+    assert.equal(stderr().length, 0, stderr().toString("utf8"));
+  } catch (cause) {
+    const diagnostic = stderr().toString("utf8").trim();
+    throw new Error(
+      `${cause.message}${diagnostic.length > 0 ? `; stderr: ${diagnostic}` : ""}`,
+      { cause }
+    );
   } finally {
     if (child.exitCode === null && child.signalCode === null) child.kill();
     await rm(root, { recursive: true, force: true });
@@ -1128,6 +1384,7 @@ await testCoalescedIndexingResetStatus();
 await testLifecycle();
 await testSavedProjectSemantics();
 await testConfigCannotWriteProtocolStdout();
+await testSourceImportCppflagsAndUnchangedRequests();
 await testCrossModuleFolderAndIncrementalSemantics();
 await testDebugCompilerProgress();
 await testTruncatedFrame();

@@ -52,6 +52,10 @@ record Diagnostic
   kind: DiagnosticKind
   message: string
   location: SourceLocation?
+  -- The active project root whose compiler attempt produced this diagnostic.
+  -- Explicit project-source locations remain the strongest ownership signal;
+  -- this preserves attribution for loader/finalization errors without one.
+  owner_module: string?
 end
 
 record TypeInfo
@@ -315,6 +319,7 @@ record Compiler
   local source_path: string?
   local binary_path: string?
   local extra_ffi_include_dirs: {string}
+  local extra_ffi_cppflags: {string}
 end
 
 local function fail<T>(module_name: string, message: string): T
@@ -564,12 +569,13 @@ local function load_with(require_function: RequireFunction): Compiler
   checked_function(driver, DRIVER_MODULE, "resolve_external_modules", type_of)
   checked_function(
     driver, DRIVER_MODULE, "restat_c_header_dependencies", type_of)
+  checked_function(driver, DRIVER_MODULE, "split_shell_words", type_of)
   required_map(driver["imported"], DRIVER_MODULE, "driver.imported")
   required_map(types["registry"], TYPES_MODULE, "types.registry")
 
   return Compiler.new(
     parser, checker, types, driver, type_of, compiler_io.create(),
-    {}, {}, nil, nil, {})
+    {}, {}, nil, nil, {}, {})
 end
 
 function load(): Compiler
@@ -590,16 +596,61 @@ function Compiler:drop_project_ast(module_name: string)
 end
 
 function Compiler:configure_paths(source_path: string?, binary_path: string?,
-                                  extra_ffi_include_dirs: {string}?)
-  self.source_path = source_path
-  self.binary_path = binary_path
-  self.extra_ffi_include_dirs = {}
+                                  extra_ffi_include_dirs: {string}?,
+                                  extra_ffi_cppflags: string?)
+  local next_include_dirs: {string} = {}
   if extra_ffi_include_dirs ~= nil then
     local source = extra_ffi_include_dirs as {string}
     for index = 1, #source do
-      self.extra_ffi_include_dirs[index] = source[index]
+      next_include_dirs[index] = source[index]
     end
   end
+
+  local next_cppflags: {string} = {}
+  if extra_ffi_cppflags ~= nil and extra_ffi_cppflags ~= "" then
+    local raw_split = checked_function(
+      self.driver, DRIVER_MODULE, "split_shell_words", self.type_of)
+    local split = raw_split as (string) -> (value, value)
+    local parsed, parse_error = split(extra_ffi_cppflags as string)
+    if parsed == nil or parsed == false then
+      return fail<value>(
+        DRIVER_MODULE, "invalid extra_ffi_cppflags: " ..
+          strings.tostring(parse_error))
+    end
+    next_cppflags = required_string_list(
+      parsed, DRIVER_MODULE, "split extra_ffi_cppflags result")
+  end
+
+  -- Commit only after every untyped compiler value has been validated. A
+  -- malformed reconfiguration leaves the last accepted project configuration
+  -- intact rather than combining new paths with old preprocessing flags.
+  self.source_path = source_path
+  self.binary_path = binary_path
+  self.extra_ffi_include_dirs = next_include_dirs
+  self.extra_ffi_cppflags = next_cppflags
+end
+
+-- The driver parses inherited TITAN_EXTRA_CPPFLAGS once. Project flags use
+-- that same parser, then extend a private copy only while this Compiler owns
+-- the shared Lua state. Restoring the exact table before releasing the permit
+-- prevents one yielding workspace analysis from reconfiguring another.
+local function install_extra_cppflags(compiler: Compiler): value
+  local previous: value = compiler.driver["EXTRA_CPPFLAGS"]
+  local effective: {integer: value} = {}
+  if previous ~= nil and previous ~= false then
+    local inherited = required_string_list(
+      previous, DRIVER_MODULE, "driver.EXTRA_CPPFLAGS")
+    for index = 1, #inherited do
+      effective[#effective + 1] = inherited[index]
+    end
+  elseif #compiler.extra_ffi_cppflags == 0 then
+    return previous
+  end
+  for index = 1, #compiler.extra_ffi_cppflags do
+    effective[#effective + 1] = compiler.extra_ffi_cppflags[index]
+  end
+  compiler.driver["EXTRA_CPPFLAGS"] = effective
+  return previous
 end
 
 local function new_context(compiler: Compiler,
@@ -1928,6 +1979,12 @@ end
 
 local function node_is_local(node: {string: value}): boolean
   local tag = required_string(node["_tag"], DRIVER_MODULE, "AST _tag")
+  if tag == "Ast.TopLevelForeignFunc" then
+    -- Titan publishes direct foreign functions only through a module's
+    -- source-visible member table. The AST has no redundant `islocal` marker,
+    -- so preserve that compiler visibility rule explicitly.
+    return true
+  end
   if tag == "Ast.TopLevelImport" or
       tag == "Ast.TopLevelForeignImport" then
     -- Import namespaces are always introduced by Titan's `local` import
@@ -1964,14 +2021,11 @@ end
 
 local function ast_identity(module_name: string, raw: {string: value},
                             tag: string, name: string): string
-  local exported = false
   if strings.sub(tag, 1, 12) == "Ast.TopLevel"
       and tag ~= "Ast.TopLevelImport"
       and tag ~= "Ast.TopLevelForeignImport" then
-    exported = not node_is_local(raw)
-  end
-  if exported then
-    return "export:" .. module_name .. ":" .. name
+    local namespace = node_is_local(raw) and "source:" or "export:"
+    return namespace .. module_name .. ":" .. name
   end
   local location: SourceLocation? = semantic_location(
     raw, "symbol declaration")
@@ -2003,7 +2057,7 @@ local function declaration_identity(module_name: string, candidate: value): stri
       name = required_string(
         declaration["name"], DRIVER_MODULE, "Ast.TopLevelVar.decl.name")
       if node_is_local(raw) then
-        return ast_identity(module_name, declaration, "Ast.Decl", name)
+        return "source:" .. module_name .. ":" .. name
       end
     end
     if not name then return nil end
@@ -2070,7 +2124,8 @@ local function declaration_identity(module_name: string, candidate: value): stri
       raw["fqtn"], DRIVER_MODULE, "symbol declaration.fqtn")
   end
   if not owner then owner = module_name end
-  return "export:" .. owner .. ":" .. name
+  local namespace = node_is_local(raw) and "source:" or "export:"
+  return namespace .. owner .. ":" .. name
 end
 
 local function declaration_local(candidate: value): boolean
@@ -2320,6 +2375,12 @@ local function Walker:add_occurrence(node: {string: value}, tag: string,
     localness = declaration_local(declaration)
   elseif role_name == "definition" and local_hint == false then
     declaration_id = "export:" .. self.module_name .. ":" .. name
+  elseif role_name == "definition" and
+      parent_tag == "Ast.TopLevelVar" and local_hint == true then
+    -- A top-level variable's source identifier is the nested Ast.Decl, while
+    -- references point back to Ast.TopLevelVar. Join those two compiler shapes
+    -- without turning lexical Ast.Decl bindings into module identities.
+    declaration_id = "source:" .. self.module_name .. ":" .. name
   elseif role_name == "definition" or role_name == "import_alias" then
     declaration_id = declaration_identity(self.module_name, node)
   end
@@ -2596,7 +2657,8 @@ local function diagnostic_body(message: string, start: integer): string
 end
 
 local function parse_diagnostic(message: string,
-                                work: NormalizationWork): Diagnostic
+                                work: NormalizationWork,
+                                owner_module: string?): Diagnostic
   local search = 1
   while search <= #message do
     work:account()
@@ -2619,15 +2681,17 @@ local function parse_diagnostic(message: string,
         kind = DiagnosticKind.type_error()
       end
       return Diagnostic.new(kind, body, SourceLocation.new(
-        strings.sub(message, 1, first - 1), line, column))
+        strings.sub(message, 1, first - 1), line, column), owner_module)
     end
     search = first + 1
   end
-  return Diagnostic.new(DiagnosticKind.compiler(), message, nil)
+  return Diagnostic.new(
+    DiagnosticKind.compiler(), message, nil, owner_module)
 end
 
 local function normalize_diagnostics(candidate: value,
-                                     work: NormalizationWork): {Diagnostic}
+                                     work: NormalizationWork,
+                                     owner_module: string?): {Diagnostic}
   if candidate == nil or candidate == false then
     return fail<{Diagnostic}>(
       DRIVER_MODULE, "compiler error list must be a Lua table")
@@ -2642,7 +2706,8 @@ local function normalize_diagnostics(candidate: value,
     work:account()
     diagnostics[index] = parse_diagnostic(
       required_string(
-        raw[index], DRIVER_MODULE, "compiler error " .. index), work)
+        raw[index], DRIVER_MODULE, "compiler error " .. index), work,
+      owner_module)
   end
   return diagnostics
 end
@@ -3281,6 +3346,15 @@ local function failed_project_snapshot(project: ProjectModule): ModuleSnapshot
     nil, {}, {}, {}, {}, nil, nil)
 end
 
+local function snapshot_profile_filename(snapshot: ModuleSnapshot): string
+  case snapshot.provenance
+  when project_source: source then return source.main_file
+  when external_source: source then return source.main_file
+  when dynamic_binary: binary then return binary.provider_file
+  when static_binary: binary then return binary.provider_file
+  end
+end
+
 local function Compiler:run_attempt_inner(
     root_module: string, projects: {string: ProjectModule},
     overrides: {string: value},
@@ -3290,22 +3364,62 @@ local function Compiler:run_attempt_inner(
   local normalization_work = NormalizationWork.new(0)
   local options: {string: value} = { ["io"] = self.io }
   options["c_header_analysis"] = c_header_analysis
-  if logging.enabled("trace") then
+  local profiling = logging.enabled("trace")
+  if profiling then
     local trace_header_phase:
-      (string, string, string, string, float) -> () =
+      (string, string, string, string, float, string?) -> () =
       function (header: string, resolved_header: string,
-                phase: string, outcome: string, cpu_ms: float)
+                phase: string, outcome: string, cpu_ms: float,
+                trace_identity: string?)
+        local identity?: string = trace_identity
+        if identity == nil or identity == "" then
+          identity = resolved_header
+          if identity == "" then identity = header end
+        end
         logging.emit("trace", "compiler.c_header.phase", {
           json.Member.new("root_module", json.from_string(root_module)),
           json.Member.new("header", json.from_string(header)),
           json.Member.new(
             "resolved_header", json.from_string(resolved_header)),
+          json.Member.new("identity", json.from_string(identity as string)),
           json.Member.new("phase", json.from_string(phase)),
           json.Member.new("outcome", json.from_string(outcome)),
           json.Member.new("cpu_ms", json.from_number(cpu_ms)),
         })
       end
+    local trace_source_module:
+      (string, string, string, float, float, float, float) -> () =
+      function (module_name: string, filename: string, outcome: string,
+                self_cpu_ms: float, total_cpu_ms: float,
+                parse_cpu_ms: float, check_cpu_ms: float)
+        logging.emit("trace", "compiler.source_module.profile", {
+          json.Member.new("root_module", json.from_string(root_module)),
+          json.Member.new("module_name", json.from_string(module_name)),
+          json.Member.new("filename", json.from_string(filename)),
+          json.Member.new("outcome", json.from_string(outcome)),
+          json.Member.new("self_cpu_ms", json.from_number(self_cpu_ms)),
+          json.Member.new("total_cpu_ms", json.from_number(total_cpu_ms)),
+          json.Member.new("parse_cpu_ms", json.from_number(parse_cpu_ms)),
+          json.Member.new("check_cpu_ms", json.from_number(check_cpu_ms)),
+        })
+      end
+    local trace_probe_cache:
+      (string, string, boolean, string, string) -> () =
+      function (module_name: string, stage: string, hit: boolean,
+                key: string, path: string)
+        logging.emit("trace", "compiler.c_probe.cache", {
+          json.Member.new("root_module", json.from_string(root_module)),
+          json.Member.new("module_name", json.from_string(module_name)),
+          json.Member.new("cache", json.from_string("persistent success")),
+          json.Member.new("stage", json.from_string(stage)),
+          json.Member.new("hit", json.from_boolean(hit)),
+          json.Member.new("key", json.from_string(key)),
+          json.Member.new("path", json.from_string(path)),
+        })
+      end
     options["c_header_process_trace"] = trace_header_phase
+    options["source_process_trace"] = trace_source_module
+    options["c_probe_cache_trace"] = trace_probe_cache
   end
   local roots: {string: value} = {[root_module] = true}
   local active_overrides: {string: value} = {}
@@ -3363,11 +3477,11 @@ local function Compiler:run_attempt_inner(
     diagnostics[#diagnostics + 1] = parse_diagnostic(
       required_string(
         interface_or_error, DRIVER_MODULE, "compiler loader error"),
-      normalization_work)
+      normalization_work, root_module)
   else
     append_diagnostics(
       diagnostics,
-      normalize_diagnostics(raw_errors, normalization_work),
+      normalize_diagnostics(raw_errors, normalization_work, root_module),
       normalization_work)
   end
 
@@ -3384,7 +3498,8 @@ local function Compiler:run_attempt_inner(
   if finalized == nil or finalized == false then
     append_diagnostics(
       diagnostics,
-      normalize_diagnostics(raw_final_errors, normalization_work),
+      normalize_diagnostics(
+        raw_final_errors, normalization_work, root_module),
       normalization_work)
   end
   local contextual_resolutions: {ContextualResolution} = {}
@@ -3427,9 +3542,22 @@ local function Compiler:run_attempt_inner(
           failed[name] = true
         end
       end
-      modules[#modules + 1] = snapshot_module(
+      local normalization_started = 0.0
+      if profiling then normalization_started = logging.clock() end
+      local snapshot = snapshot_module(
         self, name, imported[name], projects, cached, valid,
         normalization_work)
+      modules[#modules + 1] = snapshot
+      if profiling then
+        logging.emit("trace", "compiler.module.normalization", {
+          json.Member.new("root_module", json.from_string(root_module)),
+          json.Member.new("module_name", json.from_string(name)),
+          json.Member.new("filename", json.from_string(
+            snapshot_profile_filename(snapshot))),
+          json.Member.new("cpu_ms", json.from_number(
+            logging.elapsed_ms(normalization_started))),
+        })
+      end
       if is_project and valid then entries[name] = imported[name] end
     end
   end
@@ -3563,6 +3691,8 @@ function Compiler:analyze_incremental(
   end
   local permit = compiler_scheduler.acquire()
   defer permit:release()
+  local previous_cppflags = install_extra_cppflags(self)
+  defer self.driver["EXTRA_CPPFLAGS"] = previous_cppflags
   compiler_io.begin_lstat_observations(self.io)
   defer compiler_io.end_lstat_observations(self.io)
 

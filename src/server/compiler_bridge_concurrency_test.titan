@@ -60,6 +60,201 @@ local function join_nil(task: async.Task<nil, value>, subject: string)
   end
 end
 
+local function join_analysis(task: async.Task<bridge.Analysis, value>,
+                             subject: string): bridge.Analysis
+  case async.join<bridge.Analysis, value>(task)
+  when succeeded: analysis then return analysis
+  when failed: failure then
+    raise subject .. " failed: " .. strings.tostring(failure.error)
+  when cancelled then raise subject .. " was cancelled"
+  else raise subject .. " did not finish"
+  end
+end
+
+local type RestoreDriverResolver = () -> ()
+local type ObserveDriverHandoff = () -> (integer, boolean)
+local type ObserveDriverRestoration = () -> boolean
+local type InstallDriverHandoffObserver =
+  ({string: value}) ->
+    (RestoreDriverResolver, ObserveDriverHandoff,
+     ObserveDriverRestoration)
+
+local function install_driver_handoff_observer(
+    driver: {string: value}):
+    (RestoreDriverResolver, ObserveDriverHandoff,
+     ObserveDriverRestoration)
+  local install = lua.load([==[
+return function(driver)
+  local original_resolver = driver.resolve_external_modules
+  local original_cppflags = driver.EXTRA_CPPFLAGS
+  local calls = 0
+  local restored_at_handoff = false
+  driver.resolve_external_modules = function(...)
+    calls = calls + 1
+    restored_at_handoff = driver.EXTRA_CPPFLAGS == original_cppflags
+    return original_resolver(...)
+  end
+  return function()
+    driver.resolve_external_modules = original_resolver
+  end, function()
+    return calls, restored_at_handoff
+  end, function()
+    return driver.EXTRA_CPPFLAGS == original_cppflags
+  end
+end
+]==], "=compiler_bridge_cppflags_handoff_observer", nil)() as
+    InstallDriverHandoffObserver
+  return install(driver)
+end
+
+local function cppflags_include_without(
+    driver: {string: value}, required: string,
+    forbidden: string): boolean
+  local raw: value = driver["EXTRA_CPPFLAGS"]
+  if not (raw is {integer: value}) then return false end
+  local flags = raw as {integer: value}
+  local found = false
+  for index = 1, #flags do
+    local flag: value = flags[index]
+    if flag is string then
+      if flag == forbidden then return false end
+      if flag == required then found = true end
+    end
+  end
+  return found
+end
+
+local CPPFLAGS_MODULE_A = "bridge_concurrency_cppflags_a"
+local CPPFLAGS_MODULE_B = "bridge_concurrency_cppflags_b"
+local CPPFLAGS_A = "-DBRIDGE_CONCURRENCY_CPPFLAGS_A=1"
+local CPPFLAGS_B = "-DBRIDGE_CONCURRENCY_CPPFLAGS_B=1"
+
+local function isolates_cppflags_across_yielding_analysis()
+  local root = temporary_root()
+  local header_a = root .. "/bridge_concurrency_cppflags_a.h"
+  local header_b = root .. "/bridge_concurrency_cppflags_b.h"
+  fs.write_file(header_a, [[
+#ifndef BRIDGE_CONCURRENCY_CPPFLAGS_A
+#error Compiler A preprocessing flag is missing
+#endif
+#ifdef BRIDGE_CONCURRENCY_CPPFLAGS_B
+#error Compiler B preprocessing flag leaked into Compiler A
+#endif
+typedef int bridge_concurrency_cppflags_a_int;
+]])
+  fs.write_file(header_b, [[
+#ifndef BRIDGE_CONCURRENCY_CPPFLAGS_B
+#error Compiler B preprocessing flag is missing
+#endif
+#ifdef BRIDGE_CONCURRENCY_CPPFLAGS_A
+#error Compiler A preprocessing flag leaked into Compiler B
+#endif
+typedef int bridge_concurrency_cppflags_b_int;
+]])
+  defer do
+    do fs.unlink(header_a) catch end
+    do fs.unlink(header_b) catch end
+    do fs.rmdir(root) catch end
+  end
+
+  local project_a = bridge.ProjectModule.new(CPPFLAGS_MODULE_A, {
+    bridge.SourceFile.new(
+      root .. "/" .. CPPFLAGS_MODULE_A .. ".titan",
+      "local c = foreign import \"" .. header_a .. "\"\n" ..
+      "function answer(): integer return 41 end\n")
+  })
+  local project_b = bridge.ProjectModule.new(CPPFLAGS_MODULE_B, {
+    bridge.SourceFile.new(
+      root .. "/" .. CPPFLAGS_MODULE_B .. ".titan",
+      "local c = foreign import \"" .. header_b .. "\"\n" ..
+      "function answer(): integer return 42 end\n")
+  })
+  local compiler_a = bridge.load()
+  compiler_a:configure_paths(nil, nil, nil, CPPFLAGS_A)
+  local compiler_b = bridge.load()
+  compiler_b:configure_paths(nil, nil, nil, CPPFLAGS_B)
+  local driver = lua.require(DRIVER_MODULE) as {string: value}
+  local restore_resolver, observe_handoff, observe_restoration =
+    install_driver_handoff_observer(driver)
+  defer restore_resolver()
+
+  local a_finished = false
+  local a_checkpoint = false
+  local a_checkpoint_flags = false
+  local b_started_before_a_finished = false
+  local b_started_with_a_flags = false
+  local b_handoff_restored = false
+  local b_checkpoint = false
+  local b_checkpoint_flags = false
+  local b_restored_after_analysis = false
+  local b_task: async.Task<bridge.Analysis, value>? = nil
+
+  local a_task = async.run<bridge.Analysis, value>(
+    function (): bridge.Analysis
+      defer a_finished = true
+      return compiler_a:analyze_incremental(
+        {project_a}, {CPPFLAGS_MODULE_A}, {},
+        function (progress: bridge.AnalysisProgress)
+          if progress.completed_files == progress.total_files and
+             not a_checkpoint then
+            a_checkpoint = true
+            a_checkpoint_flags = cppflags_include_without(
+              driver, CPPFLAGS_A, CPPFLAGS_B)
+            b_task = async.run<bridge.Analysis, value>(
+              function (): bridge.Analysis
+                b_started_before_a_finished = not a_finished
+                b_started_with_a_flags = cppflags_include_without(
+                  driver, CPPFLAGS_A, CPPFLAGS_B)
+                local empty = compiler_b:resolve_external_modules({}, {})
+                local handoff_calls, restored = observe_handoff()
+                b_handoff_restored = #empty == 0 and
+                  handoff_calls == 1 and restored
+                local analysis = compiler_b:analyze_incremental(
+                  {project_b}, {CPPFLAGS_MODULE_B}, {},
+                  function (b_progress: bridge.AnalysisProgress)
+                    if b_progress.completed_files ==
+                         b_progress.total_files and not b_checkpoint then
+                      b_checkpoint = true
+                      b_checkpoint_flags = cppflags_include_without(
+                        driver, CPPFLAGS_B, CPPFLAGS_A)
+                    end
+                  end)
+                b_restored_after_analysis = observe_restoration()
+                return analysis
+              end)
+          end
+        end)
+    end)
+
+  local analysis_a = join_analysis(a_task, "Compiler A cppflags analysis")
+  test.assert(#analysis_a.diagnostics == 0 and
+              analysis_a:find_module(CPPFLAGS_MODULE_A) ~= nil,
+              "Compiler A rejected its isolated preprocessing flags")
+  test.assert(b_task ~= nil,
+              "Compiler A did not yield at its published-module checkpoint")
+  local analysis_b = join_analysis(
+    b_task as async.Task<bridge.Analysis, value>,
+    "Compiler B cppflags analysis")
+  test.assert(#analysis_b.diagnostics == 0 and
+              analysis_b:find_module(CPPFLAGS_MODULE_B) ~= nil,
+              "Compiler B rejected its isolated preprocessing flags")
+  test.assert(a_checkpoint and a_checkpoint_flags and
+              b_started_before_a_finished and b_started_with_a_flags,
+              "Compiler B did not queue while yielding Compiler A owned " ..
+              "its preprocessing flags")
+  test.assert(b_handoff_restored,
+              "driver.EXTRA_CPPFLAGS was not restored before permit handoff")
+  test.assert(b_checkpoint and b_checkpoint_flags,
+              "Compiler B inherited Compiler A preprocessing flags")
+  test.assert(b_restored_after_analysis and observe_restoration(),
+              "Compiler B did not restore driver.EXTRA_CPPFLAGS")
+end
+
+function test_compiler_bridge_isolates_cppflags_across_yielding_analysis(
+    _context: test.Context)
+  test_runtime.run(isolates_cppflags_across_yielding_analysis)
+end
+
 local function serializes_real_compilers_across_cancellation()
   local root_a = temporary_root()
   defer fs.rmdir(root_a)

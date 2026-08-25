@@ -4,6 +4,7 @@ local lua = import "lua"
 local strings = import "string"
 local bridge = import "server.compiler_bridge"
 local features = import "server.semantic_features"
+local logging = import "server.logging"
 local source_text = import "server.source_text"
 local test_runtime = import "server.test_runtime"
 
@@ -78,6 +79,16 @@ return function(mode, contextual_provider_file)
   if mode == "missing-abi" then driver.TITAN_ABI_VERSION = nil end
   if mode == "older-same-abi" then
     driver.LANGUAGE_SERVER_API_VERSION = nil
+  end
+  if mode ~= "same-api-missing-split-shell-words" then
+    driver.split_shell_words = function(source)
+      if source == "'unterminated" then
+        return nil, "unfinished single-quoted string"
+      end
+      local result = {}
+      for word in source:gmatch("%S+") do result[#result + 1] = word end
+      return result
+    end
   end
   local c_header_analysis_count = 0
   local c_header_analyses = {}
@@ -193,6 +204,9 @@ return function(mode, contextual_provider_file)
       if mode == "invalid-source" then
         return false,
           "/workspace/fixture.titan:2:7: syntax error: expected expression"
+      end
+      if mode == "location-free-diagnostic" then
+        return false, "cannot load " .. name
       end
       if mode == "bad-errors" then
         return true, module_type(name), "not an error array", {}
@@ -477,6 +491,12 @@ return function(mode, contextual_provider_file)
         context.io:yield(name)
         context.io:yield(name)
       end
+      if mode == "source-profiling" then
+        assert(type(options.source_process_trace) == "function")
+        options.source_process_trace(
+          name, "/workspace/fixture.titan", "complete",
+          7.0, 9.0, 2.0, 3.0)
+      end
       return true, module_type(name), {}, {}
     end
   end
@@ -545,6 +565,8 @@ function test_compiler_bridge_rejects_missing_incompatible_and_malformed_modules
                       "LANGUAGE_SERVER_API_VERSION 3")
   expect_bridge_error("same-api-missing-c-header-analysis",
                       "'new_c_header_analysis' must be a function, found nil")
+  expect_bridge_error("same-api-missing-split-shell-words",
+                      "'split_shell_words' must be a function, found nil")
   expect_bridge_error("malformed-parser", "'parse' must be a function")
 end
 
@@ -619,6 +641,44 @@ function test_compiler_bridge_scopes_one_c_header_analysis_to_all_root_attempts(
     }, {"fixture.first"}, {})
     test.assert(#second.modules >= 1,
                 "second analysis did not run its fixture root")
+  end)
+end
+
+function test_compiler_bridge_attributes_location_free_diagnostics_to_each_root(
+    _context: test.Context)
+  with_fixture("location-free-diagnostic", function ()
+    local compiler = bridge.load()
+    local analysis = compiler:analyze_incremental({
+      bridge.ProjectModule.new("fixture.first", {
+        bridge.SourceFile.new("/workspace/first.titan", ""),
+      }),
+      bridge.ProjectModule.new("fixture.second", {
+        bridge.SourceFile.new("/workspace/second.titan", ""),
+      }),
+    }, {"fixture.first", "fixture.second"}, {})
+    test.assert(#analysis.diagnostics == 2 and
+                analysis.diagnostics[1].location == nil and
+                analysis.diagnostics[1].owner_module == "fixture.first" and
+                analysis.diagnostics[2].location == nil and
+                analysis.diagnostics[2].owner_module == "fixture.second",
+                "location-free compiler errors lost their root-attempt owner")
+  end)
+end
+
+function test_compiler_bridge_accepts_parse_and_check_source_profile_fields(
+    _context: test.Context)
+  local previous_level = logging.level()
+  defer logging.configure(previous_level)
+  test.assert(logging.configure("trace"),
+              "source-profile fixture could not enable trace logging")
+  with_fixture("source-profiling", function ()
+    local compiler = bridge.load()
+    local analysis = compiler:analyze("fixture", {
+      bridge.ProjectModule.new("fixture", {bridge.SourceFile.new(
+        "/workspace/fixture.titan", "saved fixture")}),
+    })
+    test.assert(#analysis.diagnostics == 0,
+                "source-profile callback changed compiler analysis")
   end)
 end
 
@@ -1174,6 +1234,141 @@ function test_compiler_bridge_reuses_unchanged_full_ast_incrementally(
   test_runtime.run(runs_incremental_full_ast_cache)
 end
 
+local function joins_source_imported_local_function_definition_identity()
+  preload_real_compiler()
+  -- Source-defined foreign functions require a writable sibling directory for
+  -- the compiler's temporary checking header, even though project source reads
+  -- themselves come from the bridge overlay.
+  local fixture_root = fs.tmpname()
+  fs.unlink(fixture_root)
+  fs.mkdir(fixture_root)
+  defer fs.rmdir(fixture_root)
+  local provider_file =
+    fixture_root .. "/bridge_source_definition_provider.titan"
+  local consumer_file =
+    fixture_root .. "/bridge_source_definition_consumer.titan"
+  local provider = bridge.ProjectModule.new(
+    "bridge_source_definition_provider", {bridge.SourceFile.new(
+      provider_file,
+      "local ffi = foreign import \"titan/ffi.h\"\n" ..
+      "local secret_value: integer = 1\n" ..
+      "local function secret(): integer return 41 end\n" ..
+      "foreign function native_add(left: ffi.titan_ffi_int,\n" ..
+      "                            right: ffi.titan_ffi_int): " ..
+      "ffi.titan_ffi_int\n" ..
+      "  return left + right\n" ..
+      "end\n" ..
+      "local type SecretAlias = integer\n")})
+  local consumer = bridge.ProjectModule.new(
+    "bridge_source_definition_consumer", {bridge.SourceFile.new(
+      consumer_file,
+      "local provider = import \"bridge_source_definition_provider.titan\"\n" ..
+      "function answer(): integer return provider.secret() end\n" ..
+      "function read_value(): integer return provider.secret_value end\n" ..
+      "function call_native(): integer return " ..
+      "provider.native_add(1, 2) end\n" ..
+      "function alias_identity(input: provider.SecretAlias): integer " ..
+      "return input end\n")})
+  local projects = {provider, consumer}
+  local analysis = bridge.load():analyze(
+    "bridge_source_definition_consumer", projects)
+  local diagnostic_messages = strings.writer()
+  for index = 1, #analysis.diagnostics do
+    diagnostic_messages:write(analysis.diagnostics[index].message .. "\n")
+  end
+  test.assert(#analysis.diagnostics == 0,
+              "compiler rejected source-import definition fixture: " ..
+                diagnostic_messages:drain())
+  local provider_snapshot? =
+    analysis:find_module("bridge_source_definition_provider")
+  local consumer_snapshot? =
+    analysis:find_module("bridge_source_definition_consumer")
+  test.assert(provider_snapshot ~= nil and consumer_snapshot ~= nil,
+              "source-import definition fixture lost a project snapshot")
+
+  local provider_identity?: string = nil
+  local consumer_identity?: string = nil
+  local provider_variable_identity?: string = nil
+  local consumer_variable_identity?: string = nil
+  local provider_foreign_identity?: string = nil
+  local consumer_foreign_identity?: string = nil
+  local provider_alias_identity?: string = nil
+  local consumer_alias_identity?: string = nil
+  for index = 1, #provider_snapshot.symbols do
+    local symbol = provider_snapshot.symbols[index]
+    if symbol.name == "secret" and symbol.exact_span ~= nil then
+      provider_identity = symbol.declaration_id
+    elseif symbol.name == "secret_value" and symbol.exact_span ~= nil then
+      provider_variable_identity = symbol.declaration_id
+    elseif symbol.name == "native_add" then
+      provider_foreign_identity = symbol.declaration_id
+    elseif symbol.name == "SecretAlias" and symbol.exact_span ~= nil then
+      provider_alias_identity = symbol.declaration_id
+    end
+  end
+  for index = 1, #consumer_snapshot.symbols do
+    local symbol = consumer_snapshot.symbols[index]
+    if symbol.name == "secret" and symbol.exact_span ~= nil then
+      consumer_identity = symbol.declaration_id
+    elseif symbol.name == "secret_value" and symbol.exact_span ~= nil then
+      consumer_variable_identity = symbol.declaration_id
+    elseif symbol.name == "native_add" then
+      consumer_foreign_identity = symbol.declaration_id
+    elseif symbol.name == "SecretAlias" and symbol.exact_span ~= nil then
+      consumer_alias_identity = symbol.declaration_id
+    end
+  end
+  test.assert(provider_identity ~= nil and
+              provider_identity == consumer_identity,
+              "source-imported local function did not join its declaration")
+  test.assert(provider_variable_identity ~= nil and
+              provider_variable_identity == consumer_variable_identity,
+              "source-imported local variable did not join its declaration")
+  test.assert(provider_foreign_identity ~= nil and
+              provider_foreign_identity == consumer_foreign_identity,
+              "source-imported foreign function did not join its references")
+  test.assert(provider_alias_identity ~= nil and
+              provider_alias_identity == consumer_alias_identity and
+              provider_alias_identity ==
+                "source:bridge_source_definition_provider:SecretAlias",
+              "source-imported local type alias did not join its declaration")
+
+  local definition? = features.build(projects, analysis.modules):definition(
+    consumer_file, source_text.Position.new(1, 44))
+  local provider_uri?, provider_uri_error? =
+    source_text.path_to_file_uri(provider_file)
+  test.assert(provider_uri_error == nil and provider_uri ~= nil,
+              "source-import provider path did not become a file URI")
+  if provider_uri == nil then raise "source-import provider URI is missing" end
+  test.assert(definition ~= nil and
+              definition.uri == provider_uri and
+              definition.range.start.line == 2 and
+              definition.range.start.character == 15 and
+              definition.range.finish.character == 21,
+              "source-imported local function resolved to no exact definition")
+
+  local variable_definition? =
+    features.build(projects, analysis.modules):definition(
+      consumer_file, source_text.Position.new(2, 49))
+  test.assert(variable_definition ~= nil and
+              variable_definition.uri == provider_uri and
+              variable_definition.range.start.line == 1 and
+              variable_definition.range.start.character == 6 and
+              variable_definition.range.finish.character == 18,
+              "source-imported local variable resolved to no exact definition")
+
+  local foreign_definition? =
+    features.build(projects, analysis.modules):definition(
+      consumer_file, source_text.Position.new(3, 50))
+  test.assert(foreign_definition == nil,
+              "source-imported foreign function became a definition target")
+end
+
+function test_compiler_bridge_joins_source_imported_local_function_definition_identity(
+    _context: test.Context)
+  test_runtime.run(joins_source_imported_local_function_definition_identity)
+end
+
 local function reports_dirty_saved_file_progress()
   with_fixture("progress", function ()
     local compiler = bridge.load()
@@ -1306,13 +1501,18 @@ function test_compiler_bridge_rechecks_source_required_external_dependencies_of_
   test_runtime.run(reparses_source_required_external_for_cached_project)
 end
 
-local function uses_analysis_local_ffi_include_dirs()
+local function uses_analysis_local_ffi_configuration()
   preload_real_compiler()
   local include_root = fs.tmpname()
   fs.unlink(include_root)
   fs.mkdir(include_root)
   local header = include_root .. "/vscode_titan_lsp_project_only.h"
-  fs.write_file(header, "typedef int vscode_titan_lsp_project_only_int;\n")
+  fs.write_file(header, [[
+#if VSCODE_TITAN_LSP_PROJECT_FLAG != 42
+#error project preprocessing flag is missing
+#endif
+typedef int vscode_titan_lsp_project_only_int;
+]])
   defer do
     fs.unlink(header)
     fs.rmdir(include_root)
@@ -1329,8 +1529,18 @@ local function uses_analysis_local_ffi_include_dirs()
   test.assert(#rejected.diagnostics > 0,
               "project-only FFI header unexpectedly resolved globally")
 
+  local include_only = bridge.load()
+  include_only:configure_paths(nil, nil, {include_root})
+  local missing_flag = include_only:analyze("bridge_ffi_include", {module})
+  test.assert(#missing_flag.diagnostics > 0,
+              "project FFI header ignored its required preprocessing flag")
+
   local configured = bridge.load()
-  configured:configure_paths(nil, nil, {include_root})
+  configured:configure_paths(
+    nil, nil, {include_root},
+    "-DVSCODE_TITAN_LSP_PROJECT_FLAG=17 " ..
+    "-UVSCODE_TITAN_LSP_PROJECT_FLAG " ..
+    "'-DVSCODE_TITAN_LSP_PROJECT_FLAG=42'")
   local accepted = configured:analyze("bridge_ffi_include", {module})
   local messages = strings.writer()
   for index = 1, #accepted.diagnostics do
@@ -1338,7 +1548,7 @@ local function uses_analysis_local_ffi_include_dirs()
   end
   test.assert(#accepted.diagnostics == 0 and
               accepted:find_module("bridge_ffi_include") ~= nil,
-              "analysis-local FFI include directory did not reach compiler: " ..
+              "analysis-local FFI configuration did not reach compiler: " ..
               messages:drain())
   local accepted_module: bridge.ModuleSnapshot =
     accepted:find_module("bridge_ffi_include")
@@ -1353,6 +1563,47 @@ local function uses_analysis_local_ffi_include_dirs()
   end
   test.assert(observed ~= nil,
               "compiler bridge lost the resolved project FFI header")
+
+  -- Reconfigure one Compiler A -> B -> A. The middle analysis must not reuse
+  -- a probe cached under A, while the final analysis must accept A again.
+  configured:configure_paths(nil, nil, {include_root})
+  local reconfigured_without_flag =
+    configured:analyze("bridge_ffi_include", {module})
+  test.assert(#reconfigured_without_flag.diagnostics > 0,
+              "same compiler reused preprocessing flags after reconfiguration")
+  configured:configure_paths(
+    nil, nil, {include_root},
+    "-DVSCODE_TITAN_LSP_PROJECT_FLAG=17 " ..
+    "-UVSCODE_TITAN_LSP_PROJECT_FLAG " ..
+    "'-DVSCODE_TITAN_LSP_PROJECT_FLAG=42'")
+  local accepted_again = configured:analyze("bridge_ffi_include", {module})
+  test.assert(#accepted_again.diagnostics == 0,
+              "same compiler did not restore an earlier preprocessing profile")
+
+  local rejected_flags = false
+  do
+    configured:configure_paths(
+      nil, nil, {include_root .. "/missing"}, "'unterminated")
+  catch
+    rejected_flags = true
+    test.assert(error is bridge.BridgeError and
+                strings.find(
+                  (error as bridge.BridgeError).message,
+                  "invalid extra_ffi_cppflags") ~= nil,
+                "malformed project flags raised an untyped bridge error")
+  end
+  test.assert(rejected_flags,
+              "malformed project preprocessing flags were accepted")
+  local preserved = configured:analyze("bridge_ffi_include", {module})
+  test.assert(#preserved.diagnostics == 0,
+              "malformed reconfiguration replaced the last accepted paths")
+
+  local after = bridge.load()
+  after:configure_paths(nil, nil, {include_root})
+  local isolated = after:analyze("bridge_ffi_include", {module})
+  test.assert(#isolated.diagnostics > 0,
+              "project preprocessing flags leaked across compiler permits")
+
   fs.write_file(header,
     "typedef long vscode_titan_lsp_project_only_int;\n")
   local restatted = configured:restat_c_header_dependencies(
@@ -1369,9 +1620,9 @@ local function uses_analysis_local_ffi_include_dirs()
               "compiler bridge reused a changed header content identity")
 end
 
-function test_compiler_bridge_uses_analysis_local_ffi_include_directories(
+function test_compiler_bridge_uses_analysis_local_ffi_configuration(
     _context: test.Context)
-  test_runtime.run(uses_analysis_local_ffi_include_dirs)
+  test_runtime.run(uses_analysis_local_ffi_configuration)
 end
 
 local function assert_joined_symbol(module: bridge.ModuleSnapshot,

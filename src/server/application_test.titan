@@ -7,6 +7,7 @@ local timer = import "timer"
 local application = import "server.application.titan"
 local bridge = import "server.compiler_bridge"
 local compiler_io = import "server.compiler_io"
+local diagnostics = import "server.diagnostics"
 local dispatcher = import "server.dispatcher"
 local indexing_status = import "server.indexing_status"
 local json = import "server.json"
@@ -603,6 +604,14 @@ local function recovers_configuration_load_failure_from_later_save()
     contains_string(app:watched_directories_for_testing(), fs.realpath(root)),
     "configuration failure did not retain a provisional project watcher")
 
+  local failed_statuses = #statuses
+  assert_failure(app:handle(request_for(
+    filename, 0, "textDocument/foldingRange")),
+    "unchanged request after initial configuration failure")
+  test.assert(#statuses == failed_statuses and
+              not app:indexing_metrics().refresh_chain_active,
+              "unchanged request retried the failed configuration epoch")
+
   fs.write_file(config_file,
     "source_modules_root = \".\"\n")
   -- Inject the exact saved-file hint deterministically. ProjectWatcher tests
@@ -1052,6 +1061,15 @@ local function failed_revision_waits_for_a_saved_change_and_recovers()
   local app = application.create_with_service(root, service)
   defer app:close()
   app:stop_watching_for_testing()
+  local diagnostic_publications: {diagnostics.Publication} = {}
+  local throw_from_diagnostics_listener = false
+  app:set_diagnostics_listener(function (
+      publication: diagnostics.Publication)
+    diagnostic_publications[#diagnostic_publications + 1] = publication
+    if throw_from_diagnostics_listener then
+      raise "deliberate diagnostics listener failure"
+    end
+  end)
 
   local initial? = app:snapshot_for_testing()
   test.assert(initial ~= nil and #initial.dirty_modules == 0 and
@@ -1059,6 +1077,12 @@ local function failed_revision_waits_for_a_saved_change_and_recovers()
               project_is_failed(initial.project_modules[1]) and
               initial.project_modules[1].compiler_snapshot == nil,
               "diagnostic module did not become a current failed revision")
+  test.assert(#diagnostic_publications == 1 and
+              diagnostic_publications[1].uri ~= "" and
+              #diagnostic_publications[1].items == 1 and
+              diagnostic_publications[1].items[1].message ==
+                "deliberate saved-source error",
+              "current failed revision was not published to the LSP client")
   local before = app:indexing_metrics()
   local runs_before = analyzer.runs
   test.assert(
@@ -1094,6 +1118,7 @@ local function failed_revision_waits_for_a_saved_change_and_recovers()
     "-- repaired saved revision\n")
   -- The watcher is deliberately stopped above so the saved-input transition
   -- is deterministic in this Application regression.
+  throw_from_diagnostics_listener = true
   app:note_saved_change()
   wait_until(function (): boolean
     return analyzer.runs == runs_before + 1 and
@@ -1107,6 +1132,11 @@ local function failed_revision_waits_for_a_saved_change_and_recovers()
               project_is_clean(repaired.project_modules[1]) and
               after.view_builds == before.view_builds + 1,
               "saved-source repair did not publish a rebuilt semantic View")
+  test.assert(#diagnostic_publications == 2 and
+              diagnostic_publications[2].uri ==
+                diagnostic_publications[1].uri and
+              #diagnostic_publications[2].items == 0,
+              "saved-source repair did not clear its stale diagnostic")
   test.assert(
     result_array_length(
       app:handle(request_for(
@@ -1260,8 +1290,10 @@ local function rebuilds_view_when_external_recheck_fails_clean_module()
   provider_file = second_provider
   fail_consumer = true
 
-  -- Read requests remain responsive with the preceding immutable View while
-  -- the unwatched provider topology is revalidated in the background.
+  -- Unchanged read requests do not probe unwatched providers. The next saved
+  -- project refresh revalidates the provider topology, while reads remain
+  -- responsive through the preceding immutable View.
+  app:note_saved_change()
   test.assert(
     result_array_length(
       app:handle(request_for(
@@ -1435,7 +1467,7 @@ local function classifies_canonical_symlink_watcher_paths()
               "deleted canonical source directory was filtered out")
 end
 
-local function reuses_view_for_unchanged_refresh_generation()
+local function reuses_view_without_unchanged_refresh()
   with_application(function (filename: string, _analyzer: YieldingAnalyzer,
                              app: application.Application)
     local statuses: {indexing_status.Status} = {}
@@ -1447,20 +1479,21 @@ local function reuses_view_for_unchanged_refresh_generation()
       result_array_length(
         app:handle(request_for(
           filename, 32, "textDocument/foldingRange")),
-        "read-only request during no-op refresh") == 1,
-      "no-op refresh did not serve the completed View")
-    wait_until(function (): boolean return #statuses == 2 end,
-               "no-op refresh did not finish")
+        "read-only request against completed generation") == 1,
+      "completed generation did not serve the read-only request")
     local after = app:indexing_metrics()
-    test.assert(after.refresh_passes == before.refresh_passes + 1 and
-                after.view_builds == before.view_builds,
-                "unchanged generation rebuilt the semantic View")
-    test.assert(not statuses[1].initial and not statuses[2].initial,
-                "ordinary revalidation was reported as an initial index")
+    test.assert(after.refresh_passes == before.refresh_passes and
+                after.view_builds == before.view_builds and #statuses == 0,
+                "unchanged semantic request started a project refresh")
   end)
 end
 
-local function serves_completed_view_during_yielding_recheck()
+function test_application_reuses_view_without_unchanged_refresh(
+    _context: test.Context)
+  test_runtime.run(reuses_view_without_unchanged_refresh)
+end
+
+local function remains_responsive_during_yielding_recheck()
   with_application(function (filename: string, analyzer: YieldingAnalyzer,
                              app: application.Application)
     app:stop_watching_for_testing()
@@ -1475,13 +1508,14 @@ local function serves_completed_view_during_yielding_recheck()
     analyzer.finished = false
     local runs_before = analyzer.runs
 
-    -- A read-only request starts background revalidation but immediately uses
-    -- the immutable preceding completed generation.
+    app:note_saved_change()
+    -- A read-only request does not wait for the watcher-triggered analysis and
+    -- uses the preceding immutable generation while the new one is pending.
     local first = app:handle(request_for(
       filename, 1, "textDocument/foldingRange"))
     test.assert(
-      result_array_length(first, "request which started project recheck") == 1,
-      "request which started recheck did not use the completed View")
+      result_array_length(first, "request during project recheck") == 1,
+      "request during recheck did not use the completed View")
     wait_until(function (): boolean return analyzer.started end,
                "background project recheck did not start")
 
@@ -1490,7 +1524,7 @@ local function serves_completed_view_during_yielding_recheck()
     test.assert(
       result_array_length(
         responsive, "read-only request during project recheck") == 1,
-      "responsive request did not use the preceding completed generation")
+      "responsive request did not use the completed View")
     test.assert(not analyzer.finished,
                 "responsive request waited for the yielding recheck")
 
@@ -1510,12 +1544,15 @@ local function serves_completed_view_during_yielding_recheck()
     fs.write_file(
       filename, "function answer(): integer return 789 end\n")
     app:note_saved_change()
+    -- Superseding the in-flight candidate advances the pending saved epoch,
+    -- but read-only requests still use the last completed immutable View until
+    -- the coalesced follow-up publishes the newest generation.
     test.assert(
       result_array_length(
         app:handle(request_for(
           filename, 9, "textDocument/foldingRange")),
-        "read-only request during watcher-dirty generation") == 0,
-      "watcher-dirty generation reused the preceding completed View")
+        "read-only request during watcher-dirty generation") == 1,
+      "watcher-dirty generation lost the preceding completed View")
     analyzer.block = false
     wait_until(function (): boolean return #statuses == 3 end,
                "superseded refresh chain did not reach ready")
@@ -1534,9 +1571,9 @@ local function serves_completed_view_during_yielding_recheck()
   end)
 end
 
-function test_application_serves_completed_view_during_yielding_recheck(
+function test_application_remains_responsive_during_yielding_recheck(
     _context: test.Context)
-  test_runtime.run(serves_completed_view_during_yielding_recheck)
+  test_runtime.run(remains_responsive_during_yielding_recheck)
 end
 
 local function preserves_shared_refresh_after_owner_cancellation()
@@ -1600,6 +1637,52 @@ function test_application_preserves_shared_refresh_after_owner_cancellation(
   test_runtime.run(preserves_shared_refresh_after_owner_cancellation)
 end
 
+local function serves_completed_view_during_saved_failure_repair()
+  with_application(function (filename: string, analyzer: YieldingAnalyzer,
+                             app: application.Application)
+    app:stop_watching_for_testing()
+    fs.write_file(filename, "deliberately failed saved source\n")
+    analyzer.fail = true
+    assert_failure(app:handle(request_for(
+      filename, 8, "textDocument/rename")),
+      "fresh request which established the failed saved epoch")
+
+    analyzer.fail = false
+    analyzer.block = true
+    analyzer.started = false
+    analyzer.finished = false
+    fs.write_file(filename,
+      "function answer(): integer\n" ..
+      "  return 2\n" ..
+      "end\n" ..
+      "-- repaired saved revision\n")
+    app:note_saved_change()
+    wait_until(function (): boolean return analyzer.started end,
+               "saved repair analysis did not start")
+
+    test.assert(
+      result_array_length(
+        app:handle(request_for(
+          filename, 9, "textDocument/foldingRange")),
+        "read-only request during saved repair") == 1,
+      "active saved repair exposed the preceding epoch's stale failure")
+    test.assert(app:indexing_metrics().refresh_chain_active,
+                "read-only fallback terminated the blocked saved repair")
+
+    analyzer.block = false
+    wait_until(function (): boolean
+      return analyzer.finished and
+             not app:indexing_metrics().refresh_chain_active
+    end, "saved repair did not replace the failed epoch")
+    test.assert(
+      result_array_length(
+        app:handle(request_for(
+          filename, 10, "textDocument/foldingRange")),
+        "read-only request after saved repair") == 0,
+      "repaired generation did not replace the completed View")
+  end)
+end
+
 local function rejects_fallback_after_refresh_failure()
   with_application(function (filename: string, analyzer: YieldingAnalyzer,
                              app: application.Application)
@@ -1619,18 +1702,19 @@ local function rejects_fallback_after_refresh_failure()
                 statuses[2].message ~= nil,
                 "terminal refresh failure did not emit bounded status")
 
-    -- Starting a background retry must not clear the known failure and make
-    -- the preceding completed View serviceable again.
+    -- An unchanged read-only request neither clears the known failure nor
+    -- retries the same failed saved revision. A strict rename may explicitly
+    -- retry because it must prove the newest disk generation before editing.
     assert_failure(app:handle(request_for(
       filename, 11, "textDocument/foldingRange")),
       "read-only request after known refresh failure")
-    test.assert(#statuses == 3 and
-                indexing_status.state_name(statuses[3].state) == "indexing",
-                "failure retry did not start a new indexing chain")
+    test.assert(#statuses == 2,
+                "unchanged read-only request retried a failed revision")
     assert_failure(app:handle(request_for(
       filename, 13, "textDocument/rename")),
-      "fresh request joining known-failure retry")
+      "strict request retrying known refresh failure")
     test.assert(#statuses == 4 and
+                indexing_status.state_name(statuses[3].state) == "indexing" and
                 indexing_status.state_name(statuses[4].state) == "failed",
                 "explicit retry did not report a second terminal failure")
 
@@ -1726,7 +1810,10 @@ function test_application_indexing_state_machine(_context: test.Context)
     run_indexing_case(
       "canonical symlink paths", classifies_canonical_symlink_watcher_paths)
     run_indexing_case(
-      "unchanged View reuse", reuses_view_for_unchanged_refresh_generation)
+      "unchanged View reuse", reuses_view_without_unchanged_refresh)
+    run_indexing_case(
+      "saved failure repair fallback",
+      serves_completed_view_during_saved_failure_repair)
     run_indexing_case(
       "closed status suppression", emits_no_indexing_status_after_close)
   end)

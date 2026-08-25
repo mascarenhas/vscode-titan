@@ -3,6 +3,8 @@
 "use strict";
 
 const fs = require("node:fs");
+const path = require("node:path");
+const { pathToFileURL } = require("node:url");
 
 const markerPath = process.argv[2];
 const traceMarkerPath = markerPath ? `${markerPath}.trace` : undefined;
@@ -18,6 +20,7 @@ const omitIndexingGeneration = fixtureArguments.includes(
   "--omit-indexing-generation"
 );
 const emitIndexingProgress = fixtureArguments.includes("--indexing-progress");
+const emitDiagnostics = fixtureArguments.includes("--diagnostics");
 const semanticMarkerPath = argumentValue("--semantic-marker");
 const indexingDelayMs = Number(argumentValue("--indexing-delay-ms") ?? 0);
 const hangInitializeAndStayAlive =
@@ -100,48 +103,63 @@ function handleMessage(message) {
     if (ignoreShutdown) {
       return;
     }
+    if (emitDiagnostics) publishFixtureDiagnostics([]);
     respond(message.id, null);
   } else if (message.method === "exit") {
     recordEvent("exit");
     process.exit(0);
-  } else if (message.method === "initialized" && provideSemantics) {
-    notify("titan/indexingStatus", {
-      state: "indexing",
-      initial: true,
-      epoch: 0
-    });
-    if (emitIndexingProgress) {
-      notify("titan/indexingStatus", {
-        state: "indexing", initial: true, epoch: 0,
-        completed_files: 0, total_files: 2
-      });
-      notify("titan/indexingStatus", {
-        state: "indexing", initial: true, epoch: 0,
-        completed_files: 2, total_files: 2
-      });
-      notify("titan/indexingStatus", {
-        state: "indexing", initial: true, epoch: 1
-      });
-      notify("titan/indexingStatus", {
-        state: "indexing", initial: true, epoch: 1,
-        completed_files: 0, total_files: 1
-      });
-      notify("titan/indexingStatus", {
-        state: "indexing", initial: true, epoch: 1,
-        completed_files: 1, total_files: 1
-      });
+  } else if (message.method === "initialized") {
+    if (emitDiagnostics) {
+      publishFixtureDiagnostics([{
+        range: {
+          start: { line: 1, character: 2 },
+          end: { line: 1, character: 2 }
+        },
+        severity: 1,
+        code: "type",
+        source: "Titan",
+        message: "fixture saved-source type error"
+      }]);
     }
-    const readyStatus = {
+    if (provideSemantics) {
+      notify("titan/indexingStatus", {
+        state: "indexing",
+        initial: true,
+        epoch: 0
+      });
+      if (emitIndexingProgress) {
+        notify("titan/indexingStatus", {
+          state: "indexing", initial: true, epoch: 0,
+          completed_files: 0, total_files: 2
+        });
+        notify("titan/indexingStatus", {
+          state: "indexing", initial: true, epoch: 0,
+          completed_files: 2, total_files: 2
+        });
+        notify("titan/indexingStatus", {
+          state: "indexing", initial: true, epoch: 1
+        });
+        notify("titan/indexingStatus", {
+          state: "indexing", initial: true, epoch: 1,
+          completed_files: 0, total_files: 1
+        });
+        notify("titan/indexingStatus", {
+          state: "indexing", initial: true, epoch: 1,
+          completed_files: 1, total_files: 1
+        });
+      }
+      const readyStatus = {
         state: "ready",
         initial: true,
         epoch: emitIndexingProgress ? 1 : 0
       };
-    if (!omitIndexingGeneration) readyStatus.generation = 1;
-    const ready = () => notify("titan/indexingStatus", readyStatus);
-    if (indexingDelayMs > 0) {
-      setTimeout(ready, indexingDelayMs);
-    } else {
-      ready();
+      if (!omitIndexingGeneration) readyStatus.generation = 1;
+      const ready = () => notify("titan/indexingStatus", readyStatus);
+      if (indexingDelayMs > 0) {
+        setTimeout(ready, indexingDelayMs);
+      } else {
+        ready();
+      }
     }
   } else if (message.method === "$/setTrace") {
     appendEvent(traceMarkerPath, {
@@ -152,6 +170,13 @@ function handleMessage(message) {
     recordSemanticRequest(message);
     if (!hangSemantic) respondToSemanticRequest(message);
   }
+}
+
+function publishFixtureDiagnostics(diagnostics) {
+  notify("textDocument/publishDiagnostics", {
+    uri: pathToFileURL(path.join(process.cwd(), "sample.titan")).href,
+    diagnostics
+  });
 }
 
 function recordEvent(event, details = {}) {

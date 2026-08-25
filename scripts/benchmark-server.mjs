@@ -2,9 +2,10 @@
 
 import { spawn, spawnSync } from "node:child_process";
 import { constants as fsConstants } from "node:fs";
-import { access, readFile, stat } from "node:fs/promises";
+import { access, readFile, realpath, stat } from "node:fs/promises";
 import * as path from "node:path";
 import { performance } from "node:perf_hooks";
+import { StringDecoder } from "node:string_decoder";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 const MAX_FRAME_BYTES = 64 * 1024 * 1024;
@@ -13,11 +14,457 @@ const SHUTDOWN_TIMEOUT_MS = 5_000;
 const TERMINATION_GRACE_MS = 2_000;
 const INDEXING_STATUS_METHOD = "titan/indexingStatus";
 const BENCHMARK_FILE = "src/server/application.titan";
-const BENCHMARK_MARKER = 'self:start_refresh(true, "semantic_request")';
+const BENCHMARK_MARKER = 'self:start_refresh(false, "semantic_request")';
 const BENCHMARK_SYMBOL = "start_refresh";
 const LOG_LEVELS = new Set(["off", "error", "info", "debug", "trace"]);
+const STRUCTURED_LOG_PREFIX = "titan-language-server ";
+const MAX_PROFILE_LINE_CHARACTERS = 1024 * 1024;
+const SOURCE_PROFILE_EVENT = "compiler.source_module.profile";
+const SOURCE_PROFILE_OUTCOMES = new Set(["complete", "failed"]);
+const NORMALIZATION_PROFILE_EVENT = "compiler.module.normalization";
+const HEADER_PHASE_EVENT = "compiler.c_header.phase";
+const PROBE_CACHE_EVENT = "compiler.c_probe.cache";
+const HEADER_PROCESS_TOTAL_PHASE = "process_total";
+const HEADER_DOWNSTREAM_PHASE = "downstream_ffi_conversion";
+const PERSISTENT_SUCCESS_CACHE = "persistent success";
+const PROBE_CACHE_STAGES = new Set(["baseline", "candidate"]);
+const PROFILE_CPU_ROUNDING_ULPS = 64;
 
 class BenchmarkError extends Error {}
+
+function profileString(record, field, event, allowEmpty = false) {
+  const value = record[field];
+  if (typeof value !== "string" || (!allowEmpty && value.length === 0)) {
+    throw new BenchmarkError(
+      `${event} field ${field} must be ${allowEmpty ? "a string" : "a nonempty string"}`
+    );
+  }
+  return value;
+}
+
+function profileMilliseconds(record, field, event) {
+  const value = record[field];
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
+    throw new BenchmarkError(
+      `${event} field ${field} must be a finite nonnegative number`
+    );
+  }
+  return value;
+}
+
+function profileCpuRemainder(total, components, event, totalField,
+                             componentFields) {
+  const componentTotal = components.reduce(
+    (sum, component) => sum + component, 0);
+  if (!Number.isFinite(componentTotal)) {
+    throw new BenchmarkError(
+      `${event} fields ${componentFields.join(" plus ")} must not exceed ${totalField}`
+    );
+  }
+  const tolerance = Number.EPSILON * PROFILE_CPU_ROUNDING_ULPS *
+    Math.max(1, total, componentTotal);
+  if (componentTotal > total + tolerance) {
+    throw new BenchmarkError(
+      `${event} fields ${componentFields.join(" plus ")} must not exceed ${totalField}`
+    );
+  }
+  return Math.max(0, total - componentTotal);
+}
+
+function profileBoolean(record, field, event) {
+  const value = record[field];
+  if (typeof value !== "boolean") {
+    throw new BenchmarkError(`${event} field ${field} must be a boolean`);
+  }
+  return value;
+}
+
+function stableDisplayValue(current, candidate) {
+  if (candidate.length === 0) return current;
+  if (current.length === 0 || candidate < current) return candidate;
+  return current;
+}
+
+function compareProfileStrings(left, right) {
+  if (left < right) return -1;
+  if (left > right) return 1;
+  return 0;
+}
+
+function addPhase(accumulator, phase, cpuMs) {
+  const current = accumulator.get(phase) ?? { calls: 0, cpuMs: 0 };
+  current.calls += 1;
+  current.cpuMs += cpuMs;
+  accumulator.set(phase, current);
+}
+
+function phaseRows(phases) {
+  return [...phases].map(([phase, value]) => ({
+    phase,
+    calls: value.calls,
+    cpuMs: roundMilliseconds(value.cpuMs)
+  })).sort((left, right) =>
+    right.cpuMs - left.cpuMs ||
+    compareProfileStrings(left.phase, right.phase));
+}
+
+function cacheRate(hits, requests) {
+  if (requests === 0) return 0;
+  return Math.round(hits * 1_000_000 / requests) / 1_000_000;
+}
+
+function cacheCounts(source) {
+  const requests = source.hits + source.misses;
+  return {
+    hits: source.hits,
+    misses: source.misses,
+    requests,
+    hitRate: cacheRate(source.hits, requests)
+  };
+}
+
+function recordCacheRequest(target, hit) {
+  if (hit) target.hits += 1;
+  else target.misses += 1;
+}
+
+function newAttributionStream() {
+  return {
+    seen: false,
+    firstCpuMs: 0,
+    reuseTotalCpuMs: 0,
+    reuseCalls: 0,
+    reuseMaxCpuMs: 0
+  };
+}
+
+function recordAttribution(stream, cpuMs) {
+  if (!stream.seen) {
+    stream.seen = true;
+    stream.firstCpuMs = cpuMs;
+    return;
+  }
+  stream.reuseTotalCpuMs += cpuMs;
+  stream.reuseCalls += 1;
+  stream.reuseMaxCpuMs = Math.max(stream.reuseMaxCpuMs, cpuMs);
+}
+
+function firstReuseMetrics(...streams) {
+  let firstCallCpuMs = 0;
+  let reuseTotalCpuMs = 0;
+  let reuseCalls = 0;
+  let reuseMaxCpuMs = 0;
+  for (const stream of streams) {
+    firstCallCpuMs += stream.firstCpuMs;
+    reuseTotalCpuMs += stream.reuseTotalCpuMs;
+    reuseCalls += stream.reuseCalls;
+    reuseMaxCpuMs = Math.max(reuseMaxCpuMs, stream.reuseMaxCpuMs);
+  }
+  return {
+    firstCallCpuMs: roundMilliseconds(firstCallCpuMs),
+    reuseTotalCpuMs: roundMilliseconds(reuseTotalCpuMs),
+    reuseCalls,
+    reuseAverageCpuMs: roundMilliseconds(
+      reuseCalls === 0 ? 0 : reuseTotalCpuMs / reuseCalls),
+    reuseMaxCpuMs: roundMilliseconds(reuseMaxCpuMs)
+  };
+}
+
+class ColdProfileAccumulator {
+  constructor() {
+    this.modules = new Map();
+    this.headers = new Map();
+    this.headerComponentPhases = new Map();
+    this.probeCacheStages = new Map();
+    this.persistentProbeModules = new Map();
+    this.probeCacheRecords = 0;
+    this.traceRecords = 0;
+  }
+
+  ingest(record) {
+    if (typeof record !== "object" || record === null || Array.isArray(record)) {
+      return false;
+    }
+    const event = record.event;
+    if (event === SOURCE_PROFILE_EVENT) {
+      this.ingestSourceModule(record);
+    } else if (event === NORMALIZATION_PROFILE_EVENT) {
+      this.ingestNormalization(record);
+    } else if (event === HEADER_PHASE_EVENT) {
+      this.ingestHeaderPhase(record);
+    } else if (event === PROBE_CACHE_EVENT) {
+      this.ingestProbeCache(record);
+    } else {
+      return false;
+    }
+    this.traceRecords += 1;
+    return true;
+  }
+
+  moduleRow(record, event) {
+    const moduleName = profileString(record, "module_name", event);
+    const filename = profileString(record, "filename", event);
+    const key = JSON.stringify([moduleName, filename]);
+    let row = this.modules.get(key);
+    if (row === undefined) {
+      row = {
+        moduleName,
+        filename,
+        calls: 0,
+        selfCpuMs: 0,
+        parseCpuMs: 0,
+        checkCpuMs: 0,
+        otherCpuMs: 0,
+        inclusiveCpuMs: 0,
+        normalizationCpuMs: 0,
+        sourceAttribution: newAttributionStream(),
+        normalizationAttribution: newAttributionStream()
+      };
+      this.modules.set(key, row);
+    }
+    return row;
+  }
+
+  ingestSourceModule(record) {
+    profileString(record, "root_module", SOURCE_PROFILE_EVENT);
+    const outcome = profileString(record, "outcome", SOURCE_PROFILE_EVENT);
+    if (!SOURCE_PROFILE_OUTCOMES.has(outcome)) {
+      throw new BenchmarkError(
+        `${SOURCE_PROFILE_EVENT} field outcome must be complete or failed`
+      );
+    }
+    const selfCpuMs = profileMilliseconds(
+      record, "self_cpu_ms", SOURCE_PROFILE_EVENT);
+    const inclusiveCpuMs = profileMilliseconds(
+      record, "total_cpu_ms", SOURCE_PROFILE_EVENT);
+    profileCpuRemainder(
+      inclusiveCpuMs, [selfCpuMs], SOURCE_PROFILE_EVENT,
+      "total_cpu_ms", ["self_cpu_ms"]);
+    const parseCpuMs = profileMilliseconds(
+      record, "parse_cpu_ms", SOURCE_PROFILE_EVENT);
+    const checkCpuMs = profileMilliseconds(
+      record, "check_cpu_ms", SOURCE_PROFILE_EVENT);
+    const otherCpuMs = profileCpuRemainder(
+      selfCpuMs, [parseCpuMs, checkCpuMs], SOURCE_PROFILE_EVENT,
+      "self_cpu_ms", ["parse_cpu_ms", "check_cpu_ms"]);
+    const row = this.moduleRow(record, SOURCE_PROFILE_EVENT);
+    row.calls += 1;
+    row.selfCpuMs += selfCpuMs;
+    row.parseCpuMs += parseCpuMs;
+    row.checkCpuMs += checkCpuMs;
+    row.otherCpuMs += otherCpuMs;
+    row.inclusiveCpuMs += inclusiveCpuMs;
+    recordAttribution(row.sourceAttribution, selfCpuMs);
+  }
+
+  ingestNormalization(record) {
+    profileString(record, "root_module", NORMALIZATION_PROFILE_EVENT);
+    const cpuMs = profileMilliseconds(
+      record, "cpu_ms", NORMALIZATION_PROFILE_EVENT);
+    const row = this.moduleRow(record, NORMALIZATION_PROFILE_EVENT);
+    row.normalizationCpuMs += cpuMs;
+    recordAttribution(row.normalizationAttribution, cpuMs);
+  }
+
+  ingestHeaderPhase(record) {
+    profileString(record, "root_module", HEADER_PHASE_EVENT);
+    const header = profileString(
+      record, "header", HEADER_PHASE_EVENT, true);
+    const resolvedHeader = profileString(
+      record, "resolved_header", HEADER_PHASE_EVENT, true);
+    const identity = profileString(record, "identity", HEADER_PHASE_EVENT);
+    const phase = profileString(record, "phase", HEADER_PHASE_EVENT);
+    profileString(record, "outcome", HEADER_PHASE_EVENT, true);
+    const cpuMs = profileMilliseconds(record, "cpu_ms", HEADER_PHASE_EVENT);
+    let row = this.headers.get(identity);
+    if (row === undefined) {
+      row = {
+        identity,
+        header: "",
+        resolvedHeader: "",
+        calls: 0,
+        processCpuMs: 0,
+        downstreamConversionCpuMs: 0,
+        componentPhases: new Map(),
+        processAttribution: newAttributionStream(),
+        downstreamAttribution: newAttributionStream()
+      };
+      this.headers.set(identity, row);
+    }
+    row.header = stableDisplayValue(row.header, header);
+    row.resolvedHeader = stableDisplayValue(
+      row.resolvedHeader, resolvedHeader);
+    if (phase === HEADER_PROCESS_TOTAL_PHASE) {
+      row.calls += 1;
+      row.processCpuMs += cpuMs;
+      recordAttribution(row.processAttribution, cpuMs);
+    } else if (phase === HEADER_DOWNSTREAM_PHASE) {
+      row.downstreamConversionCpuMs += cpuMs;
+      recordAttribution(row.downstreamAttribution, cpuMs);
+    } else {
+      addPhase(row.componentPhases, phase, cpuMs);
+      addPhase(this.headerComponentPhases, phase, cpuMs);
+    }
+  }
+
+  ingestProbeCache(record) {
+    profileString(record, "root_module", PROBE_CACHE_EVENT);
+    const moduleName = profileString(
+      record, "module_name", PROBE_CACHE_EVENT);
+    const cache = profileString(record, "cache", PROBE_CACHE_EVENT);
+    if (cache !== PERSISTENT_SUCCESS_CACHE) {
+      throw new BenchmarkError(
+        `${PROBE_CACHE_EVENT} field cache must be ${JSON.stringify(PERSISTENT_SUCCESS_CACHE)}`
+      );
+    }
+    const stage = profileString(record, "stage", PROBE_CACHE_EVENT);
+    if (!PROBE_CACHE_STAGES.has(stage)) {
+      throw new BenchmarkError(
+        `${PROBE_CACHE_EVENT} field stage must be baseline or candidate`
+      );
+    }
+    const hit = profileBoolean(record, "hit", PROBE_CACHE_EVENT);
+    profileString(record, "key", PROBE_CACHE_EVENT);
+    profileString(record, "path", PROBE_CACHE_EVENT);
+    let stageEntry = this.probeCacheStages.get(stage);
+    if (stageEntry === undefined) {
+      stageEntry = { stage, hits: 0, misses: 0 };
+      this.probeCacheStages.set(stage, stageEntry);
+    }
+    recordCacheRequest(stageEntry, hit);
+    this.probeCacheRecords += 1;
+    let moduleEntry = this.persistentProbeModules.get(moduleName);
+    if (moduleEntry === undefined) {
+      moduleEntry = { moduleName, hits: 0, misses: 0 };
+      this.persistentProbeModules.set(moduleName, moduleEntry);
+    }
+    recordCacheRequest(moduleEntry, hit);
+  }
+
+  finish() {
+    if (this.traceRecords === 0) return undefined;
+    const moduleTotals = {
+      calls: 0,
+      selfCpuMs: 0,
+      parseCpuMs: 0,
+      checkCpuMs: 0,
+      otherCpuMs: 0,
+      normalizationCpuMs: 0,
+      attributedCpuMs: 0
+    };
+    const modules = [...this.modules.values()].map((source) => {
+      const attributedCpuMs = source.selfCpuMs + source.normalizationCpuMs;
+      moduleTotals.calls += source.calls;
+      moduleTotals.selfCpuMs += source.selfCpuMs;
+      moduleTotals.parseCpuMs += source.parseCpuMs;
+      moduleTotals.checkCpuMs += source.checkCpuMs;
+      moduleTotals.otherCpuMs += source.otherCpuMs;
+      moduleTotals.normalizationCpuMs += source.normalizationCpuMs;
+      moduleTotals.attributedCpuMs += attributedCpuMs;
+      return {
+        moduleName: source.moduleName,
+        filename: source.filename,
+        calls: source.calls,
+        selfCpuMs: roundMilliseconds(source.selfCpuMs),
+        parseCpuMs: roundMilliseconds(source.parseCpuMs),
+        checkCpuMs: roundMilliseconds(source.checkCpuMs),
+        otherCpuMs: roundMilliseconds(source.otherCpuMs),
+        inclusiveCpuMs: roundMilliseconds(source.inclusiveCpuMs),
+        normalizationCpuMs: roundMilliseconds(source.normalizationCpuMs),
+        attributedCpuMs: roundMilliseconds(attributedCpuMs),
+        ...firstReuseMetrics(
+          source.sourceAttribution, source.normalizationAttribution)
+      };
+    }).sort((left, right) =>
+      right.attributedCpuMs - left.attributedCpuMs ||
+      compareProfileStrings(left.moduleName, right.moduleName) ||
+      compareProfileStrings(left.filename, right.filename));
+
+    const headerTotals = {
+      calls: 0,
+      processCpuMs: 0,
+      downstreamConversionCpuMs: 0,
+      attributedCpuMs: 0,
+      componentPhases: phaseRows(this.headerComponentPhases)
+    };
+    const headers = [...this.headers.values()].map((source) => {
+      const attributedCpuMs = source.processCpuMs +
+        source.downstreamConversionCpuMs;
+      headerTotals.calls += source.calls;
+      headerTotals.processCpuMs += source.processCpuMs;
+      headerTotals.downstreamConversionCpuMs +=
+        source.downstreamConversionCpuMs;
+      headerTotals.attributedCpuMs += attributedCpuMs;
+      return {
+        identity: source.identity,
+        header: source.header,
+        resolvedHeader: source.resolvedHeader,
+        calls: source.calls,
+        processCpuMs: roundMilliseconds(source.processCpuMs),
+        downstreamConversionCpuMs: roundMilliseconds(
+          source.downstreamConversionCpuMs),
+        attributedCpuMs: roundMilliseconds(attributedCpuMs),
+        ...firstReuseMetrics(
+          source.processAttribution, source.downstreamAttribution),
+        componentPhases: phaseRows(source.componentPhases)
+      };
+    }).sort((left, right) =>
+      right.attributedCpuMs - left.attributedCpuMs ||
+      compareProfileStrings(left.identity, right.identity));
+
+    let probeCaches;
+    if (this.probeCacheRecords > 0) {
+      const probeTotals = { hits: 0, misses: 0 };
+      const rows = [...this.probeCacheStages.values()].map((source) => {
+        probeTotals.hits += source.hits;
+        probeTotals.misses += source.misses;
+        return { stage: source.stage, ...cacheCounts(source) };
+      }).sort((left, right) =>
+        right.requests - left.requests ||
+        compareProfileStrings(left.stage, right.stage));
+      const modules = [...this.persistentProbeModules.values()]
+        .map((source) => ({
+          moduleName: source.moduleName,
+          ...cacheCounts(source)
+        })).sort((left, right) =>
+          right.requests - left.requests ||
+          compareProfileStrings(left.moduleName, right.moduleName));
+      probeCaches = {
+        rows,
+        totals: cacheCounts(probeTotals),
+        persistentSuccess: {
+          totals: cacheCounts(probeTotals),
+          ...(modules.length === 0 ? {} : { modules })
+        }
+      };
+    }
+
+    for (const totals of [moduleTotals, headerTotals]) {
+      for (const [field, value] of Object.entries(totals)) {
+        if (field !== "calls" && field !== "componentPhases") {
+          totals[field] = roundMilliseconds(value);
+        }
+      }
+    }
+    return {
+      modules,
+      headers,
+      ...(probeCaches === undefined ? {} : { probeCaches }),
+      totals: {
+        modules: moduleTotals,
+        headers: headerTotals,
+        attributedCpuMs: roundMilliseconds(
+          moduleTotals.attributedCpuMs + headerTotals.attributedCpuMs)
+      }
+    };
+  }
+}
+
+function aggregateColdProfile(records) {
+  const accumulator = new ColdProfileAccumulator();
+  for (const record of records) accumulator.ingest(record);
+  return accumulator.finish();
+}
 
 function usage() {
   return [
@@ -26,6 +473,11 @@ function usage() {
     "options:",
     "  --server PATH       native server (default: bin/titan-language-server)",
     "  --root PATH         vscode-titan workspace (default: repository root)",
+    `  --file PATH         saved Titan target (default: ${BENCHMARK_FILE})`,
+    "  --marker TEXT       unique source text containing the target symbol",
+    "  --symbol TEXT       target symbol within --marker",
+    "  --probe SPEC        ready-state hover/definition probe",
+    "                      SPEC is OP:FILE:LINE:CHAR; may be repeated",
     "  --log-level LEVEL   server log emission (default: debug, like VS Code)",
     `  --timeout-ms N      indexing/message timeout (default: ${DEFAULT_TIMEOUT_MS})`,
     "  --help              show this help"
@@ -40,6 +492,10 @@ function parseArguments(argv) {
   const options = {
     root: repositoryRoot,
     server: undefined,
+    file: BENCHMARK_FILE,
+    marker: BENCHMARK_MARKER,
+    symbol: BENCHMARK_SYMBOL,
+    probes: [],
     logLevel: "debug",
     timeoutMs: DEFAULT_TIMEOUT_MS
   };
@@ -50,7 +506,18 @@ function parseArguments(argv) {
       process.stdout.write(`${usage()}\n`);
       process.exit(0);
     }
+    if (argument === "--probe") {
+      const value = argv[index + 1];
+      if (value === undefined) {
+        throw new BenchmarkError("--probe requires a value");
+      }
+      options.probes.push(value);
+      index += 1;
+      continue;
+    }
     if (argument === "--server" || argument === "--root" ||
+        argument === "--file" || argument === "--marker" ||
+        argument === "--symbol" ||
         argument === "--log-level" ||
         argument === "--timeout-ms") {
       const value = argv[index + 1];
@@ -62,6 +529,12 @@ function parseArguments(argv) {
         options.server = value;
       } else if (argument === "--root") {
         options.root = path.resolve(value);
+      } else if (argument === "--file") {
+        options.file = value;
+      } else if (argument === "--marker") {
+        options.marker = value;
+      } else if (argument === "--symbol") {
+        options.symbol = value;
       } else if (argument === "--log-level") {
         if (!LOG_LEVELS.has(value)) {
           throw new BenchmarkError(
@@ -85,6 +558,17 @@ function parseArguments(argv) {
   options.server = path.resolve(
     options.server ?? path.join(options.root, "bin", "titan-language-server")
   );
+  if (options.file.length === 0 || options.marker.length === 0 ||
+      options.symbol.length === 0) {
+    throw new BenchmarkError("--file, --marker, and --symbol must not be empty");
+  }
+  if (options.marker.indexOf(options.symbol) < 0 ||
+      options.marker.indexOf(options.symbol) !==
+        options.marker.lastIndexOf(options.symbol)) {
+    throw new BenchmarkError(
+      "--marker must contain --symbol exactly once"
+    );
+  }
   return options;
 }
 
@@ -359,37 +843,98 @@ async function validateInputs(options) {
   await access(options.server, fsConstants.X_OK).catch(() => {
     throw new BenchmarkError(`native server is not executable: ${options.server}`);
   });
-  const rootInfo = await stat(options.root).catch(() => undefined);
+  const canonicalRoot = await realpath(options.root).catch(() => undefined);
+  const rootInfo = canonicalRoot === undefined
+    ? undefined
+    : await stat(canonicalRoot).catch(() => undefined);
   if (rootInfo === undefined || !rootInfo.isDirectory()) {
     throw new BenchmarkError(`workspace root is not a directory: ${options.root}`);
   }
+  options.root = canonicalRoot;
 }
 
-async function benchmarkTarget(root) {
-  const filename = path.join(root, BENCHMARK_FILE);
+async function benchmarkTarget(options) {
+  const { filename, relativeFile } = await canonicalTargetInsideRoot(
+    options.root, options.file, "--file");
   const source = await readFile(filename, "utf8").catch((cause) => {
     throw new BenchmarkError(`cannot read benchmark target ${filename}: ${cause.message}`);
   });
-  const markerOffset = source.indexOf(BENCHMARK_MARKER);
-  if (markerOffset < 0 || source.indexOf(BENCHMARK_MARKER, markerOffset + 1) >= 0) {
+  const markerOffset = source.indexOf(options.marker);
+  if (markerOffset < 0 || source.indexOf(options.marker, markerOffset + 1) >= 0) {
     throw new BenchmarkError(
-      `${BENCHMARK_FILE} must contain exactly one ${BENCHMARK_MARKER}`
+      `${relativeFile} must contain exactly one ${JSON.stringify(options.marker)}`
     );
   }
-  const symbolOffset = markerOffset + BENCHMARK_MARKER.indexOf(BENCHMARK_SYMBOL);
+  const symbolOffset = markerOffset + options.marker.indexOf(options.symbol);
   const preceding = source.slice(0, symbolOffset);
   const newline = preceding.lastIndexOf("\n");
   return {
     filename,
-    relativeFile: BENCHMARK_FILE,
+    relativeFile,
     uri: pathToFileURL(filename).href,
-    symbol: BENCHMARK_SYMBOL,
+    symbol: options.symbol,
     position: {
       line: preceding.split("\n").length - 1,
       // JavaScript string length is exactly the UTF-16 code-unit count LSP uses.
       character: preceding.slice(newline + 1).length
     }
   };
+}
+
+function pathInsideRoot(root, filename, subject) {
+  const relativeFile = path.relative(root, filename);
+  if (relativeFile === "" || relativeFile === ".." ||
+      relativeFile.startsWith(`..${path.sep}`) || path.isAbsolute(relativeFile)) {
+    throw new BenchmarkError(`${subject} must identify a file inside --root`);
+  }
+  return relativeFile;
+}
+
+async function canonicalTargetInsideRoot(root, configuredPath, subject) {
+  const filename = path.resolve(root, configuredPath);
+  pathInsideRoot(root, filename, subject);
+  const canonicalFilename = await realpath(filename).catch((cause) => {
+    throw new BenchmarkError(
+      `cannot resolve ${subject} target ${filename}: ${cause.message}`
+    );
+  });
+  if (path.relative(filename, canonicalFilename) !== "") {
+    throw new BenchmarkError(`${subject} target must not traverse symlinks`);
+  }
+  const relativeFile = pathInsideRoot(root, canonicalFilename, subject);
+  const info = await stat(canonicalFilename).catch(() => undefined);
+  if (info === undefined || !info.isFile()) {
+    throw new BenchmarkError(`${subject} target is not a file: ${canonicalFilename}`);
+  }
+  return { filename: canonicalFilename, relativeFile };
+}
+
+async function benchmarkProbes(options) {
+  const result = [];
+  for (let index = 0; index < options.probes.length; index += 1) {
+    const spec = options.probes[index];
+    const match = /^(hover|definition):(.*):([0-9]+):([0-9]+)$/.exec(spec);
+    if (match === null || match[2].length === 0) {
+      throw new BenchmarkError(
+        `invalid --probe ${JSON.stringify(spec)}; expected OP:FILE:LINE:CHAR`
+      );
+    }
+    const line = Number(match[3]);
+    const character = Number(match[4]);
+    if (!Number.isSafeInteger(line) || !Number.isSafeInteger(character)) {
+      throw new BenchmarkError(`invalid --probe position: ${spec}`);
+    }
+    const { filename, relativeFile } = await canonicalTargetInsideRoot(
+      options.root, match[2], "--probe FILE");
+    result.push({
+      operation: match[1],
+      filename,
+      relativeFile,
+      uri: pathToFileURL(filename).href,
+      position: { line, character }
+    });
+  }
+  return result;
 }
 
 function clockTicksPerSecond() {
@@ -441,13 +986,83 @@ function createProcessOutcome(child) {
 
 function collectStderr(stream, maximumBytes = 64 * 1024) {
   let contents = Buffer.alloc(0);
+  const decoder = new StringDecoder("utf8");
+  const profile = new ColdProfileAccumulator();
+  let pendingLine = "";
+  let discardingOversizedLine = false;
+  let profileError;
+
+  function ingestLine(line) {
+    if (line.length > MAX_PROFILE_LINE_CHARACTERS) {
+      if (profileError === undefined &&
+          line.startsWith(STRUCTURED_LOG_PREFIX)) {
+        profileError = new BenchmarkError(
+          `structured server log line exceeded ${MAX_PROFILE_LINE_CHARACTERS} characters`
+        );
+      }
+      return;
+    }
+    if (profileError !== undefined ||
+        !line.startsWith(STRUCTURED_LOG_PREFIX)) return;
+    try {
+      const record = JSON.parse(line.slice(STRUCTURED_LOG_PREFIX.length));
+      profile.ingest(record);
+    } catch (cause) {
+      profileError = cause instanceof BenchmarkError
+        ? cause
+        : new BenchmarkError(
+          `invalid structured server log record: ${cause.message}`);
+    }
+  }
+
+  function ingestText(text, final = false) {
+    let offset = 0;
+    while (offset < text.length) {
+      if (discardingOversizedLine) {
+        const newline = text.indexOf("\n", offset);
+        if (newline < 0) return;
+        discardingOversizedLine = false;
+        offset = newline + 1;
+        continue;
+      }
+      const newline = text.indexOf("\n", offset);
+      if (newline < 0) {
+        pendingLine += text.slice(offset);
+        if (pendingLine.length > MAX_PROFILE_LINE_CHARACTERS) {
+          ingestLine(pendingLine);
+          pendingLine = "";
+          discardingOversizedLine = true;
+        }
+        break;
+      }
+      let line = pendingLine + text.slice(offset, newline);
+      pendingLine = "";
+      if (line.endsWith("\r")) line = line.slice(0, -1);
+      ingestLine(line);
+      offset = newline + 1;
+    }
+    if (final && !discardingOversizedLine && pendingLine.length > 0) {
+      ingestLine(pendingLine);
+      pendingLine = "";
+    }
+  }
+
   stream.on("data", (chunk) => {
-    contents = Buffer.concat([contents, chunk]);
+    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    contents = Buffer.concat([contents, buffer]);
     if (contents.length > maximumBytes) {
       contents = contents.subarray(contents.length - maximumBytes);
     }
+    ingestText(decoder.write(buffer));
   });
-  return () => contents.toString("utf8").trim();
+  stream.once("end", () => ingestText(decoder.end(), true));
+  return {
+    tail: () => contents.toString("utf8").trim(),
+    coldProfile: () => {
+      if (profileError !== undefined) throw profileError;
+      return profile.finish();
+    }
+  };
 }
 
 async function startServer(options) {
@@ -494,9 +1109,12 @@ function roundMilliseconds(value) {
 function definitionSummary(result, target) {
   const location = Array.isArray(result) ? result[0] : result;
   const start = location?.range?.start;
+  const found = typeof location?.uri === "string" &&
+    Number.isSafeInteger(start?.line) &&
+    Number.isSafeInteger(start?.character);
   return {
-    found: location !== null && typeof location === "object",
-    sameFile: location?.uri === target.uri,
+    found,
+    sameFile: found && location.uri === target.uri,
     line: Number.isSafeInteger(start?.line) ? start.line : undefined,
     character: Number.isSafeInteger(start?.character)
       ? start.character
@@ -506,7 +1124,8 @@ function definitionSummary(result, target) {
 
 async function benchmark(options) {
   await validateInputs(options);
-  const target = await benchmarkTarget(options.root);
+  const target = await benchmarkTarget(options);
+  const probes = await benchmarkProbes(options);
   const ticksPerSecond = clockTicksPerSecond();
   const child = await startServer(options);
   const outcome = createProcessOutcome(child);
@@ -599,10 +1218,10 @@ async function benchmark(options) {
       );
     }
 
-    const refreshStatusStart = client.statuses.length;
-    const refreshStartResources = await processSample(child.pid, ticksPerSecond);
+    const queryStatusStart = client.statuses.length;
+    const queryStartResources = await processSample(child.pid, ticksPerSecond);
     const readyQueriesSentAt = performance.now();
-    client.sendTogether([
+    const readyMessages = [
       {
         jsonrpc: "2.0",
         id: 3,
@@ -621,52 +1240,74 @@ async function benchmark(options) {
           position: target.position
         }
       }
-    ]);
+    ];
+    for (let index = 0; index < probes.length; index += 1) {
+      const probe = probes[index];
+      readyMessages.push({
+        jsonrpc: "2.0",
+        id: 10 + index,
+        method: `textDocument/${probe.operation}`,
+        params: {
+          textDocument: { uri: probe.uri },
+          position: probe.position
+        }
+      });
+    }
+    client.sendTogether(readyMessages);
 
-    await client.pumpUntil(() => {
-      const cycle = indexingCycleAfter(
-        client, refreshStatusStart, false, "unchanged refresh"
-      );
-      return responseAt(client, 3) !== undefined &&
+    await client.pumpUntil(() =>
+      responseAt(client, 3) !== undefined &&
         responseAt(client, 4) !== undefined &&
-        cycle !== undefined;
-    }, "ready queries and unchanged refresh");
+        probes.every((_, index) =>
+          responseAt(client, 10 + index) !== undefined),
+    "ready queries without refresh");
     const readyHover = await client.response(3, "ready hover response");
-    const definition = await client.response(4, "method definition response");
-    const refreshCycle = indexingCycleAfter(
-      client, refreshStatusStart, false, "unchanged refresh"
-    );
-    if (refreshCycle === undefined) {
-      throw new BenchmarkError("unchanged refresh omitted its terminal status");
-    }
-    const refreshIndexing = refreshCycle.indexing;
-    const refreshReady = refreshCycle.ready;
-    if (readyHover.receivedAt < refreshIndexing.receivedAt ||
-        definition.receivedAt < refreshIndexing.receivedAt) {
-      throw new BenchmarkError(
-        "ready queries completed before the observed refresh began"
-      );
-    }
-    if (refreshReady.epoch !== refreshIndexing.epoch) {
-      throw new BenchmarkError(
-        "workspace changed while measuring the unchanged refresh"
-      );
-    }
-    if (refreshReady.generation !== initialReady.generation) {
-      throw new BenchmarkError(
-        "workspace generation changed while measuring the unchanged refresh"
-      );
-    }
+    const definition = await client.response(4, "target definition response");
     if (readyHover.result === null) {
       throw new BenchmarkError("ready hover returned no data at the benchmark target");
     }
     const summarizedDefinition = definitionSummary(definition.result, target);
     if (!summarizedDefinition.found) {
       throw new BenchmarkError(
-        "method definition returned no location at the benchmark target"
+        "target definition returned no location at the benchmark target"
       );
     }
-    const refreshEndResources = await processSample(child.pid, ticksPerSecond);
+    const probeSummaries = [];
+    const queryResponses = [readyHover, definition];
+    for (let index = 0; index < probes.length; index += 1) {
+      const probe = probes[index];
+      const response = await client.response(
+        10 + index, `${probe.operation} probe response`);
+      if (response.result === null) {
+        throw new BenchmarkError(
+          `${probe.operation} probe returned no data for ${probe.relativeFile}`
+        );
+      }
+      const summary = {
+        operation: probe.operation,
+        file: probe.relativeFile,
+        position: probe.position,
+        latencyMs: roundMilliseconds(
+          response.receivedAt - readyQueriesSentAt),
+        hasResult: true
+      };
+      if (probe.operation === "definition") {
+        const summarizedProbeDefinition = definitionSummary(
+          response.result, probe);
+        if (!summarizedProbeDefinition.found) {
+          throw new BenchmarkError(
+            `definition probe returned no location for ${probe.relativeFile}`
+          );
+        }
+        Object.assign(summary, summarizedProbeDefinition);
+      }
+      probeSummaries.push(summary);
+      queryResponses.push(response);
+    }
+    const readyQueriesCompletedAt = Math.max(
+      ...queryResponses.map((response) => response.receivedAt)
+    );
+    const queryEndResources = await processSample(child.pid, ticksPerSecond);
 
     client.send({
       jsonrpc: "2.0",
@@ -679,6 +1320,12 @@ async function benchmark(options) {
       "shutdown response",
       SHUTDOWN_TIMEOUT_MS
     );
+    // The shutdown reply is an ordering barrier: the server has handled and
+    // joined every preceding semantic request, and the client has ingested all
+    // notifications that preceded that reply. Freeze one count for both the
+    // assertion and the report so a late busy notification cannot evade one
+    // while appearing in the other.
+    const queryIndexingStatuses = client.statuses.length - queryStatusStart;
     client.send({ jsonrpc: "2.0", method: "exit" });
     child.stdin.end();
     const exit = await withTimeout(
@@ -692,15 +1339,21 @@ async function benchmark(options) {
         `server exited with code ${exit.code} and signal ${exit.signal}`
       );
     }
+    if (queryIndexingStatuses !== 0) {
+      throw new BenchmarkError(
+        "unchanged semantic queries unexpectedly started indexing"
+      );
+    }
+    const coldProfile = stderr.coldProfile();
 
     const cpuDelta = coldEndResources.cpuMs === undefined ||
       coldStartResources.cpuMs === undefined
       ? undefined
       : coldEndResources.cpuMs - coldStartResources.cpuMs;
-    const refreshCpuDelta = refreshEndResources.cpuMs === undefined ||
-      refreshStartResources.cpuMs === undefined
+    const queryCpuDelta = queryEndResources.cpuMs === undefined ||
+      queryStartResources.cpuMs === undefined
       ? undefined
-      : refreshEndResources.cpuMs - refreshStartResources.cpuMs;
+      : queryEndResources.cpuMs - queryStartResources.cpuMs;
     return {
       server: options.server,
       workspace: options.root,
@@ -731,24 +1384,24 @@ async function benchmark(options) {
         latencyMs: roundMilliseconds(readyHover.receivedAt - readyQueriesSentAt),
         hasResult: readyHover.result !== null
       },
-      methodDefinition: {
+      targetDefinition: {
         latencyMs: roundMilliseconds(definition.receivedAt - readyQueriesSentAt),
         ...summarizedDefinition
       },
-      unchangedRefresh: {
+      probes: probeSummaries,
+      unchangedRequests: {
         wallMs: roundMilliseconds(
-          refreshReady.receivedAt - readyQueriesSentAt
-        ),
-        childCpuMs: refreshCpuDelta === undefined
+          readyQueriesCompletedAt - readyQueriesSentAt),
+        childCpuMs: queryCpuDelta === undefined
           ? undefined
-          : roundMilliseconds(refreshCpuDelta),
-        epoch: refreshReady.epoch,
-        generation: refreshReady.generation,
-        progress: progressSummary(refreshCycle)
-      }
+          : roundMilliseconds(queryCpuDelta),
+        indexingStatuses: queryIndexingStatuses,
+        generation: initialReady.generation
+      },
+      ...(coldProfile === undefined ? {} : { coldProfile })
     };
   } catch (cause) {
-    const diagnostics = stderr();
+    const diagnostics = stderr.tail();
     if (diagnostics.length > 0 && cause instanceof Error) {
       cause.message = `${cause.message}; server stderr: ${diagnostics}`;
     }
@@ -760,13 +1413,21 @@ async function benchmark(options) {
   }
 }
 
-let options;
-try {
-  options = parseArguments(process.argv.slice(2));
-  const result = await benchmark(options);
-  process.stdout.write(`${JSON.stringify(result)}\n`);
-} catch (cause) {
-  const message = cause instanceof Error ? cause.message : String(cause);
-  process.stderr.write(`${JSON.stringify({ error: message })}\n`);
-  process.exitCode = 1;
+async function main() {
+  try {
+    const options = parseArguments(process.argv.slice(2));
+    const result = await benchmark(options);
+    process.stdout.write(`${JSON.stringify(result)}\n`);
+  } catch (cause) {
+    const message = cause instanceof Error ? cause.message : String(cause);
+    process.stderr.write(`${JSON.stringify({ error: message })}\n`);
+    process.exitCode = 1;
+  }
 }
+
+if (process.argv[1] !== undefined &&
+    path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  await main();
+}
+
+export { aggregateColdProfile, collectStderr };

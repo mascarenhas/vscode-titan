@@ -47,6 +47,7 @@ local function runs_reader_coordinator_and_single_writer()
   local output = strings.writer()
   local notification_sink?: protocol.NotificationSink = nil
   local initialized_calls = 0
+  local shutdown_calls = 0
   local handler: coordinator.SemanticHandler = function (
       _request: dispatcher.SemanticRequest): dispatcher.SemanticOutcome
     while true do timer.yield() end
@@ -66,6 +67,15 @@ local function runs_reader_coordinator_and_single_writer()
       end,
       function (sink: protocol.NotificationSink)
         notification_sink = sink
+      end,
+      function ()
+        shutdown_calls = shutdown_calls + 1
+        local sink? = notification_sink
+        test.assert(sink ~= nil,
+                    "notification sink was unavailable during shutdown")
+        if sink == nil then raise "notification sink is missing" end
+        sink(
+          [[{"jsonrpc":"2.0","method":"textDocument/publishDiagnostics","params":{"uri":"file:///workspace/main.titan","diagnostics":[]}}]])
       end) == 0,
               "orderly protocol transcript returned failure")
   local frames = framing.reader()
@@ -73,6 +83,7 @@ local function runs_reader_coordinator_and_single_writer()
   local initialize_response = response_object(frames:next())
   local indexing_notification = response_object(frames:next())
   local cancellation_response = frames:next()
+  local diagnostic_clear = response_object(frames:next())
   local shutdown_response = response_object(frames:next())
 
   test.assert(json.as_integer(initialize_response:get("id")) == 1,
@@ -85,6 +96,13 @@ local function runs_reader_coordinator_and_single_writer()
               json.as_string(
                 response_object(cancellation_response):get("id")) == "work",
               "queued cancellation response was malformed")
+  local diagnostic_params? = json.as_object(diagnostic_clear:get("params"))
+  local cleared? = json.as_array(diagnostic_params:get("diagnostics"))
+  test.assert(shutdown_calls == 1 and
+              json.as_string(diagnostic_clear:get("method")) ==
+                "textDocument/publishDiagnostics" and
+              cleared ~= nil and #cleared.items == 0,
+              "shutdown did not queue the diagnostic clear before replying")
   test.assert(json.as_integer(shutdown_response:get("id")) == 2 and
               json.is_null(shutdown_response:get("result")),
               "shutdown response was lost or reordered")
