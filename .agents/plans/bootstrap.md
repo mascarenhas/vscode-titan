@@ -109,16 +109,25 @@ LSP open/change notifications do not become semantic input in V1. A request is
 answered from the newest completed generation derived from files on disk.
 Changes are detected through project `.titan` watchers and coalesced.
 
-The read request that initiates a refresh joins it, which surfaces a broken
-saved generation immediately. During a cooperatively yielding refresh, later
-read-only requests may use the immutable preceding completed generation;
-rename always joins and performs its second disk-generation check. A known
-refresh failure invalidates the fallback until a later refresh succeeds.
+Every read-only request starts or shares a background refresh and returns
+without joining it. It may use the immutable preceding completed generation
+while revalidating intentionally unwatched external inputs; after a saved-file
+hint it returns the feature's empty/null result until that saved generation is
+published. Rename always joins and performs its second disk-generation check.
+A known refresh failure invalidates the fallback until a later refresh
+succeeds.
 
 - File content change invalidates its owning module.
 - Creating or deleting a constituent of a folder module invalidates that whole
   module and updates membership.
 - Project modules retain their full annotated AST and manifest.
+- Every project module is explicitly `dirty`, `checking`, `clean`, or `failed`.
+  A diagnostic or explicit nil-manifest compiler result is current and
+  `failed`, not pending work: it contributes saved coordinates and diagnostics
+  but no semantic AST. Only a source, dependency, external-provider,
+  configuration, or compiler-observed header change returns it to `dirty`.
+  Exceptions and malformed compiler results remain retryable rather than being
+  mistaken for current diagnostics.
 - External source and binary modules retain only manifest and filesystem
   provenance metadata, never complete ASTs. An external source entry may also
   retain its compiler-observed C-header fingerprint closure.
@@ -133,6 +142,12 @@ refresh failure invalidates the fallback until a later refresh succeeds.
   unchanged one stops propagation.
 - Every asynchronous result carries a project generation. Discard stale
   generations before publishing indexes or replies.
+- A compiled interface or contextual nominal owner may discover its physical
+  provider only while the compiler is loading it. The async I/O bridge records
+  the exact followed provider identity during that analysis and publication
+  re-stats it. A stable first binary/contextual discovery commits immediately;
+  same-path replacement or different providers selected for one logical module
+  across compiler attempts invalidates the consumer and retries.
 
 ### Configuration
 
@@ -144,7 +159,8 @@ return a table. Support:
 - `source_modules_root`, defaulting to the project root;
 - `extra_ffi_include_dirs`, expressed as an ordinary Lua array table such as
   `{ "./include" }`;
-- `binary_modules_root`, defaulting to the installed Titan ABI tree.
+- `binary_modules_root`, defaulting to the installed Titan library-versioned
+  tree.
 
 Paths are resolved relative to the configuration file. Configuration changes
 invalidate project discovery and the module graph.
@@ -277,3 +293,23 @@ has evidence before moving to Done.
 - Codex's supported plugin surface is a bundled skill and deterministic query
   script. Marketplace-level `lspServers` registration is not part of the
   supported manifest contract.
+- Project analysis states distinguish pending work from a current diagnostic.
+  Failed revisions leave the compiler queue and partial semantic index until a
+  relevant observed input changes; repeated semantic requests only revalidate
+  intentionally unwatched inputs.
+- Compiler-observed provider identities close first binary and contextual
+  discovery races without forcing a duplicate whole-project pass when the
+  installed provider remained stable. The bridge retains and revalidates every
+  binary provider observation, requires one consistent binary kind/path across
+  attempts, and still permits a later source-required import to select source
+  for the final snapshot.
+- On the final integrated native server, the actual-usage vscode-titan
+  benchmark cold-indexed all 47 saved files in one compiler analysis and 27
+  root attempts: 8,894.386 ms wall, 8,860 ms child CPU, and 804,576 KiB peak
+  server RSS. The preceding duplicate-pass build took 18,058.798 ms and
+  reported 54 attempts, so removing the redundant pass reduced measured cold
+  wall time by 50.75%. A hover issued before readiness returned the intentional
+  no-data result in 0.759 ms; ready hover and method definition took 1.232 ms
+  and 1.379 ms, and an unchanged refresh took 20.185 ms with no progress work.
+  The cold run published 48 progress updates through 47/47 files, while the
+  unchanged refresh published none.

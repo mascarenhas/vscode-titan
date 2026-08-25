@@ -2,6 +2,7 @@ local fs = import "fs"
 local test = import "test"
 local strings = import "string"
 local compiler_bridge = import "server.compiler_bridge"
+local compiler_io = import "server.compiler_io"
 local project_config = import "server.project_config"
 local project_service = import "server.project_service"
 local project_graph = import "server.project_graph"
@@ -186,6 +187,15 @@ local function current_header_identity(
   end
 end
 
+local function observed_provider_identity(
+    path: string): compiler_io.LstatIdentity?
+  local metadata? = fs.stat(path)
+  if metadata == nil then return nil end
+  return compiler_io.LstatIdentity.new(
+    path, metadata.size, metadata.kind, metadata.device, metadata.inode,
+    metadata.modified_seconds, metadata.modified_nanoseconds)
+end
+
 
 local function restat_test_headers(
     dependencies: {compiler_bridge.CHeaderDependency}):
@@ -234,7 +244,7 @@ local function successful_project(
     compiler_bridge.Manifest.new(
       module.module_name, public_manifest(module),
       source_manifest(module, headers)),
-    {}, {}, imports_for(module), headers)
+    {}, {}, imports_for(module), headers, nil, nil)
 end
 
 local function failed_project(
@@ -242,7 +252,8 @@ local function failed_project(
     headers: {compiler_bridge.CHeaderDependency}):
     compiler_bridge.ModuleSnapshot
   return compiler_bridge.ModuleSnapshot.new(
-    module.module_name, project_provenance(module), nil, {}, {}, {}, headers)
+    module.module_name, project_provenance(module), nil, {}, {}, {}, headers,
+    nil, nil)
 end
 
 local function external_node(filename: string): compiler_bridge.Node
@@ -270,6 +281,9 @@ local record RecordingAnalyzer
   external_header_inputs: {compiler_bridge.CHeaderDependency}
   write_during_analysis: string?
   write_during_analysis_contents: string?
+  suppress_binary_identity_once: boolean
+  omit_binary_manifest_once: boolean
+  report_provider_conflict_once: boolean
 end
 
 local function find_bridge_project(
@@ -375,7 +389,7 @@ local function RecordingAnalyzer:analyze(
           external_source_manifest(
             "vendor.source", "vendor-public", external_headers)),
         {external_node(self.external_main)}, {}, external_imports,
-        external_headers)
+        external_headers, nil, nil)
     end
   end
   if app_uses_externals and self.external_dependency_main ~= nil then
@@ -387,37 +401,61 @@ local function RecordingAnalyzer:analyze(
       compiler_bridge.Manifest.new(
         "vendor.inner", "inner-public",
         external_source_manifest("vendor.inner", "inner-public", {})),
-      {external_node(self.external_dependency_main)}, {}, {}, {})
+      {external_node(self.external_dependency_main)}, {}, {}, {}, nil, nil)
   end
+  local binary_observations:
+    {compiler_bridge.BinaryProviderObservation} = {}
   if app_uses_externals and self.binary_file ~= nil then
+    local provider_identity? = observed_provider_identity(self.binary_file)
+    if self.suppress_binary_identity_once then
+      provider_identity = nil
+      self.suppress_binary_identity_once = false
+    end
+    local binary_manifest?: compiler_bridge.Manifest =
+      compiler_bridge.Manifest.new("vendor.binary", "binary-public", nil)
+    if self.omit_binary_manifest_once then
+      binary_manifest = nil
+      self.omit_binary_manifest_once = false
+    end
     snapshots[#snapshots + 1] = compiler_bridge.ModuleSnapshot.new(
       "vendor.binary",
       compiler_bridge.Provenance.dynamic_binary(
         compiler_bridge.BinaryProvenance.new(self.binary_file)),
-      compiler_bridge.Manifest.new("vendor.binary", "binary-public", nil),
-      {external_node(self.binary_file)}, {}, {}, {})
+      binary_manifest,
+      {external_node(self.binary_file)}, {}, {}, {}, nil,
+      provider_identity)
+    binary_observations[1] = compiler_bridge.BinaryProviderObservation.new(
+      "vendor.binary", "dynamic", self.binary_file, provider_identity)
   end
   local contextual: {compiler_bridge.ContextualResolution} = {}
   if app_uses_externals and self.binary_file ~= nil and
      self.contextual_owner_file ~= nil then
+    local owner_file = self.contextual_owner_file as string
     contextual[1] = compiler_bridge.ContextualResolution.new(
       "vendor.owner", "vendor.binary",
       compiler_bridge.Provenance.dynamic_binary(
-        compiler_bridge.BinaryProvenance.new(self.contextual_owner_file)),
-      true)
+        compiler_bridge.BinaryProvenance.new(owner_file)),
+      true, observed_provider_identity(owner_file))
   end
   if self.write_during_analysis ~= nil then
     fs.write_file(self.write_during_analysis,
                   self.write_during_analysis_contents or "")
     self.write_during_analysis = nil
   end
+  local provider_conflicts: {string} = {}
+  if self.report_provider_conflict_once then
+    provider_conflicts[1] = "vendor.binary"
+    self.report_provider_conflict_once = false
+  end
   return compiler_bridge.Analysis.new(
-    request.root_module, diagnostics, snapshots, contextual)
+    request.root_module, diagnostics, snapshots, contextual,
+    binary_observations, provider_conflicts)
 end
 
 local function new_analyzer(): RecordingAnalyzer
   return RecordingAnalyzer.new(
-    0, 0, {}, 0, {}, nil, nil, {}, nil, {}, nil, nil, {}, {}, nil, nil)
+    0, 0, {}, 0, {}, nil, nil, {}, nil, {}, nil, nil, {}, {}, nil, nil,
+    false, false, false)
 end
 
 local record RecordingResolver
@@ -450,7 +488,7 @@ end
 local function require_service(
     fixture: Fixture, analyzer: RecordingAnalyzer): project_service.Service
   local service?, failure? = project_service.load_with_analyzer(
-    fixture.root, "/sdk/lib/titan/0.26", analyzer:analyze,
+    fixture.root, "/sdk/lib/titan/0.6", analyzer:analyze,
     restat_test_headers)
   test.assert(failure == nil and service ~= nil,
               "valid project service fixture did not load")
@@ -463,7 +501,7 @@ local function require_resolved_service(
     resolver: RecordingResolver): project_service.Service
   local service?, failure? =
     project_service.load_with_analyzer_and_resolver(
-      fixture.root, "/sdk/lib/titan/0.26", analyzer:analyze,
+      fixture.root, "/sdk/lib/titan/0.6", analyzer:analyze,
       resolver:resolve, restat_test_headers)
   test.assert(failure == nil and service ~= nil,
               "valid resolved project service fixture did not load")
@@ -478,6 +516,27 @@ local function find_project(snapshot: project_service.Snapshot,
     end
   end
   return nil
+end
+
+local function project_is_clean(module: project_service.ProjectModule): boolean
+  case module.analysis_state
+  when clean then return true
+  else return false
+  end
+end
+
+local function project_is_failed(module: project_service.ProjectModule): boolean
+  case module.analysis_state
+  when failed then return true
+  else return false
+  end
+end
+
+local function project_is_dirty(module: project_service.ProjectModule): boolean
+  case module.analysis_state
+  when dirty then return true
+  else return false
+  end
 end
 
 local function find_external(snapshot: project_service.Snapshot,
@@ -543,7 +602,7 @@ local function loads_multi_module_folder_and_external_metadata()
                 folder.source_files[2].filename ==
                   fixture:path("src/pkg/part.titan"),
                 "folder module did not retain every saved constituent")
-    test.assert(folder.compiler_snapshot ~= nil and not folder.dirty,
+    test.assert(folder.compiler_snapshot ~= nil and project_is_clean(folder),
                 "valid folder module did not retain its compiler snapshot")
 
     local counters = service:counters()
@@ -626,7 +685,7 @@ local function preserves_malformed_module_diagnostics()
                 "malformed module lost its saved source snapshot")
     test.assert(bad.compiler_snapshot ~= nil and
                 bad.compiler_snapshot.manifest == nil and
-                #bad.diagnostics == 1 and bad.dirty,
+                #bad.diagnostics == 1 and project_is_failed(bad),
                 "failed module snapshot or diagnostic was not preserved")
     test.assert(bad.diagnostics[1].location ~= nil and
                 bad.diagnostics[1].location.filename ==
@@ -635,7 +694,7 @@ local function preserves_malformed_module_diagnostics()
     test.assert(service:project_ast("bad") == nil,
                 "failed project analysis published an annotated cache entry")
     test.assert(good ~= nil and good.compiler_snapshot ~= nil and
-                #good.diagnostics == 0 and not good.dirty and
+                #good.diagnostics == 0 and project_is_clean(good) and
                 service:project_ast("good") ~= nil,
                 "one malformed module poisoned an unrelated valid module")
     local counters = service:counters()
@@ -651,6 +710,42 @@ function test_project_service_preserves_failed_module_diagnostics_and_source(
   test_runtime.run(preserves_malformed_module_diagnostics)
 end
 
+local function rejects_omitted_attempted_project_result()
+  with_fixture(function (fixture: Fixture)
+    fixture:mkdir("src")
+    configure_source_root(fixture)
+    fixture:write("src/main.titan", "-- saved project\n")
+    local runs = 0
+    local service?, create_error? = project_service.create_with_analyzer(
+      fixture.root, "/sdk/lib/titan/0.6",
+      function (request: project_service.AnalysisRequest):
+          compiler_bridge.Analysis
+        runs = runs + 1
+        return compiler_bridge.Analysis.new(
+          request.root_module, {}, {}, {}, {}, {})
+      end)
+    test.assert(create_error == nil and service ~= nil,
+                "omitted-result fixture did not initialize")
+    if service == nil then raise "omitted-result Service is missing" end
+
+    local report?, refresh_error? = service:refresh()
+    local main? = find_project(service:latest(), "main")
+    test.assert(report == nil and refresh_error ~= nil and
+                strings.find(
+                  refresh_error.message,
+                  "omitted the attempted project module") ~= nil and
+                runs == 1 and main ~= nil and project_is_dirty(main) and
+                not project_is_failed(main) and
+                #service:latest().dirty_modules == 1,
+                "missing compiler output became a current failed revision")
+  end)
+end
+
+function test_project_service_rejects_omitted_attempted_project_result(
+    _context: test.Context)
+  test_runtime.run(rejects_omitted_attempted_project_result)
+end
+
 local function rejects_stale_generation_commit()
   with_fixture(function (fixture: Fixture)
     fixture:mkdir("src")
@@ -658,7 +753,7 @@ local function rejects_stale_generation_commit()
     fixture:write("src/main.titan", "-- first\n")
     local analyzer = new_analyzer()
     local service?, failure? = project_service.create_with_analyzer(
-      fixture.root, "/sdk/lib/titan/0.26", analyzer:analyze)
+      fixture.root, "/sdk/lib/titan/0.6", analyzer:analyze)
     test.assert(failure == nil and service ~= nil,
                 "stale-generation fixture did not initialize")
     local request? = service:prepare_work()
@@ -675,7 +770,8 @@ local function rejects_stale_generation_commit()
                 "older compiler result was not rejected as stale")
     local latest = service:latest()
     local main? = find_project(latest, "main")
-    test.assert(main ~= nil and main.compiler_snapshot == nil and main.dirty and
+    test.assert(main ~= nil and main.compiler_snapshot == nil and
+                project_is_dirty(main) and
                 main.source_files[1].contents ==
                   "-- second generation is longer\n",
                 "stale result overwrote the newest saved-file generation")
@@ -1058,6 +1154,75 @@ function test_project_service_clears_external_cache_on_any_config_change(
   test_runtime.run(rekeys_externals_after_any_config_change)
 end
 
+local function configuration_change_recovers_failed_revision()
+  with_fixture(function (fixture: Fixture)
+    fixture:mkdir("src")
+    fixture:mkdir("include")
+    configure_source_root(fixture)
+    fixture:write("src/main.titan", "-- configuration-dependent module\n")
+    local runs = 0
+    local analyzer: project_service.Analyzer =
+      function (request: project_service.AnalysisRequest):
+          compiler_bridge.Analysis
+        runs = runs + 1
+        local module? = find_bridge_project(
+          request.project_modules, request.root_module)
+        test.assert(module ~= nil,
+                    "configuration analyzer lost its project root")
+        if module == nil then raise "configuration project is absent" end
+        local configured = #request.config.extra_ffi_include_dirs == 1
+        local manifest?: compiler_bridge.Manifest = nil
+        local diagnostics: {compiler_bridge.Diagnostic} = {}
+        if configured then
+          manifest = compiler_bridge.Manifest.new(
+            "main", "main-public", "main-source")
+        else
+          diagnostics[1] = compiler_bridge.Diagnostic.new(
+            compiler_bridge.DiagnosticKind.type_error(),
+            "required include directory is not configured", location(module))
+        end
+        return compiler_bridge.Analysis.new(
+          request.root_module, diagnostics, {
+            compiler_bridge.ModuleSnapshot.new(
+              module.module_name, project_provenance(module), manifest,
+              {}, {}, {}, {}, nil, nil),
+          }, {}, {}, {})
+      end
+    local service?, load_error? = project_service.load_with_analyzer(
+      fixture.root, "/sdk/lib/titan/0.6", analyzer)
+    test.assert(load_error == nil and service ~= nil,
+                "configuration recovery fixture did not load")
+    if service == nil then raise "configuration recovery Service is absent" end
+    local initial? = find_project(service:latest(), "main")
+    test.assert(runs == 1 and initial ~= nil and project_is_failed(initial) and
+                #service:latest().dirty_modules == 0,
+                "configuration-dependent diagnostic remained pending work")
+
+    local unchanged?, unchanged_error? = service:refresh()
+    test.assert(unchanged_error == nil and unchanged ~= nil and
+                not unchanged.analyzed and runs == 1,
+                "unchanged configuration retried the failed revision")
+
+    fixture:write("titan-config.lua", [[
+source_modules_root = "src"
+binary_modules_root = "binary-modules"
+extra_ffi_include_dirs = { "include" }
+]])
+    local recovered?, recovery_error? = service:refresh()
+    local current? = find_project(service:latest(), "main")
+    test.assert(recovery_error == nil and recovered ~= nil and
+                recovered.analyzed and #recovered.committed_modules == 1 and
+                recovered.committed_modules[1] == "main" and runs == 2 and
+                current ~= nil and project_is_clean(current),
+                "configuration change did not recover the failed revision")
+  end)
+end
+
+function test_project_service_retries_failed_revision_after_configuration_change(
+    _context: test.Context)
+  test_runtime.run(configuration_change_recovers_failed_revision)
+end
+
 local function detects_external_provider_and_folder_topology_changes()
   with_fixture(function (fixture: Fixture)
     fixture:mkdir("src")
@@ -1218,6 +1383,454 @@ function test_project_service_tracks_contextual_owner_provider_replacement(
     invalidates_a_compiled_facade_when_its_contextual_owner_moves)
 end
 
+local function missing_provider_appearance_recovers_failed_revision()
+  with_fixture(function (fixture: Fixture)
+    fixture:mkdir("src")
+    fixture:mkdir("src/app")
+    fixture:mkdir("binary-modules")
+    configure_source_root(fixture)
+    fixture:write("src/app/main.titan", "-- binary consumer\n")
+    local provider = fixture:path("binary-modules/provider.so")
+    local available = false
+    local runs = 0
+    local analyzer: project_service.Analyzer =
+      function (request: project_service.AnalysisRequest):
+          compiler_bridge.Analysis
+        runs = runs + 1
+        local module? = find_bridge_project(
+          request.project_modules, request.root_module)
+        test.assert(module ~= nil,
+                    "missing-provider analyzer lost its project root")
+        if module == nil then raise "missing provider project is absent" end
+        local imports = {
+          one_import(module, "binary", "vendor.binary", false),
+        }
+        local project_manifest?: compiler_bridge.Manifest = nil
+        local diagnostics: {compiler_bridge.Diagnostic} = {}
+        if available then
+          project_manifest = compiler_bridge.Manifest.new(
+            "app.main", "app-public", "app-source")
+        else
+          diagnostics[1] = compiler_bridge.Diagnostic.new(
+            compiler_bridge.DiagnosticKind.type_error(),
+            "cannot resolve vendor.binary", location(module))
+        end
+        local modules: {compiler_bridge.ModuleSnapshot} = {
+          compiler_bridge.ModuleSnapshot.new(
+            module.module_name, project_provenance(module), project_manifest,
+            {}, {}, imports, {}, nil, nil),
+        }
+        local binary_observations:
+          {compiler_bridge.BinaryProviderObservation} = {}
+        if available then
+          local provider_identity? = observed_provider_identity(provider)
+          modules[2] = compiler_bridge.ModuleSnapshot.new(
+            "vendor.binary",
+            compiler_bridge.Provenance.dynamic_binary(
+              compiler_bridge.BinaryProvenance.new(provider)),
+            compiler_bridge.Manifest.new(
+              "vendor.binary", "binary-public", nil),
+            {}, {}, {}, {}, nil, provider_identity)
+          binary_observations[1] =
+            compiler_bridge.BinaryProviderObservation.new(
+              "vendor.binary", "dynamic", provider, provider_identity)
+        end
+        return compiler_bridge.Analysis.new(
+          request.root_module, diagnostics, modules, {},
+          binary_observations, {})
+      end
+    local resolver = new_resolver()
+    local service?, load_error? =
+      project_service.load_with_analyzer_and_resolver(
+        fixture.root, "/sdk/lib/titan/0.6", analyzer,
+        resolver:resolve, restat_test_headers)
+    test.assert(load_error == nil and service ~= nil,
+                "missing-provider fixture did not load a partial project")
+    if service == nil then raise "missing-provider Service is absent" end
+    local initial? = find_project(service:latest(), "app.main")
+    test.assert(runs == 1 and initial ~= nil and project_is_failed(initial) and
+                #service:latest().dirty_modules == 0 and
+                #service:direct_imports("app.main") == 1,
+                "initial missing provider remained dirty or lost its import")
+
+    local unchanged?, unchanged_error? = service:refresh()
+    test.assert(unchanged_error == nil and unchanged ~= nil and
+                not unchanged.analyzed and runs == 1,
+                "unchanged missing provider retried its failed importer")
+
+    fixture:write("binary-modules/provider.so", "available provider")
+    resolver.provenance["vendor.binary"] =
+      compiler_bridge.Provenance.dynamic_binary(
+        compiler_bridge.BinaryProvenance.new(provider))
+    available = true
+    local recovered?, recovery_error? = service:refresh()
+    local current? = find_project(service:latest(), "app.main")
+    test.assert(recovery_error == nil and recovered ~= nil and
+                not recovered.stale and
+                #recovered.committed_modules == 1 and
+                recovered.committed_modules[1] == "app.main" and
+                runs == 2 and current ~= nil and project_is_clean(current) and
+                service:external_module("vendor.binary") ~= nil,
+                "new external provider did not recover the failed importer")
+  end)
+end
+
+function test_project_service_recovers_failed_importer_when_missing_provider_appears(
+    _context: test.Context)
+  test_runtime.run(missing_provider_appearance_recovers_failed_revision)
+end
+
+local function accepts_stable_first_binary_provider()
+  with_fixture(function (fixture: Fixture)
+    fixture:mkdir("src")
+    fixture:mkdir("src/app")
+    fixture:mkdir("binary-modules")
+    configure_source_root(fixture)
+    fixture:write("src/app/main.titan", "-- binary consumer\n")
+    fixture:write("binary-modules/provider.so", "stable provider")
+
+    local provider = fixture:path("binary-modules/provider.so")
+    local analyzer = new_analyzer()
+    analyzer.binary_file = provider
+    local resolver = new_resolver()
+    resolver.provenance["vendor.binary"] =
+      compiler_bridge.Provenance.dynamic_binary(
+        compiler_bridge.BinaryProvenance.new(provider))
+
+    local service = require_resolved_service(fixture, analyzer, resolver)
+    local counters = service:counters()
+    test.assert(counters.analysis_runs == 1 and
+                counters.project_modules_submitted == 1 and
+                service:external_module("vendor.binary") ~= nil and
+                #service:latest().dirty_modules == 0,
+                "stable first binary provider forced a duplicate analysis")
+
+    local unchanged?, unchanged_error? = service:refresh()
+    test.assert(unchanged_error == nil and unchanged ~= nil and
+                not unchanged.analyzed and not unchanged.stale and
+                service:counters().analysis_runs == counters.analysis_runs,
+                "stable first binary provider was not retained as the baseline")
+  end)
+end
+
+function test_project_service_accepts_stable_first_binary_provider_once(
+    _context: test.Context)
+  test_runtime.run(accepts_stable_first_binary_provider)
+end
+
+local function validates_binary_observation_before_source_result()
+  with_fixture(function (fixture: Fixture)
+    fixture:mkdir("src")
+    fixture:mkdir("src/app")
+    fixture:mkdir("external")
+    fixture:mkdir("binary-modules")
+    configure_source_root(fixture)
+    fixture:write("src/app/main.titan", "-- mixed provider consumer\n")
+    fixture:write("external/provider.titan", "-- source provider\n")
+    fixture:write("binary-modules/provider.so", "first binary provider")
+
+    local source_provider = fixture:path("external/provider.titan")
+    local binary_provider = fixture:path("binary-modules/provider.so")
+    local replace_binary = false
+    local runs = 0
+    local analyzer: project_service.Analyzer =
+      function (request: project_service.AnalysisRequest):
+          compiler_bridge.Analysis
+        runs = runs + 1
+        local module? = find_bridge_project(
+          request.project_modules, request.root_module)
+        test.assert(module ~= nil,
+                    "mixed-provider analyzer lost its project root")
+        if module == nil then raise "mixed-provider project is absent" end
+
+        local identity? = observed_provider_identity(binary_provider)
+        local modules: {compiler_bridge.ModuleSnapshot} = {
+          compiler_bridge.ModuleSnapshot.new(
+            module.module_name, project_provenance(module),
+            compiler_bridge.Manifest.new(
+              module.module_name, public_manifest(module),
+              source_manifest(module, {})),
+            {}, {}, {
+              one_import(module, "mixed", "vendor.mixed", false),
+            }, {}, nil, nil),
+          compiler_bridge.ModuleSnapshot.new(
+            "vendor.mixed",
+            compiler_bridge.Provenance.external_source(
+              compiler_bridge.SourceProvenance.new(
+                source_provider, {source_provider})),
+            compiler_bridge.Manifest.new(
+              "vendor.mixed", "mixed-public",
+              external_source_manifest(
+                "vendor.mixed", "mixed-public", {})),
+            {external_node(source_provider)}, {}, {}, {}, nil, nil),
+        }
+        if replace_binary then
+          fs.write_file(
+            binary_provider,
+            "replacement binary provider with different bytes")
+          replace_binary = false
+        end
+        return compiler_bridge.Analysis.new(
+          request.root_module, {}, modules, {}, {
+            compiler_bridge.BinaryProviderObservation.new(
+              "vendor.mixed", "dynamic", binary_provider, identity),
+          }, {})
+      end
+
+    local service?, load_error? = project_service.load_with_analyzer(
+      fixture.root, "/sdk/lib/titan/0.6", analyzer,
+      restat_test_headers)
+    test.assert(load_error == nil and service ~= nil,
+                "mixed-provider project service did not load")
+    if service == nil then raise "mixed-provider Service is absent" end
+    local before = service:counters()
+    test.assert(before.analysis_runs == 1 and
+                before.project_modules_submitted == 1 and
+                service:external_module("vendor.mixed") ~= nil and
+                #service:latest().dirty_modules == 0,
+                "stable binary-to-source observation forced a retry")
+
+    replace_binary = true
+    fixture:write(
+      "src/app/main.titan", "-- changed mixed provider consumer\n")
+    local report?, report_error? = service:refresh()
+    local after = service:counters()
+    test.assert(report_error == nil and report ~= nil and report.stale and
+                runs == 3 and
+                after.analysis_runs == before.analysis_runs + 2 and
+                after.project_modules_submitted ==
+                  before.project_modules_submitted + 2 and
+                contains(report.committed_modules, "app.main") and
+                service:external_module("vendor.mixed") ~= nil and
+                #service:latest().dirty_modules == 0,
+                "changed transient binary observation was published")
+  end)
+end
+
+function test_project_service_validates_binary_observation_before_source_result(
+    _context: test.Context)
+  test_runtime.run(validates_binary_observation_before_source_result)
+end
+
+local function retries_unvalidated_binary_without_topology_resolver()
+  with_fixture(function (fixture: Fixture)
+    fixture:mkdir("src")
+    fixture:mkdir("src/app")
+    fixture:mkdir("binary-modules")
+    configure_source_root(fixture)
+    fixture:write("src/app/main.titan", "-- binary consumer\n")
+    fixture:write("binary-modules/provider.so", "stable provider")
+
+    local provider = fixture:path("binary-modules/provider.so")
+    local analyzer = new_analyzer()
+    analyzer.binary_file = provider
+    analyzer.suppress_binary_identity_once = true
+    local service = require_service(fixture, analyzer)
+    local counters = service:counters()
+    test.assert(counters.analysis_runs == 2 and
+                counters.project_modules_submitted == 2 and
+                service:external_module("vendor.binary") ~= nil and
+                #service:latest().dirty_modules == 0,
+                "analyzer-only service published an unvalidated binary")
+  end)
+end
+
+function test_project_service_retries_unvalidated_binary_without_resolver(
+    _context: test.Context)
+  test_runtime.run(retries_unvalidated_binary_without_topology_resolver)
+end
+
+local function retries_conflicting_binary_against_existing_baseline()
+  with_fixture(function (fixture: Fixture)
+    fixture:mkdir("src")
+    fixture:mkdir("src/app")
+    fixture:mkdir("binary-modules")
+    configure_source_root(fixture)
+    fixture:write("src/app/main.titan", "-- binary consumer\n")
+    fixture:write("src/bad.titan", "-- initially valid\n")
+    fixture:write("binary-modules/provider.so", "stable provider")
+
+    local provider = fixture:path("binary-modules/provider.so")
+    local analyzer = new_analyzer()
+    analyzer.binary_file = provider
+    local resolver = new_resolver()
+    resolver.provenance["vendor.binary"] =
+      compiler_bridge.Provenance.dynamic_binary(
+        compiler_bridge.BinaryProvenance.new(provider))
+    local service = require_resolved_service(fixture, analyzer, resolver)
+    local before = service:counters()
+
+    -- Model a successful early root which selected another provider followed
+    -- by a failing root that returned to this baseline and therefore omitted
+    -- the external manifest. Neither the unchanged final fingerprint nor the
+    -- nil manifest may hide the bridge's explicit cross-attempt conflict.
+    analyzer.suppress_binary_identity_once = true
+    analyzer.omit_binary_manifest_once = true
+    analyzer.report_provider_conflict_once = true
+    fixture:write(
+      "src/app/main.titan", "-- changed binary consumer is longer\n")
+    fixture:write("src/bad.titan", "MALFORMED later root\n")
+    local report?, report_error? = service:refresh()
+    local after = service:counters()
+    test.assert(report_error == nil and report ~= nil and report.stale and
+                after.analysis_runs == before.analysis_runs + 2 and
+                after.project_modules_submitted ==
+                  before.project_modules_submitted + 4 and
+                contains(report.committed_modules, "app.main") and
+                contains(report.failed_modules, "bad") and
+                #service:latest().dirty_modules == 0,
+                "existing provider baseline hid a mixed compiler analysis")
+  end)
+end
+
+function test_project_service_retries_binary_conflict_against_existing_baseline(
+    _context: test.Context)
+  test_runtime.run(retries_conflicting_binary_against_existing_baseline)
+end
+
+local function retries_replaced_first_binary_provider()
+  with_fixture(function (fixture: Fixture)
+    fixture:mkdir("src")
+    fixture:mkdir("src/app")
+    fixture:mkdir("binary-modules")
+    configure_source_root(fixture)
+    fixture:write("src/app/main.titan", "-- NO_EXTERNALS\n")
+    fixture:write("binary-modules/provider.so", "first provider")
+
+    local provider = fixture:path("binary-modules/provider.so")
+    local analyzer = new_analyzer()
+    analyzer.binary_file = provider
+    local resolver = new_resolver()
+    resolver.provenance["vendor.binary"] =
+      compiler_bridge.Provenance.dynamic_binary(
+        compiler_bridge.BinaryProvenance.new(provider))
+    local service = require_resolved_service(fixture, analyzer, resolver)
+    local before = service:counters()
+
+    analyzer.write_during_analysis = provider
+    analyzer.write_during_analysis_contents =
+      "replacement provider with different bytes"
+    fixture:write("src/app/main.titan", "-- binary consumer\n")
+    local report?, report_error? = service:refresh()
+    local after = service:counters()
+    test.assert(report_error == nil and report ~= nil and report.stale and
+                after.analysis_runs == before.analysis_runs + 2 and
+                after.project_modules_submitted ==
+                  before.project_modules_submitted + 2 and
+                #service:latest().dirty_modules == 0 and
+                fs.read_file(provider) ==
+                  "replacement provider with different bytes",
+                "first binary provider replacement was published or churned")
+  end)
+end
+
+function test_project_service_retries_replaced_first_binary_provider(
+    _context: test.Context)
+  test_runtime.run(retries_replaced_first_binary_provider)
+end
+
+local function accepts_stable_first_contextual_provider()
+  with_fixture(function (fixture: Fixture)
+    fixture:mkdir("src")
+    fixture:mkdir("src/app")
+    fixture:mkdir("binary-modules")
+    configure_source_root(fixture)
+    fixture:write("src/app/main.titan", "-- compiled facade consumer\n")
+    fixture:write("binary-modules/facade.so", "compiled facade")
+    fixture:write("binary-modules/owner.so", "stable owner provider")
+
+    local facade = fixture:path("binary-modules/facade.so")
+    local owner = fixture:path("binary-modules/owner.so")
+    local analyzer = new_analyzer()
+    analyzer.binary_file = facade
+    local resolver = new_resolver()
+    resolver.provenance["vendor.binary"] =
+      compiler_bridge.Provenance.dynamic_binary(
+        compiler_bridge.BinaryProvenance.new(facade))
+    resolver.provenance["vendor.owner"] =
+      compiler_bridge.Provenance.dynamic_binary(
+        compiler_bridge.BinaryProvenance.new(owner))
+
+    local service = require_resolved_service(fixture, analyzer, resolver)
+    local before = service:counters()
+    analyzer.contextual_owner_file = owner
+    fixture:write(
+      "src/app/main.titan",
+      "-- changed consumer discovers its contextual owner\n")
+    local discovered?, discovery_error? = service:refresh()
+    local loaded = service:counters()
+    test.assert(discovery_error == nil and discovered ~= nil and
+                not discovered.stale and
+                loaded.analysis_runs == before.analysis_runs + 1 and
+                loaded.project_modules_submitted ==
+                  before.project_modules_submitted + 1 and
+                #service:direct_imports("vendor.binary") == 1,
+                "stable first contextual provider forced a duplicate analysis")
+
+    local unchanged?, unchanged_error? = service:refresh()
+    local after = service:counters()
+    test.assert(unchanged_error == nil and unchanged ~= nil and
+                not unchanged.analyzed and not unchanged.stale and
+                after.analysis_runs == loaded.analysis_runs,
+                "stable contextual provider was not retained as the baseline")
+  end)
+end
+
+function test_project_service_accepts_stable_first_contextual_provider_once(
+    _context: test.Context)
+  test_runtime.run(accepts_stable_first_contextual_provider)
+end
+
+local function retries_replaced_first_contextual_provider()
+  with_fixture(function (fixture: Fixture)
+    fixture:mkdir("src")
+    fixture:mkdir("src/app")
+    fixture:mkdir("binary-modules")
+    configure_source_root(fixture)
+    fixture:write("src/app/main.titan", "-- compiled facade consumer\n")
+    fixture:write("binary-modules/facade.so", "compiled facade")
+    fixture:write("binary-modules/owner.so", "first owner provider")
+
+    local facade = fixture:path("binary-modules/facade.so")
+    local owner = fixture:path("binary-modules/owner.so")
+    local analyzer = new_analyzer()
+    analyzer.binary_file = facade
+    local resolver = new_resolver()
+    resolver.provenance["vendor.binary"] =
+      compiler_bridge.Provenance.dynamic_binary(
+        compiler_bridge.BinaryProvenance.new(facade))
+    resolver.provenance["vendor.owner"] =
+      compiler_bridge.Provenance.dynamic_binary(
+        compiler_bridge.BinaryProvenance.new(owner))
+
+    local service = require_resolved_service(fixture, analyzer, resolver)
+    local before = service:counters()
+    analyzer.contextual_owner_file = owner
+    analyzer.write_during_analysis = owner
+    analyzer.write_during_analysis_contents =
+      "replacement owner provider with different bytes"
+    fixture:write(
+      "src/app/main.titan",
+      "-- changed consumer discovers a racing contextual owner\n")
+    local report?, report_error? = service:refresh()
+    local counters = service:counters()
+    local latest = service:latest()
+    test.assert(report_error == nil and report ~= nil and report.stale and
+                counters.analysis_runs == before.analysis_runs + 2 and
+                counters.project_modules_submitted ==
+                  before.project_modules_submitted + 2 and
+                #latest.dirty_modules == 0 and
+                fs.read_file(owner) ==
+                  "replacement owner provider with different bytes",
+                "first contextual provider replacement was published or churned")
+  end)
+end
+
+function test_project_service_retries_replaced_first_contextual_provider(
+    _context: test.Context)
+  test_runtime.run(retries_replaced_first_contextual_provider)
+end
+
 local function rejects_external_change_during_analysis()
   with_fixture(function (fixture: Fixture)
     fixture:mkdir("src")
@@ -1283,14 +1896,13 @@ local function isolates_unrelated_dirty_failure()
                 report.committed_modules[1] == "b" and
                 #report.failed_modules == 1 and
                 report.failed_modules[1] == "a" and
-                #report.dirty_modules == 1 and
-                report.dirty_modules[1] == "a",
+                #report.dirty_modules == 0,
                 "failed dirty module was not isolated from unrelated success")
     local snapshot = service:latest()
     local a? = find_project(snapshot, "a")
     local b? = find_project(snapshot, "b")
-    test.assert(a ~= nil and a.dirty and #a.diagnostics == 1 and
-                b ~= nil and not b.dirty and #b.diagnostics == 0 and
+    test.assert(a ~= nil and project_is_failed(a) and #a.diagnostics == 1 and
+                b ~= nil and project_is_clean(b) and #b.diagnostics == 0 and
                 b.compiler_snapshot ~= nil and
                 b.compiler_snapshot.manifest ~= nil and
                 b.compiler_snapshot.manifest.serialized == "public:b:two",
@@ -1306,6 +1918,85 @@ end
 function test_project_service_isolates_unrelated_dirty_module_errors(
     _context: test.Context)
   test_runtime.run(isolates_unrelated_dirty_failure)
+end
+
+local function failed_fallback_retains_dependency_and_header_inputs()
+  with_fixture(function (fixture: Fixture)
+    fixture:mkdir("src")
+    fixture:mkdir("include")
+    configure_source_root(fixture)
+    fixture:write("src/dep.titan", "-- dependency\n")
+    fixture:write("src/client.titan", "-- client\n")
+    fixture:write("include/value.h", "#define VALUE 1\n")
+    local header = fixture:path("include/value.h")
+    local analyzer = new_analyzer()
+    analyzer.project_header_inputs["client"] = {
+      header_input(compiler_bridge.CHeaderDependencyKind.file(), header),
+    }
+    local service = require_service(fixture, analyzer)
+    local initial = service:counters()
+    test.assert(#service:direct_imports("client") == 1,
+                "clean client did not establish its dependency edge")
+
+    -- Model the bridge fallback used when the loader fails before publishing
+    -- its dependency/header frame: the failed snapshot contains neither, but
+    -- the service must retain the last authoritative closure.
+    analyzer.project_header_inputs["client"] = {}
+    fixture:write("src/client.titan", "MALFORMED client revision\n")
+    local failed?, failed_error? = service:refresh()
+    local failed_client? = find_project(service:latest(), "client")
+    test.assert(failed_error == nil and failed ~= nil and
+                contains(failed.failed_modules, "client") and
+                failed_client ~= nil and project_is_failed(failed_client) and
+                #service:direct_imports("client") == 1,
+                "fallback failure discarded its previous dependency frame")
+    local after_failure = service:counters()
+
+    local unchanged?, unchanged_error? = service:refresh()
+    test.assert(unchanged_error == nil and unchanged ~= nil and
+                not unchanged.analyzed and
+                service:counters().analysis_runs ==
+                  after_failure.analysis_runs,
+                "unchanged fallback failure re-entered compiler work")
+
+    fixture:write("include/value.h", "#define VALUE 2\n")
+    local header_retry?, header_error? = service:refresh()
+    local after_header = service:counters()
+    test.assert(header_error == nil and header_retry ~= nil and
+                contains(header_retry.failed_modules, "client") and
+                after_header.analysis_runs ==
+                  after_failure.analysis_runs + 1,
+                "retained header closure did not retry the failed client")
+
+    fixture:write("src/dep.titan", "-- PUBLIC_TWO dependency\n")
+    local dependency_retry?, dependency_error? = service:refresh()
+    local after_dependency = service:counters()
+    test.assert(dependency_error == nil and dependency_retry ~= nil and
+                contains(dependency_retry.committed_modules, "dep") and
+                contains(dependency_retry.failed_modules, "client") and
+                after_dependency.analysis_runs ==
+                  after_header.analysis_runs + 2,
+                "retained dependency edge did not retry the failed client")
+
+    analyzer.project_header_inputs["client"] = {
+      header_input(compiler_bridge.CHeaderDependencyKind.file(), header),
+    }
+    fixture:write("src/client.titan", "-- repaired client revision\n")
+    local recovered?, recovery_error? = service:refresh()
+    local recovered_client? = find_project(service:latest(), "client")
+    test.assert(recovery_error == nil and recovered ~= nil and
+                contains(recovered.committed_modules, "client") and
+                recovered_client ~= nil and project_is_clean(recovered_client) and
+                service:counters().analysis_runs ==
+                  after_dependency.analysis_runs + 1 and
+                initial.analysis_runs == 1,
+                "saved repair did not replace the conservative fallback frame")
+  end)
+end
+
+function test_project_service_retains_failed_fallback_invalidation_inputs(
+    _context: test.Context)
+  test_runtime.run(failed_fallback_retains_dependency_and_header_inputs)
 end
 
 local function rejects_save_completed_during_analysis()
@@ -1429,14 +2120,16 @@ local function project_header_edit_delete_and_recovery()
     test.assert(delete_error == nil and deleted ~= nil and
                 #deleted.failed_modules == 1 and
                 deleted.failed_modules[1] == "dep" and
-                dep_after_delete ~= nil and dep_after_delete.dirty,
+                dep_after_delete ~= nil and
+                project_is_failed(dep_after_delete),
                 "direct-header deletion did not publish the current diagnostic")
     fixture:write("include/direct.h", "#define DIRECT 3\n")
     local recovered?, recovery_error? = service:refresh()
     local dep_after_recovery? = find_project(service:latest(), "dep")
     test.assert(recovery_error == nil and recovered ~= nil and
                 contains(recovered.committed_modules, "dep") and
-                dep_after_recovery ~= nil and not dep_after_recovery.dirty,
+                dep_after_recovery ~= nil and
+                project_is_clean(dep_after_recovery),
                 "direct-header restoration did not recover without a Titan save")
 
     fs.unlink(nested)
@@ -1578,7 +2271,7 @@ local function rejects_new_header_change_during_analysis()
     analyzer.write_during_analysis = header
     analyzer.write_during_analysis_contents = "#define VALUE 2\n"
     local service?, failure? = project_service.create_with_analyzer(
-      fixture.root, "/sdk/lib/titan/0.26", analyzer:analyze,
+      fixture.root, "/sdk/lib/titan/0.6", analyzer:analyze,
       restat_test_headers)
     test.assert(failure == nil and service ~= nil,
                 "header race fixture did not initialize")
@@ -1607,10 +2300,10 @@ local function loads_compiler_owned_default_binary_root()
     test.assert(failure == nil and service ~= nil,
                 "default compiler-owned project service did not load")
     local snapshot = service:latest()
-    test.assert(strings.sub(snapshot.config.binary_modules_root, -5) ==
-                  "/0.26" and
+    test.assert(strings.sub(snapshot.config.binary_modules_root, -4) ==
+                  "/0.6" and
                 snapshot.config.binary_modules_root ~=
-                  fixture.root .. "/0.26",
+                  fixture.root .. "/0.6",
                 "default binary root was guessed instead of read from compiler installation paths")
     local counters = service:counters()
     test.assert(counters.analysis_runs == 0 and

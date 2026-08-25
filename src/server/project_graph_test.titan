@@ -177,6 +177,158 @@ function test_project_graph_rejects_results_invalidated_within_generation(
               "stale importer completion cleared its invalidation")
 end
 
+function test_project_graph_keeps_an_exact_failed_revision_out_of_pending_work(
+    _context: test.Context)
+  local cache = graph.create<TestAst>()
+  cache:observe_project("app.main", {stamp("app/main.titan", 1)})
+  local token? = cache:begin_project_check("app.main")
+  test.assert(token ~= nil, "initial failed-project check did not start")
+  test.assert(cache:fail_project_check(
+                token, {ordinary("vendor.dep"), ordinary("vendor.dep")}),
+              "exact diagnostic result was not accepted")
+  test.assert(cache:is_failed("app.main") and
+              not cache:is_dirty("app.main") and
+              #cache:dirty_modules() == 0 and
+              cache:begin_project_check("app.main") == nil and
+              cache:project_ast("app.main") == nil,
+              "failed current revision remained eligible compiler work")
+  local imports = cache:direct_imports("app.main")
+  local reverse = cache:reverse_imports("vendor.dep")
+  test.assert(#imports == 1 and imports[1].module_name == "vendor.dep" and
+              #reverse == 1 and reverse[1].importer == "app.main",
+              "failed result did not retain its observed dependency frame")
+
+  local unchanged = cache:observe_project(
+    "app.main", {stamp("app/main.titan", 1)})
+  test.assert(not unchanged.changed and cache:is_failed("app.main") and
+              #cache:dirty_modules() == 0,
+              "unchanged saved input retried a current diagnostic result")
+
+  local changed = cache:observe_project(
+    "app.main", {stamp("app/main.titan", 2)})
+  test.assert(changed.changed and cache:is_dirty("app.main") and
+              not cache:is_failed("app.main"),
+              "source invalidation did not retry a failed project")
+  local retry? = cache:begin_project_check("app.main")
+  test.assert(retry ~= nil and cache:abort_project_check(retry) and
+              cache:is_dirty("app.main") and
+              cache:begin_project_check("app.main") ~= nil,
+              "aborted compiler work did not return to dirty state")
+end
+
+function test_project_graph_retries_failed_dependency_consumers_and_recovers(
+    _context: test.Context)
+  local cache = graph.create<TestAst>()
+  cache:upsert_external_source(
+    "vendor.dep", {stamp("vendor/dep.titan", 1)},
+    manifest("dep-p1", "dep-s1"), {})
+  cache:observe_project("app.main", {stamp("app/main.titan", 1)})
+  cache:observe_project("app.top", {stamp("app/top.titan", 1)})
+  commit(cache, "app.main", manifest("main-p1", "main-s1"),
+         {ordinary("vendor.dep")}, "main-1")
+  commit(cache, "app.top", manifest("top-p1", "top-s1"),
+         {ordinary("app.main")}, "top-1")
+
+  cache:observe_project("app.main", {stamp("app/main.titan", 2)})
+  local failing? = cache:begin_project_check("app.main")
+  test.assert(failing ~= nil and cache:fail_project_check(
+                failing, {ordinary("vendor.dep")}),
+              "changed project diagnostic was not accepted")
+  local preserved? = cache:manifest("app.main")
+  test.assert(cache:is_failed("app.main") and preserved ~= nil and
+              preserved.public_digest == "main-p1" and
+              cache:project_ast("app.main") == nil,
+              "failed revision discarded its previous recovery manifest")
+
+  local external_invalidation = cache:invalidate_external_change("vendor.dep")
+  assert_names(external_invalidation, {"app.main"},
+               "failed external consumer invalidation")
+  local external_retry? = cache:begin_project_check("app.main")
+  test.assert(external_retry ~= nil and
+              external_retry.revision ~= failing.revision and
+              cache:fail_project_check(
+                external_retry, {ordinary("vendor.dep")}) and
+              cache:is_failed("app.main"),
+              "external invalidation did not create a retry revision")
+
+  local dependency_change = cache:upsert_external_source(
+    "vendor.dep", {stamp("vendor/dep.titan", 2)},
+    manifest("dep-p2", "dep-s2"), {})
+  assert_names(dependency_change.invalidated, {"app.main"},
+               "failed dependency consumer invalidation")
+  test.assert(cache:is_dirty("app.main") and
+              not cache:is_failed("app.main"),
+              "dependency invalidation left its failed consumer blocked")
+
+  local invalidated = commit(
+    cache, "app.main", manifest("main-p2", "main-s2"),
+    {ordinary("vendor.dep")}, "main-recovered")
+  assert_names(invalidated, {"app.top"}, "recovered manifest propagation")
+  local recovered? = cache:project_ast("app.main")
+  test.assert(not cache:is_dirty("app.main") and
+              not cache:is_failed("app.main") and
+              recovered ~= nil and recovered.label == "main-recovered",
+              "successful recovery did not publish a clean project AST")
+end
+
+function test_project_graph_retries_only_failed_importers_when_dependency_recovers_unchanged(
+    _context: test.Context)
+  local cache = graph.create<TestAst>()
+  cache:observe_project("app.dep", {stamp("app/dep.titan", 1)})
+  cache:observe_project("app.failed", {stamp("app/failed.titan", 1)})
+  cache:observe_project("app.clean", {stamp("app/clean.titan", 1)})
+  local stable = manifest("dep-public", "dep-source")
+  commit(cache, "app.dep", stable, {}, "dep-clean")
+  commit(cache, "app.failed", manifest("failed", "failed"),
+         {ordinary("app.dep")}, "failed-clean")
+  commit(cache, "app.clean", manifest("clean", "clean"),
+         {ordinary("app.dep")}, "clean")
+
+  cache:invalidate_project("app.dep")
+  local dependency? = cache:begin_project_check("app.dep")
+  test.assert(dependency ~= nil and
+              cache:fail_project_check(dependency, {}),
+              "dependency did not enter failed state")
+  cache:invalidate_project("app.failed")
+  local importer? = cache:begin_project_check("app.failed")
+  test.assert(importer ~= nil and cache:fail_project_check(
+                importer, {ordinary("app.dep")}),
+              "dependent module did not enter failed state")
+
+  -- A real retry is made eligible by a changed source/configuration/provider.
+  -- Its public interface can nevertheless converge to the previous manifest.
+  cache:invalidate_project("app.dep")
+  local invalidated = commit(
+    cache, "app.dep", stable, {}, "dep-recovered-unchanged")
+  assert_names(invalidated, {"app.failed"},
+               "unchanged dependency recovery")
+  test.assert(cache:is_dirty("app.failed") and
+              not cache:is_dirty("app.clean") and
+              cache:project_ast("app.clean") ~= nil,
+              "unchanged recovery retried a clean importer or stranded a failed one")
+end
+
+function test_project_graph_rejects_a_stale_failed_result(
+    _context: test.Context)
+  local cache = graph.create<TestAst>()
+  cache:observe_project("app.main", {stamp("app/main.titan", 1)})
+  local stale? = cache:begin_project_check("app.main")
+  test.assert(stale ~= nil, "stale diagnostic check did not start")
+  cache:observe_project("app.other", {stamp("app/other.titan", 1)})
+  test.assert(not cache:fail_project_check(
+                stale, {ordinary("vendor.stale")}) and
+              cache:is_dirty("app.main") and
+              not cache:is_failed("app.main") and
+              #cache:direct_imports("app.main") == 0,
+              "stale token published a failed project result")
+
+  local current? = cache:begin_project_check("app.main")
+  test.assert(current ~= nil and cache:fail_project_check(
+                current, {ordinary("vendor.current")}) and
+              cache:is_failed("app.main"),
+              "current replacement diagnostic did not become failed")
+end
+
 function test_project_graph_tracks_direct_and_reverse_import_modes(
     _context: test.Context)
   local cache = graph.create<TestAst>()

@@ -17,6 +17,25 @@ local record CompilerProgress
   started_cpu: float
 end
 
+-- This is the followed filesystem identity observed when lstat found a
+-- provider candidate. Following here matters for a symlinked dynamic provider:
+-- later validation must compare the object package.loadlib actually opened,
+-- while the compiler still receives unchanged lstat semantics.
+record LstatIdentity
+  path: string
+  size: integer
+  kind: string
+  device: integer
+  inode: integer
+  modified_seconds: integer
+  modified_nanoseconds: integer
+end
+
+local record LstatObservation
+  identity: LstatIdentity?
+  consistent: boolean
+end
+
 -- The compiler sees this record only through its ordinary Lua userdata proxy.
 -- Every argument/result crossing that boundary therefore uses Lua-native
 -- scalars or Maps; Titan Arrays and records never leak into compiler state.
@@ -31,6 +50,13 @@ record CompilerIO
   local next_attempt: integer
   local progress: CompilerProgress?
   local checkpoint_listener: CheckpointListener?
+  -- Provider selection can repeat across the fresh resolver contexts used by
+  -- one incremental analysis. Retain an identity only when every lstat of the
+  -- same path in that analysis observed the same state. These fields remain
+  -- private, so they do not add members or methods to the compiler's Lua
+  -- strategy proxy.
+  local observing_lstats: boolean
+  local lstat_observations: {string: LstatObservation}
 end
 
 local function failure_message(failure: value): string
@@ -47,7 +73,73 @@ local function failure_message(failure: value): string
 end
 
 function create(): CompilerIO
-  return CompilerIO.new(false, 0, nil, nil)
+  return CompilerIO.new(false, 0, nil, nil, false, {})
+end
+
+local function copy_lstat_identity(source: LstatIdentity): LstatIdentity
+  return LstatIdentity.new(
+    source.path, source.size, source.kind, source.device, source.inode,
+    source.modified_seconds, source.modified_nanoseconds)
+end
+
+local function same_lstat_identity(left: LstatIdentity,
+                                    right: LstatIdentity): boolean
+  return left.path == right.path and
+         left.size == right.size and
+         left.kind == right.kind and
+         left.device == right.device and
+         left.inode == right.inode and
+         left.modified_seconds == right.modified_seconds and
+         left.modified_nanoseconds == right.modified_nanoseconds
+end
+
+local function identity_for(path: string, metadata: fs.Stat): LstatIdentity
+  return LstatIdentity.new(
+    path, metadata.size, metadata.kind, metadata.device, metadata.inode,
+    metadata.modified_seconds, metadata.modified_nanoseconds)
+end
+
+local function same_optional_lstat_identity(left: LstatIdentity?,
+                                             right: LstatIdentity?): boolean
+  if left == nil or right == nil then return left == nil and right == nil end
+  return same_lstat_identity(left as LstatIdentity, right as LstatIdentity)
+end
+
+local function CompilerIO:observe_lstat(path: string,
+                                        identity: LstatIdentity?)
+  if not self.observing_lstats then return end
+  local previous? = self.lstat_observations[path]
+  if previous == nil then
+    self.lstat_observations[path] = LstatObservation.new(identity, true)
+  elseif previous.consistent and
+         not same_optional_lstat_identity(previous.identity, identity) then
+    previous.consistent = false
+    previous.identity = nil
+  end
+end
+
+-- Observation lifecycle is a typed bridge concern, not part of the public Lua
+-- strategy API. A new analysis always starts empty and terminal cleanup drops
+-- the state even when compiler work raises or is cancelled.
+function begin_lstat_observations(strategy: CompilerIO)
+  strategy.observing_lstats = true
+  strategy.lstat_observations = {}
+end
+
+function end_lstat_observations(strategy: CompilerIO)
+  strategy.observing_lstats = false
+  strategy.lstat_observations = {}
+end
+
+function consistent_lstat_identity(strategy: CompilerIO,
+                                   path: string): LstatIdentity?
+  if not strategy.observing_lstats then return nil end
+  local observation? = strategy.lstat_observations[path]
+  if observation == nil or not observation.consistent or
+     observation.identity == nil then
+    return nil
+  end
+  return copy_lstat_identity(observation.identity as LstatIdentity)
 end
 
 -- The bridge installs this only for the lifetime of one incremental analysis.
@@ -146,9 +238,31 @@ function CompilerIO:lstat(path: string): ({string: value}?, string?)
   local valid?, path_error? = checked_path(path)
   if not valid then return nil, path_error end
   local metadata? = fs.lstat(path)
-  if not metadata then return nil, nil end
-  return stat_map(metadata as fs.Stat), nil
+  if not metadata then
+    self:observe_lstat(path, nil)
+    return nil, nil
+  end
+  local lstat_metadata = metadata as fs.Stat
+  if self.observing_lstats then
+    -- Do not change the public lstat result when this validation-only follow
+    -- fails. Cancellation remains authoritative because the extra stat is a
+    -- real asynchronous operation in the compiler Task.
+    do
+      local followed? = fs.stat(path)
+      if followed == nil then
+        self:observe_lstat(path, nil)
+      else
+        self:observe_lstat(
+          path, identity_for(path, followed as fs.Stat))
+      end
+    catch
+      if error is async.CancellationReason then raise end
+      self:observe_lstat(path, nil)
+    end
+  end
+  return stat_map(lstat_metadata), nil
 catch
+  if error is async.CancellationReason then raise end
   return nil, failure_message(error)
 end
 
@@ -273,6 +387,13 @@ function CompilerIO:mkdir(path: string,
   local valid?, path_error? = checked_path(path)
   if not valid then return nil, path_error end
   fs.mkdir(path)
+  if remove_if_cancelled == true then
+    -- Ownership is not transferred until one uncancelled scheduler
+    -- checkpoint after the native mkdir completes. This gives cancellation a
+    -- deterministic rollback boundary even when the filesystem callback is
+    -- delivered before the caller next runs.
+    async.yield()
+  end
   return true, nil
 catch
   if error is async.CancellationReason and remove_if_cancelled == true then

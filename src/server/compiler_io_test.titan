@@ -345,6 +345,91 @@ function test_compiler_io_lua_proxy_calls_async_methods_and_yields(
   test_runtime.run(lua_proxy_yield_contract)
 end
 
+local function lstat_observation_contract()
+  local strategy = compiler_io.create()
+  local root = temporary_root()
+  defer remove_path(root)
+  local provider = root .. "/provider.so"
+  fs.write_file(provider, "first provider")
+  defer remove_path(provider)
+
+  compiler_io.begin_lstat_observations(strategy)
+  local raw?, raw_error? = strategy:lstat(provider)
+  test.assert(raw ~= nil and raw_error == nil,
+              "observed provider lstat failed")
+  local identity? = compiler_io.consistent_lstat_identity(
+    strategy, provider)
+  test.assert(identity ~= nil and identity.path == provider and
+              identity.kind == "file" and
+              identity.size == #"first provider" and
+              identity.device == integer_field(raw, "device") and
+              identity.inode == integer_field(raw, "inode") and
+              identity.modified_seconds ==
+                integer_field(raw, "modified_seconds") and
+              identity.modified_nanoseconds ==
+                integer_field(raw, "modified_nanoseconds"),
+              "typed lstat identity did not preserve compiler metadata")
+
+  local repeated?, repeated_error? = strategy:lstat(provider)
+  test.assert(repeated ~= nil and repeated_error == nil and
+              compiler_io.consistent_lstat_identity(strategy, provider) ~= nil,
+              "unchanged repeated lstat lost its consistent identity")
+
+  fs.write_file(provider, "second provider with different bytes")
+  local changed?, changed_error? = strategy:lstat(provider)
+  test.assert(changed ~= nil and changed_error == nil and
+              compiler_io.consistent_lstat_identity(strategy, provider) == nil,
+              "conflicting lstat results retained a compiler identity")
+  compiler_io.end_lstat_observations(strategy)
+  test.assert(compiler_io.consistent_lstat_identity(strategy, provider) == nil,
+              "ended lstat observation leaked an analysis identity")
+
+  compiler_io.begin_lstat_observations(strategy)
+  test.assert(compiler_io.consistent_lstat_identity(strategy, provider) == nil,
+              "new lstat observation reused a previous analysis identity")
+  strategy:lstat(provider)
+  local fresh? = compiler_io.consistent_lstat_identity(strategy, provider)
+  test.assert(fresh ~= nil and
+              fresh.size == #"second provider with different bytes",
+              "new analysis did not capture the current provider identity")
+  compiler_io.end_lstat_observations(strategy)
+
+  local target = root .. "/provider-target.so"
+  local link = root .. "/provider-link.so"
+  fs.write_file(target, "first target")
+  defer remove_path(target)
+  defer remove_path(link)
+  local linked = strategy:run({
+    [1] = "ln", [2] = "-s", [3] = target, [4] = link,
+  }, nil)
+  test.assert(bool_field(linked, "ok"),
+              "could not create provider symlink fixture")
+
+  compiler_io.begin_lstat_observations(strategy)
+  local raw_link? = strategy:lstat(link)
+  local followed_link? = strategy:stat(link)
+  local link_identity? = compiler_io.consistent_lstat_identity(
+    strategy, link)
+  test.assert(raw_link ~= nil and followed_link ~= nil and
+              string_field(raw_link, "kind") == "symlink" and
+              link_identity ~= nil and link_identity.kind == "file" and
+              link_identity.size == #"first target" and
+              link_identity.device == integer_field(
+                followed_link, "device") and
+              link_identity.inode == integer_field(followed_link, "inode"),
+              "provider observation did not follow the lstat symlink")
+  fs.write_file(target, "second target with different bytes")
+  strategy:lstat(link)
+  test.assert(compiler_io.consistent_lstat_identity(strategy, link) == nil,
+              "symlink target replacement retained a stable identity")
+  compiler_io.end_lstat_observations(strategy)
+end
+
+function test_compiler_io_tracks_only_consistent_per_analysis_lstat_identity(
+    _context: test.Context)
+  test_runtime.run(lstat_observation_contract)
+end
+
 local function compiler_progress_contract()
   local previous_level = logging.level()
   defer logging.configure(previous_level)

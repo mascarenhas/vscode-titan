@@ -380,7 +380,8 @@ local function project_inputs(snapshot: project_service.Snapshot):
     -- edit if an invalid module could contain an unindexed reference.
     projects[#projects + 1] = bridge.ProjectModule.new(
       module.module_name, files)
-    if not module.dirty then
+    case module.analysis_state
+    when clean then
       if module.compiler_snapshot == nil or #module.diagnostics > 0 then
         raise Error.new(
           "clean Titan project module '" .. module.module_name ..
@@ -388,6 +389,11 @@ local function project_inputs(snapshot: project_service.Snapshot):
           "generation")
       end
       snapshots[#snapshots + 1] = module.compiler_snapshot
+    when failed then
+      -- The diagnostics are current for this exact saved revision, but a
+      -- failed module deliberately contributes no compiler snapshot.
+    when dirty then
+      -- Saved or dependency inputs changed; indexing is still outstanding.
     end
   end
   return projects, snapshots
@@ -614,13 +620,15 @@ local function Application:refresh_once(): RefreshOutcome
     local completed? = self.completed_view
     if completed ~= nil and completed.snapshot.generation ==
          report.generation and #report.committed_modules == 0 and
+       #report.failed_modules == 0 and
        same_module_names(
          completed.snapshot.dirty_modules, snapshot.dirty_modules) then
       -- A refresh still rediscovers directories and external inputs. When its
-      -- semantic generation and clean/dirty membership did not change and no
-      -- project result committed, retain the immutable Features. A repeated
-      -- diagnostic-only retry can update Snapshot metadata but cannot make a
-      -- dirty module's excluded compiler snapshot usable.
+      -- semantic generation and pending-work membership did not change and no
+      -- clean or failed project result was published, retain the immutable
+      -- Features. In particular, a same-generation external invalidation can
+      -- turn a formerly clean module into a failed one; that result must
+      -- rebuild the View so its preceding AST is no longer exposed.
       self:reconcile_watcher(snapshot)
       return RefreshOutcome.ready(View.new(snapshot, completed.features))
     end

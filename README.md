@@ -111,8 +111,8 @@ C-header dependency restat contract, and the resolver-scoped I/O strategy with
 named completed-module yield checkpoints. The ABI alone is not the
 language-server API contract. If the compiler is not in the compiled defaults,
 configure both paths explicitly. `LUA_CPATH` must include
-both the Titan ABI provider directory (for example
-`/opt/titan/lib/titan/0.26/?.so`) and the Lua native module directory (for
+both the Titan library-versioned provider directory (for example
+`/opt/titan/lib/titan/0.6/?.so`) and the Lua native module directory (for
 example `/opt/titan/lib/lua/5.5/?.so`). This runtime discovery requirement is
 separate from the native executable's static standard-library linkage.
 
@@ -172,7 +172,7 @@ values as globals. Relative paths are resolved from that root:
 
 ```lua
 source_modules_root = "src"
-binary_modules_root = ".titan/lib/titan/0.26"
+binary_modules_root = ".titan/lib/titan/0.6"
 extra_ffi_include_dirs = { "include", "vendor/include" }
 ```
 

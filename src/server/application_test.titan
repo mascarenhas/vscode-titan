@@ -6,6 +6,7 @@ local test = import "test"
 local timer = import "timer"
 local application = import "server.application.titan"
 local bridge = import "server.compiler_bridge"
+local compiler_io = import "server.compiler_io"
 local dispatcher = import "server.dispatcher"
 local indexing_status = import "server.indexing_status"
 local json = import "server.json"
@@ -35,6 +36,15 @@ local record SavingRenameAnalyzer
   runs: integer
 end
 
+local function observed_provider_identity(
+    path: string): compiler_io.LstatIdentity?
+  local metadata? = fs.stat(path)
+  if metadata == nil then return nil end
+  return compiler_io.LstatIdentity.new(
+    path, metadata.size, metadata.kind, metadata.device, metadata.inode,
+    metadata.modified_seconds, metadata.modified_nanoseconds)
+end
+
 local function occurrence(filename: string, line: integer,
                           start_column: integer, finish_column: integer,
                           name: string, declaration_id: string,
@@ -54,6 +64,33 @@ local function find_project(request: project_service.AnalysisRequest,
   for index = 1, #request.project_modules do
     if request.project_modules[index].module_name == name then
       return request.project_modules[index]
+    end
+  end
+  return nil
+end
+
+local function project_is_clean(
+    module: project_service.ProjectModule): boolean
+  case module.analysis_state
+  when clean then return true
+  else return false
+  end
+end
+
+local function project_is_failed(
+    module: project_service.ProjectModule): boolean
+  case module.analysis_state
+  when failed then return true
+  else return false
+  end
+end
+
+local function snapshot_project(snapshot: project_service.Snapshot,
+                                name: string):
+    project_service.ProjectModule?
+  for index = 1, #snapshot.project_modules do
+    if snapshot.project_modules[index].module_name == name then
+      return snapshot.project_modules[index]
     end
   end
   return nil
@@ -97,7 +134,7 @@ local function project_snapshot(module: bridge.ProjectModule):
     bridge.Manifest.new(
       module.module_name, "public:" .. module.module_name,
       "source:" .. module.module_name),
-    nodes, symbols, {}, {})
+    nodes, symbols, {}, {}, nil, nil)
 end
 
 local function SavingRenameAnalyzer:analyze(
@@ -131,9 +168,9 @@ local function SavingRenameAnalyzer:analyze(
                  bridge.OccurrenceRole.definition()),
       occurrence(self.filename, 2, 14, 21, "renamed", declaration_id,
                  bridge.OccurrenceRole.reference()),
-    }, {}, {})
+    }, {}, {}, nil, nil)
   return bridge.Analysis.new(snapshot.project_modules[1].module_name,
-                             {}, {checked}, {})
+                             {}, {checked}, {}, {}, {})
 end
 
 local function YieldingAnalyzer:analyze(
@@ -156,7 +193,7 @@ local function YieldingAnalyzer:analyze(
     if module == nil then raise "dirty project module is missing" end
     snapshots[index] = project_snapshot(module)
   end
-  return bridge.Analysis.new(request.root_module, {}, snapshots, {})
+  return bridge.Analysis.new(request.root_module, {}, snapshots, {}, {}, {})
 end
 
 local function RecoveringAnalyzer:analyze(
@@ -172,7 +209,7 @@ local function RecoveringAnalyzer:analyze(
       bridge.Diagnostic.new(
         bridge.DiagnosticKind.syntax(), "deliberate saved-source error",
         bridge.SourceLocation.new(module.files[1].filename, 1, 1)),
-    }, {}, {})
+    }, {}, {}, {}, {})
   end
 
   local snapshots: {bridge.ModuleSnapshot} = {}
@@ -184,7 +221,7 @@ local function RecoveringAnalyzer:analyze(
     if dirty == nil then raise "repaired project module is missing" end
     snapshots[#snapshots + 1] = project_snapshot(dirty)
   end
-  return bridge.Analysis.new(request.root_module, {}, snapshots, {})
+  return bridge.Analysis.new(request.root_module, {}, snapshots, {}, {}, {})
 end
 
 local function request_for(path: string, id: integer,
@@ -346,7 +383,7 @@ local function with_application_state(
 
   local analyzer = YieldingAnalyzer.new(0, false, false, false, false)
   local service?, service_error? = project_service.load_with_analyzer(
-    root, "/sdk/lib/titan/0.26", analyzer:analyze)
+    root, "/sdk/lib/titan/0.6", analyzer:analyze)
   test.assert(service_error == nil and service ~= nil,
               "application fixture project did not load")
   if service == nil then raise "application fixture Service is missing" end
@@ -394,7 +431,7 @@ local function with_cold_application(
               snapshot_listener: project_service.SnapshotListener?):
         (project_service.Service?, project_service.Error?)
       return project_service.load_with_analyzer(
-        project_root, "/sdk/lib/titan/0.26", analyzer:analyze, nil,
+        project_root, "/sdk/lib/titan/0.6", analyzer:analyze, nil,
         snapshot_listener)
     end)
   defer app:close()
@@ -546,7 +583,7 @@ local function recovers_configuration_load_failure_from_later_save()
               snapshot_listener: project_service.SnapshotListener?):
         (project_service.Service?, project_service.Error?)
       return project_service.load_with_analyzer(
-        project_root, "/sdk/lib/titan/0.26", analyzer:analyze, nil,
+        project_root, "/sdk/lib/titan/0.6", analyzer:analyze, nil,
         snapshot_listener)
     end)
   defer app:close()
@@ -616,7 +653,7 @@ local function reconciles_expanded_scope_before_existing_analysis()
 
   local analyzer = YieldingAnalyzer.new(0, false, false, false, false)
   local service?, service_error? = project_service.load_with_analyzer(
-    root, "/sdk/lib/titan/0.26", analyzer:analyze)
+    root, "/sdk/lib/titan/0.6", analyzer:analyze)
   test.assert(service_error == nil and service ~= nil,
               "scope-expansion fixture project did not load")
   if service == nil then raise "scope-expansion fixture Service is missing" end
@@ -951,11 +988,12 @@ local function builds_semantics_from_independently_valid_modules()
         failed_filename, original_stamp.modified_seconds,
         original_stamp.modified_nanoseconds, 18))
     local failed = project_service.ProjectModule.new(
-      "failed", {failed_source}, valid.compiler_snapshot, {}, true)
+      "failed", {failed_source}, valid.compiler_snapshot, {},
+      project_service.ProjectAnalysisState.failed())
     local partial = project_service.Snapshot.new(
       saved.generation, saved.config, saved.discovery_issues,
       saved.project_directories, {valid, failed}, saved.external_modules,
-      {"failed"})
+      {})
 
     local projects, snapshots = application.project_inputs(partial)
     test.assert(#projects == 2 and projects[1].module_name ==
@@ -963,19 +1001,20 @@ local function builds_semantics_from_independently_valid_modules()
                 #snapshots == 1 and snapshots[1].module_name ==
                   valid.module_name,
                 "partial semantic inputs lost saved source or retained a " ..
-                "dirty module's stale compiler snapshot")
+                "failed module's stale compiler snapshot")
     local features = semantic_features.build(projects, snapshots)
     test.assert(#features:folding_ranges(valid.source_files[1].filename) == 1,
                 "valid module lost its compiler-backed semantics")
     test.assert(#features:folding_ranges(failed_filename) == 0 and
                 features:hover(
                   failed_filename, source_text.Position.new(0, 0)) == nil,
-                "dirty module exposed stale compiler semantics")
+                "failed module exposed stale compiler semantics")
 
     -- A clean module without a checked snapshot is an internal service
     -- inconsistency, not a recoverable source diagnostic.
     local malformed = project_service.ProjectModule.new(
-      "malformed", valid.source_files, nil, {}, false)
+      "malformed", valid.source_files, nil, {},
+      project_service.ProjectAnalysisState.clean())
     local inconsistent = project_service.Snapshot.new(
       saved.generation, saved.config, saved.discovery_issues,
       saved.project_directories, {malformed}, saved.external_modules, {})
@@ -990,7 +1029,7 @@ local function builds_semantics_from_independently_valid_modules()
   end)
 end
 
-local function publishes_recovered_partial_module_at_same_generation()
+local function failed_revision_waits_for_a_saved_change_and_recovers()
   local root = fs.tmpname()
   fs.unlink(root)
   fs.mkdir(root)
@@ -1006,7 +1045,7 @@ local function publishes_recovered_partial_module_at_same_generation()
 
   local analyzer = RecoveringAnalyzer.new(true, 0)
   local service?, service_error? = project_service.load_with_analyzer(
-    root, "/sdk/lib/titan/0.26", analyzer:analyze)
+    root, "/sdk/lib/titan/0.6", analyzer:analyze)
   test.assert(service_error == nil and service ~= nil,
               "partial recovery fixture project did not load")
   if service == nil then raise "partial recovery Service is missing" end
@@ -1015,33 +1054,264 @@ local function publishes_recovered_partial_module_at_same_generation()
   app:stop_watching_for_testing()
 
   local initial? = app:snapshot_for_testing()
-  test.assert(initial ~= nil and #initial.dirty_modules == 1,
-              "diagnostic module did not produce a partial initial View")
+  test.assert(initial ~= nil and #initial.dirty_modules == 0 and
+              #initial.project_modules == 1 and
+              project_is_failed(initial.project_modules[1]) and
+              initial.project_modules[1].compiler_snapshot == nil,
+              "diagnostic module did not become a current failed revision")
   local before = app:indexing_metrics()
   local runs_before = analyzer.runs
-  analyzer.fail = false
   test.assert(
     result_array_length(
       app:handle(request_for(
         filename, 40, "textDocument/foldingRange")),
       "folding request on partial View") == 0,
-    "partial View exposed a dirty module's structural AST")
+    "partial View exposed a failed module's structural AST")
   wait_until(function (): boolean
-    return analyzer.runs == runs_before + 1 and
-           not app:indexing_metrics().refresh_chain_active
-  end, "same-generation module repair did not finish")
+    return not app:indexing_metrics().refresh_chain_active
+  end, "failed-revision external revalidation did not finish")
+  test.assert(analyzer.runs == runs_before,
+              "semantic request recompiled an unchanged failed revision")
 
-  local repaired? = app:snapshot_for_testing()
-  local after = app:indexing_metrics()
-  test.assert(repaired ~= nil and #repaired.dirty_modules == 0 and
-              after.view_builds == before.view_builds + 1,
-              "same-generation repair reused the partial semantic View")
   test.assert(
     result_array_length(
       app:handle(request_for(
         filename, 41, "textDocument/foldingRange")),
+      "second folding request on partial View") == 0,
+    "second request exposed a failed module's structural AST")
+  wait_until(function (): boolean
+    return not app:indexing_metrics().refresh_chain_active
+  end, "second failed-revision external revalidation did not finish")
+  test.assert(analyzer.runs == runs_before and
+              app:indexing_metrics().view_builds == before.view_builds,
+              "unchanged failed revision reran analysis or rebuilt Features")
+
+  analyzer.fail = false
+  fs.write_file(filename,
+    "function answer(): integer\n" ..
+    "  return 1\n" ..
+    "end\n" ..
+    "-- repaired saved revision\n")
+  -- The watcher is deliberately stopped above so the saved-input transition
+  -- is deterministic in this Application regression.
+  app:note_saved_change()
+  wait_until(function (): boolean
+    return analyzer.runs == runs_before + 1 and
+           not app:indexing_metrics().refresh_chain_active
+  end, "saved source change did not recover the failed revision")
+
+  local repaired? = app:snapshot_for_testing()
+  local after = app:indexing_metrics()
+  test.assert(repaired ~= nil and #repaired.dirty_modules == 0 and
+              #repaired.project_modules == 1 and
+              project_is_clean(repaired.project_modules[1]) and
+              after.view_builds == before.view_builds + 1,
+              "saved-source repair did not publish a rebuilt semantic View")
+  test.assert(
+    result_array_length(
+      app:handle(request_for(
+        filename, 42, "textDocument/foldingRange")),
       "folding request after partial repair") == 1,
     "repaired module did not enter the semantic View")
+end
+
+local function rebuilds_view_when_external_recheck_fails_clean_module()
+  local root = fs.tmpname()
+  fs.unlink(root)
+  fs.mkdir(root)
+  local consumer_filename = root .. "/consumer.titan"
+  local unrelated_filename = root .. "/unrelated.titan"
+  local first_provider = root .. "/provider-one.so"
+  local second_provider = root .. "/provider-two.so"
+  fs.write_file(consumer_filename,
+    "function answer(): integer\n" ..
+    "  return 1\n" ..
+    "end\n")
+  fs.write_file(unrelated_filename,
+    "function answer(): integer\n" ..
+    "  return 1\n" ..
+    "end\n")
+  fs.write_file(first_provider, "first external provider")
+  fs.write_file(second_provider, "second external provider")
+  defer do
+    if fs.lstat(second_provider) ~= nil then fs.unlink(second_provider) end
+    if fs.lstat(first_provider) ~= nil then fs.unlink(first_provider) end
+    if fs.lstat(unrelated_filename) ~= nil then
+      fs.unlink(unrelated_filename)
+    end
+    if fs.lstat(consumer_filename) ~= nil then fs.unlink(consumer_filename) end
+    if fs.lstat(root) ~= nil then fs.rmdir(root) end
+  end
+
+  local provider_file = first_provider
+  local fail_consumer = false
+  local runs = 0
+  local checked_modules: {string} = {}
+  local analyzer: project_service.Analyzer =
+    function (request: project_service.AnalysisRequest): bridge.Analysis
+      runs = runs + 1
+      local modules: {bridge.ModuleSnapshot} = {}
+      local diagnostics: {bridge.Diagnostic} = {}
+      local binary_observations: {bridge.BinaryProviderObservation} = {}
+      local checked_consumer = false
+      for index = 1, #request.dirty_modules do
+        local name = request.dirty_modules[index]
+        checked_modules[#checked_modules + 1] = name
+        local module? = find_project(request, name)
+        test.assert(module ~= nil,
+                    "provider-failure analyzer lost a dirty module")
+        if module == nil then raise "dirty provider consumer is missing" end
+
+        local imports: {bridge.Import} = {}
+        if name == "consumer" then
+          checked_consumer = true
+          imports[1] = bridge.Import.new(
+            "vendor", "vendor.binary", false,
+            bridge.SourceLocation.new(module.files[1].filename, 1, 1))
+        end
+        if name == "consumer" and fail_consumer then
+          modules[#modules + 1] = bridge.ModuleSnapshot.new(
+            name,
+            bridge.Provenance.project_source(
+              bridge.SourceProvenance.new(
+                module.files[1].filename, {module.files[1].filename})),
+            nil, {}, {}, imports, {}, nil, nil)
+          diagnostics[#diagnostics + 1] = bridge.Diagnostic.new(
+            bridge.DiagnosticKind.type_error(),
+            "replacement provider is incompatible",
+            bridge.SourceLocation.new(module.files[1].filename, 1, 1))
+        else
+          local snapshot = project_snapshot(module)
+          modules[#modules + 1] = bridge.ModuleSnapshot.new(
+            snapshot.module_name, snapshot.provenance, snapshot.manifest,
+            snapshot.nodes, snapshot.symbols, imports,
+            snapshot.c_header_dependencies, snapshot.hover_summaries,
+            snapshot.provider_identity)
+        end
+      end
+      if checked_consumer then
+        local provider_identity? = observed_provider_identity(provider_file)
+        modules[#modules + 1] = bridge.ModuleSnapshot.new(
+          "vendor.binary",
+          bridge.Provenance.dynamic_binary(
+            bridge.BinaryProvenance.new(provider_file)),
+          bridge.Manifest.new("vendor.binary", "vendor-public", nil),
+          {}, {}, {}, {}, nil, provider_identity)
+        binary_observations[1] = bridge.BinaryProviderObservation.new(
+          "vendor.binary", "dynamic", provider_file, provider_identity)
+      end
+      return bridge.Analysis.new(
+        request.root_module, diagnostics, modules, {},
+        binary_observations, {})
+    end
+  local resolver: project_service.ExternalResolver =
+    function (_config, _projects, requests):
+        {bridge.ExternalResolution}
+      local resolutions: {bridge.ExternalResolution} = {}
+      for index = 1, #requests do
+        resolutions[index] = bridge.ExternalResolution.new(
+          requests[index].module_name,
+          bridge.Provenance.dynamic_binary(
+            bridge.BinaryProvenance.new(provider_file)), nil)
+      end
+      return resolutions
+    end
+
+  local service?, service_error? =
+    project_service.load_with_analyzer_and_resolver(
+      root, "/sdk/lib/titan/0.6", analyzer, resolver)
+  test.assert(service_error == nil and service ~= nil,
+              "provider-failure Application fixture did not load")
+  if service == nil then raise "provider-failure Service is missing" end
+  local app = application.create_with_service(root, service)
+  defer app:close()
+  app:stop_watching_for_testing()
+
+  local initial? = app:snapshot_for_testing()
+  test.assert(initial ~= nil,
+              "provider-failure fixture has no initial snapshot")
+  if initial == nil then raise "provider-failure snapshot is missing" end
+  local initial_consumer? = snapshot_project(initial, "consumer")
+  local initial_unrelated? = snapshot_project(initial, "unrelated")
+  test.assert(initial_consumer ~= nil and
+              project_is_clean(initial_consumer) and
+              initial_unrelated ~= nil and
+              project_is_clean(initial_unrelated) and
+              #initial.dirty_modules == 0,
+              "provider-failure fixture did not start fully clean")
+  test.assert(
+    result_array_length(
+      app:handle(request_for(
+        consumer_filename, 43, "textDocument/foldingRange")),
+      "initial provider consumer folding request") == 1 and
+    result_array_length(
+      app:handle(request_for(
+        unrelated_filename, 44, "textDocument/foldingRange")),
+      "initial unrelated folding request") == 1,
+    "initial semantic View did not contain both clean modules")
+  wait_until(function (): boolean
+    return not app:indexing_metrics().refresh_chain_active
+  end, "initial provider revalidation did not finish")
+
+  local initial_generation = initial.generation
+  local runs_before = runs
+  local checked_before = #checked_modules
+  local metrics_before = app:indexing_metrics()
+  provider_file = second_provider
+  fail_consumer = true
+
+  -- Read requests remain responsive with the preceding immutable View while
+  -- the unwatched provider topology is revalidated in the background.
+  test.assert(
+    result_array_length(
+      app:handle(request_for(
+        consumer_filename, 45, "textDocument/foldingRange")),
+      "folding request during provider revalidation") == 1,
+    "provider revalidation did not serve the preceding semantic View")
+  wait_until(function (): boolean
+    return runs == runs_before + 1 and
+           not app:indexing_metrics().refresh_chain_active
+  end, "replacement provider did not finish its dependent recheck")
+
+  local failed? = app:snapshot_for_testing()
+  test.assert(failed ~= nil,
+              "provider failure did not publish a project snapshot")
+  if failed == nil then raise "provider failure snapshot is missing" end
+  local failed_consumer? = snapshot_project(failed, "consumer")
+  local clean_unrelated? = snapshot_project(failed, "unrelated")
+  local failed_metrics = app:indexing_metrics()
+  test.assert(failed.generation == initial_generation and
+              #failed.dirty_modules == 0 and
+              failed_consumer ~= nil and
+              project_is_failed(failed_consumer) and
+              clean_unrelated ~= nil and
+              project_is_clean(clean_unrelated),
+              "same-generation provider failure did not isolate its consumer")
+  test.assert(#checked_modules == checked_before + 1 and
+              checked_modules[#checked_modules] == "consumer",
+              "provider replacement rechecked an unrelated clean module")
+  test.assert(failed_metrics.view_builds == metrics_before.view_builds + 1,
+              "same-generation failed result reused the preceding View")
+
+  local runs_after_failure = runs
+  test.assert(
+    result_array_length(
+      app:handle(request_for(
+        consumer_filename, 46, "textDocument/foldingRange")),
+      "failed provider consumer folding request") == 0,
+    "rebuilt View retained the failed consumer's preceding AST")
+  test.assert(
+    result_array_length(
+      app:handle(request_for(
+        unrelated_filename, 47, "textDocument/foldingRange")),
+      "clean unrelated folding request after provider failure") == 1,
+    "rebuilt View dropped the unrelated clean module")
+  wait_until(function (): boolean
+    return not app:indexing_metrics().refresh_chain_active
+  end, "unchanged failed-provider revalidation did not finish")
+  test.assert(runs == runs_after_failure and
+              app:indexing_metrics().view_builds == failed_metrics.view_builds,
+              "unchanged semantic requests retried the failed revision")
 end
 
 local function ignores_extensionless_temporary_during_active_refresh()
@@ -1133,7 +1403,7 @@ local function classifies_canonical_symlink_watcher_paths()
 
   local analyzer = YieldingAnalyzer.new(0, false, false, false, false)
   local service?, service_error? = project_service.load_with_analyzer(
-    linked_root, "/sdk/lib/titan/0.26", analyzer:analyze)
+    linked_root, "/sdk/lib/titan/0.6", analyzer:analyze)
   test.assert(service_error == nil and service ~= nil,
               "symlinked project fixture did not load")
   if service == nil then raise "symlinked project Service is missing" end
@@ -1448,8 +1718,11 @@ function test_application_indexing_state_machine(_context: test.Context)
       "partial semantic view",
       builds_semantics_from_independently_valid_modules)
     run_indexing_case(
-      "same-generation partial repair",
-      publishes_recovered_partial_module_at_same_generation)
+      "failed revision save recovery",
+      failed_revision_waits_for_a_saved_change_and_recovers)
+    run_indexing_case(
+      "same-generation provider failure View rebuild",
+      rebuilds_view_when_external_recheck_fails_clean_module)
     run_indexing_case(
       "canonical symlink paths", classifies_canonical_symlink_watcher_paths)
     run_indexing_case(
@@ -1474,7 +1747,7 @@ local function rejects_save_during_successful_rename_preflight()
 
   local analyzer = YieldingAnalyzer.new(0, false, false, false, false)
   local service?, service_error? = project_service.load_with_analyzer(
-    root, "/sdk/lib/titan/0.26", analyzer:analyze)
+    root, "/sdk/lib/titan/0.6", analyzer:analyze)
   test.assert(service_error == nil and service ~= nil,
               "rename-race fixture project did not load")
   if service == nil then raise "rename-race fixture Service is missing" end

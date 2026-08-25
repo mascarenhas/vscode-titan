@@ -8,7 +8,7 @@ local source_text = import "server.source_text"
 local test_runtime = import "server.test_runtime"
 
 local type EmptyFunction = () -> ()
-local type FixtureInstaller = (string) -> value
+local type FixtureInstaller = (string, string?) -> value
 
 local function run_bridge(body: EmptyFunction)
   do
@@ -24,7 +24,7 @@ end
 
 local function new_fixture_installer(): FixtureInstaller
   return lua.load([==[
-return function(mode)
+return function(mode, contextual_provider_file)
   local names = {
     "titan-compiler.parser",
     "titan-compiler.checker",
@@ -65,14 +65,17 @@ return function(mode)
     end,
   }
   local driver = {
-    TITAN_VER = mode == "incompatible" and "99.0" or "0.26",
+    TITAN_ABI_VERSION = mode == "incompatible" and "99" or "2",
+    TITAN_VERSION = "0.6.0",
+    TITAN_LIBRARY_VERSION = "0.6",
     LANGUAGE_SERVER_API_VERSION =
       mode == "wrong-language-server-api" and 2 or 3,
     TITAN_SOURCE_PATH = ".",
     TITAN_BIN_PATH = "",
-    INSTALL_PATHS = { titan_bin = "/opt/titan/lib/titan/0.26" },
+    INSTALL_PATHS = { titan_bin = "/opt/titan/lib/titan/0.6" },
     imported = {},
   }
+  if mode == "missing-abi" then driver.TITAN_ABI_VERSION = nil end
   if mode == "older-same-abi" then
     driver.LANGUAGE_SERVER_API_VERSION = nil
   end
@@ -85,13 +88,23 @@ return function(mode)
       checked_source_modules = {},
     }
   end
+  local contextual_finalize_count = 0
+  local binary_load_count = 0
   driver.finalize_resolver_context = function(context)
-    if mode == "contextual-resolution" then
+    if mode == "contextual-resolution" or
+       mode == "contextual-resolution-once" then
+      contextual_finalize_count = contextual_finalize_count + 1
+      local provider_file = assert(contextual_provider_file)
+      if mode ~= "contextual-resolution-once" or
+         contextual_finalize_count == 1 then
+        local metadata, metadata_error = context.io:lstat(provider_file)
+        assert(metadata and metadata_error == nil)
+      end
       context.contextual_resolutions["fixture.facade\0fixture.owner"] = {
         owner = "fixture.owner",
         exposer = "fixture.facade",
         kind = "static",
-        provider_file = "/binary/fixture-owner.a",
+        provider_file = provider_file,
         ordinary_lookup = true,
       }
     end
@@ -386,13 +399,42 @@ return function(mode)
           c_header_dependencies = {},
         }
       end
-      if mode == "binary-manifest" then
-        driver.imported["fixture.binary"] = {
-          kind = "dynamic",
-          type = module_type("fixture.binary"),
-          filename = "/binary/fixture.so",
-          c_header_dependencies = {},
-        }
+      if mode == "binary-manifest" or
+         mode == "binary-provider-switch" or
+         mode == "binary-provider-to-source" then
+        binary_load_count = binary_load_count + 1
+        local provider_file = contextual_provider_file or
+          "/binary/fixture.so"
+        if mode == "binary-provider-switch" and binary_load_count > 1 then
+          provider_file = provider_file .. ".second"
+        end
+        local source_provider =
+          mode == "binary-provider-to-source" and binary_load_count > 1
+        if contextual_provider_file and not source_provider then
+          local metadata, metadata_error =
+            assert(options.context).io:lstat(provider_file)
+          assert(metadata and metadata_error == nil)
+        end
+        if source_provider then
+          driver.imported["fixture.binary"] = {
+            kind = "source",
+            ast = {},
+            type = module_type("fixture.binary"),
+            source_manifest = source_manifest("fixture.binary"),
+            filename = provider_file ..
+              (mode == "binary-provider-to-source" and ".second" or ""),
+            source_files = {provider_file ..
+              (mode == "binary-provider-to-source" and ".second" or "")},
+            c_header_dependencies = {},
+          }
+        else
+          driver.imported["fixture.binary"] = {
+            kind = "dynamic",
+            type = module_type("fixture.binary"),
+            filename = provider_file,
+            c_header_dependencies = {},
+          }
+        end
       end
       local context = assert(options.context)
       context.checked_source_modules[
@@ -434,8 +476,10 @@ end
 ]==], "=compiler_bridge_fixture", nil)() as FixtureInstaller
 end
 
-local function with_fixture(mode: string, body: EmptyFunction)
-  local restore = new_fixture_installer()(mode) as EmptyFunction
+local function with_fixture(mode: string, body: EmptyFunction,
+                            contextual_provider_file: string?)
+  local restore = new_fixture_installer()(
+    mode, contextual_provider_file) as EmptyFunction
   defer restore()
   body()
 catch
@@ -466,6 +510,7 @@ end
 function test_compiler_bridge_rejects_missing_incompatible_and_malformed_modules(
     _context: test.Context)
   expect_bridge_error("missing-parser", "cannot load compiler module")
+  expect_bridge_error("missing-abi", "TITAN_ABI_VERSION")
   expect_bridge_error("incompatible", "incompatible Titan compiler ABI")
   expect_bridge_error("older-same-abi",
                       "matching Titan ABI alone is insufficient")
@@ -563,22 +608,125 @@ end
 
 function test_compiler_bridge_keeps_source_manifests_off_binary_snapshots(
     _context: test.Context)
-  with_fixture("binary-manifest", function ()
-    local compiler = bridge.load()
-    local analysis = compiler:analyze("fixture", {bridge.ProjectModule.new(
-      "fixture", {bridge.SourceFile.new(
-        "/workspace/fixture.titan", "saved fixture")})})
-    local binary? = analysis:find_module("fixture.binary")
-    test.assert(binary ~= nil and binary.manifest ~= nil and
-                binary.manifest.source_serialized == nil,
-                "binary snapshot acquired a source-visible manifest")
-    case binary.provenance
-    when dynamic_binary: provenance then
-      test.assert(provenance.provider_file == "/binary/fixture.so",
-                  "binary manifest fixture lost its provider provenance")
-    else
-      test.assert(false, "binary manifest fixture used source provenance")
+  run_bridge(function ()
+    local provider = fs.tmpname()
+    defer fs.unlink(provider)
+    fs.write_file(provider, "fixture binary provider")
+    with_fixture("binary-manifest", function ()
+      local compiler = bridge.load()
+      local analysis = compiler:analyze("fixture", {
+        bridge.ProjectModule.new("fixture", {bridge.SourceFile.new(
+          "/workspace/fixture.titan", "saved fixture")}),
+      })
+      local binary? = analysis:find_module("fixture.binary")
+      test.assert(binary ~= nil and binary.manifest ~= nil and
+                  binary.manifest.source_serialized == nil and
+                  binary.provider_identity ~= nil and
+                  binary.provider_identity.path == provider and
+                  binary.provider_identity.size ==
+                    #"fixture binary provider",
+                  "binary snapshot lost its compiler-observed provider")
+      case binary.provenance
+      when dynamic_binary: provenance then
+        test.assert(provenance.provider_file == provider,
+                    "binary manifest fixture lost its provider provenance")
+      else
+        test.assert(false, "binary manifest fixture used source provenance")
+      end
+    end, provider)
+  end)
+end
+
+function test_compiler_bridge_rejects_mixed_binary_providers_across_attempts(
+    _context: test.Context)
+  run_bridge(function ()
+    local first_provider = fs.tmpname()
+    local second_provider = first_provider .. ".second"
+    defer do
+      fs.unlink(second_provider)
+      fs.unlink(first_provider)
     end
+    fs.write_file(first_provider, "first provider")
+    fs.write_file(second_provider, "fallback provider")
+    with_fixture("binary-provider-switch", function ()
+      local compiler = bridge.load()
+      local analysis = compiler:analyze_incremental({
+        bridge.ProjectModule.new("fixture.first", {
+          bridge.SourceFile.new("/workspace/first.titan", ""),
+        }),
+        bridge.ProjectModule.new("fixture.second", {
+          bridge.SourceFile.new("/workspace/second.titan", ""),
+        }),
+      }, {"fixture.first", "fixture.second"}, {})
+      local binary? = analysis:find_module("fixture.binary")
+      test.assert(binary ~= nil and binary.provider_identity == nil and
+                  #analysis.provider_conflicts == 1 and
+                  analysis.provider_conflicts[1] == "fixture.binary" and
+                  #analysis.binary_provider_observations == 2 and
+                  analysis.binary_provider_observations[1].provider_file ==
+                    first_provider and
+                  analysis.binary_provider_observations[2].provider_file ==
+                    second_provider and
+                  analysis.binary_provider_observations[1].provider_identity ~=
+                    nil and
+                  analysis.binary_provider_observations[2].provider_identity ~=
+                    nil,
+                  "mixed binary providers acquired a publishable identity")
+      case binary.provenance
+      when dynamic_binary: provenance then
+        test.assert(provenance.provider_file == second_provider,
+                    "provider-switch fixture did not retain its final result")
+      else
+        test.assert(false, "provider-switch fixture used source provenance")
+      end
+    end, first_provider)
+  end)
+end
+
+local function preserves_binary_observation_when_final_snapshot_is_source()
+  local first_provider = fs.tmpname()
+  local second_provider = first_provider .. ".second"
+  defer do
+    fs.unlink(second_provider)
+    fs.unlink(first_provider)
+  end
+  fs.write_file(first_provider, "first provider")
+  fs.write_file(second_provider, "final source provider")
+  with_fixture("binary-provider-to-source", function ()
+    local compiler = bridge.load()
+    local analysis = compiler:analyze_incremental({
+      bridge.ProjectModule.new("fixture.first", {
+        bridge.SourceFile.new("/workspace/first.titan", ""),
+      }),
+      bridge.ProjectModule.new("fixture.second", {
+        bridge.SourceFile.new("/workspace/second.titan", ""),
+      }),
+    }, {"fixture.first", "fixture.second"}, {})
+    local provider? = analysis:find_module("fixture.binary")
+    test.assert(provider ~= nil and #analysis.provider_conflicts == 0 and
+                #analysis.binary_provider_observations == 1 and
+                analysis.binary_provider_observations[1].module_name ==
+                  "fixture.binary" and
+                analysis.binary_provider_observations[1].kind == "dynamic" and
+                analysis.binary_provider_observations[1].provider_file ==
+                  first_provider and
+                analysis.binary_provider_observations[1].provider_identity ~=
+                  nil,
+                "source-final result lost its earlier binary observation")
+    case provider.provenance
+    when external_source: source then
+      test.assert(source.main_file == second_provider,
+                  "source-final fixture lost its final provider")
+    else
+      test.assert(false, "source-final fixture retained binary provenance")
+    end
+  end, first_provider)
+end
+
+function test_compiler_bridge_preserves_binary_observation_before_source_result(
+    _context: test.Context)
+  run_bridge(function ()
+    preserves_binary_observation_when_final_snapshot_is_source()
   end)
 end
 
@@ -632,27 +780,60 @@ end
 
 function test_compiler_bridge_normalizes_contextual_owner_provenance(
     _context: test.Context)
-  with_fixture("contextual-resolution", function ()
-    local compiler = bridge.load()
-    local analysis = compiler:analyze("fixture", {
-      bridge.ProjectModule.new("fixture", {bridge.SourceFile.new(
-        "/workspace/fixture.titan", "saved fixture")}),
-    })
-    test.assert(#analysis.contextual_resolutions == 1,
-                "contextual owner metadata was not normalized")
-    local resolution = analysis.contextual_resolutions[1]
-    test.assert(resolution.owner_module == "fixture.owner" and
-                resolution.exposer_module == "fixture.facade" and
-                resolution.ordinary_lookup,
-                "contextual owner graph identity was changed")
-    case resolution.provenance
-    when static_binary: binary then
-      test.assert(binary.provider_file == "/binary/fixture-owner.a",
-                  "contextual owner provider path was lost")
-    else
-      test.assert(false,
-                  "contextual owner used the wrong provenance variant")
-    end
+  run_bridge(function ()
+    local provider = fs.tmpname()
+    defer fs.unlink(provider)
+    fs.write_file(provider, "fixture static provider")
+    with_fixture("contextual-resolution", function ()
+      local compiler = bridge.load()
+      local analysis = compiler:analyze("fixture", {
+        bridge.ProjectModule.new("fixture", {bridge.SourceFile.new(
+          "/workspace/fixture.titan", "saved fixture")}),
+      })
+      test.assert(#analysis.contextual_resolutions == 1,
+                  "contextual owner metadata was not normalized")
+      local resolution = analysis.contextual_resolutions[1]
+      test.assert(resolution.owner_module == "fixture.owner" and
+                  resolution.exposer_module == "fixture.facade" and
+                  resolution.ordinary_lookup and
+                  resolution.provider_identity ~= nil and
+                  resolution.provider_identity.path == provider and
+                  resolution.provider_identity.kind == "file" and
+                  resolution.provider_identity.size ==
+                    #"fixture static provider",
+                  "contextual owner graph identity was changed")
+      case resolution.provenance
+      when static_binary: binary then
+        test.assert(binary.provider_file == provider,
+                    "contextual owner provider path was lost")
+      else
+        test.assert(false,
+                    "contextual owner used the wrong provenance variant")
+      end
+    end, provider)
+  end)
+end
+
+function test_compiler_bridge_resets_contextual_provider_observations_between_analyses(
+    _context: test.Context)
+  run_bridge(function ()
+    local provider = fs.tmpname()
+    defer fs.unlink(provider)
+    fs.write_file(provider, "fixture static provider")
+    with_fixture("contextual-resolution-once", function ()
+      local compiler = bridge.load()
+      local project = bridge.ProjectModule.new(
+        "fixture", {bridge.SourceFile.new(
+          "/workspace/fixture.titan", "saved fixture")})
+      local first = compiler:analyze("fixture", {project})
+      local second = compiler:analyze("fixture", {project})
+      test.assert(#first.contextual_resolutions == 1 and
+                  first.contextual_resolutions[1].provider_identity ~= nil,
+                  "first analysis lost its observed provider identity")
+      test.assert(#second.contextual_resolutions == 1 and
+                  second.contextual_resolutions[1].provider_identity == nil,
+                  "second analysis reused a stale provider observation")
+    end, provider)
   end)
 end
 
@@ -725,8 +906,8 @@ function test_compiler_bridge_normalizes_annotated_ast_and_provenance(
   with_fixture("valid", function ()
     local compiler = bridge.load()
     test.assert(compiler:installed_binary_modules_root() ==
-                  "/opt/titan/lib/titan/0.26",
-                "compiler installation ABI directory was not exposed")
+                  "/opt/titan/lib/titan/0.6",
+                "compiler installation library directory was not exposed")
     local analysis = compiler:analyze("fixture", {bridge.ProjectModule.new(
       "fixture", {bridge.SourceFile.new(
         "/workspace/fixture.titan", "saved fixture")})})

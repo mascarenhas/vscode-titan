@@ -8,7 +8,7 @@ local compiler_scheduler = import "server.compiler_scheduler"
 local json = import "server.json"
 local logging = import "server.logging"
 
-local COMPILER_ABI = "0.26"
+local COMPILER_ABI = "2"
 local COMPILER_LANGUAGE_SERVER_API = 3
 local COMPILER_LANGUAGE_SERVER_API_MARKER = "LANGUAGE_SERVER_API_VERSION"
 local PARSER_MODULE = "titan-compiler.parser"
@@ -207,6 +207,22 @@ record ContextualResolution
   exposer_module: string
   provenance: Provenance
   ordinary_lookup: boolean
+  -- Captured by CompilerIO when the compiler selected this provider. Nil means
+  -- the provider path was not observed, or repeated lstat calls in this one
+  -- incremental analysis disagreed and the result must be treated as
+  -- unvalidated by the project service.
+  provider_identity: compiler_io.LstatIdentity?
+end
+
+-- Every ordinary binary provider selected by any root attempt remains visible
+-- until the project service publishes or rejects the complete analysis. This
+-- is distinct from final external snapshots: a later source-required attempt
+-- may legitimately leave a source snapshot for the same logical module.
+record BinaryProviderObservation
+  module_name: string
+  kind: string
+  provider_file: string
+  provider_identity: compiler_io.LstatIdentity?
 end
 
 union CHeaderDependencyKind
@@ -233,6 +249,10 @@ record ModuleSnapshot
   imports: {Import}
   c_header_dependencies: {CHeaderDependency}
   hover_summaries: {HoverSummary}?
+  -- Binary snapshots carry the exact followed provider object observed while
+  -- the compiler selected their interface. Nil is required for source
+  -- snapshots and for a binary path whose observations disagreed.
+  provider_identity: compiler_io.LstatIdentity?
 end
 
 record Analysis
@@ -240,6 +260,12 @@ record Analysis
   diagnostics: {Diagnostic}
   modules: {ModuleSnapshot}
   contextual_resolutions: {ContextualResolution}
+  binary_provider_observations: {BinaryProviderObservation}
+  -- Logical modules which selected different binary provider kind/path pairs
+  -- between root attempts. Source-required and ordinary imports may
+  -- legitimately select source and binary simultaneously; that is not a
+  -- binary-provider conflict.
+  provider_conflicts: {string}
 end
 
 -- Progress counts the saved source files in one exact dirty project workset.
@@ -483,7 +509,7 @@ local function load_with(require_function: RequireFunction): Compiler
     require_function, type_of, DRIVER_MODULE)
 
   local version = required_string(
-    driver["TITAN_VER"], DRIVER_MODULE, "TITAN_VER")
+    driver["TITAN_ABI_VERSION"], DRIVER_MODULE, "TITAN_ABI_VERSION")
   if version ~= COMPILER_ABI then
     return fail<Compiler>(DRIVER_MODULE,
       "incompatible Titan compiler ABI " .. version ..
@@ -2922,7 +2948,7 @@ local function snapshot_module(compiler: Compiler, module_name: string,
   end
   return ModuleSnapshot.new(
     module_name, origin, manifest, nodes, symbols, imports,
-    header_dependencies, hover_summaries)
+    header_dependencies, hover_summaries, nil)
 end
 
 local function normalize_contextual_resolutions(
@@ -2966,7 +2992,7 @@ local function normalize_contextual_resolutions(
       owner, exposer, origin as Provenance, required_boolean(
         raw["ordinary_lookup"], DRIVER_MODULE,
         "compiler contextual resolution '" .. key ..
-        "'.ordinary_lookup"))
+        "'.ordinary_lookup"), nil)
     local position = #result + 1
     local identity = exposer .. "\0" .. owner .. "\0" ..
                      kind .. "\0" .. provider_file
@@ -2994,10 +3020,128 @@ local function normalize_contextual_resolutions(
   return result
 end
 
+local function contextual_provider_file(
+    resolution: ContextualResolution): string
+  case resolution.provenance
+  when dynamic_binary: binary then return binary.provider_file
+  when static_binary: binary then return binary.provider_file
+  else
+    return fail<string>(DRIVER_MODULE,
+      "contextual owner has non-binary provider provenance")
+  end
+end
+
+local function attach_contextual_provider_identities(
+    strategy: compiler_io.CompilerIO,
+    resolutions: {ContextualResolution}): {ContextualResolution}
+  local result: {ContextualResolution} = {}
+  for index = 1, #resolutions do
+    local source = resolutions[index]
+    local provider_file = contextual_provider_file(source)
+    result[index] = ContextualResolution.new(
+      source.owner_module, source.exposer_module, source.provenance,
+      source.ordinary_lookup,
+      compiler_io.consistent_lstat_identity(strategy, provider_file))
+  end
+  return result
+end
+
+local function attach_module_provider_identities(
+    strategy: compiler_io.CompilerIO, modules: {ModuleSnapshot},
+    provider_conflicts: {string: boolean})
+  for index = 1, #modules do
+    local snapshot = modules[index]
+    local provider_file?: string = nil
+    case snapshot.provenance
+    when dynamic_binary: binary then provider_file = binary.provider_file
+    when static_binary: binary then provider_file = binary.provider_file
+    else
+    end
+    if provider_file ~= nil and
+       not provider_conflicts[snapshot.module_name] then
+      snapshot.provider_identity = compiler_io.consistent_lstat_identity(
+        strategy, provider_file as string)
+    end
+  end
+end
+
+local record BinaryProviderSelection
+  module_name: string
+  kind: string
+  provider_file: string
+end
+
+local function binary_provider_selection(
+    snapshot: ModuleSnapshot): BinaryProviderSelection?
+  case snapshot.provenance
+  when dynamic_binary: binary then
+    return BinaryProviderSelection.new(
+      snapshot.module_name, "dynamic", binary.provider_file)
+  when static_binary: binary then
+    return BinaryProviderSelection.new(
+      snapshot.module_name, "static", binary.provider_file)
+  else return nil
+  end
+end
+
+local function binary_provider_selection_key(
+    selection: BinaryProviderSelection): string
+  return selection.kind .. "\0" .. selection.provider_file
+end
+
+local function binary_provider_observation_key(
+    selection: BinaryProviderSelection): string
+  return selection.module_name .. "\0" ..
+         binary_provider_selection_key(selection)
+end
+
+local function observe_binary_provider_selection(
+    snapshot: ModuleSnapshot, selections: {string: string},
+    observation_keys: {string: boolean},
+    observations: {BinaryProviderSelection}, conflicts: {string: boolean})
+  local selection? = binary_provider_selection(snapshot)
+  if selection == nil then return end
+  local observed = selection as BinaryProviderSelection
+  local key = binary_provider_selection_key(observed)
+  local previous? = selections[observed.module_name]
+  if previous == nil then
+    selections[observed.module_name] = key
+  elseif previous ~= key then
+    conflicts[observed.module_name] = true
+  end
+  local observation_key = binary_provider_observation_key(observed)
+  if not observation_keys[observation_key] then
+    observation_keys[observation_key] = true
+    local position = #observations + 1
+    while position > 1 and
+          binary_provider_observation_key(observations[position - 1]) >
+            observation_key do
+      observations[position] = observations[position - 1]
+      position = position - 1
+    end
+    observations[position] = observed
+  end
+end
+
+local function attach_binary_provider_observations(
+    strategy: compiler_io.CompilerIO,
+    selections: {BinaryProviderSelection}): {BinaryProviderObservation}
+  local result: {BinaryProviderObservation} = {}
+  for index = 1, #selections do
+    local selection = selections[index]
+    result[index] = BinaryProviderObservation.new(
+      selection.module_name, selection.kind, selection.provider_file,
+      compiler_io.consistent_lstat_identity(
+        strategy, selection.provider_file))
+  end
+  return result
+end
+
 -- Installation discovery belongs to the compiler, but API 3 deliberately
 -- defers physical path resolution until a resolver owns an I/O strategy.
 -- Initialize and close that resolver under the shared Lua-state permit before
--- exposing the compiler's ABI directory to project configuration.
+-- exposing the compiler's release-versioned library directory to project
+-- configuration.
 function Compiler:installed_binary_modules_root(): string
   local permit = compiler_scheduler.acquire()
   defer permit:release()
@@ -3132,7 +3276,7 @@ local function failed_project_snapshot(project: ProjectModule): ModuleSnapshot
     project.module_name,
     Provenance.project_source(SourceProvenance.new(
       project.files[1].filename, files)),
-    nil, {}, {}, {}, {})
+    nil, {}, {}, {}, {}, nil, nil)
 end
 
 local function Compiler:run_attempt_inner(
@@ -3397,6 +3541,8 @@ function Compiler:analyze_incremental(
   end
   local permit = compiler_scheduler.acquire()
   defer permit:release()
+  compiler_io.begin_lstat_observations(self.io)
+  defer compiler_io.end_lstat_observations(self.io)
 
   local previous_source_path: value = self.driver["TITAN_SOURCE_PATH"]
   local previous_binary_path: value = self.driver["TITAN_BIN_PATH"]
@@ -3423,6 +3569,10 @@ function Compiler:analyze_incremental(
   local diagnostics: {Diagnostic} = {}
   local result_normalization_work = NormalizationWork.new(0)
   local snapshots: {string: ModuleSnapshot} = {}
+  local binary_provider_selections: {string: string} = {}
+  local binary_provider_observation_keys: {string: boolean} = {}
+  local binary_provider_selection_list: {BinaryProviderSelection} = {}
+  local provider_conflicts: {string: boolean} = {}
   local contextual_resolutions: {ContextualResolution} = {}
 
   for index = 1, #ordered do
@@ -3450,6 +3600,10 @@ function Compiler:analyze_incremental(
         diagnostics, attempt.diagnostics, result_normalization_work)
       for module_index = 1, #attempt.modules do
         local snapshot = attempt.modules[module_index]
+        observe_binary_provider_selection(
+          snapshot, binary_provider_selections,
+          binary_provider_observation_keys,
+          binary_provider_selection_list, provider_conflicts)
         snapshots[snapshot.module_name] = snapshot
       end
       for resolution_index = 1, #attempt.contextual_resolutions do
@@ -3489,8 +3643,22 @@ function Compiler:analyze_incremental(
   for index = 1, #external_names do
     modules[#modules + 1] = snapshots[external_names[index]]
   end
+  attach_module_provider_identities(
+    self.io, modules, provider_conflicts)
+  contextual_resolutions = attach_contextual_provider_identities(
+    self.io, contextual_resolutions)
+  local binary_provider_observations =
+    attach_binary_provider_observations(
+      self.io, binary_provider_selection_list)
+  local provider_conflict_names: {string} = {}
+  for name, conflicted in iteration.pairs<string, boolean>(
+      provider_conflicts) do
+    if conflicted then provider_conflict_names[#provider_conflict_names + 1] = name end
+  end
+  sort_strings(provider_conflict_names, result_normalization_work)
   local result = Analysis.new(
-    ordered[1], diagnostics, modules, contextual_resolutions)
+    ordered[1], diagnostics, modules, contextual_resolutions,
+    binary_provider_observations, provider_conflict_names)
   logging.emit("debug", "compiler.analysis.complete", {
     json.Member.new("root_module", json.from_string(ordered[1])),
     json.Member.new("diagnostics", json.from_integer(#diagnostics)),

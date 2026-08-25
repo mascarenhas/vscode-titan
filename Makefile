@@ -5,6 +5,7 @@ TITAN_REPO ?= ../titan
 TITAN_PREFIX := $(abspath .titan)
 TITANC := $(TITAN_PREFIX)/bin/titanc
 LUAROCKS := $(TITAN_PREFIX)/bin/luarocks
+TITAN_ROCKSPEC := titan-0.6.0-1.rockspec
 
 SOURCE_ROOT := $(abspath src)
 BUILD_ROOT := $(abspath .build)
@@ -85,7 +86,7 @@ help:
 toolchain: $(TITANC)
 
 $(TITANC):
-	@test -f "$(abspath $(TITAN_REPO))/titan-dev-1.rockspec" || { \
+	@test -f "$(abspath $(TITAN_REPO))/$(TITAN_ROCKSPEC)" || { \
 		echo "Titan checkout not found at $(abspath $(TITAN_REPO))" >&2; \
 		exit 1; \
 	}
@@ -94,12 +95,12 @@ $(TITANC):
 	$(MAKE) -C "$(abspath $(TITAN_REPO))" libuv PREFIX="$(TITAN_PREFIX)"
 	cd "$(abspath $(TITAN_REPO))" && \
 		PATH="$(TITAN_PREFIX)/bin:$$PATH" \
-		"$(LUAROCKS)" make --force titan-dev-1.rockspec
+		"$(LUAROCKS)" make --force "$(TITAN_ROCKSPEC)"
 
 toolchain-refresh: toolchain
 	cd "$(abspath $(TITAN_REPO))" && \
 		PATH="$(TITAN_PREFIX)/bin:$$PATH" \
-		"$(LUAROCKS)" make --force titan-dev-1.rockspec
+		"$(LUAROCKS)" make --force "$(TITAN_ROCKSPEC)"
 
 npm-ci: node_modules/.package-lock.json
 

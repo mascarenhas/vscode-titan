@@ -3,6 +3,7 @@ local fs = import "fs"
 local iteration = import "titan.iteration"
 local strings = import "string"
 local compiler_bridge = import "server.compiler_bridge"
+local compiler_io = import "server.compiler_io"
 local json = import "server.json"
 local logging = import "server.logging"
 local project_config = import "server.project_config"
@@ -20,12 +21,21 @@ record SourceFileSnapshot
   const stamp: project_graph.FileStamp
 end
 
+-- `dirty` means an input changed and compiler work is required. A failed
+-- result is instead current for its exact revision: it carries authoritative
+-- diagnostics but no semantic AST until a relevant input invalidates it.
+union ProjectAnalysisState
+  clean
+  failed
+  dirty
+end
+
 record ProjectModule
   const module_name: string
   const source_files: {SourceFileSnapshot}
   const compiler_snapshot: compiler_bridge.ModuleSnapshot?
   const diagnostics: {compiler_bridge.Diagnostic}
-  const dirty: boolean
+  const analysis_state: ProjectAnalysisState
 end
 
 record ExternalSource
@@ -338,10 +348,18 @@ end
 
 local function same_external_fingerprint(left: ExternalFingerprint,
                                          right: ExternalFingerprint): boolean
+  local same_error = left.error == right.error
+  -- Resolver error prose is not physical topology. A failed project seeds an
+  -- origin-less baseline before the resolver has produced its own message;
+  -- repeated observations of the same missing provider must remain stable.
+  if left.origin == nil and right.origin == nil and
+     #left.stamps == 0 and #right.stamps == 0 then
+    same_error = true
+  end
   return left.module_name == right.module_name and
          left.source_required == right.source_required and
          left.topology_resolved == right.topology_resolved and
-         left.error == right.error and
+         same_error and
          origin_identity(left.origin) == origin_identity(right.origin) and
          same_stamps(left.stamps, right.stamps)
 end
@@ -673,6 +691,7 @@ local function Service:accept_revalidated_fingerprint(
               not external_matches_fingerprint(external, current)
   end
   self.external_fingerprints[current.module_name] = current
+  insert_name(self.external_fingerprint_names, current.module_name)
   if changed then
     self.graph:invalidate_external_change(current.module_name)
   end
@@ -1023,6 +1042,110 @@ local function graph_imports(snapshot: compiler_bridge.ModuleSnapshot):
   return result
 end
 
+-- A nil-manifest compiler snapshot can be an explicit transitive-failure
+-- result, but the bridge's loader-level fallback has no complete import frame.
+-- Retain the last successful frame and merge anything the failed attempt did
+-- observe. A later successful commit replaces this conservative union with the
+-- exact current imports.
+local function failed_project_imports(
+    service: Service, module_name: string,
+    snapshot: compiler_bridge.ModuleSnapshot?):
+    {project_graph.ImportEdge}
+  local result = service.graph:direct_imports(module_name)
+  if snapshot ~= nil then
+    local observed = graph_imports(snapshot as compiler_bridge.ModuleSnapshot)
+    for index = 1, #observed do result[#result + 1] = observed[index] end
+  end
+  return result
+end
+
+local function same_header_input(
+    left: compiler_bridge.CHeaderDependency,
+    right: compiler_bridge.CHeaderDependency): boolean
+  return header_kind_name(left.kind) == header_kind_name(right.kind) and
+         left.path == right.path
+end
+
+-- The same fallback cannot prove that an empty header closure is complete.
+-- Preserve the prior closure, replacing identities for paths observed by this
+-- attempt and appending newly observed inputs. This keeps edits, restoration,
+-- and include-shadow changes capable of scheduling recovery.
+local function failed_project_headers(
+    service: Service, module_name: string,
+    snapshot: compiler_bridge.ModuleSnapshot?):
+    ({compiler_bridge.CHeaderDependency}, boolean)
+  local result: {compiler_bridge.CHeaderDependency} = {}
+  local known = false
+  local previous? = service.header_fingerprints[module_name]
+  if previous ~= nil then
+    result = copy_header_dependencies(previous.dependencies)
+    known = true
+  end
+  if snapshot ~= nil then
+    local observed = (snapshot as compiler_bridge.ModuleSnapshot).
+      c_header_dependencies
+    if #observed > 0 then known = true end
+    for observed_index = 1, #observed do
+      local dependency = observed[observed_index]
+      local replaced = false
+      for result_index = 1, #result do
+        if same_header_input(result[result_index], dependency) then
+          result[result_index] = copy_header_dependencies({dependency})[1]
+          replaced = true
+          break
+        end
+      end
+      if not replaced then
+        result[#result + 1] = copy_header_dependencies({dependency})[1]
+      end
+    end
+  end
+  return result, known
+end
+
+local function Service:publish_failed_project(
+    module_name: string, state: ProjectState,
+    token: project_graph.CheckToken,
+    snapshot: compiler_bridge.ModuleSnapshot?,
+    diagnostics: {compiler_bridge.Diagnostic}): boolean
+  local imports = failed_project_imports(self, module_name, snapshot)
+  local headers, headers_known = failed_project_headers(
+    self, module_name, snapshot)
+  if not self.graph:fail_project_check(token, imports) then return false end
+  -- Failed results leave the work queue, so an unresolved ordinary import must
+  -- acquire a durable missing-provider baseline now. External trees are not
+  -- watched; later semantic-request topology probes compare against this
+  -- physical absence and dirty the failed importer when a provider appears.
+  if self.external_resolver ~= nil then
+    for index = 1, #imports do
+      local edge = imports[index]
+      local name = edge.module_name
+      if self.projects[name] == nil and self.externals[name] == nil then
+        local requires_source = false
+        case edge.visibility
+        when source_required then requires_source = true
+        when ordinary then
+        end
+        local previous? = self.external_fingerprints[name]
+        if previous == nil then
+          self.external_fingerprints[name] = ExternalFingerprint.new(
+            name, requires_source, true, nil, {}, nil)
+          insert_name(self.external_fingerprint_names, name)
+        elseif previous.origin == nil and
+               requires_source and not previous.source_required then
+          self.external_fingerprints[name] = ExternalFingerprint.new(
+            name, true, previous.topology_resolved, nil,
+            copy_stamps(previous.stamps), previous.error)
+        end
+      end
+    end
+  end
+  state.diagnostics = diagnostics
+  state.compiler_snapshot = snapshot
+  if headers_known then self:remember_header_fingerprint(module_name, headers) end
+  return true
+end
+
 local function external_candidate(
     snapshot: compiler_bridge.ModuleSnapshot,
     contextual_resolutions: {compiler_bridge.ContextualResolution}):
@@ -1272,6 +1395,80 @@ local function contextual_fingerprint(
     observed.origin, observed.stamps, observed.error)
 end
 
+local function same_provider_identity(
+    identity: compiler_io.LstatIdentity): boolean
+  local current? = fs.stat(identity.path)
+  if current == nil then return false end
+  return current.size == identity.size and
+         current.kind == identity.kind and
+         current.device == identity.device and
+         current.inode == identity.inode and
+         current.modified_seconds == identity.modified_seconds and
+         current.modified_nanoseconds == identity.modified_nanoseconds
+end
+
+local function same_provider_identity_claim(
+    left: compiler_io.LstatIdentity?,
+    right: compiler_io.LstatIdentity?): boolean
+  if left == nil or right == nil then return left == nil and right == nil end
+  local actual_left = left as compiler_io.LstatIdentity
+  local actual_right = right as compiler_io.LstatIdentity
+  return actual_left.path == actual_right.path and
+         actual_left.size == actual_right.size and
+         actual_left.kind == actual_right.kind and
+         actual_left.device == actual_right.device and
+         actual_left.inode == actual_right.inode and
+         actual_left.modified_seconds == actual_right.modified_seconds and
+         actual_left.modified_nanoseconds ==
+           actual_right.modified_nanoseconds
+end
+
+local function binary_provider_key(module_name: string, kind: string,
+                                   provider_file: string): string
+  return module_name .. "\0" .. kind .. "\0" .. provider_file
+end
+
+local function binary_provider_observation_is_current(
+    observation: compiler_bridge.BinaryProviderObservation): boolean
+  if observation.kind ~= "dynamic" and observation.kind ~= "static" then
+    return false
+  end
+  local identity? = observation.provider_identity
+  return identity ~= nil and
+         (identity as compiler_io.LstatIdentity).path ==
+           observation.provider_file and
+         same_provider_identity(identity as compiler_io.LstatIdentity)
+end
+
+-- A first-seen contextual owner is safe to publish in the analysis which
+-- discovered it only when every compiler observation for that logical owner
+-- still names the exact followed provider object. Merely statting provenance
+-- after analysis cannot distinguish stable discovery from replacement while
+-- package.loadlib was consuming the provider.
+local function contextual_provider_is_current(
+    analysis: compiler_bridge.Analysis, module_name: string): boolean
+  local found = false
+  for index = 1, #analysis.contextual_resolutions do
+    local resolution = analysis.contextual_resolutions[index]
+    if resolution.owner_module == module_name then
+      found = true
+      local provider_file?: string = nil
+      case resolution.provenance
+      when dynamic_binary: binary then provider_file = binary.provider_file
+      when static_binary: binary then provider_file = binary.provider_file
+      else return false
+      end
+      local identity? = resolution.provider_identity
+      if identity == nil or
+         (identity as compiler_io.LstatIdentity).path ~= provider_file or
+         not same_provider_identity(identity as compiler_io.LstatIdentity) then
+        return false
+      end
+    end
+  end
+  return found
+end
+
 local function same_external_observation(left: ExternalFingerprint,
                                          right: ExternalFingerprint): boolean
   return left.module_name == right.module_name and
@@ -1379,12 +1576,34 @@ local function Service:commit_or_raise(
   local observed_fingerprints: {string: ExternalFingerprint} = {}
   local observed_names: {string} = {}
   local contextual_names: {string: boolean} = {}
+  local snapshot_binary_keys: {string: string} = {}
+  local snapshot_binaries:
+    {string: compiler_bridge.ModuleSnapshot} = {}
+  local snapshot_binary_names: {string} = {}
+  local binary_observation_keys: {string: boolean} = {}
+  local binary_observations:
+    {string: compiler_bridge.BinaryProviderObservation} = {}
   local unstable_external = false
   for index = 1, #analysis.modules do
     local snapshot = analysis.modules[index]
     case snapshot.provenance
     when project_source then
     else
+      case snapshot.provenance
+      when dynamic_binary: binary then
+        snapshot_binary_keys[snapshot.module_name] =
+          binary_provider_key(
+            snapshot.module_name, "dynamic", binary.provider_file)
+        snapshot_binaries[snapshot.module_name] = snapshot
+        insert_name(snapshot_binary_names, snapshot.module_name)
+      when static_binary: binary then
+        snapshot_binary_keys[snapshot.module_name] =
+          binary_provider_key(
+            snapshot.module_name, "static", binary.provider_file)
+        snapshot_binaries[snapshot.module_name] = snapshot
+        insert_name(snapshot_binary_names, snapshot.module_name)
+      else
+      end
       local external? = external_candidate(
         snapshot, analysis.contextual_resolutions)
       if external ~= nil then
@@ -1394,6 +1613,14 @@ local function Service:commit_or_raise(
           candidate_fingerprint(self, analysis, external))
       end
     end
+  end
+  for index = 1, #analysis.binary_provider_observations do
+    local observation = analysis.binary_provider_observations[index]
+    local key = binary_provider_key(
+      observation.module_name, observation.kind,
+      observation.provider_file)
+    binary_observation_keys[key] = true
+    binary_observations[key] = observation
   end
   for index = 1, #analysis.contextual_resolutions do
     local observed = contextual_fingerprint(
@@ -1412,8 +1639,20 @@ local function Service:commit_or_raise(
       self.external_fingerprints[name] = observed
       insert_name(self.external_fingerprint_names, name)
       if changed then
-        self.graph:invalidate_external_change(name)
-        if self.external_resolver ~= nil then unstable_external = true end
+        local validate_first_seen = false
+        if before == nil and contextual_names[name] then
+          -- Defer both invalidation and retry until the final provider
+          -- postvalidation below. Stable discovery belongs to this exact
+          -- compiler result and is not itself an input change.
+          validate_first_seen = true
+        end
+        if before == nil and snapshot_binary_keys[name] ~= nil then
+          validate_first_seen = true
+        end
+        if not validate_first_seen then
+          self.graph:invalidate_external_change(name)
+          if self.external_resolver ~= nil then unstable_external = true end
+        end
       end
     end
   end
@@ -1450,6 +1689,40 @@ local function Service:commit_or_raise(
       true, true, self.graph:generation(), {}, {},
       self.graph:dirty_modules())
   end
+  local invalid_provider_names: {string} = {}
+  for index = 1, #analysis.provider_conflicts do
+    insert_name(invalid_provider_names, analysis.provider_conflicts[index])
+  end
+  for index = 1, #observed_names do
+    local name = observed_names[index]
+    if contextual_names[name] and
+       not contextual_provider_is_current(analysis, name) then
+      insert_name(invalid_provider_names, name)
+    end
+  end
+  for index = 1, #analysis.binary_provider_observations do
+    local observation = analysis.binary_provider_observations[index]
+    if not binary_provider_observation_is_current(observation) then
+      insert_name(invalid_provider_names, observation.module_name)
+    end
+  end
+  for index = 1, #snapshot_binary_names do
+    local name = snapshot_binary_names[index]
+    local expected? = snapshot_binary_keys[name]
+    local snapshot? = snapshot_binaries[name]
+    local observation?: compiler_bridge.BinaryProviderObservation = nil
+    if expected ~= nil then observation = binary_observations[expected] end
+    if expected == nil or not binary_observation_keys[expected] or
+       snapshot == nil or observation == nil or
+       not same_provider_identity_claim(
+         snapshot.provider_identity, observation.provider_identity) then
+      insert_name(invalid_provider_names, name)
+    end
+  end
+  for index = 1, #invalid_provider_names do
+    self.graph:invalidate_external_change(invalid_provider_names[index])
+    unstable_external = true
+  end
   if unstable_external then
     self:abort_request(request)
     return RefreshReport.new(
@@ -1469,7 +1742,15 @@ local function Service:commit_or_raise(
     if state ~= nil and token ~= nil then
       local diagnostics? = module_diagnostics[name]
       if diagnostics == nil then diagnostics = {} end
-      if #diagnostics == 0 and snapshot ~= nil then
+      if snapshot == nil and #diagnostics == 0 then
+        -- The compiler bridge emits an explicit nil-manifest snapshot for a
+        -- project invalidated transitively by another module's diagnostic.
+        -- With neither that snapshot nor an owned diagnostic there is no
+        -- evidence of a completed result for this token. Reject the malformed
+        -- analysis instead of turning an omission into a terminal failure.
+        raise Error.new(
+          name, "compiler analysis omitted the attempted project module")
+      elseif #diagnostics == 0 and snapshot ~= nil then
         local manifest? = graph_manifest(snapshot)
         if manifest ~= nil then
           case self.graph:commit_project(
@@ -1483,19 +1764,17 @@ local function Service:commit_or_raise(
           when stale then
           end
         else
-          if self.graph:abort_project_check(token) then
-            state.diagnostics = diagnostics
-            state.compiler_snapshot = snapshot
+          if self:publish_failed_project(
+              name, state, token, snapshot, diagnostics) then
             failed[#failed + 1] = name
           end
         end
       else
         -- A compiler error is a result for this exact saved revision, but does
-        -- not publish an annotated AST or manifest. Leave it dirty for a later
-        -- refresh and block only this revision in the current fixed-point run.
-        if self.graph:abort_project_check(token) then
-          state.diagnostics = diagnostics
-          if snapshot ~= nil then state.compiler_snapshot = snapshot end
+        -- not publish an annotated AST or manifest. Record it as current and
+        -- retry only after source/dependency/provider/header invalidation.
+        if self:publish_failed_project(
+            name, state, token, snapshot, diagnostics) then
           failed[#failed + 1] = name
         end
       end
@@ -1626,7 +1905,6 @@ local function Service:prune_unreachable_externals()
 end
 
 local function Service:analyze_to_fixed_point(): (RefreshReport?, Error?)
-  local blocked_revisions: {string: integer} = {}
   local committed: {string} = {}
   local failed: {string} = {}
   local analyzed = false
@@ -1634,7 +1912,7 @@ local function Service:analyze_to_fixed_point(): (RefreshReport?, Error?)
   local iteration_count = 0
 
   while true do
-    local request? = self:prepare_work_avoiding(blocked_revisions)
+    local request? = self:prepare_work()
     if request == nil then break end
     iteration_count = iteration_count + 1
     local report?, analysis_error? = self:analyze(request)
@@ -1650,8 +1928,6 @@ local function Service:analyze_to_fixed_point(): (RefreshReport?, Error?)
     for index = 1, #report.failed_modules do
       local name = report.failed_modules[index]
       insert_name(failed, name)
-      local token? = request_token(request, name)
-      if token ~= nil then blocked_revisions[name] = token.revision end
     end
   end
 
@@ -1767,9 +2043,15 @@ function Service:latest(): Snapshot
   for index = 1, #self.project_names do
     local name = self.project_names[index]
     local state = self.projects[name]
+    local analysis_state = ProjectAnalysisState.clean()
+    if self.graph:is_dirty(name) then
+      analysis_state = ProjectAnalysisState.dirty()
+    elseif self.graph:is_failed(name) then
+      analysis_state = ProjectAnalysisState.failed()
+    end
     projects[index] = ProjectModule.new(
       name, state.source_files, state.compiler_snapshot,
-      copy_diagnostics(state.diagnostics), self.graph:is_dirty(name))
+      copy_diagnostics(state.diagnostics), analysis_state)
   end
   local externals: {ExternalModule} = {}
   for index = 1, #self.external_names do
