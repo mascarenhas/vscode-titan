@@ -18,7 +18,7 @@ The executable statically selects the Titan standard-library provider, which
 carries the embedded Lua interpreter and configured native dependencies. The
 compiler itself remains ordinary Lua code: the server's embedded Lua discovers
 and loads the installed compiler modules through `package.path` with
-`titan.lua.require`. Packaging and diagnostics must keep those two facts
+`lua.require`. Packaging and diagnostics must keep those two facts
 distinct.
 
 ## V1 boundaries

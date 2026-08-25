@@ -28,7 +28,7 @@ static Titan standard-library provider so the server carries the Titan runtime,
 embedded Lua, and configured native dependencies.
 
 The compiler is different: it remains external Lua source and must load normally
-from the embedded Lua state's `package.path` through `titan.lua.require`.
+from the embedded Lua state's `package.path` through `lua.require`.
 Export the embedded Lua C API from the executable so compiler dependencies on
 `package.cpath` bind to the same state; on ELF builds this requires the
 executable-export linker flag. Keep that dynamic boundary narrow:

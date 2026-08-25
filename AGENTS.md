@@ -14,7 +14,7 @@ Also read the matching specialist skill when the work touches it:
 
 - `titan-tester` for Titan tests;
 - `titan-async` for tasks, cancellation, files, watchers, or runtime ownership;
-- `titan-ffi` for `titan.lua`, compiler Lua modules, or C boundaries;
+- `titan-ffi` for `import "lua"`, compiler Lua modules, or C boundaries;
 - `titan-pegs` for protocol or source parsers.
 
 Use the repository-local `.agents/skills/vscode-titan-development/SKILL.md` for
@@ -29,7 +29,7 @@ project workflow.
   Titan's static-provider path.
 - The Titan compiler is not embedded in that executable. The embedded Lua loads
   the ordinary compiler Lua modules through `package.path` and
-  `titan.lua.require`.
+  `lua.require`.
 - The executable must export the embedded Lua C API so ordinary compiler
   dependencies loaded through `package.cpath` can bind to that same Lua state.
 - Stdout is exclusively for LSP framing. Diagnostics and debug logs go to
