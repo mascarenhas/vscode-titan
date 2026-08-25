@@ -20,6 +20,7 @@ record Occurrence
   const span: source_text.Span
   const byte_span: source_text.ByteSpan
   const is_local: boolean
+  const visibility: bridge.DeclarationVisibility
   const type_info: bridge.TypeInfo?
   const callable_signature: bridge.CallableSignature?
   const summary_id: integer?
@@ -119,6 +120,15 @@ local function optional_summary_key(summary_id: integer?): integer
   return summary_id
 end
 
+local function visibility_rank(
+    visibility: bridge.DeclarationVisibility): integer
+  case visibility
+  when block then return 0
+  when module then return 1
+  when exported then return 2
+  end
+end
+
 local function occurrence_less(left: Occurrence,
                                right: Occurrence): boolean
   if left.filename ~= right.filename then
@@ -141,6 +151,11 @@ local function occurrence_less(left: Occurrence,
   end
   if left.name ~= right.name then return left.name < right.name end
   if left.is_local ~= right.is_local then return not left.is_local end
+  local left_visibility = visibility_rank(left.visibility)
+  local right_visibility = visibility_rank(right.visibility)
+  if left_visibility ~= right_visibility then
+    return left_visibility < right_visibility
+  end
   local left_type = optional_type_key(left.type_info)
   local right_type = optional_type_key(right.type_info)
   if left_type ~= right_type then return left_type < right_type end
@@ -163,6 +178,8 @@ local function same_occurrence(left: Occurrence,
          left.byte_span.start == right.byte_span.start and
          left.byte_span.finish == right.byte_span.finish and
          left.is_local == right.is_local and
+         visibility_rank(left.visibility) ==
+           visibility_rank(right.visibility) and
          same_type(left.type_info, right.type_info) and
          optional_signature_key(left.callable_signature) ==
            optional_signature_key(right.callable_signature) and
@@ -490,7 +507,8 @@ local function append_snapshot_occurrences(
       target[#target + 1] = Occurrence.new(
         SymbolId.new(symbol.declaration_id), snapshot.module_name,
         symbol.location.filename, symbol.name, symbol.role, span, bytes,
-        symbol.is_local, symbol.type_info, symbol.callable_signature,
+        symbol.is_local, symbol.visibility, symbol.type_info,
+        symbol.callable_signature,
         summary_id)
     end
   end

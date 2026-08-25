@@ -58,13 +58,27 @@ union CommitResult
   stale
 end
 
+-- One explicit state prevents a failed diagnostic result from masquerading as
+-- dirty work while still distinguishing an in-flight check from an available
+-- retry. The revision remains the exact invalidation identity carried by a
+-- CheckToken.
+local union ProjectAnalysisState
+  dirty
+  checking
+  clean
+  failed
+end
+
 local record ProjectEntry<A>
   stamps: {FileStamp}
   manifest: Manifest?
   ast: A?
   imports: {ImportEdge}
-  dirty: boolean
-  checking: boolean
+  analysis_state: ProjectAnalysisState
+  -- Retain failure lineage while an input-triggered retry moves through
+  -- dirty/checking. A successful retry whose manifest is unchanged must still
+  -- wake failed importers that could not compile against the failed provider.
+  recovering_from_failure: boolean
   revision: integer
 end
 
@@ -212,6 +226,34 @@ local function same_manifest(left: Manifest, right: Manifest): boolean
          left.source_digest == right.source_digest
 end
 
+local function state_is_dirty(state: ProjectAnalysisState): boolean
+  case state
+  when dirty then return true
+  else return false
+  end
+end
+
+local function state_is_checking(state: ProjectAnalysisState): boolean
+  case state
+  when checking then return true
+  else return false
+  end
+end
+
+local function state_is_clean(state: ProjectAnalysisState): boolean
+  case state
+  when clean then return true
+  else return false
+  end
+end
+
+local function state_is_failed(state: ProjectAnalysisState): boolean
+  case state
+  when failed then return true
+  else return false
+  end
+end
+
 local function same_imports(left: {ImportEdge}, right: {ImportEdge}): boolean
   if #left ~= #right then return false end
   for index = 1, #left do
@@ -305,14 +347,17 @@ end
 
 local function Graph:advance_generation()
   self.current_generation = self.current_generation + 1
-  -- Every outstanding token names an older disk snapshot. Make dirty modules
-  -- immediately restartable; the generation comparison rejects old results.
+  -- Every outstanding token names an older disk snapshot. Make in-flight
+  -- modules immediately restartable; the generation comparison rejects old
+  -- results. A failed result for an unchanged module remains current.
   for index = 1, #self.names do
     local entry? = self.modules[self.names[index]]
     if entry ~= nil then
       case entry
       when project: project then
-        if project.dirty then project.checking = false end
+        if state_is_checking(project.analysis_state) then
+          project.analysis_state = ProjectAnalysisState.dirty()
+        end
       else
       end
     end
@@ -400,17 +445,10 @@ local function Graph:dirty_project(module_name: string): boolean
   if entry == nil then return false end
   case entry
   when project: project then
-    if project.dirty then
-      -- A second invalidation is still a new work revision. This matters after
-      -- a failed check has been blocked for the current refresh: a dependency
-      -- change must make that module eligible again without requiring another
-      -- filesystem generation.
-      project.revision = project.revision + 1
-      project.checking = false
-      return true
-    end
-    project.dirty = true
-    project.checking = false
+    -- Every invalidation is a new work revision, including dirty -> dirty and
+    -- failed -> dirty. The latter makes a current diagnostic result eligible
+    -- only when its source or one of its observed dependencies changes.
+    project.analysis_state = ProjectAnalysisState.dirty()
     project.revision = project.revision + 1
     return true
   else
@@ -504,6 +542,63 @@ local function Graph:invalidate_importers(
   return invalidated
 end
 
+-- A dependency's failed -> clean transition is itself relevant to importers
+-- which are still failed, even when the recovered manifest is byte-identical
+-- to its last successful one. Clean importers retain the ordinary
+-- visibility/manifest fast path. As with external invalidation, walk through
+-- metadata-only external nodes until a failed project root is reached.
+local function Graph:invalidate_failed_importers(
+    module_name: string, already_invalidated: {string: boolean}): {string}
+  local invalidated: {string} = {}
+  local pending: {string} = {}
+  local queued: {string: boolean} = {}
+  local visited_projects: {string: boolean} = {}
+
+  local invalidate_or_enqueue: (string) -> () = function (importer: string)
+    local entry? = self.modules[importer]
+    if entry == nil then return end
+    case entry
+    when project: project then
+      if visited_projects[importer] then return end
+      visited_projects[importer] = true
+      if not already_invalidated[importer] and
+         state_is_failed(project.analysis_state) and
+         self:dirty_project(importer) then
+        add_sorted_name(invalidated, importer)
+      end
+    when external_source then
+      if not queued[importer] then
+        queued[importer] = true
+        pending[#pending + 1] = importer
+      end
+    when external_binary then
+      if not queued[importer] then
+        queued[importer] = true
+        pending[#pending + 1] = importer
+      end
+    end
+  end
+
+  local direct? = self.reverse[module_name]
+  if direct ~= nil then
+    for index = 1, #direct do
+      invalidate_or_enqueue(direct[index].importer)
+    end
+  end
+  local next_pending = 1
+  while next_pending <= #pending do
+    local external_name = pending[next_pending]
+    next_pending = next_pending + 1
+    local reverse? = self.reverse[external_name]
+    if reverse ~= nil then
+      for index = 1, #reverse do
+        invalidate_or_enqueue(reverse[index].importer)
+      end
+    end
+  end
+  return invalidated
+end
+
 function Graph:module_names(): {string}
   local result: {string} = {}
   for index = 1, #self.names do result[index] = self.names[index] end
@@ -554,7 +649,16 @@ function Graph:is_dirty(module_name: string): boolean
   local entry? = self.modules[module_name]
   if entry == nil then return false end
   case entry
-  when project: project then return project.dirty
+  when project: project then return state_is_dirty(project.analysis_state)
+  else return false
+  end
+end
+
+function Graph:is_failed(module_name: string): boolean
+  local entry? = self.modules[module_name]
+  if entry == nil then return false end
+  case entry
+  when project: project then return state_is_failed(project.analysis_state)
   else return false
   end
 end
@@ -575,7 +679,7 @@ function Graph:project_ast(module_name: string): A?
   if entry == nil then return nil end
   case entry
   when project: project then
-    if project.dirty then return nil end
+    if not state_is_clean(project.analysis_state) then return nil end
     return project.ast
   else
     return nil
@@ -607,7 +711,7 @@ function Graph:observe_project(module_name: string,
     self:add_name(module_name)
   end
   self.modules[module_name] = Entry<A>.project(ProjectEntry<A>.new(
-    normalized, nil, nil, {}, true, false, 1))
+    normalized, nil, nil, {}, ProjectAnalysisState.dirty(), false, 1))
   local invalidated = self:invalidate_importers(
     module_name, nil, nil, true, {})
   return ChangeReport.new(true, self.current_generation, invalidated)
@@ -633,8 +737,8 @@ function Graph:begin_project_check(module_name: string): CheckToken?
   if entry == nil then return nil end
   case entry
   when project: project then
-    if not project.dirty or project.checking then return nil end
-    project.checking = true
+    if not state_is_dirty(project.analysis_state) then return nil end
+    project.analysis_state = ProjectAnalysisState.checking()
     return CheckToken.new(
       module_name, self.current_generation, project.revision)
   else
@@ -642,20 +746,46 @@ function Graph:begin_project_check(module_name: string): CheckToken?
   end
 end
 
--- Abandon an analysis result without changing the saved revision. This is
--- used for compiler failures and exceptions so a later refresh can retry the
--- same dirty input, while an obsolete token cannot clear a newer check.
+-- Abandon an analysis result without changing the saved revision. Exceptions
+-- and cancelled work remain retryable; an exact compiler diagnostic uses
+-- fail_project_check instead and becomes current for this revision.
 function Graph:abort_project_check(token: CheckToken): boolean
   if token.generation ~= self.current_generation then return false end
   local entry? = self.modules[token.module_name]
   if entry == nil then return false end
   case entry
   when project: project then
-    if not project.dirty or not project.checking or
+    if not state_is_checking(project.analysis_state) or
        project.revision ~= token.revision then
       return false
     end
-    project.checking = false
+    project.analysis_state = ProjectAnalysisState.dirty()
+    return true
+  else
+    return false
+  end
+end
+
+-- Accept an exact diagnostic result for the current revision. Its observed
+-- imports replace the last known dependency frame so later dependency changes
+-- can schedule a retry. No AST is exposed, while the previous successful
+-- manifest remains available for recovery-time propagation.
+function Graph:fail_project_check(token: CheckToken,
+                                  imports: {ImportEdge}): boolean
+  if token.generation ~= self.current_generation then return false end
+  local entry? = self.modules[token.module_name]
+  if entry == nil then return false end
+  case entry
+  when project: project then
+    if not state_is_checking(project.analysis_state) or
+       project.revision ~= token.revision then
+      return false
+    end
+    self:set_imports(
+      token.module_name, entry, normalize_imports(imports))
+    project.ast = nil
+    project.analysis_state = ProjectAnalysisState.failed()
+    project.recovering_from_failure = true
     return true
   else
     return false
@@ -671,20 +801,28 @@ function Graph:commit_project(token: CheckToken, manifest: Manifest,
   if entry == nil then return CommitResult.stale() end
   case entry
   when project: project then
-    if not project.dirty or not project.checking or
+    if not state_is_checking(project.analysis_state) or
        project.revision ~= token.revision then
       return CommitResult.stale()
     end
 
+    local recovered = project.recovering_from_failure
     local old_manifest? = project.manifest
     local normalized_imports = normalize_imports(imports)
     self:set_imports(token.module_name, entry, normalized_imports)
     project.manifest = copy_manifest(manifest)
     project.ast = ast
-    project.dirty = false
-    project.checking = false
+    project.analysis_state = ProjectAnalysisState.clean()
+    project.recovering_from_failure = false
     local invalidated = self:invalidate_importers(
       token.module_name, old_manifest, project.manifest, false, {})
+    if recovered then
+      local recovery_invalidated = self:invalidate_failed_importers(
+        token.module_name, name_set(invalidated))
+      for index = 1, #recovery_invalidated do
+        add_sorted_name(invalidated, recovery_invalidated[index])
+      end
+    end
     return CommitResult.accepted(CommitAccepted.new(invalidated))
   else
     return CommitResult.stale()

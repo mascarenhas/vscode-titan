@@ -27,14 +27,32 @@ local function occurrence(filename: string, line: integer,
                           is_local: boolean,
                           type_info: bridge.TypeInfo?,
                           callable_signature: bridge.CallableSignature?,
-                          summary_id: integer?):
+                          summary_id: integer?,
+                          visibility: bridge.DeclarationVisibility?):
     bridge.SymbolOccurrence
   local start = location(filename, line, start_column)
+  local resolved_visibility? = visibility
+  if resolved_visibility == nil then
+    if is_local then
+      resolved_visibility = bridge.DeclarationVisibility.block()
+    else
+      resolved_visibility = bridge.DeclarationVisibility.exported()
+    end
+  end
   return bridge.SymbolOccurrence.new(
     name, declaration_id, role, start,
     bridge.SourceSpan.new(
       start, location(filename, line, finish_column)),
-    is_local, type_info, callable_signature, summary_id)
+    is_local, resolved_visibility, type_info, callable_signature, summary_id)
+end
+
+local function visibility_name(
+    visibility: bridge.DeclarationVisibility): string
+  case visibility
+  when block then return "block"
+  when module then return "module"
+  when exported then return "exported"
+  end
 end
 
 local function node(id: integer, tag: string, kind: bridge.NodeKind,
@@ -76,7 +94,7 @@ local function snapshot(module_name: string, main_file: string,
     module_name,
     bridge.Provenance.project_source(
       bridge.SourceProvenance.new(main_file, source_files)),
-    nil, nodes, symbols, {}, {}, hover_summaries)
+    nil, nodes, symbols, {}, {}, hover_summaries, nil)
 end
 
 local function external_snapshot(module_name: string, filename: string,
@@ -87,7 +105,7 @@ local function external_snapshot(module_name: string, filename: string,
     module_name,
     bridge.Provenance.external_source(
       bridge.SourceProvenance.new(filename, {filename})),
-    nil, nodes, symbols, {}, {})
+    nil, nodes, symbols, {}, {}, nil, nil)
 end
 
 local function find_contents(projects: {bridge.ProjectModule},
@@ -259,11 +277,11 @@ function test_semantic_features_hover_preserves_compiler_type_views(
               hover.original_type ~= nil and
               hover.original_type.display == "integer" and
               hover.coerced_type ~= nil and
-              hover.local_declaration == true,
+              visibility_name(hover.visibility) == "block",
               "hover lost typed compiler metadata or local status")
   test.assert(hover:markdown() ==
     "- Type: `float`\n" ..
-    "- Declaration: local\n",
+    "- Visibility: block\n",
     "hover markdown repeated equivalent declared and inferred types")
 end
 
@@ -331,7 +349,7 @@ function test_semantic_features_hover_reads_unnamed_adjustment_ancestors(
   test.assert(hover:markdown() ==
                 "- Type: `integer`\n" ..
                 "- Cast to: `float`\n" ..
-                "- Declaration: local\n",
+                "- Visibility: block\n",
               "hover did not render the distinct enclosing cast target")
 end
 
@@ -358,13 +376,13 @@ function test_semantic_features_hover_prefers_named_callable_signatures(
   local callable? = model:hover(filename, source_text.Position.new(0, 11))
   test.assert(callable ~= nil and callable:markdown() ==
                 "- Signature: `sample.render(value: integer): string`\n" ..
-                "- Declaration: non-local\n",
+                "- Visibility: exported\n",
               "named function hover fell back to a bare function type")
 
   local variable? = model:hover(filename, source_text.Position.new(2, 8))
   test.assert(variable ~= nil and variable:markdown() ==
                 "- Type: `(integer) -> string`\n" ..
-                "- Declaration: local\n",
+                "- Visibility: block\n",
               "ordinary function-valued variable did not keep its bare type")
 end
 
@@ -398,7 +416,7 @@ function test_semantic_features_hover_appends_cached_aggregate_summary(
                 "- `value: integer`\n\n" ..
                 "Methods\n\n" ..
                 "- `sample.Box<integer>:get(): integer`\n\n" ..
-                "- Declaration: non-local\n",
+                "- Visibility: exported\n",
               "hover rebuilt or failed to append its cached summary")
 end
 
@@ -429,9 +447,11 @@ function test_semantic_features_hover_reports_imported_terms(
          nil, nil, nil),
   }, {
     occurrence(filename, 1, 7, 11, "math", import_symbol,
-               bridge.OccurrenceRole.import_alias(), true, module_type),
+               bridge.OccurrenceRole.import_alias(), true, module_type,
+               nil, nil, bridge.DeclarationVisibility.module()),
     occurrence(filename, 3, 10, 14, "math", import_symbol,
-               bridge.OccurrenceRole.reference(), true, module_type),
+               bridge.OccurrenceRole.reference(), true, module_type,
+               nil, nil, bridge.DeclarationVisibility.module()),
     occurrence(filename, 3, 15, 17, "pi", member_symbol,
                bridge.OccurrenceRole.reference(), false, float_type),
   })})
@@ -440,25 +460,25 @@ function test_semantic_features_hover_reports_imported_terms(
   test.assert(alias ~= nil and alias.inferred_type ~= nil and
               alias.inferred_type.display == "module titan.math" and
               alias.declared_type ~= nil and
-              alias.local_declaration == true,
+              visibility_name(alias.visibility) == "module",
               "hover lost the compiler type or localness of an import alias")
 
   local alias_use? = model:hover(filename, source_text.Position.new(2, 10))
   test.assert(alias_use ~= nil and alias_use.inferred_type ~= nil and
               alias_use.inferred_type.display == "module titan.math" and
-              alias_use.local_declaration == true,
+              visibility_name(alias_use.visibility) == "module",
               "hover lost the compiler type or localness of an imported name")
 
   local member? = model:hover(filename, source_text.Position.new(2, 15))
   test.assert(member ~= nil and member.inferred_type ~= nil and
               member.inferred_type.display == "float" and
-              member.local_declaration == false and
+              visibility_name(member.visibility) == "exported" and
               member.range.start.character == 14 and
               member.range.finish.character == 16,
               "hover lost the type, localness, or range of an imported term")
   test.assert(member:markdown() ==
                 "- Type: `float`\n" ..
-                "- Declaration: non-local\n",
+                "- Visibility: exported\n",
               "imported-term hover did not produce stable Markdown")
 end
 
@@ -718,7 +738,7 @@ function test_semantic_features_rename_requires_successful_compiler_preflight(
       occurrence("/workspace/use.titan", 1, 14, 17, "sum", renamed,
                  bridge.OccurrenceRole.reference(), false, nil),
     }),
-  }, {})
+  }, {}, {}, {})
   local verified?, verification_error? = candidate:preflight(checked)
   test.assert(verification_error == nil and verified ~= nil,
               "consistent compiler bindings did not verify the rename")
@@ -765,7 +785,7 @@ function test_semantic_features_rename_rejects_invalid_names_and_capture(
       occurrence("/workspace/use.titan", 1, 14, 17, "sum", exported,
                  bridge.OccurrenceRole.reference(), false, nil),
     }),
-  }, {})
+  }, {}, {}, {})
   local verified?, capture_error? = candidate:preflight(split)
   test.assert(verified == nil and capture_error ~= nil and
               strings.find(capture_error.message, "capture") ~= nil,
@@ -774,7 +794,7 @@ function test_semantic_features_rename_rejects_invalid_names_and_capture(
   local diagnostics = bridge.Analysis.new("pkg", {
     bridge.Diagnostic.new(
       bridge.DiagnosticKind.type_error(), "duplicate declaration", nil),
-  }, {}, {})
+  }, {}, {}, {}, {})
   local diagnostic_result?, diagnostic_error? =
     candidate:preflight(diagnostics)
   test.assert(diagnostic_result == nil and diagnostic_error ~= nil,

@@ -1036,7 +1036,7 @@ suite("Titan extension", () => {
       ""
     ].join(";");
     const luaCPath = [
-      path.join(titanPrefix, "lib", "titan", "0.26", "?.so"),
+      path.join(titanPrefix, "lib", "titan", "0.6", "?.so"),
       path.join(titanPrefix, "lib", "lua", "5.5", "?.so"),
       ""
     ].join(";");

@@ -35,12 +35,13 @@ terminal `;;`, for example:
 
 ```sh
 export LUA_PATH='/opt/titan/share/lua/5.5/?.lua;/opt/titan/share/lua/5.5/?/init.lua;;'
-export LUA_CPATH='/opt/titan/lib/titan/0.26/?.so;/opt/titan/lib/lua/5.5/?.so;;'
+export LUA_CPATH='/opt/titan/lib/titan/0.6/?.so;/opt/titan/lib/lua/5.5/?.so;;'
 ```
 
-Replace `0.26` and `5.5` with the ABI and Lua versions used to build the
-server. The Titan ABI entry is also how the server discovers the default
-binary-module root; the Lua entry supplies native compiler dependencies.
+Replace `0.6` with the installed Titan library directory version and `5.5`
+with the Lua ABI version used to build the server. The Titan library-versioned
+entry is also how the server discovers the default binary-module root; the Lua
+entry supplies native compiler dependencies.
 
 ## Install the repository plugin
 

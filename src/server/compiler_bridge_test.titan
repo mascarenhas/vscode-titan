@@ -8,7 +8,7 @@ local source_text = import "server.source_text"
 local test_runtime = import "server.test_runtime"
 
 local type EmptyFunction = () -> ()
-local type FixtureInstaller = (string) -> value
+local type FixtureInstaller = (string, string?) -> value
 
 local function run_bridge(body: EmptyFunction)
   do
@@ -24,7 +24,7 @@ end
 
 local function new_fixture_installer(): FixtureInstaller
   return lua.load([==[
-return function(mode)
+return function(mode, contextual_provider_file)
   local names = {
     "titan-compiler.parser",
     "titan-compiler.checker",
@@ -65,19 +65,45 @@ return function(mode)
     end,
   }
   local driver = {
-    TITAN_VER = mode == "incompatible" and "99.0" or "0.26",
+    TITAN_ABI_VERSION = mode == "incompatible" and "99" or "2",
+    TITAN_VERSION = "0.6.0",
+    TITAN_LIBRARY_VERSION = "0.6",
     LANGUAGE_SERVER_API_VERSION =
       mode == "wrong-language-server-api" and 2 or 3,
     TITAN_SOURCE_PATH = ".",
     TITAN_BIN_PATH = "",
-    INSTALL_PATHS = { titan_bin = "/opt/titan/lib/titan/0.26" },
+    INSTALL_PATHS = { titan_bin = "/opt/titan/lib/titan/0.6" },
     imported = {},
   }
+  if mode == "missing-abi" then driver.TITAN_ABI_VERSION = nil end
   if mode == "older-same-abi" then
     driver.LANGUAGE_SERVER_API_VERSION = nil
   end
+  local c_header_analysis_count = 0
+  local c_header_analyses = {}
+  if mode ~= "same-api-missing-c-header-analysis" then
+    driver.new_c_header_analysis = function()
+      c_header_analysis_count = c_header_analysis_count + 1
+      if mode == "c-header-analysis-lifetime" then
+        assert(c_header_analysis_count <= 2)
+      elseif mode == "bad-c-header-analysis" then
+        return 42
+      end
+      local analysis = { id = c_header_analysis_count }
+      c_header_analyses[c_header_analysis_count] = analysis
+      return analysis
+    end
+  end
+  local c_header_context_count = 0
   driver.new_resolver_context = function(options)
     assert(type(options.io) == "userdata")
+    if mode == "c-header-analysis-lifetime" then
+      c_header_context_count = c_header_context_count + 1
+      local expected = c_header_context_count <= 2 and 1 or 2
+      assert(options.c_header_analysis ~= nil)
+      assert(options.c_header_analysis == c_header_analyses[expected])
+      assert(options.c_header_analysis.id == expected)
+    end
     return {
       options = options,
       io = options.io,
@@ -85,13 +111,23 @@ return function(mode)
       checked_source_modules = {},
     }
   end
+  local contextual_finalize_count = 0
+  local binary_load_count = 0
   driver.finalize_resolver_context = function(context)
-    if mode == "contextual-resolution" then
+    if mode == "contextual-resolution" or
+       mode == "contextual-resolution-once" then
+      contextual_finalize_count = contextual_finalize_count + 1
+      local provider_file = assert(contextual_provider_file)
+      if mode ~= "contextual-resolution-once" or
+         contextual_finalize_count == 1 then
+        local metadata, metadata_error = context.io:lstat(provider_file)
+        assert(metadata and metadata_error == nil)
+      end
       context.contextual_resolutions["fixture.facade\0fixture.owner"] = {
         owner = "fixture.owner",
         exposer = "fixture.facade",
         kind = "static",
-        provider_file = "/binary/fixture-owner.a",
+        provider_file = provider_file,
         ordinary_lookup = true,
       }
     end
@@ -375,17 +411,64 @@ return function(mode)
         source_files = { "/external/main.titan", "/external/part.titan" },
         c_header_dependencies = {},
       }
-      if mode == "binary-manifest" then
-        driver.imported["fixture.binary"] = {
-          kind = "dynamic",
-          type = module_type("fixture.binary"),
-          filename = "/binary/fixture.so",
+      if mode == "dependency-diagnostic" then
+        driver.imported[name].source_manifest = nil
+        driver.imported["fixture.dependency"] = {
+          kind = "source",
+          ast = ast,
+          type = module_type("fixture.dependency"),
+          filename = "/workspace/dependency.titan",
+          source_files = { "/workspace/dependency.titan" },
           c_header_dependencies = {},
         }
+      end
+      if mode == "binary-manifest" or
+         mode == "binary-provider-switch" or
+         mode == "binary-provider-to-source" then
+        binary_load_count = binary_load_count + 1
+        local provider_file = contextual_provider_file or
+          "/binary/fixture.so"
+        if mode == "binary-provider-switch" and binary_load_count > 1 then
+          provider_file = provider_file .. ".second"
+        end
+        local source_provider =
+          mode == "binary-provider-to-source" and binary_load_count > 1
+        if contextual_provider_file and not source_provider then
+          local metadata, metadata_error =
+            assert(options.context).io:lstat(provider_file)
+          assert(metadata and metadata_error == nil)
+        end
+        if source_provider then
+          driver.imported["fixture.binary"] = {
+            kind = "source",
+            ast = {},
+            type = module_type("fixture.binary"),
+            source_manifest = source_manifest("fixture.binary"),
+            filename = provider_file ..
+              (mode == "binary-provider-to-source" and ".second" or ""),
+            source_files = {provider_file ..
+              (mode == "binary-provider-to-source" and ".second" or "")},
+            c_header_dependencies = {},
+          }
+        else
+          driver.imported["fixture.binary"] = {
+            kind = "dynamic",
+            type = module_type("fixture.binary"),
+            filename = provider_file,
+            c_header_dependencies = {},
+          }
+        end
       end
       local context = assert(options.context)
       context.checked_source_modules[
         #context.checked_source_modules + 1] = name
+      if mode == "dependency-diagnostic" then
+        context.checked_source_modules[
+          #context.checked_source_modules + 1] = "fixture.dependency"
+        return true, module_type(name), {
+          "/workspace/dependency.titan:1:1: unknown variable 'missing'",
+        }, {}
+      end
       if mode == "progress" then
         -- The real compiler reports every completed source module. Exercise
         -- both noise classes the bridge must exclude from saved-file counts:
@@ -416,8 +499,10 @@ end
 ]==], "=compiler_bridge_fixture", nil)() as FixtureInstaller
 end
 
-local function with_fixture(mode: string, body: EmptyFunction)
-  local restore = new_fixture_installer()(mode) as EmptyFunction
+local function with_fixture(mode: string, body: EmptyFunction,
+                            contextual_provider_file: string?)
+  local restore = new_fixture_installer()(
+    mode, contextual_provider_file) as EmptyFunction
   defer restore()
   body()
 catch
@@ -448,6 +533,7 @@ end
 function test_compiler_bridge_rejects_missing_incompatible_and_malformed_modules(
     _context: test.Context)
   expect_bridge_error("missing-parser", "cannot load compiler module")
+  expect_bridge_error("missing-abi", "TITAN_ABI_VERSION")
   expect_bridge_error("incompatible", "incompatible Titan compiler ABI")
   expect_bridge_error("older-same-abi",
                       "matching Titan ABI alone is insufficient")
@@ -457,6 +543,8 @@ function test_compiler_bridge_rejects_missing_incompatible_and_malformed_modules
                       "'restat_c_header_dependencies' must be a function, " ..
                       "found nil. Install a Titan compiler implementing " ..
                       "LANGUAGE_SERVER_API_VERSION 3")
+  expect_bridge_error("same-api-missing-c-header-analysis",
+                      "'new_c_header_analysis' must be a function, found nil")
   expect_bridge_error("malformed-parser", "'parse' must be a function")
 end
 
@@ -487,6 +575,50 @@ function test_compiler_bridge_rejects_malformed_compiler_results(
                   "bad diagnostics result raised an untyped error")
     end
     test.assert(rejected, "non-table compiler diagnostics were accepted")
+  end)
+  with_fixture("bad-c-header-analysis", function ()
+    local compiler = bridge.load()
+    local rejected = false
+    do
+      compiler:analyze("fixture", {bridge.ProjectModule.new(
+        "fixture", {bridge.SourceFile.new("/workspace/fixture.titan", "")})})
+    catch
+      rejected = true
+      test.assert(error is bridge.BridgeError,
+                  "bad C-header analysis raised an untyped error")
+      local failure = error as bridge.BridgeError
+      test.assert(strings.find(
+                    failure.message,
+                    "driver.new_c_header_analysis returned number " ..
+                    "instead of a table") ~= nil,
+                  failure.message)
+    end
+    test.assert(rejected, "non-table C-header analysis was accepted")
+  end)
+end
+
+function test_compiler_bridge_scopes_one_c_header_analysis_to_all_root_attempts(
+    _context: test.Context)
+  with_fixture("c-header-analysis-lifetime", function ()
+    local compiler = bridge.load()
+    local first = compiler:analyze_incremental({
+      bridge.ProjectModule.new("fixture.first", {
+        bridge.SourceFile.new("/workspace/first.titan", ""),
+      }),
+      bridge.ProjectModule.new("fixture.second", {
+        bridge.SourceFile.new("/workspace/second.titan", ""),
+      }),
+    }, {"fixture.first", "fixture.second"}, {})
+    test.assert(#first.modules >= 2,
+                "multi-root analysis did not run both fixture roots")
+
+    local second = compiler:analyze_incremental({
+      bridge.ProjectModule.new("fixture.first", {
+        bridge.SourceFile.new("/workspace/first.titan", ""),
+      }),
+    }, {"fixture.first"}, {})
+    test.assert(#second.modules >= 1,
+                "second analysis did not run its fixture root")
   end)
 end
 
@@ -520,24 +652,150 @@ function test_compiler_bridge_rejects_missing_empty_and_wrong_source_manifests(
     "wrong-source-manifest", "source manifest for 'fixture' must be a string")
 end
 
+function test_compiler_bridge_accepts_missing_manifest_after_dependency_error(
+    _context: test.Context)
+  with_fixture("dependency-diagnostic", function ()
+    local compiler = bridge.load()
+    local analysis = compiler:analyze("fixture", {
+      bridge.ProjectModule.new("fixture", {bridge.SourceFile.new(
+        "/workspace/fixture.titan", "saved fixture")}),
+      bridge.ProjectModule.new("fixture.dependency", {bridge.SourceFile.new(
+        "/workspace/dependency.titan", "invalid dependency")}),
+    })
+    local root? = analysis:find_module("fixture")
+    local dependency? = analysis:find_module("fixture.dependency")
+    test.assert(#analysis.diagnostics == 1 and root ~= nil and
+                dependency ~= nil,
+                "dependency error did not produce failed project snapshots")
+    test.assert(root.manifest == nil and dependency.manifest == nil,
+                "failed dependency closure acquired a valid manifest")
+    test.assert(not compiler:has_project_ast("fixture") and
+                not compiler:has_project_ast("fixture.dependency"),
+                "failed dependency closure entered the incremental cache")
+  end)
+end
+
 function test_compiler_bridge_keeps_source_manifests_off_binary_snapshots(
     _context: test.Context)
-  with_fixture("binary-manifest", function ()
-    local compiler = bridge.load()
-    local analysis = compiler:analyze("fixture", {bridge.ProjectModule.new(
-      "fixture", {bridge.SourceFile.new(
-        "/workspace/fixture.titan", "saved fixture")})})
-    local binary? = analysis:find_module("fixture.binary")
-    test.assert(binary ~= nil and binary.manifest ~= nil and
-                binary.manifest.source_serialized == nil,
-                "binary snapshot acquired a source-visible manifest")
-    case binary.provenance
-    when dynamic_binary: provenance then
-      test.assert(provenance.provider_file == "/binary/fixture.so",
-                  "binary manifest fixture lost its provider provenance")
-    else
-      test.assert(false, "binary manifest fixture used source provenance")
+  run_bridge(function ()
+    local provider = fs.tmpname()
+    defer fs.unlink(provider)
+    fs.write_file(provider, "fixture binary provider")
+    with_fixture("binary-manifest", function ()
+      local compiler = bridge.load()
+      local analysis = compiler:analyze("fixture", {
+        bridge.ProjectModule.new("fixture", {bridge.SourceFile.new(
+          "/workspace/fixture.titan", "saved fixture")}),
+      })
+      local binary? = analysis:find_module("fixture.binary")
+      test.assert(binary ~= nil and binary.manifest ~= nil and
+                  binary.manifest.source_serialized == nil and
+                  binary.provider_identity ~= nil and
+                  binary.provider_identity.path == provider and
+                  binary.provider_identity.size ==
+                    #"fixture binary provider",
+                  "binary snapshot lost its compiler-observed provider")
+      case binary.provenance
+      when dynamic_binary: provenance then
+        test.assert(provenance.provider_file == provider,
+                    "binary manifest fixture lost its provider provenance")
+      else
+        test.assert(false, "binary manifest fixture used source provenance")
+      end
+    end, provider)
+  end)
+end
+
+function test_compiler_bridge_rejects_mixed_binary_providers_across_attempts(
+    _context: test.Context)
+  run_bridge(function ()
+    local first_provider = fs.tmpname()
+    local second_provider = first_provider .. ".second"
+    defer do
+      fs.unlink(second_provider)
+      fs.unlink(first_provider)
     end
+    fs.write_file(first_provider, "first provider")
+    fs.write_file(second_provider, "fallback provider")
+    with_fixture("binary-provider-switch", function ()
+      local compiler = bridge.load()
+      local analysis = compiler:analyze_incremental({
+        bridge.ProjectModule.new("fixture.first", {
+          bridge.SourceFile.new("/workspace/first.titan", ""),
+        }),
+        bridge.ProjectModule.new("fixture.second", {
+          bridge.SourceFile.new("/workspace/second.titan", ""),
+        }),
+      }, {"fixture.first", "fixture.second"}, {})
+      local binary? = analysis:find_module("fixture.binary")
+      test.assert(binary ~= nil and binary.provider_identity == nil and
+                  #analysis.provider_conflicts == 1 and
+                  analysis.provider_conflicts[1] == "fixture.binary" and
+                  #analysis.binary_provider_observations == 2 and
+                  analysis.binary_provider_observations[1].provider_file ==
+                    first_provider and
+                  analysis.binary_provider_observations[2].provider_file ==
+                    second_provider and
+                  analysis.binary_provider_observations[1].provider_identity ~=
+                    nil and
+                  analysis.binary_provider_observations[2].provider_identity ~=
+                    nil,
+                  "mixed binary providers acquired a publishable identity")
+      case binary.provenance
+      when dynamic_binary: provenance then
+        test.assert(provenance.provider_file == second_provider,
+                    "provider-switch fixture did not retain its final result")
+      else
+        test.assert(false, "provider-switch fixture used source provenance")
+      end
+    end, first_provider)
+  end)
+end
+
+local function preserves_binary_observation_when_final_snapshot_is_source()
+  local first_provider = fs.tmpname()
+  local second_provider = first_provider .. ".second"
+  defer do
+    fs.unlink(second_provider)
+    fs.unlink(first_provider)
+  end
+  fs.write_file(first_provider, "first provider")
+  fs.write_file(second_provider, "final source provider")
+  with_fixture("binary-provider-to-source", function ()
+    local compiler = bridge.load()
+    local analysis = compiler:analyze_incremental({
+      bridge.ProjectModule.new("fixture.first", {
+        bridge.SourceFile.new("/workspace/first.titan", ""),
+      }),
+      bridge.ProjectModule.new("fixture.second", {
+        bridge.SourceFile.new("/workspace/second.titan", ""),
+      }),
+    }, {"fixture.first", "fixture.second"}, {})
+    local provider? = analysis:find_module("fixture.binary")
+    test.assert(provider ~= nil and #analysis.provider_conflicts == 0 and
+                #analysis.binary_provider_observations == 1 and
+                analysis.binary_provider_observations[1].module_name ==
+                  "fixture.binary" and
+                analysis.binary_provider_observations[1].kind == "dynamic" and
+                analysis.binary_provider_observations[1].provider_file ==
+                  first_provider and
+                analysis.binary_provider_observations[1].provider_identity ~=
+                  nil,
+                "source-final result lost its earlier binary observation")
+    case provider.provenance
+    when external_source: source then
+      test.assert(source.main_file == second_provider,
+                  "source-final fixture lost its final provider")
+    else
+      test.assert(false, "source-final fixture retained binary provenance")
+    end
+  end, first_provider)
+end
+
+function test_compiler_bridge_preserves_binary_observation_before_source_result(
+    _context: test.Context)
+  run_bridge(function ()
+    preserves_binary_observation_when_final_snapshot_is_source()
   end)
 end
 
@@ -591,27 +849,60 @@ end
 
 function test_compiler_bridge_normalizes_contextual_owner_provenance(
     _context: test.Context)
-  with_fixture("contextual-resolution", function ()
-    local compiler = bridge.load()
-    local analysis = compiler:analyze("fixture", {
-      bridge.ProjectModule.new("fixture", {bridge.SourceFile.new(
-        "/workspace/fixture.titan", "saved fixture")}),
-    })
-    test.assert(#analysis.contextual_resolutions == 1,
-                "contextual owner metadata was not normalized")
-    local resolution = analysis.contextual_resolutions[1]
-    test.assert(resolution.owner_module == "fixture.owner" and
-                resolution.exposer_module == "fixture.facade" and
-                resolution.ordinary_lookup,
-                "contextual owner graph identity was changed")
-    case resolution.provenance
-    when static_binary: binary then
-      test.assert(binary.provider_file == "/binary/fixture-owner.a",
-                  "contextual owner provider path was lost")
-    else
-      test.assert(false,
-                  "contextual owner used the wrong provenance variant")
-    end
+  run_bridge(function ()
+    local provider = fs.tmpname()
+    defer fs.unlink(provider)
+    fs.write_file(provider, "fixture static provider")
+    with_fixture("contextual-resolution", function ()
+      local compiler = bridge.load()
+      local analysis = compiler:analyze("fixture", {
+        bridge.ProjectModule.new("fixture", {bridge.SourceFile.new(
+          "/workspace/fixture.titan", "saved fixture")}),
+      })
+      test.assert(#analysis.contextual_resolutions == 1,
+                  "contextual owner metadata was not normalized")
+      local resolution = analysis.contextual_resolutions[1]
+      test.assert(resolution.owner_module == "fixture.owner" and
+                  resolution.exposer_module == "fixture.facade" and
+                  resolution.ordinary_lookup and
+                  resolution.provider_identity ~= nil and
+                  resolution.provider_identity.path == provider and
+                  resolution.provider_identity.kind == "file" and
+                  resolution.provider_identity.size ==
+                    #"fixture static provider",
+                  "contextual owner graph identity was changed")
+      case resolution.provenance
+      when static_binary: binary then
+        test.assert(binary.provider_file == provider,
+                    "contextual owner provider path was lost")
+      else
+        test.assert(false,
+                    "contextual owner used the wrong provenance variant")
+      end
+    end, provider)
+  end)
+end
+
+function test_compiler_bridge_resets_contextual_provider_observations_between_analyses(
+    _context: test.Context)
+  run_bridge(function ()
+    local provider = fs.tmpname()
+    defer fs.unlink(provider)
+    fs.write_file(provider, "fixture static provider")
+    with_fixture("contextual-resolution-once", function ()
+      local compiler = bridge.load()
+      local project = bridge.ProjectModule.new(
+        "fixture", {bridge.SourceFile.new(
+          "/workspace/fixture.titan", "saved fixture")})
+      local first = compiler:analyze("fixture", {project})
+      local second = compiler:analyze("fixture", {project})
+      test.assert(#first.contextual_resolutions == 1 and
+                  first.contextual_resolutions[1].provider_identity ~= nil,
+                  "first analysis lost its observed provider identity")
+      test.assert(#second.contextual_resolutions == 1 and
+                  second.contextual_resolutions[1].provider_identity == nil,
+                  "second analysis reused a stale provider observation")
+    end, provider)
   end)
 end
 
@@ -684,8 +975,8 @@ function test_compiler_bridge_normalizes_annotated_ast_and_provenance(
   with_fixture("valid", function ()
     local compiler = bridge.load()
     test.assert(compiler:installed_binary_modules_root() ==
-                  "/opt/titan/lib/titan/0.26",
-                "compiler installation ABI directory was not exposed")
+                  "/opt/titan/lib/titan/0.6",
+                "compiler installation library directory was not exposed")
     local analysis = compiler:analyze("fixture", {bridge.ProjectModule.new(
       "fixture", {bridge.SourceFile.new(
         "/workspace/fixture.titan", "saved fixture")})})
@@ -1466,7 +1757,7 @@ end
     filename, source_text.Position.new(1, 10))
   test.assert(top_level ~= nil and top_level:markdown() ==
                 "- Signature: `hover_consumer.run(): integer`\n" ..
-                "- Declaration: non-local\n",
+                "- Visibility: exported\n",
               "top-level function declaration hover lost its signature")
 
   local associated? = model:hover(
@@ -1474,7 +1765,7 @@ end
   test.assert(associated ~= nil and associated:markdown() ==
                 "- Signature: `hover_external.Counter.create(" ..
                 "initial: integer): hover_external.Counter`\n" ..
-                "- Declaration: non-local\n",
+                "- Visibility: exported\n",
               "imported record-function hover lost its named signature")
 
   local ordinary? = model:hover(
@@ -1482,7 +1773,7 @@ end
   test.assert(ordinary ~= nil and ordinary:markdown() ==
                 "- Signature: `hover_external.choose(" ..
                 "first: integer, second: integer): integer`\n" ..
-                "- Declaration: non-local\n",
+                "- Visibility: exported\n",
               "imported function hover lost its named signature")
 
   local method? = model:hover(
@@ -1490,7 +1781,7 @@ end
   test.assert(method ~= nil and method:markdown() ==
                 "- Signature: `hover_external.Counter:add(" ..
                 "delta: integer): integer`\n" ..
-                "- Declaration: non-local\n",
+                "- Visibility: exported\n",
               "method-call name hover lost its resolved method signature")
 
   local foreign_hover? = model:hover(
@@ -1538,12 +1829,27 @@ end
               diagnostic_messages:drain())
   local model = features.build({project}, analysis.modules)
 
+  local owner? = model:hover(
+    filename, source_text.Position.new(0, 8))
+  local receiver? = model:hover(
+    filename, source_text.Position.new(4, 10))
+  local owner_summary: string? = nil
+  local receiver_summary: string? = nil
+  if owner ~= nil then owner_summary = owner.summary_markdown end
+  if receiver ~= nil then receiver_summary = receiver.summary_markdown end
+  test.assert(owner_summary ~= nil and receiver_summary == owner_summary,
+              "implicit self did not reuse its aggregate hover summary")
+  test.assert(receiver ~= nil and receiver_summary ~= nil and
+              receiver:markdown() == receiver_summary ..
+                "\n- Visibility: block\n",
+              "implicit self hover lost its members or block visibility")
+
   local declaration? = model:hover(
     filename, source_text.Position.new(6, 10))
   test.assert(declaration ~= nil and declaration:markdown() ==
                 "- Signature: `generic_callable_hover.identity<T>(" ..
                   "item: T): T`\n" ..
-                "- Declaration: non-local\n",
+                "- Visibility: exported\n",
               "generic function declaration hover lost its surface signature")
 
   local method_declaration? = model:hover(
@@ -1551,14 +1857,14 @@ end
   test.assert(method_declaration ~= nil and
               method_declaration:markdown() ==
                 "- Signature: `generic_callable_hover.Box:get(): T`\n" ..
-                "- Declaration: non-local\n",
+                "- Visibility: exported\n",
               "generic owner method declaration hover was erased")
 
   local method_call? = model:hover(
     filename, source_text.Position.new(10, 14))
   test.assert(method_call ~= nil and method_call:markdown() ==
                 "- Signature: `generic_callable_hover.Box:get(): integer`\n" ..
-                "- Declaration: non-local\n",
+                "- Visibility: exported\n",
               "generic method-call name hover lost its applied signature")
 end
 
@@ -1665,7 +1971,7 @@ end
                 "Methods\n\n" ..
                 "- `summary_provider.Box<T>:get(): T`\n" ..
                 "- `local summary_provider.Box<T>:hidden(): T`\n\n" ..
-                "- Declaration: non-local\n",
+                "- Visibility: exported\n",
               "defining aggregate hover lost its full generic view:\n" ..
               defining_markdown)
 
@@ -1681,7 +1987,7 @@ end
       "item: integer): summary_provider.Box<integer>`\n\n" ..
     "Methods\n\n" ..
     "- `summary_provider.Box<integer>:get(): integer`\n\n" ..
-    "- Declaration: non-local\n"
+    "- Visibility: exported\n"
   test.assert(ordinary ~= nil and ordinary:markdown() == expected_public,
               "ordinary import exposed local or unspecialized members:\n" ..
               ordinary_markdown)
@@ -1699,7 +2005,7 @@ end
                 "Methods\n\n" ..
                 "- `summary_provider.Box<integer>:get(): integer`\n" ..
                 "- `local summary_provider.Box<integer>:hidden(): integer`\n\n" ..
-                "- Declaration: non-local\n",
+                "- Visibility: exported\n",
               "direct-source import lost its local specialized members:\n" ..
               source_markdown)
 
@@ -1714,7 +2020,7 @@ end
     "- `answer: integer`\n" ..
     "- `summary_provider.exposed(): integer`\n" ..
     "- `type BoxAlias<T> = summary_provider.Box<T>`\n\n" ..
-    "- Declaration: local\n"
+    "- Visibility: module\n"
   test.assert(public_module ~= nil and
               public_module:markdown() == expected_public_module and
               strings.find(public_module:markdown(), "Fields") == nil and
@@ -1736,7 +2042,7 @@ end
                 "- `type BoxAlias<T> = summary_provider.Box<T>`\n" ..
                 "- `local type Hidden = integer`\n" ..
                 "- `local type HiddenBox<T> = summary_provider.Box<T>`\n\n" ..
-                "- Declaration: local\n",
+                "- Visibility: module\n",
               "direct-source module hover lost its source-only members:\n" ..
               source_module_markdown)
 
@@ -1874,7 +2180,7 @@ end
                 "- `callback: (integer) -> integer`\n" ..
                 "- `function_variable_provider.declared(" ..
                   "item: integer): integer`\n\n" ..
-                "- Declaration: local\n",
+                "- Visibility: module\n",
               "module hover confused a function-valued variable with " ..
               "a named function declaration:\n" .. markdown)
 end
@@ -1999,7 +2305,7 @@ end
                 "- `hover_manifest.combine(" ..
                   "left: integer, right: integer): integer`\n" ..
                 "- `interface Formatter`\n\n" ..
-                "- Declaration: local\n" and
+                "- Visibility: module\n" and
               strings.find(module_hover:markdown(), "Variants") == nil and
               strings.find(module_hover:markdown(), ".new") == nil,
               "cached module hover expanded or lost manifest members")
@@ -2013,7 +2319,7 @@ end
                 "Methods\n\n" ..
                 "- `hover_manifest.Formatter:format(" ..
                   "subject: string, maximum: integer?): string`\n\n" ..
-                "- Declaration: non-local\n",
+                "- Visibility: exported\n",
               "cached interface hover lost fields or named methods")
 
   local parcel_hover? = model:hover(
@@ -2030,7 +2336,7 @@ end
                 "Methods\n\n" ..
                 "- `hover_manifest.Parcel:increase(" ..
                   "delta: integer): integer`\n\n" ..
-                "- Declaration: non-local\n",
+                "- Visibility: exported\n",
               "cached record hover lost normalized manifest members")
 
   local choice_hover? = model:hover(
@@ -2046,7 +2352,7 @@ end
                 "Methods\n\n" ..
                 "- `hover_manifest.Choice:label(" ..
                   "prefix: string): string`\n\n" ..
-                "- Declaration: non-local\n" and
+                "- Visibility: exported\n" and
               strings.find(choice_hover:markdown(),
                            "Choice.numbered") == nil,
               "cached union hover duplicated synthesized constructors")
@@ -2055,7 +2361,7 @@ end
   test.assert(ordinary ~= nil and ordinary:markdown() ==
                 "- Signature: `hover_manifest.combine(" ..
                 "left: integer, right: integer): integer`\n" ..
-                "- Declaration: non-local\n",
+                "- Visibility: exported\n",
               "deserialized ModuleMember lost parameter labels")
 
   local record_static? = model:hover(
@@ -2063,7 +2369,7 @@ end
   test.assert(record_static ~= nil and record_static:markdown() ==
                 "- Signature: `hover_manifest.Parcel.create(" ..
                 "initial: integer): hover_manifest.Parcel`\n" ..
-                "- Declaration: non-local\n",
+                "- Visibility: exported\n",
               "deserialized record StaticMethod lost parameter labels")
 
   local record_method? = model:hover(
@@ -2071,7 +2377,7 @@ end
   test.assert(record_method ~= nil and record_method:markdown() ==
                 "- Signature: `hover_manifest.Parcel:increase(" ..
                 "delta: integer): integer`\n" ..
-                "- Declaration: non-local\n",
+                "- Visibility: exported\n",
               "deserialized record Method lost parameter labels")
 
   local union_static? = model:hover(
@@ -2079,21 +2385,21 @@ end
   test.assert(union_static ~= nil and union_static:markdown() ==
                 "- Signature: `hover_manifest.Choice.from_ordinal(" ..
                 "ordinal: integer): hover_manifest.Choice`\n" ..
-                "- Declaration: non-local\n",
+                "- Visibility: exported\n",
               "deserialized union StaticMethod lost parameter labels")
 
   local variant? = model:hover(filename, source_text.Position.new(8, 34))
   test.assert(variant ~= nil and variant:markdown() ==
                 "- Signature: `hover_manifest.Choice.numbered(" ..
                 "integer): hover_manifest.Choice`\n" ..
-                "- Declaration: non-local\n",
+                "- Visibility: exported\n",
               "union variant constructor invented a parameter label")
 
   local union_method? = model:hover(filename, source_text.Position.new(9, 24))
   test.assert(union_method ~= nil and union_method:markdown() ==
                 "- Signature: `hover_manifest.Choice:label(" ..
                 "prefix: string): string`\n" ..
-                "- Declaration: non-local\n",
+                "- Visibility: exported\n",
               "deserialized union Method lost parameter labels")
 
   local interface_method? = model:hover(
@@ -2101,7 +2407,7 @@ end
   test.assert(interface_method ~= nil and interface_method:markdown() ==
                 "- Signature: `hover_manifest.Formatter:format(" ..
                 "subject: string, maximum: integer?): string`\n" ..
-                "- Declaration: non-local\n",
+                "- Visibility: exported\n",
               "deserialized interface Method lost parameter labels")
 end
 
@@ -2151,13 +2457,13 @@ end
   test.assert(named ~= nil and named:markdown() ==
                 "- Signature: `native.hover_named_sum(" ..
                 "left: int, right: int): int`\n" ..
-                "- Declaration: non-local\n",
+                "- Visibility: exported\n",
               "direct C function lost its written alias or parameter names")
 
   local unnamed? = model:hover(filename, source_text.Position.new(3, 42))
   test.assert(unnamed ~= nil and unnamed:markdown() ==
                 "- Signature: `native.hover_unnamed_sum(int, int): int`\n" ..
-                "- Declaration: non-local\n",
+                "- Visibility: exported\n",
               "unnamed C prototype invented parameter labels")
 end
 
