@@ -305,11 +305,12 @@ has evidence before moving to Done.
   for the final snapshot.
 - On the final integrated native server, the actual-usage vscode-titan
   benchmark cold-indexed all 47 saved files in one compiler analysis and 27
-  root attempts: 8,894.386 ms wall, 8,860 ms child CPU, and 804,576 KiB peak
-  server RSS. The preceding duplicate-pass build took 18,058.798 ms and
-  reported 54 attempts, so removing the redundant pass reduced measured cold
-  wall time by 50.75%. A hover issued before readiness returned the intentional
-  no-data result in 0.759 ms; ready hover and method definition took 1.232 ms
-  and 1.379 ms, and an unchanged refresh took 20.185 ms with no progress work.
-  The cold run published 48 progress updates through 47/47 files, while the
-  unchanged refresh published none.
+  root attempts: 9,175.704 ms wall, 9,140 ms child CPU, and 805,836 KiB peak
+  server RSS. A hover issued before readiness returned the intentional no-data
+  result in 3.271 ms; ready hover and method definition took 1.275 ms and
+  1.450 ms, and an unchanged refresh took 20.153 ms with no progress work. The
+  cold run published 48 progress updates through 47/47 files, while the
+  unchanged refresh published none. The bounded-cache comparison which
+  isolated the language-server change measured 18,058.798 ms and 54 attempts
+  with the redundant pass versus 8,894.386 ms and 27 attempts without it, a
+  50.75% cold-wall reduction.
