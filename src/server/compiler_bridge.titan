@@ -555,6 +555,8 @@ local function load_with(require_function: RequireFunction): Compiler
   checked_function(types, TYPES_MODULE, "tostring", type_of)
   checked_function(types, TYPES_MODULE, "serialize", type_of)
   checked_function(driver, DRIVER_MODULE, "defaultloader", type_of)
+  checked_function(
+    driver, DRIVER_MODULE, "new_c_header_analysis", type_of)
   checked_function(driver, DRIVER_MODULE, "new_resolver_context", type_of)
   checked_function(driver, DRIVER_MODULE, "finalize_resolver_context", type_of)
   checked_function(driver, DRIVER_MODULE, "close_resolver_context", type_of)
@@ -3283,9 +3285,28 @@ local function Compiler:run_attempt_inner(
     root_module: string, projects: {string: ProjectModule},
     overrides: {string: value},
     pending: {string: boolean}, cached: {string: CachedSourceInterface},
-    raw_cached_interfaces: {string: value}): AttemptResult
+    raw_cached_interfaces: {string: value},
+    c_header_analysis: value): AttemptResult
   local normalization_work = NormalizationWork.new(0)
   local options: {string: value} = { ["io"] = self.io }
+  options["c_header_analysis"] = c_header_analysis
+  if logging.enabled("trace") then
+    local trace_header_phase:
+      (string, string, string, string, float) -> () =
+      function (header: string, resolved_header: string,
+                phase: string, outcome: string, cpu_ms: float)
+        logging.emit("trace", "compiler.c_header.phase", {
+          json.Member.new("root_module", json.from_string(root_module)),
+          json.Member.new("header", json.from_string(header)),
+          json.Member.new(
+            "resolved_header", json.from_string(resolved_header)),
+          json.Member.new("phase", json.from_string(phase)),
+          json.Member.new("outcome", json.from_string(outcome)),
+          json.Member.new("cpu_ms", json.from_number(cpu_ms)),
+        })
+      end
+    options["c_header_process_trace"] = trace_header_phase
+  end
   local roots: {string: value} = {[root_module] = true}
   local active_overrides: {string: value} = {}
   local retained_entries: {string: value} = {}
@@ -3456,7 +3477,8 @@ local function Compiler:run_attempt(
     root_module: string, projects: {string: ProjectModule},
     overrides: {string: value},
     pending: {string: boolean}, cached: {string: CachedSourceInterface},
-    raw_cached_interfaces: {string: value}): AttemptResult
+    raw_cached_interfaces: {string: value},
+    c_header_analysis: value): AttemptResult
   local attempt = compiler_io.begin_attempt(self.io, root_module)
   local debugging = logging.enabled("debug")
   local started_cpu = 0.0
@@ -3478,7 +3500,7 @@ local function Compiler:run_attempt(
   do
     result = self:run_attempt_inner(
       root_module, projects, overrides, pending, cached,
-      raw_cached_interfaces)
+      raw_cached_interfaces, c_header_analysis)
   catch
     local outcome = "failed"
     if error is async.CancellationReason then outcome = "cancelled" end
@@ -3544,6 +3566,17 @@ function Compiler:analyze_incremental(
   compiler_io.begin_lstat_observations(self.io)
   defer compiler_io.end_lstat_observations(self.io)
 
+  local raw_new_c_header_analysis = checked_function(
+    self.driver, DRIVER_MODULE, "new_c_header_analysis", self.type_of)
+  local create_c_header_analysis =
+    raw_new_c_header_analysis as () -> value
+  local c_header_analysis = create_c_header_analysis()
+  if self.type_of(c_header_analysis) ~= "table" then
+    return fail<Analysis>(
+      DRIVER_MODULE, "driver.new_c_header_analysis returned " ..
+      describe(c_header_analysis, self.type_of) .. " instead of a table")
+  end
+
   local previous_source_path: value = self.driver["TITAN_SOURCE_PATH"]
   local previous_binary_path: value = self.driver["TITAN_BIN_PATH"]
   defer self.driver["TITAN_SOURCE_PATH"] = previous_source_path
@@ -3582,7 +3615,7 @@ function Compiler:analyze_incremental(
       do
         attempt_result = self:run_attempt(
           root, projects, overrides, pending, cached,
-          raw_cached_interfaces)
+          raw_cached_interfaces, c_header_analysis)
       catch
         -- A non-cancellation compiler failure terminally processes this root
         -- even when it fails before the driver's normal publish/yield point.
