@@ -82,6 +82,11 @@ The benchmark defaults to the extension's `debug` server-emission level so its
 numbers represent normal VS Code use. Pass `--log-level off` only when measuring
 the lower bound without structured-log overhead.
 
+For a controlled persistent-cache fill/warm comparison, set one unique
+`TITAN_PROBE_CACHE_IDENTITY` value and reuse it for the consecutive server
+processes. The value selects an isolated hashed cache namespace; changing it
+starts another namespace without deleting ordinary developer cache entries.
+
 An alternate saved target and additional ready-state probes can exercise a
 larger workspace in the same persistent server session. Probe positions are
 zero-based LSP line/character coordinates. The benchmark canonicalizes the
@@ -128,11 +133,22 @@ conversion record.
 `coldProfile.headers` attributes only each header's complete processing time
 plus downstream FFI conversion. Component header phases remain visible for
 diagnosis but are not added again. `coldProfile.probeCaches` summarizes
-persistent-success disk-cache lookups by their real `baseline` or `candidate`
-probe stage; hit rates are fractions from zero to one. Its `persistentSuccess`
-section also ranks the modules responsible for those disk-cache hits and misses,
-so a cold run's avoidable C compiler probes are visible without retaining every
-individual trace key in memory.
+completed-result disk-cache lookups by their real `baseline` or `candidate`
+probe stage; hit rates are fractions from zero to one. Its backward-compatible
+`persistentSuccess` section also ranks the modules responsible for those disk
+lookups, including misses which may become persisted deterministic rejections.
+
+`coldProfile.probeTraces.logical` counts semantic requests and unique keys by
+eventual success, compiler rejection, or infrastructure outcome; cache tier;
+first/repeated use; publication result; requesting module; and readable header
+context. `coldProfile.probeTraces.physical` separately counts execution attempts,
+children which actually started, launches with a valid monotonic duration, and
+their child wall time by outcome, single/batch kind, persistent lookup result,
+publication, module, and header context. A fully warm cache can therefore retain
+logical success and rejection requests while reporting zero physical attempts,
+zero compiler launches, and zero child wall time. These aggregates preserve the
+distinction without retaining source, command arguments, or diagnostics in the
+benchmark process.
 
 Module and header durations are process-CPU attribution, not Task-exclusive
 clocks. An async suspension can therefore let unrelated server Task CPU enter an

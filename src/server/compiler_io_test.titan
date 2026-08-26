@@ -2,6 +2,7 @@ local async = import "async"
 local fs = import "fs"
 local iteration = import "iteration"
 local lua = import "lua"
+local math = import "math"
 local system = import "os"
 local strings = import "string"
 local test = import "test"
@@ -56,6 +57,11 @@ local function integer_field(result: {string: value}, name: string): integer
   return field
 end
 
+local function float_field(result: {string: value}, name: string): float
+  local field: float = result[name]
+  return field
+end
+
 local function string_field(result: {string: value}, name: string): string
   local field: string = result[name]
   return field
@@ -93,6 +99,25 @@ local function filesystem_contract()
   local contents?, read_error? = strategy:read_file(source)
   test.assert(required_string(contents, read_error, "read_file") == bytes,
               "compiler I/O changed binary file bytes")
+  local exact?, exact_error? = strategy:read_file(source, #bytes)
+  test.assert(required_string(exact, exact_error, "bounded exact read") ==
+              bytes,
+              "bounded read changed a file exactly at its limit")
+  local bounded?, bounded_error? = strategy:read_file(source, 5)
+  test.assert(required_string(bounded, bounded_error, "bounded prefix read") ==
+              strings.sub(bytes, 1, 6),
+              "bounded read did not retain exactly one overflow byte")
+  local first?, first_error? = strategy:read_file(source, 0)
+  test.assert(required_string(first, first_error, "zero-bound read") == "p",
+              "zero-bound read did not retain its one overflow byte")
+  local invalid?, invalid_error? = strategy:read_file(source, -1)
+  test.assert(invalid == nil and invalid_error ~= nil and
+              strings.find(invalid_error, "nonnegative integer") ~= nil,
+              "negative read limit was not rejected before filesystem I/O")
+  invalid, invalid_error = strategy:read_file(source, math.maxinteger)
+  test.assert(invalid == nil and invalid_error ~= nil and
+              strings.find(invalid_error, "nonnegative integer") ~= nil,
+              "overflowing read limit was not rejected before filesystem I/O")
 
   local raw_metadata?, stat_error? = strategy:stat(source)
   test.assert(raw_metadata ~= nil and stat_error == nil,
@@ -228,6 +253,7 @@ local function process_contract()
   test.assert(bool_field(success, "started") and
               bool_field(success, "ok") and
               integer_field(success, "status") == 0 and
+              float_field(success, "wall_ms") >= 0.0 and
               string_field(success, "why") == "exit" and
               not bool_field(success, "interrupted"),
               "successful captured command returned the wrong status")
@@ -284,6 +310,15 @@ local function process_contract()
               strings.sub(string_field(unmerged, "command"), -5) ~= " 2>&1",
               "stderr_to_stdout=false did not select the split policy")
 
+  local delayed = strategy:run({
+    [1] = "sh", [2] = "-c", [3] = "sleep 0.05",
+  }, nil)
+  local delayed_wall_ms = float_field(delayed, "wall_ms")
+  test.assert(bool_field(delayed, "ok") and delayed_wall_ms >= 10.0 and
+              delayed_wall_ms < 5000.0,
+              "child wall timing was not high-resolution monotonic time: " ..
+              delayed_wall_ms)
+
   -- This exceeds ordinary pipe capacity. The run can finish only when its
   -- output reader and process waiter make progress concurrently.
   local large = strategy:run({
@@ -300,6 +335,56 @@ end
 function test_compiler_io_captures_process_output_and_status(
     _context: test.Context)
   test_runtime.run(process_contract)
+end
+
+function test_compiler_io_bounded_reader_continues_after_short_reads(
+    _context: test.Context)
+  local chunks = {"ab", "c", "def", "must not be read"}
+  local requests: {integer} = {}
+  local index = 0
+  local result = compiler_io.read_bounded_chunks(
+    function (remaining: integer): string?
+      requests[#requests + 1] = remaining
+      index = index + 1
+      return chunks[index]
+    end, 5)
+  test.assert(result == "abcdef" and index == 3,
+              "bounded reader did not stop at exactly limit plus one")
+  test.assert(#requests == 3 and requests[1] == 6 and
+              requests[2] == 4 and requests[3] == 3,
+              "bounded reader did not reduce each short-read request")
+
+  local eof_chunks = {"ab", "c"}
+  index = 0
+  result = compiler_io.read_bounded_chunks(
+    function (_remaining: integer): string?
+      index = index + 1
+      return eof_chunks[index]
+    end, 5)
+  test.assert(result == "abc" and index == 3,
+              "bounded reader did not continue to EOF after short reads")
+end
+
+function test_compiler_io_preserves_launch_facts_and_rejects_bad_clock_samples(
+    _context: test.Context)
+  local before_spawn = compiler_io.capture_failure(
+    "compiler", "spawn failed", false)
+  local after_spawn = compiler_io.capture_failure(
+    "compiler", "capture failed", true)
+  test.assert(not bool_field(before_spawn, "started") and
+              bool_field(after_spawn, "started"),
+              "capture failures lost their pre/post-spawn distinction")
+
+  test.assert(compiler_io.elapsed_monotonic_ms(12.5, 15.0) == 2.5,
+              "valid monotonic samples did not produce elapsed time")
+  test.assert(compiler_io.elapsed_monotonic_ms(-1.0, 15.0) == nil and
+              compiler_io.elapsed_monotonic_ms(12.5, -1.0) == nil and
+              compiler_io.elapsed_monotonic_ms(math.huge, 15.0) == nil and
+              compiler_io.elapsed_monotonic_ms(12.5, math.huge) == nil and
+              compiler_io.elapsed_monotonic_ms(0 / 0, 15.0) == nil and
+              compiler_io.elapsed_monotonic_ms(12.5, 0 / 0) == nil and
+              compiler_io.elapsed_monotonic_ms(15.0, 12.5) == nil,
+              "invalid monotonic samples fabricated a wall duration")
 end
 
 local function lua_proxy_yield_contract()
@@ -325,16 +410,20 @@ return function(strategy, path)
   local entries, list_error = strategy:list(path:match("^(.*)/"))
   assert(entries and list_error == nil and type(entries) == "table",
          "list did not cross as an ordinary Lua table")
+  local bounded, read_error = strategy:read_file(path, 5)
+  assert(bounded == "functi" and read_error == nil,
+         "bounded read did not cross the Lua proxy")
   strategy:yield("fixture.module")
-  return metadata.kind, metadata.size, #entries
+  return metadata.kind, metadata.size, #entries, bounded
 end
 ]==], "=compiler_io_lua_proxy", nil)() as
-    (compiler_io.CompilerIO, string) -> (string, integer, integer)
+    (compiler_io.CompilerIO, string) -> (string, integer, integer, string)
 
-  local kind, size, entries = invoke(strategy, source)
+  local kind, size, entries, bounded = invoke(strategy, source)
   test.assert(observed,
               "CompilerIO:yield did not cooperatively run another Task")
-  test.assert(kind == "file" and size > 0 and entries == 1,
+  test.assert(kind == "file" and size > 0 and entries == 1 and
+              bounded == "functi",
               "Lua proxy invocation changed stat/list results")
   test.assert(observer:status():has_succeeded(),
               "yield observer did not finish successfully")

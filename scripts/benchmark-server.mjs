@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import { spawn, spawnSync } from "node:child_process";
+import { Buffer } from "node:buffer";
 import { constants as fsConstants } from "node:fs";
 import { access, readFile, realpath, stat } from "node:fs/promises";
 import * as path from "node:path";
@@ -24,10 +25,29 @@ const SOURCE_PROFILE_OUTCOMES = new Set(["complete", "failed"]);
 const NORMALIZATION_PROFILE_EVENT = "compiler.module.normalization";
 const HEADER_PHASE_EVENT = "compiler.c_header.phase";
 const PROBE_CACHE_EVENT = "compiler.c_probe.cache";
+const PROBE_SEMANTIC_EVENT = "compiler.c_probe.semantic";
+const PROBE_EXECUTION_EVENT = "compiler.c_probe.execution";
 const HEADER_PROCESS_TOTAL_PHASE = "process_total";
 const HEADER_DOWNSTREAM_PHASE = "downstream_ffi_conversion";
 const PERSISTENT_SUCCESS_CACHE = "persistent success";
 const PROBE_CACHE_STAGES = new Set(["baseline", "candidate"]);
+const PROBE_OUTCOMES = new Set([
+  "success", "compiler_rejection", "infrastructure_failure"
+]);
+const PROBE_CACHE_TIERS = new Set([
+  "service", "analysis", "persistent", "compiler"
+]);
+const PROBE_BATCH_KINDS = new Set(["single", "batch"]);
+const PROBE_PUBLICATIONS = new Set([
+  "not_applicable", "published", "existing", "failed", "conflict",
+  "disabled", "unstable_diagnostic", "too_large",
+  "diagnostic_not_persisted", "mixed"
+]);
+const PROBE_PERSISTENT_LOOKUPS = new Set([
+  "not_applicable", "disabled", "memory", "hit", "miss", "invalid",
+  "io_error", "mixed"
+]);
+const MAX_PROBE_HEADER_LABEL_BYTES = 4096;
 const PROFILE_CPU_ROUNDING_ULPS = 64;
 
 class BenchmarkError extends Error {}
@@ -128,6 +148,150 @@ function recordCacheRequest(target, hit) {
   else target.misses += 1;
 }
 
+function profileEnum(record, field, event, allowed) {
+  const value = profileString(record, field, event);
+  if (!allowed.has(value)) {
+    throw new BenchmarkError(
+      `${event} field ${field} has unsupported value ${JSON.stringify(value)}`
+    );
+  }
+  return value;
+}
+
+function profileProbeKey(record, event) {
+  const key = profileString(record, "key", event);
+  if (!/^[0-9a-f]{64}$/.test(key)) {
+    throw new BenchmarkError(`${event} field key must be a 64-byte hex digest`);
+  }
+  return key;
+}
+
+function profileProbeHeaderLabel(record, event) {
+  const label = profileString(record, "header_label", event, true);
+  if (Buffer.byteLength(label, "utf8") > MAX_PROBE_HEADER_LABEL_BYTES) {
+    throw new BenchmarkError(
+      `${event} field header_label must be a string of at most ${MAX_PROBE_HEADER_LABEL_BYTES} bytes`
+    );
+  }
+  return label;
+}
+
+function recordProbeHeaderLabel(labels, identity, label) {
+  const existing = labels.get(identity);
+  if (existing === undefined) {
+    labels.set(identity, label);
+  } else {
+    // The semantic identity deliberately ignores redundant source spellings,
+    // while its human-readable label is derived from those spellings. Pick a
+    // stable nonempty representative without splitting or rejecting one
+    // equivalent header context.
+    labels.set(identity, stableDisplayValue(existing, label));
+  }
+}
+
+function newLogicalCounts() {
+  return { requests: 0, repeatedRequests: 0, keys: new Set() };
+}
+
+function recordLogicalCounts(target, key, repeated) {
+  target.requests += 1;
+  if (repeated) target.repeatedRequests += 1;
+  target.keys.add(key);
+}
+
+function logicalCounts(target) {
+  return {
+    requests: target.requests,
+    uniqueKeys: target.keys.size,
+    repeatedRequests: target.repeatedRequests
+  };
+}
+
+function recordLogicalDimension(map, name, key, repeated) {
+  let target = map.get(name);
+  if (target === undefined) {
+    target = newLogicalCounts();
+    map.set(name, target);
+  }
+  recordLogicalCounts(target, key, repeated);
+}
+
+function logicalRows(map, field) {
+  return [...map].map(([name, source]) => ({
+    [field]: name,
+    ...logicalCounts(source)
+  })).sort((left, right) =>
+    right.requests - left.requests ||
+    compareProfileStrings(String(left[field]), String(right[field])));
+}
+
+function newPhysicalCounts() {
+  return { attempts: 0, launches: 0, measuredLaunches: 0, childWallMs: 0 };
+}
+
+function recordPhysicalCounts(target, started, wallMs) {
+  target.attempts += 1;
+  if (!started) return;
+  target.launches += 1;
+  if (wallMs !== undefined) {
+    target.measuredLaunches += 1;
+    target.childWallMs += wallMs;
+  }
+}
+
+function physicalCounts(target) {
+  return {
+    attempts: target.attempts,
+    launches: target.launches,
+    measuredLaunches: target.measuredLaunches,
+    childWallMs: roundMilliseconds(target.childWallMs)
+  };
+}
+
+function recordPhysicalDimension(map, name, started, wallMs) {
+  let target = map.get(name);
+  if (target === undefined) {
+    target = newPhysicalCounts();
+    map.set(name, target);
+  }
+  recordPhysicalCounts(target, started, wallMs);
+}
+
+function physicalRows(map, field) {
+  return [...map].map(([name, source]) => ({
+    [field]: name,
+    ...physicalCounts(source)
+  })).sort((left, right) =>
+    right.childWallMs - left.childWallMs ||
+    right.launches - left.launches ||
+    right.attempts - left.attempts ||
+    compareProfileStrings(String(left[field]), String(right[field])));
+}
+
+function logicalHeaderContextRows(map, labels) {
+  return [...map].map(([headerIdentity, source]) => ({
+    headerIdentity,
+    headerLabel: labels.get(headerIdentity),
+    ...logicalCounts(source)
+  })).sort((left, right) =>
+    right.requests - left.requests ||
+    compareProfileStrings(left.headerLabel, right.headerLabel) ||
+    compareProfileStrings(left.headerIdentity, right.headerIdentity));
+}
+
+function physicalHeaderContextRows(map, labels) {
+  return [...map].map(([headerIdentity, source]) => ({
+    headerIdentity,
+    headerLabel: labels.get(headerIdentity),
+    ...physicalCounts(source)
+  })).sort((left, right) =>
+    right.childWallMs - left.childWallMs ||
+    right.launches - left.launches ||
+    right.attempts - left.attempts ||
+    compareProfileStrings(left.headerLabel, right.headerLabel) ||
+    compareProfileStrings(left.headerIdentity, right.headerIdentity));
+}
+
 function newAttributionStream() {
   return {
     seen: false,
@@ -178,6 +342,23 @@ class ColdProfileAccumulator {
     this.probeCacheStages = new Map();
     this.persistentProbeModules = new Map();
     this.probeCacheRecords = 0;
+    this.logicalProbes = newLogicalCounts();
+    this.logicalProbeOutcomes = new Map();
+    this.logicalProbeTiers = new Map();
+    this.logicalProbeRepetitions = new Map();
+    this.logicalProbePublications = new Map();
+    this.logicalProbeModules = new Map();
+    this.probeHeaderLabels = new Map();
+    this.logicalProbeHeaderContexts = new Map();
+    this.semanticProbeRecords = 0;
+    this.physicalProbes = newPhysicalCounts();
+    this.physicalProbeOutcomes = new Map();
+    this.physicalProbeBatchKinds = new Map();
+    this.physicalProbeLookups = new Map();
+    this.physicalProbePublications = new Map();
+    this.physicalProbeModules = new Map();
+    this.physicalProbeHeaderContexts = new Map();
+    this.executionProbeRecords = 0;
     this.traceRecords = 0;
   }
 
@@ -194,6 +375,10 @@ class ColdProfileAccumulator {
       this.ingestHeaderPhase(record);
     } else if (event === PROBE_CACHE_EVENT) {
       this.ingestProbeCache(record);
+    } else if (event === PROBE_SEMANTIC_EVENT) {
+      this.ingestProbeSemantic(record);
+    } else if (event === PROBE_EXECUTION_EVENT) {
+      this.ingestProbeExecution(record);
     } else {
       return false;
     }
@@ -341,6 +526,84 @@ class ColdProfileAccumulator {
     recordCacheRequest(moduleEntry, hit);
   }
 
+  ingestProbeSemantic(record) {
+    profileString(record, "root_module", PROBE_SEMANTIC_EVENT);
+    const moduleName = profileString(
+      record, "module_name", PROBE_SEMANTIC_EVENT, true);
+    const key = profileProbeKey(record, PROBE_SEMANTIC_EVENT);
+    profileString(record, "probe_kind", PROBE_SEMANTIC_EVENT);
+    const headerIdentity = profileString(
+      record, "header_identity", PROBE_SEMANTIC_EVENT, true);
+    const headerLabel = profileProbeHeaderLabel(record, PROBE_SEMANTIC_EVENT);
+    const outcome = profileEnum(
+      record, "outcome", PROBE_SEMANTIC_EVENT, PROBE_OUTCOMES);
+    const cacheTier = profileEnum(
+      record, "cache_tier", PROBE_SEMANTIC_EVENT, PROBE_CACHE_TIERS);
+    const repeated = profileBoolean(
+      record, "repeated", PROBE_SEMANTIC_EVENT);
+    const publication = profileEnum(
+      record, "publication", PROBE_SEMANTIC_EVENT, PROBE_PUBLICATIONS);
+
+    recordLogicalCounts(this.logicalProbes, key, repeated);
+    recordLogicalDimension(
+      this.logicalProbeOutcomes, outcome, key, repeated);
+    recordLogicalDimension(
+      this.logicalProbeTiers, cacheTier, key, repeated);
+    recordLogicalDimension(
+      this.logicalProbeRepetitions, repeated, key, repeated);
+    recordLogicalDimension(
+      this.logicalProbePublications, publication, key, repeated);
+    recordLogicalDimension(
+      this.logicalProbeModules, moduleName, key, repeated);
+    recordProbeHeaderLabel(
+      this.probeHeaderLabels, headerIdentity, headerLabel);
+    recordLogicalDimension(
+      this.logicalProbeHeaderContexts, headerIdentity, key, repeated);
+    this.semanticProbeRecords += 1;
+  }
+
+  ingestProbeExecution(record) {
+    profileString(record, "root_module", PROBE_EXECUTION_EVENT);
+    const moduleName = profileString(
+      record, "module_name", PROBE_EXECUTION_EVENT, true);
+    profileProbeKey(record, PROBE_EXECUTION_EVENT);
+    profileString(record, "probe_kind", PROBE_EXECUTION_EVENT);
+    const batchKind = profileEnum(
+      record, "batch_kind", PROBE_EXECUTION_EVENT, PROBE_BATCH_KINDS);
+    const headerIdentity = profileString(
+      record, "header_identity", PROBE_EXECUTION_EVENT, true);
+    const headerLabel = profileProbeHeaderLabel(record, PROBE_EXECUTION_EVENT);
+    const outcome = profileEnum(
+      record, "outcome", PROBE_EXECUTION_EVENT, PROBE_OUTCOMES);
+    const lookup = profileEnum(
+      record, "persistent_lookup", PROBE_EXECUTION_EVENT,
+      PROBE_PERSISTENT_LOOKUPS);
+    const publication = profileEnum(
+      record, "publication", PROBE_EXECUTION_EVENT, PROBE_PUBLICATIONS);
+    const started = profileBoolean(
+      record, "started", PROBE_EXECUTION_EVENT);
+    const wallMs = record.wall_ms === undefined
+      ? undefined
+      : profileMilliseconds(record, "wall_ms", PROBE_EXECUTION_EVENT);
+
+    recordProbeHeaderLabel(
+      this.probeHeaderLabels, headerIdentity, headerLabel);
+    recordPhysicalCounts(this.physicalProbes, started, wallMs);
+    recordPhysicalDimension(
+      this.physicalProbeOutcomes, outcome, started, wallMs);
+    recordPhysicalDimension(
+      this.physicalProbeBatchKinds, batchKind, started, wallMs);
+    recordPhysicalDimension(
+      this.physicalProbeLookups, lookup, started, wallMs);
+    recordPhysicalDimension(
+      this.physicalProbePublications, publication, started, wallMs);
+    recordPhysicalDimension(
+      this.physicalProbeModules, moduleName, started, wallMs);
+    recordPhysicalDimension(
+      this.physicalProbeHeaderContexts, headerIdentity, started, wallMs);
+    this.executionProbeRecords += 1;
+  }
+
   finish() {
     if (this.traceRecords === 0) return undefined;
     const moduleTotals = {
@@ -439,6 +702,41 @@ class ColdProfileAccumulator {
       };
     }
 
+    let probeTraces;
+    if (this.semanticProbeRecords > 0 || this.executionProbeRecords > 0) {
+      const repetitionRows = [...this.logicalProbeRepetitions]
+        .map(([repeated, source]) => ({
+          repeated,
+          ...logicalCounts(source)
+        })).sort((left, right) => Number(left.repeated) - Number(right.repeated));
+      probeTraces = {
+        logical: {
+          totals: logicalCounts(this.logicalProbes),
+          outcomes: logicalRows(this.logicalProbeOutcomes, "outcome"),
+          tiers: logicalRows(this.logicalProbeTiers, "cacheTier"),
+          repetitions: repetitionRows,
+          publications: logicalRows(
+            this.logicalProbePublications, "publication"),
+          modules: logicalRows(this.logicalProbeModules, "moduleName"),
+          headerContexts: logicalHeaderContextRows(
+            this.logicalProbeHeaderContexts, this.probeHeaderLabels)
+        },
+        physical: {
+          totals: physicalCounts(this.physicalProbes),
+          outcomes: physicalRows(this.physicalProbeOutcomes, "outcome"),
+          batchKinds: physicalRows(
+            this.physicalProbeBatchKinds, "batchKind"),
+          persistentLookups: physicalRows(
+            this.physicalProbeLookups, "persistentLookup"),
+          publications: physicalRows(
+            this.physicalProbePublications, "publication"),
+          modules: physicalRows(this.physicalProbeModules, "moduleName"),
+          headerContexts: physicalHeaderContextRows(
+            this.physicalProbeHeaderContexts, this.probeHeaderLabels)
+        }
+      };
+    }
+
     for (const totals of [moduleTotals, headerTotals]) {
       for (const [field, value] of Object.entries(totals)) {
         if (field !== "calls" && field !== "componentPhases") {
@@ -450,6 +748,7 @@ class ColdProfileAccumulator {
       modules,
       headers,
       ...(probeCaches === undefined ? {} : { probeCaches }),
+      ...(probeTraces === undefined ? {} : { probeTraces }),
       totals: {
         modules: moduleTotals,
         headers: headerTotals,

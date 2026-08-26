@@ -15,13 +15,18 @@ SERVER_SOURCE_STAGE := $(BUILD_ROOT)/server-src
 TEST_SOURCE_STAGE := $(BUILD_ROOT)/test-src
 SERVER_INSTALL_STAGE := $(BUILD_ROOT)/install-root
 VSIX_DIR := $(BUILD_ROOT)/vsix
+NATIVE_BUILD_DIR := $(BUILD_ROOT)/native
 SERVER_BUILD_OUTPUT := $(SERVER_BUILD_DIR)/titan_language_server
 SERVER := $(abspath bin/titan-language-server)
 SERVER_TEST := $(TEST_BUILD_DIR)/server/tests
-SERVER_SOURCES := $(shell find src -type f -name '*.titan' -print 2>/dev/null)
+SERVER_SOURCES := $(shell find src -type f \( -name '*.titan' -o -name '*.h' \) -print 2>/dev/null)
 SERVER_SOURCE_DIRS := src $(shell find src/server -type d -print 2>/dev/null)
+COMPILER_IO_CLOCK_SOURCE := src/server/compiler_io_clock.c
+COMPILER_IO_CLOCK_HEADER := src/server/compiler_io_clock.h
+COMPILER_IO_CLOCK_OBJECT := $(NATIVE_BUILD_DIR)/compiler_io_clock.o
 HOST_OS := $(shell uname -s)
 HOST_ARCH := $(shell uname -m)
+CC ?= cc
 CCACHE_DISABLE ?= 1
 INSTALL_PREFIX ?= /usr/local
 
@@ -109,23 +114,31 @@ node_modules/.package-lock.json: package.json package-lock.json
 
 server: $(SERVER)
 
-$(SERVER): $(SERVER_SOURCES) $(SERVER_SOURCE_DIRS) Makefile | $(TITANC)
+$(COMPILER_IO_CLOCK_OBJECT): $(COMPILER_IO_CLOCK_SOURCE) $(COMPILER_IO_CLOCK_HEADER)
+	@mkdir -p "$(dir $(COMPILER_IO_CLOCK_OBJECT))"
+	CCACHE_DISABLE="$(CCACHE_DISABLE)" $(CC) -std=c99 -O2 \
+		-Wall -Wextra -Werror \
+		-c "$(COMPILER_IO_CLOCK_SOURCE)" \
+		-o "$(COMPILER_IO_CLOCK_OBJECT)"
+
+$(SERVER): $(SERVER_SOURCES) $(SERVER_SOURCE_DIRS) Makefile \
+	$(COMPILER_IO_CLOCK_OBJECT) | $(TITANC)
 	rm -rf -- "$(SERVER_SOURCE_STAGE)"
 	@mkdir -p "$(SERVER_BUILD_DIR)" "$(SERVER_SOURCE_STAGE)" "$(dir $(SERVER))"
 	cp -a "$(SOURCE_ROOT)/." "$(SERVER_SOURCE_STAGE)/"
 	cd "$(SERVER_BUILD_DIR)" && \
 		CCACHE_DISABLE="$(CCACHE_DISABLE)" \
-		TITAN_EXTRA_LDFLAGS="$(strip $(TITAN_EXTRA_LDFLAGS) $(EXPORT_LUA_LDFLAGS))" \
+		TITAN_EXTRA_LDFLAGS="$(strip $(TITAN_EXTRA_LDFLAGS) $(EXPORT_LUA_LDFLAGS) $(COMPILER_IO_CLOCK_OBJECT))" \
 		"$(TITANC)" --static --tree "$(SERVER_SOURCE_STAGE)" titan_language_server
 	install -m 0755 "$(SERVER_BUILD_OUTPUT)" "$(SERVER)"
 
-server-test: $(SERVER_SOURCES) | $(TITANC)
+server-test: $(SERVER_SOURCES) $(COMPILER_IO_CLOCK_OBJECT) | $(TITANC)
 	rm -rf -- "$(TEST_SOURCE_STAGE)"
 	@mkdir -p "$(TEST_BUILD_DIR)" "$(TEST_SOURCE_STAGE)"
 	cp -a "$(SOURCE_ROOT)/." "$(TEST_SOURCE_STAGE)/"
 	cd "$(TEST_BUILD_DIR)" && \
 		CCACHE_DISABLE="$(CCACHE_DISABLE)" \
-		TITAN_EXTRA_LDFLAGS="$(strip $(TITAN_EXTRA_LDFLAGS) $(EXPORT_LUA_LDFLAGS))" \
+		TITAN_EXTRA_LDFLAGS="$(strip $(TITAN_EXTRA_LDFLAGS) $(EXPORT_LUA_LDFLAGS) $(COMPILER_IO_CLOCK_OBJECT))" \
 		"$(TITANC)" --static --test --no-uv-bootstrap \
 			--tree "$(TEST_SOURCE_STAGE)" server.tests
 	CCACHE_DISABLE="$(CCACHE_DISABLE)" "$(SERVER_TEST)"
@@ -196,6 +209,9 @@ install-vsix: package
 
 clean:
 	rm -rf -- "$(BUILD_ROOT)" "$(SERVER)" dist dist-test
+	rm -f -- \
+		"$(abspath bridge_source_definition_consumer.a)" \
+		"$(abspath bridge_source_definition_consumer.so)"
 
 clean-node:
 	rm -rf -- node_modules .vscode-test

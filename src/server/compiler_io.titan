@@ -3,8 +3,10 @@ local fs = import "fs"
 local iteration = import "iteration"
 local json = import "server.json"
 local logging = import "server.logging"
+local math = import "math"
 local system = import "os"
 local strings = import "string"
+local monotonic = foreign import "compiler_io_clock.h"
 
 type CheckpointListener = (string?) -> ()
 
@@ -277,9 +279,38 @@ catch
   return false
 end
 
-function CompilerIO:read_file(path: string): (string?, string?)
+local function read_bounded_chunks(reader: (integer) -> string?,
+                                   max_bytes: integer): string
+  local output = strings.writer()
+  local remaining = max_bytes + 1
+  while remaining > 0 do
+    local chunk? = reader(remaining)
+    if chunk == nil or #chunk == 0 then return output:drain() end
+    output:write(chunk)
+    remaining = remaining - #chunk
+  end
+  return output:drain()
+end
+
+function CompilerIO:read_file(path: string,
+                              max_bytes: integer?): (string?, string?)
   local valid?, path_error? = checked_path(path)
   if not valid then return nil, path_error end
+  if max_bytes ~= nil then
+    if max_bytes < 0 or max_bytes >= math.maxinteger then
+      return nil, "read limit must be a nonnegative integer"
+    end
+
+    -- Read one byte beyond the caller's bound so it can distinguish an exact
+    -- fit from a file which grew after stat. A filesystem read may complete
+    -- short without reaching EOF, so continue only through the remaining
+    -- bounded prefix and never materialize the rest of a large replacement.
+    local file = fs.open(path, "r")
+    defer file:close()
+    return read_bounded_chunks(function (remaining: integer): string?
+      return file:read(remaining)
+    end, max_bytes), nil
+  end
   return fs.read_file(path), nil
 catch
   return nil, failure_message(error)
@@ -649,10 +680,10 @@ local function kill_owned_process(process: system.Process)
   end
 end
 
-local function capture_failure(command: string,
-                               diagnostic: string): {string: value}
+local function capture_failure(command: string, diagnostic: string,
+                               started: boolean): {string: value}
   return {
-    ["started"] = false,
+    ["started"] = started,
     ["ok"] = false,
     ["command"] = command,
     ["diagnostic"] = diagnostic,
@@ -684,11 +715,13 @@ local function capture_process(process: system.Process,
     when failed: failure then
       return capture_failure(
         command, "could not capture command output: " ..
-        failure_message(failure.error))
+        failure_message(failure.error), true)
     when cancelled then
-      return capture_failure(command, "captured command reader was cancelled")
+      return capture_failure(
+        command, "captured command reader was cancelled", true)
     else
-      return capture_failure(command, "captured command reader did not finish")
+      return capture_failure(
+        command, "captured command reader did not finish", true)
     end
 
     local status?: system.ExitStatus = nil
@@ -697,11 +730,14 @@ local function capture_process(process: system.Process,
     when failed: failure then
       return capture_failure(
         command, (captured as string) ..
-        "\nfailed waiting for command: " .. failure_message(failure.error))
+        "\nfailed waiting for command: " .. failure_message(failure.error),
+        true)
     when cancelled then
-      return capture_failure(command, "captured command wait was cancelled")
+      return capture_failure(
+        command, "captured command wait was cancelled", true)
     else
-      return capture_failure(command, "captured command wait did not finish")
+      return capture_failure(
+        command, "captured command wait did not finish", true)
     end
 
     local actual = status as system.ExitStatus
@@ -742,22 +778,68 @@ local function capture_process(process: system.Process,
   end
 end
 
-local function spawn_and_capture(env_arguments: {string}, command: string,
-                                 merged: boolean): {string: value}
+local function capture_spawned_process(process: system.Process,
+                                       command: string): {string: value}
+  return capture_process(process, command)
+catch
+  -- system.spawn already transferred a live child to this scope. Preserve
+  -- that physical-launch fact even when pipe setup or capture fails before a
+  -- normal exit status can be reported.
+  kill_owned_process(process)
+  if error is async.CancellationReason then raise end
+  return capture_failure(
+    command, "could not capture started command: " ..
+    failure_message(error), true)
+end
+
+local function spawn_and_capture_untimed(
+    env_arguments: {string}, command: string,
+    merged: boolean): {string: value}
   if merged then
     local process = system.spawn(
       "/usr/bin/env", env_arguments, system.with_merged_output)
-    return capture_process(process, command)
+    return capture_spawned_process(process, command)
   end
   -- This matches io.popen(command, "r"): stdout is captured while stderr
   -- remains the language-server process's diagnostic stream.
   local process = system.spawn(
     "/usr/bin/env", env_arguments, system.with_parent_stderr)
-  return capture_process(process, command)
+  return capture_spawned_process(process, command)
 catch
   if error is async.CancellationReason then raise end
   return capture_failure(
-    command, "could not start captured command: " .. failure_message(error))
+    command, "could not start captured command: " .. failure_message(error),
+    false)
+end
+
+-- Measure the complete physical-child interval, including spawn, concurrent
+-- pipe draining, and the authoritative wait/reap Task. Process CPU time cannot
+-- represent this duration because the compiler runs in another process.
+local function monotonic_ms(): float
+  return monotonic.vscode_titan_monotonic_ms()
+end
+
+local function elapsed_monotonic_ms(started: float,
+                                    finished: float): float?
+  if started < 0.0 or started ~= started or started >= math.huge or
+     finished < 0.0 or finished ~= finished or finished >= math.huge or
+     finished < started then
+    return nil
+  end
+  return finished - started
+end
+
+local function spawn_and_capture(env_arguments: {string}, command: string,
+                                 merged: boolean): {string: value}
+  local started = monotonic_ms()
+  local result = spawn_and_capture_untimed(
+    env_arguments, command, merged)
+  local elapsed? = elapsed_monotonic_ms(started, monotonic_ms())
+  if elapsed ~= nil then
+    local measured = elapsed as float
+    result["wall_ms"] = measured
+  end
+  return result
 end
 
 local function run_checked(argv_value: value,

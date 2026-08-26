@@ -497,6 +497,99 @@ return function(mode, contextual_provider_file)
           name, "/workspace/fixture.titan", "complete",
           7.0, 9.0, 2.0, 3.0)
       end
+      if mode == "probe-tracing" then
+        assert(type(options.c_probe_semantic_trace) == "function")
+        assert(type(options.c_probe_execution_trace) == "function")
+        local semantic_ok = pcall(options.c_probe_semantic_trace, {
+          event = "semantic_result",
+          module = name,
+          key = string.rep("a", 64),
+          probe_kind = "unsafe_object_pointer",
+          header_identity = string.rep("b", 64),
+          header_label = "lua.h + uv.h",
+          outcome = "compiler_rejection",
+          cache_tier = "persistent",
+          repeated = true,
+          publication = "existing",
+          source = "must not cross the bridge",
+          argv = { "must", "not", "cross" },
+          diagnostic = "must not cross the bridge",
+        })
+        assert(semantic_ok)
+        local diagnostic_publication_ok =
+          pcall(options.c_probe_semantic_trace, {
+            event = "semantic_result",
+            module = name,
+            key = string.rep("9", 64),
+            probe_kind = "unsafe_object_pointer",
+            header_identity = string.rep("8", 64),
+            header_label = "lua.h + uv.h",
+            outcome = "success",
+            cache_tier = "compiler",
+            repeated = false,
+            publication = "diagnostic_not_persisted",
+          })
+        assert(diagnostic_publication_ok)
+        local execution_ok = pcall(options.c_probe_execution_trace, {
+          event = "compiler_execution",
+          module = name,
+          key = string.rep("c", 64),
+          probe_kind = "declaration_compatibility",
+          batch_kind = "batch",
+          header_identity = string.rep("d", 64),
+          header_label = "lua.h + uv.h",
+          outcome = "success",
+          persistent_lookup = "miss",
+          publication = "published",
+          started = true,
+          wall_ms = 12.5,
+          command = "must not cross the bridge",
+          source = "must not cross the bridge",
+        })
+        assert(execution_ok)
+        local oversized_ok = pcall(options.c_probe_semantic_trace, {
+          event = "semantic_result",
+          module = name,
+          key = string.rep("e", 64),
+          probe_kind = "c_operator",
+          header_identity = "",
+          header_label = string.rep("x", 4097),
+          outcome = "success",
+          cache_tier = "compiler",
+          repeated = false,
+          publication = "not_applicable",
+        })
+        assert(not oversized_ok)
+        local duration_ok = pcall(options.c_probe_execution_trace, {
+          event = "compiler_execution",
+          module = name,
+          key = string.rep("f", 64),
+          probe_kind = "c_operator",
+          batch_kind = "single",
+          header_identity = "",
+          header_label = "",
+          outcome = "success",
+          persistent_lookup = "disabled",
+          publication = "not_applicable",
+          started = true,
+          wall_ms = 0 / 0,
+        })
+        assert(not duration_ok)
+        local started_ok = pcall(options.c_probe_execution_trace, {
+          event = "compiler_execution",
+          module = name,
+          key = string.rep("f", 64),
+          probe_kind = "c_operator",
+          batch_kind = "single",
+          header_identity = "",
+          header_label = "",
+          outcome = "infrastructure_failure",
+          persistent_lookup = "not_applicable",
+          publication = "not_applicable",
+          started = "yes",
+        })
+        assert(not started_ok)
+      end
       return true, module_type(name), {}, {}
     end
   end
@@ -679,6 +772,23 @@ function test_compiler_bridge_accepts_parse_and_check_source_profile_fields(
     })
     test.assert(#analysis.diagnostics == 0,
                 "source-profile callback changed compiler analysis")
+  end)
+end
+
+function test_compiler_bridge_bounds_and_types_c_probe_trace_callbacks(
+    _context: test.Context)
+  local previous_level = logging.level()
+  defer logging.configure(previous_level)
+  test.assert(logging.configure("trace"),
+              "C-probe trace fixture could not enable trace logging")
+  with_fixture("probe-tracing", function ()
+    local compiler = bridge.load()
+    local analysis = compiler:analyze("fixture", {
+      bridge.ProjectModule.new("fixture", {bridge.SourceFile.new(
+        "/workspace/fixture.titan", "saved fixture")}),
+    })
+    test.assert(#analysis.diagnostics == 0,
+                "C-probe trace callbacks changed compiler analysis")
   end)
 end
 
@@ -1235,6 +1345,14 @@ function test_compiler_bridge_reuses_unchanged_full_ast_incrementally(
 end
 
 local function joins_source_imported_local_function_definition_identity()
+  local generated_archive = "bridge_source_definition_consumer.a"
+  local generated_shared = "bridge_source_definition_consumer.so"
+  do fs.unlink(generated_archive) catch end
+  do fs.unlink(generated_shared) catch end
+  defer do
+    do fs.unlink(generated_archive) catch end
+    do fs.unlink(generated_shared) catch end
+  end
   preload_real_compiler()
   -- Source-defined foreign functions require a writable sibling directory for
   -- the compiler's temporary checking header, even though project source reads

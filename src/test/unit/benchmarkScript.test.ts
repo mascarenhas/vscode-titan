@@ -73,10 +73,53 @@ interface ProbeCacheProfile {
   };
 }
 
+interface LogicalProbeCounts {
+  requests: number;
+  uniqueKeys: number;
+  repeatedRequests: number;
+}
+
+interface PhysicalProbeCounts {
+  attempts: number;
+  launches: number;
+  measuredLaunches: number;
+  childWallMs: number;
+}
+
+interface ProbeTraceProfile {
+  logical: {
+    totals: LogicalProbeCounts;
+    outcomes: Array<LogicalProbeCounts & { outcome: string }>;
+    tiers: Array<LogicalProbeCounts & { cacheTier: string }>;
+    repetitions: Array<LogicalProbeCounts & { repeated: boolean }>;
+    publications: Array<LogicalProbeCounts & { publication: string }>;
+    modules: Array<LogicalProbeCounts & { moduleName: string }>;
+    headerContexts: Array<LogicalProbeCounts & {
+      headerIdentity: string;
+      headerLabel: string;
+    }>;
+  };
+  physical: {
+    totals: PhysicalProbeCounts;
+    outcomes: Array<PhysicalProbeCounts & { outcome: string }>;
+    batchKinds: Array<PhysicalProbeCounts & { batchKind: string }>;
+    persistentLookups: Array<PhysicalProbeCounts & {
+      persistentLookup: string;
+    }>;
+    publications: Array<PhysicalProbeCounts & { publication: string }>;
+    modules: Array<PhysicalProbeCounts & { moduleName: string }>;
+    headerContexts: Array<PhysicalProbeCounts & {
+      headerIdentity: string;
+      headerLabel: string;
+    }>;
+  };
+}
+
 interface ColdProfile {
   modules: ModuleProfileRow[];
   headers: HeaderProfileRow[];
   probeCaches?: ProbeCacheProfile;
+  probeTraces?: ProbeTraceProfile;
   totals: {
     modules: Omit<ModuleProfileRow,
       "moduleName" | "filename" | "inclusiveCpuMs" |
@@ -312,6 +355,7 @@ describe("language-server cold profile aggregation", () => {
     });
     assert.equal(profile.totals.attributedCpuMs, 15.5);
     assert.equal(profile.probeCaches, undefined);
+    assert.equal(profile.probeTraces, undefined);
   });
 
   test("counts header calls from process totals without double-counting components",
@@ -477,7 +521,266 @@ describe("language-server cold profile aggregation", () => {
     });
   });
 
-  test("omits absent profiles and rejects invalid trace durations and identities",
+  test("aggregates logical and physical C-probe lifecycle traces", async () => {
+    const keyA = "a".repeat(64);
+    const keyB = "b".repeat(64);
+    const keyC = "c".repeat(64);
+    const headerOne = "1".repeat(64);
+    const headerTwo = "2".repeat(64);
+    const headerOneLabel = "lua.h + uv.h";
+    const headerTwoLabel = "fixture_probe.h";
+    const semantic = (
+      moduleName: string,
+      key: string,
+      headerIdentity: string,
+      headerLabel: string,
+      outcome: string,
+      cacheTier: string,
+      repeated: boolean,
+      publication: string
+    ) => ({
+      event: "compiler.c_probe.semantic",
+      root_module: "project.root",
+      module_name: moduleName,
+      key,
+      probe_kind: "unsafe_object_pointer",
+      header_identity: headerIdentity,
+      header_label: headerLabel,
+      outcome,
+      cache_tier: cacheTier,
+      repeated,
+      publication
+    });
+    const execution = (
+      moduleName: string,
+      key: string,
+      headerIdentity: string,
+      headerLabel: string,
+      outcome: string,
+      batchKind: string,
+      persistentLookup: string,
+      publication: string,
+      started: boolean,
+      wallMs?: number
+    ) => ({
+      event: "compiler.c_probe.execution",
+      root_module: "project.root",
+      module_name: moduleName,
+      key,
+      probe_kind: "declaration_compatibility",
+      batch_kind: batchKind,
+      header_identity: headerIdentity,
+      header_label: headerLabel,
+      outcome,
+      persistent_lookup: persistentLookup,
+      publication,
+      started,
+      ...(wallMs === undefined ? {} : { wall_ms: wallMs })
+    });
+
+    const profile = await aggregateColdProfile([
+      semantic("project.a", keyA, headerOne, headerOneLabel, "success",
+        "compiler", false, "diagnostic_not_persisted"),
+      semantic("project.a", keyA, headerOne, headerOneLabel, "success",
+        "service", true, "existing"),
+      semantic("project.b", keyB, headerOne, headerOneLabel,
+        "compiler_rejection", "persistent", false, "existing"),
+      semantic("project.b", keyC, headerTwo, headerTwoLabel,
+        "infrastructure_failure", "compiler", false, "failed"),
+      semantic("project.b", keyC, headerTwo, headerTwoLabel,
+        "infrastructure_failure", "compiler", true, "not_applicable"),
+      execution("project.a", keyA, headerOne, headerOneLabel, "success",
+        "single", "miss", "published", true, 10.25),
+      execution("project.a", keyA, headerOne, headerOneLabel,
+        "compiler_rejection", "single", "hit", "existing", true, 2),
+      execution("project.b", keyB, headerTwo, headerTwoLabel,
+        "compiler_rejection", "batch", "mixed", "mixed", true, 20.5),
+      execution("project.b", keyC, headerTwo, headerTwoLabel,
+        "infrastructure_failure", "single", "io_error", "failed", false,
+        99)
+    ]);
+
+    assert.ok(profile?.probeTraces);
+    assert.deepEqual(profile.probeTraces.logical.totals, {
+      requests: 5,
+      uniqueKeys: 3,
+      repeatedRequests: 2
+    });
+    assert.deepEqual(profile.probeTraces.logical.outcomes, [
+      {
+        outcome: "infrastructure_failure",
+        requests: 2,
+        uniqueKeys: 1,
+        repeatedRequests: 1
+      },
+      {
+        outcome: "success",
+        requests: 2,
+        uniqueKeys: 1,
+        repeatedRequests: 1
+      },
+      {
+        outcome: "compiler_rejection",
+        requests: 1,
+        uniqueKeys: 1,
+        repeatedRequests: 0
+      }
+    ]);
+    assert.deepEqual(profile.probeTraces.logical.tiers, [
+      {
+        cacheTier: "compiler", requests: 3, uniqueKeys: 2,
+        repeatedRequests: 1
+      },
+      {
+        cacheTier: "persistent", requests: 1, uniqueKeys: 1,
+        repeatedRequests: 0
+      },
+      {
+        cacheTier: "service", requests: 1, uniqueKeys: 1,
+        repeatedRequests: 1
+      }
+    ]);
+    assert.deepEqual(profile.probeTraces.logical.repetitions, [
+      { repeated: false, requests: 3, uniqueKeys: 3, repeatedRequests: 0 },
+      { repeated: true, requests: 2, uniqueKeys: 2, repeatedRequests: 2 }
+    ]);
+    assert.deepEqual(profile.probeTraces.logical.publications, [
+      {
+        publication: "existing", requests: 2, uniqueKeys: 2,
+        repeatedRequests: 1
+      },
+      {
+        publication: "diagnostic_not_persisted", requests: 1, uniqueKeys: 1,
+        repeatedRequests: 0
+      },
+      {
+        publication: "failed", requests: 1, uniqueKeys: 1,
+        repeatedRequests: 0
+      },
+      {
+        publication: "not_applicable", requests: 1, uniqueKeys: 1,
+        repeatedRequests: 1
+      }
+    ]);
+    assert.deepEqual(profile.probeTraces.logical.modules, [
+      {
+        moduleName: "project.b", requests: 3, uniqueKeys: 2,
+        repeatedRequests: 1
+      },
+      {
+        moduleName: "project.a", requests: 2, uniqueKeys: 1,
+        repeatedRequests: 1
+      }
+    ]);
+    assert.deepEqual(profile.probeTraces.logical.headerContexts, [
+      {
+        headerIdentity: headerOne,
+        headerLabel: headerOneLabel,
+        requests: 3,
+        uniqueKeys: 2,
+        repeatedRequests: 1
+      },
+      {
+        headerIdentity: headerTwo,
+        headerLabel: headerTwoLabel,
+        requests: 2,
+        uniqueKeys: 1,
+        repeatedRequests: 1
+      }
+    ]);
+    assert.deepEqual(profile.probeTraces.physical.totals, {
+      attempts: 4,
+      launches: 3,
+      measuredLaunches: 3,
+      childWallMs: 32.75
+    });
+    assert.deepEqual(profile.probeTraces.physical.modules, [
+      {
+        moduleName: "project.b", attempts: 2, launches: 1,
+        measuredLaunches: 1,
+        childWallMs: 20.5
+      },
+      {
+        moduleName: "project.a", attempts: 2, launches: 2,
+        measuredLaunches: 2,
+        childWallMs: 12.25
+      }
+    ]);
+    assert.deepEqual(profile.probeTraces.physical.headerContexts, [
+      {
+        headerIdentity: headerTwo, headerLabel: headerTwoLabel,
+        attempts: 2, launches: 1, measuredLaunches: 1,
+        childWallMs: 20.5
+      },
+      {
+        headerIdentity: headerOne, headerLabel: headerOneLabel,
+        attempts: 2, launches: 2, measuredLaunches: 2,
+        childWallMs: 12.25
+      }
+    ]);
+    assert.deepEqual(profile.probeTraces.physical.outcomes[0], {
+      outcome: "compiler_rejection",
+      attempts: 2,
+      launches: 2,
+      measuredLaunches: 2,
+      childWallMs: 22.5
+    });
+    assert.deepEqual(profile.probeTraces.physical.batchKinds, [
+      {
+        batchKind: "batch",
+        attempts: 1,
+        launches: 1,
+        measuredLaunches: 1,
+        childWallMs: 20.5
+      },
+      {
+        batchKind: "single",
+        attempts: 3,
+        launches: 2,
+        measuredLaunches: 2,
+        childWallMs: 12.25
+      }
+    ]);
+    assert.deepEqual(profile.probeTraces.physical.persistentLookups, [
+      {
+        persistentLookup: "mixed",
+        attempts: 1,
+        launches: 1,
+        measuredLaunches: 1,
+        childWallMs: 20.5
+      },
+      {
+        persistentLookup: "miss",
+        attempts: 1,
+        launches: 1,
+        measuredLaunches: 1,
+        childWallMs: 10.25
+      },
+      {
+        persistentLookup: "hit",
+        attempts: 1,
+        launches: 1,
+        measuredLaunches: 1,
+        childWallMs: 2
+      },
+      {
+        persistentLookup: "io_error",
+        attempts: 1,
+        launches: 0,
+        measuredLaunches: 0,
+        childWallMs: 0
+      }
+    ]);
+    assert.deepEqual(profile.probeTraces.physical.publications[0], {
+      publication: "mixed",
+      attempts: 1,
+      launches: 1,
+      measuredLaunches: 1,
+      childWallMs: 20.5
+    });
+  });
+
+  test("omits absent profiles, rejects invalid traces, and stabilizes labels",
   async () => {
     assert.equal(await aggregateColdProfile([
       { event: "server.start", cpu_ms: 10 }
@@ -623,6 +926,139 @@ describe("language-server cold profile aggregation", () => {
       key: "persistent:bad",
       path: 42
     }]), /path must be a nonempty string/);
+    await assert.rejects(aggregateColdProfile([{
+      event: "compiler.c_probe.semantic",
+      root_module: "project.root",
+      module_name: "project.bad",
+      key: "not-a-digest",
+      probe_kind: "c_operator",
+      header_identity: "",
+      header_label: "",
+      outcome: "success",
+      cache_tier: "compiler",
+      repeated: false,
+      publication: "not_applicable"
+    }]), /key must be a 64-byte hex digest/);
+    await assert.rejects(aggregateColdProfile([{
+      event: "compiler.c_probe.semantic",
+      root_module: "project.root",
+      module_name: "project.bad",
+      key: "a".repeat(64),
+      probe_kind: "c_operator",
+      header_identity: "",
+      header_label: "",
+      outcome: "cached",
+      cache_tier: "compiler",
+      repeated: false,
+      publication: "not_applicable"
+    }]), /outcome has unsupported value/);
+    await assert.rejects(aggregateColdProfile([{
+      event: "compiler.c_probe.execution",
+      root_module: "project.root",
+      module_name: "project.bad",
+      key: "a".repeat(64),
+      probe_kind: "c_operator",
+      batch_kind: "single",
+      header_identity: "",
+      header_label: "",
+      outcome: "success",
+      persistent_lookup: "miss",
+      publication: "not_applicable",
+      started: true,
+      wall_ms: -0.1
+    }]), /wall_ms must be a finite nonnegative number/);
+    await assert.rejects(aggregateColdProfile([{
+      event: "compiler.c_probe.execution",
+      root_module: "project.root",
+      module_name: "project.bad",
+      key: "a".repeat(64),
+      probe_kind: "c_operator",
+      batch_kind: "single",
+      header_identity: "",
+      header_label: "",
+      outcome: "success",
+      persistent_lookup: "miss",
+      publication: "not_applicable",
+      started: "yes"
+    }]), /started must be a boolean/);
+    await assert.rejects(aggregateColdProfile([{
+      event: "compiler.c_probe.semantic",
+      root_module: "project.root",
+      module_name: "project.bad",
+      key: "a".repeat(64),
+      probe_kind: "c_operator",
+      header_identity: "context",
+      header_label: "💥".repeat(1025),
+      outcome: "success",
+      cache_tier: "compiler",
+      repeated: false,
+      publication: "not_applicable"
+    }]), /header_label must be a string of at most 4096 bytes/);
+    const equivalentLabels = await aggregateColdProfile([{
+      event: "compiler.c_probe.semantic",
+      root_module: "project.root",
+      module_name: "project.bad",
+      key: "a".repeat(64),
+      probe_kind: "c_operator",
+      header_identity: "same-context",
+      header_label: "lua.h",
+      outcome: "success",
+      cache_tier: "compiler",
+      repeated: false,
+      publication: "not_applicable"
+    }, {
+      event: "compiler.c_probe.execution",
+      root_module: "project.root",
+      module_name: "project.bad",
+      key: "a".repeat(64),
+      probe_kind: "c_operator",
+      batch_kind: "single",
+      header_identity: "same-context",
+      header_label: "uv.h",
+      outcome: "success",
+      persistent_lookup: "miss",
+      publication: "not_applicable",
+      started: true
+    }]);
+    assert.equal(
+      equivalentLabels?.probeTraces?.logical.headerContexts[0].headerLabel,
+      "lua.h");
+    assert.equal(
+      equivalentLabels?.probeTraces?.physical.headerContexts[0].headerLabel,
+      "lua.h");
+
+    const reversedLabels = await aggregateColdProfile([{
+      event: "compiler.c_probe.execution",
+      root_module: "project.root",
+      module_name: "project.bad",
+      key: "a".repeat(64),
+      probe_kind: "c_operator",
+      batch_kind: "single",
+      header_identity: "same-context",
+      header_label: "uv.h",
+      outcome: "success",
+      persistent_lookup: "miss",
+      publication: "not_applicable",
+      started: true
+    }, {
+      event: "compiler.c_probe.semantic",
+      root_module: "project.root",
+      module_name: "project.bad",
+      key: "a".repeat(64),
+      probe_kind: "c_operator",
+      header_identity: "same-context",
+      header_label: "lua.h",
+      outcome: "success",
+      cache_tier: "compiler",
+      repeated: false,
+      publication: "not_applicable"
+    }]);
+    assert.equal(
+      reversedLabels?.probeTraces?.logical.headerContexts[0].headerLabel,
+      "lua.h");
+    assert.equal(
+      reversedLabels?.probeTraces?.physical.headerContexts[0].headerLabel,
+      "lua.h");
   });
 
   test("rejects oversized structured profile lines independent of chunking",

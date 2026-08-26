@@ -15,6 +15,7 @@ local PARSER_MODULE = "titan-compiler.parser"
 local CHECKER_MODULE = "titan-compiler.checker"
 local TYPES_MODULE = "titan-compiler.types"
 local DRIVER_MODULE = "titan-compiler.driver"
+local C_PROBE_TRACE_STRING_BYTES = 4096
 
 record BridgeError
   module_name: string
@@ -279,6 +280,35 @@ record AnalysisProgress
   const total_files: integer
 end
 
+-- These records are the complete language-server view of the compiler's
+-- C-probe lifecycle. Keep the dynamic Lua tables at this one boundary: source,
+-- argv, diagnostics, commands, and cache paths are intentionally absent.
+local record CProbeSemanticTrace
+  module_name: string
+  key: string
+  probe_kind: string
+  header_identity: string
+  header_label: string
+  outcome: string
+  cache_tier: string
+  repeated: boolean
+  publication: string
+end
+
+local record CProbeExecutionTrace
+  module_name: string
+  key: string
+  probe_kind: string
+  batch_kind: string
+  header_identity: string
+  header_label: string
+  outcome: string
+  persistent_lookup: string
+  publication: string
+  started: boolean
+  wall_ms: float?
+end
+
 type ProgressListener = (AnalysisProgress) -> ()
 
 -- Only unchanged external source modules use this serialized boundary. Clean
@@ -370,6 +400,194 @@ local function required_boolean(candidate: value, module_name: string,
   return result
 catch
   return fail<boolean>(module_name, subject .. " must be a boolean")
+end
+
+local function bounded_trace_string(candidate: value, subject: string,
+                                    allow_empty: boolean): string
+  local result = required_string(candidate, DRIVER_MODULE, subject)
+  if (not allow_empty and result == "") or
+     #result > C_PROBE_TRACE_STRING_BYTES then
+    local expectation = "a nonempty"
+    if allow_empty then expectation = "a" end
+    return fail<string>(DRIVER_MODULE,
+      subject .. " must be " .. expectation .. " string of at most " ..
+      C_PROBE_TRACE_STRING_BYTES .. " bytes")
+  end
+  return result
+end
+
+local function probe_trace_outcome(candidate: value,
+                                   subject: string): string
+  local result = bounded_trace_string(candidate, subject, false)
+  if result ~= "success" and result ~= "compiler_rejection" and
+     result ~= "infrastructure_failure" then
+    return fail<string>(DRIVER_MODULE,
+      subject .. " has unsupported value '" .. result .. "'")
+  end
+  return result
+end
+
+local function probe_trace_publication(candidate: value,
+                                       subject: string): string
+  local result = bounded_trace_string(candidate, subject, false)
+  if result ~= "not_applicable" and result ~= "published" and
+     result ~= "existing" and result ~= "failed" and
+     result ~= "conflict" and result ~= "disabled" and
+     result ~= "unstable_diagnostic" and result ~= "too_large" and
+     result ~= "diagnostic_not_persisted" and
+     result ~= "mixed" then
+    return fail<string>(DRIVER_MODULE,
+      subject .. " has unsupported value '" .. result .. "'")
+  end
+  return result
+end
+
+local function probe_trace_wall_ms(candidate: value,
+                                   subject: string): float?
+  if candidate == nil then return nil end
+  local result = candidate as float
+  if result < 0.0 or result ~= result or result >= math.huge then
+    return fail<float?>(DRIVER_MODULE,
+      subject .. " must be a finite nonnegative number")
+  end
+  return result
+catch
+  if error is BridgeError then raise end
+  return fail<float?>(DRIVER_MODULE,
+    subject .. " must be a finite nonnegative number")
+end
+
+local function normalize_c_probe_semantic_trace(
+    candidate: value): CProbeSemanticTrace
+  local subject = "compiler C-probe semantic trace"
+  local raw = required_map(candidate, DRIVER_MODULE, subject)
+  local event = bounded_trace_string(
+    raw["event"], subject .. ".event", false)
+  if event ~= "semantic_result" then
+    return fail<CProbeSemanticTrace>(DRIVER_MODULE,
+      subject .. ".event must be 'semantic_result'")
+  end
+  local key = bounded_trace_string(raw["key"], subject .. ".key", false)
+  if #key ~= 64 then
+    return fail<CProbeSemanticTrace>(DRIVER_MODULE,
+      subject .. ".key must be a 64-byte digest")
+  end
+  local tier = bounded_trace_string(
+    raw["cache_tier"], subject .. ".cache_tier", false)
+  if tier ~= "service" and tier ~= "analysis" and
+     tier ~= "persistent" and tier ~= "compiler" then
+    return fail<CProbeSemanticTrace>(DRIVER_MODULE,
+      subject .. ".cache_tier has unsupported value '" .. tier .. "'")
+  end
+  return CProbeSemanticTrace.new(
+    bounded_trace_string(raw["module"], subject .. ".module", true),
+    key,
+    bounded_trace_string(
+      raw["probe_kind"], subject .. ".probe_kind", false),
+    bounded_trace_string(
+      raw["header_identity"], subject .. ".header_identity", true),
+    bounded_trace_string(
+      raw["header_label"], subject .. ".header_label", true),
+    probe_trace_outcome(raw["outcome"], subject .. ".outcome"),
+    tier,
+    required_boolean(raw["repeated"], DRIVER_MODULE,
+      subject .. ".repeated"),
+    probe_trace_publication(
+      raw["publication"], subject .. ".publication"))
+end
+
+local function normalize_c_probe_execution_trace(
+    candidate: value): CProbeExecutionTrace
+  local subject = "compiler C-probe execution trace"
+  local raw = required_map(candidate, DRIVER_MODULE, subject)
+  local event = bounded_trace_string(
+    raw["event"], subject .. ".event", false)
+  if event ~= "compiler_execution" then
+    return fail<CProbeExecutionTrace>(DRIVER_MODULE,
+      subject .. ".event must be 'compiler_execution'")
+  end
+  local key = bounded_trace_string(raw["key"], subject .. ".key", false)
+  if #key ~= 64 then
+    return fail<CProbeExecutionTrace>(DRIVER_MODULE,
+      subject .. ".key must be a 64-byte digest")
+  end
+  local batch_kind = bounded_trace_string(
+    raw["batch_kind"], subject .. ".batch_kind", false)
+  if batch_kind ~= "single" and batch_kind ~= "batch" then
+    return fail<CProbeExecutionTrace>(DRIVER_MODULE,
+      subject .. ".batch_kind has unsupported value '" ..
+      batch_kind .. "'")
+  end
+  local lookup = bounded_trace_string(
+    raw["persistent_lookup"], subject .. ".persistent_lookup", false)
+  if lookup ~= "not_applicable" and lookup ~= "disabled" and
+     lookup ~= "memory" and lookup ~= "hit" and lookup ~= "miss" and
+     lookup ~= "invalid" and lookup ~= "io_error" and
+     lookup ~= "mixed" then
+    return fail<CProbeExecutionTrace>(DRIVER_MODULE,
+      subject .. ".persistent_lookup has unsupported value '" ..
+      lookup .. "'")
+  end
+  return CProbeExecutionTrace.new(
+    bounded_trace_string(raw["module"], subject .. ".module", true),
+    key,
+    bounded_trace_string(
+      raw["probe_kind"], subject .. ".probe_kind", false),
+    batch_kind,
+    bounded_trace_string(
+      raw["header_identity"], subject .. ".header_identity", true),
+    bounded_trace_string(
+      raw["header_label"], subject .. ".header_label", true),
+    probe_trace_outcome(raw["outcome"], subject .. ".outcome"),
+    lookup,
+    probe_trace_publication(
+      raw["publication"], subject .. ".publication"),
+    required_boolean(raw["started"], DRIVER_MODULE,
+      subject .. ".started"),
+    probe_trace_wall_ms(raw["wall_ms"], subject .. ".wall_ms"))
+end
+
+local function emit_c_probe_semantic_trace(root_module: string,
+                                           candidate: value)
+  local trace = normalize_c_probe_semantic_trace(candidate)
+  logging.emit("trace", "compiler.c_probe.semantic", {
+    json.Member.new("root_module", json.from_string(root_module)),
+    json.Member.new("module_name", json.from_string(trace.module_name)),
+    json.Member.new("key", json.from_string(trace.key)),
+    json.Member.new("probe_kind", json.from_string(trace.probe_kind)),
+    json.Member.new(
+      "header_identity", json.from_string(trace.header_identity)),
+    json.Member.new("header_label", json.from_string(trace.header_label)),
+    json.Member.new("outcome", json.from_string(trace.outcome)),
+    json.Member.new("cache_tier", json.from_string(trace.cache_tier)),
+    json.Member.new("repeated", json.from_boolean(trace.repeated)),
+    json.Member.new("publication", json.from_string(trace.publication)),
+  })
+end
+
+local function emit_c_probe_execution_trace(root_module: string,
+                                            candidate: value)
+  local trace = normalize_c_probe_execution_trace(candidate)
+  local fields: {json.Member} = {
+    json.Member.new("root_module", json.from_string(root_module)),
+    json.Member.new("module_name", json.from_string(trace.module_name)),
+    json.Member.new("key", json.from_string(trace.key)),
+    json.Member.new("probe_kind", json.from_string(trace.probe_kind)),
+    json.Member.new("batch_kind", json.from_string(trace.batch_kind)),
+    json.Member.new(
+      "header_identity", json.from_string(trace.header_identity)),
+    json.Member.new("header_label", json.from_string(trace.header_label)),
+    json.Member.new("outcome", json.from_string(trace.outcome)),
+    json.Member.new(
+      "persistent_lookup", json.from_string(trace.persistent_lookup)),
+    json.Member.new("publication", json.from_string(trace.publication)),
+    json.Member.new("started", json.from_boolean(trace.started)),
+  }
+  if trace.wall_ms ~= nil then
+    fields[#fields + 1] = json.Member.new(
+      "wall_ms", json.from_number(trace.wall_ms as float))
+  end
+  logging.emit("trace", "compiler.c_probe.execution", fields)
 end
 
 local function required_string_list(candidate: value, module_name: string,
@@ -3417,9 +3635,19 @@ local function Compiler:run_attempt_inner(
           json.Member.new("path", json.from_string(path)),
         })
       end
+    local trace_probe_semantic: (value) -> () =
+      function (event: value)
+        emit_c_probe_semantic_trace(root_module, event)
+      end
+    local trace_probe_execution: (value) -> () =
+      function (event: value)
+        emit_c_probe_execution_trace(root_module, event)
+      end
     options["c_header_process_trace"] = trace_header_phase
     options["source_process_trace"] = trace_source_module
     options["c_probe_cache_trace"] = trace_probe_cache
+    options["c_probe_semantic_trace"] = trace_probe_semantic
+    options["c_probe_execution_trace"] = trace_probe_execution
   end
   local roots: {string: value} = {[root_module] = true}
   local active_overrides: {string: value} = {}

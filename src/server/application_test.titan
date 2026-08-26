@@ -1579,12 +1579,19 @@ end
 local function preserves_shared_refresh_after_owner_cancellation()
   with_application(function (filename: string, analyzer: YieldingAnalyzer,
                              app: application.Application)
+    -- This case exercises request cancellation, not kernel watcher delivery.
+    -- Arm the blocking analyzer before publishing the saved-change hint:
+    -- fs.write_file yields, so an active watcher could otherwise consume and
+    -- commit this revision while block is still false. The later forced rename
+    -- scan would then have no dirty work and never call the analyzer.
+    app:stop_watching_for_testing()
     fs.write_file(
       filename, "function answer(): integer return 123456 end\n")
     analyzer.block = true
     analyzer.started = false
     analyzer.finished = false
     local runs_before = analyzer.runs
+    app:note_saved_change()
 
     -- A fresh rename request joins the independently rooted refresh. Cancelling
     -- that request must detach its join without cancelling shared indexing.
@@ -1593,7 +1600,8 @@ local function preserves_shared_refresh_after_owner_cancellation()
       return app:handle(request_for(
         filename, 5, "textDocument/rename"))
     end)
-    while not analyzer.started do timer.yield() end
+    wait_until(function (): boolean return analyzer.started end,
+               "refresh owner did not start its shared recheck")
     test.assert(analyzer.runs == runs_before + 1,
                 "refresh owner did not start exactly one shared recheck")
 
