@@ -354,7 +354,7 @@ has evidence before moving to Done.
   rebuild; that run established the P0 negative-result cache work subsequently
   implemented by Titan #108 / PR #110.
 - The final PR #110 integration pins Titan commit
-  `4446c46709d6d90d94df5d9719a10512fd257a15` and compares one uniquely
+  `95b9a9f1da2e6b9bb26f723229bb5af681b82007` and compares one uniquely
   namespaced empty-cache run with its unchanged warm successor. Both indexed
   generation 89's 143 saved files in one initial epoch. The empty-cache run
   took 278,950.401 ms wall, 201,230 ms language-server-process CPU, and
@@ -380,4 +380,6 @@ has evidence before moving to Done.
   follow-up centralized the already enforced 1 MiB persistent-diagnostic
   bound in the record codec and added its direct regression. It does not alter
   cache keys, encoded bytes, or service behavior for any persistable result,
-  so the `a3b168a1` performance evidence remains representative.
+  so the `a3b168a1` performance evidence remains representative. The final
+  compiler follow-up restores the repository's documented 30/30/35-minute
+  Linux job timeouts and likewise changes no compiler or runtime behavior.
