@@ -212,7 +212,7 @@ initial generation is available.
 Compiler errors from each completed saved-file generation appear in VS Code's
 **Problems** view. Their locations are converted from compiler byte columns
 using the saved source text; unsaved editor contents are not diagnostic input.
-Repairing or deleting a file, changing the configured source root, or stopping
+Repairing or deleting a file, changing the configured source roots, or stopping
 the workspace language client clears the corresponding stale entries.
 
 ### Language-server diagnostics and protocol tracing
@@ -251,15 +251,27 @@ An optional `titan-config.lua` at the workspace root assigns configuration
 values as globals. Relative paths are resolved from that root:
 
 ```lua
-source_modules_root = "src"
+include = { ".", "./spec/stdlib/titan" }
+exclude = { "./examples", "./spec/fixtures" }
+source_module_roots = { ".", "./spec/stdlib/titan", "./vendor/titan" }
 binary_modules_root = ".titan/lib/titan/0.6"
 extra_ffi_include_dirs = { "include", "vendor/include" }
 extra_ffi_cppflags = "-DPROJECT_FFI=1 '-Ivendor path/include'"
 ```
 
-All fields are optional. The source root defaults to the workspace root, the
-binary root defaults to the compatible compiler installation, and the FFI
-include list defaults to empty. `extra_ffi_cppflags` is parsed with the
+All fields are optional. `include` and `source_module_roots` each independently
+default to `{ "./src" }`, `exclude` defaults to an empty list, the binary root
+defaults to the compatible compiler installation, and the FFI include list
+defaults to empty. `include` is the ordered set of roots recursively scanned
+for saved project modules and watched for `.titan` changes. `exclude` removes
+files or directory subtrees from that watch set without removing their saved
+modules from project discovery. `source_module_roots` is the compiler's
+complete ordered source-module search path. It normally starts with the
+project roots and may append external source folders that should not be
+watched. Its normalized entries are joined with `;` and installed as
+`TITAN_SOURCE_PATH`. A normalized source-module root therefore cannot contain
+`;`; watcher-only include roots do not have that restriction.
+`extra_ffi_cppflags` is parsed with the
 compiler's existing `TITAN_EXTRA_CPPFLAGS` shell-word rules and appended to
 the value inherited by the workspace-isolated server process. It accepts the
 same ordered `-I`/`-D` preprocessing arguments used by `titanc`. Unknown fields
@@ -272,11 +284,25 @@ This setting controls language-server analysis only. Keep the normal build's
 semantics and command-line compilation can intentionally see different C
 preprocessing environments.
 
+When include roots overlap, the most-specific configured root owns its
+physical subtree for project indexing. This gives each saved file one
+canonical logical module identity (required by semantic navigation) instead of
+indexing the same bytes twice under both ancestor- and nested-relative names.
+For distinct include roots that provide the same logical name, the first root
+wins. The server submits those saved project modules directly to the compiler,
+while preserving the complete `source_module_roots` order for every compiler
+source-module lookup.
+
 Project discovery intentionally ignores symlinked files and directories below
-the configured source root in version 1. This keeps project identity and the
-watch set inside the resolved source tree; use ordinary files/directories for
-project modules. This restriction does not prohibit opening the workspace root
-itself through a symlink, as described above.
+the configured include roots in version 1. This keeps project identity and the
+watch set inside the resolved source trees; use ordinary files/directories for
+project modules. A file or directory listed in `exclude` remains part of the
+recursive saved-source scan but is not watched. Its changes become visible on
+the next refresh triggered by another watched input. Conversely, a path listed
+only in `source_module_roots` is compiler-resolved external source: it is not
+watched, indexed, or a navigation target in version 1. This restriction does
+not prohibit opening the workspace root itself through a symlink, as described
+above.
 
 ## Package and install the VSIX
 

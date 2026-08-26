@@ -66,7 +66,7 @@ end
 
 local function configure_source_root(fixture: Fixture)
   fixture:write("titan-config.lua", [[
-source_modules_root = "src"
+include = { "src" }
 binary_modules_root = "binary-modules"
 ]])
 end
@@ -325,7 +325,7 @@ local function RecordingAnalyzer:analyze(
   end
   self.last_cached_count = #request.cached_sources
   if self.expected_source_root ~= nil then
-    test.assert(request.config.source_modules_root == self.expected_source_root,
+    test.assert(request.config:source_path() == self.expected_source_root,
                 "analysis request lost the normalized source root")
   end
 
@@ -674,6 +674,137 @@ end
 function test_project_service_loads_saved_multi_module_and_folder_snapshot(
     _context: test.Context)
   test_runtime.run(loads_multi_module_folder_and_external_metadata)
+end
+
+local function loads_ordered_roots_and_watch_exclusions()
+  with_fixture(function (fixture: Fixture)
+    fixture:mkdir("first")
+    fixture:mkdir("second")
+    fixture:mkdir("second/ignored")
+    fixture:mkdir("lookup")
+    fixture:mkdir("binary-modules")
+    fixture:write("titan-config.lua", [[
+include = { "first", "second" }
+exclude = { "second/ignored", "first/excluded_file.titan" }
+source_module_roots = { "first", "second", "lookup" }
+binary_modules_root = "binary-modules"
+]])
+    fixture:write("first/shared.titan", "-- first shared\n")
+    fixture:write("first/excluded_file.titan", "-- unwatched file\n")
+    fixture:write("second/shared.titan", "-- shadowed shared\n")
+    fixture:write("second/only.titan", "-- second root\n")
+    fixture:write("second/ignored/hidden.titan", "-- unwatched subtree\n")
+    fixture:write("lookup/external.titan", "-- source-only external\n")
+
+    local analyzer = new_analyzer()
+    analyzer.expected_source_root = fixture:path("first") .. ";" ..
+                                    fixture:path("second") .. ";" ..
+                                    fixture:path("lookup")
+    local service = require_service(fixture, analyzer)
+    local snapshot = service:latest()
+    test.assert(snapshot.config:source_path() ==
+                  analyzer.expected_source_root and
+                #snapshot.project_modules == 4 and
+                find_project(snapshot, "excluded_file") ~= nil and
+                find_project(snapshot, "ignored.hidden") ~= nil and
+                find_project(snapshot, "external") == nil and
+                find_project(snapshot, "only") ~= nil and
+                find_project(snapshot, "shared") ~= nil,
+                "watch ownership or compiler lookup roots were conflated")
+    local shared? = find_project(snapshot, "shared")
+    test.assert(shared ~= nil and
+                shared.source_files[1].filename ==
+                  fixture:path("first/shared.titan"),
+                "later source root replaced the first matching module")
+    test.assert(#snapshot.project_directories == 2 and
+                snapshot.project_directories[1] == fixture:path("first") and
+                snapshot.project_directories[2] == fixture:path("second"),
+                "excluded watch subtree remained in project directories")
+  end)
+end
+
+function test_project_service_preserves_ordered_roots_and_watch_exclusions(
+    _context: test.Context)
+  test_runtime.run(loads_ordered_roots_and_watch_exclusions)
+end
+
+local function reconciles_exclude_without_reanalysis()
+  with_fixture(function (fixture: Fixture)
+    fixture:mkdir("src")
+    fixture:mkdir("src/generated")
+    configure_source_root(fixture)
+    fixture:write("src/main.titan", "-- watched source\n")
+    fixture:write("src/generated/hidden.titan", "-- unwatched source\n")
+
+    local analyzer = new_analyzer()
+    local service = require_service(fixture, analyzer)
+    local before = service:counters()
+    fixture:write("titan-config.lua", [[
+include = { "src" }
+exclude = { "src/generated" }
+binary_modules_root = "binary-modules"
+]])
+
+    local report?, failure? = service:refresh()
+    local after = service:counters()
+    local snapshot = service:latest()
+    test.assert(failure == nil and report ~= nil and
+                not report.analyzed and not report.stale and
+                after.analysis_runs == before.analysis_runs and
+                after.project_modules_submitted ==
+                  before.project_modules_submitted,
+                "exclude-only change invalidated compatible analysis")
+    test.assert(#snapshot.config.exclude == 1 and
+                snapshot.config.exclude[1] ==
+                  fixture:path("src/generated") and
+                #snapshot.project_directories == 1 and
+                snapshot.project_directories[1] == fixture:path("src") and
+                #snapshot.project_modules == 2 and
+                find_project(snapshot, "generated.hidden") ~= nil,
+                "exclude-only change did not reconcile watcher policy")
+  end)
+end
+
+function test_project_service_reconciles_exclude_without_reanalysis(
+    _context: test.Context)
+  test_runtime.run(reconciles_exclude_without_reanalysis)
+end
+
+local function invalidates_changed_source_module_roots()
+  with_fixture(function (fixture: Fixture)
+    fixture:mkdir("src")
+    fixture:mkdir("lookup-one")
+    fixture:mkdir("lookup-two")
+    fixture:write("titan-config.lua", [[
+include = { "src" }
+source_module_roots = { "src", "lookup-one" }
+]])
+    fixture:write("src/main.titan", "-- project source\n")
+
+    local analyzer = new_analyzer()
+    local service = require_service(fixture, analyzer)
+    local before = service:counters()
+    fixture:write("titan-config.lua", [[
+include = { "src" }
+source_module_roots = { "src", "lookup-two" }
+]])
+
+    local report?, failure? = service:refresh()
+    local after = service:counters()
+    test.assert(failure == nil and report ~= nil and report.analyzed and
+                after.analysis_runs == before.analysis_runs + 1 and
+                after.project_modules_submitted ==
+                  before.project_modules_submitted + 1 and
+                service:latest().config:source_path() ==
+                  fixture:path("src") .. ";" ..
+                    fixture:path("lookup-two"),
+                "source-module-root change reused compiler configuration")
+  end)
+end
+
+function test_project_service_invalidates_changed_source_module_roots(
+    _context: test.Context)
+  test_runtime.run(invalidates_changed_source_module_roots)
 end
 
 local function preserves_malformed_module_diagnostics()
@@ -1138,7 +1269,7 @@ local function rekeys_externals_after_any_config_change()
     local before = service:counters()
 
     fixture:write("titan-config.lua", [[
-source_modules_root = "src"
+include = { "src" }
 binary_modules_root = "binary-modules"
 extra_ffi_include_dirs = { "include" }
 ]])
@@ -1168,7 +1299,7 @@ local function configuration_change_recovers_failed_revision()
     fixture:mkdir("include")
     configure_source_root(fixture)
     fixture:write("titan-config.lua", [[
-source_modules_root = "src"
+include = { "src" }
 binary_modules_root = "binary-modules"
 extra_ffi_include_dirs = { "include" }
 extra_ffi_cppflags = "-DPROJECT_SERVICE_FFI=0"
@@ -1219,7 +1350,7 @@ extra_ffi_cppflags = "-DPROJECT_SERVICE_FFI=0"
                 "unchanged configuration retried the failed revision")
 
     fixture:write("titan-config.lua", [[
-source_modules_root = "src"
+include = { "src" }
 binary_modules_root = "binary-modules"
 extra_ffi_include_dirs = { "include" }
 extra_ffi_cppflags = "-DPROJECT_SERVICE_FFI=1"
@@ -2367,6 +2498,7 @@ end
 
 local function loads_compiler_owned_default_binary_root()
   with_fixture(function (fixture: Fixture)
+    fixture:mkdir("src")
     local service?, failure? = project_service.load_default(fixture.root)
     test.assert(failure == nil and service ~= nil,
                 "default compiler-owned project service did not load")

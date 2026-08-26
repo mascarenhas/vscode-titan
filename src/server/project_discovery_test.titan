@@ -1,4 +1,5 @@
 local fs = import "fs"
+local os = import "os"
 local test = import "test"
 local strings = import "string"
 local discovery = import "server.project_discovery"
@@ -66,7 +67,7 @@ local function with_fixture(body: FixtureBody)
 end
 
 local function require_discovery(root: string): discovery.Discovery
-  local found?, failure? = discovery.discover(root)
+  local found?, failure? = discovery.discover({root}, {})
   test.assert(failure == nil and found ~= nil,
               "valid project source tree was not discovered")
   return found
@@ -212,16 +213,165 @@ function test_project_discovery_recomputes_folder_main_transitions(
   test_runtime.run(observes_folder_main_transitions)
 end
 
+local function scans_ordered_multiple_roots_once()
+  with_fixture(function (fixture: Fixture)
+    fixture:mkdir("first")
+    fixture:mkdir("second")
+    fixture:mkdir("second/nested")
+    fixture:write("first/shared.titan")
+    fixture:write("second/shared.titan")
+    fixture:write("second/only.titan")
+    fixture:write("second/nested/nested.titan")
+
+    local found?, failure? = discovery.discover(
+      {fixture:path("first"), fixture:path("second")}, {})
+    test.assert(failure == nil and found ~= nil,
+                "multiple source roots were rejected")
+    test.assert(#found.include_roots == 2 and
+                found.include_roots[1] == fixture:path("first") and
+                found.include_roots[2] == fixture:path("second"),
+                "include root order was not retained")
+    test.assert(#found.modules == 3 and
+                found:find_module("nested") ~= nil and
+                found:find_module("only") ~= nil and
+                found:find_module("shared") ~= nil,
+                "multiple roots did not produce one merged module catalog")
+    test.assert(found:owner_for_file(fixture:path("first/shared.titan")) ==
+                  "shared" and
+                found:owner_for_file(fixture:path("second/shared.titan")) ==
+                  nil,
+                "later root did not preserve first-root module precedence")
+  end)
+end
+
+function test_project_discovery_merges_ordered_include_roots(
+    _context: test.Context)
+  test_runtime.run(scans_ordered_multiple_roots_once)
+end
+
+local function gives_nested_include_its_own_module_identity()
+  with_fixture(function (fixture: Fixture)
+    fixture:mkdir("spec")
+    fixture:mkdir("spec/stdlib")
+    fixture:mkdir("spec/stdlib/titan")
+    fixture:mkdir("spec/stdlib/titan/support")
+    fixture:write("main.titan")
+    fixture:write("spec/stdlib/titan/support/runtime.titan")
+
+    local nested = fixture:path("spec/stdlib/titan")
+    local found?, failure? = discovery.discover({fixture.root, nested}, {})
+    test.assert(failure == nil and found ~= nil,
+                "overlapping source roots were rejected")
+    test.assert(#found.modules == 2 and
+                found:find_module("main") ~= nil and
+                found:find_module("support.runtime") ~= nil and
+                found:find_module("spec.stdlib.titan.support.runtime") == nil,
+                "nested include root did not own its physical subtree once")
+    test.assert(found:owner_for_file(
+                  fixture:path("spec/stdlib/titan/support/runtime.titan")) ==
+                  "support.runtime",
+                "nested include root lost source-file ownership")
+  end)
+end
+
+function test_project_discovery_partitions_overlapping_include_roots(
+    _context: test.Context)
+  test_runtime.run(gives_nested_include_its_own_module_identity)
+end
+
+local function canonicalizes_aliased_include_and_exclude_roots()
+  with_fixture(function (fixture: Fixture)
+    fixture:mkdir("actual")
+    fixture:mkdir("actual/pkg")
+    fixture:write("actual/root.titan")
+    fixture:write("actual/pkg/item.titan")
+    local actual = fixture:path("actual")
+    local nested = fixture:path("actual/pkg")
+    local linked = fixture:path("linked")
+    local linker = os.spawn("/bin/ln", {"-s", actual, linked})
+    local link_input? = linker.stdin
+    if link_input ~= nil then link_input:close() end
+    local link_status = linker:wait()
+    local link_output? = linker.stdout
+    if link_output ~= nil then link_output:close() end
+    local link_error? = linker.stderr
+    if link_error ~= nil then link_error:close() end
+    test.assert(link_status.code == 0 and link_status.signal == nil,
+                "could not create include-root symlink fixture")
+    defer fs.unlink(linked)
+
+    local found?, failure? = discovery.discover(
+      {linked, actual, nested}, {linked .. "/pkg"})
+    test.assert(failure == nil and found ~= nil,
+                "canonical include-root discovery failed")
+    test.assert(#found.include_roots == 2 and
+                found.include_roots[1] == linked and
+                found.include_roots[2] == nested,
+                "physical include aliases were not deduplicated in order")
+    test.assert(#found.modules == 2 and
+                found:find_module("root") ~= nil and
+                found:find_module("item") ~= nil and
+                found:find_module("pkg.item") == nil,
+                "aliased overlap indexed one physical subtree twice")
+    test.assert(#found.directories == 1 and
+                found.directories[1] == linked,
+                "aliased exclusion remained in the watcher directory set")
+    test.assert(found:owner_for_file(
+                  fixture:path("actual/pkg/item.titan")) == "item",
+                "canonical nested include lost lexical file ownership")
+  end)
+end
+
+function test_project_discovery_canonicalizes_include_and_exclude_aliases(
+    _context: test.Context)
+  test_runtime.run(canonicalizes_aliased_include_and_exclude_roots)
+end
+
+local function scans_but_does_not_watch_excluded_paths()
+  with_fixture(function (fixture: Fixture)
+    fixture:mkdir("src")
+    fixture:mkdir("src/ignored")
+    fixture:mkdir("src/ignored/deeper")
+    fixture:mkdir("src/kept")
+    fixture:write("src/ignored/hidden.titan")
+    fixture:write("src/ignored/deeper/inner.titan")
+    fixture:write("src/kept/excluded_file.titan")
+    fixture:write("src/kept/visible.titan")
+
+    local source = fixture:path("src")
+    local ignored = fixture:path("src/ignored")
+    local excluded_file = fixture:path("src/kept/excluded_file.titan")
+    local found?, failure? = discovery.discover(
+      {source}, {ignored, excluded_file})
+    test.assert(failure == nil and found ~= nil,
+                "watch exclusions made discovery fail")
+    test.assert(found:find_module("ignored.hidden") ~= nil and
+                found:find_module("ignored.deeper.inner") ~= nil and
+                found:find_module("kept.excluded_file") ~= nil and
+                found:find_module("kept.visible") ~= nil,
+                "watch exclusions incorrectly removed saved source modules")
+    test.assert(#found.directories == 2 and
+                found.directories[1] == source and
+                found.directories[2] == fixture:path("src/kept"),
+                "excluded folder subtree remained in the watch directory set")
+  end)
+end
+
+function test_project_discovery_keeps_excluded_sources_but_omits_watch_subtrees(
+    _context: test.Context)
+  test_runtime.run(scans_but_does_not_watch_excluded_paths)
+end
+
 local function rejects_non_directory_root()
   local path = fs.tmpname()
   defer fs.unlink(path)
-  local found?, failure? = discovery.discover(path)
+  local found?, failure? = discovery.discover({path}, {})
   test.assert(found == nil and failure ~= nil and
               strings.find(failure.message, "not a directory") ~= nil,
-              "regular file was accepted as a source modules root")
+              "regular file was accepted as an include root")
 end
 
-function test_project_discovery_rejects_non_directory_source_root(
+function test_project_discovery_rejects_non_directory_include_root(
     _context: test.Context)
   test_runtime.run(rejects_non_directory_root)
 end

@@ -12,6 +12,7 @@ local dispatcher = import "server.dispatcher"
 local indexing_status = import "server.indexing_status"
 local json = import "server.json"
 local logging = import "server.logging"
+local project_config = import "server.project_config"
 local project_graph = import "server.project_graph"
 local project_watcher = import "server.project_watcher"
 local project_service = import "server.project_service"
@@ -372,13 +373,16 @@ local function with_application_state(
   local root = fs.tmpname()
   fs.unlink(root)
   fs.mkdir(root)
-  local filename = root .. "/main.titan"
+  local source_root = root .. "/src"
+  fs.mkdir(source_root)
+  local filename = source_root .. "/main.titan"
   fs.write_file(filename,
     "function answer(): integer\n" ..
     "  return 1\n" ..
     "end\n")
   defer do
     if fs.lstat(filename) ~= nil then fs.unlink(filename) end
+    if fs.lstat(source_root) ~= nil then fs.rmdir(source_root) end
     if fs.lstat(root) ~= nil then fs.rmdir(root) end
   end
 
@@ -414,13 +418,16 @@ local function with_cold_application(
   local root = fs.tmpname()
   fs.unlink(root)
   fs.mkdir(root)
-  local filename = root .. "/main.titan"
+  local source_root = root .. "/src"
+  fs.mkdir(source_root)
+  local filename = source_root .. "/main.titan"
   fs.write_file(filename,
     "function answer(): integer\n" ..
     "  return 1\n" ..
     "end\n")
   defer do
     if fs.lstat(filename) ~= nil then fs.unlink(filename) end
+    if fs.lstat(source_root) ~= nil then fs.rmdir(source_root) end
     if fs.lstat(root) ~= nil then fs.rmdir(root) end
   end
 
@@ -613,7 +620,8 @@ local function recovers_configuration_load_failure_from_later_save()
               "unchanged request retried the failed configuration epoch")
 
   fs.write_file(config_file,
-    "source_modules_root = \".\"\n")
+    "include = { \".\" }\n" ..
+    "source_module_roots = { \".\" }\n")
   -- Inject the exact saved-file hint deterministically. ProjectWatcher tests
   -- separately cover delivery from the filesystem backend; this regression
   -- exercises the Application lifecycle after a pre-Service load failure.
@@ -647,7 +655,8 @@ local function reconciles_expanded_scope_before_existing_analysis()
   local old_filename = old_root .. "/main.titan"
   local next_filename = next_root .. "/main.titan"
   fs.write_file(config_file,
-    "source_modules_root = \"../old_source\"\n")
+    "include = { \"../old_source\" }\n" ..
+    "source_module_roots = { \"../old_source\" }\n")
   fs.write_file(old_filename, "function answer(): integer return 1 end\n")
   fs.write_file(next_filename, "function answer(): integer return 2 end\n")
   defer do
@@ -676,7 +685,8 @@ local function reconciles_expanded_scope_before_existing_analysis()
   analyzer.block = true
   analyzer.started = false
   fs.write_file(config_file,
-    "source_modules_root = \"../next_source\"\n")
+    "include = { \"../next_source\" }\n" ..
+    "source_module_roots = { \"../next_source\" }\n")
   app:note_saved_change()
   wait_until(function (): boolean return analyzer.started end,
              "expanded-scope analyzer did not start")
@@ -700,7 +710,8 @@ local function reconciles_expanded_scope_before_existing_analysis()
   test.assert(snapshot ~= nil,
               "expanded-scope refresh did not retain a project snapshot")
   local saved = snapshot as project_service.Snapshot
-  test.assert(saved.config.source_modules_root == next_root and
+  test.assert(#saved.config.include == 1 and
+              saved.config.include[1] == next_root and
               #saved.project_modules == 1 and
               #saved.project_modules[1].source_files == 1 and
               saved.project_modules[1].source_files[1].contents == changed,
@@ -840,7 +851,7 @@ local function filters_irrelevant_watcher_hints()
     local snapshot? = app:snapshot_for_testing()
     test.assert(snapshot ~= nil, "watch filtering fixture has no snapshot")
     local saved = snapshot as project_service.Snapshot
-    local source_root = saved.config.source_modules_root
+    local source_root = saved.config.include[1]
     local project_root = saved.config.project_root
     local package_directory = source_root .. "/new_package"
     local build_directory = source_root .. "/build"
@@ -848,6 +859,23 @@ local function filters_irrelevant_watcher_hints()
     local editor_directory = source_root .. "/.editor"
     local dotted_directory = source_root .. "/build.debug"
     local makefile = source_root .. "/Makefile"
+    local second_root = project_root .. "/other-src"
+    local nested_root = source_root .. "/generated.code/nested-src"
+    local lookup_root = project_root .. "/compiler-only"
+    local excluded_directory = source_root .. "/generated"
+    local excluded_file = source_root .. "/ignored.titan"
+    local filtered_config = project_config.ProjectConfig.new(
+      saved.config.project_root, saved.config.config_file,
+      {source_root, second_root, nested_root},
+      {excluded_directory, excluded_file},
+      {source_root, lookup_root},
+      saved.config.binary_modules_root,
+      saved.config.extra_ffi_include_dirs,
+      saved.config.extra_ffi_cppflags)
+    local filtered = project_service.Snapshot.new(
+      saved.generation, filtered_config, saved.discovery_issues,
+      saved.project_directories, saved.project_modules,
+      saved.external_modules, saved.dirty_modules)
     fs.write_file(makefile, "all:\n")
     defer fs.unlink(makefile)
     test.assert(application.relevant_watch_change(
@@ -860,6 +888,24 @@ local function filters_irrelevant_watcher_hints()
                   saved, project_watcher.PathChange.modified(
                     project_root .. "/titan-config.lua")),
                 "exact project configuration path was filtered out")
+    test.assert(application.relevant_watch_change(
+                  filtered, project_watcher.PathChange.modified(
+                    second_root .. "/second.titan")),
+                "saved Titan path in a later include root was filtered out")
+    test.assert(application.relevant_watch_change(
+                  filtered, project_watcher.PathChange.modified(
+                    nested_root .. "/nested.titan")),
+                "nested root below an ancestor-invalid path was filtered out")
+    test.assert(not application.relevant_watch_change(
+                  filtered, project_watcher.PathChange.modified(
+                    excluded_file)) and
+                not application.relevant_watch_change(
+                  filtered, project_watcher.PathChange.modified(
+                    excluded_directory .. "/nested.titan")) and
+                not application.relevant_watch_change(
+                  filtered, project_watcher.PathChange.created(
+                    excluded_directory)),
+                "excluded file or directory hint remained watch-relevant")
     test.assert(not application.relevant_watch_change(
                   saved, project_watcher.PathChange.modified(
                     source_root .. "/main.o")) and
@@ -872,6 +918,9 @@ local function filters_irrelevant_watcher_hints()
                 not application.relevant_watch_change(
                   saved, project_watcher.PathChange.modified(
                     "/outside/project.titan")) and
+                not application.relevant_watch_change(
+                  filtered, project_watcher.PathChange.modified(
+                    lookup_root .. "/external.titan")) and
                 not application.relevant_watch_change(
                   saved, project_watcher.PathChange.modified(
                     editor_directory)) and
@@ -989,7 +1038,7 @@ local function builds_semantics_from_independently_valid_modules()
                 "partial semantic-view fixture has unexpected modules")
     local valid = saved.project_modules[1]
     local original_stamp = valid.source_files[1].stamp
-    local failed_filename = saved.config.source_modules_root ..
+    local failed_filename = saved.config.include[1] ..
                             "/failed.titan"
     local failed_source = project_service.SourceFileSnapshot.new(
       failed_filename, "function broken(:\n",
@@ -1042,13 +1091,16 @@ local function failed_revision_waits_for_a_saved_change_and_recovers()
   local root = fs.tmpname()
   fs.unlink(root)
   fs.mkdir(root)
-  local filename = root .. "/main.titan"
+  local source_root = root .. "/src"
+  fs.mkdir(source_root)
+  local filename = source_root .. "/main.titan"
   fs.write_file(filename,
     "function answer(): integer\n" ..
     "  return 1\n" ..
     "end\n")
   defer do
     if fs.lstat(filename) ~= nil then fs.unlink(filename) end
+    if fs.lstat(source_root) ~= nil then fs.rmdir(source_root) end
     if fs.lstat(root) ~= nil then fs.rmdir(root) end
   end
 
@@ -1149,8 +1201,10 @@ local function rebuilds_view_when_external_recheck_fails_clean_module()
   local root = fs.tmpname()
   fs.unlink(root)
   fs.mkdir(root)
-  local consumer_filename = root .. "/consumer.titan"
-  local unrelated_filename = root .. "/unrelated.titan"
+  local source_root = root .. "/src"
+  fs.mkdir(source_root)
+  local consumer_filename = source_root .. "/consumer.titan"
+  local unrelated_filename = source_root .. "/unrelated.titan"
   local first_provider = root .. "/provider-one.so"
   local second_provider = root .. "/provider-two.so"
   fs.write_file(consumer_filename,
@@ -1170,6 +1224,7 @@ local function rebuilds_view_when_external_recheck_fails_clean_module()
       fs.unlink(unrelated_filename)
     end
     if fs.lstat(consumer_filename) ~= nil then fs.unlink(consumer_filename) end
+    if fs.lstat(source_root) ~= nil then fs.rmdir(source_root) end
     if fs.lstat(root) ~= nil then fs.rmdir(root) end
   end
 
@@ -1355,7 +1410,7 @@ local function ignores_extensionless_temporary_during_active_refresh()
     test.assert(snapshot ~= nil,
                 "active temporary-file fixture has no snapshot")
     local saved = snapshot as project_service.Snapshot
-    local temporary = saved.config.source_modules_root .. "/XXcompiler"
+    local temporary = saved.config.include[1] .. "/XXcompiler"
     fs.write_file(temporary, "temporary reservation")
     defer do
       analyzer.block = false
@@ -1412,7 +1467,7 @@ local function classifies_canonical_symlink_watcher_paths()
   fs.mkdir(package_directory)
   fs.write_file(filename, "function answer(): integer return 1 end\n")
   fs.write_file(config_file,
-    "source_modules_root = './src'\n")
+    "include = { './src' }\n")
   local linker = os.spawn("/bin/ln", {"-s", actual_root, linked_root})
   local link_input? = linker.stdin
   if link_input ~= nil then link_input:close() end
@@ -1449,7 +1504,7 @@ local function classifies_canonical_symlink_watcher_paths()
   local canonical_file = canonical_source .. "/main.titan"
   local canonical_package = canonical_source .. "/package"
   local canonical_config = fs.realpath(linked_root) .. "/titan-config.lua"
-  test.assert(canonical_source ~= saved.config.source_modules_root,
+  test.assert(canonical_source ~= saved.config.include[1],
               "symlink fixture did not retain its lexical configured root")
   test.assert(application.relevant_watch_change(
                 saved, project_watcher.PathChange.modified(canonical_file)) and
@@ -1831,12 +1886,15 @@ local function rejects_save_during_successful_rename_preflight()
   local root = fs.tmpname()
   fs.unlink(root)
   fs.mkdir(root)
-  local filename = root .. "/main.titan"
+  local source_root = root .. "/src"
+  fs.mkdir(source_root)
+  local filename = source_root .. "/main.titan"
   fs.write_file(filename,
     "local answer = 1\n" ..
     "local copy = answer\n")
   defer do
     if fs.lstat(filename) ~= nil then fs.unlink(filename) end
+    if fs.lstat(source_root) ~= nil then fs.rmdir(source_root) end
     if fs.lstat(root) ~= nil then fs.rmdir(root) end
   end
 

@@ -33,7 +33,8 @@ end
 -- bounded string/table work and cannot be cancelled between a hint and its
 -- epoch increment.
 local record WatchFilter
-  const source_roots: {string}
+  const include_roots: {string}
+  const excluded_paths: {string}
   const configuration_paths: {string: boolean}
   const known_directories: {string: boolean}
 end
@@ -216,7 +217,7 @@ end
 -- Mirror project discovery's lexical directory boundary. Names such as build
 -- and tmp are valid module components and must remain observable; their
 -- non-Titan artifacts are filtered separately by watch_path_relevant.
-local function source_directory_path(root: string, path: string): boolean
+local function included_directory_path(root: string, path: string): boolean
   if not path_within(root, path) then return false end
   if path == root then return true end
   local start = #root + 2
@@ -246,11 +247,39 @@ end
 
 local function build_watch_filter(snapshot: project_service.Snapshot):
     WatchFilter
-  local source_root = snapshot.config.source_modules_root
-  local source_roots = {source_root}
-  local canonical_source_root = canonical_directory(source_root)
-  if canonical_source_root ~= source_root then
-    source_roots[#source_roots + 1] = canonical_source_root
+  local include_roots: {string} = {}
+  for index = 1, #snapshot.config.include do
+    local include_root = snapshot.config.include[index]
+    include_roots[#include_roots + 1] = include_root
+    local canonical_include_root = canonical_directory(include_root)
+    if canonical_include_root ~= include_root then
+      include_roots[#include_roots + 1] = canonical_include_root
+    end
+  end
+
+  local excluded_paths: {string} = {}
+  for index = 1, #snapshot.config.exclude do
+    local excluded = snapshot.config.exclude[index]
+    excluded_paths[#excluded_paths + 1] = excluded
+    local canonical = canonical_directory(excluded)
+    if canonical ~= excluded then
+      excluded_paths[#excluded_paths + 1] = canonical
+    end
+    local canonical_leaf = canonical_file_path(excluded)
+    if canonical_leaf ~= excluded and canonical_leaf ~= canonical then
+      excluded_paths[#excluded_paths + 1] = canonical_leaf
+    end
+    for root_index = 1, #snapshot.config.include do
+      local include_root = snapshot.config.include[root_index]
+      if path_within(include_root, excluded) then
+        local observed = rebase_path(
+          excluded, include_root, canonical_directory(include_root))
+        if observed ~= excluded and observed ~= canonical and
+           observed ~= canonical_leaf then
+          excluded_paths[#excluded_paths + 1] = observed
+        end
+      end
+    end
   end
 
   local configuration_paths: {string: boolean} = {}
@@ -268,11 +297,17 @@ local function build_watch_filter(snapshot: project_service.Snapshot):
   for index = 1, #snapshot.project_directories do
     local directory = snapshot.project_directories[index]
     known_directories[directory] = true
-    known_directories[rebase_path(
-      directory, source_root, canonical_source_root)] = true
+    known_directories[canonical_directory(directory)] = true
+    for root_index = 1, #snapshot.config.include do
+      local include_root = snapshot.config.include[root_index]
+      if path_within(include_root, directory) then
+        known_directories[rebase_path(
+          directory, include_root, canonical_directory(include_root))] = true
+      end
+    end
   end
   return WatchFilter.new(
-    source_roots, configuration_paths, known_directories)
+    include_roots, excluded_paths, configuration_paths, known_directories)
 end
 
 -- A failed configuration load or source discovery cannot provide a Snapshot
@@ -285,14 +320,14 @@ local function provisional_watch_filter(project_root: string): WatchFilter
   local configuration_paths: {string: boolean} = {}
   configuration_paths[expected_config] = true
   configuration_paths[canonical_file_path(expected_config)] = true
-  local source_roots = {project_root}
+  local include_roots = {project_root}
   local canonical_root = canonical_directory(project_root)
-  if canonical_root ~= project_root then source_roots[2] = canonical_root end
+  if canonical_root ~= project_root then include_roots[2] = canonical_root end
   local known_directories: {string: boolean} = {}
   known_directories[project_root] = true
   known_directories[canonical_root] = true
   return WatchFilter.new(
-    source_roots, configuration_paths, known_directories)
+    include_roots, {}, configuration_paths, known_directories)
 end
 
 -- The directory watcher is intentionally broader than the saved project: it
@@ -310,26 +345,29 @@ local function watch_change_disposition(filter: WatchFilter,
   if filter.configuration_paths[path] then
     return WatchDisposition.relevant()
   end
-  for index = 1, #filter.source_roots do
-    local source_root = filter.source_roots[index]
-    if path_within(source_root, path) then
+  for index = 1, #filter.excluded_paths do
+    if path_within(filter.excluded_paths[index], path) then
+      return WatchDisposition.irrelevant()
+    end
+  end
+  for index = 1, #filter.include_roots do
+    local include_root = filter.include_roots[index]
+    if path_within(include_root, path) then
       if titan_source_path(path) then
-        if source_directory_path(source_root, parent_directory(path)) then
+        if included_directory_path(include_root, parent_directory(path)) then
           return WatchDisposition.relevant()
         end
-        return WatchDisposition.irrelevant()
-      end
-      if not source_directory_path(source_root, path) then
-        return WatchDisposition.irrelevant()
-      end
-      if filter.known_directories[path] then
-        return WatchDisposition.relevant()
-      end
-      case change
-      when created then
-        return WatchDisposition.possible_directory(path)
       else
-        return WatchDisposition.irrelevant()
+        if included_directory_path(include_root, path) then
+          if filter.known_directories[path] then
+            return WatchDisposition.relevant()
+          end
+          case change
+          when created then
+            return WatchDisposition.possible_directory(path)
+          else
+          end
+        end
       end
     end
   end
@@ -1093,7 +1131,7 @@ local function default_rename_analyzer(
     projects: {bridge.ProjectModule}): bridge.Analysis
   local compiler = bridge.load()
   compiler:configure_paths(
-    snapshot.config.source_modules_root,
+    snapshot.config:source_path(),
     snapshot.config.binary_modules_root,
     snapshot.config.extra_ffi_include_dirs,
     snapshot.config.extra_ffi_cppflags)
