@@ -160,7 +160,14 @@ normalize it immediately to a typed record. Evaluate it in an otherwise empty
 environment and read configuration from its global assignments; it does not
 return a table. Support:
 
-- `source_modules_root`, defaulting to the project root;
+- `include`, an ordered Lua array of recursive saved-project discovery and
+  watcher roots defaulting to `{ "./src" }`;
+- `exclude`, a Lua array of files or directory subtrees omitted from watching
+  while remaining in recursive project discovery;
+- `source_module_roots`, an independent ordered Lua array defaulting to
+  `{ "./src" }`; its normalized roots form the compiler's complete, exact
+  semicolon-separated source-module search path, normally beginning with the
+  project roots and optionally appending unwatched external source folders;
 - `extra_ffi_include_dirs`, expressed as an ordinary Lua array table such as
   `{ "./include" }`;
 - `extra_ffi_cppflags`, expressed as a shell-word string parsed with the
@@ -171,9 +178,16 @@ return a table. Support:
 
 Paths are resolved relative to the configuration file. FFI flags are installed
 only while that workspace owns the shared compiler state and the inherited
-driver table is restored before another compiler runs. Configuration changes,
-including a flags-only change, invalidate project discovery and the module
-graph.
+driver table is restored before another compiler runs. Semantic configuration
+changes, including include order or a flags-only change, invalidate project
+discovery and the module graph. An exclude-only change reconciles watcher
+policy without discarding compatible analysis.
+
+Project indexing assigns an overlapping physical subtree to its most-specific
+configured include root. This preserves the one-saved-file/one-project-module
+identity required by the semantic index. Distinct include roots that provide
+the same logical module use the first include root; independently,
+`source_module_roots` retains its exact declared order for compiler lookup.
 
 ## Implementation phases and gates
 

@@ -325,9 +325,10 @@ end
 local function copy_config(source: project_config.ProjectConfig):
     project_config.ProjectConfig
   return project_config.ProjectConfig.new(
-    source.project_root, source.config_file, source.source_modules_root,
-    source.binary_modules_root, copy_strings(source.extra_ffi_include_dirs),
-    source.extra_ffi_cppflags)
+    source.project_root, source.config_file, copy_strings(source.include),
+    copy_strings(source.exclude), copy_strings(source.source_module_roots),
+    source.binary_modules_root,
+    copy_strings(source.extra_ffi_include_dirs), source.extra_ffi_cppflags)
 end
 
 local function same_stamp(left: project_graph.FileStamp,
@@ -458,11 +459,13 @@ local function same_string_arrays(left: {string}, right: {string}): boolean
   return true
 end
 
-local function same_config(left: project_config.ProjectConfig,
-                           right: project_config.ProjectConfig): boolean
+local function same_analysis_config(left: project_config.ProjectConfig,
+                                    right: project_config.ProjectConfig): boolean
   return left.project_root == right.project_root and
          left.config_file == right.config_file and
-         left.source_modules_root == right.source_modules_root and
+         same_string_arrays(left.include, right.include) and
+         same_string_arrays(left.source_module_roots,
+                            right.source_module_roots) and
          left.binary_modules_root == right.binary_modules_root and
          same_string_arrays(left.extra_ffi_include_dirs,
                             right.extra_ffi_include_dirs) and
@@ -807,12 +810,14 @@ local function Service:scan_or_raise(): Snapshot
     return fail<Snapshot>(config_error.path, config_error.message)
   end
   local found?, discovery_error? = project_discovery.discover(
-    loaded.source_modules_root)
+    loaded.include, loaded.exclude)
   if found == nil then
     return fail<Snapshot>(discovery_error.path, discovery_error.message)
   end
 
-  local config_changed = not same_config(self.current_config, loaded)
+  -- Exclude is watcher policy only. It changes the published Snapshot and
+  -- reconciled registrations without invalidating compiler results.
+  local config_changed = not same_analysis_config(self.current_config, loaded)
   local next_projects: {string: ProjectState} = {}
   local next_names: {string} = {}
   for index = 1, #found.modules do
@@ -2037,8 +2042,9 @@ function Service:external_module(module_name: string): ExternalModule?
   return self.externals[module_name]
 end
 
--- Discovery records only directories traversed below the configured project
--- source root. External provenance is intentionally never added here.
+-- Discovery records only watched directories traversed below the configured
+-- include roots. External provenance and excluded watch subtrees are never
+-- added here.
 function Service:project_directories(): {string}
   return copy_strings(self.catalog.directories)
 end
@@ -2081,7 +2087,7 @@ local function create_or_raise(project_root: string,
     return fail<Service>(config_error.path, config_error.message)
   end
   local found?, discovery_error? = project_discovery.discover(
-    loaded.source_modules_root)
+    loaded.include, loaded.exclude)
   if found == nil then
     return fail<Service>(discovery_error.path, discovery_error.message)
   end
@@ -2213,7 +2219,7 @@ local function load_with_compiler(
   local analyzer: Analyzer = function (
       request: AnalysisRequest): compiler_bridge.Analysis
     compiler:configure_paths(
-      request.config.source_modules_root,
+      request.config:source_path(),
       request.config.binary_modules_root,
       request.config.extra_ffi_include_dirs,
       request.config.extra_ffi_cppflags)
@@ -2226,7 +2232,7 @@ local function load_with_compiler(
       requests: {compiler_bridge.ExternalResolutionRequest}):
       {compiler_bridge.ExternalResolution}
     compiler:configure_paths(
-      config.source_modules_root, config.binary_modules_root,
+      config:source_path(), config.binary_modules_root,
       config.extra_ffi_include_dirs, config.extra_ffi_cppflags)
     return compiler:resolve_external_modules(project_modules, requests)
   end

@@ -13,10 +13,21 @@ end
 record ProjectConfig
   project_root: string
   config_file: string?
-  source_modules_root: string
+  include: {string}
+  exclude: {string}
+  source_module_roots: {string}
   binary_modules_root: string
   extra_ffi_include_dirs: {string}
   extra_ffi_cppflags: string?
+end
+
+function ProjectConfig:source_path(): string
+  local output = strings.writer()
+  for index = 1, #self.source_module_roots do
+    if index > 1 then output:write(";") end
+    output:write(self.source_module_roots[index])
+  end
+  return output:drain()
 end
 
 local function fail<T>(path: string, message: string): T
@@ -70,12 +81,26 @@ local function optional_string(config_file: string, candidate: value,
   return candidate as string
 end
 
-local function normalize_include_dirs(config_file: string, base: string,
-                                      candidate: value): {string}
-  if candidate == nil then return {} end
+local function normalize_paths(config_file: string, base: string,
+                               candidate: value, field: string,
+                               defaults: {string}): {string}
+  if candidate == nil then
+    local result: {string} = {}
+    for index = 1, #defaults do
+      local resolved = resolve_config_path(
+        config_file, base, defaults[index], field .. "[" .. index .. "]")
+      if field == "source_module_roots" and
+         strings.find(resolved, ";") ~= nil then
+        return fail<{string}>(
+          config_file, field .. "[" .. index .. "] must not contain ';'")
+      end
+      result[index] = resolved
+    end
+    return result
+  end
   if not (candidate is {value: value}) then
     return fail<{string}>(
-      config_file, "extra_ffi_include_dirs must be a Lua array table")
+      config_file, field .. " must be a Lua array table")
   end
 
   local raw = candidate as {value: value}
@@ -86,28 +111,33 @@ local function normalize_include_dirs(config_file: string, base: string,
     if not (key is integer) then
       return fail<{string}>(
         config_file,
-        "extra_ffi_include_dirs must contain only integer array keys")
+        field .. " must contain only integer array keys")
     end
     local index = key as integer
     if index < 1 then
       return fail<{string}>(
         config_file,
-        "extra_ffi_include_dirs array keys must be positive")
+        field .. " array keys must be positive")
     end
     if not (item is string) then
       return fail<{string}>(
         config_file,
-        "extra_ffi_include_dirs entries must be strings")
+        field .. " entries must be strings")
     end
-    normalized[index] = resolve_config_path(
-      config_file, base, item as string,
-      "extra_ffi_include_dirs[" .. index .. "]")
+    local resolved = resolve_config_path(
+      config_file, base, item as string, field .. "[" .. index .. "]")
+    if field == "source_module_roots" and
+       strings.find(resolved, ";") ~= nil then
+      return fail<{string}>(
+        config_file, field .. "[" .. index .. "] must not contain ';'")
+    end
+    normalized[index] = resolved
     count = count + 1
     if index > maximum then maximum = index end
   end
   if count ~= maximum then
     return fail<{string}>(
-      config_file, "extra_ffi_include_dirs must be a dense Lua array")
+      config_file, field .. " must be a dense Lua array")
   end
 
   local result: {string} = {}
@@ -120,7 +150,9 @@ local function normalize_environment(config_file: string,
                                      default_binary_root: string,
                                      environment: {value: value}):
     ProjectConfig
-  local raw_source_root: value = nil
+  local raw_include: value = nil
+  local raw_exclude: value = nil
+  local raw_source_module_roots: value = nil
   local raw_binary_root: value = nil
   local raw_include_dirs: value = nil
   local raw_cppflags: value = nil
@@ -130,8 +162,12 @@ local function normalize_environment(config_file: string,
         config_file, "titan-config.lua global names must be strings")
     end
     local name = key as string
-    if name == "source_modules_root" then
-      raw_source_root = item
+    if name == "include" then
+      raw_include = item
+    elseif name == "exclude" then
+      raw_exclude = item
+    elseif name == "source_module_roots" then
+      raw_source_module_roots = item
     elseif name == "binary_modules_root" then
       raw_binary_root = item
     elseif name == "extra_ffi_include_dirs" then
@@ -144,19 +180,24 @@ local function normalize_environment(config_file: string,
     end
   end
 
-  local source_root = optional_path(
-    config_file, project_root, raw_source_root,
-    "source_modules_root", project_root)
+  local include = normalize_paths(
+    config_file, project_root, raw_include, "include", {"./src"})
+  local exclude = normalize_paths(
+    config_file, project_root, raw_exclude, "exclude", {})
+  local source_module_roots = normalize_paths(
+    config_file, project_root, raw_source_module_roots,
+    "source_module_roots", {"./src"})
   local binary_root = optional_path(
     config_file, project_root, raw_binary_root,
     "binary_modules_root", default_binary_root)
-  local include_dirs = normalize_include_dirs(
-    config_file, project_root, raw_include_dirs)
+  local include_dirs = normalize_paths(
+    config_file, project_root, raw_include_dirs,
+    "extra_ffi_include_dirs", {})
   local cppflags: string? = optional_string(
     config_file, raw_cppflags, "extra_ffi_cppflags")
   return ProjectConfig.new(
-    project_root, config_file, source_root, binary_root, include_dirs,
-    cppflags)
+    project_root, config_file, include, exclude, source_module_roots,
+    binary_root, include_dirs, cppflags)
 end
 
 local function load_or_raise(project_root: string,
@@ -171,7 +212,13 @@ local function load_or_raise(project_root: string,
 
   local metadata? = fs.stat(config_file)
   if metadata == nil then
-    return ProjectConfig.new(root, nil, root, default_binary_root, {}, nil)
+    local include = normalize_paths(
+      config_file, root, nil, "include", {"./src"})
+    local source_module_roots = normalize_paths(
+      config_file, root, nil, "source_module_roots", {"./src"})
+    return ProjectConfig.new(
+      root, nil, include, {}, source_module_roots,
+      default_binary_root, {}, nil)
   end
   if metadata.kind ~= "file" then
     return fail<ProjectConfig>(

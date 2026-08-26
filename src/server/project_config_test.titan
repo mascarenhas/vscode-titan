@@ -22,8 +22,15 @@ local function run_without_config()
                 "missing optional config did not use defaults")
     test.assert(loaded.project_root == root and loaded.config_file == nil,
                 "default config did not retain its project identity")
-    test.assert(loaded.source_modules_root == root,
-                "source root did not default to the project root")
+    test.assert(#loaded.include == 1 and
+                loaded.include[1] == root .. "/src",
+                "include did not default to the project src directory")
+    test.assert(#loaded.source_module_roots == 1 and
+                loaded.source_module_roots[1] == root .. "/src" and
+                loaded:source_path() == root .. "/src",
+                "source module roots did not default to project src")
+    test.assert(#loaded.exclude == 0,
+                "exclude did not default to an empty array")
     test.assert(loaded.binary_modules_root == "/sdk/lib/titan/0.6",
                 "binary root did not default to the library-versioned tree")
     test.assert(#loaded.extra_ffi_include_dirs == 0,
@@ -38,11 +45,49 @@ function test_project_config_defaults_when_root_file_is_absent(
   test_runtime.run(run_without_config)
 end
 
+local function defaults_root_lists_independently()
+  with_temporary_project(function (root: string)
+    local filename = root .. "/titan-config.lua"
+    defer fs.unlink(filename)
+
+    fs.write_file(filename, [[
+include = { "./watched" }
+]])
+    local include_only?, include_failure? =
+      config.load(root, "/sdk/lib/titan/0.6")
+    test.assert(include_failure == nil and include_only ~= nil and
+                include_only.include[1] == root .. "/watched" and
+                #include_only.source_module_roots == 1 and
+                include_only.source_module_roots[1] == root .. "/src",
+                "source roots inherited the explicitly configured include")
+
+    fs.write_file(filename, [[
+source_module_roots = { "./lookup" }
+]])
+    local source_only?, source_failure? =
+      config.load(root, "/sdk/lib/titan/0.6")
+    test.assert(source_failure == nil and source_only ~= nil and
+                #source_only.include == 1 and
+                source_only.include[1] == root .. "/src" and
+                source_only.source_module_roots[1] == root .. "/lookup",
+                "include inherited the explicitly configured source roots")
+  end)
+end
+
+function test_project_config_defaults_root_lists_independently(
+    _context: test.Context)
+  test_runtime.run(defaults_root_lists_independently)
+end
+
 local function run_relative_config()
   with_temporary_project(function (root: string)
     local filename = root .. "/titan-config.lua"
     fs.write_file(filename, [[
-source_modules_root = "src/../modules"
+include = { "./src", "./tests" }
+exclude = { "./examples", "./spec/fixtures" }
+source_module_roots = {
+  "./src", "./tests", "src/../modules", "./spec/stdlib/titan"
+}
 binary_modules_root = "./vendor/titan"
 extra_ffi_include_dirs = { "./include", "../shared/include" }
 extra_ffi_cppflags = "-DPROJECT_FFI=1 '-Ipath with spaces'"
@@ -54,8 +99,24 @@ extra_ffi_cppflags = "-DPROJECT_FFI=1 '-Ipath with spaces'"
                 "valid titan-config.lua was rejected")
     test.assert(loaded.config_file == filename,
                 "loaded config did not retain its filename")
-    test.assert(loaded.source_modules_root == root .. "/modules",
-                "relative source root was not resolved from the config file")
+    test.assert(#loaded.include == 2 and
+                loaded.include[1] == root .. "/src" and
+                loaded.include[2] == root .. "/tests",
+                "relative include paths were not normalized in array order")
+    test.assert(#loaded.source_module_roots == 4 and
+                loaded.source_module_roots[1] == root .. "/src" and
+                loaded.source_module_roots[2] == root .. "/tests" and
+                loaded.source_module_roots[3] == root .. "/modules" and
+                loaded.source_module_roots[4] ==
+                  root .. "/spec/stdlib/titan" and
+                loaded:source_path() == root .. "/src;" ..
+                  root .. "/tests;" .. root .. "/modules;" ..
+                  root .. "/spec/stdlib/titan",
+                "source module roots were not normalized in array order")
+    test.assert(#loaded.exclude == 2 and
+                loaded.exclude[1] == root .. "/examples" and
+                loaded.exclude[2] == root .. "/spec/fixtures",
+                "relative exclude paths were not normalized in array order")
     test.assert(loaded.binary_modules_root == root .. "/vendor/titan",
                 "relative binary root was not resolved from the config file")
     local shared_include?, shared_failure? =
@@ -96,11 +157,26 @@ local function run_invalid_configs()
 
     assert_config_error(root, "return 42\n", "return no value")
     assert_config_error(root,
-      "return { source_modules_root = './legacy' }\n",
+      "return { include = { './legacy' } }\n",
       "use global assignments")
     assert_config_error(root,
-      "source_modules_root = false\n",
-      "source_modules_root must be a string")
+      "include = false\n",
+      "include must be a Lua array table")
+    assert_config_error(root,
+      "include = { [2] = './two' }\n",
+      "include must be a dense Lua array")
+    assert_config_error(root,
+      "exclude = { './one', 2 }\n",
+      "exclude entries must be strings")
+    assert_config_error(root,
+      "source_module_roots = false\n",
+      "source_module_roots must be a Lua array table")
+    assert_config_error(root,
+      "source_module_roots = { [2] = './two' }\n",
+      "source_module_roots must be a dense Lua array")
+    assert_config_error(root,
+      "source_module_roots = { './one;./two' }\n",
+      "source_module_roots[1] must not contain ';'")
     assert_config_error(root,
       "extra_ffi_include_dirs = { [2] = './two' }\n",
       "dense Lua array")
@@ -111,7 +187,7 @@ local function run_invalid_configs()
       "extra_ffi_cppflags = { '-DNOT_A_STRING=1' }\n",
       "extra_ffi_cppflags must be a string")
     assert_config_error(root,
-      "source_module_root = './typo'\n",
+      "source_modules_root = './legacy'\n",
       "unknown titan-config.lua field")
     assert_config_error(root,
       "_ENV[1] = './not-a-name'\n",
@@ -122,11 +198,57 @@ local function run_invalid_configs()
     assert_config_error(root,
       "io.write('must never reach LSP stdout')\n",
       "cannot evaluate")
-    assert_config_error(root, "source_modules_root = {\n", "cannot evaluate")
+    assert_config_error(root, "include = {\n", "cannot evaluate")
   end)
 end
 
 function test_project_config_rejects_untyped_sparse_or_invalid_values(
     _context: test.Context)
   test_runtime.run(run_invalid_configs)
+end
+
+local function rejects_semicolon_after_relative_resolution()
+  local reservation = fs.tmpname()
+  fs.unlink(reservation)
+  local root = reservation .. ";project"
+  fs.mkdir(root)
+  defer fs.rmdir(root)
+
+  local loaded?, failure? = config.load(root, "/sdk/lib/titan/0.6")
+  test.assert(loaded == nil and failure ~= nil and
+              failure.path == root .. "/titan-config.lua" and
+              strings.find(
+                failure.message,
+                "source_module_roots[1] must not contain ';'") ~= nil,
+              "semicolon introduced by project-root resolution was accepted")
+end
+
+function test_project_config_rejects_ambiguous_normalized_source_path(
+    _context: test.Context)
+  test_runtime.run(rejects_semicolon_after_relative_resolution)
+end
+
+local function permits_semicolon_in_watcher_include_root()
+  local reservation = fs.tmpname()
+  fs.unlink(reservation)
+  local root = reservation .. ";project"
+  fs.mkdir(root)
+  defer fs.rmdir(root)
+  local filename = root .. "/titan-config.lua"
+  fs.write_file(filename, [[
+include = { "./watched" }
+source_module_roots = { "/compiler/source" }
+]])
+  defer fs.unlink(filename)
+
+  local loaded?, failure? = config.load(root, "/sdk/lib/titan/0.6")
+  test.assert(failure == nil and loaded ~= nil and
+              loaded.include[1] == root .. "/watched" and
+              loaded:source_path() == "/compiler/source",
+              "watcher include was incorrectly parsed as compiler source path")
+end
+
+function test_project_config_allows_semicolon_outside_source_module_roots(
+    _context: test.Context)
+  test_runtime.run(permits_semicolon_in_watcher_include_root)
 end

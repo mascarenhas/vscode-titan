@@ -519,6 +519,11 @@ async function testSavedProjectSemantics() {
     "end",
     ""
   ];
+  await writeFile(
+    path.join(root, "titan-config.lua"),
+    'include = { "." }\nsource_module_roots = { "." }\n',
+    "utf8"
+  );
   await writeFile(filename, sourceLines.join("\n"), "utf8");
 
   const uri = pathToFileURL(filename).href;
@@ -843,13 +848,19 @@ async function testConfigCannotWriteProtocolStdout() {
 async function testSourceImportCppflagsAndUnchangedRequests() {
   const root = await makePhysicalTemporaryRoot("vscode-titan-source-config-");
   const sourceRoot = path.join(root, "src");
+  const secondarySourceRoot = path.join(sourceRoot, "stdlib");
+  const lookupRoot = path.join(root, "lookup");
   const includeRoot = path.join(root, "include");
   await mkdir(sourceRoot);
+  await mkdir(secondarySourceRoot);
+  await mkdir(lookupRoot);
   await mkdir(includeRoot);
   await writeFile(
     path.join(root, "titan-config.lua"),
     [
-      'source_modules_root = "src"',
+      'include = { "src", "src/stdlib" }',
+      'source_module_roots = { "src", "src/stdlib", "lookup" }',
+      'exclude = { "src/stdlib/provider.titan" }',
       'extra_ffi_include_dirs = { "include" }',
       "extra_ffi_cppflags = \"-DVSCODE_TITAN_PROTOCOL_FLAG=17 " +
         "-UVSCODE_TITAN_PROTOCOL_FLAG " +
@@ -880,8 +891,15 @@ async function testSourceImportCppflagsAndUnchangedRequests() {
   ];
   const consumerLines = [
     'local provider = import "provider.titan"',
+    'local external = import "external"',
     "function answer(): integer",
-    "  return provider.secret(41)",
+    "  return provider.secret(40) + external.external_answer()",
+    "end",
+    ""
+  ];
+  const externalLines = [
+    "function external_answer(): integer",
+    "  return 1",
     "end",
     ""
   ];
@@ -893,17 +911,19 @@ async function testSourceImportCppflagsAndUnchangedRequests() {
     "end",
     ""
   ];
-  const providerFile = path.join(sourceRoot, "provider.titan");
+  const providerFile = path.join(secondarySourceRoot, "provider.titan");
   const consumerFile = path.join(sourceRoot, "consumer.titan");
   const guardedFile = path.join(sourceRoot, "guarded.titan");
+  const externalFile = path.join(lookupRoot, "external.titan");
   await writeFile(providerFile, providerLines.join("\n"), "utf8");
   await writeFile(consumerFile, consumerLines.join("\n"), "utf8");
   await writeFile(guardedFile, guardedLines.join("\n"), "utf8");
+  await writeFile(externalFile, externalLines.join("\n"), "utf8");
 
   const providerUri = pathToFileURL(providerFile).href;
   const consumerUri = pathToFileURL(consumerFile).href;
   const guardedUri = pathToFileURL(guardedFile).href;
-  const secretColumn = consumerLines[2].indexOf("secret");
+  const secretColumn = consumerLines[3].indexOf("secret");
   const guardedColumn = guardedLines[1].indexOf("guarded_answer");
   assert.ok(secretColumn >= 0 && guardedColumn >= 0);
 
@@ -923,7 +943,7 @@ async function testSourceImportCppflagsAndUnchangedRequests() {
 
     const sourcePosition = {
       textDocument: { uri: consumerUri },
-      position: { line: 2, character: secretColumn + 1 }
+      position: { line: 3, character: secretColumn + 1 }
     };
     const definition = await semanticRequest(
       child,
@@ -1027,7 +1047,7 @@ async function testCrossModuleFolderAndIncrementalSemantics() {
   await mkdir(libraryRoot, { recursive: true });
   await writeFile(
     path.join(root, "titan-config.lua"),
-    "source_modules_root = 'src'\n",
+    "include = { 'src' }\n",
     "utf8"
   );
   const mainFile = path.join(libraryRoot, "library.titan");
@@ -1200,6 +1220,11 @@ async function testDebugCompilerProgress() {
   const root = await makePhysicalTemporaryRoot("vscode-titan-progress-");
   const moduleRoot = path.join(root, "sample");
   await mkdir(moduleRoot);
+  await writeFile(
+    path.join(root, "titan-config.lua"),
+    'include = { "." }\nsource_module_roots = { "." }\n',
+    "utf8"
+  );
   await writeFile(
     path.join(moduleRoot, "sample.titan"),
     "function answer(): integer return 42 end\n",
