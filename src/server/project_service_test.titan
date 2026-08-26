@@ -490,8 +490,12 @@ local function require_service(
   local service?, failure? = project_service.load_with_analyzer(
     fixture.root, "/sdk/lib/titan/0.6", analyzer:analyze,
     restat_test_headers)
+  local detail = ""
+  if failure ~= nil then
+    detail = ": " .. failure.path .. ": " .. failure.message
+  end
   test.assert(failure == nil and service ~= nil,
-              "valid project service fixture did not load")
+              "valid project service fixture did not load" .. detail)
   return service
 end
 
@@ -503,8 +507,12 @@ local function require_resolved_service(
     project_service.load_with_analyzer_and_resolver(
       fixture.root, "/sdk/lib/titan/0.6", analyzer:analyze,
       resolver:resolve, restat_test_headers)
+  local detail = ""
+  if failure ~= nil then
+    detail = ": " .. failure.path .. ": " .. failure.message
+  end
   test.assert(failure == nil and service ~= nil,
-              "valid resolved project service fixture did not load")
+              "valid resolved project service fixture did not load" .. detail)
   return service
 end
 
@@ -1159,6 +1167,12 @@ local function configuration_change_recovers_failed_revision()
     fixture:mkdir("src")
     fixture:mkdir("include")
     configure_source_root(fixture)
+    fixture:write("titan-config.lua", [[
+source_modules_root = "src"
+binary_modules_root = "binary-modules"
+extra_ffi_include_dirs = { "include" }
+extra_ffi_cppflags = "-DPROJECT_SERVICE_FFI=0"
+]])
     fixture:write("src/main.titan", "-- configuration-dependent module\n")
     local runs = 0
     local analyzer: project_service.Analyzer =
@@ -1170,7 +1184,8 @@ local function configuration_change_recovers_failed_revision()
         test.assert(module ~= nil,
                     "configuration analyzer lost its project root")
         if module == nil then raise "configuration project is absent" end
-        local configured = #request.config.extra_ffi_include_dirs == 1
+        local configured = #request.config.extra_ffi_include_dirs == 1 and
+          request.config.extra_ffi_cppflags == "-DPROJECT_SERVICE_FFI=1"
         local manifest?: compiler_bridge.Manifest = nil
         local diagnostics: {compiler_bridge.Diagnostic} = {}
         if configured then
@@ -1207,6 +1222,7 @@ local function configuration_change_recovers_failed_revision()
 source_modules_root = "src"
 binary_modules_root = "binary-modules"
 extra_ffi_include_dirs = { "include" }
+extra_ffi_cppflags = "-DPROJECT_SERVICE_FFI=1"
 ]])
     local recovered?, recovery_error? = service:refresh()
     local current? = find_project(service:latest(), "main")
@@ -1918,6 +1934,61 @@ end
 function test_project_service_isolates_unrelated_dirty_module_errors(
     _context: test.Context)
   test_runtime.run(isolates_unrelated_dirty_failure)
+end
+
+local function attributes_location_free_diagnostics_to_attempted_modules()
+  with_fixture(function (fixture: Fixture)
+    fixture:mkdir("src")
+    configure_source_root(fixture)
+    fixture:write("src/a.titan", "-- first root\n")
+    fixture:write("src/b.titan", "-- later root\n")
+    local analyzer: project_service.Analyzer =
+      function (request: project_service.AnalysisRequest):
+          compiler_bridge.Analysis
+        local modules: {compiler_bridge.ModuleSnapshot} = {}
+        local diagnostics: {compiler_bridge.Diagnostic} = {}
+        for index = 1, #request.dirty_modules do
+          local name = request.dirty_modules[index]
+          local module? = find_bridge_project(request.project_modules, name)
+          test.assert(module ~= nil,
+                      "owned-diagnostic analyzer lost a project module")
+          if module == nil then raise "owned project module is missing" end
+          modules[#modules + 1] = failed_project(module, {})
+          diagnostics[#diagnostics + 1] = compiler_bridge.Diagnostic.new(
+            compiler_bridge.DiagnosticKind.compiler(),
+            "cannot load " .. name, nil, name)
+        end
+        local b? = find_bridge_project(request.project_modules, "b")
+        test.assert(b ~= nil,
+                    "owned-diagnostic analyzer lost the located module")
+        if b == nil then raise "located project module is missing" end
+        diagnostics[#diagnostics + 1] = compiler_bridge.Diagnostic.new(
+          compiler_bridge.DiagnosticKind.type_error(),
+          "located failure in b", location(b), "a")
+        return compiler_bridge.Analysis.new(
+          request.root_module, diagnostics, modules, {}, {}, {})
+      end
+    local service?, failure? = project_service.load_with_analyzer(
+      fixture.root, "/sdk/lib/titan/0.6", analyzer,
+      restat_test_headers)
+    test.assert(failure == nil and service ~= nil,
+                "owned-diagnostic project did not load")
+    if service == nil then raise "owned-diagnostic Service is missing" end
+    local a? = find_project(service:latest(), "a")
+    local b? = find_project(service:latest(), "b")
+    test.assert(a ~= nil and b ~= nil and project_is_failed(a) and
+                project_is_failed(b) and #a.diagnostics == 1 and
+                #b.diagnostics == 2 and
+                a.diagnostics[1].message == "cannot load a" and
+                b.diagnostics[1].message == "cannot load b" and
+                b.diagnostics[2].message == "located failure in b",
+                "diagnostic ownership ignored its attempt or exact location")
+  end)
+end
+
+function test_project_service_attributes_location_free_diagnostics_to_attempted_modules(
+    _context: test.Context)
+  test_runtime.run(attributes_location_free_diagnostics_to_attempted_modules)
 end
 
 local function failed_fallback_retains_dependency_and_header_inputs()

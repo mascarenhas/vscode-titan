@@ -1,0 +1,106 @@
+local test = import "test"
+local bridge = import "server.compiler_bridge"
+local diagnostics = import "server.diagnostics"
+local json = import "server.json"
+local project_config = import "server.project_config"
+local project_graph = import "server.project_graph"
+local project_service = import "server.project_service"
+
+local function snapshot(filename: string, contents: string,
+                        items: {bridge.Diagnostic}): project_service.Snapshot
+  local source = project_service.SourceFileSnapshot.new(
+    filename, contents,
+    project_graph.FileStamp.new(filename, 1, 2, #contents))
+  local module = project_service.ProjectModule.new(
+    "main", {source}, nil, items,
+    project_service.ProjectAnalysisState.failed())
+  return project_service.Snapshot.new(
+    1,
+    project_config.ProjectConfig.new(
+      "/workspace", nil, "/workspace", "/sdk", {}, nil),
+    {}, {"/workspace"}, {module}, {}, {})
+end
+
+function test_diagnostics_map_saved_compiler_byte_locations_to_lsp(
+    _context: test.Context)
+  local filename = "/workspace/main.titan"
+  local publications = diagnostics.from_snapshot(snapshot(
+    filename, "\u{10400}broken\n", {
+      bridge.Diagnostic.new(
+        bridge.DiagnosticKind.type_error(), "wrong result type",
+        bridge.SourceLocation.new(filename, 1, 5)),
+      bridge.Diagnostic.new(
+        bridge.DiagnosticKind.type_error(), "wrong result type",
+        bridge.SourceLocation.new(filename, 1, 5)),
+    }))
+  test.assert(#publications == 1 and #publications[1].items == 1,
+              "saved compiler diagnostic was not assigned or deduplicated")
+  local item = publications[1].items[1]
+  test.assert(publications[1].uri == "file:///workspace/main.titan" and
+              item.range.start.line == 0 and
+              item.range.start.character == 2 and
+              item.range.finish.line == 0 and
+              item.range.finish.character == 2,
+              "compiler byte column was not converted to the LSP position")
+
+  local encoded?, parse_error? = json.parse(
+    diagnostics.notification(publications[1]))
+  local envelope? = json.as_object(encoded)
+  local params? = json.as_object(envelope:get("params"))
+  local values? = json.as_array(params:get("diagnostics"))
+  local diagnostic? = json.as_object(values.items[1])
+  test.assert(parse_error == nil and envelope ~= nil and params ~= nil and
+              json.as_string(envelope:get("method")) ==
+                "textDocument/publishDiagnostics" and
+              json.as_integer(diagnostic:get("severity")) == 1 and
+              json.as_string(diagnostic:get("code")) == "type" and
+              json.as_string(diagnostic:get("source")) == "Titan" and
+              json.as_string(diagnostic:get("message")) ==
+                "wrong result type",
+              "LSP diagnostic notification lost compiler metadata")
+end
+
+function test_diagnostics_filter_external_locations_and_clear_stale_files(
+    _context: test.Context)
+  local filename = "/workspace/main.titan"
+  local publisher = diagnostics.create()
+  local observed: {diagnostics.Publication} = {}
+  publisher:set_listener(function (publication: diagnostics.Publication)
+    observed[#observed + 1] = publication
+  end)
+
+  local external = diagnostics.from_snapshot(snapshot(
+    filename, "function answer(): integer return 1 end\n", {
+      bridge.Diagnostic.new(
+        bridge.DiagnosticKind.compiler(), "external failure",
+        bridge.SourceLocation.new("/sdk/vendor.titan", 1, 1)),
+    }))
+  test.assert(#external == 0,
+              "external source diagnostic was published as a project error")
+
+  publisher:publish(diagnostics.from_snapshot(snapshot(
+    filename, "function broken(\n", {
+      bridge.Diagnostic.new(
+        bridge.DiagnosticKind.syntax(), "syntax error: malformed",
+        bridge.SourceLocation.new(filename, 1, 1)),
+    })))
+  publisher:publish(diagnostics.from_snapshot(snapshot(
+    "/workspace/new-root/main.titan",
+    "function answer(): integer return 1 end\n", {})))
+  test.assert(#observed == 2 and #observed[1].items == 1 and
+              observed[1].uri == "file:///workspace/main.titan" and
+              #observed[2].items == 0 and
+              observed[2].uri == "file:///workspace/main.titan",
+              "root replacement did not clear the stale diagnostic URI")
+
+  publisher:publish(diagnostics.from_snapshot(snapshot(
+    filename, "function broken(\n", {
+      bridge.Diagnostic.new(
+        bridge.DiagnosticKind.syntax(), "syntax error: malformed",
+        bridge.SourceLocation.new(filename, 1, 1)),
+    })))
+  publisher:stop()
+  test.assert(#observed == 4 and #observed[4].items == 0 and
+              observed[4].uri == "file:///workspace/main.titan",
+              "publisher shutdown did not clear its active diagnostic URI")
+end

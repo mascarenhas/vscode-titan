@@ -7,6 +7,7 @@ local response_queue = import "server.response_queue"
 type SemanticHandler = (dispatcher.SemanticRequest) ->
   dispatcher.SemanticOutcome
 type InitializedHandler = () -> ()
+type ShutdownHandler = () -> ()
 
 local type RemoveListener = () -> ()
 
@@ -24,6 +25,7 @@ record Coordinator
   local output: response_queue.ResponseQueue
   local handler: SemanticHandler
   local initialized_handler: InitializedHandler?
+  local shutdown_handler: ShutdownHandler?
   local active: {ActiveRequest}
 end
 
@@ -40,11 +42,13 @@ end
 
 function create(output: response_queue.ResponseQueue,
                 handler: SemanticHandler?,
-                initialized_handler: InitializedHandler?): Coordinator
+                initialized_handler: InitializedHandler?,
+                shutdown_handler: ShutdownHandler?): Coordinator
   local actual = method_not_found
   if handler ~= nil then actual = handler end
   return Coordinator.new(
-    dispatcher.create(), output, actual, initialized_handler, {})
+    dispatcher.create(), output, actual, initialized_handler,
+    shutdown_handler, {})
 end
 
 function Coordinator:phase_name(): string
@@ -217,6 +221,8 @@ function Coordinator:handle(source: string): integer?
     return nil
   when shutdown: result then
     self:cancel_all("language server shutdown")
+    local handler? = self.shutdown_handler
+    if handler ~= nil then handler() end
     self:publish(result)
     logging.emit("info", "lifecycle.shutdown", nil)
     return nil
