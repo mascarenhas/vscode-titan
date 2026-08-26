@@ -48,6 +48,11 @@ if grep -Eq '[.]map$' <<<"$contents"; then
   exit 1
 fi
 
+if grep -Eq '^extension/.*[.](a|so)([.][^/]*)?$' <<<"$contents"; then
+  echo "VSIX contains an unexpected native library or archive" >&2
+  exit 1
+fi
+
 extract_root=$(mktemp -d)
 trap 'rm -rf -- "$extract_root"' EXIT
 unzip -qq "$vsix" extension/bin/titan-language-server -d "$extract_root"

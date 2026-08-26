@@ -336,7 +336,7 @@ has evidence before moving to Done.
   `async.titan` and `fs.titan` hovers took 3.344/3.800 ms; and the
   `os.titan` source-import definition took 4.122 ms. The unchanged request pair
   emitted zero indexing statuses and consumed zero sampled child CPU.
-- The final exclusive-attribution trace is
+- The pre-#108 exclusive-attribution trace is
   `/tmp/vscode-titan-cold-profile-phases.json`, SHA-256
   `5ac2b57223cb87483010a3d8156261ff94ff6f991ddcddac64d0dd2879dcae31`.
   It indexed the same 143 saved files in one generation and took 314,637.283 ms
@@ -351,4 +351,33 @@ has evidence before moving to Done.
   definition probes all succeeded, and the unchanged request batch completed
   in 14.600 ms with zero indexing-status notifications. The persistent-success
   probe stream recorded 10 hits and 1,075 misses after the isolated toolchain
-  rebuild; deterministic negative-result reuse is tracked as P0 in Titan #108.
+  rebuild; that run established the P0 negative-result cache work subsequently
+  implemented by Titan #108 / PR #110.
+- The final PR #110 integration pins Titan commit
+  `4446c46709d6d90d94df5d9719a10512fd257a15` and compares one uniquely
+  namespaced empty-cache run with its unchanged warm successor. Both indexed
+  generation 89's 143 saved files in one initial epoch. The empty-cache run
+  took 278,950.401 ms wall, 201,230 ms language-server-process CPU, and
+  3,296,740 KiB peak server RSS; its 1,084 physical compiler launches comprised 336
+  successes and 748 deterministic rejections and used 96,046.773 ms summed
+  child wall time. The logical stream reduced 92,428 semantic requests to
+  9,608 compiler keys, including 374 distinct rejected keys. The warm run
+  served all 9,608 compiler keys from persistent evidence, performed zero
+  physical compiler launches, and took 168,812.703 ms wall, 166,880 ms
+  language-server-process CPU, and 3,259,828 KiB peak server RSS: reductions of
+  110,137.698 ms (39.48%) wall and 34,350 ms (17.07%) process CPU without a
+  meaningful RSS increase. During the two runs, an immediate hover completed
+  before readiness with the intentional no-data result in 1.488/1.275 ms;
+  ready hover took 0.736/0.806 ms; source-import definition took 0.877/1.013
+  ms; and unchanged request batches took 2.225/2.445 ms with no indexing-status
+  notification. The evidence is
+  `/tmp/vscode-titan-pr35-a3b168a1-cold.json` (SHA-256
+  `f175805f05ffeaf871f999a9cee21cf7828fb72a8e7041e665e8b3a3bdb7d969`)
+  and `/tmp/vscode-titan-pr35-a3b168a1-warm.json` (SHA-256
+  `466cff279dcb28faf59baa1eb3577b690e3120356051f5d37efec902dc081645`).
+  The first Titan amend after these captures changed only documentation,
+  compiler coverage specs, and coverage-process grouping. A final coverage
+  follow-up centralized the already enforced 1 MiB persistent-diagnostic
+  bound in the record codec and added its direct regression. It does not alter
+  cache keys, encoded bytes, or service behavior for any persistable result,
+  so the `a3b168a1` performance evidence remains representative.
