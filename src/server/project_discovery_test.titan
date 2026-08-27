@@ -67,7 +67,7 @@ local function with_fixture(body: FixtureBody)
 end
 
 local function require_discovery(root: string): discovery.Discovery
-  local found?, failure? = discovery.discover({root}, {})
+  local found?, failure? = discovery.discover({root}, {}, {root})
   test.assert(failure == nil and found ~= nil,
               "valid project source tree was not discovered")
   return found
@@ -91,8 +91,14 @@ local function scans_flat_folder_and_nested_modules()
     fixture:write(".build/generated/copied.titan")
 
     local found = require_discovery(fixture.root)
+    local issue_detail = ""
+    if #found.issues > 0 then
+      issue_detail = ": " .. found.issues[1].path .. ": " ..
+                     found.issues[1].message
+    end
     test.assert(#found.issues == 0,
-                "valid folder project produced discovery issues")
+                "valid folder project produced discovery issues" ..
+                issue_detail)
     test.assert(#found.modules == 3 and
                 found.modules[1].name == "flat" and
                 found.modules[2].name == "pkg" and
@@ -137,6 +143,7 @@ local function reports_only_invalid_logical_module_names()
     fixture:write("titan.titan")
     fixture:write("bad name.titan")
     fixture:write("good/9bad.titan")
+    fixture:write("good/bad.name.titan")
     fixture:write("owner/owner.titan")
     fixture:write("owner/bad name.titan")
 
@@ -144,10 +151,12 @@ local function reports_only_invalid_logical_module_names()
     test.assert(found:find_module("titan") ~= nil and
                 found:find_module("owner") ~= nil,
                 "valid root or folder module was omitted")
-    test.assert(#found.issues == 2 and
+    test.assert(#found.issues == 3 and
                 strings.find(found.issues[1].message,
                              "invalid logical Titan module name") ~= nil and
                 strings.find(found.issues[2].message,
+                             "invalid logical Titan module name") ~= nil and
+                strings.find(found.issues[3].message,
                              "invalid logical Titan module name") ~= nil,
                 "invalid flat module names were not reported deterministically")
     test.assert(found:owner_for_file("owner/bad name.titan") == "owner",
@@ -213,7 +222,7 @@ function test_project_discovery_recomputes_folder_main_transitions(
   test_runtime.run(observes_folder_main_transitions)
 end
 
-local function scans_ordered_multiple_roots_once()
+local function uses_source_root_order_independently_of_include_order()
   with_fixture(function (fixture: Fixture)
     fixture:mkdir("first")
     fixture:mkdir("second")
@@ -224,18 +233,24 @@ local function scans_ordered_multiple_roots_once()
     fixture:write("second/nested/nested.titan")
 
     local found?, failure? = discovery.discover(
-      {fixture:path("first"), fixture:path("second")}, {})
+      {fixture:path("second"), fixture:path("first")}, {},
+      {fixture:path("first"), fixture:path("second")})
     test.assert(failure == nil and found ~= nil,
                 "multiple source roots were rejected")
     test.assert(#found.include_roots == 2 and
-                found.include_roots[1] == fixture:path("first") and
-                found.include_roots[2] == fixture:path("second"),
+                found.include_roots[1] == fixture:path("second") and
+                found.include_roots[2] == fixture:path("first"),
                 "include root order was not retained")
     test.assert(#found.modules == 3 and
                 found:find_module("nested") ~= nil and
                 found:find_module("only") ~= nil and
                 found:find_module("shared") ~= nil,
                 "multiple roots did not produce one merged module catalog")
+    test.assert(#found.issues == 1 and
+                found.issues[1].path ==
+                  fixture:path("second/shared.titan") and
+                strings.find(found.issues[1].message, "shadowed") ~= nil,
+                "later included provider was silently omitted")
     test.assert(found:owner_for_file(fixture:path("first/shared.titan")) ==
                   "shared" and
                 found:owner_for_file(fixture:path("second/shared.titan")) ==
@@ -246,10 +261,92 @@ end
 
 function test_project_discovery_merges_ordered_include_roots(
     _context: test.Context)
-  test_runtime.run(scans_ordered_multiple_roots_once)
+  test_runtime.run(uses_source_root_order_independently_of_include_order)
 end
 
-local function gives_nested_include_its_own_module_identity()
+local function derives_project_names_from_source_roots_only()
+  with_fixture(function (fixture: Fixture)
+    fixture:mkdir("titan")
+    fixture:mkdir("titan/uv")
+    fixture:mkdir("spec")
+    fixture:mkdir("spec/stdlib")
+    fixture:mkdir("spec/stdlib/titan")
+    fixture:mkdir("spec/stdlib/titan/support")
+    fixture:mkdir("external")
+    fixture:write("titan/fs.titan")
+    fixture:write("titan/uv/uv.titan")
+    fixture:write("titan/uv/task.titan")
+    fixture:write("spec/stdlib/titan/support/runtime.titan")
+    fixture:write("external/lookup_only.titan")
+
+    local standard_library = fixture:path("titan")
+    local test_library = fixture:path("spec/stdlib/titan")
+    local found?, failure? = discovery.discover(
+      {standard_library, test_library}, {},
+      {fixture.root, test_library, fixture:path("external")})
+    test.assert(failure == nil and found ~= nil,
+                "divergent include and source roots were rejected")
+    test.assert(#found.modules == 3 and
+                found:find_module("titan.fs") ~= nil and
+                found:find_module("titan.uv") ~= nil and
+                found:find_module("support.runtime") ~= nil and
+                found:find_module("fs") == nil and
+                found:find_module("uv") == nil and
+                found:find_module("spec.stdlib.titan.support.runtime") == nil,
+                "include roots still determined logical project names")
+    test.assert(found:find_module("lookup_only") == nil,
+                "unwatched source-only root became a project catalog")
+    local uv? = found:find_module("titan.uv")
+    test.assert(uv ~= nil and #uv.files == 2 and
+                uv.files[1] == fixture:path("titan/uv/uv.titan") and
+                uv.files[2] == fixture:path("titan/uv/task.titan") and
+                found:owner_for_file("titan/uv/task.titan") == "titan.uv",
+                "source-root-qualified folder ownership was not retained")
+  end)
+end
+
+function test_project_discovery_derives_identity_from_source_roots_not_watch_roots(
+    _context: test.Context)
+  test_runtime.run(derives_project_names_from_source_roots_only)
+end
+
+local function preserves_cross_root_flat_folder_and_blocked_precedence()
+  with_fixture(function (fixture: Fixture)
+    fixture:mkdir("first")
+    fixture:mkdir("first/pkg")
+    fixture:mkdir("second")
+    fixture:mkdir("second/m")
+    fixture:mkdir("second/pkg")
+    fixture:write("first/m.titan")
+    fixture:write("first/pkg/pkg.titan")
+    fixture:write("first/pkg/child.titan")
+    fixture:write("second/m/m.titan")
+    fixture:write("second/pkg/child.titan")
+
+    local found?, failure? = discovery.discover(
+      {fixture:path("second"), fixture:path("first")}, {},
+      {fixture:path("first"), fixture:path("second")})
+    test.assert(failure == nil and found ~= nil,
+                "cross-root precedence fixture was rejected")
+    local m? = found:find_module("m")
+    test.assert(m ~= nil and not m:is_folder() and
+                m.main_file == fixture:path("first/m.titan") and
+                found:owner_for_file(fixture:path("second/m/m.titan")) == nil,
+                "later folder bypassed an earlier flat provider")
+    test.assert(found:find_module("pkg") ~= nil and
+                found:find_module("pkg.child") == nil and
+                found:owner_for_file(
+                  fixture:path("second/pkg/child.titan")) == nil,
+                "later flat bypassed an earlier blocked folder constituent")
+  end)
+end
+
+function test_project_discovery_matches_cross_root_compiler_precedence(
+    _context: test.Context)
+  test_runtime.run(preserves_cross_root_flat_folder_and_blocked_precedence)
+end
+
+local function gives_nested_source_root_its_own_module_identity()
   with_fixture(function (fixture: Fixture)
     fixture:mkdir("spec")
     fixture:mkdir("spec/stdlib")
@@ -259,24 +356,189 @@ local function gives_nested_include_its_own_module_identity()
     fixture:write("spec/stdlib/titan/support/runtime.titan")
 
     local nested = fixture:path("spec/stdlib/titan")
-    local found?, failure? = discovery.discover({fixture.root, nested}, {})
+    local found?, failure? = discovery.discover(
+      {fixture.root, nested}, {}, {fixture.root, nested})
     test.assert(failure == nil and found ~= nil,
                 "overlapping source roots were rejected")
     test.assert(#found.modules == 2 and
                 found:find_module("main") ~= nil and
                 found:find_module("support.runtime") ~= nil and
                 found:find_module("spec.stdlib.titan.support.runtime") == nil,
-                "nested include root did not own its physical subtree once")
+                "nested source root did not own its physical subtree once")
     test.assert(found:owner_for_file(
                   fixture:path("spec/stdlib/titan/support/runtime.titan")) ==
                   "support.runtime",
-                "nested include root lost source-file ownership")
+                "nested source root lost source-file ownership")
   end)
 end
 
-function test_project_discovery_partitions_overlapping_include_roots(
+function test_project_discovery_partitions_overlapping_source_roots(
     _context: test.Context)
-  test_runtime.run(gives_nested_include_its_own_module_identity)
+  test_runtime.run(gives_nested_source_root_its_own_module_identity)
+end
+
+local function traverses_to_nested_source_root_after_invalid_component()
+  with_fixture(function (fixture: Fixture)
+    fixture:mkdir("vendor.foo")
+    fixture:mkdir("vendor.foo/src")
+    fixture:mkdir("vendor.foo/src/pkg")
+    fixture:write("vendor.foo/src/pkg/item.titan")
+
+    local nested = fixture:path("vendor.foo/src")
+    local found?, failure? = discovery.discover(
+      {fixture.root}, {}, {nested})
+    test.assert(failure == nil and found ~= nil and #found.issues == 0,
+                "nested source root behind invalid include component failed")
+    test.assert(found:find_module("pkg.item") ~= nil and
+                found:owner_for_file(
+                  fixture:path("vendor.foo/src/pkg/item.titan")) == "pkg.item",
+                "nested source root did not reset logical module identity")
+    test.assert(#found.directories == 4 and
+                found.directories[2] == fixture:path("vendor.foo") and
+                found.directories[3] == nested,
+                "discovery pruned the path leading to a nested source root")
+  end)
+end
+
+function test_project_discovery_reaches_nested_source_root_after_invalid_component(
+    _context: test.Context)
+  test_runtime.run(traverses_to_nested_source_root_after_invalid_component)
+end
+
+local function preserves_lexical_source_ancestry_above_symlinked_include()
+  with_fixture(function (fixture: Fixture)
+    fixture:mkdir("actual")
+    fixture:write("actual/item.titan")
+    local actual = fixture:path("actual")
+    local linked = fixture:path("linked")
+    local linker = os.spawn("/bin/ln", {"-s", actual, linked})
+    local link_input? = linker.stdin
+    if link_input ~= nil then link_input:close() end
+    local link_status = linker:wait()
+    local link_output? = linker.stdout
+    if link_output ~= nil then link_output:close() end
+    local link_error? = linker.stderr
+    if link_error ~= nil then link_error:close() end
+    test.assert(link_status.code == 0 and link_status.signal == nil,
+                "could not create source-ancestry symlink fixture")
+    defer fs.unlink(linked)
+
+    local found?, failure? = discovery.discover(
+      {linked}, {}, {fixture.root})
+    test.assert(failure == nil and found ~= nil and #found.issues == 0 and
+                found:find_module("linked.item") ~= nil,
+                "lexical source root ancestry was replaced by canonical path")
+    local linked_owner? = found:owner_for_file(linked .. "/item.titan")
+    local canonical_item = fs.realpath(actual .. "/item.titan")
+    local canonical_owner? = found:owner_for_file(canonical_item)
+    test.assert(linked_owner == "linked.item",
+                "lexical symlink source lost owner: " ..
+                strings.tostring(linked_owner))
+    test.assert(canonical_owner == "linked.item",
+                "canonical symlink target lost owner: " ..
+                strings.tostring(canonical_owner))
+  end)
+end
+
+function test_project_discovery_preserves_lexical_source_root_ancestry(
+    _context: test.Context)
+  test_runtime.run(preserves_lexical_source_ancestry_above_symlinked_include)
+end
+
+local function reports_overlapping_root_descriptor_mismatch()
+  with_fixture(function (fixture: Fixture)
+    fixture:mkdir("pkg")
+    fixture:write("pkg/pkg.titan")
+    fixture:write("pkg/child.titan")
+    local nested = fixture:path("pkg")
+
+    local found?, failure? = discovery.discover(
+      {nested}, {}, {fixture.root, nested})
+    test.assert(failure == nil and found ~= nil and #found.issues == 1,
+                "overlapping descriptor mismatch was not reported once")
+    test.assert(found:find_module("pkg") == nil and
+                found:find_module("child") ~= nil and
+                found:owner_for_file(fixture:path("pkg/pkg.titan")) == nil and
+                strings.find(found.issues[1].message,
+                             "different physical provider") ~= nil,
+                "ambiguous flat/folder identity entered the project catalog")
+  end)
+end
+
+function test_project_discovery_reports_overlapping_root_descriptor_mismatch(
+    _context: test.Context)
+  test_runtime.run(reports_overlapping_root_descriptor_mismatch)
+end
+
+local function reports_unwatched_earlier_source_shadow()
+  with_fixture(function (fixture: Fixture)
+    fixture:mkdir("external")
+    fixture:mkdir("project")
+    fixture:write("external/shared.titan")
+    fixture:write("project/shared.titan")
+
+    local project = fixture:path("project")
+    local found?, failure? = discovery.discover(
+      {project}, {}, {fixture:path("external"), project})
+    test.assert(failure == nil and found ~= nil and
+                #found.modules == 0 and #found.issues == 1 and
+                found.issues[1].path == fixture:path("project/shared.titan") and
+                strings.find(found.issues[1].message,
+                             fixture:path("external/shared.titan")) ~= nil,
+                "earlier unwatched provider did not shadow project candidate")
+  end)
+end
+
+function test_project_discovery_reports_unwatched_source_root_shadow(
+    _context: test.Context)
+  test_runtime.run(reports_unwatched_earlier_source_shadow)
+end
+
+
+local function ignores_failed_candidate_stat_like_compiler()
+  with_fixture(function (fixture: Fixture)
+    fixture:mkdir("project")
+    fixture:write("not-a-directory")
+    fixture:write("project/shared.titan")
+
+    local project = fixture:path("project")
+    local found?, failure? = discovery.discover(
+      {project}, {}, {fixture:path("not-a-directory"), project})
+    test.assert(failure == nil and found ~= nil and #found.issues == 0 and
+                found:find_module("shared") ~= nil,
+                "failed earlier candidate stat aborted compiler-style lookup")
+  end)
+end
+
+function test_project_discovery_treats_failed_candidate_stat_as_miss(
+    _context: test.Context)
+  test_runtime.run(ignores_failed_candidate_stat_like_compiler)
+end
+
+local function preserves_reserved_terminal_folder_blocking()
+  with_fixture(function (fixture: Fixture)
+    fixture:mkdir("pkg")
+    fixture:mkdir("pkg/titan")
+    fixture:write("pkg/titan/titan.titan")
+    fixture:write("pkg/titan/child.titan")
+
+    local found?, failure? = discovery.discover(
+      {fixture:path("pkg/titan")}, {}, {fixture.root})
+    test.assert(failure == nil and found ~= nil and #found.issues == 2,
+                "reserved terminal folder fixture was not reported")
+    test.assert(found:find_module("pkg.titan.child") == nil and
+                found:owner_for_file(
+                  fixture:path("pkg/titan/child.titan")) == nil and
+                found.issues[1].path ==
+                  fixture:path("pkg/titan/child.titan") and
+                strings.find(found.issues[1].message, "blocked") ~= nil,
+                "invalid owner name did not retain compiler folder blocking")
+  end)
+end
+
+function test_project_discovery_preserves_reserved_terminal_folder_blocking(
+    _context: test.Context)
+  test_runtime.run(preserves_reserved_terminal_folder_blocking)
 end
 
 local function canonicalizes_aliased_include_and_exclude_roots()
@@ -301,7 +563,7 @@ local function canonicalizes_aliased_include_and_exclude_roots()
     defer fs.unlink(linked)
 
     local found?, failure? = discovery.discover(
-      {linked, actual, nested}, {linked .. "/pkg"})
+      {linked, actual, nested}, {linked .. "/pkg"}, {actual, nested})
     test.assert(failure == nil and found ~= nil,
                 "canonical include-root discovery failed")
     test.assert(#found.include_roots == 2 and
@@ -319,6 +581,9 @@ local function canonicalizes_aliased_include_and_exclude_roots()
     test.assert(found:owner_for_file(
                   fixture:path("actual/pkg/item.titan")) == "item",
                 "canonical nested include lost lexical file ownership")
+    test.assert(found:owner_for_file(linked .. "/root.titan") == "root" and
+                found:owner_for_file(actual .. "/root.titan") == "root",
+                "source and include aliases did not share physical ownership")
   end)
 end
 
@@ -342,7 +607,7 @@ local function scans_but_does_not_watch_excluded_paths()
     local ignored = fixture:path("src/ignored")
     local excluded_file = fixture:path("src/kept/excluded_file.titan")
     local found?, failure? = discovery.discover(
-      {source}, {ignored, excluded_file})
+      {source}, {ignored, excluded_file}, {source})
     test.assert(failure == nil and found ~= nil,
                 "watch exclusions made discovery fail")
     test.assert(found:find_module("ignored.hidden") ~= nil and
@@ -362,10 +627,36 @@ function test_project_discovery_keeps_excluded_sources_but_omits_watch_subtrees(
   test_runtime.run(scans_but_does_not_watch_excluded_paths)
 end
 
+local function reports_included_sources_without_module_roots()
+  with_fixture(function (fixture: Fixture)
+    fixture:mkdir("watched")
+    fixture:mkdir("lookup")
+    fixture:write("watched/main.titan")
+    fixture:write("lookup/external.titan")
+
+    local watched = fixture:path("watched")
+    local found?, failure? = discovery.discover(
+      {watched}, {}, {fixture:path("lookup")})
+    test.assert(failure == nil and found ~= nil and
+                #found.modules == 0 and #found.issues == 1 and
+                found.issues[1].path == fixture:path("watched/main.titan") and
+                strings.find(found.issues[1].message,
+                             "source_module_roots") ~= nil,
+                "unmapped watched source received an invented module name")
+    test.assert(#found.directories == 1 and found.directories[1] == watched,
+                "unmapped include root was removed from watcher scope")
+  end)
+end
+
+function test_project_discovery_reports_included_files_outside_source_roots(
+    _context: test.Context)
+  test_runtime.run(reports_included_sources_without_module_roots)
+end
+
 local function rejects_non_directory_root()
   local path = fs.tmpname()
   defer fs.unlink(path)
-  local found?, failure? = discovery.discover({path}, {})
+  local found?, failure? = discovery.discover({path}, {}, {path})
   test.assert(found == nil and failure ~= nil and
               strings.find(failure.message, "not a directory") ~= nil,
               "regular file was accepted as an include root")

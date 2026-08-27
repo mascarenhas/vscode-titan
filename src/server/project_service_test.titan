@@ -728,6 +728,59 @@ function test_project_service_preserves_ordered_roots_and_watch_exclusions(
   test_runtime.run(loads_ordered_roots_and_watch_exclusions)
 end
 
+local function loads_project_identity_from_divergent_source_roots()
+  with_fixture(function (fixture: Fixture)
+    fixture:mkdir("titan")
+    fixture:mkdir("titan/uv")
+    fixture:mkdir("spec")
+    fixture:mkdir("spec/stdlib")
+    fixture:mkdir("spec/stdlib/titan")
+    fixture:mkdir("spec/stdlib/titan/support")
+    fixture:mkdir("lookup")
+    fixture:mkdir("binary-modules")
+    fixture:write("titan-config.lua", [[
+include = { "titan", "spec/stdlib/titan" }
+source_module_roots = { ".", "spec/stdlib/titan", "lookup" }
+binary_modules_root = "binary-modules"
+]])
+    fixture:write("titan/fs.titan", "-- standard library module\n")
+    fixture:write("titan/uv/uv.titan", "-- uv folder main\n")
+    fixture:write("titan/uv/task.titan", "-- uv constituent\n")
+    fixture:write(
+      "spec/stdlib/titan/support/runtime.titan", "-- test module\n")
+    fixture:write("lookup/external.titan", "-- source-only external\n")
+
+    local analyzer = new_analyzer()
+    analyzer.expected_source_root = fixture.root .. ";" ..
+                                    fixture:path("spec/stdlib/titan") .. ";" ..
+                                    fixture:path("lookup")
+    local service = require_service(fixture, analyzer)
+    local snapshot = service:latest()
+    test.assert(#snapshot.project_modules == 3 and
+                find_project(snapshot, "titan.fs") ~= nil and
+                find_project(snapshot, "titan.uv") ~= nil and
+                find_project(snapshot, "support.runtime") ~= nil and
+                find_project(snapshot, "fs") == nil and
+                find_project(snapshot, "uv") == nil and
+                find_project(snapshot, "external") == nil,
+                "service catalog used watcher roots as module roots")
+    local uv? = find_project(snapshot, "titan.uv")
+    test.assert(uv ~= nil and #uv.source_files == 2 and
+                uv.source_files[1].filename ==
+                  fixture:path("titan/uv/uv.titan") and
+                uv.source_files[2].filename ==
+                  fixture:path("titan/uv/task.titan"),
+                "service lost source-root-qualified folder inputs")
+    test.assert(#snapshot.project_directories == 4,
+                "source-only root leaked into watched project directories")
+  end)
+end
+
+function test_project_service_uses_source_roots_for_project_module_identity(
+    _context: test.Context)
+  test_runtime.run(loads_project_identity_from_divergent_source_roots)
+end
+
 local function reconciles_exclude_without_reanalysis()
   with_fixture(function (fixture: Fixture)
     fixture:mkdir("src")
@@ -1144,6 +1197,49 @@ end
 function test_project_service_uses_real_compiler_source_interfaces_for_selective_rechecking(
     _context: test.Context)
   test_runtime.run(rechecks_real_compiler_source_dependants_selectively)
+end
+
+local function analyzes_source_qualified_modules_from_narrow_watch_root()
+  with_fixture(function (fixture: Fixture)
+    fixture:mkdir("titan")
+    fixture:mkdir("titan/uv")
+    fixture:write("titan-config.lua", [[
+include = { "titan" }
+source_module_roots = { "." }
+]])
+    fixture:write("titan/uv/uv.titan", [[function answer(): integer
+  return private_answer()
+end
+]])
+    fixture:write("titan/uv/task.titan", [[local function private_answer(): integer
+  return 42
+end
+]])
+    fixture:write("titan/async.titan", [[local uv = import "uv.titan"
+function answer(): integer return uv.private_answer() end
+]])
+
+    local service?, failure? = project_service.load_default(fixture.root)
+    local detail = ""
+    if failure ~= nil then detail = ": " .. failure.message end
+    test.assert(failure == nil and service ~= nil,
+                "real compiler rejected source-root project identity" .. detail)
+    local snapshot = service:latest()
+    local async_module? = find_project(snapshot, "titan.async")
+    local uv? = find_project(snapshot, "titan.uv")
+    test.assert(#snapshot.project_modules == 2 and
+                async_module ~= nil and
+                async_module.compiler_snapshot ~= nil and
+                uv ~= nil and uv.compiler_snapshot ~= nil and
+                find_project(snapshot, "async") == nil and
+                find_project(snapshot, "uv") == nil,
+                "real compiler catalog retained include-relative identities")
+  end)
+end
+
+function test_project_service_real_compiler_matches_divergent_watch_and_source_roots(
+    _context: test.Context)
+  test_runtime.run(analyzes_source_qualified_modules_from_narrow_watch_root)
 end
 
 local function revalidates_external_source_when_encountered_again()
