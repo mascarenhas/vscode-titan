@@ -861,6 +861,7 @@ local function filters_irrelevant_watcher_hints()
     local makefile = source_root .. "/Makefile"
     local second_root = project_root .. "/other-src"
     local nested_root = source_root .. "/generated.code/nested-src"
+    local implicit_nested_root = source_root .. "/vendor.foo/src"
     local lookup_root = project_root .. "/compiler-only"
     local excluded_directory = source_root .. "/generated"
     local excluded_file = source_root .. "/ignored.titan"
@@ -868,7 +869,7 @@ local function filters_irrelevant_watcher_hints()
       saved.config.project_root, saved.config.config_file,
       {source_root, second_root, nested_root},
       {excluded_directory, excluded_file},
-      {source_root, lookup_root},
+      {source_root, implicit_nested_root, lookup_root},
       saved.config.binary_modules_root,
       saved.config.extra_ffi_include_dirs,
       saved.config.extra_ffi_cppflags)
@@ -896,6 +897,11 @@ local function filters_irrelevant_watcher_hints()
                   filtered, project_watcher.PathChange.modified(
                     nested_root .. "/nested.titan")),
                 "nested root below an ancestor-invalid path was filtered out")
+    test.assert(application.relevant_watch_change(
+                  filtered, project_watcher.PathChange.modified(
+                    implicit_nested_root .. "/nested.titan")),
+                "nested source root below an ancestor-invalid path was " ..
+                "filtered out")
     test.assert(not application.relevant_watch_change(
                   filtered, project_watcher.PathChange.modified(
                     excluded_file)) and
@@ -1467,7 +1473,9 @@ local function classifies_canonical_symlink_watcher_paths()
   fs.mkdir(package_directory)
   fs.write_file(filename, "function answer(): integer return 1 end\n")
   fs.write_file(config_file,
-    "include = { './src' }\n")
+    "include = { './src' }\n" ..
+    "source_module_roots = { './src', " ..
+    "'./src/vendor.foo/future' }\n")
   local linker = os.spawn("/bin/ln", {"-s", actual_root, linked_root})
   local link_input? = linker.stdin
   if link_input ~= nil then link_input:close() end
@@ -1503,6 +1511,7 @@ local function classifies_canonical_symlink_watcher_paths()
   local canonical_source = fs.realpath(linked_root .. "/src")
   local canonical_file = canonical_source .. "/main.titan"
   local canonical_package = canonical_source .. "/package"
+  local canonical_future = canonical_source .. "/vendor.foo/future"
   local canonical_config = fs.realpath(linked_root) .. "/titan-config.lua"
   test.assert(canonical_source ~= saved.config.include[1],
               "symlink fixture did not retain its lexical configured root")
@@ -1514,6 +1523,10 @@ local function classifies_canonical_symlink_watcher_paths()
               application.relevant_watch_change(
                 saved, project_watcher.PathChange.modified(canonical_config)),
               "canonical watcher path did not map to symlinked project root")
+  test.assert(application.relevant_watch_change(
+                saved, project_watcher.PathChange.modified(
+                  canonical_future .. "/created.titan")),
+              "missing nested source root lost its canonical watcher path")
 
   app:stop_watching_for_testing()
   fs.rmdir(package_directory)

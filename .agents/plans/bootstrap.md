@@ -183,11 +183,13 @@ changes, including include order or a flags-only change, invalidate project
 discovery and the module graph. An exclude-only change reconciles watcher
 policy without discarding compatible analysis.
 
-Project indexing assigns an overlapping physical subtree to its most-specific
-configured include root. This preserves the one-saved-file/one-project-module
-identity required by the semantic index. Distinct include roots that provide
-the same logical module use the first include root; independently,
-`source_module_roots` retains its exact declared order for compiler lookup.
+`include` selects the saved project files and watcher scope but does not name
+modules. Project indexing derives each selected file's logical name from its
+most-specific containing `source_module_roots` entry, then validates that
+candidate against compiler lookup order, including per-root folder-before-flat
+and blocked-constituent precedence. A shadowed or overlap-ambiguous candidate,
+or an included source outside every source root, is a deterministic discovery
+issue. A source root not selected by `include` remains external and unwatched.
 
 ## Implementation phases and gates
 

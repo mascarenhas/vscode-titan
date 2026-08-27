@@ -35,6 +35,7 @@ end
 
 record Discovery
   include_roots: {string}
+  source_roots: {string}
   directories: {string}
   modules: {Module}
   owner_by_file: {string: string}
@@ -54,6 +55,13 @@ function Discovery:owner_for_file(path: string): string?
     if normalized == nil then return nil end
     return self.owner_by_file[normalized]
   end
+  for index = 1, #self.source_roots do
+    local normalized? = source_text.resolve_path(self.source_roots[index], path)
+    if normalized ~= nil then
+      local owner? = self.owner_by_file[normalized]
+      if owner ~= nil then return owner end
+    end
+  end
   for index = 1, #self.include_roots do
     local normalized? = source_text.resolve_path(self.include_roots[index], path)
     if normalized ~= nil then
@@ -66,6 +74,8 @@ end
 
 local record FileEntry
   path: string
+  source_path: string
+  canonical_path: string
   relative: string
   directory: string
   basename: string
@@ -74,6 +84,45 @@ end
 local record IncludeRoot
   lexical: string
   canonical: string
+end
+
+local record SourceRoot
+  lexical: string
+  canonical: string
+end
+
+local record Scan
+  files: {FileEntry}
+  directories: {string}
+end
+
+local record ModuleCatalog
+  modules: {Module}
+  owner_by_file: {string: string}
+  issues: {Issue}
+end
+
+local record Candidate
+  module: Module
+  owner_by_file: {string: string}
+end
+
+local record PhysicalSource
+  kind: ModuleKind
+  main_file: string
+  files: {string}
+end
+
+local union SourceResolution
+  found: PhysicalSource
+  blocked: string
+end
+
+local record SourceSelection
+  root_index: integer
+  relative: string
+  source_path: string
+  depth: integer
 end
 
 local function fail<T>(path: string, message: string): T
@@ -242,9 +291,56 @@ local function pruned(path: string, roots: {string}): boolean
   return false
 end
 
+local function relative_to_root(root: string, path: string): string
+  if root == "/" then return strings.sub(path, 2) end
+  return strings.sub(path, #root + 2)
+end
+
+local function valid_path_components(path: string): boolean
+  if path == "" then return true end
+  local start = 1
+  for index = 1, #path + 1 do
+    if index == #path + 1 or strings.byte(path, index) == 47 then
+      if not valid_module_component(
+          strings.sub(path, start, index - 1)) then
+        return false
+      end
+      start = index + 1
+    end
+  end
+  return true
+end
+
+-- Include roots decide membership, while a nested source root can reset the
+-- logical path after an include-relative component such as `vendor.foo` that
+-- is not itself a valid module component. Preserve the old tooling-tree prune
+-- everywhere that cannot lead to such a configured source root.
+local function source_directory_relevant(observed: string, canonical: string,
+                                         include_relative: string,
+                                         source_roots: {SourceRoot}): boolean
+  for index = 1, #source_roots do
+    local root = source_roots[index]
+    if path_within(observed, root.lexical) or
+       path_within(canonical, root.canonical) then
+      return true
+    end
+    if path_within(root.lexical, observed) and
+       valid_path_components(relative_to_root(root.lexical, observed)) then
+      return true
+    end
+    if path_within(root.canonical, canonical) and
+       valid_path_components(relative_to_root(root.canonical, canonical)) then
+      return true
+    end
+  end
+  return valid_path_components(include_relative)
+end
+
 local function collect(directory: string, relative_directory: string,
                        files: {FileEntry}, directories: {string},
-                       excluded: {string}, boundaries: {string})
+                       excluded: {string}, boundaries: {string},
+                       observed_root: string, canonical_root: string,
+                       source_roots: {SourceRoot})
   if pruned(directory, boundaries) then return end
   -- Exclusions affect only the returned watcher set. Discovery still scans
   -- their saved sources so compiler/project ownership remains unchanged.
@@ -260,20 +356,21 @@ local function collect(directory: string, relative_directory: string,
     if relative_directory ~= "" then
       relative = relative_directory .. "/" .. name
     end
-    -- A nested include root is a scan boundary: that more-specific root owns
-    -- the physical files once, under module names relative to itself.
+    -- A nested include root is a scan boundary so the physical subtree and its
+    -- watcher directories are collected only once. Source roots name modules.
     if not pruned(path, boundaries) then
       local metadata? = fs.lstat(path)
       if metadata ~= nil then
-        -- A directory component that cannot occur in a logical Titan module
-        -- cannot contain a resolvable descendant either. Pruning it here keeps
-        -- build/tooling trees such as .build, .titan, and .git out of both
-        -- project discovery and the watcher set.
-        if metadata.kind == "directory" and valid_module_component(name) then
-          collect(path, relative, files, directories, excluded, boundaries)
+        local canonical = rebase_path(
+          path, observed_root, canonical_root)
+        if metadata.kind == "directory" and source_directory_relevant(
+            path, canonical, relative, source_roots) then
+          collect(path, relative, files, directories, excluded, boundaries,
+                  observed_root, canonical_root, source_roots)
         elseif metadata.kind == "file" and titan_source(name) then
-          files[#files + 1] =
-            FileEntry.new(path, relative, relative_directory, name)
+          files[#files + 1] = FileEntry.new(
+            path, path, canonical, relative,
+            relative_directory, name)
         end
         -- Symlinks are deliberately not followed. The project identity is the
         -- lexical source tree, and a watch must not escape it through a link.
@@ -331,6 +428,7 @@ end
 
 local function folder_module_name(entry: FileEntry): string?
   if entry.directory == "" then return nil end
+  if not valid_path_components(entry.directory) then return nil end
   local components = path_components(entry.directory)
   local stem = source_stem(entry.basename)
   if components[#components] ~= stem then return nil end
@@ -371,20 +469,14 @@ local function validated_include_root(root: string): IncludeRoot
   end
 end
 
-local function discover_root(root: string, excluded: {string},
-                             boundaries: {string}): Discovery
-  local root_metadata? = fs.stat(root)
-  if root_metadata == nil then
-    return fail<Discovery>(root, "include root does not exist")
-  end
-  if root_metadata.kind ~= "directory" then
-    return fail<Discovery>(root, "include root is not a directory")
-  end
+local function own(owner_by_file: {string: string}, entry: FileEntry,
+                   module_name: string)
+  owner_by_file[entry.path] = module_name
+  owner_by_file[entry.source_path] = module_name
+  owner_by_file[entry.canonical_path] = module_name
+end
 
-  local entries: {FileEntry} = {}
-  local directories: {string} = {}
-  collect(root, "", entries, directories, excluded, boundaries)
-
+local function discover_entries(entries: {FileEntry}): ModuleCatalog
   local modules: {Module} = {}
   local modules_by_name: {string: Module} = {}
   local folders_by_directory: {string: Module} = {}
@@ -401,7 +493,7 @@ local function discover_root(root: string, excluded: {string},
       modules[#modules + 1] = module
       modules_by_name[name] = module
       folders_by_directory[entry.directory] = module
-      owner_by_file[entry.path] = name
+      own(owner_by_file, entry, name)
     end
   end
 
@@ -419,7 +511,7 @@ local function discover_root(root: string, excluded: {string},
     for index = 1, #contributors do
       local contributor = contributors[index]
       module.files[#module.files + 1] = contributor.path
-      owner_by_file[contributor.path] = module.name
+      own(owner_by_file, contributor, module.name)
     end
   end
 
@@ -427,7 +519,9 @@ local function discover_root(root: string, excluded: {string},
     local entry = entries[index]
     if owner_by_file[entry.path] == nil then
       local name = flat_module_name(entry)
-      if not valid_module_name(name) then
+      local stem = strings.sub(entry.relative, 1, #entry.relative - 6)
+      if stem == "" or not valid_path_components(stem) or
+         not valid_module_name(name) then
         issues[#issues + 1] = Issue.new(
           entry.path,
           "invalid logical Titan module name '" .. name .. "'")
@@ -436,7 +530,7 @@ local function discover_root(root: string, excluded: {string},
           name, ModuleKind.flat(), entry.path, {entry.path})
         modules[#modules + 1] = module
         modules_by_name[name] = module
-        owner_by_file[entry.path] = name
+        own(owner_by_file, entry, name)
       end
       -- A same-name flat file is shadowed by the already selected folder main.
     end
@@ -444,21 +538,222 @@ local function discover_root(root: string, excluded: {string},
 
   sort_modules(modules)
   sort_issues(issues)
-  return Discovery.new({root}, directories, modules, owner_by_file, issues)
+  return ModuleCatalog.new(modules, owner_by_file, issues)
 end
 
-local function scan_root(root: string, excluded: {string},
-                         boundaries: {string}): Discovery
+local function scan_root_or_raise(root: IncludeRoot, excluded: {string},
+                                  boundaries: {string},
+                                  source_roots: {SourceRoot}): Scan
+  local root_metadata? = fs.stat(root.lexical)
+  if root_metadata == nil then
+    return fail<Scan>(root.lexical, "include root does not exist")
+  end
+  if root_metadata.kind ~= "directory" then
+    return fail<Scan>(root.lexical, "include root is not a directory")
+  end
+  local entries: {FileEntry} = {}
+  local directories: {string} = {}
+  collect(root.lexical, "", entries, directories, excluded, boundaries,
+          root.lexical, root.canonical, source_roots)
+  return Scan.new(entries, directories)
+end
+
+local function scan_root(root: IncludeRoot, excluded: {string},
+                         boundaries: {string},
+                         source_roots: {SourceRoot}): Scan
   do
-    return discover_root(root, excluded, boundaries)
+    return scan_root_or_raise(root, excluded, boundaries, source_roots)
   catch
     if error is async.CancellationReason then raise end
     if error is Error then raise end
-    return fail<Discovery>(root, strings.tostring(error))
+    return fail<Scan>(root.lexical, strings.tostring(error))
   end
 end
 
-local function discover_or_raise(include: {string}, exclude: {string}): Discovery
+local function relative_parent(path: string): string
+  local slash = 0
+  for index = 1, #path do
+    if strings.byte(path, index) == 47 then slash = index end
+  end
+  if slash == 0 then return "" end
+  return strings.sub(path, 1, slash - 1)
+end
+
+local function path_depth(path: string): integer
+  if path == "" then return 0 end
+  local depth = 1
+  for index = 1, #path do
+    if strings.byte(path, index) == 47 then depth = depth + 1 end
+  end
+  return depth
+end
+
+local function consider_source_selection(selected: SourceSelection?,
+                                         root_index: integer,
+                                         relative: string,
+                                         source_path: string):
+    SourceSelection
+  local candidate = SourceSelection.new(
+    root_index, relative, source_path, path_depth(relative))
+  if selected == nil or candidate.depth < selected.depth then
+    return candidate
+  end
+  return selected
+end
+
+-- The lexical check preserves a configured source root above a symlinked
+-- include (for example /workspace containing /workspace/link -> /actual).
+-- Canonical containment then handles the inverse alias. The shortest relative
+-- path is the physically most-specific source root; declaration order breaks
+-- ties without making include order part of module identity.
+local function selected_source_root(entry: FileEntry,
+                                    roots: {SourceRoot}): SourceSelection?
+  local selected: SourceSelection? = nil
+  for index = 1, #roots do
+    local root = roots[index]
+    if path_within(root.lexical, entry.path) then
+      local relative = relative_to_root(root.lexical, entry.path)
+      selected = consider_source_selection(
+        selected, index, relative, entry.path)
+    end
+    if path_within(root.canonical, entry.canonical_path) then
+      local relative = relative_to_root(root.canonical, entry.canonical_path)
+      selected = consider_source_selection(
+        selected, index, relative,
+        rebase_path(entry.canonical_path, root.canonical, root.lexical))
+    end
+  end
+  return selected
+end
+
+local function map_to_source_root(entry: FileEntry,
+                                  selection: SourceSelection): FileEntry
+  return FileEntry.new(
+    entry.path, selection.source_path, entry.canonical_path,
+    selection.relative, relative_parent(selection.relative), entry.basename)
+end
+
+local function module_path(name: string): string
+  local output = strings.writer()
+  for index = 1, #name do
+    local byte: integer = strings.byte(name, index)
+    if byte == 46 then
+      output:write("/")
+    else
+      output:write(strings.sub(name, index, index))
+    end
+  end
+  return output:drain()
+end
+
+local function terminal_component(name: string): string
+  local start = 1
+  for index = 1, #name do
+    if strings.byte(name, index) == 46 then start = index + 1 end
+  end
+  return strings.sub(name, start)
+end
+
+local function module_owner(name: string): string?
+  local finish = 0
+  for index = 1, #name do
+    if strings.byte(name, index) == 46 then finish = index - 1 end
+  end
+  if finish == 0 then return nil end
+  return strings.sub(name, 1, finish)
+end
+
+local function regular_file(path: string): boolean
+  do
+    local metadata? = fs.stat(path)
+    return metadata ~= nil and metadata.kind == "file"
+  catch
+    if error is async.CancellationReason then raise end
+    -- The compiler treats a failed source-candidate stat as a miss and keeps
+    -- searching. Only a selected folder whose contents cannot be listed is a
+    -- resolver error.
+    return false
+  end
+end
+
+local function source_resolution_in_root(root: SourceRoot, name: string):
+    SourceResolution?
+  local relative = module_path(name)
+  local basename = terminal_component(name)
+  local folder = join(root.lexical, relative)
+  local folder_main = join(folder, basename .. ".titan")
+  if regular_file(folder_main) then
+    local contributor_names: {string} = {}
+    local entries = fs.list(folder)
+    for index = 1, #entries do
+      local entry = entries[index]
+      if entry ~= basename .. ".titan" and titan_source(entry) and
+         regular_file(join(folder, entry)) then
+        contributor_names[#contributor_names + 1] = entry
+      end
+    end
+    sort_strings(contributor_names)
+    local files = {folder_main}
+    for index = 1, #contributor_names do
+      files[#files + 1] = join(folder, contributor_names[index])
+    end
+    return SourceResolution.found(
+      PhysicalSource.new(ModuleKind.folder(), folder_main, files))
+  end
+
+  local flat = join(root.lexical, relative .. ".titan")
+  if not regular_file(flat) then return nil end
+  local owner? = module_owner(name)
+  if owner ~= nil then
+    local owner_main = join(
+      join(root.lexical, module_path(owner)),
+      terminal_component(owner) .. ".titan")
+    if regular_file(owner_main) then
+      return SourceResolution.blocked(owner_main)
+    end
+  end
+  return SourceResolution.found(
+    PhysicalSource.new(ModuleKind.flat(), flat, {flat}))
+end
+
+
+local function resolve_source(roots: {SourceRoot}, name: string):
+    SourceResolution?
+  for index = 1, #roots do
+    local resolved? = source_resolution_in_root(roots[index], name)
+    if resolved ~= nil then return resolved end
+  end
+  return nil
+end
+
+local function module_is_folder(module: Module): boolean
+  return module:is_folder()
+end
+
+local function physical_is_folder(source: PhysicalSource): boolean
+  case source.kind
+  when folder then return true
+  else return false
+  end
+end
+
+local function same_physical_source(module: Module,
+                                    source: PhysicalSource): boolean
+  if module_is_folder(module) ~= physical_is_folder(source) or
+     #module.files ~= #source.files then
+    return false
+  end
+  for index = 1, #module.files do
+    if canonical_path(module.files[index]) ~= canonical_path(source.files[index])
+       then
+      return false
+    end
+  end
+  return true
+end
+
+local function discover_or_raise(include: {string}, exclude: {string},
+                                 source_module_roots: {string}): Discovery
   local roots: {IncludeRoot} = {}
   local present: {string: boolean} = {}
   for index = 1, #include do
@@ -467,6 +762,17 @@ local function discover_or_raise(include: {string}, exclude: {string}): Discover
     if not present[identity.canonical] then
       present[identity.canonical] = true
       roots[#roots + 1] = identity
+    end
+  end
+
+  local source_roots: {SourceRoot} = {}
+  local source_present: {string: boolean} = {}
+  for index = 1, #source_module_roots do
+    local root = absolute_root(source_module_roots[index])
+    local canonical = canonical_path(root)
+    if not source_present[canonical] then
+      source_present[canonical] = true
+      source_roots[#source_roots + 1] = SourceRoot.new(root, canonical)
     end
   end
 
@@ -482,8 +788,8 @@ local function discover_or_raise(include: {string}, exclude: {string}): Discover
 
   local directories: {string} = {}
   local directory_present: {string: boolean} = {}
+  local entries: {FileEntry} = {}
   local modules: {Module} = {}
-  local modules_by_name: {string: Module} = {}
   local owner_by_file: {string: string} = {}
   local issues: {Issue} = {}
 
@@ -508,7 +814,7 @@ local function discover_or_raise(include: {string}, exclude: {string}): Discover
           excluded_path, root.canonical, root.lexical)
       end
     end
-    local found = scan_root(root.lexical, root_excluded, boundaries)
+    local found = scan_root(root, root_excluded, boundaries, source_roots)
     for index = 1, #found.directories do
       local directory = found.directories[index]
       if not directory_present[directory] then
@@ -516,18 +822,85 @@ local function discover_or_raise(include: {string}, exclude: {string}): Discover
         directories[#directories + 1] = directory
       end
     end
-    for index = 1, #found.modules do
-      local module = found.modules[index]
-      if modules_by_name[module.name] == nil then
-        modules_by_name[module.name] = module
-        modules[#modules + 1] = module
-        for file_index = 1, #module.files do
-          owner_by_file[module.files[file_index]] = module.name
-        end
+    for index = 1, #found.files do
+      entries[#entries + 1] = found.files[index]
+    end
+  end
+
+  local entries_by_source_root: {{FileEntry}} = {}
+  for index = 1, #source_roots do entries_by_source_root[index] = {} end
+  for index = 1, #entries do
+    local entry = entries[index]
+    local selection? = selected_source_root(entry, source_roots)
+    if selection == nil then
+      issues[#issues + 1] = Issue.new(
+        entry.path,
+        "saved Titan source is not beneath any source_module_roots entry")
+    else
+      local bucket = entries_by_source_root[selection.root_index]
+      bucket[#bucket + 1] = map_to_source_root(entry, selection)
+    end
+  end
+
+  -- A candidate is named from its most-specific source root. Validate that
+  -- identity against root-major compiler lookup before publishing it. This is
+  -- essential for overlapping roots and earlier unwatched roots: either can
+  -- make the compiler select a different physical provider for the same name.
+  local candidates: {string: Candidate} = {}
+  local candidate_names: {string} = {}
+  for root_index = 1, #source_roots do
+    local catalog = discover_entries(entries_by_source_root[root_index])
+    for index = 1, #catalog.modules do
+      local module = catalog.modules[index]
+      if candidates[module.name] == nil then
+        candidates[module.name] = Candidate.new(
+          module, catalog.owner_by_file)
+        candidate_names[#candidate_names + 1] = module.name
+      else
+        local selected = candidates[module.name]
+        issues[#issues + 1] = Issue.new(
+          module.main_file,
+          "logical Titan module '" .. module.name ..
+          "' is shadowed by earlier source_module_roots provider '" ..
+          selected.module.main_file .. "'")
       end
     end
-    for index = 1, #found.issues do
-      issues[#issues + 1] = found.issues[index]
+    for index = 1, #catalog.issues do
+      issues[#issues + 1] = catalog.issues[index]
+    end
+  end
+
+  sort_strings(candidate_names)
+  for index = 1, #candidate_names do
+    local name = candidate_names[index]
+    local candidate = candidates[name]
+    local resolved? = resolve_source(source_roots, name)
+    if resolved == nil then
+      issues[#issues + 1] = Issue.new(
+        candidate.module.main_file,
+        "logical Titan module '" .. name ..
+        "' is not resolvable through source_module_roots")
+    else
+      case resolved
+      when blocked: blocking_source then
+        issues[#issues + 1] = Issue.new(
+          candidate.module.main_file,
+          "logical Titan module '" .. name ..
+          "' is blocked by folder source '" .. blocking_source .. "'")
+      when found: source then
+        if same_physical_source(candidate.module, source) then
+          modules[#modules + 1] = candidate.module
+          for file, owner in iteration.pairs(candidate.owner_by_file) do
+            if owner == name then owner_by_file[file] = name end
+          end
+        else
+          issues[#issues + 1] = Issue.new(
+            candidate.module.main_file,
+            "logical Titan module '" .. name ..
+            "' resolves to a different physical provider through " ..
+            "source_module_roots: '" .. source.main_file .. "'")
+        end
+      end
     end
   end
 
@@ -535,13 +908,19 @@ local function discover_or_raise(include: {string}, exclude: {string}): Discover
   sort_issues(issues)
   local include_roots: {string} = {}
   for index = 1, #roots do include_roots[index] = roots[index].lexical end
+  local source_root_paths: {string} = {}
+  for index = 1, #source_roots do
+    source_root_paths[index] = source_roots[index].lexical
+  end
   return Discovery.new(
-    include_roots, directories, modules, owner_by_file, issues)
+    include_roots, source_root_paths, directories,
+    modules, owner_by_file, issues)
 end
 
-function discover(include: {string}, exclude: {string}): (Discovery?, Error?)
+function discover(include: {string}, exclude: {string},
+                  source_module_roots: {string}): (Discovery?, Error?)
   do
-    return discover_or_raise(include, exclude), nil
+    return discover_or_raise(include, exclude, source_module_roots), nil
   catch
     if error is async.CancellationReason then raise end
     if error is Error then return nil, error as Error end
