@@ -1763,6 +1763,97 @@ local function assert_joined_symbol(module: bridge.ModuleSnapshot,
               "compiler-backed symbol '" .. name .. "' was under-indexed")
 end
 
+local function normalizes_spread_expression_metadata()
+  preload_real_compiler()
+  local filename = "/workspace/spread_semantics.titan"
+  local source = [[function sink(left: integer?, right: integer?)
+end
+
+function use(items: {integer}, lookup: {integer: integer},
+             first: integer, last: integer): {integer}
+  sink(...lookup[first, last])
+  return {...items[first, last]}
+end
+]]
+  local projects = {bridge.ProjectModule.new("spread_semantics", {
+    bridge.SourceFile.new(filename, source),
+  })}
+  local analysis = bridge.load():analyze("spread_semantics", projects)
+  local diagnostics = strings.writer()
+  for index = 1, #analysis.diagnostics do
+    diagnostics:write(analysis.diagnostics[index].message .. "\n")
+  end
+  test.assert(#analysis.diagnostics == 0,
+              "compiler rejected spread semantic fixture: " ..
+              diagnostics:drain())
+  local module? = analysis:find_module("spread_semantics")
+  test.assert(module ~= nil,
+              "spread semantic fixture lost its compiler snapshot")
+
+  local carriers = 0
+  local projections = 0
+  for index = 1, #module.nodes do
+    local node = module.nodes[index]
+    if node.tag == "Ast.ExpSpread" then
+      carriers = carriers + 1
+    elseif node.tag == "Ast.ExpSpreadIndex" then
+      projections = projections + 1
+    end
+  end
+  test.assert(carriers == 2 and projections == 2,
+              "spread carriers or finite projections were not normalized")
+  assert_joined_symbol(module, "items", 2)
+  assert_joined_symbol(module, "lookup", 2)
+  assert_joined_symbol(module, "first", 3)
+  assert_joined_symbol(module, "last", 3)
+
+  local model = features.build(projects, analysis.modules)
+  local first_definition? = model:definition(
+    filename, source_text.Position.new(5, 18))
+  test.assert(first_definition ~= nil and
+              first_definition.range.start.line == 4 and
+              first_definition.range.start.character == 13 and
+              first_definition.range.finish.character == 18,
+              "spread lower bound did not resolve to its parameter")
+
+  local first_references = model:references(
+    filename, source_text.Position.new(5, 18), false)
+  local last_references = model:references(
+    filename, source_text.Position.new(5, 25), false)
+  test.assert(#first_references == 2 and
+              first_references[1].range.start.line == 5 and
+              first_references[2].range.start.line == 6 and
+              #last_references == 2 and
+              last_references[1].range.start.line == 5 and
+              last_references[2].range.start.line == 6,
+              "spread bounds were not indexed exactly once per written use")
+
+  local first_hover? = model:hover(
+    filename, source_text.Position.new(5, 18))
+  test.assert(first_hover ~= nil and
+              first_hover.range.start.line == 5 and
+              first_hover.range.start.character == 17 and
+              first_hover.range.finish.character == 22 and
+              first_hover:markdown() ==
+                "- Type: `integer`\n- Visibility: block\n",
+              "spread bound lost its exact range or compiler hover type")
+
+  local ranges = model:folding_ranges(filename)
+  local saw_use = false
+  for index = 1, #ranges do
+    if ranges[index].start_line == 3 and ranges[index].end_line == 6 then
+      saw_use = true
+    end
+  end
+  test.assert(saw_use,
+              "spread syntax disrupted the containing function fold")
+end
+
+function test_compiler_bridge_normalizes_spread_expression_semantics(
+    _context: test.Context)
+  run_bridge(normalizes_spread_expression_metadata)
+end
+
 local function normalizes_generic_nominal_member_metadata()
   preload_real_compiler()
   local compiler = bridge.load()
