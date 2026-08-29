@@ -14,12 +14,20 @@ hover, references, rename, and folding for an entire project. The server must
 build as one native executable and be usable independently by VS Code and
 Codex.
 
-The executable statically selects the Titan standard-library provider, which
-carries the embedded Lua interpreter and configured native dependencies. The
-compiler itself remains ordinary Lua code: the server's embedded Lua discovers
-and loads the installed compiler modules through `package.path` with
-`lua.require`. Packaging and diagnostics must keep those two facts
-distinct.
+The executable statically selects the Titan standard-library runtime modules
+needed by the server, together with the embedded Lua interpreter and configured
+native dependencies. Initialized statically linked modules register their
+runtime openers in `package.preload`. The executable separately embeds a
+metadata-only inventory of all 18 canonical standard-module interfaces;
+compiler language-server API 4 validates and decodes it for project
+typechecking. This inventory is analysis data, not module implementation or a
+linkable provider.
+
+The compiler itself remains ordinary Lua code: the server's embedded Lua
+discovers and loads compiler modules through `package.path` with `lua.require`.
+The VSIX supplies matching private Lua source and native-module trees, while
+standalone callers supply their own paths. Packaging and diagnostics must keep
+those facts distinct.
 
 ## V1 boundaries
 
@@ -60,19 +68,34 @@ messages; stderr carries logs.
 
 The Makefile owns the cross-language build:
 
-1. compile the Titan server with the project-local `.titan/bin/titanc` and
-   static Titan-provider preference;
+1. compile the Titan server with the project-local `.titan/bin/titanc`, static
+   Titan-provider preference, and the complete metadata-only standard-interface
+   inventory;
 2. compile/bundle the extension and run its JavaScript tests;
-3. assemble a platform-specific VSIX containing the native executable;
+3. assemble a platform-specific VSIX containing the native executable plus
+   exactly the private `dist/titan/share/lua/5.5` and
+   `dist/titan/lib/lua/5.5` trees, with no `lib/titan` tree, Titan provider
+   archive, Titan headers, or additional native SDK payload;
 4. provide focused and complete test targets.
 
-The executable has no Titan stdlib or Lua DSO requirement when the installed
-static provider supplies them. This does not mean the compiler Lua sources are
-inside the binary: the runtime installation must expose compatible
-`titan-compiler` modules on Lua's `package.path` and their ordinary native Lua
-modules on `package.cpath`. On ELF systems the server link must export the
-embedded Lua API (for example with `-Wl,-E`) so those native modules bind to the
-same Lua state.
+Initialized statically selected Titan runtime modules register their openers in
+`package.preload`; the VSIX does not copy their provider archive to disk. This
+does not mean the compiler Lua sources are inside the binary. The VSIX carries
+the ordinary compiler modules under `dist/titan/share/lua/5.5` and their native
+Lua dependencies under `dist/titan/lib/lua/5.5`, then launches the server with
+absolute `TITAN_LS_LUA_PATH` and `TITAN_LS_LUA_CPATH` templates. A standalone
+server instead uses those environment variables or its `./?.lua` and `./?.so`
+defaults. On ELF systems the server link must export the embedded Lua API (for
+example with `-Wl,-E`) so native Lua modules bind to the same Lua state.
+
+Project typechecking does not discover Titan standard-module interfaces through
+an on-disk provider. API 4 validates and decodes the executable's metadata-only
+18-entry inventory before considering disk-backed compiled providers. The
+inventory covers `titan.async`, `titan.coroutine`, `titan.fs`, `titan.gc`,
+`titan.http`, `titan.io`, `titan.iteration`, `titan.lua`, `titan.math`,
+`titan.net`, `titan.os`, `titan.peg`, `titan.ssl`, `titan.string`, `titan.test`,
+`titan.timer`, `titan.url`, and `titan.uv`; it carries serialized ABI/type data,
+not implementations or link inputs.
 
 ### Server layers
 
@@ -152,6 +175,12 @@ joins its explicit retry.
   re-stats it. A stable first binary/contextual discovery commits immediately;
   same-path replacement or different providers selected for one logical module
   across compiler attempts invalidates the consumer and retries.
+- The metadata-only embedded provider is the running executable itself and
+  cannot be reloaded in place. The bridge captures its followed identity before
+  the first analysis, requires the same baseline at every later analysis, and
+  observes it again before publication. Replacement is a terminal request to
+  restart the language-server process rather than attributing in-memory
+  interfaces to a different file at the same pathname.
 
 ### Configuration
 
@@ -233,8 +262,11 @@ Gate: the single native executable passes protocol transcripts and a real
 
 ### Phase 3 — compiler bridge and project graph
 
-- Load the compatible installed compiler Lua modules through normal
-  `package.path`; report actionable discovery/version failures.
+- Load compatible compiler Lua modules through normal `package.path`; use the
+  VSIX-owned tree by default and report actionable discovery/version failures
+  for standalone or configured overrides. Require compiler
+  `LANGUAGE_SERVER_API_VERSION = 4` and give each resolver context the validated
+  metadata-only `embedded_interface_provider` option.
 - Identify the smallest compiler API changes required for independent module
   checking, manifests, annotated AST retention, I/O injection, and cooperative
   yield. Keep any such work on a new Titan repository branch.
@@ -265,14 +297,17 @@ through the compiled server.
 
 ### Phase 5 — packaging, agents, and delivery
 
-- Package the correct platform executable in a VSIX and document how other
-  platforms are built.
+- Package the correct platform executable and exactly its private
+  `dist/titan/share/lua/5.5` and `dist/titan/lib/lua/5.5` trees in a VSIX, and
+  document how other platforms are built. Do not package `lib/titan`, provider
+  archives, Titan headers, or any other native SDK payload.
 - Document clean builds, all tests, F5 development, VSIX creation, and local
   `code --install-extension` installation.
 - Package an agent-readable, skills-only Codex adapter whose deterministic
   read-only query script launches the same executable directly, including root
-  and compiler `package.path` requirements, then test its framing and lifecycle
-  through definitions, references, hover, folding, and rename previews.
+  and standalone `TITAN_LS_LUA_PATH` / `TITAN_LS_LUA_CPATH` requirements, then
+  test its framing and lifecycle through definitions, references, hover,
+  folding, and rename previews.
 - Run the full Make/npm/Titan gates, inspect the packaged contents and native
   dependencies, and review scope against every acceptance criterion.
 - Commit exact paths to a feature branch and open a reviewed pull request. If
@@ -287,6 +322,13 @@ has evidence before moving to Done.
 ## Review checklist
 
 - No compiler Lua modules claimed to be embedded in the executable.
+- VSIX compiler artifacts are confined to `dist/titan/share/lua/5.5` and
+  `dist/titan/lib/lua/5.5`.
+- No `lib/titan` tree, Titan provider/archive, Titan headers, or additional
+  native SDK payload in the VSIX.
+- Initialized statically linked standard modules use `package.preload`; the
+  complete 18-entry embedded inventory is validated metadata-only analysis
+  input, not runtime code or a linkable provider.
 - Native compiler dependencies can bind to the exported embedded Lua API.
 - No server logging on stdout.
 - No unsaved text used for semantic answers.
@@ -301,9 +343,11 @@ has evidence before moving to Done.
 
 ## Resolved investigation outcomes
 
-- Compiler API 3 exposes resolver-scoped incremental analysis, complete project
-  AST reuse, detached public manifests, exact external provenance, and ordered
-  checked-module checkpoints without embedding compiler Lua modules.
+- Compiler API 4 exposes resolver-scoped incremental analysis, complete project
+  AST reuse, detached public manifests, exact external provenance, ordered
+  checked-module checkpoints, and validation/resolution of the executable's
+  metadata-only standard-interface provider without embedding compiler Lua
+  modules.
 - The resolver context owns one I/O strategy. Ordinary `titanc` uses the Lua
   implementation; the server supplies a Titan-record proxy backed by Titan
   async filesystem/process APIs and `async.yield`. The one focused Titan

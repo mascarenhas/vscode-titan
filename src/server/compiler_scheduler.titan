@@ -8,6 +8,7 @@ local logging = import "server.logging"
 
 local record Waiter
   task: async.Task<value, value>
+  resume_token: async.ResumeToken
   queued: boolean
   granted: boolean
 end
@@ -42,7 +43,7 @@ local function Scheduler:grant_next()
         json.Member.new("remaining_waiters", json.from_integer(
           #self.waiters)),
       })
-      waiter.task:resume()
+      waiter.task:resume(waiter.resume_token)
       return
     end
   end
@@ -74,7 +75,9 @@ function Scheduler:acquire(): Permit
     return Permit.new(function () self:release_owner() end, false)
   end
 
-  local waiter = Waiter.new(async.running(), true, false)
+  local waiter = Waiter.new(
+    async.running(), async.ResumeToken.new("server.compiler_scheduler"),
+    true, false)
   self.waiters[#self.waiters + 1] = waiter
   local started = logging.clock()
   logging.emit("debug", "compiler.scheduler.wait", {
@@ -82,7 +85,9 @@ function Scheduler:acquire(): Permit
   })
   local abandon = function () self:abandon(waiter) end
   do
-    while not waiter.granted do async.suspend(abandon) end
+    while not waiter.granted do
+      async.suspend(waiter.resume_token, abandon)
+    end
     waiter.queued = false
     logging.emit("debug", "compiler.scheduler.acquire", {
       json.Member.new("waited", json.from_boolean(true)),

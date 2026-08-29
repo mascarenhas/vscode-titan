@@ -1,0 +1,68 @@
+local os = import "os"
+local test = import "test"
+local lua_paths = import "server.lua_paths.titan"
+
+local function restore_environment(name: string, contents: string?)
+  if contents ~= nil then
+    os.setenv(name, contents)
+  else
+    os.unsetenv(name)
+  end
+end
+
+local function restore_state(path: string, cpath: string,
+                             environment_path: string?,
+                             environment_cpath: string?)
+  lua_paths.set_package_paths(path, cpath)
+  restore_environment("TITAN_LS_LUA_PATH", environment_path)
+  restore_environment("TITAN_LS_LUA_CPATH", environment_cpath)
+end
+
+function test_lua_paths_default_independently_of_ambient_lua_paths(
+    _context: test.Context)
+  local original_path, original_cpath = lua_paths.current_package_paths()
+  local original_environment_path? = os.getenv("TITAN_LS_LUA_PATH")
+  local original_environment_cpath? = os.getenv("TITAN_LS_LUA_CPATH")
+  defer restore_state(
+    original_path, original_cpath,
+    original_environment_path, original_environment_cpath)
+
+  os.unsetenv("TITAN_LS_LUA_PATH")
+  os.unsetenv("TITAN_LS_LUA_CPATH")
+  lua_paths.set_package_paths("ambient/?.lua", "ambient/?.so")
+
+  local configured_path, configured_cpath = lua_paths.configure()
+  local actual_path, actual_cpath = lua_paths.current_package_paths()
+  test.assert(configured_path == "./?.lua" and actual_path == "./?.lua",
+    "language server did not replace package.path with its local default")
+  test.assert(configured_cpath == "./?.so" and actual_cpath == "./?.so",
+    "language server did not replace package.cpath with its local default")
+end
+
+function test_lua_paths_apply_environment_overrides_independently(
+    _context: test.Context)
+  local original_path, original_cpath = lua_paths.current_package_paths()
+  local original_environment_path? = os.getenv("TITAN_LS_LUA_PATH")
+  local original_environment_cpath? = os.getenv("TITAN_LS_LUA_CPATH")
+  defer restore_state(
+    original_path, original_cpath,
+    original_environment_path, original_environment_cpath)
+
+  local override_path = "/extension with spaces/share/lua/5.5/?.lua"
+  local override_cpath = "/extension with spaces/lib/lua/5.5/?.so"
+  os.setenv("TITAN_LS_LUA_PATH", override_path)
+  os.unsetenv("TITAN_LS_LUA_CPATH")
+  local configured_path, configured_cpath = lua_paths.configure()
+  test.assert(configured_path == override_path,
+    "language server did not apply TITAN_LS_LUA_PATH")
+  test.assert(configured_cpath == "./?.so",
+    "Lua source override unexpectedly changed the native-module default")
+
+  os.unsetenv("TITAN_LS_LUA_PATH")
+  os.setenv("TITAN_LS_LUA_CPATH", override_cpath)
+  configured_path, configured_cpath = lua_paths.configure()
+  test.assert(configured_path == "./?.lua",
+    "native-module override unexpectedly changed the source-module default")
+  test.assert(configured_cpath == override_cpath,
+    "language server did not apply TITAN_LS_LUA_CPATH")
+end

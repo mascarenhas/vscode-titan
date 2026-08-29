@@ -18,6 +18,7 @@ local record InputDelivery
   body: string
   acknowledged: boolean
   reader: async.Task?
+  resume_token: async.ResumeToken
 end
 
 local union InputEvent
@@ -29,6 +30,7 @@ end
 local record InputQueue
   items: {InputEvent}
   waiter: async.Task?
+  resume_token: async.ResumeToken
 end
 
 local record Session
@@ -41,7 +43,8 @@ local record Session
 end
 
 local function new_input_queue(): InputQueue
-  return InputQueue.new({}, nil)
+  return InputQueue.new(
+    {}, nil, async.ResumeToken.new("server.protocol.input_queue"))
 end
 
 local function InputDelivery:acknowledge()
@@ -49,7 +52,7 @@ local function InputDelivery:acknowledge()
   self.acknowledged = true
   local reader? = self.reader
   self.reader = nil
-  if reader ~= nil then reader:resume() end
+  if reader ~= nil then reader:resume(self.resume_token) end
 end
 
 local function InputDelivery:wait()
@@ -63,7 +66,9 @@ local function InputDelivery:wait()
     if self.reader == current then self.reader = nil end
   end
   defer detach()
-  while not self.acknowledged do async.suspend(detach) end
+  while not self.acknowledged do
+    async.suspend(self.resume_token, detach)
+  end
 end
 
 local function InputQueue:push(event: InputEvent)
@@ -71,7 +76,7 @@ local function InputQueue:push(event: InputEvent)
   local waiter? = self.waiter
   if waiter == nil then return end
   self.waiter = nil
-  waiter:resume()
+  waiter:resume(self.resume_token)
 end
 
 local function InputQueue:take(): InputEvent
@@ -85,7 +90,7 @@ local function InputQueue:take(): InputEvent
       if self.waiter == current then self.waiter = nil end
     end
     defer detach()
-    async.suspend(detach)
+    async.suspend(self.resume_token, detach)
   end
 
   local count = #self.items
@@ -110,7 +115,9 @@ local function read_messages(source: io.Reader, queue: InputQueue): nil
     logging.emit("trace", "protocol.receive", {
       json.Member.new("bytes", json.from_integer(#body)),
     })
-    local delivery = InputDelivery.new(body, false, nil)
+    local delivery = InputDelivery.new(
+      body, false, nil,
+      async.ResumeToken.new("server.protocol.input_delivery"))
     queue:push(InputEvent.message(delivery))
     -- Do not submit another stdin read until the coordinator has processed
     -- this envelope. In particular, exit leaves the reader explicitly

@@ -139,6 +139,18 @@ for (const [index, rawPlugin] of marketplace.plugins.entries()) {
     if (skill.includes("[TODO:")) {
       throw new Error(`${pluginName}: ${entry.name} contains a TODO placeholder`);
     }
+    if (entry.name === "titan-lsp-query") {
+      for (const variable of [
+        "TITAN_LS_LUA_PATH",
+        "TITAN_LS_LUA_CPATH"
+      ]) {
+        if (!skill.includes(variable)) {
+          throw new Error(
+            `${pluginName}: ${entry.name} must document ${variable}`
+          );
+        }
+      }
+    }
   }
 
   const queryScript = path.join(

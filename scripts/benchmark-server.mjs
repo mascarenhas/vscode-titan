@@ -49,6 +49,21 @@ const PROBE_PERSISTENT_LOOKUPS = new Set([
 ]);
 const MAX_PROBE_HEADER_LABEL_BYTES = 4096;
 const PROFILE_CPU_ROUNDING_ULPS = 64;
+const REPOSITORY_ROOT = path.resolve(
+  path.dirname(fileURLToPath(import.meta.url)),
+  ".."
+);
+const DEVELOPMENT_LUA_ROOT = path.join(
+  REPOSITORY_ROOT, ".titan", "share", "lua", "5.5"
+);
+const DEVELOPMENT_C_ROOT = path.join(
+  REPOSITORY_ROOT, ".titan", "lib", "lua", "5.5"
+);
+const DEVELOPMENT_LUA_PATH = [
+  path.join(DEVELOPMENT_LUA_ROOT, "?.lua"),
+  path.join(DEVELOPMENT_LUA_ROOT, "?", "init.lua")
+].join(";");
+const DEVELOPMENT_LUA_CPATH = path.join(DEVELOPMENT_C_ROOT, "?.so");
 
 class BenchmarkError extends Error {}
 
@@ -784,12 +799,8 @@ function usage() {
 }
 
 function parseArguments(argv) {
-  const repositoryRoot = path.resolve(
-    path.dirname(fileURLToPath(import.meta.url)),
-    ".."
-  );
   const options = {
-    root: repositoryRoot,
+    root: REPOSITORY_ROOT,
     server: undefined,
     file: BENCHMARK_FILE,
     marker: BENCHMARK_MARKER,
@@ -1369,6 +1380,10 @@ async function startServer(options) {
     cwd: options.root,
     env: {
       ...process.env,
+      TITAN_LS_LUA_PATH:
+        process.env.TITAN_LS_LUA_PATH ?? DEVELOPMENT_LUA_PATH,
+      TITAN_LS_LUA_CPATH:
+        process.env.TITAN_LS_LUA_CPATH ?? DEVELOPMENT_LUA_CPATH,
       TITAN_LANGUAGE_SERVER_LOG_LEVEL: options.logLevel
     },
     stdio: ["pipe", "pipe", "pipe"]

@@ -7,8 +7,16 @@ import * as path from "node:path";
 import { pathToFileURL } from "node:url";
 
 const server = process.argv[2];
+const mode = process.argv[3] ?? "full";
 if (!server) {
-  console.error("usage: node scripts/test-server-protocol.mjs PATH-TO-SERVER");
+  console.error(
+    "usage: node scripts/test-server-protocol.mjs PATH-TO-SERVER " +
+      "[--self-contained-smoke]"
+  );
+  process.exit(2);
+}
+if (!["full", "--self-contained-smoke"].includes(mode)) {
+  console.error(`unsupported protocol-test mode: ${mode}`);
   process.exit(2);
 }
 
@@ -127,6 +135,50 @@ function launch(cwd = process.cwd(), logLevel = "off") {
     },
     stdio: ["pipe", "pipe", "pipe"]
   });
+}
+
+async function printedLuaPaths(environment) {
+  const child = spawn(path.resolve(server), ["--print-paths"], {
+    cwd: process.cwd(),
+    env: environment,
+    stdio: ["pipe", "pipe", "pipe"]
+  });
+  const stdout = collect(child.stdout);
+  const stderr = collect(child.stderr);
+  const exit = exitOf(child);
+  const outcome = await awaitExit(exit);
+  assert.deepEqual(
+    outcome,
+    { code: 0, signal: null },
+    stderr().toString("utf8")
+  );
+  assert.equal(stderr().length, 0, stderr().toString("utf8"));
+  return stdout().toString("utf8");
+}
+
+async function testLuaModulePathConfiguration() {
+  const defaultEnvironment = {
+    ...process.env,
+    LUA_PATH: "/ambient/must-not-leak/?.lua",
+    LUA_CPATH: "/ambient/must-not-leak/?.so"
+  };
+  delete defaultEnvironment.TITAN_LS_LUA_PATH;
+  delete defaultEnvironment.TITAN_LS_LUA_CPATH;
+  assert.equal(
+    await printedLuaPaths(defaultEnvironment),
+    "package.path=./?.lua\npackage.cpath=./?.so\n"
+  );
+
+  const sourcePath = "/extension with spaces/share/lua/5.5/?.lua";
+  const nativePath = "/extension with spaces/lib/lua/5.5/?.so";
+  assert.equal(
+    await printedLuaPaths({
+      ...defaultEnvironment,
+      TITAN_LS_LUA_PATH: sourcePath,
+      TITAN_LS_LUA_CPATH: nativePath
+    }),
+    `package.path=${sourcePath}\npackage.cpath=${nativePath}\n`
+  );
 }
 
 function exitOf(child) {
@@ -789,6 +841,113 @@ async function testSavedProjectSemantics() {
   }
 }
 
+async function testSelfContainedCompilerModules() {
+  const root = await makePhysicalTemporaryRoot(
+    "vscode-titan-self-contained-"
+  );
+  const filename = path.join(root, "standard_module.titan");
+  const lines = [
+    'local strings = import "string"',
+    'local http = import "http"',
+    "",
+    "function render(item: string): string",
+    "  return strings.upper(item)",
+    "end",
+    "function request_scheme(request: http.Request): string",
+    "  return request.url.scheme",
+    "end",
+    "function use(): string",
+    '  return render("titan")',
+    "end",
+    ""
+  ];
+  await writeFile(
+    path.join(root, "titan-config.lua"),
+    'include = { "." }\nsource_module_roots = { "." }\n',
+    "utf8"
+  );
+  await writeFile(filename, lines.join("\n"), "utf8");
+
+  const uri = pathToFileURL(filename).href;
+  const renderLine = lines.findIndex(
+    (line) => line.startsWith("function render(")
+  );
+  assert.ok(renderLine >= 0);
+  const useLine = lines.findIndex((line) => line.includes('render("titan")'));
+  assert.ok(useLine >= 0);
+  const useColumn = lines[useLine].indexOf("render");
+  assert.ok(useColumn >= 0);
+  const child = launch(root);
+  const exit = exitOf(child);
+  const stderr = collect(child.stderr);
+  const responses = new FrameReader(child.stdout);
+  try {
+    await request(child, responses, 1, "initialize", {});
+    child.stdin.write(frame({
+      jsonrpc: "2.0",
+      method: "initialized",
+      params: {}
+    }));
+    await waitForIndexing(responses);
+
+    const definition = await semanticRequest(
+      child,
+      responses,
+      "self-contained-definition",
+      "textDocument/definition",
+      {
+        textDocument: { uri },
+        position: { line: useLine, character: useColumn + 1 }
+      }
+    );
+    assert.equal(definition.error, undefined, JSON.stringify(definition.error));
+    assert.deepEqual(
+      definition.result,
+      {
+        uri,
+        range: {
+          start: { line: renderLine, character: 9 },
+          end: { line: renderLine, character: 15 }
+        }
+      },
+      `self-contained definition failed; diagnostics: ${
+        JSON.stringify(responses.diagnosticPublications)
+      }`
+    );
+    assert.ok(
+      responses.diagnosticPublications.every(
+        (publication) => publication.diagnostics.length === 0
+      ),
+      `self-contained standard-module fixture produced diagnostics: ${
+        JSON.stringify(responses.diagnosticPublications)
+      }`
+    );
+
+    const shutdown = await request(
+      child,
+      responses,
+      "self-contained-shutdown",
+      "shutdown",
+      null
+    );
+    assert.equal(shutdown.result, null);
+    child.stdin.write(frame({ jsonrpc: "2.0", method: "exit" }));
+    assert.deepEqual(await awaitExit(exit), { code: 0, signal: null });
+    await responses.finish();
+    assert.equal(responses.buffer.length, 0);
+    assert.equal(stderr().length, 0, stderr().toString("utf8"));
+  } catch (cause) {
+    const diagnostic = stderr().toString("utf8").trim();
+    throw new Error(
+      `${cause.message}${diagnostic.length > 0 ? `; stderr: ${diagnostic}` : ""}`,
+      { cause }
+    );
+  } finally {
+    if (child.exitCode === null && child.signalCode === null) child.kill();
+    await rm(root, { recursive: true, force: true });
+  }
+}
+
 async function testConfigCannotWriteProtocolStdout() {
   const root = await makePhysicalTemporaryRoot("vscode-titan-config-");
   const filename = path.join(root, "sample.titan");
@@ -992,7 +1151,8 @@ async function testSourceImportCppflagsAndUnchangedRequests() {
     );
     assert.ok(
       guardedHover.result,
-      "project preprocessing configuration did not produce a semantic snapshot"
+      "project preprocessing configuration did not produce a semantic snapshot; " +
+        `diagnostics: ${JSON.stringify(responses.diagnosticPublications)}`
     );
     assert.equal(guardedHover.result.contents.kind, "markdown");
     assert.match(guardedHover.result.contents.value, /guarded_answer/);
@@ -1405,12 +1565,18 @@ async function testTruncatedFrame() {
   }
 }
 
-await testCoalescedIndexingResetStatus();
-await testLifecycle();
-await testSavedProjectSemantics();
-await testConfigCannotWriteProtocolStdout();
-await testSourceImportCppflagsAndUnchangedRequests();
-await testCrossModuleFolderAndIncrementalSemantics();
-await testDebugCompilerProgress();
-await testTruncatedFrame();
-console.log("native server protocol transcript passed");
+await testLuaModulePathConfiguration();
+if (mode === "--self-contained-smoke") {
+  await testSelfContainedCompilerModules();
+  console.log("self-contained compiler-module protocol smoke passed");
+} else {
+  await testCoalescedIndexingResetStatus();
+  await testLifecycle();
+  await testSavedProjectSemantics();
+  await testConfigCannotWriteProtocolStdout();
+  await testSourceImportCppflagsAndUnchangedRequests();
+  await testCrossModuleFolderAndIncrementalSemantics();
+  await testDebugCompilerProgress();
+  await testTruncatedFrame();
+  console.log("native server protocol transcript passed");
+}

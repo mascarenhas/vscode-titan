@@ -12,7 +12,10 @@ import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { afterEach, describe, test } from "node:test";
 import {
+  COMPILER_CACHE_PREFIX_ENVIRONMENT_VARIABLE,
   DEFAULT_SERVER_LOG_LEVEL,
+  LANGUAGE_SERVER_LUA_CPATH_ENVIRONMENT_VARIABLE,
+  LANGUAGE_SERVER_LUA_PATH_ENVIRONMENT_VARIABLE,
   SERVER_BASENAME,
   SERVER_LOG_LEVEL_ENVIRONMENT_VARIABLE,
   ServerConfigurationError,
@@ -92,25 +95,78 @@ describe("server configuration", () => {
   test("reads compiler Lua discovery paths without rewriting them", () => {
     assert.deepEqual(
       readCompilerDiscoveryConfiguration(
-        "./compiler/?.lua;;",
-        "./compiler/?.so;;"
+        "./compiler/?.lua",
+        "./compiler/?.so",
+        "/extension"
       ),
       {
-        luaPath: "./compiler/?.lua;;",
-        luaCPath: "./compiler/?.so;;"
+        luaPath: "./compiler/?.lua",
+        luaCPath: "./compiler/?.so"
       }
     );
   });
 
+  test("resolves empty compiler paths to the packaged Lua trees", () => {
+    const extensionRoot = path.join(path.sep, "extension with spaces");
+    assert.deepEqual(
+      readCompilerDiscoveryConfiguration("", "", extensionRoot),
+      {
+        luaPath: [
+          path.join(
+            extensionRoot, "dist", "titan", "share", "lua", "5.5", "?.lua"
+          ),
+          path.join(
+            extensionRoot, "dist", "titan", "share", "lua", "5.5", "?",
+            "init.lua"
+          )
+        ].join(";"),
+        luaCPath: path.join(
+          extensionRoot, "dist", "titan", "lib", "lua", "5.5", "?.so"
+        )
+      }
+    );
+  });
+
+  test("applies compiler path overrides independently", () => {
+    const extensionRoot = path.join(path.sep, "extension");
+    const sourceOverride = readCompilerDiscoveryConfiguration(
+      "/configured/?.lua", "", extensionRoot
+    );
+    assert.equal(sourceOverride.luaPath, "/configured/?.lua");
+    assert.equal(
+      sourceOverride.luaCPath,
+      path.join(
+        extensionRoot, "dist", "titan", "lib", "lua", "5.5", "?.so"
+      )
+    );
+
+    const nativeOverride = readCompilerDiscoveryConfiguration(
+      "", "/configured/?.so", extensionRoot
+    );
+    assert.equal(
+      nativeOverride.luaPath,
+      [
+        path.join(
+          extensionRoot, "dist", "titan", "share", "lua", "5.5", "?.lua"
+        ),
+        path.join(
+          extensionRoot, "dist", "titan", "share", "lua", "5.5", "?",
+          "init.lua"
+        )
+      ].join(";")
+    );
+    assert.equal(nativeOverride.luaCPath, "/configured/?.so");
+  });
+
   test("rejects non-string compiler discovery paths", () => {
     assert.throws(
-      () => readCompilerDiscoveryConfiguration([], ""),
+      () => readCompilerDiscoveryConfiguration([], "", "/extension"),
       (error: unknown) =>
         error instanceof ServerConfigurationError &&
         /titan\.compiler\.luaPath must be a string/.test(error.message)
     );
     assert.throws(
-      () => readCompilerDiscoveryConfiguration("", null),
+      () => readCompilerDiscoveryConfiguration("", null, "/extension"),
       (error: unknown) =>
         error instanceof ServerConfigurationError &&
         /titan\.compiler\.luaCPath must be a string/.test(error.message)
@@ -232,6 +288,8 @@ describe("server launch validation", () => {
       options: {
         cwd: "/workspace/project",
         env: {
+          TITAN_LS_LUA_CPATH: "./?.so",
+          TITAN_LS_LUA_PATH: "./?.lua",
           TITAN_LANGUAGE_SERVER_LOG_LEVEL: "debug",
           TITAN_TEST_ENV: "configured"
         }
@@ -241,22 +299,33 @@ describe("server launch validation", () => {
     assert.notEqual(launch.options.env, sourceEnvironment);
   });
 
-  test("overrides compiler discovery paths only when configured", () => {
+  test("launches with resolved compiler discovery paths", () => {
     const sourceEnvironment = {
       LUA_PATH: "inherited-lua-path",
       LUA_CPATH: "inherited-lua-cpath",
+      TITAN_LS_LUA_PATH: "inherited-server-lua-path",
+      TITAN_LS_LUA_CPATH: "inherited-server-lua-cpath",
+      TITAN_PREFIX: "inherited-cache-prefix",
       TITAN_TEST_ENV: "preserved"
     };
+
+    const bundledDiscovery = readCompilerDiscoveryConfiguration(
+      "", "", "/extension"
+    );
 
     const inherited = createServerLaunchOptions(
       "/bin/titan-language-server",
       [],
       "/workspace/project",
       sourceEnvironment,
-      { luaPath: "", luaCPath: "" }
+      bundledDiscovery
     );
     assert.deepEqual(inherited.options.env, {
       ...sourceEnvironment,
+      [LANGUAGE_SERVER_LUA_PATH_ENVIRONMENT_VARIABLE]:
+        bundledDiscovery.luaPath,
+      [LANGUAGE_SERVER_LUA_CPATH_ENVIRONMENT_VARIABLE]:
+        bundledDiscovery.luaCPath,
       TITAN_LANGUAGE_SERVER_LOG_LEVEL: "debug"
     });
 
@@ -266,19 +335,27 @@ describe("server launch validation", () => {
       "/workspace/project",
       sourceEnvironment,
       {
-        luaPath: "/opt/titan/compiler/?.lua;;",
-        luaCPath: "/opt/titan/compiler/?.so;;"
-      }
+        luaPath: "/opt/titan/compiler/?.lua",
+        luaCPath: "/opt/titan/compiler/?.so"
+      },
+      "debug",
+      "/extension-storage"
     );
     assert.deepEqual(configured.options.env, {
-      LUA_PATH: "/opt/titan/compiler/?.lua;;",
-      LUA_CPATH: "/opt/titan/compiler/?.so;;",
+      LUA_PATH: "inherited-lua-path",
+      LUA_CPATH: "inherited-lua-cpath",
+      TITAN_LS_LUA_PATH: "/opt/titan/compiler/?.lua",
+      TITAN_LS_LUA_CPATH: "/opt/titan/compiler/?.so",
+      [COMPILER_CACHE_PREFIX_ENVIRONMENT_VARIABLE]: "/extension-storage",
       TITAN_LANGUAGE_SERVER_LOG_LEVEL: "debug",
       TITAN_TEST_ENV: "preserved"
     });
     assert.deepEqual(sourceEnvironment, {
       LUA_PATH: "inherited-lua-path",
       LUA_CPATH: "inherited-lua-cpath",
+      TITAN_LS_LUA_PATH: "inherited-server-lua-path",
+      TITAN_LS_LUA_CPATH: "inherited-server-lua-cpath",
+      TITAN_PREFIX: "inherited-cache-prefix",
       TITAN_TEST_ENV: "preserved"
     });
   });
@@ -289,7 +366,7 @@ describe("server launch validation", () => {
       [],
       "/workspace/project",
       { [SERVER_LOG_LEVEL_ENVIRONMENT_VARIABLE]: "inherited" },
-      { luaPath: "", luaCPath: "" },
+      { luaPath: "./?.lua", luaCPath: "./?.so" },
       "trace"
     );
 

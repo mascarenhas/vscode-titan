@@ -6,18 +6,20 @@ local async = import "async"
 record ResponseQueue
   local items: {string}
   local waiter: async.Task?
+  local resume_token: async.ResumeToken
   local stopped: boolean
 end
 
 function create(): ResponseQueue
-  return ResponseQueue.new({}, nil, false)
+  return ResponseQueue.new(
+    {}, nil, async.ResumeToken.new("server.response_queue"), false)
 end
 
 local function ResponseQueue:wake()
   local waiter? = self.waiter
   if waiter == nil then return end
   self.waiter = nil
-  waiter:resume()
+  waiter:resume(self.resume_token)
 end
 
 function ResponseQueue:push(message: string)
@@ -49,7 +51,7 @@ function ResponseQueue:take(): string?
       if self.waiter == current then self.waiter = nil end
     end
     defer detach()
-    async.suspend(detach)
+    async.suspend(self.resume_token, detach)
   end
 
   local count = #self.items

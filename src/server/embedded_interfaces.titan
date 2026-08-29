@@ -1,0 +1,51 @@
+local lua = foreign import "lua.h"
+local ffi = foreign import "titan/ffi.h"
+local native = foreign import "embedded_interfaces_native.h"
+
+local function pushed_identity(): {string: value}
+  local results = native.titan_ls_push_embedded_provider_identity(L)
+  if results ~= 1 then
+    raise "embedded compiler provider identity returned " ..
+          (results as integer) .. " values instead of one"
+  end
+  local raw: value = ffi.lua_totvalue(L, -1)
+  if not (raw is {string: value}) then
+    raise "embedded compiler provider identity must return a Lua table"
+  end
+  return raw as {string: value}
+end
+
+-- The generated native inventory is data-only: it contains the canonical
+-- compiler interfaces for Titan's standard provider, not its native payload.
+-- Keep the one untyped table at the compiler-driver boundary; API 4 validates
+-- and decodes every entry before the resolver can observe it.
+function provider(): ({string: value}, {string: value})
+  local top = lua.lua_gettop(L)
+  defer lua.lua_settop(L, top)
+  if lua.lua_checkstack(L, 2) == 0 then
+    raise "cannot reserve Lua stack for embedded compiler interfaces"
+  end
+  local results = native.titan_ls_push_embedded_interface_provider(L)
+  if results ~= 1 then
+    raise "embedded compiler interface provider returned " ..
+          (results as integer) .. " values instead of one"
+  end
+  local raw: value = ffi.lua_totvalue(L, -1)
+  if not (raw is {string: value}) then
+    raise "embedded compiler interface provider must return a Lua table"
+  end
+  return raw as {string: value}, pushed_identity()
+end
+
+-- Re-observe the running image through the same native path used to construct
+-- the initial provider. This remains synchronous and metadata-only, so bridge
+-- fixture analyses do not need an async filesystem runtime merely to validate
+-- the executable-backed inventory.
+function identity(): {string: value}
+  local top = lua.lua_gettop(L)
+  defer lua.lua_settop(L, top)
+  if lua.lua_checkstack(L, 1) == 0 then
+    raise "cannot reserve Lua stack for embedded compiler provider identity"
+  end
+  return pushed_identity()
+end

@@ -204,8 +204,9 @@ function appendEvent(targetPath, details) {
       pid: process.pid,
       cwd: process.cwd(),
       arguments: fixtureArguments,
-      luaPath: process.env.LUA_PATH,
-      luaCPath: process.env.LUA_CPATH,
+      luaPath: process.env.TITAN_LS_LUA_PATH,
+      luaCPath: process.env.TITAN_LS_LUA_CPATH,
+      compilerCachePrefix: process.env.TITAN_PREFIX,
       serverLogLevel: process.env.TITAN_LANGUAGE_SERVER_LOG_LEVEL,
       ...details
     })}\n`);

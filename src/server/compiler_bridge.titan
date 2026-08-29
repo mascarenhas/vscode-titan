@@ -5,11 +5,12 @@ local strings = import "string"
 local async = import "async"
 local compiler_io = import "server.compiler_io"
 local compiler_scheduler = import "server.compiler_scheduler"
+local embedded_interfaces = import "server.embedded_interfaces"
 local json = import "server.json"
 local logging = import "server.logging"
 
 local COMPILER_ABI = "2"
-local COMPILER_LANGUAGE_SERVER_API = 3
+local COMPILER_LANGUAGE_SERVER_API = 4
 local COMPILER_LANGUAGE_SERVER_API_MARKER = "LANGUAGE_SERVER_API_VERSION"
 local PARSER_MODULE = "titan-compiler.parser"
 local CHECKER_MODULE = "titan-compiler.checker"
@@ -343,6 +344,9 @@ record Compiler
   local types: {string: value}
   local driver: {string: value}
   local type_of: TypeOfFunction
+  local embedded_interface_provider: {string: value}
+  local embedded_provider_file: string
+  local embedded_provider_identity: compiler_io.LstatIdentity
   local io: compiler_io.CompilerIO
   local project_asts: {string: value}
   local project_entries: {string: value}
@@ -392,6 +396,43 @@ local function required_integer(candidate: value, module_name: string,
 catch
   return fail<integer>(module_name,
     subject .. " must carry an exact Lua integer")
+end
+
+local function embedded_provider_identity(
+    candidate: {string: value}, provider_file: string):
+    compiler_io.LstatIdentity
+  local path = required_string(
+    candidate["path"], DRIVER_MODULE,
+    "embedded compiler provider identity.path")
+  if path ~= provider_file then
+    return fail<compiler_io.LstatIdentity>(
+      DRIVER_MODULE,
+      "embedded compiler provider identity path '" .. path ..
+      "' does not match provider_file '" .. provider_file .. "'")
+  end
+  local kind = required_string(
+    candidate["kind"], DRIVER_MODULE,
+    "embedded compiler provider identity.kind")
+  if kind ~= "file" then
+    return fail<compiler_io.LstatIdentity>(
+      DRIVER_MODULE,
+      "embedded compiler provider identity kind must be 'file', found '" ..
+      kind .. "'")
+  end
+  return compiler_io.LstatIdentity.new(
+    path,
+    required_integer(candidate["size"], DRIVER_MODULE,
+                     "embedded compiler provider identity.size"),
+    kind,
+    required_integer(candidate["device"], DRIVER_MODULE,
+                     "embedded compiler provider identity.device"),
+    required_integer(candidate["inode"], DRIVER_MODULE,
+                     "embedded compiler provider identity.inode"),
+    required_integer(candidate["modified_seconds"], DRIVER_MODULE,
+                     "embedded compiler provider identity.modified_seconds"),
+    required_integer(
+      candidate["modified_nanoseconds"], DRIVER_MODULE,
+      "embedded compiler provider identity.modified_nanoseconds"))
 end
 
 local function required_boolean(candidate: value, module_name: string,
@@ -720,7 +761,9 @@ local function make_type_of(): TypeOfFunction
   return candidate as TypeOfFunction
 end
 
-local function load_with(require_function: RequireFunction): Compiler
+local function load_with(require_function: RequireFunction,
+                         embedded_interface_provider: {string: value},
+                         embedded_identity: compiler_io.LstatIdentity): Compiler
   local type_of = make_type_of()
   local parser = require_compiler_module(
     require_function, type_of, PARSER_MODULE)
@@ -791,13 +834,32 @@ local function load_with(require_function: RequireFunction): Compiler
   required_map(driver["imported"], DRIVER_MODULE, "driver.imported")
   required_map(types["registry"], TYPES_MODULE, "types.registry")
 
+  local embedded_provider_file = required_string(
+    embedded_interface_provider["provider_file"], DRIVER_MODULE,
+    "embedded_interface_provider.provider_file")
   return Compiler.new(
-    parser, checker, types, driver, type_of, compiler_io.create(),
+    parser, checker, types, driver, type_of, embedded_interface_provider,
+    embedded_provider_file, embedded_identity, compiler_io.create(),
     {}, {}, nil, nil, {}, {})
 end
 
 function load(): Compiler
-  return load_with(lua.require)
+  local provider: {string: value} = {}
+  local raw_identity: {string: value} = {}
+  do
+    provider, raw_identity = embedded_interfaces.provider()
+  catch
+    raise BridgeError.new(
+      DRIVER_MODULE,
+      "cannot load embedded Titan compiler interfaces: " ..
+      strings.tostring(error))
+  end
+  local provider_file = required_string(
+    provider["provider_file"], DRIVER_MODULE,
+    "embedded_interface_provider.provider_file")
+  return load_with(
+    lua.require, provider,
+    embedded_provider_identity(raw_identity, provider_file))
 end
 
 function Compiler:compiler_abi(): string
@@ -879,6 +941,8 @@ local function new_context(compiler: Compiler,
   local options: {string: value} = {}
   if supplied ~= nil then options = supplied as {string: value} end
   options["io"] = compiler.io
+  options["embedded_interface_provider"] =
+    compiler.embedded_interface_provider
   local context: value = create(options)
   if compiler.type_of(context) ~= "table" then
     return fail<value>(DRIVER_MODULE,
@@ -1057,7 +1121,7 @@ function Compiler:resolve_external_modules(
       provenance = Provenance.dynamic_binary(BinaryProvenance.new(
         required_string(raw["provider_file"], DRIVER_MODULE,
                         subject .. ".provider_file")))
-    elseif kind == "static" then
+    elseif kind == "static" or kind == "embedded" then
       provenance = Provenance.static_binary(BinaryProvenance.new(
         required_string(raw["provider_file"], DRIVER_MODULE,
                         subject .. ".provider_file")))
@@ -2574,7 +2638,7 @@ local function exact_occurrence_span(node: {string: value}, tag: string,
   if name_location ~= nil then
     return exact_name_span(name_location, name)
   end
-  -- API 3 marks every source-written identifier with `_name_loc`. Compiler
+  -- API 4 marks every source-written identifier with `_name_loc`. Compiler
   -- lowerings reuse a nearby diagnostic `loc` for generated names, so that
   -- broader location must never be promoted into an exact navigation span.
   return nil
@@ -3098,8 +3162,18 @@ local function cached_source_map(cached: {CachedSourceInterface},
   return normalized, raw
 end
 
+local record NormalizedProvenance
+  provenance: Provenance
+  embedded_provider: boolean
+end
+
+local record NormalizedModule
+  snapshot: ModuleSnapshot
+  embedded_provider: boolean
+end
+
 local function provenance(entry: {string: value}, module_name: string,
-                          projects: {string: ProjectModule}): Provenance
+                          projects: {string: ProjectModule}): NormalizedProvenance
   local kind = required_string(
     entry["kind"], DRIVER_MODULE,
     "compiler provenance for '" .. module_name .. "'.kind")
@@ -3115,21 +3189,34 @@ local function provenance(entry: {string: value}, module_name: string,
     end
     local source = SourceProvenance.new(main_file, source_files)
     if projects[module_name] ~= nil then
-      return Provenance.project_source(source)
+      return NormalizedProvenance.new(
+        Provenance.project_source(source), false)
     end
-    return Provenance.external_source(source)
+    return NormalizedProvenance.new(
+      Provenance.external_source(source), false)
   end
   if kind == "dynamic" then
-    return Provenance.dynamic_binary(BinaryProvenance.new(required_string(
-      entry["filename"], DRIVER_MODULE,
-      "compiler provenance for '" .. module_name .. "'.filename")))
+    return NormalizedProvenance.new(
+      Provenance.dynamic_binary(BinaryProvenance.new(required_string(
+        entry["filename"], DRIVER_MODULE,
+        "compiler provenance for '" .. module_name .. "'.filename"))),
+      false)
   end
   if kind == "static" then
-    return Provenance.static_binary(BinaryProvenance.new(required_string(
-      entry["static_archive"], DRIVER_MODULE,
-      "compiler provenance for '" .. module_name .. "'.static_archive")))
+    return NormalizedProvenance.new(
+      Provenance.static_binary(BinaryProvenance.new(required_string(
+        entry["static_archive"], DRIVER_MODULE,
+        "compiler provenance for '" .. module_name .. "'.static_archive"))),
+      false)
   end
-  return fail<Provenance>(DRIVER_MODULE,
+  if kind == "embedded" then
+    return NormalizedProvenance.new(
+      Provenance.static_binary(BinaryProvenance.new(required_string(
+        entry["filename"], DRIVER_MODULE,
+        "compiler provenance for '" .. module_name .. "'.filename"))),
+      true)
+  end
+  return fail<NormalizedProvenance>(DRIVER_MODULE,
     "unsupported compiler provenance kind '" .. kind .. "'")
 end
 
@@ -3138,10 +3225,11 @@ local function snapshot_module(compiler: Compiler, module_name: string,
                                projects: {string: ProjectModule},
                                cached: {string: CachedSourceInterface},
                                valid_manifest: boolean,
-                               work: NormalizationWork): ModuleSnapshot
+                               work: NormalizationWork): NormalizedModule
   local entry = required_map(
     candidate, DRIVER_MODULE, "driver.imported['" .. module_name .. "']")
-  local origin = provenance(entry, module_name, projects)
+  local normalized_origin = provenance(entry, module_name, projects)
+  local origin = normalized_origin.provenance
   local manifest: Manifest? = nil
   if valid_manifest then
     local cached_source? = cached[module_name]
@@ -3157,7 +3245,7 @@ local function snapshot_module(compiler: Compiler, module_name: string,
           entry["source_manifest"], DRIVER_MODULE,
           "compiler source manifest for '" .. module_name .. "'")
         if source_serialized == "" then
-          return fail<ModuleSnapshot>(
+          return fail<NormalizedModule>(
             DRIVER_MODULE, "compiler source manifest for '" ..
             module_name .. "' must not be empty")
         end
@@ -3166,7 +3254,7 @@ local function snapshot_module(compiler: Compiler, module_name: string,
           entry["source_manifest"], DRIVER_MODULE,
           "compiler source manifest for '" .. module_name .. "'")
         if source_serialized == "" then
-          return fail<ModuleSnapshot>(
+          return fail<NormalizedModule>(
             DRIVER_MODULE, "compiler source manifest for '" ..
             module_name .. "' must not be empty")
         end
@@ -3187,7 +3275,7 @@ local function snapshot_module(compiler: Compiler, module_name: string,
   local raw_ast: value = entry["ast"]
   if projects[module_name] ~= nil then
     if raw_ast == nil or raw_ast == false then
-      return fail<ModuleSnapshot>(DRIVER_MODULE,
+      return fail<NormalizedModule>(DRIVER_MODULE,
         "project source '" .. module_name .. "' has no annotated AST")
     end
     nodes, symbols, imports, hover_summaries = walk_ast(
@@ -3236,20 +3324,27 @@ local function snapshot_module(compiler: Compiler, module_name: string,
         SourceLocation.new(filename, 1, 1))
     end
   end
-  return ModuleSnapshot.new(
-    module_name, origin, manifest, nodes, symbols, imports,
-    header_dependencies, hover_summaries, nil)
+  return NormalizedModule.new(
+    ModuleSnapshot.new(
+      module_name, origin, manifest, nodes, symbols, imports,
+      header_dependencies, hover_summaries, nil),
+    normalized_origin.embedded_provider)
+end
+
+local record NormalizedContextualResolution
+  resolution: ContextualResolution
+  embedded_provider: boolean
 end
 
 local function normalize_contextual_resolutions(
     context: value, work: NormalizationWork):
-    {ContextualResolution}
+    {NormalizedContextualResolution}
   local raw_context = required_map(
     context, DRIVER_MODULE, "compiler resolver context")
   local raw_resolutions = required_map(
     raw_context["contextual_resolutions"], DRIVER_MODULE,
     "compiler resolver contextual_resolutions")
-  local result: {ContextualResolution} = {}
+  local result: {NormalizedContextualResolution} = {}
   for key, candidate in iteration.pairs<string, value>(raw_resolutions) do
     work:account()
     local raw = required_map(candidate, DRIVER_MODULE,
@@ -3270,25 +3365,30 @@ local function normalize_contextual_resolutions(
     if kind == "dynamic" then
       origin = Provenance.dynamic_binary(
         BinaryProvenance.new(provider_file))
-    elseif kind == "static" then
+    elseif kind == "static" or kind == "embedded" then
       origin = Provenance.static_binary(
         BinaryProvenance.new(provider_file))
     else
-      return fail<{ContextualResolution}>(DRIVER_MODULE,
+      return fail<{NormalizedContextualResolution}>(DRIVER_MODULE,
         "compiler contextual resolution '" .. key ..
         "' has unsupported provenance kind '" .. kind .. "'")
     end
-    local normalized = ContextualResolution.new(
-      owner, exposer, origin as Provenance, required_boolean(
-        raw["ordinary_lookup"], DRIVER_MODULE,
-        "compiler contextual resolution '" .. key ..
-        "'.ordinary_lookup"), nil)
+    local normalized_kind = kind
+    if normalized_kind == "embedded" then normalized_kind = "static" end
+    local normalized = NormalizedContextualResolution.new(
+      ContextualResolution.new(
+        owner, exposer, origin as Provenance, required_boolean(
+          raw["ordinary_lookup"], DRIVER_MODULE,
+          "compiler contextual resolution '" .. key ..
+          "'.ordinary_lookup"), nil),
+      kind == "embedded")
     local position = #result + 1
     local identity = exposer .. "\0" .. owner .. "\0" ..
-                     kind .. "\0" .. provider_file
+                     normalized_kind .. "\0" .. provider_file
     while position > 1 do
       work:account()
-      local previous = result[position - 1]
+      local previous_normalized = result[position - 1]
+      local previous = previous_normalized.resolution
       local previous_kind = "dynamic"
       local previous_file = ""
       case previous.provenance
@@ -3302,7 +3402,7 @@ local function normalize_contextual_resolutions(
         previous.owner_module .. "\0" .. previous_kind .. "\0" ..
         previous_file
       if previous_identity <= identity then break end
-      result[position] = previous
+      result[position] = previous_normalized
       position = position - 1
     end
     result[position] = normalized
@@ -3321,24 +3421,56 @@ local function contextual_provider_file(
   end
 end
 
+local function copy_provider_identity(
+    source: compiler_io.LstatIdentity): compiler_io.LstatIdentity
+  return compiler_io.LstatIdentity.new(
+    source.path, source.size, source.kind, source.device, source.inode,
+    source.modified_seconds, source.modified_nanoseconds)
+end
+
+-- API 4's embedded provider never traverses the compiler's filesystem
+-- strategy. Its exact executable path is therefore stamped from the native
+-- live-image observation validated at the end of this analysis; every other
+-- binary provider retains the ordinary per-analysis lstat contract.
+local function selected_provider_identity(
+    compiler: Compiler, embedded_identity: compiler_io.LstatIdentity,
+    provider_file: string,
+    embedded_provider: boolean): compiler_io.LstatIdentity?
+  if embedded_provider then
+    if provider_file ~= compiler.embedded_provider_file then
+      return fail<compiler_io.LstatIdentity?>(
+        DRIVER_MODULE,
+        "embedded compiler result names unexpected provider '" ..
+        provider_file .. "'")
+    end
+    return copy_provider_identity(embedded_identity)
+  end
+  return compiler_io.consistent_lstat_identity(compiler.io, provider_file)
+end
+
 local function attach_contextual_provider_identities(
-    strategy: compiler_io.CompilerIO,
-    resolutions: {ContextualResolution}): {ContextualResolution}
+    compiler: Compiler, embedded_identity: compiler_io.LstatIdentity,
+    resolutions: {NormalizedContextualResolution}): {ContextualResolution}
   local result: {ContextualResolution} = {}
   for index = 1, #resolutions do
-    local source = resolutions[index]
+    local normalized = resolutions[index]
+    local source = normalized.resolution
     local provider_file = contextual_provider_file(source)
     result[index] = ContextualResolution.new(
       source.owner_module, source.exposer_module, source.provenance,
       source.ordinary_lookup,
-      compiler_io.consistent_lstat_identity(strategy, provider_file))
+      selected_provider_identity(
+        compiler, embedded_identity, provider_file,
+        normalized.embedded_provider))
   end
   return result
 end
 
 local function attach_module_provider_identities(
-    strategy: compiler_io.CompilerIO, modules: {ModuleSnapshot},
-    provider_conflicts: {string: boolean})
+    compiler: Compiler, embedded_identity: compiler_io.LstatIdentity,
+    modules: {ModuleSnapshot},
+    provider_conflicts: {string: boolean},
+    embedded_modules: {string: boolean})
   for index = 1, #modules do
     local snapshot = modules[index]
     local provider_file?: string = nil
@@ -3349,8 +3481,9 @@ local function attach_module_provider_identities(
     end
     if provider_file ~= nil and
        not provider_conflicts[snapshot.module_name] then
-      snapshot.provider_identity = compiler_io.consistent_lstat_identity(
-        strategy, provider_file as string)
+      snapshot.provider_identity = selected_provider_identity(
+        compiler, embedded_identity, provider_file as string,
+        embedded_modules[snapshot.module_name] == true)
     end
   end
 end
@@ -3359,24 +3492,30 @@ local record BinaryProviderSelection
   module_name: string
   kind: string
   provider_file: string
+  embedded_provider: boolean
 end
 
 local function binary_provider_selection(
-    snapshot: ModuleSnapshot): BinaryProviderSelection?
+    snapshot: ModuleSnapshot,
+    embedded_provider: boolean): BinaryProviderSelection?
   case snapshot.provenance
   when dynamic_binary: binary then
     return BinaryProviderSelection.new(
-      snapshot.module_name, "dynamic", binary.provider_file)
+      snapshot.module_name, "dynamic", binary.provider_file,
+      embedded_provider)
   when static_binary: binary then
     return BinaryProviderSelection.new(
-      snapshot.module_name, "static", binary.provider_file)
+      snapshot.module_name, "static", binary.provider_file,
+      embedded_provider)
   else return nil
   end
 end
 
 local function binary_provider_selection_key(
     selection: BinaryProviderSelection): string
-  return selection.kind .. "\0" .. selection.provider_file
+  local kind = selection.kind
+  if selection.embedded_provider then kind = "embedded" end
+  return kind .. "\0" .. selection.provider_file
 end
 
 local function binary_provider_observation_key(
@@ -3386,10 +3525,11 @@ local function binary_provider_observation_key(
 end
 
 local function observe_binary_provider_selection(
-    snapshot: ModuleSnapshot, selections: {string: string},
+    snapshot: ModuleSnapshot, embedded_provider: boolean,
+    selections: {string: string},
     observation_keys: {string: boolean},
     observations: {BinaryProviderSelection}, conflicts: {string: boolean})
-  local selection? = binary_provider_selection(snapshot)
+  local selection? = binary_provider_selection(snapshot, embedded_provider)
   if selection == nil then return end
   local observed = selection as BinaryProviderSelection
   local key = binary_provider_selection_key(observed)
@@ -3414,20 +3554,49 @@ local function observe_binary_provider_selection(
 end
 
 local function attach_binary_provider_observations(
-    strategy: compiler_io.CompilerIO,
+    compiler: Compiler, embedded_identity: compiler_io.LstatIdentity,
     selections: {BinaryProviderSelection}): {BinaryProviderObservation}
   local result: {BinaryProviderObservation} = {}
   for index = 1, #selections do
     local selection = selections[index]
     result[index] = BinaryProviderObservation.new(
       selection.module_name, selection.kind, selection.provider_file,
-      compiler_io.consistent_lstat_identity(
-        strategy, selection.provider_file))
+      selected_provider_identity(
+        compiler, embedded_identity, selection.provider_file,
+        selection.embedded_provider))
   end
   return result
 end
 
--- Installation discovery belongs to the compiler, but API 3 deliberately
+local function observe_embedded_provider(
+    compiler: Compiler): compiler_io.LstatIdentity
+  local raw_identity: {string: value} = {}
+  do
+    raw_identity = embedded_interfaces.identity()
+  catch
+    raise BridgeError.new(
+      DRIVER_MODULE,
+      "cannot observe embedded compiler provider '" ..
+      compiler.embedded_provider_file .. "': " .. strings.tostring(error))
+  end
+  return embedded_provider_identity(
+    raw_identity, compiler.embedded_provider_file)
+end
+
+local function validate_embedded_provider_baseline(
+    compiler: Compiler): compiler_io.LstatIdentity
+  local observed = observe_embedded_provider(compiler)
+  if not compiler_io.same_lstat_identity(
+      compiler.embedded_provider_identity, observed) then
+    raise BridgeError.new(
+      DRIVER_MODULE,
+      "embedded compiler provider '" .. compiler.embedded_provider_file ..
+      "' changed after compiler initialization; restart the language server")
+  end
+  return observed
+end
+
+-- Installation discovery belongs to the compiler, but API 4 deliberately
 -- defers physical path resolution until a resolver owns an I/O strategy.
 -- Initialize and close that resolver under the shared Lua-state permit before
 -- exposing the compiler's release-versioned library directory to project
@@ -3463,7 +3632,8 @@ end
 local record AttemptResult
   diagnostics: {Diagnostic}
   modules: {ModuleSnapshot}
-  contextual_resolutions: {ContextualResolution}
+  contextual_resolutions: {NormalizedContextualResolution}
+  embedded_modules: {string: boolean}
   checked: {string}
   entries: {string: value}
   failed: {string: boolean}
@@ -3735,7 +3905,7 @@ local function Compiler:run_attempt_inner(
         raw_final_errors, normalization_work, root_module),
       normalization_work)
   end
-  local contextual_resolutions: {ContextualResolution} = {}
+  local contextual_resolutions: {NormalizedContextualResolution} = {}
   if finalized ~= nil and finalized ~= false then
     contextual_resolutions = normalize_contextual_resolutions(
       context, normalization_work)
@@ -3751,6 +3921,7 @@ local function Compiler:run_attempt_inner(
   if not ok then checked_set[root_module] = true end
 
   local modules: {ModuleSnapshot} = {}
+  local embedded_modules: {string: boolean} = {}
   local entries: {string: value} = {}
   local names = sorted_entry_names(imported, normalization_work)
   for index = 1, #names do
@@ -3777,10 +3948,12 @@ local function Compiler:run_attempt_inner(
       end
       local normalization_started = 0.0
       if profiling then normalization_started = logging.clock() end
-      local snapshot = snapshot_module(
+      local normalized = snapshot_module(
         self, name, imported[name], projects, cached, valid,
         normalization_work)
+      local snapshot = normalized.snapshot
       modules[#modules + 1] = snapshot
+      if normalized.embedded_provider then embedded_modules[name] = true end
       if profiling then
         logging.emit("trace", "compiler.module.normalization", {
           json.Member.new("root_module", json.from_string(root_module)),
@@ -3798,7 +3971,8 @@ local function Compiler:run_attempt_inner(
     modules[#modules + 1] = failed_project_snapshot(projects[root_module])
   end
   return AttemptResult.new(
-    diagnostics, modules, contextual_resolutions, checked, entries, failed)
+    diagnostics, modules, contextual_resolutions, embedded_modules,
+    checked, entries, failed)
 end
 
 local function emit_attempt_terminal(
@@ -3928,6 +4102,7 @@ function Compiler:analyze_incremental(
   defer self.driver["EXTRA_CPPFLAGS"] = previous_cppflags
   compiler_io.begin_lstat_observations(self.io)
   defer compiler_io.end_lstat_observations(self.io)
+  validate_embedded_provider_baseline(self)
 
   local raw_new_c_header_analysis = checked_function(
     self.driver, DRIVER_MODULE, "new_c_header_analysis", self.type_of)
@@ -3970,6 +4145,9 @@ function Compiler:analyze_incremental(
   local binary_provider_selection_list: {BinaryProviderSelection} = {}
   local provider_conflicts: {string: boolean} = {}
   local contextual_resolutions: {ContextualResolution} = {}
+  local normalized_contextual_resolutions:
+    {NormalizedContextualResolution} = {}
+  local embedded_modules: {string: boolean} = {}
 
   for index = 1, #ordered do
     local root = ordered[index]
@@ -3996,14 +4174,18 @@ function Compiler:analyze_incremental(
         diagnostics, attempt.diagnostics, result_normalization_work)
       for module_index = 1, #attempt.modules do
         local snapshot = attempt.modules[module_index]
+        local embedded_provider =
+          attempt.embedded_modules[snapshot.module_name] == true
         observe_binary_provider_selection(
-          snapshot, binary_provider_selections,
+          snapshot, embedded_provider, binary_provider_selections,
           binary_provider_observation_keys,
           binary_provider_selection_list, provider_conflicts)
         snapshots[snapshot.module_name] = snapshot
+        embedded_modules[snapshot.module_name] = embedded_provider
       end
       for resolution_index = 1, #attempt.contextual_resolutions do
-        contextual_resolutions[#contextual_resolutions + 1] =
+        normalized_contextual_resolutions[
+          #normalized_contextual_resolutions + 1] =
           attempt.contextual_resolutions[resolution_index]
       end
       for name, entry in iteration.pairs<string, value>(attempt.entries) do
@@ -4039,13 +4221,15 @@ function Compiler:analyze_incremental(
   for index = 1, #external_names do
     modules[#modules + 1] = snapshots[external_names[index]]
   end
+  local final_embedded_identity = validate_embedded_provider_baseline(self)
   attach_module_provider_identities(
-    self.io, modules, provider_conflicts)
+    self, final_embedded_identity, modules, provider_conflicts,
+    embedded_modules)
   contextual_resolutions = attach_contextual_provider_identities(
-    self.io, contextual_resolutions)
+    self, final_embedded_identity, normalized_contextual_resolutions)
   local binary_provider_observations =
     attach_binary_provider_observations(
-      self.io, binary_provider_selection_list)
+      self, final_embedded_identity, binary_provider_selection_list)
   local provider_conflict_names: {string} = {}
   for name, conflicted in iteration.pairs<string, boolean>(
       provider_conflicts) do

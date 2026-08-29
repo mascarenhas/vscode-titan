@@ -4,8 +4,12 @@ SHELL := /bin/bash
 TITAN_REPO ?= ../titan
 TITAN_PREFIX := $(abspath .titan)
 TITANC := $(TITAN_PREFIX)/bin/titanc
+TITAN_LUA := $(TITAN_PREFIX)/bin/lua
 LUAROCKS := $(TITAN_PREFIX)/bin/luarocks
 TITAN_ROCKSPEC := titan-0.6.0-1.rockspec
+TITAN_STANDARD_PROVIDER := $(TITAN_PREFIX)/lib/titan/0.6/titan.a
+DEVELOPMENT_LUA_PATH := $(TITAN_PREFIX)/share/lua/5.5/?.lua;$(TITAN_PREFIX)/share/lua/5.5/?/init.lua
+DEVELOPMENT_LUA_CPATH := $(TITAN_PREFIX)/lib/lua/5.5/?.so
 
 SOURCE_ROOT := $(abspath src)
 BUILD_ROOT := $(abspath .build)
@@ -24,6 +28,10 @@ SERVER_SOURCE_DIRS := src $(shell find src/server -type d -print 2>/dev/null)
 COMPILER_IO_CLOCK_SOURCE := src/server/compiler_io_clock.c
 COMPILER_IO_CLOCK_HEADER := src/server/compiler_io_clock.h
 COMPILER_IO_CLOCK_OBJECT := $(NATIVE_BUILD_DIR)/compiler_io_clock.o
+EMBEDDED_INTERFACES_GENERATOR := scripts/generate-embedded-interfaces.lua
+EMBEDDED_INTERFACES_HEADER := src/server/embedded_interfaces_native.h
+EMBEDDED_INTERFACES_SOURCE := $(NATIVE_BUILD_DIR)/embedded_interfaces_native.c
+EMBEDDED_INTERFACES_OBJECT := $(NATIVE_BUILD_DIR)/embedded_interfaces_native.o
 HOST_OS := $(shell uname -s)
 HOST_ARCH := $(shell uname -m)
 CC ?= cc
@@ -121,35 +129,61 @@ $(COMPILER_IO_CLOCK_OBJECT): $(COMPILER_IO_CLOCK_SOURCE) $(COMPILER_IO_CLOCK_HEA
 		-c "$(COMPILER_IO_CLOCK_SOURCE)" \
 		-o "$(COMPILER_IO_CLOCK_OBJECT)"
 
+$(TITAN_STANDARD_PROVIDER): | $(TITANC)
+	@test -f "$@" || { \
+		echo "Titan standard provider not found at $@" >&2; \
+		exit 1; \
+	}
+
+$(EMBEDDED_INTERFACES_SOURCE): $(EMBEDDED_INTERFACES_GENERATOR) \
+	$(TITAN_STANDARD_PROVIDER)
+	@mkdir -p "$(dir $(EMBEDDED_INTERFACES_SOURCE))"
+	"$(TITAN_LUA)" "$(EMBEDDED_INTERFACES_GENERATOR)" \
+		"$(TITAN_STANDARD_PROVIDER)" "$@"
+
+$(EMBEDDED_INTERFACES_OBJECT): $(EMBEDDED_INTERFACES_SOURCE) \
+	$(EMBEDDED_INTERFACES_HEADER) $(TITAN_STANDARD_PROVIDER)
+	@mkdir -p "$(dir $(EMBEDDED_INTERFACES_OBJECT))"
+	CCACHE_DISABLE="$(CCACHE_DISABLE)" $(CC) -std=c99 -O2 \
+		-Wall -Wextra -Werror \
+		-I "$(TITAN_PREFIX)/include" -I "$(SOURCE_ROOT)/server" \
+		-c "$(EMBEDDED_INTERFACES_SOURCE)" \
+		-o "$(EMBEDDED_INTERFACES_OBJECT)"
+
 $(SERVER): $(SERVER_SOURCES) $(SERVER_SOURCE_DIRS) Makefile \
-	$(COMPILER_IO_CLOCK_OBJECT) | $(TITANC)
+	$(COMPILER_IO_CLOCK_OBJECT) $(EMBEDDED_INTERFACES_OBJECT) | $(TITANC)
 	rm -rf -- "$(SERVER_SOURCE_STAGE)"
 	@mkdir -p "$(SERVER_BUILD_DIR)" "$(SERVER_SOURCE_STAGE)" "$(dir $(SERVER))"
 	cp -a "$(SOURCE_ROOT)/." "$(SERVER_SOURCE_STAGE)/"
 	cd "$(SERVER_BUILD_DIR)" && \
 		CCACHE_DISABLE="$(CCACHE_DISABLE)" \
-		TITAN_EXTRA_LDFLAGS="$(strip $(TITAN_EXTRA_LDFLAGS) $(EXPORT_LUA_LDFLAGS) $(COMPILER_IO_CLOCK_OBJECT))" \
+		TITAN_EXTRA_LDFLAGS="$(strip $(TITAN_EXTRA_LDFLAGS) $(EXPORT_LUA_LDFLAGS) $(COMPILER_IO_CLOCK_OBJECT) $(EMBEDDED_INTERFACES_OBJECT) $(TITAN_STANDARD_PROVIDER))" \
 		"$(TITANC)" --static --tree "$(SERVER_SOURCE_STAGE)" titan_language_server
 	install -m 0755 "$(SERVER_BUILD_OUTPUT)" "$(SERVER)"
 
-server-test: $(SERVER_SOURCES) $(COMPILER_IO_CLOCK_OBJECT) | $(TITANC)
+server-test: $(SERVER_SOURCES) $(COMPILER_IO_CLOCK_OBJECT) \
+	$(EMBEDDED_INTERFACES_OBJECT) | $(TITANC)
 	rm -rf -- "$(TEST_SOURCE_STAGE)"
 	@mkdir -p "$(TEST_BUILD_DIR)" "$(TEST_SOURCE_STAGE)"
 	cp -a "$(SOURCE_ROOT)/." "$(TEST_SOURCE_STAGE)/"
 	cd "$(TEST_BUILD_DIR)" && \
 		CCACHE_DISABLE="$(CCACHE_DISABLE)" \
-		TITAN_EXTRA_LDFLAGS="$(strip $(TITAN_EXTRA_LDFLAGS) $(EXPORT_LUA_LDFLAGS) $(COMPILER_IO_CLOCK_OBJECT))" \
+		TITAN_EXTRA_LDFLAGS="$(strip $(TITAN_EXTRA_LDFLAGS) $(EXPORT_LUA_LDFLAGS) $(COMPILER_IO_CLOCK_OBJECT) $(EMBEDDED_INTERFACES_OBJECT) $(TITAN_STANDARD_PROVIDER))" \
 		"$(TITANC)" --static --test --no-uv-bootstrap \
 			--tree "$(TEST_SOURCE_STAGE)" server.tests
 	CCACHE_DISABLE="$(CCACHE_DISABLE)" "$(SERVER_TEST)"
 
 server-protocol-test: $(SERVER)
-	node scripts/test-server-protocol.mjs "$(SERVER)"
+	TITAN_LS_LUA_PATH='$(DEVELOPMENT_LUA_PATH)' \
+	TITAN_LS_LUA_CPATH='$(DEVELOPMENT_LUA_CPATH)' \
+		node scripts/test-server-protocol.mjs "$(SERVER)"
 
 codex-native-test: $(SERVER)
-	node scripts/test-codex-native.mjs "$(SERVER)"
+	TITAN_LS_LUA_PATH='$(DEVELOPMENT_LUA_PATH)' \
+	TITAN_LS_LUA_CPATH='$(DEVELOPMENT_LUA_CPATH)' \
+		node scripts/test-codex-native.mjs "$(SERVER)"
 
-extension: npm-ci
+extension: npm-ci | $(TITANC)
 	npm run compile
 
 extension-test: npm-ci
@@ -175,7 +209,8 @@ plugin-validate:
 	node scripts/validate-plugin.mjs
 
 verify: test extension-host-test package inspect-server plugin-validate install-server-test
-	./scripts/inspect-vsix.sh "$(VSIX)" "$(VSIX_TARGET)"
+	TITAN_PREFIX="$(TITAN_PREFIX)" \
+		./scripts/inspect-vsix.sh "$(VSIX)" "$(VSIX_TARGET)"
 
 install-server: $(SERVER)
 	install -d "$(DESTDIR)$(INSTALL_PREFIX)/bin"

@@ -226,7 +226,8 @@ class TitanClientManager {
       );
       const compilerDiscovery = readCompilerDiscoveryConfiguration(
         compilerConfiguration.get<unknown>("luaPath", ""),
-        compilerConfiguration.get<unknown>("luaCPath", "")
+        compilerConfiguration.get<unknown>("luaCPath", ""),
+        this.context.extensionPath
       );
       command = resolveServerExecutable(
         serverConfiguration.configuredPath,
@@ -237,6 +238,7 @@ class TitanClientManager {
       const physicalWorkspaceRoot = await resolvePhysicalWorkspaceRoot(
         folder.uri.fsPath
       );
+      await vscode.workspace.fs.createDirectory(this.context.globalStorageUri);
 
       const serverOptions: ServerOptions = createServerLaunchOptions(
         command,
@@ -244,7 +246,8 @@ class TitanClientManager {
         physicalWorkspaceRoot,
         process.env,
         compilerDiscovery,
-        serverConfiguration.logLevel
+        serverConfiguration.logLevel,
+        this.context.globalStorageUri.fsPath
       );
       const documentSelector = createWorkspaceDocumentSelector(folder);
       const clientOptions: LanguageClientOptions = {

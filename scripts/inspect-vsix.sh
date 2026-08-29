@@ -8,6 +8,8 @@ fi
 
 vsix=$1
 target=$2
+repository_root=$(CDPATH= cd "$(dirname "$0")/.." && pwd -P)
+titan_prefix=${TITAN_PREFIX:-$repository_root/.titan}
 if [[ ! -f "$vsix" ]]; then
   echo "VSIX is missing: $vsix" >&2
   exit 1
@@ -29,8 +31,20 @@ for required in \
   extension/dist/notices/titan/THIRD_PARTY_NOTICES.md \
   extension/dist/notices/titan/LICENSES/libuv-LICENSE \
   extension/dist/notices/titan/LICENSES/openssl-LICENSE \
+  extension/dist/notices/lua/argparse/LICENSE \
+  extension/dist/notices/lua/inspect/LICENSE \
+  extension/dist/notices/lua/lpeglabel/LICENSE \
+  extension/dist/notices/lua/luafilesystem/LICENSE.html \
+  extension/dist/notices/lua/luarocks/COPYING \
   extension/dist/notices/javascript/semver/LICENSE \
-  extension/dist/notices/javascript/vscode-languageclient/License.txt; do
+  extension/dist/notices/javascript/vscode-languageclient/License.txt \
+  extension/dist/titan/share/lua/5.5/c-parser/cdriver.lua \
+  extension/dist/titan/share/lua/5.5/inspect.lua \
+  extension/dist/titan/share/lua/5.5/relabel.lua \
+  extension/dist/titan/share/lua/5.5/titan-compiler/driver.lua \
+  extension/dist/titan/share/lua/5.5/titan-compiler/version.lua \
+  extension/dist/titan/lib/lua/5.5/lfs.so \
+  extension/dist/titan/lib/lua/5.5/lpeglabel.so; do
   if ! grep -Fxq "$required" <<<"$contents"; then
     echo "VSIX is missing $required" >&2
     exit 1
@@ -48,18 +62,192 @@ if grep -Eq '[.]map$' <<<"$contents"; then
   exit 1
 fi
 
-if grep -Eq '^extension/.*[.](a|so)([.][^/]*)?$' <<<"$contents"; then
-  echo "VSIX contains an unexpected native library or archive" >&2
+if grep -Eq '^extension/.*([.]a|[.]so[.][^/]*)$' <<<"$contents"; then
+  echo "VSIX contains an unexpected archive or versioned native library" >&2
+  exit 1
+fi
+
+expected_native_modules=$(
+  printf '%s\n' \
+    extension/dist/titan/lib/lua/5.5/lfs.so \
+    extension/dist/titan/lib/lua/5.5/lpeglabel.so |
+    LC_ALL=C sort
+)
+actual_native_modules=$(
+  grep -E '^extension/.*[.]so$' <<<"$contents" | LC_ALL=C sort || true
+)
+if [[ "$actual_native_modules" != "$expected_native_modules" ]]; then
+  echo "VSIX native-module inventory does not match the reviewed Lua tree" >&2
+  diff -u \
+    <(printf '%s\n' "$expected_native_modules") \
+    <(printf '%s\n' "$actual_native_modules") || true
+  exit 1
+fi
+
+unexpected_titan_payload=$(
+  grep -E '^extension/dist/titan(/|$)' <<<"$contents" |
+    grep -Ev \
+      '^extension/dist/titan/?$|^extension/dist/titan/(share|lib)/?$|^extension/dist/titan/(share|lib)/lua/?$|^extension/dist/titan/(share|lib)/lua/5[.]5(/.*)?$' \
+    || true
+)
+if [[ -n "$unexpected_titan_payload" ]]; then
+  echo "VSIX contains content outside the two reviewed Lua module trees:" >&2
+  printf '%s\n' "$unexpected_titan_payload" >&2
+  exit 1
+fi
+
+if grep -Eq '^extension/dist/titan/(include|src|lib/titan|share/titan)(/|$)' \
+    <<<"$contents"; then
+  echo "VSIX contains Titan provider, SDK, source, or non-Lua share content" >&2
   exit 1
 fi
 
 extract_root=$(mktemp -d)
 trap 'rm -rf -- "$extract_root"' EXIT
-unzip -qq "$vsix" extension/bin/titan-language-server -d "$extract_root"
+unzip -qq "$vsix" \
+  extension/bin/titan-language-server \
+  'extension/dist/titan/*' \
+  -d "$extract_root"
 if [[ ! -x "$extract_root/extension/bin/titan-language-server" ]]; then
   echo "VSIX did not preserve the native server executable mode" >&2
   exit 1
 fi
+
+compare_module_tree() {
+  local relative_tree=$1
+  local source_tree="$titan_prefix/$relative_tree"
+  local packaged_tree="$extract_root/extension/dist/titan/$relative_tree"
+  local source_inventory="$extract_root/source-inventory"
+  local packaged_inventory="$extract_root/packaged-inventory"
+
+  if [[ ! -d "$source_tree" ]]; then
+    echo "source Lua module tree is missing: $source_tree" >&2
+    exit 1
+  fi
+  if [[ ! -d "$packaged_tree" ]]; then
+    echo "packaged Lua module tree is missing: $packaged_tree" >&2
+    exit 1
+  fi
+  if find "$packaged_tree" ! -type d ! -type f -print -quit |
+      grep -q .; then
+    echo "packaged Lua module tree contains a non-regular entry: $relative_tree" >&2
+    exit 1
+  fi
+
+  (
+    cd "$source_tree"
+    find . -type f -print | LC_ALL=C sort
+  ) >"$source_inventory"
+  (
+    cd "$packaged_tree"
+    find . -type f -print | LC_ALL=C sort
+  ) >"$packaged_inventory"
+  if ! diff -u "$source_inventory" "$packaged_inventory"; then
+    echo "packaged Lua module inventory differs from $source_tree" >&2
+    exit 1
+  fi
+
+  while IFS= read -r relative_file; do
+    if ! cmp -s \
+        "$source_tree/$relative_file" \
+        "$packaged_tree/$relative_file"; then
+      echo "packaged Lua module differs from source: $relative_tree/$relative_file" >&2
+      exit 1
+    fi
+  done <"$source_inventory"
+}
+
+compare_module_tree share/lua/5.5
+compare_module_tree lib/lua/5.5
+
+inspect_native_module() {
+  local module=$1
+  file "$module"
+  case "$(uname -s)" in
+    Linux)
+      local dependencies
+      dependencies=$(ldd "$module")
+      printf '%s\n' "$dependencies"
+      if grep -Eiq 'lib(lua|titan|uv|ssl|crypto|lpeg|pcre)' \
+          <<<"$dependencies"; then
+        echo "bundled Lua module has an unexpected runtime dependency: $module" >&2
+        exit 1
+      fi
+
+      local required_glibc
+      required_glibc=$(
+        objdump -T "$module" |
+          sed -n 's/.*(GLIBC_\([0-9][0-9.]*\)).*/\1/p' |
+          sort -Vu |
+          tail -n 1
+      )
+      if [[ -n "$required_glibc" ]]; then
+        echo "maximum required GLIBC symbol version: $required_glibc"
+      fi
+      if [[ -n "${TITAN_MAX_GLIBC_VERSION:-}" ]]; then
+        if [[ ! "$TITAN_MAX_GLIBC_VERSION" =~ ^[0-9]+([.][0-9]+)*$ ]]; then
+          echo "invalid TITAN_MAX_GLIBC_VERSION: $TITAN_MAX_GLIBC_VERSION" >&2
+          exit 2
+        fi
+        local newest_glibc
+        newest_glibc=$(
+          printf '%s\n' "$required_glibc" "$TITAN_MAX_GLIBC_VERSION" |
+            sort -Vu |
+            tail -n 1
+        )
+        if [[ -n "$required_glibc" &&
+              "$newest_glibc" != "$TITAN_MAX_GLIBC_VERSION" ]]; then
+          echo "$module requires GLIBC_$required_glibc, newer than the allowed GLIBC_$TITAN_MAX_GLIBC_VERSION baseline" >&2
+          exit 1
+        fi
+      fi
+      ;;
+    Darwin)
+      local dependencies
+      dependencies=$(otool -L "$module")
+      printf '%s\n' "$dependencies"
+      if grep -Eiq 'lib(lua|titan|uv|ssl|crypto|lpeg|pcre)' \
+          <<<"$dependencies"; then
+        echo "bundled Lua module has an unexpected runtime dependency: $module" >&2
+        exit 1
+      fi
+      ;;
+    *)
+      echo "native dependency inspection is unsupported on $(uname -s)" >&2
+      exit 1
+      ;;
+  esac
+}
+
+inspect_native_module \
+  "$extract_root/extension/dist/titan/lib/lua/5.5/lfs.so"
+inspect_native_module \
+  "$extract_root/extension/dist/titan/lib/lua/5.5/lpeglabel.so"
+
+node_executable=$(command -v node)
+protocol_root="$extract_root/unrelated-working-directory"
+cache_root="$extract_root/compiler-cache"
+hostile_titan_root="$extract_root/ambient-titan-must-not-be-used"
+mkdir -p \
+  "$protocol_root" \
+  "$cache_root" \
+  "$hostile_titan_root/lib/titan/0.6" \
+  "$hostile_titan_root/source"
+(
+  cd "$protocol_root"
+  export LUA_PATH=/ambient/must-not-be-used/?.lua
+  export LUA_CPATH=/ambient/must-not-be-used/?.so
+  export TITAN_ROCKS_ROOT="$hostile_titan_root"
+  export TITAN_PATH="$hostile_titan_root/lib/titan/0.6"
+  export TITAN_PATH_0_6="$hostile_titan_root/lib/titan/0.6"
+  export TITAN_SOURCE_PATH="$hostile_titan_root/source/?.titan"
+  export TITAN_LS_LUA_PATH="$extract_root/extension/dist/titan/share/lua/5.5/?.lua;$extract_root/extension/dist/titan/share/lua/5.5/?/init.lua"
+  export TITAN_LS_LUA_CPATH="$extract_root/extension/dist/titan/lib/lua/5.5/?.so"
+  export TITAN_PREFIX="$cache_root"
+  "$node_executable" "$repository_root/scripts/test-server-protocol.mjs" \
+    "$extract_root/extension/bin/titan-language-server" \
+    --self-contained-smoke
+)
 
 manifest=$(unzip -p "$vsix" extension.vsixmanifest)
 if ! grep -Fq "TargetPlatform=\"$target\"" <<<"$manifest"; then

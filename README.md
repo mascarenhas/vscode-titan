@@ -7,11 +7,21 @@ Titan projects. The server is an ordinary LSP process over stdio. A bundled
 skills-only Codex plugin queries that same executable for read-only saved-file
 code intelligence.
 
-The native executable statically links the Titan standard-library provider,
-the embedded Lua interpreter, and the selected native dependencies. The Titan
-compiler itself is not embedded: that Lua state loads the normal installed
-`titan-compiler` modules through `package.path` and their native dependencies
-through `package.cpath`.
+The native executable statically links the selected Titan standard-library
+runtime modules, the embedded Lua interpreter, and the selected native
+dependencies. Initialized statically linked modules register their runtime
+openers in `package.preload`. Separately, the executable carries a metadata-only
+inventory of all 18 canonical Titan standard-module interfaces; compiler
+language-server API 4 validates and decodes those serialized interfaces for
+project typechecking. The inventory contains no standard-module implementation,
+provider archive, header, or SDK payload.
+
+The Titan compiler itself is not embedded in that executable: its Lua state
+loads the ordinary `titan-compiler` modules through `package.path` and their
+native Lua dependencies through `package.cpath`. A target-specific VSIX carries
+compatible module trees under exactly `dist/titan/share/lua/5.5` and
+`dist/titan/lib/lua/5.5`, so the extension does not require a separate system
+Titan compiler installation.
 
 ## Prerequisites
 
@@ -25,7 +35,9 @@ native Titan toolchain/package path rather than relabeling another host's
 executable.
 
 The repository owns an ignored Titan installation in `.titan/`; build commands
-do not rely on an ambient `titanc` or Lua installation.
+do not rely on an ambient `titanc` or Lua installation. These prerequisites are
+for building the repository. Installing its target-specific VSIX does not
+require that development toolchain.
 
 ## Build and test
 
@@ -36,10 +48,13 @@ make
 make test
 ```
 
-`make` produces `bin/titan-language-server` and `dist/extension.js`. The server
-build uses Titan's static-provider path and, on ELF systems, exports the embedded
-Lua API so compiler dependencies loaded from `package.cpath` bind to that same
-Lua state.
+`make` produces `bin/titan-language-server` and `dist/extension.js`, and stages
+the project-local Lua source and native-module trees under exactly
+`dist/titan/share/lua/5.5` and `dist/titan/lib/lua/5.5`. It does not stage a
+`lib/titan` tree, a Titan provider archive, Titan headers, or any other Titan SDK
+payload. The server build uses Titan's static-provider path and, on ELF systems,
+exports the embedded Lua API so compiler dependencies loaded from
+`package.cpath` bind to that same Lua state.
 
 If `.titan/` already exists after the sibling Titan checkout changes, run
 `make toolchain-refresh` before rebuilding so the isolated compiler modules and
@@ -172,23 +187,34 @@ per workspace folder. These settings can override discovery:
 - `titan.languageServer.arguments`: extra process arguments.
 - `titan.languageServer.logLevel`: structured server diagnostics written to
   stderr (`off`, `error`, `info`, `debug`, or `trace`; default `debug`).
-- `titan.compiler.luaPath`: optional `LUA_PATH` override for compiler modules.
-- `titan.compiler.luaCPath`: optional `LUA_CPATH` override for native Lua
-  dependencies.
+- `titan.compiler.luaPath`: optional `TITAN_LS_LUA_PATH` override for compiler
+  modules.
+- `titan.compiler.luaCPath`: optional `TITAN_LS_LUA_CPATH` override for native
+  Lua dependencies.
 
-Empty compiler path settings preserve the extension host's environment and
-Lua's compiled defaults. A packaged server still needs a compatible Titan
-compiler installation at runtime. Compatibility requires both the matching
-Titan ABI and `titan-compiler.driver.LANGUAGE_SERVER_API_VERSION == 3`; API 3
-includes the compiler's typed semantic metadata, incremental-analysis hooks,
-C-header dependency restat contract, and the resolver-scoped I/O strategy with
-named completed-module yield checkpoints. The ABI alone is not the
-language-server API contract. If the compiler is not in the compiled defaults,
-configure both paths explicitly. `LUA_CPATH` must include
-both the Titan library-versioned provider directory (for example
-`/opt/titan/lib/titan/0.6/?.so`) and the Lua native module directory (for
-example `/opt/titan/lib/lua/5.5/?.so`). This runtime discovery requirement is
-separate from the native executable's static standard-library linkage.
+When these settings are empty, the extension supplies absolute search templates
+for its own `dist/titan/share/lua/5.5` and `dist/titan/lib/lua/5.5` trees. The
+VSIX is therefore self-contained for compiler discovery and does not inherit
+ambient `LUA_PATH` or `LUA_CPATH` defaults. Configured values replace the
+corresponding packaged template verbatim, so an override must be a complete Lua
+search path. Compatibility still requires both the matching Titan ABI and
+`titan-compiler.driver.LANGUAGE_SERVER_API_VERSION == 4`; API 4 includes the
+compiler's typed semantic metadata, incremental-analysis hooks, C-header
+dependency restat contract, resolver-scoped I/O strategy with named
+completed-module yield checkpoints, and the validated metadata-only embedded
+interface provider used before disk-backed compiled providers. The ABI alone is
+not the language-server API contract.
+
+The two bundled trees contain ordinary Lua source and native Lua modules; they
+are not embedded into the executable. They contain no `lib/titan` provider tree,
+provider archive, Titan headers, or other SDK payload. Initialized Titan
+standard-library runtime modules are instead statically linked into the
+executable and registered for `require` through `package.preload`. Project
+typechecking uses the executable's separate, validated metadata-only inventory
+for `titan.async`, `titan.coroutine`, `titan.fs`, `titan.gc`, `titan.http`,
+`titan.io`, `titan.iteration`, `titan.lua`, `titan.math`, `titan.net`,
+`titan.os`, `titan.peg`, `titan.ssl`, `titan.string`, `titan.test`,
+`titan.timer`, `titan.url`, and `titan.uv`.
 
 In Remote SSH, WSL, or container workspaces, the workspace extension and native
 server run on that remote host. The client maps the workspace's remote URI
@@ -331,11 +357,19 @@ To install only the server under a custom prefix:
 make install-server INSTALL_PREFIX="$HOME/.local"
 ```
 
-The VSIX includes this project's license plus Titan/native and bundled
-JavaScript dependency notices. A server-only installation includes this
-project's license and the Titan/native notices under
-`share/doc/titan-language-server` in the selected prefix; it contains no
-bundled JavaScript dependencies.
+The VSIX includes the native server, the private compiler module trees under
+exactly `dist/titan/share/lua/5.5` and `dist/titan/lib/lua/5.5`, this project's
+license, and Titan/native, Lua-module, and bundled JavaScript dependency
+notices. It does not include a Titan provider/archive, `lib/titan` tree, Titan
+headers, or any other native SDK payload, and does not depend on a system
+compiler module tree.
+
+A server-only installation includes the executable plus this project's license
+and the Titan/native notices under `share/doc/titan-language-server` in the
+selected prefix. It does not install the VSIX's private compiler module trees or
+bundled JavaScript dependencies. A standalone server therefore uses
+`TITAN_LS_LUA_PATH` and `TITAN_LS_LUA_CPATH` when its compiler modules are not
+available as `./?.lua` and `./?.so`; see [the Codex setup guide](docs/codex.md).
 
 ## Version 1 behavior
 

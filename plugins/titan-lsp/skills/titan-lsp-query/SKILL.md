@@ -11,6 +11,20 @@ Use the deterministic client at
 performs one query, shuts the server down, and writes one JSON object to stdout.
 Server and client diagnostics remain on stderr.
 
+The standalone server defaults to `./?.lua` and `./?.so`; the skill does not
+carry compiler modules. Unless matching modules are deliberately present in
+the project root, pass complete Lua 5.5 module trees from the same Titan build
+in the query process environment, for example:
+
+```sh
+export TITAN_LS_LUA_PATH='/opt/titan/share/lua/5.5/?.lua;/opt/titan/share/lua/5.5/?/init.lua'
+export TITAN_LS_LUA_CPATH='/opt/titan/lib/lua/5.5/?.so'
+```
+
+Use the actual compatible installation prefix; do not append `;;` or rely on
+ambient `LUA_PATH` and `LUA_CPATH` expansion. Keep these variables in the
+environment used for every query command.
+
 Run it with an absolute project root and a project `.titan` file:
 
 ```sh

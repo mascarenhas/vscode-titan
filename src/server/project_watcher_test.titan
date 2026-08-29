@@ -10,6 +10,7 @@ local record Fake
   operations: {string}
   batches: {{project_watcher.BackendEvent}}
   waiter: async.Task?
+  resume_token: async.ResumeToken?
   active_polls: integer
   maximum_active_polls: integer
   poll_count: integer
@@ -71,13 +72,18 @@ local function Fake:poll(): {project_watcher.BackendEvent}
   end
 
   local current = async.running()
+  local resume_token = async.ResumeToken.new("server.project_watcher fake")
   local detach = function ()
-    if self.waiter == current then self.waiter = nil end
+    if self.waiter == current then
+      self.waiter = nil
+      self.resume_token = nil
+    end
   end
   defer detach()
   while #self.batches == 0 do
     self.waiter = current
-    async.suspend(detach)
+    self.resume_token = resume_token
+    async.suspend(resume_token, detach)
   end
 
   local result = self:remove_first_batch()
@@ -93,7 +99,12 @@ end
 local function Fake:push(events: {project_watcher.BackendEvent})
   self.batches[#self.batches + 1] = events
   local waiter? = self.waiter
-  if waiter ~= nil then waiter:resume() end
+  local resume_token? = self.resume_token
+  if waiter ~= nil and resume_token ~= nil then
+    self.waiter = nil
+    self.resume_token = nil
+    waiter:resume(resume_token)
+  end
 end
 
 local function Fake:backend(): project_watcher.Backend
@@ -136,7 +147,7 @@ local function describe_change(change: project_watcher.PathChange): string
 end
 
 local function fake_lifecycle_and_coalescing()
-  local fake = Fake.new({}, {}, {}, nil, 0, 0, 0, 0, 0)
+  local fake = Fake.new({}, {}, {}, nil, nil, 0, 0, 0, 0, 0)
   local received: {project_watcher.RediscoveryBatch} = {}
   local owner?: project_watcher.ProjectWatcher
   owner = project_watcher.start_with_backend(
@@ -222,7 +233,7 @@ end
 
 
 local function retries_transient_poll_failure()
-  local fake = Fake.new({}, {}, {}, nil, 0, 0, 0, 0, 1)
+  local fake = Fake.new({}, {}, {}, nil, nil, 0, 0, 0, 0, 1)
   local received: {project_watcher.RediscoveryBatch} = {}
   local owner = project_watcher.start_with_backend(
     fake:backend(), scope({"/project"}, {}),
@@ -252,7 +263,7 @@ function test_project_watcher_retries_transient_poll_failure(
 end
 
 local function backs_off_persistent_poll_failures()
-  local fake = Fake.new({}, {}, {}, nil, 0, 0, 0, 0, 100)
+  local fake = Fake.new({}, {}, {}, nil, nil, 0, 0, 0, 0, 100)
   local failures = 0
   local owner = project_watcher.start_with_backend(
     fake:backend(), scope({"/project"}, {}),

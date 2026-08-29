@@ -23,6 +23,7 @@ interface FixtureEvent {
   arguments: string[];
   luaPath?: string;
   luaCPath?: string;
+  compilerCachePrefix?: string;
   serverLogLevel?: string;
   rootPath?: string | null;
   rootUri?: string | null;
@@ -53,8 +54,8 @@ interface CapturedSyntaxToken {
 
 suite("Titan extension", () => {
   const extensionIdentifier = "mascarenhas.titan";
-  const configuredLuaPath = "/fixture/compiler/?.lua;;";
-  const configuredLuaCPath = "/fixture/compiler/?.so;;";
+  const configuredLuaPath = "/fixture/compiler/?.lua";
+  const configuredLuaCPath = "/fixture/compiler/?.so";
   let alpha: vscode.WorkspaceFolder;
   let beta: vscode.WorkspaceFolder;
   let alphaMarkerPath: string;
@@ -230,7 +231,7 @@ suite("Titan extension", () => {
       ["initialize", "shutdown", "exit", "initialize"]
     );
 
-    const globalLuaPath = "/fixture/compiler/reconfigured/?.lua;;";
+    const globalLuaPath = "/fixture/compiler/reconfigured/?.lua";
     await vscode.workspace.getConfiguration("titan.compiler").update(
       "luaPath",
       globalLuaPath,
@@ -1008,7 +1009,7 @@ suite("Titan extension", () => {
 
       process.env.TITAN_LSP_FIXTURE_HANG_ROOT = alpha.uri.fsPath;
       try {
-        const globalLuaCPath = "/fixture/compiler/start-timeout/?.so;;";
+        const globalLuaCPath = "/fixture/compiler/start-timeout/?.so";
         await vscode.workspace.getConfiguration("titan.compiler").update(
           "luaCPath",
           globalLuaCPath,
@@ -1092,34 +1093,56 @@ suite("Titan extension", () => {
   );
 
   test("connects VS Code to the packaged native server", async function () {
-    this.timeout(30_000);
+    this.timeout(60_000);
     const repositoryRoot = path.resolve(__dirname, "../../../..");
     const server = path.join(repositoryRoot, "bin", "titan-language-server");
-    const titanPrefix = path.join(repositoryRoot, ".titan");
-    const luaPath = [
-      path.join(titanPrefix, "share", "lua", "5.5", "?.lua"),
-      path.join(titanPrefix, "share", "lua", "5.5", "?", "init.lua"),
-      ""
+    const extension = vscode.extensions.getExtension(extensionIdentifier);
+    assert.ok(extension, `${extensionIdentifier} should be installed`);
+    const modulePrefix = path.join(extension.extensionPath, "dist", "titan");
+    const bundledLuaPath = [
+      path.join(modulePrefix, "share", "lua", "5.5", "?.lua"),
+      path.join(modulePrefix, "share", "lua", "5.5", "?", "init.lua")
     ].join(";");
-    const luaCPath = [
-      path.join(titanPrefix, "lib", "titan", "0.6", "?.so"),
-      path.join(titanPrefix, "lib", "lua", "5.5", "?.so"),
-      ""
-    ].join(";");
+    const bundledLuaCPath = path.join(
+      modulePrefix, "lib", "lua", "5.5", "?.so"
+    );
+
+    await Promise.all([
+      resetMarker(alphaMarkerPath),
+      resetMarker(betaMarkerPath)
+    ]);
+    await vscode.workspace.getConfiguration("titan.compiler").update(
+      "luaPath",
+      "",
+      vscode.ConfigurationTarget.Global
+    );
+    await waitForEventSequence(
+      alphaMarkerPath,
+      ["shutdown", "exit", "initialize"],
+      10_000
+    );
+    await vscode.workspace.getConfiguration("titan.compiler").update(
+      "luaCPath",
+      "",
+      vscode.ConfigurationTarget.Global
+    );
+    const defaulted = await waitForEventSequence(
+      alphaMarkerPath,
+      [
+        "shutdown", "exit", "initialize",
+        "shutdown", "exit", "initialize"
+      ],
+      10_000
+    );
+    const defaultedInitialization = defaulted[5];
+    assert.equal(defaultedInitialization.luaPath, bundledLuaPath);
+    assert.equal(defaultedInitialization.luaCPath, bundledLuaCPath);
+    assert.ok(defaultedInitialization.compilerCachePrefix);
+    assert.ok(path.isAbsolute(defaultedInitialization.compilerCachePrefix));
 
     await vscode.workspace.getConfiguration("titan.languageServer").update(
       "path",
       server,
-      vscode.ConfigurationTarget.Global
-    );
-    await vscode.workspace.getConfiguration("titan.compiler").update(
-      "luaPath",
-      luaPath,
-      vscode.ConfigurationTarget.Global
-    );
-    await vscode.workspace.getConfiguration("titan.compiler").update(
-      "luaCPath",
-      luaCPath,
       vscode.ConfigurationTarget.Global
     );
 
@@ -1163,6 +1186,8 @@ function assertInitialization(
   assert.deepEqual(event.arguments, ["--fixture-token", token]);
   assert.equal(event.luaPath, luaPath);
   assert.equal(event.luaCPath, luaCPath);
+  assert.ok(event.compilerCachePrefix);
+  assert.ok(path.isAbsolute(event.compilerCachePrefix));
   assert.equal(event.serverLogLevel, "info");
   assert.equal(event.trace, "off");
   assert.equal(event.rootPath, folder.uri.fsPath);

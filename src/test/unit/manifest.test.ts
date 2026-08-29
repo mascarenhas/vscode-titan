@@ -55,6 +55,7 @@ describe("extension manifest", () => {
     for (const script of [
       "vscode:prepublish",
       "compile",
+      "stage-lua-modules",
       "stage-notices",
       "test:unit",
       "test:vscode",

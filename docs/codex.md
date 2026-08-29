@@ -21,27 +21,40 @@ Ensure `$HOME/.local/bin` is on the `PATH` inherited by Codex, then verify:
 command -v titan-language-server
 ```
 
-The executable contains the statically selected Titan standard library,
-embedded Lua interpreter, and selected native dependencies. It does **not**
-contain the Titan compiler. The embedded Lua state loads the ordinary
-`titan-compiler` Lua modules through `package.path` and native compiler
-dependencies through `package.cpath`.
+The executable contains the selected statically linked Titan runtime modules,
+embedded Lua interpreter, and selected native dependencies. Each initialized
+statically linked module registers its runtime opener in `package.preload`.
+Separately, the executable embeds a metadata-only inventory of all 18 canonical
+Titan standard-module interfaces. Compiler language-server API 4 validates and
+decodes this inventory for project typechecking; it is not module code, a Titan
+provider archive, headers, or an SDK payload.
 
-A server built by this repository's project-local toolchain already has that
-toolchain's `.titan` Lua paths as its compiled defaults. If the compiler is in a
-different installation, start Codex with `LUA_PATH` and `LUA_CPATH` that select
-the ABI-compatible compiler installation. Preserve Lua's defaults with the
-terminal `;;`, for example:
+The executable does **not** contain the Titan compiler. The embedded Lua state
+loads the ordinary `titan-compiler` Lua modules through `package.path` and native
+compiler dependencies through `package.cpath`.
+
+`make install-server` installs the standalone executable and its notices, not
+the VSIX's private compiler module trees. At startup the server replaces ambient
+Lua discovery with `./?.lua` and `./?.so`. Unless compatible modules are in its
+working directory, start Codex with complete `TITAN_LS_LUA_PATH` and
+`TITAN_LS_LUA_CPATH` templates, for example:
 
 ```sh
-export LUA_PATH='/opt/titan/share/lua/5.5/?.lua;/opt/titan/share/lua/5.5/?/init.lua;;'
-export LUA_CPATH='/opt/titan/lib/titan/0.6/?.so;/opt/titan/lib/lua/5.5/?.so;;'
+export TITAN_LS_LUA_PATH='/opt/titan/share/lua/5.5/?.lua;/opt/titan/share/lua/5.5/?/init.lua'
+export TITAN_LS_LUA_CPATH='/opt/titan/lib/lua/5.5/?.so'
 ```
 
-Replace `0.6` with the installed Titan library directory version and `5.5`
-with the Lua ABI version used to build the server. The Titan library-versioned
-entry is also how the server discovers the default binary-module root; the Lua
-entry supplies native compiler dependencies.
+Replace `5.5` with the Lua ABI version used to build the server. These variables
+are passed directly to `package.path` and `package.cpath`; they do not use the
+ambient `LUA_PATH`/`LUA_CPATH` defaults or terminal-`;;` expansion.
+
+The target-specific VSIX handles this automatically: it carries
+`dist/titan/share/lua/5.5` and `dist/titan/lib/lua/5.5`, and the extension passes
+absolute templates for those private trees to its server process. That
+self-contained VSIX behavior does not change the standalone installation
+contract above. Those exact trees are the complete bundled compiler-module
+payload: the VSIX does not add `lib/titan`, a provider archive, Titan headers,
+or any other native SDK content.
 
 ## Install the repository plugin
 
@@ -97,10 +110,15 @@ returns a `WorkspaceEdit` with `applied: false`. It never changes source files.
   folding.
 - The compiler modules and any native Lua dependencies must be ABI-compatible
   with the embedded Lua/Titan runtime in the executable. The compiler driver
-  must also export `LANGUAGE_SERVER_API_VERSION = 3`; API 3 includes the typed
+  must also export `LANGUAGE_SERVER_API_VERSION = 4`; API 4 includes the typed
   metadata, incremental-analysis hooks, C-header dependency restat contract,
-  and resolver-scoped I/O strategy with checked-module yield sequencing used
-  here. The Titan ABI alone does not promise that surface.
+  resolver-scoped I/O strategy with checked-module yield sequencing, and the
+  validated metadata-only embedded-interface resolver used here. Its complete
+  18-entry inventory covers `titan.async`, `titan.coroutine`, `titan.fs`,
+  `titan.gc`, `titan.http`, `titan.io`, `titan.iteration`, `titan.lua`,
+  `titan.math`, `titan.net`, `titan.os`, `titan.peg`, `titan.ssl`,
+  `titan.string`, `titan.test`, `titan.timer`, `titan.url`, and `titan.uv`.
+  The Titan ABI alone does not promise that surface.
 
 To remove the integration, use the ordinary Codex plugin commands:
 

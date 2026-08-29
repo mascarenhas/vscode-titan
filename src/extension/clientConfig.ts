@@ -4,6 +4,12 @@ import * as path from "node:path";
 
 export const PACKAGED_SERVER_DIRECTORY = "bin";
 export const SERVER_BASENAME = "titan-language-server";
+export const PACKAGED_LUA_PREFIX_DIRECTORY = path.join("dist", "titan");
+export const LANGUAGE_SERVER_LUA_PATH_ENVIRONMENT_VARIABLE =
+  "TITAN_LS_LUA_PATH";
+export const LANGUAGE_SERVER_LUA_CPATH_ENVIRONMENT_VARIABLE =
+  "TITAN_LS_LUA_CPATH";
+export const COMPILER_CACHE_PREFIX_ENVIRONMENT_VARIABLE = "TITAN_PREFIX";
 export const SERVER_LOG_LEVEL_ENVIRONMENT_VARIABLE =
   "TITAN_LANGUAGE_SERVER_LOG_LEVEL";
 
@@ -81,7 +87,8 @@ export function readServerConfiguration(
 
 export function readCompilerDiscoveryConfiguration(
   configuredLuaPath: unknown,
-  configuredLuaCPath: unknown
+  configuredLuaCPath: unknown,
+  extensionRoot: string
 ): CompilerDiscoveryConfiguration {
   if (typeof configuredLuaPath !== "string") {
     throw new ServerConfigurationError(
@@ -94,9 +101,19 @@ export function readCompilerDiscoveryConfiguration(
     );
   }
 
+  const prefix = path.join(extensionRoot, PACKAGED_LUA_PREFIX_DIRECTORY);
+  const sourceRoot = path.join(prefix, "share", "lua", "5.5");
+  const nativeRoot = path.join(prefix, "lib", "lua", "5.5");
   return {
-    luaPath: configuredLuaPath,
-    luaCPath: configuredLuaCPath
+    luaPath: configuredLuaPath.length > 0
+      ? configuredLuaPath
+      : [
+          path.join(sourceRoot, "?.lua"),
+          path.join(sourceRoot, "?", "init.lua")
+        ].join(";"),
+    luaCPath: configuredLuaCPath.length > 0
+      ? configuredLuaCPath
+      : path.join(nativeRoot, "?.so")
   };
 }
 
@@ -173,18 +190,21 @@ export function createServerLaunchOptions(
   workspaceRoot: string,
   environment: NodeJS.ProcessEnv = process.env,
   compilerDiscovery: CompilerDiscoveryConfiguration = {
-    luaPath: "",
-    luaCPath: ""
+    luaPath: "./?.lua",
+    luaCPath: "./?.so"
   },
-  logLevel: ServerLogLevel = DEFAULT_SERVER_LOG_LEVEL
+  logLevel: ServerLogLevel = DEFAULT_SERVER_LOG_LEVEL,
+  compilerCachePrefix = ""
 ): ServerLaunchOptions {
   const childEnvironment = { ...environment };
   childEnvironment[SERVER_LOG_LEVEL_ENVIRONMENT_VARIABLE] = logLevel;
-  if (compilerDiscovery.luaPath.length > 0) {
-    childEnvironment.LUA_PATH = compilerDiscovery.luaPath;
-  }
-  if (compilerDiscovery.luaCPath.length > 0) {
-    childEnvironment.LUA_CPATH = compilerDiscovery.luaCPath;
+  childEnvironment[LANGUAGE_SERVER_LUA_PATH_ENVIRONMENT_VARIABLE] =
+    compilerDiscovery.luaPath;
+  childEnvironment[LANGUAGE_SERVER_LUA_CPATH_ENVIRONMENT_VARIABLE] =
+    compilerDiscovery.luaCPath;
+  if (compilerCachePrefix.length > 0) {
+    childEnvironment[COMPILER_CACHE_PREFIX_ENVIRONMENT_VARIABLE] =
+      compilerCachePrefix;
   }
 
   return {

@@ -3,6 +3,7 @@ local test = import "test"
 local lua = import "lua"
 local strings = import "string"
 local bridge = import "server.compiler_bridge"
+local embedded_interfaces = import "server.embedded_interfaces"
 local features = import "server.semantic_features"
 local logging = import "server.logging"
 local source_text = import "server.source_text"
@@ -70,7 +71,7 @@ return function(mode, contextual_provider_file)
     TITAN_VERSION = "0.6.0",
     TITAN_LIBRARY_VERSION = "0.6",
     LANGUAGE_SERVER_API_VERSION =
-      mode == "wrong-language-server-api" and 2 or 3,
+      mode == "wrong-language-server-api" and 3 or 4,
     TITAN_SOURCE_PATH = ".",
     TITAN_BIN_PATH = "",
     INSTALL_PATHS = { titan_bin = "/opt/titan/lib/titan/0.6" },
@@ -108,6 +109,9 @@ return function(mode, contextual_provider_file)
   local c_header_context_count = 0
   driver.new_resolver_context = function(options)
     assert(type(options.io) == "userdata")
+    assert(type(options.embedded_interface_provider) == "table")
+    assert(type(options.embedded_interface_provider.provider_file) == "string")
+    assert(type(options.embedded_interface_provider.entries) == "table")
     if mode == "c-header-analysis-lifetime" then
       c_header_context_count = c_header_context_count + 1
       local expected = c_header_context_count <= 2 and 1 or 2
@@ -438,17 +442,25 @@ return function(mode, contextual_provider_file)
         }
       end
       if mode == "binary-manifest" or
+         mode == "embedded-provider" or
+         mode == "ordinary-executable-provider" or
          mode == "binary-provider-switch" or
          mode == "binary-provider-to-source" then
         binary_load_count = binary_load_count + 1
         local provider_file = contextual_provider_file or
           "/binary/fixture.so"
+        if mode == "embedded-provider" or
+           mode == "ordinary-executable-provider" then
+          provider_file = assert(
+            options.embedded_interface_provider).provider_file
+        end
         if mode == "binary-provider-switch" and binary_load_count > 1 then
           provider_file = provider_file .. ".second"
         end
         local source_provider =
           mode == "binary-provider-to-source" and binary_load_count > 1
-        if contextual_provider_file and not source_provider then
+        if contextual_provider_file and not source_provider and
+           mode ~= "embedded-provider" then
           local metadata, metadata_error =
             assert(options.context).io:lstat(provider_file)
           assert(metadata and metadata_error == nil)
@@ -467,7 +479,7 @@ return function(mode, contextual_provider_file)
           }
         else
           driver.imported["fixture.binary"] = {
-            kind = "dynamic",
+            kind = mode == "embedded-provider" and "embedded" or "dynamic",
             type = module_type("fixture.binary"),
             filename = provider_file,
             c_header_dependencies = {},
@@ -652,11 +664,11 @@ function test_compiler_bridge_rejects_missing_incompatible_and_malformed_modules
   expect_bridge_error("older-same-abi",
                       "matching Titan ABI alone is insufficient")
   expect_bridge_error("wrong-language-server-api",
-                      "requires LANGUAGE_SERVER_API_VERSION 3")
+                      "requires LANGUAGE_SERVER_API_VERSION 4")
   expect_bridge_error("same-api-missing-restat",
                       "'restat_c_header_dependencies' must be a function, " ..
                       "found nil. Install a Titan compiler implementing " ..
-                      "LANGUAGE_SERVER_API_VERSION 3")
+                      "LANGUAGE_SERVER_API_VERSION 4")
   expect_bridge_error("same-api-missing-c-header-analysis",
                       "'new_c_header_analysis' must be a function, found nil")
   expect_bridge_error("same-api-missing-split-shell-words",
@@ -874,6 +886,75 @@ function test_compiler_bridge_keeps_source_manifests_off_binary_snapshots(
         test.assert(false, "binary manifest fixture used source provenance")
       end
     end, provider)
+  end)
+end
+
+function test_compiler_bridge_observes_embedded_provider_identity(
+    _context: test.Context)
+  run_bridge(function ()
+    local raw_provider, raw_identity = embedded_interfaces.provider()
+    local provider: string = raw_provider["provider_file"]
+    local provider_size: integer = raw_identity["size"]
+    with_fixture("embedded-provider", function ()
+      local compiler = bridge.load()
+      local analysis = compiler:analyze("fixture", {
+        bridge.ProjectModule.new("fixture", {bridge.SourceFile.new(
+          "/workspace/fixture.titan", "saved fixture")}),
+      })
+      local embedded? = analysis:find_module("fixture.binary")
+      test.assert(embedded ~= nil and
+                  embedded.provider_identity ~= nil and
+                  embedded.provider_identity.path == provider and
+                  embedded.provider_identity.size == provider_size and
+                  #analysis.binary_provider_observations == 1 and
+                  analysis.binary_provider_observations[1].module_name ==
+                    "fixture.binary" and
+                  analysis.binary_provider_observations[1].kind == "static" and
+                  analysis.binary_provider_observations[1].provider_file ==
+                    provider and
+                  analysis.binary_provider_observations[1].provider_identity ~=
+                    nil,
+                  "embedded provider was not stamped as an observed binary")
+      case embedded.provenance
+      when static_binary: provenance then
+        test.assert(provenance.provider_file == provider,
+                    "embedded provider lost its executable provenance")
+      else
+        test.assert(false,
+                    "embedded provider used non-static bridge provenance")
+      end
+    end, nil)
+  end)
+end
+
+function test_compiler_bridge_does_not_treat_an_ordinary_executable_path_as_embedded(
+    _context: test.Context)
+  run_bridge(function ()
+    local raw_provider, _raw_identity = embedded_interfaces.provider()
+    local provider: string = raw_provider["provider_file"]
+    with_fixture("ordinary-executable-provider", function ()
+      local compiler = bridge.load()
+      local analysis = compiler:analyze("fixture", {
+        bridge.ProjectModule.new("fixture", {bridge.SourceFile.new(
+          "/workspace/fixture.titan", "saved fixture")}),
+      })
+      local ordinary? = analysis:find_module("fixture.binary")
+      test.assert(ordinary ~= nil and ordinary.provider_identity == nil and
+                  #analysis.binary_provider_observations == 1 and
+                  analysis.binary_provider_observations[1].provider_file ==
+                    provider and
+                  analysis.binary_provider_observations[1].provider_identity ==
+                    nil,
+                  "ordinary executable-path provider bypassed lstat evidence")
+      case ordinary.provenance
+      when dynamic_binary: provenance then
+        test.assert(provenance.provider_file == provider,
+                    "ordinary executable-path provider lost its provenance")
+      else
+        test.assert(false,
+                    "ordinary executable-path provider became embedded/static")
+      end
+    end, nil)
   end)
 end
 
@@ -1372,9 +1453,8 @@ local function joins_source_imported_local_function_definition_identity()
       "local ffi = foreign import \"titan/ffi.h\"\n" ..
       "local secret_value: integer = 1\n" ..
       "local function secret(): integer return 41 end\n" ..
-      "foreign function native_add(left: ffi.titan_ffi_int,\n" ..
-      "                            right: ffi.titan_ffi_int): " ..
-      "ffi.titan_ffi_int\n" ..
+      "foreign function native_add(left: int,\n" ..
+      "                            right: int): int\n" ..
       "  return left + right\n" ..
       "end\n" ..
       "local type SecretAlias = integer\n")})
@@ -2175,8 +2255,7 @@ end
 function choose(first: integer, second: integer): integer
   return first + second
 end
-foreign function native_add(left: ffi.titan_ffi_int,
-                            right: ffi.titan_ffi_int): ffi.titan_ffi_int
+foreign function native_add(left: int, right: int): int
   return left + right
 end
 ]])
@@ -2250,8 +2329,7 @@ end
   test.assert(foreign_hover ~= nil and
               foreign_hover.callable_signature ~= nil and
               foreign_hover.callable_signature.display ==
-                "hover_external.native_add(left: titan_ffi_int, " ..
-                "right: titan_ffi_int): titan_ffi_int",
+                "hover_external.native_add(left: int, right: int): int",
               "source-imported foreign function lost its exact signature")
 end
 

@@ -1,0 +1,88 @@
+local test = import "test"
+local iteration = import "iteration"
+local lua = import "lua"
+local strings = import "string"
+local embedded_interfaces = import "server.embedded_interfaces"
+
+local EXPECTED: {string: boolean} = {
+  ["titan.async"] = true,
+  ["titan.coroutine"] = true,
+  ["titan.fs"] = true,
+  ["titan.gc"] = true,
+  ["titan.http"] = true,
+  ["titan.io"] = true,
+  ["titan.iteration"] = true,
+  ["titan.lua"] = true,
+  ["titan.math"] = true,
+  ["titan.net"] = true,
+  ["titan.os"] = true,
+  ["titan.peg"] = true,
+  ["titan.ssl"] = true,
+  ["titan.string"] = true,
+  ["titan.test"] = true,
+  ["titan.timer"] = true,
+  ["titan.url"] = true,
+  ["titan.uv"] = true,
+}
+
+function test_embedded_interfaces_expose_the_complete_metadata_only_provider(
+    _context: test.Context)
+  local provider, identity = embedded_interfaces.provider()
+  local provider_file: string = provider["provider_file"]
+  test.assert(#provider_file > 0 and strings.sub(provider_file, 1, 1) == "/",
+              "embedded interface provider path is not absolute")
+  local identity_path: string = identity["path"]
+  local identity_kind: string = identity["kind"]
+  local identity_size: integer = identity["size"]
+  local identity_device: integer = identity["device"]
+  local identity_inode: integer = identity["inode"]
+  local identity_seconds: integer = identity["modified_seconds"]
+  local identity_nanoseconds: integer = identity["modified_nanoseconds"]
+  test.assert(identity_path == provider_file and identity_kind == "file" and
+              identity_size > 0 and identity_nanoseconds >= 0 and
+              identity_nanoseconds < 1000000000,
+              "embedded provider identity is incomplete or mismatched")
+
+  local raw_entries: value = provider["entries"]
+  test.assert(raw_entries is {string: value},
+              "embedded interface provider has no entry table")
+  local entries = raw_entries as {string: value}
+  local count = 0
+  for name, raw_entry in iteration.pairs<string, value>(entries) do
+    count = count + 1
+    test.assert(EXPECTED[name] == true,
+                "embedded interface provider exposed unexpected " .. name)
+    test.assert(raw_entry is {string: value},
+                "embedded interface entry is not a table")
+    local entry = raw_entry as {string: value}
+    local abi: string = entry["abi"]
+    local types: string = entry["types"]
+    test.assert(abi == "2" and #types > 0,
+                "embedded interface entry has invalid ABI/types")
+  end
+  test.assert(count == 18,
+              "embedded interface provider did not expose 18 entries")
+
+  -- Discard any support table an earlier compiler test loaded from an ambient
+  -- installation. The provider's registry preload must be sufficient by
+  -- itself, and requiring it must expose the metadata-probing helper.
+  local clear_loaded = lua.load([[
+return function()
+  package.loaded["titan"] = nil
+end
+]], "=embedded_interfaces_clear_titan", nil)() as () -> ()
+  clear_loaded()
+  local support = lua.require("titan")
+  local inspect_support = lua.load([[
+return function(module)
+  return type(package.preload["titan"]),
+         type(module),
+         type(module._loadlib)
+end
+]], "=embedded_interfaces_inspect_titan", nil)() as
+    (value) -> (string, string, string)
+  local preload_kind, support_kind, loadlib_kind = inspect_support(support)
+  test.assert(preload_kind == "function" and support_kind == "table" and
+              loadlib_kind == "function",
+              "embedded provider did not preload Titan compiler support")
+end
