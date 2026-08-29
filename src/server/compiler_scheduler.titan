@@ -10,7 +10,7 @@ local record Waiter
   task: async.Task<value, value>
   resume_token: async.ResumeToken
   queued: boolean
-  granted: boolean
+  reserved: boolean
 end
 
 record Permit
@@ -34,11 +34,11 @@ local function Scheduler:grant_next()
       self.waiters[index] = self.waiters[index + 1]
     end
     self.waiters[#self.waiters] = nil
-    if waiter.queued and not waiter.granted then
+    if waiter.queued then
       -- Keep queued true until the resumed Task accepts ownership. Its
-      -- cancellation action can therefore detect a granted-but-not-yet-run
-      -- permit and hand it to the following waiter.
-      waiter.granted = true
+      -- cancellation action or post-suspend catch can therefore detect a
+      -- reserved-but-not-yet-run permit and hand it to the following waiter.
+      waiter.reserved = true
       logging.emit("trace", "compiler.scheduler.grant", {
         json.Member.new("remaining_waiters", json.from_integer(
           #self.waiters)),
@@ -53,7 +53,7 @@ end
 local function Scheduler:abandon(waiter: Waiter)
   if not waiter.queued then return end
   waiter.queued = false
-  if waiter.granted then
+  if waiter.reserved then
     -- active represents this reservation already. Transfer it instead of
     -- clearing the scheduler while an older owner is still unwinding.
     self:grant_next()
@@ -85,9 +85,7 @@ function Scheduler:acquire(): Permit
   })
   local abandon = function () self:abandon(waiter) end
   do
-    while not waiter.granted do
-      async.suspend(waiter.resume_token, abandon)
-    end
+    async.suspend(waiter.resume_token, abandon)
     waiter.queued = false
     logging.emit("debug", "compiler.scheduler.acquire", {
       json.Member.new("waited", json.from_boolean(true)),
@@ -97,6 +95,8 @@ function Scheduler:acquire(): Permit
     })
     return Permit.new(function () self:release_owner() end, false)
   catch
+    -- Resume delivery closes its zero timer before re-entering this Task, so
+    -- cancellation can be injected after the cancellation action was cleared.
     self:abandon(waiter)
     raise
   end
