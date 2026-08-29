@@ -67,8 +67,14 @@ Create board-sized issues rather than treating each broad feature as one task;
 record dependencies and acceptance criteria in each issue. Keep item status,
 priority, and size current with `gh project` commands.
 
-Direct commits to `main` are authorized for this new repository. Inspect the
-worktree, stage exact paths, and verify the intended commit before publishing.
+The direct-commit allowance applied only during the repository's initial
+development and is now retired. Work in a focused branch, inspect the worktree,
+stage exact paths, verify the intended commit, and open a PR after the owned
+acceptance criteria pass. Leave the PR open for maintainer review. Do not merge
+it or commit or push directly to `main` unless the maintainer explicitly
+authorizes that exact action.
+
 If compiler changes become necessary, make them in a new branch in `../titan`;
 do not mix them into this repository, and open the Titan PR only after the
-extension/server work is wrapped and locally verified.
+extension/server work is wrapped and locally verified. Leave that PR open for
+maintainer review as well; opening it does not authorize merging it.

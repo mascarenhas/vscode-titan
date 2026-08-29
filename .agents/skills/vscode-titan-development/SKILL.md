@@ -87,9 +87,15 @@ delivery. For a direct focused `titanc` invocation, copy `src/` to a temporary
 source stage first; using the working tree itself as `--tree` can emit generated
 `.c`/`.o` files beside the authored Titan modules. Inspect the VSIX contents and
 the executable's native dependencies.
-Update Project status/priority/size with `gh`, then stage exact paths and commit
-to `main` only when the owned acceptance criteria are satisfied.
+Update Project status/priority/size with `gh`, then work in a focused branch,
+stage exact paths, and open a PR only when the owned acceptance criteria are
+satisfied. Leave the PR open for maintainer review. The direct-commit allowance
+was limited to initial repository development and is retired; do not merge a PR
+or commit or push directly to `main` unless the maintainer explicitly authorizes
+that exact action.
 
 If the compiler needs changes, work in a new branch under `../titan`, preserve
 its existing compiler behavior for `titanc`, run its own focused and broad
-tests, and defer its PR until the extension/server work is wrapped.
+tests, and defer its PR until the extension/server work is wrapped. Leave the
+compiler PR open for maintainer review; opening it does not authorize merging
+it.
