@@ -2955,6 +2955,120 @@ function test_compiler_bridge_preserves_cached_manifest_callable_hover_signature
   test_runtime.run(preserves_cached_manifest_callable_hover_signatures)
 end
 
+local function preserves_current_metadata_types_in_cached_external_manifests()
+  preload_real_compiler()
+  local external_root = fs.tmpname()
+  fs.unlink(external_root)
+  fs.mkdir(external_root)
+  local external_file = external_root .. "/bridge_metadata.titan"
+  fs.write_file(external_file, [[
+function view(items: const? { integer }): const? { integer }
+  return items
+end
+function optional(items: (const? { integer })?): (const? { integer })?
+  return items
+end
+function relay(callback: foreign (*lua_State, const *char) -> int):
+    foreign (*lua_State, const *char) -> int
+  return callback
+end
+]])
+  defer do
+    fs.unlink(external_file)
+    fs.rmdir(external_root)
+  end
+
+  local filename = "/workspace/bridge_metadata_consumer.titan"
+  local source = [[local cached = import "bridge_metadata"
+function use(callback: foreign (*lua_State, const *char) -> int,
+             mutable: { integer }, immutable: const { integer }): integer
+  local mutable_view = cached.view(mutable)
+  local immutable_view = cached.view(immutable)
+  local optional_view? = cached.optional(nil)
+  local relayed = cached.relay(callback)
+  local result: integer = relayed(L, "fixture")
+  return result
+end
+]]
+  local consumer = bridge.ProjectModule.new("bridge_metadata_consumer", {
+    bridge.SourceFile.new(filename, source),
+  })
+  local initial_compiler = bridge.load()
+  initial_compiler:configure_paths(external_root, nil, nil)
+  local initial = initial_compiler:analyze("bridge_metadata_consumer", {consumer})
+  local diagnostic_messages = strings.writer()
+  for index = 1, #initial.diagnostics do
+    diagnostic_messages:write(initial.diagnostics[index].message .. "\n")
+  end
+  test.assert(#initial.diagnostics == 0,
+              "compiler rejected current metadata fixture: " ..
+                diagnostic_messages:drain())
+  local external? = initial:find_module("bridge_metadata")
+  test.assert(external ~= nil and external.manifest ~= nil and
+              #external.nodes == 0 and #external.symbols == 0 and
+              not initial_compiler:has_project_ast("bridge_metadata"),
+              "external metadata seed retained project semantic state")
+  local manifest: bridge.Manifest = external.manifest
+  test.assert(manifest.source_serialized ~= nil and
+              strings.find(manifest.serialized, 'Array(Integer(),"maybe")') ~= nil and
+              strings.find(manifest.serialized, "CFunction(") ~= nil and
+              strings.find(manifest.serialized, "CStruct(") ~= nil,
+              "current Array and portable C metadata were not serialized")
+  local cached_external = bridge.CachedSourceInterface.new(
+    "bridge_metadata", manifest.serialized, manifest.source_serialized,
+    external_file, {external_file}, external.imports,
+    external.c_header_dependencies)
+
+  -- Make source fallback fail so this analysis proves manifest rehydration.
+  fs.write_file(external_file, "function broken(: integer) end\n")
+  local reloaded_compiler = bridge.load()
+  reloaded_compiler:configure_paths(external_root, nil, nil)
+  local reloaded = reloaded_compiler:analyze_incremental(
+    {consumer}, {"bridge_metadata_consumer"}, {cached_external})
+  for index = 1, #reloaded.diagnostics do
+    diagnostic_messages:write(reloaded.diagnostics[index].message .. "\n")
+  end
+  test.assert(#reloaded.diagnostics == 0,
+              "compiler could not rehydrate current metadata: " ..
+                diagnostic_messages:drain())
+  local project? = reloaded:find_module("bridge_metadata_consumer")
+  test.assert(project ~= nil and #project.nodes > 0 and
+              reloaded_compiler:has_project_ast("bridge_metadata_consumer"),
+              "manifest consumer lost its annotated project AST")
+  local expected_types: {string: string} = {
+    ["mutable_view"] = "const? { integer }",
+    ["immutable_view"] = "const? { integer }",
+    ["optional_view"] = "const? { integer }?",
+    ["relayed"] = "*(foreign  (*lua_State, const *char) -> int)",
+  }
+  local checked_types = 0
+  for index = 1, #project.symbols do
+    local symbol = project.symbols[index]
+    local expected? = expected_types[symbol.name]
+    if expected ~= nil then
+      test.assert(symbol.type_info ~= nil and
+                  symbol.type_info.display == expected,
+                  "cached metadata changed the type of '" .. symbol.name .. "'")
+      expected_types[symbol.name] = nil
+      checked_types = checked_types + 1
+    end
+  end
+  test.assert(checked_types == 4,
+              "cached metadata fixture lost inferred local symbols")
+  local cached_snapshot? = reloaded:find_module("bridge_metadata")
+  test.assert(cached_snapshot ~= nil and #cached_snapshot.nodes == 0 and
+              #cached_snapshot.symbols == 0 and cached_snapshot.manifest ~= nil and
+              cached_snapshot.manifest.serialized == manifest.serialized and
+              cached_snapshot.manifest.source_serialized == manifest.source_serialized and
+              not reloaded_compiler:has_project_ast("bridge_metadata"),
+              "rehydrated external metadata retained an AST or changed its manifest")
+end
+
+function test_compiler_bridge_preserves_current_metadata_in_cached_external_manifests(
+    _context: test.Context)
+  run_bridge(preserves_current_metadata_types_in_cached_external_manifests)
+end
+
 local function preserves_direct_c_callable_hover_signatures()
   preload_real_compiler()
   local include_root = fs.tmpname()

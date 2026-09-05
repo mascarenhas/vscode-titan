@@ -11,7 +11,7 @@ The native executable statically links the selected Titan standard-library
 runtime modules, the embedded Lua interpreter, and the selected native
 dependencies. Initialized statically linked modules register their runtime
 openers in `package.preload`. Separately, the executable carries a metadata-only
-inventory of all 18 canonical Titan standard-module interfaces; compiler
+inventory of all 19 canonical Titan standard-module interfaces; compiler
 language-server API 4 validates and decodes those serialized interfaces for
 project typechecking. The inventory contains no standard-module implementation,
 provider archive, header, or SDK payload.
@@ -213,7 +213,7 @@ executable and registered for `require` through `package.preload`. Project
 typechecking uses the executable's separate, validated metadata-only inventory
 for `titan.async`, `titan.coroutine`, `titan.fs`, `titan.gc`, `titan.http`,
 `titan.io`, `titan.iteration`, `titan.lua`, `titan.math`, `titan.net`,
-`titan.os`, `titan.peg`, `titan.ssl`, `titan.string`, `titan.test`,
+`titan.os`, `titan.peg`, `titan.reflect`, `titan.ssl`, `titan.string`, `titan.test`,
 `titan.timer`, `titan.url`, and `titan.uv`.
 
 In Remote SSH, WSL, or container workspaces, the workspace extension and native

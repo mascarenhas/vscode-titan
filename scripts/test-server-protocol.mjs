@@ -849,12 +849,17 @@ async function testSelfContainedCompilerModules() {
   const lines = [
     'local strings = import "string"',
     'local http = import "http"',
+    'local reflect = import "reflect"',
     "",
     "function render(item: string): string",
     "  return strings.upper(item)",
     "end",
     "function request_scheme(request: http.Request): string",
     "  return request.url.scheme",
+    "end",
+    "function reflected_fields(descriptor: reflect.RecordType): " +
+      "const { reflect.FieldType }",
+    "  return descriptor.fields",
     "end",
     "function use(): string",
     '  return render("titan")',
@@ -877,6 +882,10 @@ async function testSelfContainedCompilerModules() {
   assert.ok(useLine >= 0);
   const useColumn = lines[useLine].indexOf("render");
   assert.ok(useColumn >= 0);
+  const reflectLine = lines.findIndex(
+    (line) => line.startsWith("function reflected_fields(")
+  );
+  assert.ok(reflectLine >= 0);
   const child = launch(root);
   const exit = exitOf(child);
   const stderr = collect(child.stderr);
@@ -914,6 +923,21 @@ async function testSelfContainedCompilerModules() {
         JSON.stringify(responses.diagnosticPublications)
       }`
     );
+    const reflectHover = await semanticRequest(
+      child,
+      responses,
+      "self-contained-reflect-hover",
+      "textDocument/hover",
+      {
+        textDocument: { uri },
+        position: { line: reflectLine, character: 10 }
+      }
+    );
+    assert.equal(reflectHover.error, undefined, JSON.stringify(reflectHover.error));
+    assert.ok(reflectHover.result, "packaged reflect interface has no hover");
+    assert.match(reflectHover.result.contents.value, /titan\.reflect\.RecordType/);
+    assert.match(reflectHover.result.contents.value, /const/);
+    assert.match(reflectHover.result.contents.value, /titan\.reflect\.FieldType/);
     assert.ok(
       responses.diagnosticPublications.every(
         (publication) => publication.diagnostics.length === 0

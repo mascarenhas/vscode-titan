@@ -24,7 +24,7 @@ command -v titan-language-server
 The executable contains the selected statically linked Titan runtime modules,
 embedded Lua interpreter, and selected native dependencies. Each initialized
 statically linked module registers its runtime opener in `package.preload`.
-Separately, the executable embeds a metadata-only inventory of all 18 canonical
+Separately, the executable embeds a metadata-only inventory of all 19 canonical
 Titan standard-module interfaces. Compiler language-server API 4 validates and
 decodes this inventory for project typechecking; it is not module code, a Titan
 provider archive, headers, or an SDK payload.
@@ -114,9 +114,9 @@ returns a `WorkspaceEdit` with `applied: false`. It never changes source files.
   metadata, incremental-analysis hooks, C-header dependency restat contract,
   resolver-scoped I/O strategy with checked-module yield sequencing, and the
   validated metadata-only embedded-interface resolver used here. Its complete
-  18-entry inventory covers `titan.async`, `titan.coroutine`, `titan.fs`,
+  19-entry inventory covers `titan.async`, `titan.coroutine`, `titan.fs`,
   `titan.gc`, `titan.http`, `titan.io`, `titan.iteration`, `titan.lua`,
-  `titan.math`, `titan.net`, `titan.os`, `titan.peg`, `titan.ssl`,
+  `titan.math`, `titan.net`, `titan.os`, `titan.peg`, `titan.reflect`, `titan.ssl`,
   `titan.string`, `titan.test`, `titan.timer`, `titan.url`, and `titan.uv`.
   The Titan ABI alone does not promise that surface.
 

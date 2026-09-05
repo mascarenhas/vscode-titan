@@ -14,6 +14,7 @@ local EXPECTED_MODULES = {
     "titan.net",
     "titan.os",
     "titan.peg",
+    "titan.reflect",
     "titan.ssl",
     "titan.string",
     "titan.test",
@@ -62,7 +63,8 @@ local function validate_inventory(entries)
         if #unexpected ~= 0 then
             parts[#parts + 1] = "unexpected " .. join_quoted(unexpected)
         end
-        return nil, "expected the exact 18-module Titan interface inventory (" ..
+        return nil, "expected the exact " .. #EXPECTED_MODULES ..
+            "-module Titan interface inventory (" ..
             table.concat(parts, "; ") .. ")"
     end
 
@@ -614,6 +616,13 @@ local function self_test()
     assert(first:find("extern int luaopen_titan(lua_State *L);", 1, true))
     assert(first:find("LUA_PRELOAD_TABLE", 1, true))
     assert(not first:find("luaopen_titan_", 1, true))
+
+    local reflect = entries["titan.reflect"]
+    entries["titan.reflect"] = nil
+    local old_inventory, missing_reflect_error = render_source(entries)
+    assert(old_inventory == nil)
+    assert(missing_reflect_error:find('missing "titan.reflect"', 1, true))
+    entries["titan.reflect"] = reflect
 
     entries[EXPECTED_MODULES[1]].abi = "wrong"
     local wrong_abi, abi_error = render_source(entries)

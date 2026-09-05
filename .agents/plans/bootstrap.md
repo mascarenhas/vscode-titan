@@ -18,7 +18,7 @@ The executable statically selects the Titan standard-library runtime modules
 needed by the server, together with the embedded Lua interpreter and configured
 native dependencies. Initialized statically linked modules register their
 runtime openers in `package.preload`. The executable separately embeds a
-metadata-only inventory of all 18 canonical standard-module interfaces;
+metadata-only inventory of all 19 canonical standard-module interfaces;
 compiler language-server API 4 validates and decodes it for project
 typechecking. This inventory is analysis data, not module implementation or a
 linkable provider.
@@ -90,10 +90,11 @@ example with `-Wl,-E`) so native Lua modules bind to the same Lua state.
 
 Project typechecking does not discover Titan standard-module interfaces through
 an on-disk provider. API 4 validates and decodes the executable's metadata-only
-18-entry inventory before considering disk-backed compiled providers. The
+19-entry inventory before considering disk-backed compiled providers. The
 inventory covers `titan.async`, `titan.coroutine`, `titan.fs`, `titan.gc`,
 `titan.http`, `titan.io`, `titan.iteration`, `titan.lua`, `titan.math`,
-`titan.net`, `titan.os`, `titan.peg`, `titan.ssl`, `titan.string`, `titan.test`,
+`titan.net`, `titan.os`, `titan.peg`, `titan.reflect`, `titan.ssl`,
+`titan.string`, `titan.test`,
 `titan.timer`, `titan.url`, and `titan.uv`; it carries serialized ABI/type data,
 not implementations or link inputs.
 
@@ -327,7 +328,7 @@ has evidence before moving to Done.
 - No `lib/titan` tree, Titan provider/archive, Titan headers, or additional
   native SDK payload in the VSIX.
 - Initialized statically linked standard modules use `package.preload`; the
-  complete 18-entry embedded inventory is validated metadata-only analysis
+  complete 19-entry embedded inventory is validated metadata-only analysis
   input, not runtime code or a linkable provider.
 - Native compiler dependencies can bind to the exported embedded Lua API.
 - No server logging on stdout.
