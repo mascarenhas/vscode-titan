@@ -19,9 +19,9 @@ needed by the server, together with the embedded Lua interpreter and configured
 native dependencies. Initialized statically linked modules register their
 runtime openers in `package.preload`. The executable separately embeds a
 metadata-only inventory of all 19 canonical standard-module interfaces;
-compiler language-server API 4 validates and decodes it for project
-typechecking. This inventory is analysis data, not module implementation or a
-linkable provider.
+compiler language-server API 5 validates and decodes it and its build target's
+C type profile for project typechecking. This inventory is analysis data, not
+module implementation or a linkable provider.
 
 The compiler itself remains ordinary Lua code: the server's embedded Lua
 discovers and loads compiler modules through `package.path` with `lua.require`.
@@ -89,14 +89,18 @@ defaults. On ELF systems the server link must export the embedded Lua API (for
 example with `-Wl,-E`) so native Lua modules bind to the same Lua state.
 
 Project typechecking does not discover Titan standard-module interfaces through
-an on-disk provider. API 4 validates and decodes the executable's metadata-only
+an on-disk provider. API 5 validates and decodes the executable's metadata-only
 19-entry inventory before considering disk-backed compiled providers. The
 inventory covers `titan.async`, `titan.coroutine`, `titan.fs`, `titan.gc`,
 `titan.http`, `titan.io`, `titan.iteration`, `titan.lua`, `titan.math`,
 `titan.net`, `titan.os`, `titan.peg`, `titan.reflect`, `titan.ssl`,
 `titan.string`, `titan.test`,
 `titan.timer`, `titan.url`, and `titan.uv`; it carries serialized ABI/type data,
-not implementations or link inputs.
+not implementations or link inputs. The provider also carries a validated
+build target profile describing portable C types and numeric conversions, so
+ordinary semantic analysis can consume reflection metadata without a C compiler
+or Titan SDK. C header imports and native compilation still require the
+configured C toolchain and SDK.
 
 ### Server layers
 
@@ -266,8 +270,9 @@ Gate: the single native executable passes protocol transcripts and a real
 - Load compatible compiler Lua modules through normal `package.path`; use the
   VSIX-owned tree by default and report actionable discovery/version failures
   for standalone or configured overrides. Require compiler
-  `LANGUAGE_SERVER_API_VERSION = 4` and give each resolver context the validated
-  metadata-only `embedded_interface_provider` option.
+  `LANGUAGE_SERVER_API_VERSION = 5` and give each resolver context the validated
+  metadata-only `embedded_interface_provider` option, including the validated
+  `target_profile` exported from the server build toolchain.
 - Identify the smallest compiler API changes required for independent module
   checking, manifests, annotated AST retention, I/O injection, and cooperative
   yield. Keep any such work on a new Titan repository branch.
@@ -344,11 +349,13 @@ has evidence before moving to Done.
 
 ## Resolved investigation outcomes
 
-- Compiler API 4 exposes resolver-scoped incremental analysis, complete project
+- Compiler API 5 exposes resolver-scoped incremental analysis, complete project
   AST reuse, detached public manifests, exact external provenance, ordered
   checked-module checkpoints, and validation/resolution of the executable's
-  metadata-only standard-interface provider without embedding compiler Lua
-  modules.
+  metadata-only standard-interface provider and its build target profile without
+  embedding compiler Lua modules. The profile supplies portable C type traits
+  for ordinary semantic analysis; explicit C header imports continue to use a
+  live configured toolchain and SDK.
 - The resolver context owns one I/O strategy. Ordinary `titanc` uses the Lua
   implementation; the server supplies a Titan-record proxy backed by Titan
   async filesystem/process APIs and `async.yield`. The one focused Titan

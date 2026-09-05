@@ -40,19 +40,21 @@ verification and monitor Linux CI only.
   newly added `titan.reflect` module.
 - Validation and delivery results will be recorded here after execution.
 
-## Completed local validation
+## Initial local validation
 
 - Fresh compiler installed successfully; installed `types.lua` and `driver.lua`
-  match the pristine clone. The clone remains clean at `0ac5df1`.
+  matched the pristine clone, which was clean at `0ac5df1` during this run.
 - The original generator rejects the new archive with `unexpected
   "titan.reflect"`; the updated generator and its self-test pass.
 - Compiler API 4 and ABI 2 are unchanged. An independent audit found no bridge
   serialization API mismatch. Existing compiler-owned serialization and
-  decoding remain authoritative; no compiler edits were necessary.
+  decoding remain authoritative. The later SDK-free package failure below
+  demonstrated a separate compiler blocker.
 - All 221 native tests, 56 JavaScript tests, 12 extension-host tests, protocol
   transcripts, and Codex adapter smoke tests pass. The full documented
-  `make verify` gate completed, including packaging, self-contained reflection
-  smoke, native/VSIX inspection, plugin validation, and staged installation.
+  `make verify` gate completed, including packaging, the initial reflection
+  smoke (later found to inherit ambient headers), native/VSIX inspection,
+  plugin validation, and staged installation.
   The gate was resumed at the remaining stages after giving VS Code a writable
   temporary runtime directory and extracting the pinned LuaRocks license source
   into the fresh clone. Already passed test stages were not repeated.
@@ -74,3 +76,60 @@ verification and monitor Linux CI only.
 
 Publication and CI evidence belong in the PR and issue #45; leave the PR open
 for maintainer review.
+
+## CI-discovered compiler blocker
+
+- PR #46 commit `1f4e301` passed all native, JavaScript, and extension-host
+  tests in Linux run `33990472201`, then failed the self-contained packaged
+  reflection smoke because no authoritative C target profile was available.
+- The original local package pass was masked by inherited `C_INCLUDE_PATH`
+  exposing an unrelated Titan SDK. Clearing the ambient C include paths
+  reproduces the CI failure with a fresh package extraction and cache.
+- Reflection exports portable C integer callback metadata. The compiler must
+  normalize that metadata before publication, but API 4 requires `lua.h` even
+  for pure type decisions. Skipping normalization would weaken ordinary C
+  argument, return, and conversion checking.
+- Implement API 5 in the isolated compiler branch
+  `fix/embedded-interface-c-profile`, with a validated declarative build target
+  profile on the analysis-only embedded provider. The compiler owns profile
+  reconstruction and numeric normalization. Actual native probes still require
+  a configured SDK/toolchain and matching target identity. No SDK payload is
+  added to the VSIX and no compiler globals are injected by the bridge.
+- The extension generator records the build profile alongside the exact
+  19-module metadata inventory; API expectations and documentation advance to
+  5. The package smoke clears ambient include paths and selects an unavailable
+  C compiler, while testing reflected callback C-int-to-Titan-integer typing.
+- Repeat focused and full local verification and pristine stdlib indexing with
+  ambient C include paths cleared. Publish the compiler prerequisite PR only
+  after the extension is locally wrapped, pin the verified compiler commit,
+  and leave both PRs open with Linux CI evidence. Never dispatch macOS CI.
+
+## API 5 extension verification
+
+- Refreshed the production `.titan` prefix from the isolated compiler branch.
+  Generator validation normalizes every archive entry against the exported
+  build profile, and its native data translation unit compiles with warnings
+  treated as errors.
+- A complete uninterrupted `make verify` passed with ambient C include
+  variables cleared: 222 native tests, 56 JavaScript tests, 12 extension-host
+  tests, protocol/Codex smoke, packaging, native/VSIX inspection, plugin
+  validation, and staged installation. The extracted VSIX smoke selects an
+  unavailable C compiler and exercises reflection imports and C callback
+  result conversion.
+- The configured stdlib workspace again indexed 114 saved files across
+  59 modules with zero diagnostics. Timer/uv and reflection definitions and
+  reflection/async hovers succeeded; unchanged queries caused no indexing.
+  This concurrent local run took 236,789.951 ms with 156,410 ms child CPU.
+- Benchmark evidence: `/tmp/vscode-titan-compiler-y5yweR/profile-stdlib-index.json`,
+  SHA-256 `b5509408d701db728f41a9eb790321d34934bf6b3fc111caecb8f1a874a47baf`.
+- Verified local Linux x64 VSIX: 21,463,493 bytes, SHA-256
+  `f26453b114f65402f257ec0112f0b333545efa7cb2cb10568903a8d3ff576027`.
+- Titan master advanced to `b72f5e4` with SQLite during this work. This
+  compatibility fix retains the original `0ac5df1` snapshot plus the
+  isolated API 5 prerequisite, preserving the verified 19-module inventory.
+
+- The compiler prerequisite is committed as
+  `f8e4c4d7e89f8584af6ed1583e9a296aa9c53476`; CI now pins that exact revision.
+  Its complete fresh-prefix `make test` passed 128 retained checks, 3,286
+  compiler tests, and 241 native stdlib tests. Both working trees passed
+  independent review and diff checks before their final commits.

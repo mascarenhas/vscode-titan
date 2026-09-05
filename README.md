@@ -12,9 +12,10 @@ runtime modules, the embedded Lua interpreter, and the selected native
 dependencies. Initialized statically linked modules register their runtime
 openers in `package.preload`. Separately, the executable carries a metadata-only
 inventory of all 19 canonical Titan standard-module interfaces; compiler
-language-server API 4 validates and decodes those serialized interfaces for
-project typechecking. The inventory contains no standard-module implementation,
-provider archive, header, or SDK payload.
+language-server API 5 validates and decodes those serialized interfaces and
+their build target's C type profile for project typechecking. The inventory
+contains no standard-module implementation, provider archive, header, or SDK
+payload.
 
 The Titan compiler itself is not embedded in that executable: its Lua state
 loads the ordinary `titan-compiler` modules through `package.path` and their
@@ -198,12 +199,16 @@ VSIX is therefore self-contained for compiler discovery and does not inherit
 ambient `LUA_PATH` or `LUA_CPATH` defaults. Configured values replace the
 corresponding packaged template verbatim, so an override must be a complete Lua
 search path. Compatibility still requires both the matching Titan ABI and
-`titan-compiler.driver.LANGUAGE_SERVER_API_VERSION == 4`; API 4 includes the
+`titan-compiler.driver.LANGUAGE_SERVER_API_VERSION == 5`; API 5 includes the
 compiler's typed semantic metadata, incremental-analysis hooks, C-header
 dependency restat contract, resolver-scoped I/O strategy with named
 completed-module yield checkpoints, and the validated metadata-only embedded
-interface provider used before disk-backed compiled providers. The ABI alone is
-not the language-server API contract.
+interface provider used before disk-backed compiled providers. The provider's
+validated build target profile describes portable C types in those interfaces
+and their numeric conversions, allowing reflection imports and ordinary
+semantic analysis without a C compiler or Titan SDK. C header imports and
+native compilation still require the configured C toolchain and SDK. The ABI
+alone is not the language-server API contract.
 
 The two bundled trees contain ordinary Lua source and native Lua modules; they
 are not embedded into the executable. They contain no `lib/titan` provider tree,

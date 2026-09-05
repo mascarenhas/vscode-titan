@@ -235,6 +235,11 @@ mkdir -p \
   "$hostile_titan_root/source"
 (
   cd "$protocol_root"
+  # Embedded interfaces must remain usable without a C toolchain or ambient
+  # Titan SDK headers, including when their metadata contains portable C types.
+  unset CPATH C_INCLUDE_PATH CPLUS_INCLUDE_PATH
+  export CC="$extract_root/c-compiler-must-not-be-used"
+  export CCACHE_DISABLE=1
   export LUA_PATH=/ambient/must-not-be-used/?.lua
   export LUA_CPATH=/ambient/must-not-be-used/?.so
   export TITAN_ROCKS_ROOT="$hostile_titan_root"

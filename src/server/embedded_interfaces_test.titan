@@ -88,6 +88,31 @@ end
               "embedded provider did not preload Titan compiler support")
 end
 
+function test_embedded_target_profile_reconstructs_native_numeric_traits(
+    _context: test.Context)
+  local provider = embedded_interfaces.provider()
+  local check_profile = lua.load([[
+return function(data)
+  local semantics = require "titan-compiler.csemantics"
+  local profile, message = semantics.import_profile(data)
+  if not profile then return false, tostring(message) end
+  local integer = profile.integers["int"].type
+  if integer._c_numeric == nil or integer._c_numeric_carriers == nil then
+    return false, "embedded C int lost its numeric lowering traits"
+  end
+  local exported, export_error = semantics.export_profile(profile)
+  if not exported then return false, tostring(export_error) end
+  return exported.identity == data.identity and
+         profile.identity == data.identity and
+         integer._c_numeric_carriers.identity == data.identity,
+         "embedded target profile identity changed during reconstruction"
+end
+]], "=embedded_interfaces_target_profile", nil)() as
+    (value) -> (boolean, string)
+  local valid, message = check_profile(provider["target_profile"])
+  test.assert(valid, message)
+end
+
 function test_reflect_interface_does_not_load_its_runtime(_context: test.Context)
   local runtime_is_absent = lua.load([[
 return function()
