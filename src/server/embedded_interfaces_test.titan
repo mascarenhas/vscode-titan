@@ -12,12 +12,14 @@ local EXPECTED: {string: boolean} = {
   ["titan.http"] = true,
   ["titan.io"] = true,
   ["titan.iteration"] = true,
+  ["titan.json"] = true,
   ["titan.lua"] = true,
   ["titan.math"] = true,
   ["titan.net"] = true,
   ["titan.os"] = true,
   ["titan.peg"] = true,
   ["titan.reflect"] = true,
+  ["titan.sqlite3"] = true,
   ["titan.ssl"] = true,
   ["titan.string"] = true,
   ["titan.test"] = true,
@@ -61,8 +63,8 @@ function test_embedded_interfaces_expose_the_complete_metadata_only_provider(
     test.assert(abi == "2" and #types > 0,
                 "embedded interface entry has invalid ABI/types")
   end
-  test.assert(count == 19,
-              "embedded interface provider did not expose 19 entries")
+  test.assert(count == 21,
+              "embedded interface provider did not expose 21 entries")
 
   -- Discard any support table an earlier compiler test loaded from an ambient
   -- installation. The provider's registry preload must be sufficient by
@@ -113,22 +115,23 @@ end
   test.assert(valid, message)
 end
 
-function test_reflect_interface_does_not_load_its_runtime(_context: test.Context)
+function test_unused_interfaces_do_not_load_their_runtimes(_context: test.Context)
   local runtime_is_absent = lua.load([[
-return function()
-  return package.preload["titan.reflect"] == nil and
-         package.loaded["titan.reflect"] == nil
+return function(name)
+  return package.preload[name] == nil and package.loaded[name] == nil
 end
-]], "=embedded_interfaces_reflect_runtime", nil)() as () -> boolean
-  test.assert(runtime_is_absent(),
-              "reflect runtime is unexpectedly linked or loaded")
+]], "=embedded_interfaces_unused_runtime", nil)() as (string) -> boolean
+  local names: {string} = {"titan.json", "titan.reflect", "titan.sqlite3"}
+  for _, name in iteration.ipairs<string>(names) do
+    test.assert(runtime_is_absent(name),
+                name .. " runtime is unexpectedly linked or loaded")
 
-  local provider = embedded_interfaces.provider()
-  local entries: {string: value} = provider["entries"]
-  local reflect: {string: value} = entries["titan.reflect"]
-  local types: string = reflect["types"]
-  test.assert(#types > 0,
-              "reflect typechecking metadata is missing")
-  test.assert(runtime_is_absent(),
-              "reading reflect metadata registered or loaded its runtime")
+    local provider = embedded_interfaces.provider()
+    local entries: {string: value} = provider["entries"]
+    local entry: {string: value} = entries[name]
+    local types: string = entry["types"]
+    test.assert(#types > 0, name .. " typechecking metadata is missing")
+    test.assert(runtime_is_absent(name),
+                "reading " .. name .. " metadata registered or loaded its runtime")
+  end
 end

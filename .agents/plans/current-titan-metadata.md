@@ -133,3 +133,47 @@ for maintainer review.
   Its complete fresh-prefix `make test` passed 128 retained checks, 3,286
   compiler tests, and 241 native stdlib tests. Both working trees passed
   independent review and diff checks before their final commits.
+
+## Refresh to merged Titan master
+
+The maintainer merged the Titan prerequisites and requested PR #46 be updated
+to latest master before the extension merge. Remote master is now
+`65523fa1e0bcc23b411f956b967c3a3b17dbc581`, including JSON, SQLite, and
+the merged API 5 profile fix. Use the same clean temporary compiler checkout
+at that exact detached revision; continue leaving the active sibling untouched.
+
+- Update the CI pin and exact embedded inventory from 19 to 21 modules.
+- Regress metadata-only JSON and SQLite imports in the self-contained package
+  smoke, retaining the unavailable C compiler and cleared ambient headers.
+- Refresh the isolated production SDK, run the full extension verification gate,
+  and reindex the expanded saved-source stdlib workspace with semantic probes
+  for both newly included modules.
+- Review, commit exact paths, and push the existing PR branch. Verify Linux CI
+  on the new head and keep PR #46 open and issue #45 In review.
+
+### Merged-master validation
+
+- Refreshed `.titan` from pristine detached master `65523fa` and verified the
+  installed compiler modules match that checkout. Remote master still resolves
+  to the same full revision immediately before publication.
+- The complete gate passed: 222 native tests, 56 JavaScript tests, 12
+  extension-host tests, protocol/Codex checks, generator self-test, packaging,
+  native/VSIX inspection, plugin validation, and staged installation. After the
+  native tests passed, the restricted sandbox rejected a protocol process's
+  `getsockname`; the remaining gate passed in the authorized environment.
+- The SDK-free extracted-package smoke now checks JSON options and reflection
+  descriptors plus SQLite const-Array and row metadata, while the three unused
+  runtime modules remain absent from the executable.
+- The expanded stdlib workspace indexed 135 saved files across 63 modules with
+  zero diagnostics. Timer/uv, JSON, and SQLite definition probes and all hover
+  probes passed; unchanged queries emitted no indexing progress.
+- The checked-in compiler project config omits `sqlite-autoconf-3530400` from
+  its FFI include directories, so the initial source-index run correctly
+  reported missing SQLite headers. The successful run supplied that directory
+  through a temporary project-config overlay. The pristine config was restored
+  immediately afterward; the compiler checkout is clean and unchanged.
+- Successful indexing took 234,824.651 ms wall time and 144,470 ms child CPU.
+  Evidence: `/tmp/vscode-titan-compiler-y5yweR/latest-configured-stdlib-index.json`,
+  SHA-256 `1a8ba398bfcdae5c66bc4d948aafe63b35d3c226503af5fab39dd2a12a65d053`.
+- Verified local Linux x64 VSIX: 21,476,423 bytes, SHA-256
+  `94478df94b113dab93016034e3ac1200af1730d4d625ac973830d4051bd63044`.

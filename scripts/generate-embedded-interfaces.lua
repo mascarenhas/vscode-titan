@@ -9,12 +9,14 @@ local EXPECTED_MODULES = {
     "titan.http",
     "titan.io",
     "titan.iteration",
+    "titan.json",
     "titan.lua",
     "titan.math",
     "titan.net",
     "titan.os",
     "titan.peg",
     "titan.reflect",
+    "titan.sqlite3",
     "titan.ssl",
     "titan.string",
     "titan.test",
@@ -707,12 +709,15 @@ local function self_test()
     local no_profile, profile_error = render_source(entries)
     assert(no_profile == nil and profile_error == "missing build target profile")
 
-    local reflect = entries["titan.reflect"]
-    entries["titan.reflect"] = nil
-    local old_inventory, missing_reflect_error = render_source(entries)
-    assert(old_inventory == nil)
-    assert(missing_reflect_error:find('missing "titan.reflect"', 1, true))
-    entries["titan.reflect"] = reflect
+    for _, name in ipairs({ "titan.json", "titan.reflect", "titan.sqlite3" }) do
+        local entry = entries[name]
+        entries[name] = nil
+        local old_inventory, missing_error = render_source(entries, profile)
+        assert(old_inventory == nil)
+        assert(missing_error:find("missing " .. string.format("%q", name),
+            1, true))
+        entries[name] = entry
+    end
 
     entries[EXPECTED_MODULES[1]].abi = "wrong"
     local wrong_abi, abi_error = render_source(entries)
