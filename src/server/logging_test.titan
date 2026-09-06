@@ -1,7 +1,7 @@
 local async = import "async"
 local test = import "test"
 local strings = import "string"
-local json = import "server.json"
+local wire = import "server.wire"
 local logging = import "server.logging.titan"
 local response_queue = import "server.response_queue"
 local test_runtime = import "server.test_runtime"
@@ -14,14 +14,17 @@ function test_structured_logging_filters_levels_and_encodes_fields(
               "logging rejected a supported level")
   test.assert(logging.format("info", "filtered", nil) == nil,
               "logging emitted a filtered level")
-  local rendered? = logging.format("error", "project.failure", {
-    json.Member.new("generation", json.from_integer(7)),
-    json.Member.new("message", json.from_string("bad saved project")),
-  })
+  local fields: wire.Object = {
+    ["generation"] = 7,
+    ["message"] = "bad saved project",
+  }
+  local rendered? = logging.format("error", "project.failure", fields)
   test.assert(
     rendered ==
-      [[titan-language-server {"level":"error","event":"project.failure","generation":7,"message":"bad saved project"}]],
+      [[titan-language-server {"event":"project.failure","generation":7,"level":"error","message":"bad saved project"}]],
     "structured logging did not produce a stable stderr record")
+  test.assert(fields["level"] == nil and fields["event"] == nil,
+              "logging modified the caller's field map")
 
   test.assert(not logging.configure("noisy"),
               "logging accepted an unknown level")
@@ -37,8 +40,8 @@ function test_structured_logging_drops_unencodable_diagnostic_data(
               "logging rejected debug level")
 
   local malformed_path = "/project/" .. strings.char(0xff) .. ".titan"
-  local fields = {
-    json.Member.new("path", json.from_string(malformed_path)),
+  local fields: wire.Object = {
+    ["path"] = malformed_path,
   }
   test.assert(logging.format("debug", "project.watch.batch", fields) == nil,
               "logging formatted invalid UTF-8 diagnostic data")
@@ -50,6 +53,26 @@ function test_structured_logging_drops_unencodable_diagnostic_data(
   test.assert(true, "logging emit did not return")
 end
 
+function test_structured_logging_recovers_after_cyclic_fields(
+    _context: test.Context)
+  local previous_level = logging.level()
+  defer logging.configure(previous_level)
+  test.assert(logging.configure("debug"),
+              "logging rejected debug level")
+
+  local fields: wire.Object = {}
+  fields["detail"] = fields
+  test.assert(logging.format("debug", "project.watch.batch", fields) == nil,
+              "logging formatted cyclic diagnostic data")
+  logging.emit("debug", "project.watch.batch", fields)
+
+  fields["detail"] = false
+  local rendered? = logging.format("debug", "project.watch.batch", fields)
+  test.assert(rendered ==
+      [[titan-language-server {"detail":false,"event":"project.watch.batch","level":"debug"}]],
+    "an unencodable record disrupted later logging")
+end
+
 function test_structured_logging_bounds_string_collections(
     _context: test.Context)
   local previous_level = logging.level()
@@ -57,13 +80,17 @@ function test_structured_logging_bounds_string_collections(
   test.assert(logging.configure("debug"),
               "logging rejected debug level")
 
-  local small = json.encode(logging.summarize_strings({"alpha", "beta"}))
+  local empty = wire.encode(logging.summarize_strings({}))
+  test.assert(empty == [[{"count":0,"sample":[],"truncated":false}]],
+              "logging changed an empty string sample into an object")
+
+  local small = wire.encode(logging.summarize_strings({"alpha", "beta"}))
   test.assert(
     small ==
       [[{"count":2,"sample":["alpha","beta"],"truncated":false}]],
     "logging changed an untruncated string summary")
 
-  local bounded = json.encode(logging.summarize_strings({
+  local bounded = wire.encode(logging.summarize_strings({
     "one", "two", "three", "four", "five", "six", "seven", "eight",
     "nine", "ten",
   }))

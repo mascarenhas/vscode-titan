@@ -1441,6 +1441,7 @@ async function benchmark(options) {
   const target = await benchmarkTarget(options);
   const probes = await benchmarkProbes(options);
   const ticksPerSecond = clockTicksPerSecond();
+  const startupStartedAt = performance.now();
   const child = await startServer(options);
   const outcome = createProcessOutcome(child);
   const stderr = collectStderr(child.stderr);
@@ -1676,6 +1677,13 @@ async function benchmark(options) {
         file: target.relativeFile,
         symbol: target.symbol,
         position: target.position
+      },
+      startup: {
+        wallMs: roundMilliseconds(initialize.receivedAt - startupStartedAt),
+        childCpuMs: coldStartResources.cpuMs === undefined
+          ? undefined
+          : roundMilliseconds(coldStartResources.cpuMs),
+        peakRssKiB: coldStartResources.peakRssKiB
       },
       coldIndex: {
         wallMs: roundMilliseconds(initialReady.receivedAt - coldSentAt),

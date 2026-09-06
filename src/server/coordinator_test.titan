@@ -1,25 +1,24 @@
 local test = import "test"
+local strings = import "string"
 local timer = import "timer"
 local coordinator = import "server.coordinator"
 local dispatcher = import "server.dispatcher"
-local json = import "server.json"
+local wire = import "server.wire"
 local response_queue = import "server.response_queue"
 local test_runtime = import "server.test_runtime"
 
-local function response_object(source: string): json.Object
-  local parsed?, failure? = json.parse(source)
-  test.assert(failure == nil and parsed ~= nil,
-              "coordinator produced invalid response JSON")
-  local object? = json.as_object(parsed)
+local function response_object(source: string): wire.Object
+  local parsed = wire.decode(source)
+  local object? = wire.as_object(parsed)
   test.assert(object ~= nil, "coordinator response was not an object")
   return object
 end
 
 local function error_code(source: string): integer
   local object = response_object(source)
-  local failure? = json.as_object(object:get("error"))
+  local failure? = wire.as_object(object["error"])
   test.assert(failure ~= nil, "response did not contain an error object")
-  local code? = json.as_integer(failure:get("code"))
+  local code? = wire.as_integer(failure["code"])
   test.assert(code ~= nil, "response error did not contain an integer code")
   return code
 end
@@ -38,9 +37,10 @@ local function completes_yielding_semantic_requests()
     local handler: coordinator.SemanticHandler = function (
         request: dispatcher.SemanticRequest): dispatcher.SemanticOutcome
       timer.yield()
-      return dispatcher.SemanticOutcome.result(json.from_object({
-        json.Member.new("method", json.from_string(request.method)),
-      }))
+      local result: wire.Object = {
+        ["method"] = request.method,
+      }
+      return dispatcher.SemanticOutcome.result(result)
     end
     local server = coordinator.create(output, handler)
     defer server:cancel_all("yielding request test cleanup")
@@ -54,11 +54,11 @@ local function completes_yielding_semantic_requests()
     while server:active_count() > 0 do timer.yield() end
 
     local response = response_object(output:take())
-    test.assert(json.as_string(response:get("id")) == "work",
+    test.assert(wire.as_string(response["id"]) == "work",
                 "semantic response changed its string request id")
-    local result? = json.as_object(response:get("result"))
+    local result? = wire.as_object(response["result"])
     test.assert(result ~= nil and
-                json.as_string(result:get("method")) == "workspace/symbol",
+                wire.as_string(result["method"]) == "workspace/symbol",
                 "yielding semantic handler result was lost")
     test.assert(output:pending() == 0,
                 "semantic request produced more than one response")
@@ -79,9 +79,10 @@ local function completes_second_request_while_first_is_suspended()
         slow_started = true
         while not release_slow do timer.yield() end
       end
-      return dispatcher.SemanticOutcome.result(json.from_object({
-        json.Member.new("method", json.from_string(request.method)),
-      }))
+      local result: wire.Object = {
+        ["method"] = request.method,
+      }
+      return dispatcher.SemanticOutcome.result(result)
     end
     local server = coordinator.create(output, handler)
     defer server:cancel_all("responsive request test cleanup")
@@ -97,13 +98,13 @@ local function completes_second_request_while_first_is_suspended()
     while output:pending() == 0 do timer.yield() end
 
     local fast = response_object(output:take())
-    test.assert(json.as_string(fast:get("id")) == "fast" and
+    test.assert(wire.as_string(fast["id"]) == "fast" and
                 server:active_count() == 1,
                 "second request did not complete while first was suspended")
     release_slow = true
     while server:active_count() > 0 do timer.yield() end
     local slow = response_object(output:take())
-    test.assert(json.as_string(slow:get("id")) == "slow" and
+    test.assert(wire.as_string(slow["id"]) == "slow" and
                 output:pending() == 0,
                 "suspended first request did not finish exactly once")
 end
@@ -122,7 +123,7 @@ local function cancels_and_joins_one_request()
       started = true
       defer cleaned = true
       while true do timer.yield() end
-      return dispatcher.SemanticOutcome.result(json.null())
+      return dispatcher.SemanticOutcome.result(wire.null())
     end
     local server = coordinator.create(output, handler)
     defer server:cancel_all("cancellation test cleanup")
@@ -143,7 +144,7 @@ local function cancels_and_joins_one_request()
     local response = output:take()
     test.assert(error_code(response) == -32800,
                 "cancelled request did not return RequestCancelled")
-    test.assert(json.as_integer(response_object(response):get("id")) == 7,
+    test.assert(wire.as_integer(response_object(response)["id"]) == 7,
                 "cancellation response changed the request id")
     test.assert(output:pending() == 0,
                 "cancelled request produced more than one terminal response")
@@ -163,7 +164,7 @@ local function shutdown_cancels_all_before_reply()
       started = started + 1
       defer cleaned = cleaned + 1
       while true do timer.yield() end
-      return dispatcher.SemanticOutcome.result(json.null())
+      return dispatcher.SemanticOutcome.result(wire.null())
     end
     local server = coordinator.create(output, handler)
     defer server:cancel_all("shutdown test cleanup")
@@ -187,8 +188,8 @@ local function shutdown_cancels_all_before_reply()
     test.assert(error_code(first) == -32800 and
                 error_code(second) == -32800,
                 "shutdown did not publish cancellation responses")
-    test.assert(json.as_integer(shutdown:get("id")) == 99 and
-                json.is_null(shutdown:get("result")),
+    test.assert(wire.as_integer(shutdown["id"]) == 99 and
+                wire.is_null(shutdown["result"]),
                 "shutdown response was not published after cancellations")
     test.assert(output:pending() == 0,
                 "shutdown produced duplicate terminal responses")
@@ -204,7 +205,7 @@ local function rejects_duplicate_active_request_ids()
     local handler: coordinator.SemanticHandler = function (
         _request: dispatcher.SemanticRequest): dispatcher.SemanticOutcome
       while true do timer.yield() end
-      return dispatcher.SemanticOutcome.result(json.null())
+      return dispatcher.SemanticOutcome.result(wire.null())
     end
     local server = coordinator.create(output, handler)
     defer server:cancel_all("duplicate id test cleanup")
@@ -232,4 +233,58 @@ end
 function test_coordinator_rejects_duplicate_active_request_ids(
     _context: test.Context)
   test_runtime.run(rejects_duplicate_active_request_ids)
+end
+
+local function recovers_after_unencodable_result_and_preserves_nulls()
+  local output = response_queue.create()
+  local handler: coordinator.SemanticHandler = function (
+      request: dispatcher.SemanticRequest): dispatcher.SemanticOutcome
+    if request.method == "test/unencodable" then
+      return dispatcher.SemanticOutcome.result(strings.char(0xff))
+    end
+    return dispatcher.SemanticOutcome.result(request.params)
+  end
+  local server = coordinator.create(output, handler)
+  defer server:cancel_all("wire result test cleanup")
+  initialize(server, output)
+
+  server:handle(
+    [[{"jsonrpc":"2.0","id":"bad","method":"test/unencodable"}]])
+  while server:active_count() > 0 do timer.yield() end
+  test.assert(output:pending() == 1,
+              "unencodable result did not produce one terminal response")
+  local rejected = output:take()
+  test.assert(error_code(rejected) == -32603 and
+              wire.as_string(response_object(rejected)["id"]) == "bad",
+              "unencodable result lost its request id or Internal Error")
+
+  server:handle(
+    [[{"jsonrpc":"2.0","id":"next","method":"test/echo",]] ..
+    [["params":{"nothing":null,"items":[null,false,null],]] ..
+    [["emptyArray":[],"emptyObject":{}}}]])
+  while server:active_count() > 0 do timer.yield() end
+  test.assert(output:pending() == 1,
+              "request following an encoding failure did not complete once")
+  local response = response_object(output:take())
+  local result? = wire.as_object(response["result"])
+  test.assert(wire.as_string(response["id"]) == "next" and result ~= nil,
+              "request following an encoding failure lost its result")
+  local items? = wire.as_array(result["items"])
+  local empty_array? = wire.as_array(result["emptyArray"])
+  test.assert(wire.is_null(result["nothing"]) and
+              result["missing"] == nil and
+              items ~= nil and #items == 3 and
+              wire.is_null(items[1]) and
+              wire.as_boolean(items[2]) == false and
+              wire.is_null(items[3]) and
+              empty_array ~= nil and #empty_array == 0 and
+              wire.as_object(result["emptyObject"]) ~= nil,
+              "native wire roundtrip lost nulls, false, or collection shapes")
+  test.assert(output:pending() == 0,
+              "wire result handling produced duplicate responses")
+end
+
+function test_coordinator_recovers_encoding_failure_and_preserves_nulls(
+    _context: test.Context)
+  test_runtime.run(recovers_after_unencodable_result_and_preserves_nulls)
 end

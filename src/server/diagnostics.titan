@@ -1,7 +1,7 @@
 local async = import "async"
 local strings = import "string"
 local bridge = import "server.compiler_bridge"
-local json = import "server.json"
+local wire = import "server.wire"
 local lsp = import "server.lsp_types"
 local project_service = import "server.project_service"
 local source_text = import "server.source_text"
@@ -71,27 +71,28 @@ local function item_key(item: Item): string
 end
 
 function notification(publication: Publication): string
-  local encoded: {json.Value} = {}
+  local encoded: wire.Array = {}
   for index = 1, #publication.items do
     local item = publication.items[index]
-    encoded[index] = json.from_object({
-      json.Member.new("range", lsp.range_value(item.range)),
-      json.Member.new("severity", json.from_integer(1)),
-      json.Member.new("code", json.from_string(
-        diagnostic_code(item.kind))),
-      json.Member.new("source", json.from_string("Titan")),
-      json.Member.new("message", json.from_string(item.message)),
-    })
+    local diagnostic: wire.Object = {
+      ["range"] = lsp.range_value(item.range),
+      ["severity"] = 1,
+      ["code"] = diagnostic_code(item.kind),
+      ["source"] = "Titan",
+      ["message"] = item.message,
+    }
+    encoded[index] = diagnostic
   end
-  return json.encode(json.from_object({
-    json.Member.new("jsonrpc", json.from_string("2.0")),
-    json.Member.new(
-      "method", json.from_string("textDocument/publishDiagnostics")),
-    json.Member.new("params", json.from_object({
-      json.Member.new("uri", json.from_string(publication.uri)),
-      json.Member.new("diagnostics", json.from_array(encoded)),
-    })),
-  }))
+  local params: wire.Object = {
+    ["uri"] = publication.uri,
+    ["diagnostics"] = encoded,
+  }
+  local envelope: wire.Object = {
+    ["jsonrpc"] = "2.0",
+    ["method"] = "textDocument/publishDiagnostics",
+    ["params"] = params,
+  }
+  return wire.encode(envelope)
 end
 
 local function project_files(snapshot: project_service.Snapshot):

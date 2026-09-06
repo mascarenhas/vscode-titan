@@ -24,6 +24,10 @@ compatible module trees under exactly `dist/titan/share/lua/5.5` and
 `dist/titan/lib/lua/5.5`, so the extension does not require a separate system
 Titan compiler installation.
 
+JSON-RPC messages and structured stderr logs use `titan.json` through the
+`server.wire` boundary, with native Maps and Arrays and explicit JSON nulls.
+Request IDs and parsed LSP parameters retain their nominal types.
+
 ## Prerequisites
 
 - A sibling Titan checkout at `../titan` (override with `TITAN_REPO=...`).
@@ -87,12 +91,19 @@ native Titan suite and `make extension-test` runs the extension unit tests. A
 successful compilation by itself is not a successful test run.
 
 To measure the production server against this repository's saved Titan source,
-including cold-index wall/CPU time, peak RSS, request responsiveness, and an
-unchanged hover/definition pair that must not start indexing, run:
+including startup and cold-index wall/CPU time, peak RSS, request responsiveness,
+and an unchanged hover/definition pair that must not start indexing, run:
 
 ```sh
 node scripts/benchmark-server.mjs --server bin/titan-language-server
 ```
+
+`startup.wallMs` measures process launch through receipt of the `initialize`
+reply, including native module initialization. On Linux, `startup.childCpuMs`
+reports cumulative server process CPU sampled immediately after that reply,
+and `startup.peakRssKiB` reports peak resident memory at that point. CPU and RSS
+fields are omitted on other platforms. `coldIndex` begins with the subsequent
+`initialized` notification, so its wall and CPU times exclude startup.
 
 The benchmark defaults to the extension's `debug` server-emission level so its
 numbers represent normal VS Code use. Pass `--log-level off` only when measuring

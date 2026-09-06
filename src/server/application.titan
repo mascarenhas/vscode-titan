@@ -1,11 +1,12 @@
 local async = import "async"
 local fs = import "fs"
+local json = import "json"
 local strings = import "string"
 local bridge = import "server.compiler_bridge"
 local diagnostics = import "server.diagnostics"
 local dispatcher = import "server.dispatcher"
 local indexing_status = import "server.indexing_status"
-local json = import "server.json"
+local wire = import "server.wire"
 local logging = import "server.logging"
 local lsp = import "server.lsp_types"
 local project_discovery = import "server.project_discovery"
@@ -228,15 +229,14 @@ local function bounded_log_message(message: string): string
 end
 
 local function watch_path_array(changes: {project_watcher.PathChange}):
-    json.Value
-  local values: {json.Value} = {}
+    wire.Array
+  local values: wire.Array = {}
   local limit = #changes
   if limit > MAX_LOGGED_WATCH_PATHS then limit = MAX_LOGGED_WATCH_PATHS end
   for index = 1, limit do
-    values[index] = json.from_string(
-      project_watcher.change_path(changes[index]))
+    values[index] = project_watcher.change_path(changes[index])
   end
-  return json.from_array(values)
+  return values
 end
 
 -- Mirror project discovery's lexical directory boundary. Names such as build
@@ -505,10 +505,10 @@ end
 
 local function log_watch_failure(failure: project_watcher.WatchFailure)
   logging.emit("error", "project.watch.failure", {
-    json.Member.new("operation", json.from_string(failure.operation)),
-    json.Member.new("name", json.from_string(failure.name)),
-    json.Member.new("code", json.from_integer(failure.code)),
-    json.Member.new("message", json.from_string(failure.message)),
+    ["operation"] = failure.operation,
+    ["name"] = failure.name,
+    ["code"] = failure.code,
+    ["message"] = failure.message,
   })
 end
 
@@ -594,16 +594,13 @@ local function Application:watch_callback(
   end
   if logging.enabled("debug") then
     logging.emit("debug", "project.watch.batch", {
-      json.Member.new("changes", json.from_integer(#batch.changes)),
-      json.Member.new("paths", watch_path_array(batch.changes)),
-      json.Member.new("paths_truncated", json.from_boolean(
-        #batch.changes > MAX_LOGGED_WATCH_PATHS)),
-      json.Member.new("failures", json.from_integer(#batch.failures)),
-      json.Member.new("watch_set_changed", json.from_boolean(
-        batch.watch_set_changed)),
-      json.Member.new("directory_probes", json.from_integer(
-        queued_directory_probes)),
-      json.Member.new("relevant", json.from_boolean(relevant)),
+      ["changes"] = #batch.changes,
+      ["paths"] = watch_path_array(batch.changes),
+      ["paths_truncated"] = #batch.changes > MAX_LOGGED_WATCH_PATHS,
+      ["failures"] = #batch.failures,
+      ["watch_set_changed"] = batch.watch_set_changed,
+      ["directory_probes"] = queued_directory_probes,
+      ["relevant"] = relevant,
     })
   end
   if relevant then
@@ -623,9 +620,8 @@ function Application:note_saved_change()
   if self.closed then return end
   self.change_epoch = self.change_epoch + 1
   logging.emit("debug", "indexing.saved_change", {
-    json.Member.new("epoch", json.from_integer(self.change_epoch)),
-    json.Member.new("refresh_active", json.from_boolean(
-      self.refresh_task ~= nil)),
+    ["epoch"] = self.change_epoch,
+    ["refresh_active"] = self.refresh_task ~= nil,
   })
   self:start_refresh(false, "saved_change")
 end
@@ -752,9 +748,23 @@ local function Application:emit_indexing_status(
      self.active_refresh_epoch ~= nil then
     epoch = self.active_refresh_epoch
   end
-  listener(indexing_status.Status.new(
-    state, self.refresh_chain_initial, epoch,
-    self:status_generation(), message, completed_files, total_files))
+  do
+    listener(indexing_status.Status.new(
+      state, self.refresh_chain_initial, epoch,
+      self:status_generation(), message, completed_files, total_files))
+  catch
+    -- Encoding optional status output must not retire the indexing work that
+    -- owns the saved generation. Other listener failures keep their behavior.
+    if error is json.Error then
+      local failure: json.Error = error
+      if failure.position == nil and
+         (failure.code == "invalid_utf8" or
+          failure.code == "limit_exceeded") then
+        return
+      end
+    end
+    raise
+  end
 end
 
 local function Application:emit_compiler_progress(
@@ -777,11 +787,10 @@ local function Application:begin_refresh_chain(reason: string)
     logging.clock())
   self.refresh_chain = chain
   logging.emit("info", "indexing.chain.start", {
-    json.Member.new("chain", json.from_integer(chain.id)),
-    json.Member.new("reason", json.from_string(chain.reason)),
-    json.Member.new("epoch", json.from_integer(self.change_epoch)),
-    json.Member.new("initial", json.from_boolean(
-      self.refresh_chain_initial)),
+    ["chain"] = chain.id,
+    ["reason"] = chain.reason,
+    ["epoch"] = self.change_epoch,
+    ["initial"] = self.refresh_chain_initial,
   })
   self:emit_indexing_status(indexing_status.State.indexing(), nil, nil, nil)
 end
@@ -794,32 +803,24 @@ local function Application:complete_refresh_chain(
   -- malformed diagnostic field must never keep a completed chain active.
   self.refresh_chain = nil
   do
-    local fields: {json.Member} = {
-      json.Member.new("chain", json.from_integer(chain.id)),
-      json.Member.new("reason", json.from_string(chain.reason)),
-      json.Member.new("outcome", json.from_string(outcome)),
-      json.Member.new("initial", json.from_boolean(
-        self.refresh_chain_initial)),
-      json.Member.new("attempted_epoch", json.from_integer(
-        attempted_epoch)),
-      json.Member.new("completed_epoch", json.from_integer(
-        self.completed_epoch)),
-      json.Member.new("pending_epoch", json.from_integer(self.change_epoch)),
-      json.Member.new("passes", json.from_integer(
-        self.refresh_passes - chain.first_pass)),
-      json.Member.new("wall_ms", json.from_number(
-        logging.elapsed_wall_ms(chain.started_wall))),
-      json.Member.new("cpu_ms", json.from_number(
-        logging.elapsed_ms(chain.started_cpu))),
+    local fields: wire.Object = {
+      ["chain"] = chain.id,
+      ["reason"] = chain.reason,
+      ["outcome"] = outcome,
+      ["initial"] = self.refresh_chain_initial,
+      ["attempted_epoch"] = attempted_epoch,
+      ["completed_epoch"] = self.completed_epoch,
+      ["pending_epoch"] = self.change_epoch,
+      ["passes"] = self.refresh_passes - chain.first_pass,
+      ["wall_ms"] = logging.elapsed_wall_ms(chain.started_wall),
+      ["cpu_ms"] = logging.elapsed_ms(chain.started_cpu),
     }
     local generation? = self:status_generation()
     if generation ~= nil then
-      fields[#fields + 1] = json.Member.new(
-        "generation", json.from_integer(generation))
+      fields["generation"] = generation
     end
     if message ~= nil then
-      fields[#fields + 1] = json.Member.new(
-        "message", json.from_string(bounded_log_message(message)))
+      fields["message"] = bounded_log_message(message)
     end
     local level = "info"
     if outcome == "failed" then level = "error" end
@@ -858,14 +859,13 @@ local function Application:start_refresh(force: boolean, reason: string):
       local started = logging.clock()
       self.refresh_passes = self.refresh_passes + 1
       logging.emit("debug", "indexing.pass.start", {
-        json.Member.new("chain", json.from_integer(chain.id)),
-        json.Member.new("chain_reason", json.from_string(chain.reason)),
-        json.Member.new("trigger", json.from_string(reason)),
-        json.Member.new("epoch", json.from_integer(target_epoch)),
-        json.Member.new("force", json.from_boolean(force)),
-        json.Member.new("pass", json.from_integer(self.refresh_passes)),
-        json.Member.new("follow_up", json.from_boolean(
-          self.refresh_passes > chain.first_pass + 1)),
+        ["chain"] = chain.id,
+        ["chain_reason"] = chain.reason,
+        ["trigger"] = reason,
+        ["epoch"] = target_epoch,
+        ["force"] = force,
+        ["pass"] = self.refresh_passes,
+        ["follow_up"] = self.refresh_passes > chain.first_pass + 1,
       })
       local completed = self:refresh_once()
       local outcome_name = "unknown"
@@ -908,13 +908,12 @@ local function Application:start_refresh(force: boolean, reason: string):
       end
 
       logging.emit("debug", "indexing.pass.complete", {
-        json.Member.new("chain", json.from_integer(chain.id)),
-        json.Member.new("trigger", json.from_string(reason)),
-        json.Member.new("epoch", json.from_integer(target_epoch)),
-        json.Member.new("outcome", json.from_string(outcome_name)),
-        json.Member.new("pending_epoch", json.from_integer(self.change_epoch)),
-        json.Member.new("cpu_ms", json.from_number(
-          logging.elapsed_ms(started))),
+        ["chain"] = chain.id,
+        ["trigger"] = reason,
+        ["epoch"] = target_epoch,
+        ["outcome"] = outcome_name,
+        ["pending_epoch"] = self.change_epoch,
+        ["cpu_ms"] = logging.elapsed_ms(started),
       })
 
       self.refresh_task = nil
@@ -1092,27 +1091,27 @@ local function parse_error(item: lsp.Error?): dispatcher.SemanticOutcome
 end
 
 local function location_result(location: semantic_features.Location?):
-    json.Value
-  if location == nil then return json.null() end
+    value
+  if location == nil then return wire.null() end
   return lsp.location_value(location.uri, location.range)
 end
 
 local function locations_result(locations: {semantic_features.Location}):
-    json.Value
-  local result: {json.Value} = {}
+    wire.Array
+  local result: wire.Array = {}
   for index = 1, #locations do
     result[index] = lsp.location_value(
       locations[index].uri, locations[index].range)
   end
-  return json.from_array(result)
+  return result
 end
 
-local function folding_result(ranges: {lsp.FoldingRange}): json.Value
-  local result: {json.Value} = {}
+local function folding_result(ranges: {lsp.FoldingRange}): wire.Array
+  local result: wire.Array = {}
   for index = 1, #ranges do
     result[index] = lsp.folding_range_value(ranges[index])
   end
-  return json.from_array(result)
+  return result
 end
 
 local function Application:handle_definition(
@@ -1124,7 +1123,7 @@ local function Application:handle_definition(
     if view_error ~= nil then
       return failure(REQUEST_FAILED, view_error.message)
     end
-    return dispatcher.SemanticOutcome.result(json.null())
+    return dispatcher.SemanticOutcome.result(wire.null())
   end
   return dispatcher.SemanticOutcome.result(location_result(
     view.features:definition(params.path, params.position)))
@@ -1139,7 +1138,8 @@ local function Application:handle_references(
     if view_error ~= nil then
       return failure(REQUEST_FAILED, view_error.message)
     end
-    return dispatcher.SemanticOutcome.result(json.from_array({}))
+    local result: wire.Array = {}
+    return dispatcher.SemanticOutcome.result(result)
   end
   return dispatcher.SemanticOutcome.result(locations_result(
     view.features:references(
@@ -1156,11 +1156,11 @@ local function Application:handle_hover(
     if view_error ~= nil then
       return failure(REQUEST_FAILED, view_error.message)
     end
-    return dispatcher.SemanticOutcome.result(json.null())
+    return dispatcher.SemanticOutcome.result(wire.null())
   end
   local hover? = view.features:hover(params.path, params.position)
   if hover == nil then
-    return dispatcher.SemanticOutcome.result(json.null())
+    return dispatcher.SemanticOutcome.result(wire.null())
   end
   return dispatcher.SemanticOutcome.result(
     lsp.hover_value(hover:markdown(), hover.range))
@@ -1175,7 +1175,8 @@ local function Application:handle_folding(
     if view_error ~= nil then
       return failure(REQUEST_FAILED, view_error.message)
     end
-    return dispatcher.SemanticOutcome.result(json.from_array({}))
+    local result: wire.Array = {}
+    return dispatcher.SemanticOutcome.result(result)
   end
   return dispatcher.SemanticOutcome.result(folding_result(
     view.features:folding_ranges(params.path)))

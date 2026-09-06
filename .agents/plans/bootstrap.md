@@ -106,9 +106,10 @@ configured C toolchain and SDK.
 
 Keep protocol plumbing separate from compiler semantics:
 
-1. **Transport and JSON** — incremental stdin framing, strict request/response
-   envelopes, JSON values, UTF-16/LSP positions, URI/path conversion, error and
-   cancellation handling.
+1. **Transport and JSON** — incremental stdin framing, the `titan.json` codec
+   through `server.wire`, strict request/response envelopes, native JSON Maps
+   and Arrays, UTF-16/LSP positions, URI/path conversion, error and cancellation
+   handling.
 2. **Lifecycle and dispatch** — initialize, initialized, shutdown, exit,
    capability advertisement, request IDs, notifications, and serialized output.
 3. **Project model** — workspace root, optional `titan-config.lua`, module-path
@@ -127,9 +128,10 @@ Keep protocol plumbing separate from compiler semantics:
 6. **Feature queries** — one symbol/reference index feeds definition,
    references, and rename; typed nodes feed hover; source structure feeds folding.
 
-The first implementation should adapt the compiler's real AST and APIs rather
-than inventing a parallel Titan parser. A small JSON parser/encoder for LSP is a
-separate protocol concern.
+The server adapts the compiler's real AST and APIs. `server.wire` delegates JSON
+parsing and encoding to `titan.json`, with native Maps and Arrays at the protocol
+and structured-log boundary and one explicit null token. Request IDs and parsed
+LSP parameters retain their nominal types.
 
 ### Disk snapshots and invalidation
 
@@ -255,7 +257,8 @@ launch a fixture stdio server without polluting protocol stdout.
 
 ### Phase 2 — Titan protocol core
 
-- Implement JSON representation, parser/encoder, and byte-accurate LSP framing.
+- Use `titan.json` through `server.wire` for native JSON values and codec
+  operations, alongside byte-accurate LSP framing.
 - Implement lifecycle and dispatch with only the V1 capabilities advertised.
 - Make stderr logging explicit and serialize all stdout writes.
 - Add Titan unit tests and transcript tests for fragmented/multiple frames,
