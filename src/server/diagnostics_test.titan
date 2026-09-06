@@ -3,6 +3,7 @@ local bridge = import "server.compiler_bridge"
 local diagnostics = import "server.diagnostics"
 local wire = import "server.wire"
 local project_config = import "server.project_config"
+local project_discovery = import "server.project_discovery"
 local project_graph = import "server.project_graph"
 local project_service = import "server.project_service"
 
@@ -20,6 +21,54 @@ local function snapshot(filename: string, contents: string,
       "/workspace", nil, {"/workspace"}, {}, {"/workspace"},
       "/sdk", {}, nil),
     {}, {"/workspace"}, {module}, {}, {})
+end
+
+function test_diagnostics_publish_and_clear_unmapped_source_warnings(
+    _context: test.Context)
+  local saved = snapshot("/workspace/src/main.titan", "", {})
+  local issues = {
+    project_discovery.Issue.new(
+      "/workspace/loose.titan", "outside source_module_roots",
+      project_discovery.IssueKind.unmapped_source()),
+    project_discovery.Issue.new(
+      "/workspace/other.titan", "outside source_module_roots",
+      project_discovery.IssueKind.unmapped_source()),
+    project_discovery.Issue.new(
+      "/workspace/src/invalid.name.titan", "invalid logical module name",
+      project_discovery.IssueKind.invalid_module()),
+  }
+  local with_issues = project_service.Snapshot.new(
+    saved.generation, saved.config, issues, saved.project_directories,
+    saved.project_modules, saved.external_modules, saved.dirty_modules)
+  local publications = diagnostics.from_snapshot(with_issues)
+  test.assert(#publications == 2 and #publications[1].items == 1 and
+              publications[1].uri == "file:///workspace/loose.titan" and
+              publications[2].uri == "file:///workspace/other.titan",
+              "discovery did not publish one warning per unmapped saved source")
+  local envelope? = wire.as_object(wire.decode(
+    diagnostics.notification(publications[1])))
+  local params? = wire.as_object(envelope["params"])
+  local items? = wire.as_array(params["diagnostics"])
+  local item? = wire.as_object(items[1])
+  test.assert(wire.as_integer(item["severity"]) == 2 and
+              wire.as_string(item["code"]) == "unmapped-source" and
+              wire.as_string(item["source"]) == "Titan" and
+              publications[1].items[1].range.start.line == 0 and
+              publications[1].items[1].range.start.character == 0,
+              "unmapped diagnostic lost its warning severity or file anchor")
+
+  local publisher = diagnostics.create()
+  local observed: {diagnostics.Publication} = {}
+  publisher:set_listener(function (publication: diagnostics.Publication)
+    observed[#observed + 1] = publication
+  end)
+  publisher:publish(publications)
+  publisher:publish(diagnostics.from_snapshot(saved))
+  test.assert(#observed == 4 and #observed[3].items == 0 and
+              observed[3].uri == publications[1].uri and
+              #observed[4].items == 0 and
+              observed[4].uri == publications[2].uri,
+              "ordinary discovery did not clear resolved unmapped warnings")
 end
 
 function test_diagnostics_map_saved_compiler_byte_locations_to_lsp(

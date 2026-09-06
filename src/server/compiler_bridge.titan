@@ -2297,13 +2297,37 @@ local function node_has_synthetic_children(node: {string: value},
       node["_union_constructor"], DRIVER_MODULE, tag .. "._union_constructor")
 end
 
+local function declaration_namespace(raw: {string: value}, tag: string): string
+  if tag == "Ast.TopLevelTypeAlias" or tag == "Ast.TopLevelInterface"
+      or tag == "Type.Interface" or tag == "Type.GenericAlias" then
+    return "type"
+  end
+  if tag == "Checker.TypeMember" then
+    local target = required_map(
+      raw["type"], DRIVER_MODULE, "Checker.TypeMember.type")
+    -- Qualified record/union type syntax wraps the ordinary module member.
+    -- Its type mentions and constructor namespace refer to one declaration.
+    -- Aliases and Interfaces instead carry their target type directly, even
+    -- when an alias offers the same constructor syntax as a nominal owner.
+    if target["_tag"] ~= "Type.ModuleMember" then return "type" end
+  end
+  return "value"
+end
+
+local function module_declaration_identity(module_name: string,
+                                           raw: {string: value},
+                                           tag: string, name: string): string
+  local visibility = node_is_local(raw) and "source:" or "export:"
+  return visibility .. module_name .. ":" ..
+    declaration_namespace(raw, tag) .. ":" .. name
+end
+
 local function ast_identity(module_name: string, raw: {string: value},
                             tag: string, name: string): string
   if strings.sub(tag, 1, 12) == "Ast.TopLevel"
       and tag ~= "Ast.TopLevelImport"
       and tag ~= "Ast.TopLevelForeignImport" then
-    local namespace = node_is_local(raw) and "source:" or "export:"
-    return namespace .. module_name .. ":" .. name
+    return module_declaration_identity(module_name, raw, tag, name)
   end
   local location: SourceLocation? = semantic_location(
     raw, "symbol declaration")
@@ -2334,9 +2358,6 @@ local function declaration_identity(module_name: string, candidate: value): stri
         raw["decl"], DRIVER_MODULE, "Ast.TopLevelVar.decl")
       name = required_string(
         declaration["name"], DRIVER_MODULE, "Ast.TopLevelVar.decl.name")
-      if node_is_local(raw) then
-        return "source:" .. module_name .. ":" .. name
-      end
     end
     if not name then return nil end
     return ast_identity(module_name, raw, tag, name)
@@ -2402,8 +2423,7 @@ local function declaration_identity(module_name: string, candidate: value): stri
       raw["fqtn"], DRIVER_MODULE, "symbol declaration.fqtn")
   end
   if not owner then owner = module_name end
-  local namespace = node_is_local(raw) and "source:" or "export:"
-  return namespace .. owner .. ":" .. name
+  return module_declaration_identity(owner, raw, tag, name)
 end
 
 local function declaration_local(candidate: value): boolean
@@ -2652,13 +2672,14 @@ local function Walker:add_occurrence(node: {string: value}, tag: string,
     declaration_id = declaration_identity(self.module_name, declaration)
     localness = declaration_local(declaration)
   elseif role_name == "definition" and local_hint == false then
-    declaration_id = "export:" .. self.module_name .. ":" .. name
+    declaration_id = "export:" .. self.module_name .. ":" ..
+      declaration_namespace(node, tag) .. ":" .. name
   elseif role_name == "definition" and
       parent_tag == "Ast.TopLevelVar" and local_hint == true then
     -- A top-level variable's source identifier is the nested Ast.Decl, while
     -- references point back to Ast.TopLevelVar. Join those two compiler shapes
     -- without turning lexical Ast.Decl bindings into module identities.
-    declaration_id = "source:" .. self.module_name .. ":" .. name
+    declaration_id = "source:" .. self.module_name .. ":value:" .. name
   elseif role_name == "definition" or role_name == "import_alias" then
     declaration_id = declaration_identity(self.module_name, node)
   end

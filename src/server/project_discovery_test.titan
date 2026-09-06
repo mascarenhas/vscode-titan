@@ -643,14 +643,66 @@ local function reports_included_sources_without_module_roots()
                 strings.find(found.issues[1].message,
                              "source_module_roots") ~= nil,
                 "unmapped watched source received an invented module name")
-    test.assert(#found.directories == 1 and found.directories[1] == watched,
-                "unmapped include root was removed from watcher scope")
+    test.assert(#found.directories == 0 and
+                found:owner_for_file(fixture:path("watched/main.titan")) == nil,
+                "unmapped include root remained watched or acquired an owner")
   end)
 end
 
 function test_project_discovery_reports_included_files_outside_source_roots(
     _context: test.Context)
   test_runtime.run(reports_included_sources_without_module_roots)
+end
+
+local function watches_only_mapped_source_branches()
+  with_fixture(function (fixture: Fixture)
+    fixture:mkdir("included")
+    fixture:mkdir("included/src")
+    fixture:mkdir("included/unmapped")
+    fixture:mkdir("lookup")
+    fixture:write("included/src/main.titan")
+    fixture:write("included/loose.titan")
+    fixture:write("included/unmapped/other.titan")
+    fixture:write("lookup/external.titan")
+    local included = fixture:path("included")
+    local mapped = fixture:path("included/src")
+    local unmapped = fixture:path("included/unmapped")
+    local found?, failure? = discovery.discover(
+      {included, unmapped}, {unmapped}, {mapped, fixture:path("lookup")})
+    test.assert(failure == nil and found ~= nil and
+                #found.modules == 1 and found.modules[1].name == "main" and
+                #found.issues == 2,
+                "mixed include scope lost mapped modules or unmapped warnings")
+    test.assert(found.issues[1].path == fixture:path("included/loose.titan") and
+                found.issues[2].path == unmapped .. "/other.titan",
+                "unmapped source warnings were duplicated or reordered")
+    for index = 1, #found.issues do
+      case found.issues[index].kind
+      when unmapped_source then
+      else test.assert(false, "unmapped source issue lost its warning category")
+      end
+      test.assert(found:owner_for_file(found.issues[index].path) == nil,
+                  "unmapped source entered project module ownership")
+    end
+    test.assert(#found.directories == 2 and
+                found.directories[1] == included and
+                found.directories[2] == mapped,
+                "watch scope included an unmapped or external branch")
+
+    local remapped?, remap_error? = discovery.discover(
+      {included, unmapped}, {unmapped},
+      {mapped, unmapped, fixture:path("lookup")})
+    test.assert(remap_error == nil and remapped ~= nil and
+                #remapped.modules == 2 and #remapped.issues == 1 and
+                remapped:owner_for_file(unmapped .. "/other.titan") == "other" and
+                #remapped.directories == 2,
+                "adding a source root did not resolve its warning or preserve exclude")
+  end)
+end
+
+function test_project_discovery_watches_only_mapped_source_branches(
+    _context: test.Context)
+  test_runtime.run(watches_only_mapped_source_branches)
 end
 
 local function rejects_non_directory_root()

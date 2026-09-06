@@ -1529,7 +1529,7 @@ local function joins_source_imported_local_function_definition_identity()
   test.assert(provider_alias_identity ~= nil and
               provider_alias_identity == consumer_alias_identity and
               provider_alias_identity ==
-                "source:bridge_source_definition_provider:SecretAlias",
+                "source:bridge_source_definition_provider:type:SecretAlias",
               "source-imported local type alias did not join its declaration")
 
   local definition? = features.build(projects, analysis.modules):definition(
@@ -3241,4 +3241,244 @@ end
 function test_compiler_bridge_preserves_alias_and_named_parameter_rename_metadata(
     _context: test.Context)
   test_runtime.run(preserves_alias_and_named_parameter_rename_metadata)
+end
+
+local function marked_name_position(source: string, marker: string,
+                                     name: string): source_text.Position
+  local first? = strings.find(source, marker)
+  test.assert(first ~= nil, "semantic fixture lost marker '" .. marker .. "'")
+  local name_start? = strings.find(marker, name)
+  test.assert(name_start ~= nil, "semantic fixture marker lost its identifier")
+  local position?, position_error? = source_text.position_for_offset(
+    source, first + name_start - 2)
+  test.assert(position_error == nil and position ~= nil,
+              "semantic fixture marker has no source position")
+  return position
+end
+
+local function assert_namespace_definition_and_references(
+    model: features.Features, provider_file: string, consumer_file: string,
+    definition_position: source_text.Position,
+    provider_reference: source_text.Position,
+    consumer_reference: source_text.Position)
+  local provider_uri = "file://" .. provider_file
+  local consumer_uri = "file://" .. consumer_file
+  local definition? = model:definition(consumer_file, consumer_reference)
+  test.assert(definition ~= nil and definition.uri == provider_uri and
+              definition.range.start.line == definition_position.line and
+              definition.range.start.character == definition_position.character,
+              "same-spelled declarations resolved to the wrong namespace")
+  local references = model:references(consumer_file, consumer_reference, false)
+  test.assert(#references == 2 and
+              references[1].uri == consumer_uri and
+              references[1].range.start.line == consumer_reference.line and
+              references[1].range.start.character == consumer_reference.character and
+              references[2].uri == provider_uri and
+              references[2].range.start.line == provider_reference.line and
+              references[2].range.start.character == provider_reference.character and
+              #model:references(consumer_file, consumer_reference, true) == 3,
+              "references merged different namespaces or lost a same-namespace use")
+end
+
+local function assert_namespace_rename(model: features.Features,
+                                       filename: string,
+                                       position: source_text.Position)
+  local candidate?, candidate_error? = model:rename(filename, position, "Updated")
+  test.assert(candidate_error == nil and candidate ~= nil,
+              "namespace declaration did not produce a rename candidate")
+  local analysis = bridge.load():analyze(
+    "namespace_consumer", candidate:edited_project_modules())
+  local verified?, verification_error? = candidate:preflight(analysis)
+  test.assert(#analysis.diagnostics == 0 and verification_error == nil and
+              verified ~= nil,
+              "namespace-preserving rename failed compiler preflight")
+  local documents = verified:document_edits()
+  test.assert(#documents == 2 and
+              documents[1].uri == "file:///workspace/namespace_consumer.titan" and
+              #documents[1].edits == 1 and
+              documents[2].uri == "file:///workspace/namespace_provider.titan" and
+              #documents[2].edits == 2,
+              "rename crossed the type/value or lexical shadow boundary")
+end
+
+local function separates_declaration_namespaces(is_interface: boolean,
+                                                is_local: boolean)
+  preload_real_compiler()
+  local provider_file = "/workspace/namespace_provider.titan"
+  local consumer_file = "/workspace/namespace_consumer.titan"
+  local local_prefix = is_local and "local " or ""
+  local type_declaration = local_prefix .. "type Shared = integer\n"
+  local value_declaration = local_prefix .. "Shared = 7\n"
+  local value_use = "Shared"
+  if is_interface then
+    type_declaration = "interface Shared\n  function read(): integer\nend\n"
+    value_declaration = "function Shared(): integer return 7 end\n"
+    value_use = "Shared()"
+  end
+  local provider_source = type_declaration .. value_declaration ..
+    "function consume(input: Shared): integer\n" ..
+    "  return " .. value_use .. "\nend\n" ..
+    "function shadow(): integer\n" ..
+    "  local Shared = 5\n  return Shared + 1\nend\n"
+  local consumer_source = "local provider = import \"namespace_provider" ..
+    (is_local and ".titan" or "") .. "\"\n" ..
+    "function consume(input: provider.Shared): integer\n" ..
+    "  return provider." .. value_use .. "\nend\n"
+  local projects = {
+    bridge.ProjectModule.new("namespace_provider", {
+      bridge.SourceFile.new(provider_file, provider_source),
+    }),
+    bridge.ProjectModule.new("namespace_consumer", {
+      bridge.SourceFile.new(consumer_file, consumer_source),
+    }),
+  }
+  local analysis = bridge.load():analyze("namespace_consumer", projects)
+  test.assert(#analysis.diagnostics == 0,
+              "compiler rejected same-spelled type and value declarations")
+  local model = features.build(projects, analysis.modules)
+  local type_definition = marked_name_position(
+    provider_source, is_interface and "interface Shared" or "type Shared", "Shared")
+  local value_definition = marked_name_position(
+    provider_source, is_interface and "function Shared" or "Shared = 7", "Shared")
+  local type_use = marked_name_position(
+    consumer_source, "input: provider.Shared", "Shared")
+  local value_reference = marked_name_position(
+    consumer_source, "return provider.Shared", "Shared")
+  assert_namespace_definition_and_references(
+    model, provider_file, consumer_file, type_definition,
+    marked_name_position(provider_source, "input: Shared", "Shared"), type_use)
+  assert_namespace_definition_and_references(
+    model, provider_file, consumer_file, value_definition,
+    marked_name_position(provider_source, "return Shared", "Shared"),
+    value_reference)
+
+  local shadow_use = marked_name_position(
+    provider_source, "return Shared + 1", "Shared")
+  local shadow_definition? = model:definition(provider_file, shadow_use)
+  local expected_shadow = marked_name_position(
+    provider_source, "  local Shared", "Shared")
+  test.assert(shadow_definition ~= nil and
+              shadow_definition.range.start.line == expected_shadow.line and
+              shadow_definition.range.start.character == expected_shadow.character and
+              #model:references(provider_file, shadow_use, false) == 1,
+              "module namespace identity absorbed a lexical shadow")
+
+  local type_hover? = model:hover(consumer_file, type_use)
+  local value_hover? = model:hover(consumer_file, value_reference)
+  test.assert(type_hover ~= nil and value_hover ~= nil,
+              "namespace distinction lost a hover target")
+  if is_interface then
+    test.assert(type_hover.summary_markdown ~= nil and
+                strings.find(type_hover.summary_markdown, "**interface**") ~= nil and
+                type_hover.callable_signature == nil and
+                value_hover.callable_signature ~= nil,
+                "Interface hover merged with its same-spelled callable")
+  end
+  local visibility = is_local and "module" or "exported"
+  test.assert(strings.find(type_hover:markdown(), "Visibility: " .. visibility) ~= nil and
+              strings.find(value_hover:markdown(), "Visibility: " .. visibility) ~= nil,
+              "namespace identity changed declaration visibility")
+  assert_namespace_rename(model, consumer_file, type_use)
+  assert_namespace_rename(model, consumer_file, value_reference)
+end
+
+function test_compiler_bridge_separates_type_and_value_namespaces(
+    context: test.Context)
+  context:run("exported_alias_and_variable", function(_child: test.Context)
+    run_bridge(function() separates_declaration_namespaces(false, false) end)
+  end)
+  context:run("interface_and_function", function(_child: test.Context)
+    run_bridge(function() separates_declaration_namespaces(true, false) end)
+  end)
+  context:run("source_visible_alias_and_variable", function(_child: test.Context)
+    run_bridge(function() separates_declaration_namespaces(false, true) end)
+  end)
+end
+
+local function renames_into_the_other_namespace(rename_type: boolean)
+  preload_real_compiler()
+  local filename = "/workspace/namespace_rename.titan"
+  local source = [[type Input = integer
+Shared = 7
+function read(input: Input): integer
+  return Shared
+end
+]]
+  local projects = {bridge.ProjectModule.new("namespace_rename", {
+    bridge.SourceFile.new(filename, source),
+  })}
+  local analysis = bridge.load():analyze("namespace_rename", projects)
+  test.assert(#analysis.diagnostics == 0, "namespace rename fixture did not compile")
+  local model = features.build(projects, analysis.modules)
+  local position = marked_name_position(
+    source, rename_type and "input: Input" or "return Shared",
+    rename_type and "Input" or "Shared")
+  local candidate?, candidate_error? = model:rename(
+    filename, position, rename_type and "Shared" or "Input")
+  test.assert(candidate_error == nil and candidate ~= nil,
+              "legal cross-namespace rename did not produce a candidate")
+  local checked = bridge.load():analyze(
+    "namespace_rename", candidate:edited_project_modules())
+  local verified?, verification_error? = candidate:preflight(checked)
+  test.assert(#checked.diagnostics == 0 and verification_error == nil and
+              verified ~= nil and #verified:document_edits() == 1 and
+              #verified:document_edits()[1].edits == 2,
+              "rename confused the opposite namespace with a declaration collision")
+end
+
+function test_compiler_bridge_allows_rename_into_the_other_namespace(
+    context: test.Context)
+  context:run("type_into_value_name", function(_child: test.Context)
+    run_bridge(function() renames_into_the_other_namespace(true) end)
+  end)
+  context:run("value_into_type_name", function(_child: test.Context)
+    run_bridge(function() renames_into_the_other_namespace(false) end)
+  end)
+end
+
+local function joins_nominal_type_and_constructor_namespaces()
+  preload_real_compiler()
+  local projects = {
+    bridge.ProjectModule.new("nominal_provider", {bridge.SourceFile.new(
+      "/workspace/nominal_provider.titan", [[record Box
+  amount: integer
+end
+union Choice
+  some: integer
+  none
+end
+type BoxAlias = Box
+type ChoiceAlias = Choice
+]])}),
+    bridge.ProjectModule.new("nominal_consumer", {bridge.SourceFile.new(
+      "/workspace/nominal_consumer.titan", [[local p = import "nominal_provider"
+function make(box: p.Box): p.Choice
+  local other: p.BoxAlias = p.BoxAlias.new(box.amount)
+  local choice: p.ChoiceAlias = p.ChoiceAlias.some(other.amount)
+  return p.Choice.some(p.Box.new(other.amount).amount)
+end
+]])}),
+  }
+  local analysis = bridge.load():analyze("nominal_consumer", projects)
+  test.assert(#analysis.diagnostics == 0,
+              "compiler rejected nominal namespace fixture")
+  local provider? = analysis:find_module("nominal_provider")
+  local consumer? = analysis:find_module("nominal_consumer")
+  test.assert(provider ~= nil and consumer ~= nil,
+              "nominal namespace fixture lost a module")
+  local names = {"Box", "Choice", "BoxAlias", "ChoiceAlias"}
+  for index = 1, #names do
+    local identity? = symbol_identity(provider, names[index])
+    test.assert(identity ~= nil and identity == symbol_identity(consumer, names[index]),
+                "type and constructor uses split their nominal or alias declaration")
+  end
+  test.assert(symbol_identity(provider, "Box") ~= symbol_identity(provider, "BoxAlias") and
+              symbol_identity(provider, "Choice") ~= symbol_identity(provider, "ChoiceAlias"),
+              "a transparent alias merged with its target declaration")
+  features.build(projects, analysis.modules)
+end
+
+function test_compiler_bridge_joins_nominal_type_and_constructor_namespaces(
+    _context: test.Context)
+  run_bridge(joins_nominal_type_and_constructor_namespaces)
 end

@@ -871,7 +871,7 @@ local function filters_irrelevant_watcher_hints()
       saved.config.project_root, saved.config.config_file,
       {source_root, second_root, nested_root},
       {excluded_directory, excluded_file},
-      {source_root, implicit_nested_root, lookup_root},
+      {source_root, second_root, implicit_nested_root, lookup_root},
       saved.config.binary_modules_root,
       saved.config.extra_ffi_include_dirs,
       saved.config.extra_ffi_cppflags)
@@ -1031,6 +1031,145 @@ local function filters_irrelevant_watcher_hints()
     test.assert(app:indexing_metrics().refresh_passes == before_directory + 1,
                 "new source-directory probe scheduled repeated refreshes")
   end)
+end
+
+local function refreshes_unmapped_warnings_only_during_ordinary_discovery()
+  local root = fs.tmpname()
+  fs.unlink(root)
+  fs.mkdir(root)
+  local source_root = root .. "/src"
+  local unmapped_root = root .. "/loose"
+  local filename = source_root .. "/main.titan"
+  local loose = root .. "/loose.titan"
+  local removed = unmapped_root .. "/other.titan"
+  local created = unmapped_root .. "/new.titan"
+  local config = root .. "/titan-config.lua"
+  defer do
+    if fs.lstat(created) ~= nil then fs.unlink(created) end
+    if fs.lstat(removed) ~= nil then fs.unlink(removed) end
+    if fs.lstat(loose) ~= nil then fs.unlink(loose) end
+    if fs.lstat(filename) ~= nil then fs.unlink(filename) end
+    if fs.lstat(config) ~= nil then fs.unlink(config) end
+    if fs.lstat(unmapped_root) ~= nil then fs.rmdir(unmapped_root) end
+    if fs.lstat(source_root) ~= nil then fs.rmdir(source_root) end
+    if fs.lstat(root) ~= nil then fs.rmdir(root) end
+  end
+  fs.mkdir(source_root)
+  fs.mkdir(unmapped_root)
+  fs.write_file(filename, "function answer(): integer return 1 end\n")
+  fs.write_file(loose, "not valid Titan source\n")
+  fs.write_file(removed, "also not valid Titan source\n")
+  fs.write_file(config,
+    "include = { '.' }\nsource_module_roots = { 'src' }\n")
+  local analyzer = YieldingAnalyzer.new(0, false, false, false, false)
+  local service?, service_error? = project_service.load_with_analyzer(
+    root, "/sdk/lib/titan/0.6", analyzer:analyze)
+  test.assert(service_error == nil and service ~= nil,
+              "unmapped warning fixture project did not load")
+  local app = application.create_with_service(root, service)
+  defer app:close()
+  local watched = app:watched_directories_for_testing()
+  test.assert(contains_string(watched, fs.realpath(root)) and
+              contains_string(watched, fs.realpath(source_root)) and
+              not contains_string(watched, fs.realpath(unmapped_root)),
+              "unmapped branch acquired a native directory watcher")
+  app:stop_watching_for_testing()
+
+  local publications: {string: diagnostics.Publication} = {}
+  local publication_count = 0
+  app:set_diagnostics_listener(function (publication: diagnostics.Publication)
+    publications[publication.uri] = publication
+    publication_count = publication_count + 1
+  end)
+  local loose_uri = source_text.path_to_file_uri(loose)
+  local removed_uri = source_text.path_to_file_uri(removed)
+  local created_uri = source_text.path_to_file_uri(created)
+  test.assert(publication_count == 2 and
+              #publications[loose_uri].items == 1 and
+              #publications[removed_uri].items == 1,
+              "initial saved discovery did not publish unmapped warnings")
+  local saved = service:latest()
+  local projects, snapshots = application.project_inputs(saved)
+  test.assert(#saved.project_modules == 1 and #projects == 1 and
+              #snapshots == 1 and projects[1].module_name == "main",
+              "unmapped sources reached compiler or semantic project inputs")
+  local features = semantic_features.build(projects, snapshots)
+  test.assert(features:hover(loose, source_text.Position.new(0, 0)) == nil and
+              #features:folding_ranges(loose) == 0,
+              "unmapped source acquired semantic navigation data")
+
+  local before = app:indexing_metrics()
+  local epoch = app:change_epoch_for_testing()
+  local runs = analyzer.runs
+  fs.write_file(loose, "changed but still unmapped\n")
+  fs.unlink(removed)
+  fs.write_file(created, "function answer(): integer return 2 end\n")
+  app:watch_callback(project_watcher.RediscoveryBatch.new({
+    project_watcher.PathChange.modified(loose),
+    project_watcher.PathChange.deleted(removed),
+    project_watcher.PathChange.created(created),
+    project_watcher.PathChange.modified(unmapped_root),
+    project_watcher.PathChange.created(root .. "/unmapped_branch"),
+  }, {}, false))
+  timer.yield()
+  test.assert(app:change_epoch_for_testing() == epoch and
+              app:indexing_metrics().refresh_passes == before.refresh_passes and
+              not app:directory_probe_active_for_testing() and
+              analyzer.runs == runs and publication_count == 2,
+              "unmapped file or directory hints started refresh or publication")
+
+  app:watch_callback(project_watcher.RediscoveryBatch.new({
+    project_watcher.PathChange.modified(filename),
+  }, {}, false))
+  wait_until(function (): boolean
+    local metrics = app:indexing_metrics()
+    return metrics.refresh_passes == before.refresh_passes + 1 and
+           not metrics.refresh_chain_active
+  end, "ordinary saved-file discovery did not finish")
+  app:stop_watching_for_testing()
+  test.assert(#publications[removed_uri].items == 0 and
+              #publications[created_uri].items == 1 and
+              #publications[loose_uri].items == 1 and
+              analyzer.runs == runs and
+              service:latest().generation == saved.generation,
+              "ordinary discovery did not replace warnings without recompiling")
+
+  fs.write_file(config,
+    "include = { '.' }\nsource_module_roots = { 'src', 'loose' }\n")
+  app:watch_callback(project_watcher.RediscoveryBatch.new({
+    project_watcher.PathChange.modified(config),
+  }, {}, false))
+  wait_until(function (): boolean
+    local metrics = app:indexing_metrics()
+    return metrics.refresh_passes == before.refresh_passes + 2 and
+           not metrics.refresh_chain_active
+  end, "source-root mapping refresh did not finish")
+  test.assert(#publications[created_uri].items == 0 and
+              #publications[loose_uri].items == 1 and
+              #service:latest().project_modules == 2 and
+              contains_string(app:watched_directories_for_testing(),
+                              fs.realpath(unmapped_root)),
+              "configured source root did not clear its warning and enter project scope")
+  app:stop_watching_for_testing()
+
+  fs.write_file(config,
+    "include = { 'src' }\nsource_module_roots = { 'src' }\n")
+  app:watch_callback(project_watcher.RediscoveryBatch.new({
+    project_watcher.PathChange.modified(config),
+  }, {}, false))
+  wait_until(function (): boolean
+    local metrics = app:indexing_metrics()
+    return metrics.refresh_passes == before.refresh_passes + 3 and
+           not metrics.refresh_chain_active
+  end, "include-scope replacement did not finish")
+  test.assert(#publications[loose_uri].items == 0 and
+              #service:latest().discovery_issues == 0,
+              "include-scope replacement left stale unmapped warnings")
+end
+
+function test_application_refreshes_unmapped_warnings_only_during_ordinary_discovery(
+    _context: test.Context)
+  test_runtime.run(refreshes_unmapped_warnings_only_during_ordinary_discovery)
 end
 
 local function builds_semantics_from_independently_valid_modules()
@@ -1535,6 +1674,161 @@ local function classifies_canonical_symlink_watcher_paths()
   test.assert(application.relevant_watch_change(
                 saved, project_watcher.PathChange.deleted(canonical_package)),
               "deleted canonical source directory was filtered out")
+end
+
+local function watches_canonical_targets_of_lexically_mapped_include_symlinks()
+  local base = fs.tmpname()
+  fs.unlink(base)
+  fs.mkdir(base)
+  local project = base .. "/workspace"
+  local actual = base .. "/actual"
+  local linked = project .. "/link"
+  local filename = actual .. "/main.titan"
+  local nested = actual .. "/new_branch"
+  local config = project .. "/titan-config.lua"
+  defer do
+    if fs.lstat(linked) ~= nil then fs.unlink(linked) end
+    if fs.lstat(nested) ~= nil then fs.rmdir(nested) end
+    if fs.lstat(filename) ~= nil then fs.unlink(filename) end
+    if fs.lstat(config) ~= nil then fs.unlink(config) end
+    if fs.lstat(actual) ~= nil then fs.rmdir(actual) end
+    if fs.lstat(project) ~= nil then fs.rmdir(project) end
+    if fs.lstat(base) ~= nil then fs.rmdir(base) end
+  end
+  fs.mkdir(project)
+  fs.mkdir(actual)
+  fs.write_file(filename, "function answer(): integer return 1 end\n")
+  fs.write_file(config,
+    "include = { 'link' }\nsource_module_roots = { '.' }\n")
+  local linker = os.spawn("/bin/ln", {"-s", actual, linked})
+  local link_input? = linker.stdin
+  if link_input ~= nil then link_input:close() end
+  local link_status = linker:wait()
+  local link_output? = linker.stdout
+  if link_output ~= nil then link_output:close() end
+  local link_error? = linker.stderr
+  if link_error ~= nil then link_error:close() end
+  test.assert(link_status.code == 0 and link_status.signal == nil,
+              "could not create lexical source-ancestry symlink fixture")
+
+  local analyzer = YieldingAnalyzer.new(0, false, false, false, false)
+  local service?, service_error? = project_service.load_with_analyzer(
+    project, "/sdk/lib/titan/0.6", analyzer:analyze)
+  test.assert(service_error == nil and service ~= nil,
+              "lexically mapped symlink fixture project did not load")
+  local app = application.create_with_service(project, service)
+  defer app:close()
+  app:stop_watching_for_testing()
+  local saved = service:latest()
+  test.assert(#saved.project_modules == 1 and
+              saved.project_modules[1].module_name == "link.main" and
+              #saved.discovery_issues == 0,
+              "symlink target outside physical source root lost its lexical owner")
+  local canonical_file = fs.realpath(filename)
+  local canonical_nested = fs.realpath(actual) .. "/new_branch"
+  test.assert(application.relevant_watch_change(
+                saved, project_watcher.PathChange.modified(canonical_file)) and
+              application.relevant_watch_change(
+                saved, project_watcher.PathChange.created(canonical_nested)),
+              "canonical watcher paths lost lexical source-root coverage")
+  test.assert(not application.relevant_watch_change(
+                saved, project_watcher.PathChange.modified(
+                  base .. "/outside.titan")),
+              "include symlink expanded watcher coverage outside its target")
+
+  local before = app:indexing_metrics().refresh_passes
+  app:watch_callback(project_watcher.RediscoveryBatch.new({
+    project_watcher.PathChange.modified(canonical_file),
+  }, {}, false))
+  wait_until(function (): boolean
+    local metrics = app:indexing_metrics()
+    return metrics.refresh_passes == before + 1 and
+           not metrics.refresh_chain_active
+  end, "canonical source modification did not refresh its lexical project")
+  app:stop_watching_for_testing()
+  fs.mkdir(nested)
+  app:watch_callback(project_watcher.RediscoveryBatch.new({
+    project_watcher.PathChange.created(canonical_nested),
+  }, {}, false))
+  wait_until(function (): boolean
+    local metrics = app:indexing_metrics()
+    return metrics.refresh_passes == before + 2 and
+           not app:directory_probe_active_for_testing() and
+           not metrics.refresh_chain_active
+  end, "canonical directory creation did not refresh its lexical project")
+  test.assert(contains_string(app:watched_directories_for_testing(),
+                              canonical_nested),
+              "canonical newly discovered directory did not acquire a watcher")
+end
+
+function test_application_watches_canonical_targets_of_lexically_mapped_include_symlinks(
+    _context: test.Context)
+  test_runtime.run(watches_canonical_targets_of_lexically_mapped_include_symlinks)
+end
+
+local function probes_source_ancestors_with_titan_suffix()
+  with_application(function (_filename: string, analyzer: YieldingAnalyzer,
+                             app: application.Application)
+    app:stop_watching_for_testing()
+    local initial = app:snapshot_for_testing()
+    local root = initial.config.project_root
+    local config = root .. "/titan-config.lua"
+    local ancestor = root .. "/vendor.titan"
+    defer do
+      app:stop_watching_for_testing()
+      local metadata? = fs.lstat(ancestor)
+      if metadata ~= nil then
+        if metadata.kind == "directory" then fs.rmdir(ancestor)
+        else fs.unlink(ancestor) end
+      end
+      if fs.lstat(config) ~= nil then fs.unlink(config) end
+    end
+    fs.write_file(config,
+      "include = { '.' }\n" ..
+      "source_module_roots = { 'src', 'vendor.titan/src' }\n")
+    local before = app:indexing_metrics().refresh_passes
+    app:note_saved_change()
+    wait_until(function (): boolean
+      local metrics = app:indexing_metrics()
+      return metrics.refresh_passes == before + 1 and
+             not metrics.refresh_chain_active
+    end, "future source-root configuration did not refresh")
+    app:stop_watching_for_testing()
+    local epoch = app:change_epoch_for_testing()
+    local runs = analyzer.runs
+
+    fs.write_file(ancestor, "an unmapped regular source file\n")
+    app:watch_callback(project_watcher.RediscoveryBatch.new({
+      project_watcher.PathChange.created(ancestor),
+    }, {}, false))
+    wait_until(function (): boolean
+      return not app:directory_probe_active_for_testing()
+    end, "source-shaped ancestor kind probe did not finish")
+    test.assert(app:change_epoch_for_testing() == epoch and
+                app:indexing_metrics().refresh_passes == before + 1 and
+                analyzer.runs == runs,
+                "unmapped regular file at a source-root ancestor triggered refresh")
+
+    fs.unlink(ancestor)
+    fs.mkdir(ancestor)
+    app:watch_callback(project_watcher.RediscoveryBatch.new({
+      project_watcher.PathChange.created(ancestor),
+    }, {}, false))
+    wait_until(function (): boolean
+      local metrics = app:indexing_metrics()
+      return metrics.refresh_passes == before + 2 and
+             not app:directory_probe_active_for_testing() and
+             not metrics.refresh_chain_active
+    end, "directory with Titan suffix did not reveal the future source-root path")
+    test.assert(contains_string(app:watched_directories_for_testing(),
+                                fs.realpath(ancestor)),
+                "source-root ancestor with Titan suffix did not acquire a watcher")
+  end)
+end
+
+function test_application_probes_source_ancestors_with_titan_suffix(
+    _context: test.Context)
+  test_runtime.run(probes_source_ancestors_with_titan_suffix)
 end
 
 local function reuses_view_without_unchanged_refresh()
