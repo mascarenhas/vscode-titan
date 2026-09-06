@@ -165,7 +165,7 @@ source/build tree and never mutate the shared SDK or provider staging.
 ## Upstream prerequisite and publication
 
 - [Titan PR #145](https://github.com/mascarenhas/titan/pull/145) contains the
-  reviewed depth fix at `63aff6722212edd318486607c7e01823c31f378a`. CI pins that
+  reviewed depth fix at `9bc8b711ae8b7c21422cbb57c906be01ac76d067`. CI pins that
   exact commit; the local SDK and all verification above used those same
   production sources. The active sibling Titan checkout was not modified.
 - The complete Titan gate passed 129 retained build/runtime checks, 3293
@@ -174,3 +174,17 @@ source/build tree and never mutate the shared SDK or provider staging.
 - Independent final review is clean. Both new PRs remain open for maintainer
   review; Linux CI results and artifact provenance are appended to their PR
   descriptions after completion. No macOS workflow is dispatched.
+
+## CI verification follow-up
+
+The first extension Linux run passed all 236 native, 56 JavaScript, and 12
+extension-host tests plus package checks. Reviewing the upstream sanitizer
+log then found that its renamed nesting test had a stale CI selector and ran
+zero tests, despite the regular full suite covering it. Titan PR #145 now
+selects each of the three depth cases explicitly and requires positive test
+counts. Its focused workflow contract and all three exact native selections
+passed locally; the actual guard accepts positive counts and rejects zero.
+
+The pin above includes that CI correction. Production Titan/server sources
+and the locally verified SDK/package are unchanged. Final Linux CI evidence
+for both corrected heads is recorded in their PR descriptions after completion.
