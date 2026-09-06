@@ -15,8 +15,9 @@ file semantics, asynchronous request ownership, and the static runtime boundary.
 
 PR #46 passed Linux CI run `34000527739` and was merged with explicit maintainer
 authorization before this branch was created. Its 21-module metadata inventory
-and API 5 provider are the starting point. The migration and any new Titan PR
-remain open for review after verification; they are not authorized for merge.
+and API 5 provider are the starting point. The migration and its Titan prerequisite were initially left open for review.
+The maintainer subsequently merged Titan PR #145 and authorized merging
+extension PR #48 after refreshing the master pin and passing CI.
 
 ## Shared wire boundary
 
@@ -108,7 +109,7 @@ source/build tree and never mutate the shared SDK or provider staging.
 - [x] Replace the codec and all production/test callers.
 - [x] Complete local extension verification and independent review.
 - Publication and Linux CI completion are tracked on the linked PRs and
-  issue #47 board item; the new PRs remain open for review.
+  issue #47 board item. The final merge follows the authorization below.
 
 ## Implemented policies
 
@@ -165,15 +166,16 @@ source/build tree and never mutate the shared SDK or provider staging.
 ## Upstream prerequisite and publication
 
 - [Titan PR #145](https://github.com/mascarenhas/titan/pull/145) contains the
-  reviewed depth fix at `9bc8b711ae8b7c21422cbb57c906be01ac76d067`. CI pins that
-  exact commit; the local SDK and all verification above used those same
+  reviewed depth fix, now merged at `16d9770684cb4d94a1d20fa81698be4a794f0574`.
+  CI pins that master commit; the local SDK and all verification above used those same
   production sources. The active sibling Titan checkout was not modified.
 - The complete Titan gate passed 129 retained build/runtime checks, 3293
   compiler tests in four shards, and 455 native stdlib tests. Separate focused
   canonical selections passed all 149 JSON tests and 16 PEG tests.
-- Independent final review is clean. Both new PRs remain open for maintainer
-  review; Linux CI results and artifact provenance are appended to their PR
-  descriptions after completion. No macOS workflow is dispatched.
+- Independent final review is clean. Linux CI results and artifact provenance
+  are recorded in the PR descriptions. The maintainer merged the Titan PR and
+  authorized the extension merge after the final pin check. No macOS workflow
+  is dispatched.
 
 ## CI verification follow-up
 
@@ -188,3 +190,17 @@ passed locally; the actual guard accepts positive counts and rejects zero.
 The pin above includes that CI correction. Production Titan/server sources
 and the locally verified SDK/package are unchanged. Final Linux CI evidence
 for both corrected heads is recorded in their PR descriptions after completion.
+
+## Merged-master pin and authorized extension merge
+
+- The maintainer merged Titan PR #145 and explicitly authorized updating the
+  local checkout, pinning its master commit in PR #48, monitoring CI, and
+  merging the extension PR after the checks pass.
+- Fetched Titan master is `16d9770684cb4d94a1d20fa81698be4a794f0574`. Its
+  complete tree and the previously verified PR head `9bc8b711` both resolve to
+  `1cf74be5330136a55761bca9bbf56d94c32735f5`; their full diff is empty.
+  The isolated local Titan checkout now points to that master commit.
+- Only the CI pin and this plan change. Existing local full-gate evidence
+  remains valid for the identical source tree. A fresh complete Linux CI run
+  validates the new pin before the authorized merge; its final run and artifact
+  evidence are recorded in PR #48. The board moves to Done after merging.
