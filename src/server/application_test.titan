@@ -1,5 +1,6 @@
 local async = import "async"
 local fs = import "fs"
+local json = import "json"
 local os = import "os"
 local strings = import "string"
 local test = import "test"
@@ -10,7 +11,7 @@ local compiler_io = import "server.compiler_io"
 local diagnostics = import "server.diagnostics"
 local dispatcher = import "server.dispatcher"
 local indexing_status = import "server.indexing_status"
-local json = import "server.json"
+local wire = import "server.wire"
 local logging = import "server.logging"
 local project_config = import "server.project_config"
 local project_graph = import "server.project_graph"
@@ -233,21 +234,22 @@ local function request_for(path: string, id: integer,
               "application fixture path did not become a file URI")
   if uri == nil then raise "application fixture URI is missing" end
   local actual_uri: string = uri
-  local members: {json.Member} = {
-    json.Member.new("textDocument", json.from_object({
-      json.Member.new("uri", json.from_string(actual_uri)),
-    })),
+  local document: wire.Object = {
+    ["uri"] = actual_uri,
+  }
+  local params: wire.Object = {
+    ["textDocument"] = document,
   }
   if method == "textDocument/rename" then
-    members[#members + 1] = json.Member.new("position", json.from_object({
-      json.Member.new("line", json.from_integer(0)),
-      json.Member.new("character", json.from_integer(0)),
-    }))
-    members[#members + 1] =
-      json.Member.new("newName", json.from_string("renamed"))
+    local position: wire.Object = {
+      ["line"] = 0,
+      ["character"] = 0,
+    }
+    params["position"] = position
+    params["newName"] = "renamed"
   end
   return dispatcher.SemanticRequest.new(
-    dispatcher.RequestId.integer_id(id), method, json.from_object(members))
+    dispatcher.RequestId.integer_id(id), method, params)
 end
 
 local function rename_request_for(path: string, id: integer,
@@ -257,18 +259,18 @@ local function rename_request_for(path: string, id: integer,
   test.assert(uri_error == nil and uri ~= nil,
               "application fixture path did not become a file URI")
   if uri == nil then raise "application fixture URI is missing" end
-  local document = json.from_object({
-    json.Member.new("uri", json.from_string(uri)),
-  })
-  local position = json.from_object({
-    json.Member.new("line", json.from_integer(0)),
-    json.Member.new("character", json.from_integer(character)),
-  })
-  local params = json.from_object({
-    json.Member.new("textDocument", document),
-    json.Member.new("position", position),
-    json.Member.new("newName", json.from_string("renamed")),
-  })
+  local document: wire.Object = {
+    ["uri"] = uri,
+  }
+  local position: wire.Object = {
+    ["line"] = 0,
+    ["character"] = character,
+  }
+  local params: wire.Object = {
+    ["textDocument"] = document,
+    ["position"] = position,
+    ["newName"] = "renamed",
+  }
   return dispatcher.SemanticRequest.new(
     dispatcher.RequestId.integer_id(id), "textDocument/rename", params)
 end
@@ -280,17 +282,17 @@ local function position_request_for(path: string, id: integer,
   test.assert(uri_error == nil and uri ~= nil,
               "application fixture path did not become a file URI")
   if uri == nil then raise "application fixture URI is missing" end
-  local document = json.from_object({
-    json.Member.new("uri", json.from_string(uri)),
-  })
-  local position = json.from_object({
-    json.Member.new("line", json.from_integer(0)),
-    json.Member.new("character", json.from_integer(character)),
-  })
-  local params = json.from_object({
-    json.Member.new("textDocument", document),
-    json.Member.new("position", position),
-  })
+  local document: wire.Object = {
+    ["uri"] = uri,
+  }
+  local position: wire.Object = {
+    ["line"] = 0,
+    ["character"] = character,
+  }
+  local params: wire.Object = {
+    ["textDocument"] = document,
+    ["position"] = position,
+  }
   return dispatcher.SemanticRequest.new(
     dispatcher.RequestId.integer_id(id), method, params)
 end
@@ -299,9 +301,9 @@ local function result_array_length(
     outcome: dispatcher.SemanticOutcome, subject: string): integer
   case outcome
   when result: item then
-    local array? = json.as_array(item)
+    local array? = wire.as_array(item)
     if array == nil then raise subject .. " did not return a JSON array" end
-    return #array.items
+    return #array
   when failure: failure then
     test.assert(false, subject .. ": " .. failure.message)
   end
@@ -329,7 +331,7 @@ local function assert_null_result(outcome: dispatcher.SemanticOutcome,
                                   subject: string)
   case outcome
   when result: item then
-    test.assert(json.is_null(item), subject .. " did not return null")
+    test.assert(wire.is_null(item), subject .. " did not return null")
   when failure: failure then
     test.assert(false, subject .. ": " .. failure.message)
   end
@@ -1835,6 +1837,67 @@ local function emits_no_indexing_status_after_close()
     test.assert(not app:indexing_metrics().refresh_chain_active,
                 "application close left an unterminated indexing chain")
   end)
+end
+
+local function continues_indexing_after_status_encoding_failure()
+  with_unindexed_application(function (
+      filename: string, _analyzer: YieldingAnalyzer,
+      app: application.Application)
+    local observed = 0
+    app:set_indexing_listener(function (status: indexing_status.Status)
+      observed = observed + 1
+      indexing_status.notification(indexing_status.Status.new(
+        status.state, status.initial, status.epoch, status.generation,
+        strings.char(0xff), status.completed_files, status.total_files))
+    end)
+    app:start_indexing()
+    wait_until(function (): boolean
+      return not app:indexing_metrics().refresh_chain_active
+    end, "status encoding failure interrupted the initial indexing chain")
+    test.assert(observed >= 2 and
+                app:indexing_metrics().view_builds == 1,
+                "status encoding failure prevented the completed semantic View")
+    test.assert(result_array_length(
+      app:handle(request_for(filename, 51, "textDocument/foldingRange")),
+      "folding after status encoding failure") == 1,
+      "status encoding failure discarded the completed saved generation")
+    wait_until(function (): boolean
+      return not app:indexing_metrics().refresh_chain_active
+    end, "revalidation after status encoding failure did not finish")
+
+    app:set_indexing_listener(function (_status: indexing_status.Status)
+      raise "unexpected status listener failure"
+    end)
+    local propagated = false
+    do
+      app:emit_indexing_status(indexing_status.State.ready(), nil, nil, nil)
+    catch
+      propagated = error == "unexpected status listener failure"
+    end
+    test.assert(propagated,
+                "status publication swallowed an unexpected listener failure")
+
+    app:set_indexing_listener(function (_status: indexing_status.Status)
+      wire.decode("\"" .. strings.char(0xff) .. "\"")
+    end)
+    local decoding_failure = false
+    do
+      app:emit_indexing_status(indexing_status.State.ready(), nil, nil, nil)
+    catch
+      if error is json.Error then
+        local failure: json.Error = error
+        decoding_failure = failure.code == "invalid_utf8" and
+                           failure.position ~= nil
+      end
+    end
+    test.assert(decoding_failure,
+                "status publication swallowed an unrelated JSON decode error")
+  end)
+end
+
+function test_application_continues_indexing_after_status_encoding_failure(
+    _context: test.Context)
+  test_runtime.run(continues_indexing_after_status_encoding_failure)
 end
 
 local function run_indexing_case(name: string, body: () -> ())

@@ -1,4 +1,4 @@
-local json = import "server.json"
+local wire = import "server.wire"
 
 record Error
   code: integer
@@ -7,7 +7,7 @@ end
 
 union Decision
   unhandled
-  result: json.Value
+  result: value
   failure: Error
   notification
   initialized
@@ -49,30 +49,28 @@ local function fail(code: integer, message: string): Decision
   return Decision.failure(Error.new(code, message))
 end
 
-local function initialize_result(): json.Value
-  local capabilities = json.from_object({
+local function initialize_result(): wire.Object
+  local capabilities: wire.Object = {
     -- vscode-languageclient currently advertises only UTF-16 and rejects any
     -- other selection. State the negotiated/default encoding explicitly.
-    json.Member.new("positionEncoding", json.from_string("utf-16")),
-    json.Member.new("definitionProvider", json.from_boolean(true)),
-    json.Member.new("referencesProvider", json.from_boolean(true)),
-    json.Member.new("renameProvider", json.from_boolean(true)),
-    json.Member.new("hoverProvider", json.from_boolean(true)),
-    json.Member.new("foldingRangeProvider", json.from_boolean(true)),
-  })
-  return json.from_object({
-    json.Member.new("capabilities", capabilities),
-  })
+    ["positionEncoding"] = "utf-16",
+    ["definitionProvider"] = true,
+    ["referencesProvider"] = true,
+    ["renameProvider"] = true,
+    ["hoverProvider"] = true,
+    ["foldingRangeProvider"] = true,
+  }
+  return {["capabilities"] = capabilities}
 end
 
-local function object_params(params: json.Value?): boolean
+local function object_params(params: value): boolean
   if params == nil then return false end
-  return json.as_object(params) ~= nil
+  return wire.as_object(params) ~= nil
 end
 
-local function absent_or_null_params(params: json.Value?): boolean
+local function absent_or_null_params(params: value): boolean
   if params == nil then return true end
-  return json.is_null(params)
+  return wire.is_null(params)
 end
 
 local function Lifecycle:handle_exit(is_request: boolean): Decision
@@ -90,7 +88,7 @@ local function Lifecycle:handle_exit(is_request: boolean): Decision
 end
 
 local function Lifecycle:handle_initialize(
-    is_request: boolean, params: json.Value?): Decision
+    is_request: boolean, params: value): Decision
   if not is_request then
     return fail(INVALID_REQUEST, "initialize must be sent as a request")
   end
@@ -108,7 +106,7 @@ local function Lifecycle:handle_initialize(
 end
 
 local function Lifecycle:handle_initialized(
-    is_request: boolean, params: json.Value?): Decision
+    is_request: boolean, params: value): Decision
   if is_request then
     return fail(INVALID_REQUEST, "initialized must be sent as a notification")
   end
@@ -127,7 +125,7 @@ local function Lifecycle:handle_initialized(
 end
 
 local function Lifecycle:handle_shutdown(
-    is_request: boolean, params: json.Value?): Decision
+    is_request: boolean, params: value): Decision
   if not is_request then
     return fail(INVALID_REQUEST, "shutdown must be sent as a request")
   end
@@ -141,17 +139,17 @@ local function Lifecycle:handle_shutdown(
                 "server has not received an initialize request")
   when awaiting_initialized then
     self.phase = Phase.shutdown()
-    return Decision.result(json.null())
+    return Decision.result(wire.null())
   when running then
     self.phase = Phase.shutdown()
-    return Decision.result(json.null())
+    return Decision.result(wire.null())
   else
     return fail(INVALID_REQUEST, "server has already shut down")
   end
 end
 
 function Lifecycle:dispatch(method: string, is_request: boolean,
-                            params: json.Value?): Decision
+                            params: value): Decision
   if method == "exit" then return self:handle_exit(is_request) end
   if method == "initialize" then
     return self:handle_initialize(is_request, params)

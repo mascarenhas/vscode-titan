@@ -1,39 +1,29 @@
-local json = import "server.json"
+local wire = import "server.wire"
 local lsp = import "server.lsp_types"
 local source_text = import "server.source_text"
 local test = import "test"
 
-local function params(uri: json.Value, line: json.Value,
-                      character: json.Value): json.Value
-  return json.from_object({
-    json.Member.new("textDocument", json.from_object({
-      json.Member.new("uri", uri),
-    })),
-    json.Member.new("position", json.from_object({
-      json.Member.new("line", line),
-      json.Member.new("character", character),
-    })),
-  })
+local function params(uri: value, line: value,
+                      character: value): wire.Object
+  local document: wire.Object = {["uri"] = uri}
+  local position: wire.Object = {["line"] = line, ["character"] = character}
+  return {["textDocument"] = document, ["position"] = position}
 end
 
 function test_lsp_types_parses_local_document_positions(
     _context: test.Context)
   local parsed?, failure? = lsp.parse_document_position(params(
-    json.from_string("file:///workspace/a%20b.titan"),
-    json.from_integer(3), json.from_integer(5)))
+    "file:///workspace/a%20b.titan", 3, 5))
   test.assert(failure == nil and parsed ~= nil and
               parsed.uri == "file:///workspace/a%20b.titan" and
               parsed.path == "/workspace/a b.titan" and
               parsed.position.line == 3 and parsed.position.character == 5,
               "valid document position did not normalize")
 
-  local text_document = json.from_object({
-    json.Member.new(
-      "uri", json.from_string("file:///workspace/a%20b.titan")),
-  })
-  local document_params = json.from_object({
-    json.Member.new("textDocument", text_document),
-  })
+  local text_document: wire.Object = {
+    ["uri"] = "file:///workspace/a%20b.titan",
+  }
+  local document_params: wire.Object = {["textDocument"] = text_document}
   local document?, document_error? = lsp.parse_document(document_params)
   test.assert(document_error == nil and document ~= nil and
               document.path == "/workspace/a b.titan",
@@ -41,34 +31,69 @@ function test_lsp_types_parses_local_document_positions(
 end
 
 function test_lsp_types_rejects_malformed_params(_context: test.Context)
+  local empty: wire.Object = {}
   local missing?, missing_error? =
-    lsp.parse_document_position(json.new_object())
+    lsp.parse_document_position(empty)
   test.assert(missing == nil and missing_error ~= nil and
               missing_error.code == -32602,
               "missing document position did not return Invalid params")
 
   local remote?, remote_error? = lsp.parse_document_position(params(
-    json.from_string("file://example.com/workspace/main.titan"),
-    json.from_integer(0), json.from_integer(0)))
+    "file://example.com/workspace/main.titan", 0, 0))
   test.assert(remote == nil and remote_error ~= nil,
               "non-local document URI was accepted")
 
   local negative?, negative_error? = lsp.parse_document_position(params(
-    json.from_string("file:///workspace/main.titan"),
-    json.from_integer(-1), json.from_integer(0)))
+    "file:///workspace/main.titan", -1, 0))
   test.assert(negative == nil and negative_error ~= nil,
               "negative LSP position was accepted")
+end
+
+function test_lsp_types_requires_integer_position_tags(_context: test.Context)
+  local spellings: {string} = {"1.0", "1e0"}
+  for index = 1, #spellings do
+    local number = wire.decode(spellings[index])
+    local line?, line_error? = lsp.parse_document_position(params(
+      "file:///workspace/main.titan", number, 0))
+    test.assert(line == nil and line_error ~= nil and line_error.code == -32602,
+                "an integral JSON float was accepted as an LSP line")
+    local character?, character_error? = lsp.parse_document_position(params(
+      "file:///workspace/main.titan", 0, number))
+    test.assert(character == nil and character_error ~= nil and
+                character_error.code == -32602,
+                "an integral JSON float was accepted as an LSP character")
+  end
+end
+
+function test_lsp_types_requires_a_boolean_reference_flag(_context: test.Context)
+  local reference_params = params("file:///workspace/main.titan", 0, 0)
+  local context: wire.Object = {}
+  reference_params["context"] = context
+  local missing?, missing_error? = lsp.parse_references(reference_params)
+  test.assert(missing == nil and missing_error ~= nil and
+              missing_error.code == -32602,
+              "a missing includeDeclaration flag was accepted")
+
+  local invalid: wire.Array = {0, 1, "false", wire.null()}
+  for index = 1, #invalid do
+    context["includeDeclaration"] = invalid[index]
+    local parsed?, failure? = lsp.parse_references(reference_params)
+    test.assert(parsed == nil and failure ~= nil and failure.code == -32602,
+                "a non-boolean includeDeclaration flag was accepted")
+  end
+  context["includeDeclaration"] = false
+  local parsed?, failure? = lsp.parse_references(reference_params)
+  test.assert(parsed ~= nil and failure == nil and
+              not parsed.include_declaration,
+              "false includeDeclaration was treated as absent")
 end
 
 function test_lsp_types_parses_reference_and_rename_extensions(
     _context: test.Context)
   local reference_params = params(
-    json.from_string("file:///workspace/main.titan"),
-    json.from_integer(1), json.from_integer(2))
-  local reference_object? = json.as_object(reference_params)
-  reference_object:set("context", json.from_object({
-    json.Member.new("includeDeclaration", json.from_boolean(false)),
-  }))
+    "file:///workspace/main.titan", 1, 2)
+  local context: wire.Object = {["includeDeclaration"] = false}
+  reference_params["context"] = context
   local references?, references_error? =
     lsp.parse_references(reference_params)
   test.assert(references_error == nil and references ~= nil and
@@ -76,16 +101,14 @@ function test_lsp_types_parses_reference_and_rename_extensions(
               "reference context did not parse")
 
   local rename_params = params(
-    json.from_string("file:///workspace/main.titan"),
-    json.from_integer(1), json.from_integer(2))
-  local rename_object? = json.as_object(rename_params)
-  rename_object:set("newName", json.from_string("renamed_2"))
+    "file:///workspace/main.titan", 1, 2)
+  rename_params["newName"] = "renamed_2"
   local rename?, rename_error? = lsp.parse_rename(rename_params)
   test.assert(rename_error == nil and rename ~= nil and
               rename.new_name == "renamed_2",
               "valid rename params did not parse")
 
-  rename_object:set("newName", json.from_string("function"))
+  rename_params["newName"] = "function"
   local keyword?, keyword_error? = lsp.parse_rename(rename_params)
   test.assert(keyword == nil and keyword_error ~= nil,
               "Titan keyword was accepted as a rename target")
@@ -104,18 +127,37 @@ function test_lsp_types_encodes_deterministic_results(_context: test.Context)
       lsp.TextEdit.new(first, "a"),
     }),
   })
-  test.assert(json.encode(edit) ==
-    [[{"changes":{"file:///a.titan":[{"range":{"start":{"line":0,"character":1},"end":{"line":0,"character":4}},"newText":"a"}],"file:///z.titan":[{"range":{"start":{"line":2,"character":0},"end":{"line":2,"character":3}},"newText":"z"}]}}]],
+  test.assert(wire.encode(edit) ==
+    [[{"changes":{"file:///a.titan":[{"newText":"a","range":{"end":{"character":4,"line":0},"start":{"character":1,"line":0}}}],"file:///z.titan":[{"newText":"z","range":{"end":{"character":3,"line":2},"start":{"character":0,"line":2}}}]}}]],
     "workspace edit was not encoded deterministically")
 
   local hover = lsp.hover_value("```titan\ninteger\n```", first)
-  test.assert(json.encode(hover) ==
-    [[{"contents":{"kind":"markdown","value":"```titan\ninteger\n```"},"range":{"start":{"line":0,"character":1},"end":{"line":0,"character":4}}}]],
+  test.assert(wire.encode(hover) ==
+    [[{"contents":{"kind":"markdown","value":"```titan\ninteger\n```"},"range":{"end":{"character":4,"line":0},"start":{"character":1,"line":0}}}]],
     "hover result did not use MarkupContent and an exact range")
 
   local fold = lsp.folding_range_value(lsp.FoldingRange.new(
     1, 2, 8, 0, "region"))
-  test.assert(json.encode(fold) ==
-    [[{"startLine":1,"endLine":8,"startCharacter":2,"endCharacter":0,"kind":"region"}]],
+  test.assert(wire.encode(fold) ==
+    [[{"endCharacter":0,"endLine":8,"kind":"region","startCharacter":2,"startLine":1}]],
     "folding range fields changed")
+end
+
+function test_lsp_types_preserves_empty_collections_and_optional_omissions(
+    _context: test.Context)
+  test.assert(wire.encode(lsp.workspace_edit_value({})) == [[{"changes":{}}]],
+              "an empty workspace edit did not contain an empty changes object")
+  local empty_edits = lsp.workspace_edit_value({
+    lsp.DocumentEdits.new("file:///empty.titan", {}),
+  })
+  test.assert(wire.encode(empty_edits) ==
+      [[{"changes":{"file:///empty.titan":[]}}]],
+    "an empty document edit list became a JSON object")
+  test.assert(wire.encode(lsp.hover_value("text", nil)) ==
+      [[{"contents":{"kind":"markdown","value":"text"}}]],
+    "an absent hover range was encoded as null")
+  local fold = lsp.folding_range_value(lsp.FoldingRange.new(
+    1, nil, 8, nil, nil))
+  test.assert(wire.encode(fold) == [[{"endLine":8,"startLine":1}]],
+              "absent folding range fields were encoded as null")
 end

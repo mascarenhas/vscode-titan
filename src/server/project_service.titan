@@ -4,7 +4,6 @@ local iteration = import "iteration"
 local strings = import "string"
 local compiler_bridge = import "server.compiler_bridge"
 local compiler_io = import "server.compiler_io"
-local json = import "server.json"
 local logging = import "server.logging"
 local project_config = import "server.project_config"
 local project_discovery = import "server.project_discovery"
@@ -800,9 +799,8 @@ end
 local function Service:scan_or_raise(): Snapshot
   local started = logging.clock()
   logging.emit("debug", "project.scan.start", {
-    json.Member.new("root", json.from_string(self.project_root)),
-    json.Member.new("generation", json.from_integer(
-      self.graph:generation())),
+    ["root"] = self.project_root,
+    ["generation"] = self.graph:generation(),
   })
   local loaded?, config_error? = project_config.load(
     self.project_root, self.installed_binary_modules_root)
@@ -863,16 +861,13 @@ local function Service:scan_or_raise(): Snapshot
   self:revalidate_known_headers()
   local snapshot = self:latest()
   logging.emit("debug", "project.scan.complete", {
-    json.Member.new("generation", json.from_integer(snapshot.generation)),
-    json.Member.new("project_modules", json.from_integer(
-      #snapshot.project_modules)),
-    json.Member.new("project_directories", json.from_integer(
-      #snapshot.project_directories)),
-    json.Member.new("dirty_modules", logging.summarize_strings(
-      snapshot.dirty_modules)),
-    json.Member.new("config_changed", json.from_boolean(config_changed)),
-    json.Member.new("cpu_ms", json.from_number(
-      logging.elapsed_ms(started))),
+    ["generation"] = snapshot.generation,
+    ["project_modules"] = #snapshot.project_modules,
+    ["project_directories"] = #snapshot.project_directories,
+    ["dirty_modules"] = logging.summarize_strings(
+      snapshot.dirty_modules),
+    ["config_changed"] = config_changed,
+    ["cpu_ms"] = logging.elapsed_ms(started),
   })
   return snapshot
 end
@@ -1016,16 +1011,13 @@ local function Service:prepare_work_avoiding(
     selected[1], modules, selected, cached_sources, fingerprints,
     header_fingerprints, tokens)
   logging.emit("debug", "analysis.workset", {
-    json.Member.new("generation", json.from_integer(request.generation)),
-    json.Member.new("root_module", json.from_string(request.root_module)),
-    json.Member.new("dirty_modules", logging.summarize_strings(
-      request.dirty_modules)),
-    json.Member.new("cached_sources", json.from_integer(
-      #request.cached_sources)),
-    json.Member.new("external_fingerprints", json.from_integer(
-      #request.external_fingerprints)),
-    json.Member.new("header_fingerprints", json.from_integer(
-      #request.header_fingerprints)),
+    ["generation"] = request.generation,
+    ["root_module"] = request.root_module,
+    ["dirty_modules"] = logging.summarize_strings(
+      request.dirty_modules),
+    ["cached_sources"] = #request.cached_sources,
+    ["external_fingerprints"] = #request.external_fingerprints,
+    ["header_fingerprints"] = #request.header_fingerprints,
   })
   return request
 end
@@ -1840,25 +1832,24 @@ local function Service:analyze_or_raise(
   self.submitted_count = self.submitted_count + #request.dirty_modules
   local started = logging.clock()
   logging.emit("debug", "analysis.start", {
-    json.Member.new("generation", json.from_integer(request.generation)),
-    json.Member.new("root_module", json.from_string(request.root_module)),
-    json.Member.new("dirty_modules", logging.summarize_strings(
-      request.dirty_modules)),
+    ["generation"] = request.generation,
+    ["root_module"] = request.root_module,
+    ["dirty_modules"] = logging.summarize_strings(
+      request.dirty_modules),
   })
   local analysis = self.analyzer(request)
   local report = self:commit_or_raise(request, analysis)
   logging.emit("debug", "analysis.complete", {
-    json.Member.new("generation", json.from_integer(report.generation)),
-    json.Member.new("root_module", json.from_string(request.root_module)),
-    json.Member.new("stale", json.from_boolean(report.stale)),
-    json.Member.new("committed_modules", logging.summarize_strings(
-      report.committed_modules)),
-    json.Member.new("failed_modules", logging.summarize_strings(
-      report.failed_modules)),
-    json.Member.new("remaining_dirty", logging.summarize_strings(
-      report.dirty_modules)),
-    json.Member.new("cpu_ms", json.from_number(
-      logging.elapsed_ms(started))),
+    ["generation"] = report.generation,
+    ["root_module"] = request.root_module,
+    ["stale"] = report.stale,
+    ["committed_modules"] = logging.summarize_strings(
+      report.committed_modules),
+    ["failed_modules"] = logging.summarize_strings(
+      report.failed_modules),
+    ["remaining_dirty"] = logging.summarize_strings(
+      report.dirty_modules),
+    ["cpu_ms"] = logging.elapsed_ms(started),
   })
   return report
 end
@@ -1949,14 +1940,14 @@ local function Service:analyze_to_fixed_point(): (RefreshReport?, Error?)
     analyzed, saw_stale, self.graph:generation(), committed, failed,
     self.graph:dirty_modules())
   logging.emit("debug", "analysis.fixed_point", {
-    json.Member.new("generation", json.from_integer(report.generation)),
-    json.Member.new("iterations", json.from_integer(iteration_count)),
-    json.Member.new("analyzed", json.from_boolean(report.analyzed)),
-    json.Member.new("stale", json.from_boolean(report.stale)),
-    json.Member.new("committed_modules", logging.summarize_strings(committed)),
-    json.Member.new("failed_modules", logging.summarize_strings(failed)),
-    json.Member.new("remaining_dirty", logging.summarize_strings(
-      report.dirty_modules)),
+    ["generation"] = report.generation,
+    ["iterations"] = iteration_count,
+    ["analyzed"] = report.analyzed,
+    ["stale"] = report.stale,
+    ["committed_modules"] = logging.summarize_strings(committed),
+    ["failed_modules"] = logging.summarize_strings(failed),
+    ["remaining_dirty"] = logging.summarize_strings(
+      report.dirty_modules),
   })
   return report, nil
 end
@@ -1965,16 +1956,14 @@ local function Service:refresh_internal(snapshot_listener: SnapshotListener?):
     (RefreshReport?, Error?)
   local started = logging.clock()
   logging.emit("debug", "project.refresh.start", {
-    json.Member.new("generation", json.from_integer(
-      self.graph:generation())),
+    ["generation"] = self.graph:generation(),
   })
   local scanned?, scan_error? = self:scan()
   if scanned == nil then
     logging.emit("error", "project.refresh.failure", {
-      json.Member.new("path", json.from_string(scan_error.path)),
-      json.Member.new("message", json.from_string(scan_error.message)),
-      json.Member.new("cpu_ms", json.from_number(
-        logging.elapsed_ms(started))),
+      ["path"] = scan_error.path,
+      ["message"] = scan_error.message,
+      ["cpu_ms"] = logging.elapsed_ms(started),
     })
     return nil, scan_error
   end
@@ -1985,22 +1974,19 @@ local function Service:refresh_internal(snapshot_listener: SnapshotListener?):
   local report?, refresh_error? = self:analyze_to_fixed_point()
   if report == nil then
     logging.emit("error", "project.refresh.failure", {
-      json.Member.new("path", json.from_string(refresh_error.path)),
-      json.Member.new("message", json.from_string(refresh_error.message)),
-      json.Member.new("cpu_ms", json.from_number(
-        logging.elapsed_ms(started))),
+      ["path"] = refresh_error.path,
+      ["message"] = refresh_error.message,
+      ["cpu_ms"] = logging.elapsed_ms(started),
     })
     return nil, refresh_error
   end
   logging.emit("info", "project.refresh.complete", {
-    json.Member.new("generation", json.from_integer(report.generation)),
-    json.Member.new("analyzed", json.from_boolean(report.analyzed)),
-    json.Member.new("committed", json.from_integer(
-      #report.committed_modules)),
-    json.Member.new("failed", json.from_integer(#report.failed_modules)),
-    json.Member.new("dirty", json.from_integer(#report.dirty_modules)),
-    json.Member.new("cpu_ms", json.from_number(
-      logging.elapsed_ms(started))),
+    ["generation"] = report.generation,
+    ["analyzed"] = report.analyzed,
+    ["committed"] = #report.committed_modules,
+    ["failed"] = #report.failed_modules,
+    ["dirty"] = #report.dirty_modules,
+    ["cpu_ms"] = logging.elapsed_ms(started),
   })
   return report, nil
 end

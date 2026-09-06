@@ -1,25 +1,54 @@
 local test = import "test"
-local json = import "server.json"
+local iteration = import "iteration"
+local strings = import "string"
+local json = import "json"
+local wire = import "server.wire"
 local framing = import "server.framing"
 local dispatcher = import "server.dispatcher"
 
-local function response_object(result: dispatcher.DispatchResult): json.Object
+local function response_object(result: dispatcher.DispatchResult): wire.Object
   test.assert(result.response ~= nil, "request produced no response")
-  local parsed?, failure? = json.parse(result.response)
-  test.assert(failure == nil and parsed ~= nil,
-              "dispatcher produced invalid response JSON")
-  local object? = json.as_object(parsed)
+  local parsed = wire.decode(result.response)
+  local object? = wire.as_object(parsed)
   test.assert(object ~= nil, "dispatcher response was not an object")
   return object
 end
 
+local function member_count(object: wire.Object): integer
+  local count = 0
+  for _, _ in iteration.pairs<string, value>(object) do count = count + 1 end
+  return count
+end
+
 local function response_error_code(result: dispatcher.DispatchResult): integer
   local object = response_object(result)
-  local failure? = json.as_object(object:get("error"))
+  local failure? = wire.as_object(object["error"])
   test.assert(failure ~= nil, "response did not contain an error object")
-  local code? = json.as_integer(failure:get("code"))
+  local code? = wire.as_integer(failure["code"])
   test.assert(code ~= nil, "response error did not contain an integer code")
   return code
+end
+
+local function running_dispatcher(): dispatcher.Dispatcher
+  local server = dispatcher.create()
+  server:dispatch(
+    [[{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}]])
+  server:dispatch(
+    [[{"jsonrpc":"2.0","method":"initialized","params":{}}]])
+  return server
+end
+
+local function assert_internal_error(object: wire.Object,
+                                     id: dispatcher.RequestId)
+  local failure? = wire.as_object(object["error"])
+  test.assert(failure ~= nil and member_count(failure) == 2 and
+              wire.as_integer(failure["code"]) == -32603 and
+              wire.as_string(failure["message"]) == "Internal error",
+              "encoding failure did not produce the fixed Internal Error")
+  test.assert(member_count(object) == 3 and object["result"] == nil and
+              wire.as_string(object["jsonrpc"]) == "2.0" and
+              object["id"] == id:to_json(),
+              "encoding fallback changed the envelope or request id")
 end
 
 function test_dispatcher_runs_the_lsp_lifecycle(_context: test.Context)
@@ -28,20 +57,20 @@ function test_dispatcher_runs_the_lsp_lifecycle(_context: test.Context)
   local initialized = server:dispatch(
     [[{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}]])
   local initialize_response = response_object(initialized)
-  test.assert(json.as_integer(initialize_response:get("id")) == 1,
+  test.assert(wire.as_integer(initialize_response["id"]) == 1,
               "initialize response changed the request id")
   local initialize_result? =
-    json.as_object(initialize_response:get("result"))
+    wire.as_object(initialize_response["result"])
   local capabilities? =
-    json.as_object(initialize_result:get("capabilities"))
-  test.assert(capabilities ~= nil and #capabilities.members == 6 and
-              json.as_string(capabilities:get("positionEncoding")) ==
+    wire.as_object(initialize_result["capabilities"])
+  test.assert(capabilities ~= nil and member_count(capabilities) == 6 and
+              wire.as_string(capabilities["positionEncoding"]) ==
                 "utf-16" and
-              json.as_boolean(capabilities:get("definitionProvider")) and
-              json.as_boolean(capabilities:get("referencesProvider")) and
-              json.as_boolean(capabilities:get("renameProvider")) and
-              json.as_boolean(capabilities:get("hoverProvider")) and
-              json.as_boolean(capabilities:get("foldingRangeProvider")),
+              wire.as_boolean(capabilities["definitionProvider"]) and
+              wire.as_boolean(capabilities["referencesProvider"]) and
+              wire.as_boolean(capabilities["renameProvider"]) and
+              wire.as_boolean(capabilities["hoverProvider"]) and
+              wire.as_boolean(capabilities["foldingRangeProvider"]),
               "dispatcher omitted a supported semantic capability")
 
   local ready = server:dispatch(
@@ -64,8 +93,8 @@ function test_dispatcher_runs_the_lsp_lifecycle(_context: test.Context)
   local shutdown = server:dispatch(
     [[{"jsonrpc":"2.0","id":2,"method":"shutdown"}]])
   local shutdown_response = response_object(shutdown)
-  test.assert(json.as_integer(shutdown_response:get("id")) == 2 and
-              json.is_null(shutdown_response:get("result")),
+  test.assert(wire.as_integer(shutdown_response["id"]) == 2 and
+              wire.is_null(shutdown_response["result"]),
               "shutdown response did not preserve id and null result")
 
   local exited = server:dispatch(
@@ -146,7 +175,7 @@ function test_dispatcher_validates_envelope_params_without_replying_to_notificat
 
   local shutdown = server:dispatch(
     [[{"jsonrpc":"2.0","id":3,"method":"shutdown","params":null}]])
-  test.assert(json.is_null(response_object(shutdown):get("result")),
+  test.assert(wire.is_null(response_object(shutdown)["result"]),
               "shutdown rejected interoperable null params")
   local bad_exit = server:dispatch(
     [[{"jsonrpc":"2.0","method":"exit","params":{}}]])
@@ -164,14 +193,14 @@ function test_dispatcher_enforces_lsp_request_id_domain(
   local maximum = dispatcher.create():dispatch(
     [[{"jsonrpc":"2.0","id":2147483647,"method":"initialize",]] ..
     [["params":{}}]])
-  test.assert(json.as_integer(response_object(maximum):get("id")) ==
+  test.assert(wire.as_integer(response_object(maximum)["id"]) ==
                 2147483647,
               "maximum signed 32-bit request id was rejected")
 
   local minimum = dispatcher.create():dispatch(
     [[{"jsonrpc":"2.0","id":-2147483648,"method":"initialize",]] ..
     [["params":{}}]])
-  test.assert(json.as_integer(response_object(minimum):get("id")) ==
+  test.assert(wire.as_integer(response_object(minimum)["id"]) ==
                 -2147483648,
               "minimum signed 32-bit request id was rejected")
 
@@ -179,7 +208,7 @@ function test_dispatcher_enforces_lsp_request_id_domain(
     [[{"jsonrpc":"2.0","id":2147483648,"method":"initialize",]] ..
     [["params":{}}]])
   test.assert(response_error_code(too_large) == -32600 and
-              json.is_null(response_object(too_large):get("id")),
+              wire.is_null(response_object(too_large)["id"]),
               "out-of-range positive request id was accepted")
 
   local too_small = dispatcher.create():dispatch(
@@ -188,11 +217,173 @@ function test_dispatcher_enforces_lsp_request_id_domain(
   test.assert(response_error_code(too_small) == -32600,
               "out-of-range negative request id was accepted")
 
-  local fractional = dispatcher.create():dispatch(
-    [[{"jsonrpc":"2.0","id":1.5,"method":"initialize",]] ..
-    [["params":{}}]])
-  test.assert(response_error_code(fractional) == -32600,
-              "fractional request id was accepted")
+  local noninteger_ids: {string} = {"1.5", "1.0", "1e0"}
+  for index = 1, #noninteger_ids do
+    local rejected = dispatcher.create():dispatch(
+      [[{"jsonrpc":"2.0","id":]] .. noninteger_ids[index] ..
+      [[,"method":"initialize","params":{}}]])
+    test.assert(response_error_code(rejected) == -32600 and
+                wire.is_null(response_object(rejected)["id"]),
+                "noninteger request id was accepted: " .. noninteger_ids[index])
+  end
+end
+
+function test_dispatcher_distinguishes_null_and_missing_request_ids(
+    _context: test.Context)
+  local server = dispatcher.create()
+  local root_null = server:dispatch("null")
+  test.assert(response_error_code(root_null) == -32600 and
+              wire.is_null(response_object(root_null)["id"]),
+              "a null document was treated as a notification")
+
+  local explicit_null = server:dispatch(
+    [[{"jsonrpc":"2.0","id":null,"method":"initialize","params":{}}]])
+  test.assert(response_error_code(explicit_null) == -32600 and
+              wire.is_null(response_object(explicit_null)["id"]),
+              "an explicit null request id was treated as a missing id")
+
+  local missing = server:dispatch(
+    [[{"jsonrpc":"2.0","method":"initialize","params":{}}]])
+  test.assert(missing.response == nil and
+              server:phase_name() == "before_initialize",
+              "a missing id replied or initialized the server")
+  local accepted = server:dispatch(
+    [[{"jsonrpc":"2.0","id":7,"method":"initialize","params":{}}]])
+  test.assert(wire.as_integer(response_object(accepted)["id"]) == 7 and
+              server:phase_name() == "awaiting_initialized",
+              "rejected null envelopes disrupted the next valid request")
+end
+
+function test_dispatcher_rejects_noninteger_cancellation_ids(
+    _context: test.Context)
+  local server = running_dispatcher()
+  local invalid_ids: {string} = {"1.0", "1e0", "2147483648", "null"}
+  for index = 1, #invalid_ids do
+    case server:route(
+      [[{"jsonrpc":"2.0","method":"$/cancelRequest","params":{"id":]] ..
+      invalid_ids[index] .. [[}}]])
+    when immediate: result then
+      test.assert(result.response == nil and result.exit_code == nil,
+                  "invalid cancellation id produced protocol output")
+    else
+      test.assert(false, "invalid cancellation id reached request ownership")
+    end
+  end
+  case server:route(
+    [[{"jsonrpc":"2.0","method":"$/cancelRequest","params":{"id":1}}]])
+  when cancel: id then
+    test.assert(id:equals(dispatcher.RequestId.integer_id(1)),
+                "integer cancellation id changed during routing")
+  else
+    test.assert(false, "valid cancellation was lost after rejected ids")
+  end
+end
+
+function test_dispatcher_classifies_numeric_range_errors_and_recovers(
+    _context: test.Context)
+  local server = dispatcher.create()
+  local out_of_range: {string} = {
+    "9223372036854775808", "1e9999", "1e-9999",
+  }
+  for index = 1, #out_of_range do
+    local rejected = server:dispatch(
+      [[{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"n":]] ..
+      out_of_range[index] .. [[}}]])
+    test.assert(response_error_code(rejected) == -32600 and
+                wire.is_null(response_object(rejected)["id"]),
+                "unrepresentable JSON number did not return Invalid Request")
+  end
+
+  local malformed: {string} = {"1e", "01", "1."}
+  for index = 1, #malformed do
+    local rejected = server:dispatch(
+      [[{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"n":]] ..
+      malformed[index] .. [[}}]])
+    test.assert(response_error_code(rejected) == -32700 and
+                wire.is_null(response_object(rejected)["id"]),
+                "malformed JSON number did not return Parse error")
+  end
+
+  test.assert(server:phase_name() == "before_initialize",
+              "rejected JSON changed the lifecycle")
+  local accepted = server:dispatch(
+    [[{"jsonrpc":"2.0","id":9,"method":"initialize","params":{}}]])
+  test.assert(wire.as_integer(response_object(accepted)["id"]) == 9 and
+              response_object(accepted)["error"] == nil,
+              "numeric JSON rejection disrupted a later valid request")
+end
+
+function test_dispatcher_encodes_nil_and_false_semantic_results(
+    _context: test.Context)
+  local id = dispatcher.RequestId.integer_id(17)
+  local absent = response_object(dispatcher.result_response(id, nil))
+  test.assert(absent["result"] ~= nil and wire.is_null(absent["result"]) and
+              wire.as_integer(absent["id"]) == 17 and absent["error"] == nil,
+              "a nil semantic result omitted the required null result")
+  local flag = response_object(dispatcher.result_response(id, false))
+  test.assert(wire.as_boolean(flag["result"]) == false and
+              flag["error"] == nil,
+              "a false semantic result was changed to null or omitted")
+end
+
+function test_dispatcher_falls_back_for_unencodable_results_and_error_text(
+    _context: test.Context)
+  local integer_id = dispatcher.RequestId.integer_id(17)
+  local cyclic: wire.Object = {}
+  cyclic["self"] = cyclic
+  assert_internal_error(
+    response_object(dispatcher.result_response(integer_id, cyclic)), integer_id)
+
+  local string_id = dispatcher.RequestId.string_id("saved-file")
+  local malformed: wire.Object = {
+    ["uri"] = "file:///workspace/" .. strings.char(0xff),
+  }
+  assert_internal_error(
+    response_object(dispatcher.result_response(string_id, malformed)), string_id)
+  assert_internal_error(response_object(dispatcher.failure_response(
+    string_id, -32602, "invalid path: " .. strings.char(0xff))), string_id)
+
+  local recovered = response_object(dispatcher.result_response(string_id, "ok"))
+  test.assert(wire.as_string(recovered["result"]) == "ok" and
+              recovered["error"] == nil,
+              "encoding failure disrupted a later semantic result")
+end
+
+function test_dispatcher_fallback_preserves_the_largest_accepted_string_id(
+    _context: test.Context)
+  local input_limit = 16 * 1024 * 1024
+  local prefix = [[{"jsonrpc":"2.0","id":"]]
+  local suffix = [[","method":"x"}]]
+  local text_id = strings.rep("x", input_limit - #prefix - #suffix)
+  local input = framing.reader()
+  input:feed(framing.frame(prefix .. text_id .. suffix))
+  local body? = input:next()
+  test.assert(body ~= nil and #body == input_limit and input:next() == nil,
+              "maximum-sized request did not pass the input framing boundary")
+
+  local server = running_dispatcher()
+  case server:route(body)
+  when semantic: request then
+    test.assert(request.id:to_json() == text_id,
+                "maximum-sized string id was not accepted intact")
+    local fallback = dispatcher.failure_response(
+      request.id, -32602, strings.char(0xff))
+    test.assert(fallback.response ~= nil, "maximum-id fallback was dropped")
+    local response: string = fallback.response
+    test.assert(#response > input_limit and #response <= input_limit + 4096,
+                "maximum-id fallback did not fit the reserved output budget")
+    -- Response envelopes have an explicit reserve beyond the input frame
+    -- limit. Decode with that allowance instead of the request-only decoder.
+    local decoded = json.decode(response, nil,
+      json.DecodeOption.max_bytes(input_limit + 4096))
+    local object? = wire.as_object(decoded)
+    test.assert(object ~= nil, "maximum-id fallback was not a JSON object")
+    assert_internal_error(object, request.id)
+    test.assert(wire.as_string(object["id"]) == text_id,
+                "maximum-id fallback truncated or changed the accepted id")
+  else
+    test.assert(false, "maximum-sized valid request was not routed")
+  end
 end
 
 function test_dispatcher_processes_a_coalesced_framed_transcript(
@@ -209,9 +400,9 @@ function test_dispatcher_processes_a_coalesced_framed_transcript(
   local second_body? = input:next()
   local first = server:dispatch(first_body)
   local second = server:dispatch(second_body)
-  test.assert(json.as_integer(response_object(first):get("id")) == 1,
+  test.assert(wire.as_integer(response_object(first)["id"]) == 1,
               "first coalesced request was not dispatched first")
-  test.assert(json.as_integer(response_object(second):get("id")) == 2,
+  test.assert(wire.as_integer(response_object(second)["id"]) == 2,
               "second coalesced request was lost or reordered")
   test.assert(input:next() == nil,
               "coalesced transcript left an unexpected third frame")

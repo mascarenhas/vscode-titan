@@ -4,24 +4,22 @@ local strings = import "string"
 local coordinator = import "server.coordinator"
 local dispatcher = import "server.dispatcher"
 local framing = import "server.framing"
-local json = import "server.json"
+local wire = import "server.wire"
 local protocol = import "server.protocol"
 local test_runtime = import "server.test_runtime"
 
-local function response_object(source: string): json.Object
-  local parsed?, failure? = json.parse(source)
-  test.assert(failure == nil and parsed ~= nil,
-              "protocol writer emitted malformed JSON")
-  local object? = json.as_object(parsed)
+local function response_object(source: string): wire.Object
+  local parsed = wire.decode(source)
+  local object? = wire.as_object(parsed)
   test.assert(object ~= nil, "protocol response was not an object")
   return object
 end
 
 local function response_error_code(source: string): integer
   local object = response_object(source)
-  local failure? = json.as_object(object:get("error"))
+  local failure? = wire.as_object(object["error"])
   test.assert(failure ~= nil, "protocol response had no error object")
-  local code? = json.as_integer(failure:get("code"))
+  local code? = wire.as_integer(failure["code"])
   test.assert(code ~= nil, "protocol error had no integer code")
   return code
 end
@@ -51,7 +49,7 @@ local function runs_reader_coordinator_and_single_writer()
   local handler: coordinator.SemanticHandler = function (
       _request: dispatcher.SemanticRequest): dispatcher.SemanticOutcome
     while true do timer.yield() end
-    return dispatcher.SemanticOutcome.result(json.null())
+    return dispatcher.SemanticOutcome.result(wire.null())
   end
 
   test.assert(protocol.run(
@@ -86,25 +84,25 @@ local function runs_reader_coordinator_and_single_writer()
   local diagnostic_clear = response_object(frames:next())
   local shutdown_response = response_object(frames:next())
 
-  test.assert(json.as_integer(initialize_response:get("id")) == 1,
+  test.assert(wire.as_integer(initialize_response["id"]) == 1,
               "initialize response was lost or reordered")
   test.assert(initialized_calls == 1 and
-              json.as_string(indexing_notification:get("method")) ==
+              wire.as_string(indexing_notification["method"]) ==
                 "titan/indexingStatus",
               "initialized hook did not publish its server notification")
   test.assert(response_error_code(cancellation_response) == -32800 and
-              json.as_string(
-                response_object(cancellation_response):get("id")) == "work",
+              wire.as_string(
+                response_object(cancellation_response)["id"]) == "work",
               "queued cancellation response was malformed")
-  local diagnostic_params? = json.as_object(diagnostic_clear:get("params"))
-  local cleared? = json.as_array(diagnostic_params:get("diagnostics"))
+  local diagnostic_params? = wire.as_object(diagnostic_clear["params"])
+  local cleared? = wire.as_array(diagnostic_params["diagnostics"])
   test.assert(shutdown_calls == 1 and
-              json.as_string(diagnostic_clear:get("method")) ==
+              wire.as_string(diagnostic_clear["method"]) ==
                 "textDocument/publishDiagnostics" and
-              cleared ~= nil and #cleared.items == 0,
+              cleared ~= nil and #cleared == 0,
               "shutdown did not queue the diagnostic clear before replying")
-  test.assert(json.as_integer(shutdown_response:get("id")) == 2 and
-              json.is_null(shutdown_response:get("result")),
+  test.assert(wire.as_integer(shutdown_response["id"]) == 2 and
+              wire.is_null(shutdown_response["result"]),
               "shutdown response was lost or reordered")
   test.assert(frames:next() == nil and frames:pending_bytes() == 0,
               "single protocol writer emitted an extra or partial frame")
@@ -135,7 +133,7 @@ local function reports_eof_before_exit()
 
   local frames = framing.reader()
   frames:feed(output:drain())
-  test.assert(json.as_integer(response_object(frames:next()):get("id")) == 1,
+  test.assert(wire.as_integer(response_object(frames:next())["id"]) == 1,
               "writer did not flush the accepted response before EOF failure")
   test.assert(frames:next() == nil,
               "EOF failure produced an unexpected protocol response")
@@ -143,4 +141,43 @@ end
 
 function test_protocol_reports_eof_before_exit(_context: test.Context)
   test_runtime.run(reports_eof_before_exit)
+end
+
+local function recovers_after_rejected_json_bodies()
+  local bodies: {string} = {
+    [[{"jsonrpc":"2.0","id":1,"id":2}]],
+    [[{"method":"]] .. strings.char(0xff) .. [["}]],
+    "null",
+    [[{"jsonrpc":"2.0","id":null,"method":"initialize","params":{}}]],
+    [[{"jsonrpc":"2.0","id":"café","method":"initialize","params":{}}]],
+    [[{"jsonrpc":"2.0","method":"initialized","params":{}}]],
+    [[{"jsonrpc":"2.0","id":2,"method":"shutdown","params":null}]],
+    [[{"jsonrpc":"2.0","method":"exit","params":null}]],
+  }
+  local input = strings.writer()
+  for index = 1, #bodies do input:write(framing.frame(bodies[index])) end
+  local output = strings.writer()
+  test.assert(protocol.run(strings.reader(input:drain()), output) == 0,
+              "rejected JSON body prevented orderly protocol shutdown")
+
+  local frames = framing.reader()
+  frames:feed(output:drain())
+  local expected: {integer} = {-32700, -32700, -32600, -32600}
+  for index = 1, #expected do
+    local response = frames:next()
+    test.assert(response_error_code(response) == expected[index] and
+                wire.is_null(response_object(response)["id"]),
+                "rejected JSON body changed its error category or null id")
+  end
+  local initialized = response_object(frames:next())
+  test.assert(wire.as_string(initialized["id"]) == "café",
+              "protocol lost its byte-framed Unicode id after rejected input")
+  local shutdown = response_object(frames:next())
+  test.assert(wire.as_integer(shutdown["id"]) == 2 and
+              wire.is_null(shutdown["result"]) and frames:next() == nil,
+              "protocol did not preserve null lifecycle results after recovery")
+end
+
+function test_protocol_recovers_after_rejected_json_bodies(_context: test.Context)
+  test_runtime.run(recovers_after_rejected_json_bodies)
 end

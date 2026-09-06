@@ -1,6 +1,7 @@
 local async = import "async"
+local iteration = import "iteration"
 local os = import "os"
-local json = import "server.json"
+local wire = import "server.wire"
 local response_queue = import "server.response_queue"
 
 -- Structured diagnostics are always written to stderr. The leading component
@@ -65,19 +66,18 @@ end
 -- Debug records must stay useful without becoming proportional to the size of
 -- a large project. Keep both the encoded record and the eager work performed
 -- by a disabled logging call bounded while retaining the complete item count.
-function summarize_strings(items: {string}): json.Value
-  local sample: {json.Value} = {}
+function summarize_strings(items: {string}): wire.Object
+  local sample: wire.Array = {}
   local limit = #items
   if limit > STRING_SAMPLE_LIMIT then limit = STRING_SAMPLE_LIMIT end
   for index = 1, limit do
-    sample[index] = json.from_string(items[index])
+    sample[index] = items[index]
   end
-  return json.from_object({
-    json.Member.new("count", json.from_integer(#items)),
-    json.Member.new("sample", json.from_array(sample)),
-    json.Member.new("truncated", json.from_boolean(
-      #items > STRING_SAMPLE_LIMIT)),
-  })
+  return {
+    ["count"] = #items,
+    ["sample"] = sample,
+    ["truncated"] = #items > STRING_SAMPLE_LIMIT,
+  }
 end
 
 local function write_records(queue: response_queue.ResponseQueue): nil
@@ -120,19 +120,19 @@ function close()
 end
 
 function format(level: string, event: string,
-                fields: {json.Member}?): string?
+                fields: wire.Object?): string?
   do
     if not enabled(level) then return nil end
-    local members: {json.Member} = {
-      json.Member.new("level", json.from_string(level)),
-      json.Member.new("event", json.from_string(event)),
+    local entry: wire.Object = {
+      ["level"] = level,
+      ["event"] = event,
     }
     if fields ~= nil then
-      for index = 1, #fields do
-        members[#members + 1] = fields[index]
+      for key, item in iteration.pairs<string, value>(fields) do
+        entry[key] = item
       end
     end
-    return "titan-language-server " .. json.encode(json.from_object(members))
+    return "titan-language-server " .. wire.encode(entry)
   catch
     -- Diagnostic data can originate in filesystem/native errors and is not
     -- guaranteed to be valid UTF-8. A malformed optional log record must never
@@ -142,7 +142,7 @@ function format(level: string, event: string,
   end
 end
 
-function emit(level: string, event: string, fields: {json.Member}?)
+function emit(level: string, event: string, fields: wire.Object?)
   do
     local rendered? = format(level, event, fields)
     local queue? = output

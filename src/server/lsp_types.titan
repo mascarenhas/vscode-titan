@@ -1,4 +1,4 @@
-local json = import "server.json"
+local wire = import "server.wire"
 local source_text = import "server.source_text"
 local strings = import "string"
 
@@ -52,50 +52,50 @@ local function invalid<T>(message: string): (T?, Error?)
   return nil, Error.new(INVALID_PARAMS, message)
 end
 
-local function required_object(candidate: json.Value?, subject: string):
-    (json.Object?, Error?)
+local function required_object(candidate: value, subject: string):
+    (wire.Object?, Error?)
   if candidate == nil then
-    return invalid<json.Object>(subject .. " must be an object")
+    return invalid<wire.Object>(subject .. " must be an object")
   end
-  local object? = json.as_object(candidate)
+  local object? = wire.as_object(candidate)
   if object == nil then
-    return invalid<json.Object>(subject .. " must be an object")
+    return invalid<wire.Object>(subject .. " must be an object")
   end
   return object, nil
 end
 
-local function required_member(object: json.Object, key: string,
-                               subject: string): (json.Value?, Error?)
-  local candidate? = object:get(key)
+local function required_member(object: wire.Object, key: string,
+                               subject: string): (value, Error?)
+  local candidate? = object[key]
   if candidate == nil then
-    return invalid<json.Value>(subject .. "." .. key .. " is required")
+    return invalid<value>(subject .. "." .. key .. " is required")
   end
   return candidate, nil
 end
 
-local function required_string(object: json.Object, key: string,
+local function required_string(object: wire.Object, key: string,
                                subject: string): (string?, Error?)
   local candidate?, failure? = required_member(object, key, subject)
   if candidate == nil then return nil, failure end
-  local result? = json.as_string(candidate)
+  local result? = wire.as_string(candidate)
   if result == nil then
     return invalid<string>(subject .. "." .. key .. " must be a string")
   end
   return result, nil
 end
 
-local function required_integer(object: json.Object, key: string,
+local function required_integer(object: wire.Object, key: string,
                                 subject: string): (integer?, Error?)
   local candidate?, failure? = required_member(object, key, subject)
   if candidate == nil then return nil, failure end
-  local result? = json.as_integer(candidate)
+  local result? = wire.as_integer(candidate)
   if result == nil then
     return invalid<integer>(subject .. "." .. key .. " must be an integer")
   end
   return result, nil
 end
 
-function parse_document(params: json.Value?): (TextDocument?, Error?)
+function parse_document(params: value): (TextDocument?, Error?)
   local object?, object_error? = required_object(params, "params")
   if object == nil then return nil, object_error end
 
@@ -119,11 +119,11 @@ function parse_document(params: json.Value?): (TextDocument?, Error?)
   return TextDocument.new(uri, path), nil
 end
 
-local function parse_document_position_or_error(params: json.Value?):
+local function parse_document_position_or_error(params: value):
     (DocumentPosition?, Error?)
   local document?, document_error? = parse_document(params)
   if document == nil then return nil, document_error end
-  local object? = json.as_object(params)
+  local object? = wire.as_object(params)
 
   local raw_position?, position_error? =
     required_member(object, "position", "params")
@@ -147,15 +147,15 @@ local function parse_document_position_or_error(params: json.Value?):
     source_text.Position.new(line, character)), nil
 end
 
-function parse_document_position(params: json.Value?):
+function parse_document_position(params: value):
     (DocumentPosition?, Error?)
   return parse_document_position_or_error(params)
 end
 
-function parse_references(params: json.Value?): (ReferencesParams?, Error?)
+function parse_references(params: value): (ReferencesParams?, Error?)
   local document?, document_error? = parse_document_position_or_error(params)
   if document == nil then return nil, document_error end
-  local object? = json.as_object(params)
+  local object? = wire.as_object(params)
   local raw_context?, context_error? =
     required_member(object, "context", "params")
   if raw_context == nil then return nil, context_error end
@@ -165,7 +165,7 @@ function parse_references(params: json.Value?): (ReferencesParams?, Error?)
   local raw_include?, include_error? =
     required_member(context, "includeDeclaration", "params.context")
   if raw_include == nil then return nil, include_error end
-  local include? = json.as_boolean(raw_include)
+  local include? = wire.as_boolean(raw_include)
   if include == nil then
     return invalid<ReferencesParams>(
       "params.context.includeDeclaration must be a boolean")
@@ -209,10 +209,10 @@ function valid_identifier(name: string): boolean
   return true
 end
 
-function parse_rename(params: json.Value?): (RenameParams?, Error?)
+function parse_rename(params: value): (RenameParams?, Error?)
   local document?, document_error? = parse_document_position_or_error(params)
   if document == nil then return nil, document_error end
-  local object? = json.as_object(params)
+  local object? = wire.as_object(params)
   local name?, name_error? = required_string(object, "newName", "params")
   if name == nil then return nil, name_error end
   if not valid_identifier(name) then
@@ -222,106 +222,59 @@ function parse_rename(params: json.Value?): (RenameParams?, Error?)
   return RenameParams.new(document, name), nil
 end
 
-function position_value(position: source_text.Position): json.Value
-  return json.from_object({
-    json.Member.new("line", json.from_integer(position.line)),
-    json.Member.new("character", json.from_integer(position.character)),
-  })
+function position_value(position: source_text.Position): wire.Object
+  return {["line"] = position.line, ["character"] = position.character}
 end
 
-function range_value(span: source_text.Span): json.Value
-  return json.from_object({
-    json.Member.new("start", position_value(span.start)),
-    json.Member.new("end", position_value(span.finish)),
-  })
+function range_value(span: source_text.Span): wire.Object
+  return {["start"] = position_value(span.start), ["end"] = position_value(span.finish)}
 end
 
-function location_value(uri: string, span: source_text.Span): json.Value
-  return json.from_object({
-    json.Member.new("uri", json.from_string(uri)),
-    json.Member.new("range", range_value(span)),
-  })
+function location_value(uri: string, span: source_text.Span): wire.Object
+  return {["uri"] = uri, ["range"] = range_value(span)}
 end
 
-function text_edit_value(edit: TextEdit): json.Value
-  return json.from_object({
-    json.Member.new("range", range_value(edit.range)),
-    json.Member.new("newText", json.from_string(edit.new_text)),
-  })
+function text_edit_value(edit: TextEdit): wire.Object
+  return {["range"] = range_value(edit.range), ["newText"] = edit.new_text}
 end
 
-local function bytewise_less(left: string, right: string): boolean
-  local limit = #left
-  if #right < limit then limit = #right end
-  for index = 1, limit do
-    local left_byte: integer = strings.byte(left, index)
-    local right_byte: integer = strings.byte(right, index)
-    if left_byte < right_byte then return true end
-    if left_byte > right_byte then return false end
-  end
-  return #left < #right
-end
-
-local function sorted_documents(documents: {DocumentEdits}): {DocumentEdits}
-  local result: {DocumentEdits} = {}
+function workspace_edit_value(documents: {DocumentEdits}): wire.Object
+  local changes: wire.Object = {}
   for index = 1, #documents do
-    local item = documents[index]
-    local target = #result + 1
-    while target > 1 and bytewise_less(item.uri, result[target - 1].uri) do
-      result[target] = result[target - 1]
-      target = target - 1
+    local document = documents[index]
+    local edits: wire.Array = {}
+    for edit_index = 1, #document.edits do
+      edits[edit_index] = text_edit_value(document.edits[edit_index])
     end
-    result[target] = item
+    changes[document.uri] = edits
+  end
+  return {["changes"] = changes}
+end
+
+function hover_value(markdown: string, span: source_text.Span?): wire.Object
+  local contents: wire.Object = {["kind"] = "markdown", ["value"] = markdown}
+  local result: wire.Object = {
+    ["contents"] = contents,
+  }
+  if span ~= nil then
+    result["range"] = range_value(span)
   end
   return result
 end
 
-function workspace_edit_value(documents: {DocumentEdits}): json.Value
-  local changes: {json.Member} = {}
-  local ordered = sorted_documents(documents)
-  for index = 1, #ordered do
-    local document = ordered[index]
-    local edits: {json.Value} = {}
-    for edit_index = 1, #document.edits do
-      edits[edit_index] = text_edit_value(document.edits[edit_index])
-    end
-    changes[#changes + 1] = json.Member.new(
-      document.uri, json.from_array(edits))
-  end
-  return json.from_object({
-    json.Member.new("changes", json.from_object(changes)),
-  })
-end
-
-function hover_value(markdown: string, span: source_text.Span?): json.Value
-  local members: {json.Member} = {
-    json.Member.new("contents", json.from_object({
-      json.Member.new("kind", json.from_string("markdown")),
-      json.Member.new("value", json.from_string(markdown)),
-    })),
-  }
-  if span ~= nil then
-    members[#members + 1] = json.Member.new("range", range_value(span))
-  end
-  return json.from_object(members)
-end
-
-function folding_range_value(range: FoldingRange): json.Value
-  local members: {json.Member} = {
-    json.Member.new("startLine", json.from_integer(range.start_line)),
-    json.Member.new("endLine", json.from_integer(range.end_line)),
+function folding_range_value(range: FoldingRange): wire.Object
+  local result: wire.Object = {
+    ["startLine"] = range.start_line,
+    ["endLine"] = range.end_line,
   }
   if range.start_character ~= nil then
-    members[#members + 1] = json.Member.new(
-      "startCharacter", json.from_integer(range.start_character))
+    result["startCharacter"] = range.start_character
   end
   if range.end_character ~= nil then
-    members[#members + 1] = json.Member.new(
-      "endCharacter", json.from_integer(range.end_character))
+    result["endCharacter"] = range.end_character
   end
   if range.kind ~= nil then
-    members[#members + 1] = json.Member.new(
-      "kind", json.from_string(range.kind))
+    result["kind"] = range.kind
   end
-  return json.from_object(members)
+  return result
 end

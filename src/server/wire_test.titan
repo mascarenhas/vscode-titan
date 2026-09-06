@@ -1,0 +1,94 @@
+local test = import "test"
+local json = import "json"
+local strings = import "string"
+local wire = import "server.wire"
+
+function test_wire_preserves_nulls_and_absent_members(_context: test.Context)
+  local object: wire.Object = wire.decode(
+    [[{"present":null,"items":[null,false,null]}]])
+  test.assert(object["missing"] == nil and object["present"] ~= nil and
+              wire.is_null(object["present"]),
+              "missing and explicit null members became indistinguishable")
+  local items: wire.Array = object["items"]
+  test.assert(#items == 3 and wire.is_null(items[1]) and
+              wire.as_boolean(items[2]) == false and wire.is_null(items[3]),
+              "decoding lost null array positions or false")
+  test.assert(wire.encode(object) ==
+                [[{"items":[null,false,null],"present":null}]],
+              "null preservation or deterministic object encoding changed")
+  test.assert(wire.is_null(wire.decode("null")) and
+              wire.encode(wire.null()) == "null" and
+              not wire.is_null(nil),
+              "the shared null token did not distinguish null from absence")
+end
+
+function test_wire_preserves_empty_container_shapes(_context: test.Context)
+  local array: wire.Array = {}
+  local object: wire.Object = {}
+  test.assert(wire.encode(array) == "[]" and wire.encode(object) == "{}",
+              "empty native containers lost their wire shapes")
+  test.assert(wire.as_array(wire.decode("[]")) ~= nil and
+              wire.as_object(wire.decode("[]")) == nil and
+              wire.as_object(wire.decode("{}")) ~= nil and
+              wire.as_array(wire.decode("{}")) == nil,
+              "container extraction confused objects and arrays")
+end
+
+function test_wire_extracts_strict_scalar_tags(_context: test.Context)
+  test.assert(wire.as_integer(wire.decode("1")) == 1 and
+              wire.as_integer(wire.decode("1.0")) == nil and
+              wire.as_integer(wire.decode("1e0")) == nil,
+              "integer extraction accepted a floating JSON token")
+  test.assert(wire.as_boolean(wire.decode("false")) == false and
+              wire.as_boolean(wire.decode("true")) == true and
+              wire.as_boolean(0) == nil and wire.as_boolean("") == nil and
+              wire.as_boolean(wire.null()) == nil,
+              "boolean extraction performed truthiness conversion")
+  test.assert(wire.as_string("text") == "text" and
+              wire.as_string(1) == nil and wire.as_integer("1") == nil,
+              "scalar extraction coerced strings or numbers")
+end
+
+local function rejected_code(source: string): string
+  wire.decode(source)
+  return "accepted"
+catch
+  if error is json.Error then
+    local failure: json.Error = error
+    return failure.code
+  end
+  raise
+end
+
+function test_wire_preserves_128_levels_of_input_nesting(_context: test.Context)
+  local arrays = strings.rep("[", 128) .. "0" .. strings.rep("]", 128)
+  local objects = strings.rep([[{"x":]], 128) .. "0" .. strings.rep("}", 128)
+  test.assert(wire.encode(wire.decode(arrays)) == arrays and
+              wire.encode(wire.decode(objects)) == objects,
+              "migration reduced the accepted container nesting depth")
+  local mixed = "0"
+  for depth = 1, 128 do
+    if depth % 2 == 0 then
+      mixed = [[{"a":false,"x":]] .. mixed .. [[,"z":null}]]
+    else
+      mixed = "[false," .. mixed .. ",null]"
+    end
+  end
+  test.assert(wire.encode(wire.decode(mixed)) == mixed,
+              "sibling alternatives exhausted the application PEG stack")
+  test.assert(rejected_code("[" .. arrays .. "]") == "limit_exceeded" and
+              rejected_code([[{"x":]] .. objects .. "}") == "limit_exceeded",
+              "configured nesting limit did not reject depth 129")
+end
+
+function test_wire_uses_the_framing_byte_budget(_context: test.Context)
+  local beyond_frame = strings.rep(" ", 16 * 1024 * 1024) .. "0"
+  test.assert(rejected_code(beyond_frame) == "limit_exceeded",
+              "wire decoding accepted a body above the framing byte budget")
+  -- This is below the byte budget but above the stdlib's default node limit.
+  -- Framing remains the server's resource boundary for otherwise valid input.
+  local source = "[" .. strings.rep("0,", 1000000) .. "0]"
+  local items: wire.Array = wire.decode(source)
+  test.assert(#items == 1000001,
+              "the stdlib default node budget reduced accepted frame contents")
+end
