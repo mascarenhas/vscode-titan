@@ -4,7 +4,8 @@
 #include "lua.h"
 
 /* Register Titan's metadata-free compiler support table as package.preload
- * "titan", then push the metadata-only standard-library interface provider.
+ * "titan", then push the metadata-only standard-library interface provider
+ * and its declarative build target profile.
  * This neither initializes nor registers any of the native titan.* modules. */
 int titan_ls_push_embedded_interface_provider(lua_State *L);
 

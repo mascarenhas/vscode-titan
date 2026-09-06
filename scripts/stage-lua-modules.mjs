@@ -8,7 +8,7 @@ const EXPECTED_COMPILER_VERSION = {
   TITAN_ABI_VERSION: "2",
   TITAN_VERSION: "0.6.0"
 };
-const EXPECTED_LANGUAGE_SERVER_API_VERSION = 4;
+const EXPECTED_LANGUAGE_SERVER_API_VERSION = 5;
 const EXPECTED_SHARE_ROOT = [
   "argparse.lua:file",
   "c-parser:directory",

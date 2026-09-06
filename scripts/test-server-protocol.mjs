@@ -849,12 +849,35 @@ async function testSelfContainedCompilerModules() {
   const lines = [
     'local strings = import "string"',
     'local http = import "http"',
+    'local reflect = import "reflect"',
+    'local json = import "json"',
+    'local sqlite3 = import "sqlite3"',
     "",
     "function render(item: string): string",
     "  return strings.upper(item)",
     "end",
     "function request_scheme(request: http.Request): string",
     "  return request.url.scheme",
+    "end",
+    "function reflected_fields(descriptor: reflect.RecordType): " +
+      "const { reflect.FieldType }",
+    "  return descriptor.fields",
+    "end",
+    "function call_reflected(callback: reflect.LuaCFunctionValue): integer",
+    "  local result: integer = callback.entry(L)",
+    "  return result",
+    "end",
+    "function encode_json(subject: value, option: json.EncodeOption): string",
+    "  return json.encode(subject, option, json.EncodeOption.max_depth(8))",
+    "end",
+    "function decode_json(source: string): value",
+    "  return json.decode(source, nil, json.DecodeOption.max_depth(8))",
+    "end",
+    "function sqlite_columns(cursor: sqlite3.Cursor): const { sqlite3.Column }",
+    "  return cursor.columns",
+    "end",
+    "function sqlite_value(row: sqlite3.Row, index: integer): value",
+    "  return row:get(index)",
     "end",
     "function use(): string",
     '  return render("titan")',
@@ -914,6 +937,48 @@ async function testSelfContainedCompilerModules() {
         JSON.stringify(responses.diagnosticPublications)
       }`
     );
+    for (const probe of [
+      {
+        module: "reflect",
+        name: "reflected_fields",
+        types: [/titan\.reflect\.RecordType/, /const/, /titan\.reflect\.FieldType/]
+      },
+      {
+        module: "json",
+        name: "encode_json",
+        types: [/titan\.json\.EncodeOption/, /string/]
+      },
+      {
+        module: "json-decode",
+        name: "decode",
+        prefix: "  return json.decode(",
+        types: [/titan\.reflect\.Type/, /titan\.json\.DecodeOption/]
+      },
+      {
+        module: "sqlite3",
+        name: "sqlite_columns",
+        types: [/titan\.sqlite3\.Cursor/, /const/, /titan\.sqlite3\.Column/]
+      }
+    ]) {
+      const line = lines.findIndex(
+        (source) => source.startsWith(probe.prefix ?? `function ${probe.name}(`)
+      );
+      assert.ok(line >= 0);
+      const character = lines[line].indexOf(probe.name) + 1;
+      assert.ok(character > 0);
+      const hover = await semanticRequest(
+        child,
+        responses,
+        `self-contained-${probe.module}-hover`,
+        "textDocument/hover",
+        { textDocument: { uri }, position: { line, character } }
+      );
+      assert.equal(hover.error, undefined, JSON.stringify(hover.error));
+      assert.ok(hover.result, `packaged ${probe.module} interface has no hover`);
+      for (const type of probe.types) {
+        assert.match(hover.result.contents.value, type);
+      }
+    }
     assert.ok(
       responses.diagnosticPublications.every(
         (publication) => publication.diagnostics.length === 0
