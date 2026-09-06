@@ -6,8 +6,13 @@ local lsp = import "server.lsp_types"
 local project_service = import "server.project_service"
 local source_text = import "server.source_text"
 
+union Kind
+  compiler: bridge.DiagnosticKind
+  unmapped_source
+end
+
 record Item
-  const kind: bridge.DiagnosticKind
+  const kind: Kind
   const message: string
   const range: source_text.Span
 end
@@ -50,11 +55,22 @@ local function notify(listener: Listener, publication: Publication)
   do listener(publication) catch end
 end
 
-local function diagnostic_code(kind: bridge.DiagnosticKind): string
+local function diagnostic_code(kind: Kind): string
   case kind
-  when syntax then return "syntax"
-  when type_error then return "type"
-  when compiler then return "compiler"
+  when compiler: compiler_kind then
+    case compiler_kind
+    when syntax then return "syntax"
+    when type_error then return "type"
+    when compiler then return "compiler"
+    end
+  when unmapped_source then return "unmapped-source"
+  end
+end
+
+local function diagnostic_severity(kind: Kind): integer
+  case kind
+  when compiler then return 1
+  when unmapped_source then return 2
   end
 end
 
@@ -76,7 +92,7 @@ function notification(publication: Publication): string
     local item = publication.items[index]
     local diagnostic: wire.Object = {
       ["range"] = lsp.range_value(item.range),
-      ["severity"] = 1,
+      ["severity"] = diagnostic_severity(item.kind),
       ["code"] = diagnostic_code(item.kind),
       ["source"] = "Titan",
       ["message"] = item.message,
@@ -170,7 +186,7 @@ local function build(snapshot: project_service.Snapshot,
         local diagnostic = file.diagnostics[diagnostic_index]
         local position = position_for_diagnostic(coordinates, diagnostic)
         local candidate = Item.new(
-          diagnostic.kind, diagnostic.message,
+          Kind.compiler(diagnostic.kind), diagnostic.message,
           source_text.Span.new(position, position))
         local key = item_key(candidate)
         if not seen[key] then
@@ -182,6 +198,20 @@ local function build(snapshot: project_service.Snapshot,
       if uri ~= nil then
         publications[#publications + 1] = Publication.new(uri, items)
       end
+    end
+  end
+  for issue_index = 1, #snapshot.discovery_issues do
+    local issue = snapshot.discovery_issues[issue_index]
+    case issue.kind
+    when unmapped_source then
+      local uri?, uri_error? = source_text.path_to_file_uri(issue.path)
+      if uri ~= nil then
+        local position = source_text.Position.new(0, 0)
+        local item = Item.new(Kind.unmapped_source(), issue.message,
+                             source_text.Span.new(position, position))
+        publications[#publications + 1] = Publication.new(uri, {item})
+      end
+    else
     end
   end
   return publications

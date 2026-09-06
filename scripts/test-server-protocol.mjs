@@ -208,8 +208,12 @@ function validateDiagnosticPublication(params) {
   assert.ok(Array.isArray(params.diagnostics));
   for (const diagnostic of params.diagnostics) {
     assert.ok(diagnostic !== null && typeof diagnostic === "object");
-    assert.equal(diagnostic.severity, 1);
-    assert.ok(["syntax", "type", "compiler"].includes(diagnostic.code));
+    if (diagnostic.code === "unmapped-source") {
+      assert.equal(diagnostic.severity, 2);
+    } else {
+      assert.ok(["syntax", "type", "compiler"].includes(diagnostic.code));
+      assert.equal(diagnostic.severity, 1);
+    }
     assert.equal(diagnostic.source, "Titan");
     assert.equal(typeof diagnostic.message, "string");
     for (const position of [
@@ -824,6 +828,97 @@ async function testSavedProjectSemantics() {
     const shutdownClear = await nextDiagnosticPublication(responses);
     assert.equal(shutdownClear.uri, uri);
     assert.deepEqual(shutdownClear.diagnostics, []);
+    child.stdin.write(frame({ jsonrpc: "2.0", method: "exit" }));
+    assert.deepEqual(await awaitExit(exit), { code: 0, signal: null });
+    await responses.finish();
+    assert.equal(stderr().length, 0, stderr().toString("utf8"));
+    assert.equal(responses.buffer.length, 0, "unexpected bytes after responses");
+  } catch (cause) {
+    const diagnostic = stderr().toString("utf8").trim();
+    throw new Error(
+      `${cause.message}${diagnostic.length > 0 ? `; stderr: ${diagnostic}` : ""}`,
+      { cause }
+    );
+  } finally {
+    if (child.exitCode === null && child.signalCode === null) child.kill();
+    await rm(root, { recursive: true, force: true });
+  }
+}
+
+async function testUnmappedSourceWarnings() {
+  const root = await makePhysicalTemporaryRoot("vscode-titan-unmapped-");
+  const sourceRoot = path.join(root, "src");
+  const mappedFile = path.join(sourceRoot, "main.titan");
+  const unmappedFile = path.join(root, "loose.titan");
+  const unmappedUri = pathToFileURL(unmappedFile).href;
+  await mkdir(sourceRoot);
+  await writeFile(
+    path.join(root, "titan-config.lua"),
+    'include = { "." }\nsource_module_roots = { "src" }\n',
+    "utf8"
+  );
+  await writeFile(
+    mappedFile,
+    "function answer(): integer return 1 end\n",
+    "utf8"
+  );
+  // Invalid unmapped bytes must produce only a discovery warning; they are
+  // excluded from the compiler and from saved semantic navigation.
+  await writeFile(unmappedFile, "function outside(\n", "utf8");
+
+  const child = launch(root);
+  const exit = exitOf(child);
+  const stderr = collect(child.stderr);
+  const responses = new FrameReader(child.stdout);
+  try {
+    const initialized = await request(child, responses, 1, "initialize", {});
+    assert.equal(initialized.error, undefined);
+    child.stdin.write(frame({
+      jsonrpc: "2.0",
+      method: "initialized",
+      params: {}
+    }));
+    await waitForIndexing(responses);
+    const warning = await nextDiagnosticPublication(responses);
+    assert.equal(warning.uri, unmappedUri);
+    assert.equal(warning.diagnostics.length, 1);
+    assert.equal(warning.diagnostics[0].severity, 2);
+    assert.equal(warning.diagnostics[0].code, "unmapped-source");
+    assert.match(warning.diagnostics[0].message, /source_module_roots/);
+    assert.deepEqual(warning.diagnostics[0].range, {
+      start: { line: 0, character: 0 },
+      end: { line: 0, character: 0 }
+    });
+    const definition = await semanticRequest(
+      child,
+      responses,
+      "unmapped-definition",
+      "textDocument/definition",
+      {
+        textDocument: { uri: unmappedUri },
+        position: { line: 0, character: 10 }
+      }
+    );
+    assert.equal(definition.error, undefined);
+    assert.equal(definition.result, null);
+
+    // The mapped save drives ordinary discovery and clears the deleted file's
+    // warning. Native application tests separately prove that unmapped changes
+    // alone cannot initiate a refresh, without relying on timing sleeps here.
+    await rm(unmappedFile);
+    await writeSavedGeneration(
+      responses,
+      mappedFile,
+      "function answer(): integer return 2 end\n"
+    );
+    const cleared = await nextDiagnosticPublication(responses);
+    assert.equal(cleared.uri, unmappedUri);
+    assert.deepEqual(cleared.diagnostics, []);
+
+    const shutdown = await request(
+      child, responses, "shutdown", "shutdown", null
+    );
+    assert.equal(shutdown.result, null);
     child.stdin.write(frame({ jsonrpc: "2.0", method: "exit" }));
     assert.deepEqual(await awaitExit(exit), { code: 0, signal: null });
     await responses.finish();
@@ -1638,6 +1733,7 @@ if (mode === "--self-contained-smoke") {
   await testCoalescedIndexingResetStatus();
   await testLifecycle();
   await testSavedProjectSemantics();
+  await testUnmappedSourceWarnings();
   await testConfigCannotWriteProtocolStdout();
   await testSourceImportCppflagsAndUnchangedRequests();
   await testCrossModuleFolderAndIncrementalSemantics();

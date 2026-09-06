@@ -23,9 +23,15 @@ function Module:is_folder(): boolean
   end
 end
 
+union IssueKind
+  invalid_module
+  unmapped_source
+end
+
 record Issue
   path: string
   message: string
+  kind: IssueKind
 end
 
 record Error
@@ -311,6 +317,23 @@ local function valid_path_components(path: string): boolean
   return true
 end
 
+-- Native directory watches cover mapped source trees and the ancestors needed
+-- to observe a configured source root appearing later. Unmapped branches are
+-- still scanned below, but changes there do not initiate another scan.
+local function mapped_directory_relevant(observed: string, canonical: string,
+                                         source_roots: {SourceRoot}): boolean
+  for index = 1, #source_roots do
+    local root = source_roots[index]
+    if path_within(observed, root.lexical) or
+       path_within(canonical, root.canonical) or
+       path_within(root.lexical, observed) or
+       path_within(root.canonical, canonical) then
+      return true
+    end
+  end
+  return false
+end
+
 -- Include roots decide membership, while a nested source root can reset the
 -- logical path after an include-relative component such as `vendor.foo` that
 -- is not itself a valid module component. Preserve the old tooling-tree prune
@@ -344,7 +367,9 @@ local function collect(directory: string, relative_directory: string,
   if pruned(directory, boundaries) then return end
   -- Exclusions affect only the returned watcher set. Discovery still scans
   -- their saved sources so compiler/project ownership remains unchanged.
-  if not pruned(directory, excluded) then
+  if not pruned(directory, excluded) and mapped_directory_relevant(
+      directory, rebase_path(directory, observed_root, canonical_root),
+      source_roots) then
     directories[#directories + 1] = directory
   end
   local entries = fs.list(directory)
@@ -524,7 +549,8 @@ local function discover_entries(entries: {FileEntry}): ModuleCatalog
          not valid_module_name(name) then
         issues[#issues + 1] = Issue.new(
           entry.path,
-          "invalid logical Titan module name '" .. name .. "'")
+          "invalid logical Titan module name '" .. name .. "'",
+          IssueKind.invalid_module())
       elseif modules_by_name[name] == nil then
         local module = Module.new(
           name, ModuleKind.flat(), entry.path, {entry.path})
@@ -835,7 +861,9 @@ local function discover_or_raise(include: {string}, exclude: {string},
     if selection == nil then
       issues[#issues + 1] = Issue.new(
         entry.path,
-        "saved Titan source is not beneath any source_module_roots entry")
+        "saved Titan source is not beneath any source_module_roots entry; " ..
+        "it is excluded from project analysis and watching",
+        IssueKind.unmapped_source())
     else
       local bucket = entries_by_source_root[selection.root_index]
       bucket[#bucket + 1] = map_to_source_root(entry, selection)
@@ -862,7 +890,7 @@ local function discover_or_raise(include: {string}, exclude: {string},
           module.main_file,
           "logical Titan module '" .. module.name ..
           "' is shadowed by earlier source_module_roots provider '" ..
-          selected.module.main_file .. "'")
+          selected.module.main_file .. "'", IssueKind.invalid_module())
       end
     end
     for index = 1, #catalog.issues do
@@ -879,14 +907,16 @@ local function discover_or_raise(include: {string}, exclude: {string},
       issues[#issues + 1] = Issue.new(
         candidate.module.main_file,
         "logical Titan module '" .. name ..
-        "' is not resolvable through source_module_roots")
+        "' is not resolvable through source_module_roots",
+        IssueKind.invalid_module())
     else
       case resolved
       when blocked: blocking_source then
         issues[#issues + 1] = Issue.new(
           candidate.module.main_file,
           "logical Titan module '" .. name ..
-          "' is blocked by folder source '" .. blocking_source .. "'")
+          "' is blocked by folder source '" .. blocking_source .. "'",
+          IssueKind.invalid_module())
       when found: source then
         if same_physical_source(candidate.module, source) then
           modules[#modules + 1] = candidate.module
@@ -898,7 +928,8 @@ local function discover_or_raise(include: {string}, exclude: {string},
             candidate.module.main_file,
             "logical Titan module '" .. name ..
             "' resolves to a different physical provider through " ..
-            "source_module_roots: '" .. source.main_file .. "'")
+            "source_module_roots: '" .. source.main_file .. "'",
+            IssueKind.invalid_module())
         end
       end
     end

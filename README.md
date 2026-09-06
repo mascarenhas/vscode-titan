@@ -334,8 +334,13 @@ file one canonical project identity. The server checks that identity against
 the compiler's declared-root order and per-root folder-before-flat rules. A
 shadowed, blocked, or overlap-ambiguous project provider is reported as a
 configuration issue instead of being submitted under an identity that differs
-from `titanc`. An included `.titan` file outside every source root is likewise
-reported instead of receiving an include-relative name.
+from `titanc`. Each included `.titan` file outside every source root gets an
+`unmapped-source` warning in Problems. These files are excluded from compilation,
+indexing, navigation, and source watching. Their creation, modification, or
+deletion does not trigger a refresh. Warnings are updated or cleared during the
+next ordinary discovery pass, such as one triggered by a mapped source save or
+configuration change; adding the missing source root brings its files into the
+project.
 
 Project discovery intentionally ignores symlinked files and directories below
 the configured include roots in version 1. This keeps project identity and the

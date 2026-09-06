@@ -262,7 +262,6 @@ end
 local function included_directory_path(root: string, path: string,
                                        source_roots: {string}): boolean
   if not path_within(root, path) then return false end
-  if path == root then return true end
   for index = 1, #source_roots do
     local source_root = source_roots[index]
     -- Keep ancestors of a configured nested source root observable even when
@@ -274,7 +273,16 @@ local function included_directory_path(root: string, path: string,
       return true
     end
   end
-  return valid_relative_directory(root, path)
+  return mapped_source_path(path, source_roots) and
+         valid_relative_directory(root, path)
+end
+
+local function mapped_source_path(path: string,
+                                  source_roots: {string}): boolean
+  for index = 1, #source_roots do
+    if path_within(source_roots[index], path) then return true end
+  end
+  return false
 end
 
 local function rebase_path(path: string, source_root: string,
@@ -290,10 +298,12 @@ end
 local function build_watch_filter(snapshot: project_service.Snapshot):
     WatchFilter
   local include_roots: {string} = {}
+  local canonical_includes: {string} = {}
   for index = 1, #snapshot.config.include do
     local include_root = snapshot.config.include[index]
     include_roots[#include_roots + 1] = include_root
     local canonical_include_root = canonical_directory(include_root)
+    canonical_includes[index] = canonical_include_root
     if canonical_include_root ~= include_root then
       include_roots[#include_roots + 1] = canonical_include_root
     end
@@ -306,6 +316,27 @@ local function build_watch_filter(snapshot: project_service.Snapshot):
     local canonical_source_root = canonical_configured_path(source_root)
     if canonical_source_root ~= source_root then
       source_roots[#source_roots + 1] = canonical_source_root
+    end
+    -- Discovery accepts lexical source ancestry across an include symlink.
+    -- Carry that same mapped coverage into the native watcher's namespace,
+    -- even when the symlink target is outside the source root's physical tree.
+    for include_index = 1, #snapshot.config.include do
+      local include_root = snapshot.config.include[include_index]
+      local canonical_include = canonical_includes[include_index]
+      if canonical_include ~= include_root then
+        if path_within(source_root, include_root) then
+          source_roots[#source_roots + 1] = canonical_include
+        elseif path_within(include_root, source_root) then
+          source_roots[#source_roots + 1] = rebase_path(
+            source_root, include_root, canonical_include)
+        end
+        if path_within(canonical_source_root, canonical_include) then
+          source_roots[#source_roots + 1] = include_root
+        elseif path_within(canonical_include, canonical_source_root) then
+          source_roots[#source_roots + 1] = rebase_path(
+            canonical_source_root, canonical_include, include_root)
+        end
+      end
     end
   end
 
@@ -406,22 +437,24 @@ local function watch_change_disposition(filter: WatchFilter,
   for index = 1, #filter.include_roots do
     local include_root = filter.include_roots[index]
     if path_within(include_root, path) then
-      if titan_source_path(path) then
-        if included_directory_path(
-            include_root, parent_directory(path), filter.source_roots) then
+      if titan_source_path(path) and
+         mapped_source_path(path, filter.source_roots) and
+         included_directory_path(
+           include_root, parent_directory(path), filter.source_roots) then
+        return WatchDisposition.relevant()
+      end
+      -- A configured source-root ancestor may itself end in .titan. Treat its
+      -- creation as a possible directory, so an actual unmapped regular file
+      -- still cannot trigger discovery after the asynchronous kind probe.
+      if included_directory_path(
+          include_root, path, filter.source_roots) then
+        if filter.known_directories[path] then
           return WatchDisposition.relevant()
         end
-      else
-        if included_directory_path(
-            include_root, path, filter.source_roots) then
-          if filter.known_directories[path] then
-            return WatchDisposition.relevant()
-          end
-          case change
-          when created then
-            return WatchDisposition.possible_directory(path)
-          else
-          end
+        case change
+        when created then
+          return WatchDisposition.possible_directory(path)
+        else
         end
       end
     end
