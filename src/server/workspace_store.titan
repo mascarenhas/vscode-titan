@@ -1,0 +1,166 @@
+local async = import "async"
+local sqlite3 = import "sqlite3"
+
+-- One connection is leased for a complete logical operation. The updater owns
+-- transactions; a request only reads while holding its lease. Releasing access
+-- never commits, rolls back, or closes somebody else's operation.
+local record Waiter
+  task: async.Task<value, value>
+  token: async.ResumeToken
+  queued: boolean
+  reserved: boolean
+end
+
+record Access
+  const connection: sqlite3.Connection
+  local release_owner: () -> ()
+  local released: boolean
+end
+
+record Store
+  local const connection: sqlite3.Connection
+  local active: boolean
+  local waiters: {Waiter}
+  local closing: boolean
+  local closed: boolean
+end
+
+function execute(connection: sqlite3.Connection, sql: string,
+                 ...: value): integer
+  local statement = connection:prepare(sql)
+  defer statement:close()
+  return statement:execute(...)
+end
+
+function scalar_integer(connection: sqlite3.Connection, sql: string,
+                 ...: value): integer
+  local statement = connection:prepare(sql)
+  defer statement:close()
+  local cursor = statement:query(...)
+  defer cursor:close()
+  local row? = cursor:fetch()
+  if row == nil then raise "workspace store scalar query returned no row" end
+  return row:get(1)
+end
+
+-- SQLite Rows own their values after the cursor closes. Callers decode these
+-- temporary transport rows immediately into their typed domain records.
+function rows(connection: sqlite3.Connection, query: string,
+              ...: value): {sqlite3.Row}
+  local statement = connection:prepare(query)
+  defer statement:close()
+  local cursor = statement:query(...)
+  defer cursor:close()
+  local result: {sqlite3.Row} = {}
+  for row in cursor:fetch do result[#result + 1] = row end
+  return result
+end
+
+function bytes(row: sqlite3.Row, column: integer): string
+  local blob: sqlite3.Blob = row:get(column)
+  return blob.bytes
+end
+
+function optional_bytes(row: sqlite3.Row, column: integer): string?
+  local blob: sqlite3.Blob? = row:get(column)
+  if blob == nil then return nil end
+  return blob.bytes
+end
+
+function open(path: string): Store
+  local connection = sqlite3.connect(path)
+  local initialized = false
+  defer do
+    if not initialized then connection:close() end
+  end
+  execute(connection, "PRAGMA foreign_keys=ON")
+  if scalar_integer(connection, "PRAGMA foreign_keys") ~= 1 then
+    raise "workspace store requires SQLite foreign keys"
+  end
+  execute(connection,
+    "CREATE TABLE IF NOT EXISTS main.store_state (" ..
+    "singleton INTEGER PRIMARY KEY CHECK(singleton=1), " ..
+    "published_generation INTEGER NOT NULL DEFAULT 0)")
+  execute(connection,
+    "INSERT OR IGNORE INTO main.store_state(singleton) VALUES(1)")
+  execute(connection,
+    "CREATE TABLE IF NOT EXISTS main.cache_meta (" ..
+    "key BLOB PRIMARY KEY, value BLOB NOT NULL) WITHOUT ROWID")
+  initialized = true
+  return Store.new(connection, false, {}, false, false)
+end
+
+local function Store:grant_next()
+  while #self.waiters > 0 do
+    local waiter = self.waiters[1]
+    for index = 1, #self.waiters - 1 do
+      self.waiters[index] = self.waiters[index + 1]
+    end
+    self.waiters[#self.waiters] = nil
+    if waiter.queued then
+      waiter.reserved = true
+      waiter.task:resume(waiter.token)
+      return
+    end
+  end
+  self.active = false
+end
+
+local function Store:abandon(waiter: Waiter)
+  if not waiter.queued then return end
+  waiter.queued = false
+  if waiter.reserved then self:grant_next() end
+end
+
+local function Store:release_owner()
+  if not self.active then raise "workspace store released without an owner" end
+  self:grant_next()
+end
+
+local function Store:acquire_owner(): Access
+  if not self.active then
+    self.active = true
+    return Access.new(self.connection,
+      function () self:release_owner() end, false)
+  end
+  local waiter = Waiter.new(async.running(),
+    async.ResumeToken.new("server.workspace_store"), true, false)
+  self.waiters[#self.waiters + 1] = waiter
+  do
+    async.suspend(waiter.token, function () self:abandon(waiter) end)
+    waiter.queued = false
+    return Access.new(self.connection,
+      function () self:release_owner() end, false)
+  catch
+    -- A granted waiter can be cancelled before its scheduled resume executes.
+    self:abandon(waiter)
+    raise
+  end
+end
+
+function Store:acquire(): Access
+  if self.closing or self.closed then raise "workspace store is closed" end
+  return self:acquire_owner()
+end
+
+function Access:release()
+  if self.released then return end
+  self.released = true
+  self.release_owner()
+end
+
+function Store:close()
+  if self.closed then return end
+  self.closing = true
+  -- Join the queue after every previously accepted reader/updater. The caller
+  -- drains its writer Task before cancellation, so transaction cleanup remains
+  -- owned by that live Task rather than a cancelled request's defer.
+  local access = self:acquire_owner()
+  defer access:release()
+  if self.closed then return end
+  if not self.connection:get_autocommit() then
+    raise "workspace store closed before its transaction was drained"
+  end
+  self.connection:close()
+  self.closed = true
+end

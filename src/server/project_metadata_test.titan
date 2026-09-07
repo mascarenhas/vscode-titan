@@ -1,0 +1,87 @@
+local test = import "test"
+local bridge = import "server.compiler_bridge"
+local graph = import "server.project_graph"
+local metadata = import "server.project_metadata"
+local stores = import "server.workspace_store"
+local test_runtime = import "server.test_runtime"
+
+function test_project_metadata_roundtrips_ordered_batches_and_nullable_binary_fields(
+    _context: test.Context)
+  test_runtime.run(function ()
+    local store = stores.open(":memory:")
+    defer store:close()
+    local access = store:acquire()
+    defer access:release()
+    local cache = graph.create<bridge.ModuleSnapshot>(access.connection)
+    local saved = metadata.create(access.connection, cache)
+    local sources: {metadata.SourceFileSnapshot} = {}
+    local diagnostics: {bridge.Diagnostic} = {}
+    local stamps: {graph.FileStamp} = {}
+    local paths: {string} = {}
+    local headers: {bridge.CHeaderDependency} = {}
+    for index = 1, 45 do
+      local path = "folder/part" .. (46 - index) .. ".titan"
+      local identity: string?
+      if index % 2 == 0 then identity = "identity\0\255" .. index end
+      local stamp = graph.FileStamp.new(path, 1, 2, 3, identity)
+      sources[index] = metadata.SourceFileSnapshot.new(path, "bytes\0\255" .. index, stamp)
+      stamps[index] = stamp
+      paths[index] = path
+      local location: bridge.SourceLocation?
+      local owner: string?
+      if index % 2 == 0 then location = bridge.SourceLocation.new(path, index, 2) end
+      if index % 3 == 0 then owner = "folder" end
+      diagnostics[index] = bridge.Diagnostic.new(bridge.DiagnosticKind.type_error(),
+        "message\0\255" .. index, location, owner)
+      local kind = bridge.CHeaderDependencyKind.file()
+      if index % 2 == 0 then kind = bridge.CHeaderDependencyKind.search() end
+      headers[index] = bridge.CHeaderDependency.new(kind, "include/" .. index .. ".h",
+        "header\0\255" .. index)
+    end
+    access.connection:set_autocommit(false)
+    cache:observe_project("folder", stamps)
+    saved:write_project_sources("folder", sources)
+    saved:write_diagnostics("folder", diagnostics)
+    saved:write_header("folder", headers)
+    saved:write_external(metadata.ExternalModule.new("vendor",
+      metadata.ExternalOrigin.source(metadata.ExternalSource.new(paths[1], paths)),
+      graph.Manifest.new("public\0\255", "source\0\255"), stamps, nil, {}, {}, headers))
+    access.connection:commit()
+    local project? = saved:project("folder")
+    test.assert(project ~= nil and #project.source_files == 45 and #project.diagnostics == 45,
+      "batched metadata lost source or diagnostic rows")
+    if project == nil then raise "metadata project disappeared" end
+    for index = 1, 45 do
+      local source = project.source_files[index]
+      local diagnostic = project.diagnostics[index]
+      test.assert(source.filename == paths[index] and
+        source.contents == sources[index].contents and
+        source.stamp.identity == stamps[index].identity,
+        "source order or nullable binary identity changed across a batch boundary")
+      test.assert(diagnostic.message == diagnostics[index].message and
+        diagnostic.owner_module == diagnostics[index].owner_module,
+        "diagnostic binary payload or trailing nullable owner was corrupted")
+      test.assert((diagnostic.location == nil) == (index % 2 ~= 0),
+        "diagnostic nullable location shifted bound columns")
+      if diagnostic.location ~= nil then
+        test.assert(diagnostic.location.filename == paths[index] and
+          diagnostic.location.line == index and diagnostic.location.column == 2,
+          "diagnostic location did not preserve its exact ordered row")
+      end
+    end
+    local fingerprint? = saved:header("folder")
+    local external? = saved:external("vendor")
+    test.assert(fingerprint ~= nil and #fingerprint.dependencies == 45 and
+      external ~= nil and #external.stamps == 45 and
+      #external.c_header_dependencies == 45 and external.analyzed_input_identity == nil,
+      "batched external/header metadata did not roundtrip")
+    if external == nil or fingerprint == nil then raise "metadata dependencies disappeared" end
+    for index = 1, 45 do
+      test.assert(external.stamps[index].path == paths[index] and
+        external.stamps[index].identity == stamps[index].identity and
+        fingerprint.dependencies[index].identity == headers[index].identity and
+        external.c_header_dependencies[index].path == headers[index].path,
+        "external/header ordinal or binary input identity changed across batches")
+    end
+  end)
+end

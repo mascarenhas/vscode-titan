@@ -1,0 +1,505 @@
+local fs = import "fs"
+local sqlite3 = import "sqlite3"
+local strings = import "string"
+local test = import "test"
+local caches = import "server.workspace_cache"
+local sql = import "server.workspace_store"
+local bridge = import "server.compiler_bridge"
+local identity = import "server.content_identity"
+local test_runtime = import "server.test_runtime"
+local features = import "server.semantic_features"
+local published_diagnostics = import "server.published_diagnostics"
+local graph = import "server.project_graph"
+
+local function new_root(): string
+  local root = fs.tmpname()
+  fs.unlink(root)
+  fs.mkdir(root)
+  return root
+end
+
+local function cleanup(root: string)
+  local entries = fs.list(root)
+  for index = 1, #entries do
+    local path = root .. "/" .. entries[index]
+    local stat = fs.lstat(path)
+    if stat.kind == "directory" then cleanup(path) else fs.unlink(path) end
+  end
+  fs.rmdir(root)
+end
+
+local function initialize_revision(cache: caches.Cache)
+  local access = cache.store:acquire()
+  defer access:release()
+  features.initialize_schema(access.connection)
+  published_diagnostics.initialize_schema(access.connection)
+  sql.execute(access.connection,"CREATE TABLE IF NOT EXISTS main.graph_modules(" ..
+    "name TEXT PRIMARY KEY,provenance INTEGER,state INTEGER,revision INTEGER)")
+  sql.execute(access.connection,"INSERT INTO main.graph_modules VALUES('main',0,2,1) " ..
+    "ON CONFLICT(name) DO NOTHING")
+end
+
+function test_workspace_cache_rejects_project_payload_ahead_of_its_publication(
+    _context: test.Context)
+  test_runtime.run(function ()
+    local root = new_root()
+    defer cleanup(root)
+    local cache = caches.open(root,"crash-window")
+    initialize_revision(cache)
+    cache:prepare()
+    cache:set_projects({bridge.ProjectPayload.new("main","old-checked-graph")})
+    publish(cache)
+    do
+      local access = cache.store:acquire()
+      defer access:release()
+      sql.execute(access.connection,"UPDATE main.graph_modules SET revision=2 WHERE name='main'")
+    end
+    cache.store:close()
+    local reopened = caches.open(root,"crash-window")
+    defer reopened.store:close()
+    test.assert(#reopened:project_payloads() == 0 and not reopened:prepare(),
+      "restart hydrated an old payload after newer compiler work committed alone")
+  end)
+end
+
+function test_workspace_cache_missing_semantic_table_rebuilds_materialized_view(
+    _context: test.Context)
+  test_runtime.run(function ()
+    local cache = caches.memory("missing-table")
+    defer cache.store:close()
+    initialize_revision(cache)
+    cache:prepare()
+    cache:set_projects({bridge.ProjectPayload.new("main","checked-graph")})
+    publish(cache)
+    do
+      local access = cache.store:acquire()
+      defer access:release()
+      sql.execute(access.connection,"DROP TABLE main.semantic_hovers")
+    end
+    test.assert(#cache:project_payloads() == 1 and not cache:prepare(),
+      "missing materialized table was treated as a reusable complete view")
+  end)
+end
+
+local function publish(cache: caches.Cache)
+  local access = cache.store:acquire()
+  defer access:release()
+  access.connection:set_autocommit(false)
+  cache:publish(access.connection)
+  sql.execute(access.connection,
+    "UPDATE main.store_state SET published_generation=3 WHERE singleton=1")
+  access.connection:commit()
+  cache:publication_committed()
+end
+
+function test_content_identity_hashes_arbitrary_saved_bytes(_context: test.Context)
+  test_runtime.run(function ()
+    test.assert(identity.digest("") == strings.char(
+      0xe3,0xb0,0xc4,0x42,0x98,0xfc,0x1c,0x14,0x9a,0xfb,0xf4,0xc8,0x99,0x6f,0xb9,0x24,
+      0x27,0xae,0x41,0xe4,0x64,0x9b,0x93,0x4c,0xa4,0x95,0x99,0x1b,0x78,0x52,0xb8,0x55),
+      "native SHA256 disagrees with the complete empty-input digest")
+    test.assert(identity.digest("abc") == strings.char(
+      0xba,0x78,0x16,0xbf,0x8f,0x01,0xcf,0xea,0x41,0x41,0x40,0xde,0x5d,0xae,0x22,0x23,
+      0xb0,0x03,0x61,0xa3,0x96,0x17,0x7a,0x9c,0xb4,0x10,0xff,0x61,0xf2,0x00,0x15,0xad),
+      "native SHA256 disagrees with the complete abc digest")
+    test.assert(identity.digest("a\0b\255") == strings.char(
+      0xa3,0x7c,0xc3,0x02,0x6a,0xae,0x4d,0x51,0x9e,0x0b,0x19,0xc2,0x98,0xfa,0x91,0x3b,
+      0x4d,0xcc,0xfd,0xf0,0x65,0x8c,0xbc,0xcb,0xb7,0xde,0xaa,0x02,0x26,0xd5,0xac,0xdb),
+      "native SHA256 changed embedded-NUL or high-byte input")
+  end)
+end
+
+function test_workspace_cache_publishes_binary_payloads_and_preserves_warm_projects(
+    _context: test.Context)
+  test_runtime.run(function ()
+    local cache = caches.memory("test-context")
+    defer cache.store:close()
+    initialize_revision(cache)
+    test.assert(not cache:prepare(),"empty cache exposed a completed view")
+    cache:set_projects({bridge.ProjectPayload.new("main","project\0\255")})
+    cache:stage("c-header-v1","header\0key","graph\0\255",{})
+    cache:stage("ffi-conversion-v1","conversion","converted\0",{})
+    publish(cache)
+    test.assert(cache:lookup("c-header-v1","header\0key") == "graph\0\255" and
+      cache:lookup("ffi-conversion-v1","conversion") == "converted\0",
+      "compiler payload lost binary contents")
+    test.assert(cache:prepare(),"unchanged work revision was not reusable")
+    publish(cache)
+    local projects = cache:project_payloads()
+    test.assert(#projects == 1 and projects[1].payload == "project\0\255",
+      "warm publication discarded its persisted project graph")
+  end)
+end
+
+function test_workspace_cache_reopens_and_rebuilds_incompatible_or_corrupt_files(
+    _context: test.Context)
+  test_runtime.run(function ()
+    local root = new_root()
+    defer cleanup(root)
+    local cache = caches.open(root,"context-one")
+    local filename = cache.path
+    test.assert(filename ~= ":memory:","writable workspace did not persist")
+    initialize_revision(cache)
+    cache:prepare()
+    cache:set_projects({bridge.ProjectPayload.new("main","saved")})
+    publish(cache)
+    cache.store:close()
+    local reopened = caches.open(root,"context-one")
+    test.assert(#reopened:project_payloads() == 1 and reopened:prepare(),
+      "compatible restart lost the completed saved view")
+    reopened.store:close()
+    local changed = caches.open(root,"context-two")
+    initialize_revision(changed)
+    test.assert(#changed:project_payloads() == 0,"configuration mismatch reused project graph")
+    changed.store:close()
+    fs.write_file(filename,"this is not a SQLite database\0")
+    local recovered = caches.open(root,"context-two")
+    initialize_revision(recovered)
+    test.assert(recovered.path == filename and #recovered:project_payloads() == 0,
+      "corrupt disposable database did not rebuild")
+    recovered.store:close()
+    test.assert(fs.read_file(root .. "/.titan-ls/.gitignore") == "*\n",
+      "workspace cache did not exclude itself from version control")
+  end)
+end
+
+function test_workspace_cache_unavailable_directory_uses_identical_memory_schema(
+    _context: test.Context)
+  test_runtime.run(function ()
+    local root = new_root()
+    defer cleanup(root)
+    fs.write_file(root .. "/.titan-ls","occupied")
+    local cache = caches.open(root,"context")
+    defer cache.store:close()
+    test.assert(cache.path == ":memory:","unavailable cache directory did not fall back")
+    initialize_revision(cache)
+    cache:prepare()
+    cache:set_projects({bridge.ProjectPayload.new("main","volatile")})
+    publish(cache)
+    test.assert(#cache:project_payloads() == 1,"memory fallback changed the cache API")
+    test.assert(fs.read_file(root .. "/.titan-ls") == "occupied",
+      "fallback replaced a non-cache workspace file")
+  end)
+end
+
+function test_workspace_cache_native_context_change_rebuilds_before_hydration(
+    _context: test.Context)
+  test_runtime.run(function ()
+    local cache = caches.memory("stable-inventory")
+    initialize_revision(cache)
+    test.assert(cache:accept_native_context("first-world") and
+      cache:accept_native_context("first-world"),"compatible native world was rejected")
+    cache:prepare()
+    cache:set_projects({bridge.ProjectPayload.new("main","old-world-graph")})
+    publish(cache)
+    cache:stage("c-header-v1","new-world-header","freshly-validated",{})
+    test.assert(not cache:accept_native_context("second-world"),
+      "changed native context was allowed to hydrate old project rows")
+    cache = cache:rebuild()
+    defer cache.store:close()
+    initialize_revision(cache)
+    test.assert(cache:accept_native_context("second-world") and
+      #cache:project_payloads() == 0 and not cache:prepare(),
+      "native context rebuild retained an incompatible completed view")
+    test.assert(cache:lookup("c-header-v1","new-world-header") == "freshly-validated",
+      "native context rebuild lost freshly validated staged header work")
+  end)
+end
+
+function test_workspace_cache_configuration_context_commits_with_its_view(
+    _context: test.Context)
+  test_runtime.run(function ()
+    local root = new_root()
+    defer cleanup(root)
+    local cache = caches.open(root,"configuration-a")
+    initialize_revision(cache)
+    cache:accept_native_context("native-a")
+    cache:prepare()
+    cache:set_projects({bridge.ProjectPayload.new("main","checked-a")})
+    publish(cache)
+    cache:prepare()
+    cache:set_projects({bridge.ProjectPayload.new("main","checked-b")})
+    cache:stage_context(root,"configuration-b","native-b")
+    do
+      local access = cache.store:acquire()
+      defer access:release()
+      access.connection:set_autocommit(false)
+      cache:publish(access.connection)
+      access.connection:rollback()
+      local rows = sql.rows(access.connection,
+        "SELECT value FROM main.cache_meta WHERE key=?",sqlite3.Blob.new("compatibility"))
+      test.assert(sql.bytes(rows[1],1) ==
+        identity.digest(fs.realpath(root) .. "\0configuration-a"),
+        "rolled-back publication relabeled the saved view")
+    end
+    test.assert(cache:accept_native_context("native-a") and
+      cache:project_payloads()[1].payload == "checked-a",
+      "rolled-back publication changed the native context or project graph")
+    publish(cache)
+    cache.store:close()
+    local reopened = caches.open(root,"configuration-b")
+    defer reopened.store:close()
+    test.assert(reopened:accept_native_context("native-b") and
+      reopened:project_payloads()[1].payload == "checked-b" and reopened:prepare(),
+      "committed configuration transition did not survive a warm restart")
+  end)
+end
+
+function test_workspace_cache_relocated_database_rejects_the_previous_root(
+    _context: test.Context)
+  test_runtime.run(function ()
+    local root = new_root()
+    defer cleanup(root)
+    local other_root = new_root()
+    defer cleanup(other_root)
+    local cache = caches.open(root,"same-compiler-and-settings")
+    initialize_revision(cache)
+    cache:prepare()
+    cache:set_projects({bridge.ProjectPayload.new("main","original-root-graph")})
+    publish(cache)
+    local filename = cache.path
+    cache.store:close()
+    fs.mkdir(other_root .. "/.titan-ls")
+    fs.write_file(other_root .. "/.titan-ls/index.sqlite3",fs.read_file(filename))
+    local relocated = caches.open(other_root,"same-compiler-and-settings")
+    defer relocated.store:close()
+    initialize_revision(relocated)
+    test.assert(#relocated:project_payloads() == 0 and not relocated:prepare(),
+      "copied cache served graphs whose paths belong to another workspace")
+  end)
+end
+
+function test_workspace_cache_malformed_sqlite_payloads_are_misses(_context: test.Context)
+  test_runtime.run(function ()
+    local cache = caches.memory("malformed-payload-columns")
+    defer cache.store:close()
+    initialize_revision(cache)
+    cache:prepare()
+    cache:set_projects({bridge.ProjectPayload.new("main","checked-graph")})
+    cache:stage("c-header-v1","header","header-graph",{})
+    cache:stage("ffi-conversion-v1","conversion","converted-graph",{})
+    publish(cache)
+    do
+      local access = cache.store:acquire()
+      defer access:release()
+      sql.execute(access.connection,"UPDATE main.project_snapshots SET payload='invalid-text'")
+      sql.execute(access.connection,"UPDATE main.header_graphs SET payload='invalid-text'")
+      sql.execute(access.connection,"UPDATE main.ffi_conversion_snapshots SET payload='invalid-text'")
+    end
+    test.assert(#cache:project_payloads() == 0 and
+      cache:lookup("c-header-v1","header") == nil and
+      cache:lookup("ffi-conversion-v1","conversion") == nil,
+      "invalid SQLite payload types escaped the disposable cache boundary")
+  end)
+end
+
+function test_workspace_cache_missing_or_malformed_metadata_rebuilds(_context: test.Context)
+  test_runtime.run(function ()
+    local root = new_root()
+    defer cleanup(root)
+    for scenario = 1, 2 do
+      local cache = caches.open(root,"metadata-recovery")
+      initialize_revision(cache)
+      cache:accept_native_context("native")
+      cache:prepare()
+      cache:set_projects({bridge.ProjectPayload.new("main","old-graph")})
+      publish(cache)
+      do
+        local access = cache.store:acquire()
+        defer access:release()
+        if scenario == 1 then
+          sql.execute(access.connection,"UPDATE main.cache_meta SET value='invalid-text' WHERE key=?",
+            sqlite3.Blob.new("native_context"))
+        else
+          sql.execute(access.connection,"DELETE FROM main.cache_meta WHERE key=?",
+            sqlite3.Blob.new("compatibility"))
+        end
+      end
+      cache.store:close()
+      local recovered = caches.open(root,"metadata-recovery")
+      initialize_revision(recovered)
+      test.assert(recovered.path ~= ":memory:" and #recovered:project_payloads() == 0 and
+        recovered:accept_native_context("new-native"),
+        "malformed or missing compatibility metadata did not rebuild the file cache")
+      recovered.store:close()
+    end
+  end)
+end
+
+function test_workspace_cache_sparse_publication_preserves_rows_and_rolls_back_pruning(
+    _context: test.Context)
+  test_runtime.run(function ()
+    local cache = caches.memory("sparse-publication")
+    defer cache.store:close()
+    initialize_revision(cache)
+    local names = {"main", "keep", "failed", "removed", "external", "dirty",
+      "unrepresentable", "malformed", "malformed_revision"}
+    local initial: {bridge.ProjectPayload} = {}
+    do
+      local access = cache.store:acquire()
+      defer access:release()
+      for index = 1, #names do
+        sql.execute(access.connection,
+          "INSERT INTO main.graph_modules VALUES(?,0,2,1) ON CONFLICT(name) DO NOTHING",
+          names[index])
+        initial[index] = bridge.ProjectPayload.new(names[index],"saved-" .. names[index])
+      end
+    end
+    cache:prepare()
+    cache:set_projects(initial)
+    publish(cache)
+    local previous_key = ""
+    do
+      local access = cache.store:acquire()
+      defer access:release()
+      local connection = access.connection
+      previous_key = sql.bytes(sql.rows(connection,
+        "SELECT value FROM main.cache_meta WHERE key=?",
+        sqlite3.Blob.new("published_revisions"))[1],1)
+      sql.execute(connection,
+        "UPDATE main.graph_modules SET revision=2 WHERE name IN ('main','unrepresentable')")
+      sql.execute(connection,"UPDATE main.graph_modules SET state=3 WHERE name='failed'")
+      sql.execute(connection,"UPDATE main.graph_modules SET state=0 WHERE name='dirty'")
+      sql.execute(connection,"UPDATE main.graph_modules SET provenance=1 WHERE name='external'")
+      sql.execute(connection,"DELETE FROM main.graph_modules WHERE name='removed'")
+      sql.execute(connection,"INSERT INTO main.graph_modules VALUES('missing',0,2,1)")
+      sql.execute(connection,
+        "UPDATE main.project_snapshots SET payload='invalid-text' WHERE module=CAST('malformed' AS BLOB)")
+      sql.execute(connection,
+        "UPDATE main.project_snapshots SET revision='invalid-text' WHERE module=CAST('malformed_revision' AS BLOB)")
+      sql.execute(connection,
+        "INSERT INTO main.project_snapshots VALUES('malformed-key',?,1)",
+        sqlite3.Blob.new("orphaned-text-key"))
+      sql.execute(connection,
+        "CREATE TRIGGER main.keep_payload_delete BEFORE DELETE ON project_snapshots " ..
+        "WHEN OLD.module=CAST('keep' AS BLOB) BEGIN SELECT RAISE(ABORT,'unchanged payload deleted'); END")
+      sql.execute(connection,
+        "CREATE TRIGGER main.keep_payload_update BEFORE UPDATE ON project_snapshots " ..
+        "WHEN OLD.module=CAST('keep' AS BLOB) BEGIN SELECT RAISE(ABORT,'unchanged payload updated'); END")
+      sql.execute(connection,
+        "CREATE TRIGGER main.fail_payload_publication BEFORE UPDATE ON cache_meta " ..
+        "WHEN NEW.key=CAST('published_revisions' AS BLOB) " ..
+        "BEGIN SELECT RAISE(ABORT,'forced payload publication failure'); END")
+    end
+    test.assert(not cache:prepare(),"changed work reused the whole completed view")
+    local selected = cache:projects_to_export()
+    test.assert(#selected == 5 and selected[1] == "main" and selected[2] == "malformed" and
+      selected[3] == "malformed_revision" and selected[4] == "missing" and
+      selected[5] == "unrepresentable",
+      "sparse selection included an unchanged/nonclean module or missed invalid payloads")
+    -- The omitted selected module represents a compiler encoding failure.
+    cache:set_projects({
+      bridge.ProjectPayload.new("main","new-main"),
+      bridge.ProjectPayload.new("malformed","repaired-payload"),
+      bridge.ProjectPayload.new("malformed_revision","repaired-revision"),
+      bridge.ProjectPayload.new("missing","new-missing"),
+    })
+    do
+      local access = cache.store:acquire()
+      defer access:release()
+      local connection = access.connection
+      connection:set_autocommit(false)
+      local rejected = false
+      do cache:publish(connection)
+      catch rejected = error is sqlite3.Error and (error as sqlite3.Error).code == 19 end
+      connection:rollback()
+      test.assert(rejected,"injected late publication failure did not reject the update")
+      test.assert(sql.scalar_integer(connection,"SELECT count(*) FROM main.project_snapshots") == 10,
+        "rolled-back publication retained its pruning or replacement rows")
+      test.assert(sql.bytes(sql.rows(connection,
+        "SELECT payload FROM main.project_snapshots WHERE module=CAST('main' AS BLOB)")[1],1) ==
+        "saved-main", "rollback retained a replacement payload")
+      test.assert(sql.bytes(sql.rows(connection,
+        "SELECT value FROM main.cache_meta WHERE key=?",
+        sqlite3.Blob.new("published_revisions"))[1],1) == previous_key,
+        "rollback changed the completed payload publication identity")
+      sql.execute(connection,"DROP TRIGGER main.fail_payload_publication")
+    end
+    publish(cache)
+    do
+      local access = cache.store:acquire()
+      defer access:release()
+      local connection = access.connection
+      test.assert(sql.scalar_integer(connection,"SELECT count(*) FROM main.project_snapshots") == 5,
+        "publication retained removed, failed, dirty, nonproject or unrepresentable payloads")
+      test.assert(sql.bytes(sql.rows(connection,
+        "SELECT payload FROM main.project_snapshots WHERE module=CAST('keep' AS BLOB)")[1],1) ==
+        "saved-keep", "sparse publication changed an unchanged payload")
+      test.assert(sql.bytes(sql.rows(connection,
+        "SELECT payload FROM main.project_snapshots WHERE module=CAST('main' AS BLOB)")[1],1) ==
+        "new-main", "sparse publication lost the changed payload")
+    end
+    local still_missing = cache:projects_to_export()
+    test.assert(#still_missing == 1 and still_missing[1] == "unrepresentable",
+      "an encoding failure retained its obsolete completed payload")
+  end)
+end
+
+function test_workspace_cache_recreated_module_invalidates_its_unpublished_predecessor(
+    _context: test.Context)
+  test_runtime.run(function ()
+    local cache = caches.memory("recreated-module")
+    defer cache.store:close()
+    do
+      local access = cache.store:acquire()
+      defer access:release()
+      features.initialize_schema(access.connection)
+      published_diagnostics.initialize_schema(access.connection)
+      local modules = graph.create<integer>(access.connection)
+      modules:observe_project("main",{graph.FileStamp.new("main.titan",1,0,3,"old")})
+      local token? = modules:begin_project_check("main")
+      test.assert(token ~= nil,"first incarnation did not become checkable")
+      modules:commit_project(token as graph.CheckToken,graph.Manifest.new("old","old"),{},1)
+    end
+    cache:prepare()
+    cache:set_projects({bridge.ProjectPayload.new("main","first-incarnation")})
+    publish(cache)
+    do
+      local access = cache.store:acquire()
+      defer access:release()
+      local modules = graph.create<integer>(access.connection)
+      modules:remove_module("main")
+      modules:observe_project("main",{graph.FileStamp.new("main.titan",1,0,3,"new")})
+      local token? = modules:begin_project_check("main")
+      test.assert(token ~= nil,"recreated incarnation did not become checkable")
+      modules:commit_project(token as graph.CheckToken,graph.Manifest.new("new","new"),{},2)
+    end
+    -- No cache/semantic publication separated deletion from recreation.
+    test.assert(not cache:prepare() and #cache:project_payloads() == 0,
+      "recreated module reused its predecessor's completed payload or semantic view")
+    local selected = cache:projects_to_export()
+    test.assert(#selected == 1 and selected[1] == "main",
+      "recreated module was omitted from sparse payload encoding")
+    cache:set_projects({bridge.ProjectPayload.new("main","second-incarnation")})
+    publish(cache)
+    test.assert(cache:project_payloads()[1].payload == "second-incarnation",
+      "recreated module did not replace its predecessor's opaque graph")
+  end)
+end
+
+function test_workspace_cache_rebuilds_the_previous_schema_before_graph_use(
+    _context: test.Context)
+  test_runtime.run(function ()
+    local root = new_root()
+    defer cleanup(root)
+    local cache = caches.open(root,"same-context")
+    initialize_revision(cache)
+    cache:prepare()
+    cache:set_projects({bridge.ProjectPayload.new("main","previous-schema")})
+    publish(cache)
+    do
+      local access = cache.store:acquire()
+      defer access:release()
+      sql.execute(access.connection,"PRAGMA main.user_version=1")
+    end
+    cache.store:close()
+    local reopened = caches.open(root,"same-context")
+    defer reopened.store:close()
+    initialize_revision(reopened)
+    test.assert(#reopened:project_payloads() == 0,"previous graph schema survived a cache reopen")
+    local access = reopened.store:acquire()
+    defer access:release()
+    test.assert(sql.scalar_integer(access.connection,"PRAGMA main.user_version") == 2,
+      "rebuild did not install the new graph schema version")
+  end)
+end

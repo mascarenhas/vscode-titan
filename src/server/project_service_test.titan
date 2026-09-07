@@ -1,4 +1,7 @@
 local fs = import "fs"
+local async = import "async"
+local sqlite3 = import "sqlite3"
+local file_times = foreign import "utime.h"
 local test = import "test"
 local strings = import "string"
 local compiler_bridge = import "server.compiler_bridge"
@@ -6,7 +9,16 @@ local compiler_io = import "server.compiler_io"
 local project_config = import "server.project_config"
 local project_service = import "server.project_service"
 local project_graph = import "server.project_graph"
+local stores = import "server.workspace_store"
 local test_runtime = import "server.test_runtime"
+
+local function fixed_modified_time(path: string)
+  local times = file_times.utimbuf.new()
+  times.actime = 1700000000
+  times.modtime = 1700000000
+  test.assert(file_times.utime(path, times) == 0,
+    "could not set deterministic saved-file timestamp")
+end
 
 local record Fixture
   root: string
@@ -14,6 +26,7 @@ local record Fixture
   directories: {string}
   known_files: {string: boolean}
   known_directories: {string: boolean}
+  services: {project_service.Service}
 end
 
 local type FixtureBody = (Fixture) -> ()
@@ -22,7 +35,7 @@ local function new_fixture(): Fixture
   local root = fs.tmpname()
   fs.unlink(root)
   fs.mkdir(root)
-  return Fixture.new(root, {}, {root}, {}, {[root] = true})
+  return Fixture.new(root, {}, {root}, {}, {[root] = true}, {})
 end
 
 local function Fixture:path(relative: string): string
@@ -48,6 +61,7 @@ local function Fixture:write(relative: string, contents: string)
 end
 
 local function Fixture:cleanup()
+  for index = #self.services, 1, -1 do self.services[index]:close() end
   for index = #self.files, 1, -1 do
     if fs.lstat(self.files[index]) ~= nil then fs.unlink(self.files[index]) end
   end
@@ -490,6 +504,7 @@ local function require_service(
   local service?, failure? = project_service.load_with_analyzer(
     fixture.root, "/sdk/lib/titan/0.6", analyzer:analyze,
     restat_test_headers)
+  if service ~= nil then fixture.services[#fixture.services + 1] = service end
   local detail = ""
   if failure ~= nil then
     detail = ": " .. failure.path .. ": " .. failure.message
@@ -507,6 +522,7 @@ local function require_resolved_service(
     project_service.load_with_analyzer_and_resolver(
       fixture.root, "/sdk/lib/titan/0.6", analyzer:analyze,
       resolver:resolve, restat_test_headers)
+  if service ~= nil then fixture.services[#fixture.services + 1] = service end
   local detail = ""
   if failure ~= nil then
     detail = ": " .. failure.path .. ": " .. failure.message
@@ -614,7 +630,7 @@ local function loads_multi_module_folder_and_external_metadata()
                 "valid folder module did not retain its compiler snapshot")
 
     local counters = service:counters()
-    test.assert(counters.file_reads == 3 and
+    test.assert(counters.file_reads == 6 and
                 counters.analysis_runs == 1 and
                 counters.project_modules_submitted == 2 and
                 analyzer.runs == 1 and analyzer.last_module_count == 2,
@@ -916,6 +932,7 @@ local function rejects_omitted_attempted_project_result()
         return compiler_bridge.Analysis.new(
           request.root_module, {}, {}, {}, {}, {})
       end)
+    if service ~= nil then fixture.services[#fixture.services + 1] = service end
     test.assert(create_error == nil and service ~= nil,
                 "omitted-result fixture did not initialize")
     if service == nil then raise "omitted-result Service is missing" end
@@ -946,6 +963,7 @@ local function rejects_stale_generation_commit()
     local analyzer = new_analyzer()
     local service?, failure? = project_service.create_with_analyzer(
       fixture.root, "/sdk/lib/titan/0.6", analyzer:analyze)
+    if service ~= nil then fixture.services[#fixture.services + 1] = service end
     test.assert(failure == nil and service ~= nil,
                 "stale-generation fixture did not initialize")
     local request? = service:prepare_work()
@@ -986,7 +1004,7 @@ local function stops_propagation_at_unchanged_manifests()
     local analyzer = new_analyzer()
     local service = require_service(fixture, analyzer)
     local before = service:counters()
-    test.assert(before.file_reads == 4 and before.analysis_runs == 1 and
+    test.assert(before.file_reads == 8 and before.analysis_runs == 1 and
                 before.project_modules_submitted == 4,
                 "initial dependency fixture was not analyzed once")
 
@@ -1000,8 +1018,8 @@ local function stops_propagation_at_unchanged_manifests()
                 #report.dirty_modules == 0,
                 "body-only edit propagated beyond its provider")
     local after = service:counters()
-    test.assert(after.file_reads == before.file_reads + 1,
-                "unchanged project modules were re-read from disk")
+    test.assert(after.file_reads == before.file_reads + 8,
+                "refresh did not validate every project source before publication")
     test.assert(after.analysis_runs == before.analysis_runs + 1 and
                 after.project_modules_submitted ==
                   before.project_modules_submitted + 1 and
@@ -1095,6 +1113,7 @@ function run(): integer return dep.hidden(1) end
 ]])
 
     local service?, failure? = project_service.load_default(fixture.root)
+    if service ~= nil then fixture.services[#fixture.services + 1] = service end
     test.assert(failure == nil and service ~= nil,
                 "real compiler project fixture did not load")
     local initial = service:latest()
@@ -1220,6 +1239,7 @@ function answer(): integer return uv.private_answer() end
 ]])
 
     local service?, failure? = project_service.load_default(fixture.root)
+    if service ~= nil then fixture.services[#fixture.services + 1] = service end
     local detail = ""
     if failure ~= nil then detail = ": " .. failure.message end
     test.assert(failure == nil and service ~= nil,
@@ -1270,10 +1290,10 @@ local function revalidates_external_source_when_encountered_again()
                 not report.stale,
                 "external mtime change did not schedule a project refresh")
     local after = service:counters()
-    test.assert(after.file_reads == before.file_reads and
+    test.assert(after.file_reads == before.file_reads + 2 and
                 after.analysis_runs == before.analysis_runs + 1 and
                 analyzer.last_cached_count == 0,
-                "external revalidation re-read project sources or skipped analysis")
+                "external revalidation did not validate saved sources and analyze once")
     local updated? = service:external_module("vendor.source")
     test.assert(updated ~= nil and #updated.stamps == 2 and
                 updated.stamps[2].size ~= old_external.stamps[2].size,
@@ -1322,12 +1342,12 @@ local function revalidates_transitive_external_dependency()
                 #report.dirty_modules == 0,
                 "transitive external change did not recheck its project root")
     local after = service:counters()
-    test.assert(after.file_reads == before.file_reads and
+    test.assert(after.file_reads == before.file_reads + 2 and
                 after.analysis_runs == before.analysis_runs + 1 and
                 after.project_modules_submitted ==
                   before.project_modules_submitted + 1 and
                 analyzer.last_cached_count == 1,
-                "transitive external refresh re-read or rechecked unrelated input")
+                "transitive external refresh did not validate sources or rechecked unrelated modules")
     local inner? = service:external_module("vendor.inner")
     test.assert(inner ~= nil and
                 inner.stamps[1].size ==
@@ -1432,6 +1452,7 @@ extra_ffi_cppflags = "-DPROJECT_SERVICE_FFI=0"
       end
     local service?, load_error? = project_service.load_with_analyzer(
       fixture.root, "/sdk/lib/titan/0.6", analyzer)
+    if service ~= nil then fixture.services[#fixture.services + 1] = service end
     test.assert(load_error == nil and service ~= nil,
                 "configuration recovery fixture did not load")
     if service == nil then raise "configuration recovery Service is absent" end
@@ -1687,6 +1708,7 @@ local function missing_provider_appearance_recovers_failed_revision()
       project_service.load_with_analyzer_and_resolver(
         fixture.root, "/sdk/lib/titan/0.6", analyzer,
         resolver:resolve, restat_test_headers)
+    if service ~= nil then fixture.services[#fixture.services + 1] = service end
     test.assert(load_error == nil and service ~= nil,
                 "missing-provider fixture did not load a partial project")
     if service == nil then raise "missing-provider Service is absent" end
@@ -1823,6 +1845,7 @@ local function validates_binary_observation_before_source_result()
     local service?, load_error? = project_service.load_with_analyzer(
       fixture.root, "/sdk/lib/titan/0.6", analyzer,
       restat_test_headers)
+    if service ~= nil then fixture.services[#fixture.services + 1] = service end
     test.assert(load_error == nil and service ~= nil,
                 "mixed-provider project service did not load")
     if service == nil then raise "mixed-provider Service is absent" end
@@ -2198,6 +2221,7 @@ local function attributes_location_free_diagnostics_to_attempted_modules()
     local service?, failure? = project_service.load_with_analyzer(
       fixture.root, "/sdk/lib/titan/0.6", analyzer,
       restat_test_headers)
+    if service ~= nil then fixture.services[#fixture.services + 1] = service end
     test.assert(failure == nil and service ~= nil,
                 "owned-diagnostic project did not load")
     if service == nil then raise "owned-diagnostic Service is missing" end
@@ -2325,7 +2349,7 @@ local function rejects_save_completed_during_analysis()
                   "public:main:two",
                 "obsolete bytes were published after a mid-analysis save")
     local after = service:counters()
-    test.assert(after.file_reads == before.file_reads + 2 and
+    test.assert(after.file_reads == before.file_reads + 3 and
                 after.analysis_runs == before.analysis_runs + 2 and
                 after.project_modules_submitted ==
                   before.project_modules_submitted + 2,
@@ -2406,11 +2430,11 @@ local function project_header_edit_delete_and_recovery()
                 edited.committed_modules[2] == "friend",
                 "direct-header edit did not reach exactly its owner and source importer")
     local after_edit = service:counters()
-    test.assert(after_edit.file_reads == initial.file_reads and
+    test.assert(after_edit.file_reads == initial.file_reads + 12 and
                 after_edit.analysis_runs == initial.analysis_runs + 2 and
                 after_edit.project_modules_submitted ==
                   initial.project_modules_submitted + 2,
-                "header edit reread Titan sources or selected unrelated modules")
+                "header edit skipped source validation or selected unrelated modules")
 
     fs.unlink(direct)
     local deleted?, delete_error? = service:refresh()
@@ -2439,7 +2463,8 @@ local function project_header_edit_delete_and_recovery()
     local nested_recovered?, nested_recovery_error? = service:refresh()
     test.assert(nested_recovery_error == nil and nested_recovered ~= nil and
                 contains(nested_recovered.committed_modules, "dep") and
-                service:counters().file_reads == initial.file_reads,
+                service:counters().file_reads == initial.file_reads +
+                  (service:counters().analysis_runs - initial.analysis_runs + 5) * 4,
                 "transitive-header restoration required a Titan source change")
   end)
 end
@@ -2491,7 +2516,7 @@ local function include_shadow_addition_and_removal()
     selected = service:project_ast("main")
     test.assert(restore_error == nil and restored ~= nil and selected ~= nil and
                 selected.c_header_dependencies[3].path == late and
-                service:counters().file_reads == before.file_reads,
+                service:counters().file_reads == before.file_reads + 4,
                 "removing the earlier shadow did not restore the later winner")
   end)
 end
@@ -2571,6 +2596,7 @@ local function rejects_new_header_change_during_analysis()
     local service?, failure? = project_service.create_with_analyzer(
       fixture.root, "/sdk/lib/titan/0.6", analyzer:analyze,
       restat_test_headers)
+    if service ~= nil then fixture.services[#fixture.services + 1] = service end
     test.assert(failure == nil and service ~= nil,
                 "header race fixture did not initialize")
     local report?, refresh_error? = service:refresh()
@@ -2596,6 +2622,7 @@ local function loads_compiler_owned_default_binary_root()
   with_fixture(function (fixture: Fixture)
     fixture:mkdir("src")
     local service?, failure? = project_service.load_default(fixture.root)
+    if service ~= nil then fixture.services[#fixture.services + 1] = service end
     test.assert(failure == nil and service ~= nil,
                 "default compiler-owned project service did not load")
     local snapshot = service:latest()
@@ -2614,4 +2641,378 @@ end
 function test_project_service_load_default_uses_compiler_installation_root(
     _context: test.Context)
   test_runtime.run(loads_compiler_owned_default_binary_root)
+end
+
+function test_project_service_detects_changed_saved_bytes_with_preserved_mtime_and_size(
+    _context: test.Context)
+  test_runtime.run(function ()
+    with_fixture(function (fixture: Fixture)
+      fixture:mkdir("src")
+      configure_source_root(fixture)
+      fixture:write("src/main.titan", "-- body one\n")
+      local path = fixture:path("src/main.titan")
+      fixed_modified_time(path)
+      local analyzer = new_analyzer()
+      local service = require_service(fixture, analyzer)
+      local before = service:latest()
+      local previous = before.project_modules[1].source_files[1]
+      fixture:write("src/main.titan", "-- body two\n")
+      fixed_modified_time(path)
+      local report?, failure? = service:refresh()
+      local after = service:latest()
+      local current = after.project_modules[1].source_files[1]
+      test.assert(failure == nil and report ~= nil and report.analyzed and
+        #report.committed_modules == 1 and report.committed_modules[1] == "main",
+        "same-mtime same-size content change did not recheck its project module")
+      test.assert(previous.stamp.modified_seconds == current.stamp.modified_seconds and
+        previous.stamp.modified_nanoseconds == current.stamp.modified_nanoseconds and
+        previous.stamp.size == current.stamp.size and
+        previous.stamp.identity ~= current.stamp.identity and
+        current.contents == "-- body two\n",
+        "saved-byte identity did not distinguish an edit with unchanged metadata")
+    end)
+  end)
+end
+
+function test_project_service_keeps_reads_available_during_analysis_and_drains_close(
+    _context: test.Context)
+  test_runtime.run(function ()
+    with_fixture(function (fixture: Fixture)
+      fixture:mkdir("src")
+      configure_source_root(fixture)
+      fixture:write("src/main.titan", "-- body one\n")
+      local started, await_started, close_started = async.channel<boolean>(1)
+      defer close_started()
+      local resume, await_resume, close_resume = async.channel<boolean>(1)
+      defer close_resume()
+      local block = false
+      local recorder = new_analyzer()
+      local analyzer: project_service.Analyzer = function (
+          request: project_service.AnalysisRequest): compiler_bridge.Analysis
+        if block then
+          started(true)
+          await_resume()
+        end
+        return recorder:analyze(request)
+      end
+      local service?, failure? = project_service.load_with_analyzer(
+        fixture.root, "/sdk/lib/titan/0.6", analyzer)
+      if service ~= nil then fixture.services[#fixture.services + 1] = service end
+      test.assert(service ~= nil and failure == nil, "drain fixture did not load")
+      if service == nil then raise "drain fixture Service is missing" end
+      fixture:write("src/main.titan", "-- body two\n")
+      local scanned?, scan_error? = service:scan()
+      test.assert(scanned ~= nil and scan_error == nil, "drain fixture scan failed")
+      local request? = service:prepare_work()
+      test.assert(request ~= nil, "saved edit did not prepare analysis")
+      block = true
+      local worker = async.run<nil, value>(function (): nil
+        local report?, commit_error? = service:analyze(request)
+        test.assert(report ~= nil and commit_error == nil and
+          #report.committed_modules == 1, "accepted analysis failed while close waited")
+        return nil
+      end)
+      await_started()
+      -- This read would deadlock if compiler work retained the SQLite lease.
+      local during = service:latest()
+      test.assert(#during.project_modules == 1 and
+        during.project_modules[1].compiler_snapshot ~= nil,
+        "last compiler snapshot disappeared while refresh was active")
+      local closed = false
+      local closer = async.run<nil, value>(function (): nil
+        service:close()
+        closed = true
+        return nil
+      end)
+      async.yield()
+      test.assert(not closed, "Service closed before accepted analysis drained")
+      resume(true)
+      test.assert(async.join<nil, value>(worker):has_succeeded(), "analysis worker failed")
+      test.assert(async.join<nil, value>(closer):has_succeeded() and closed,
+        "Service did not close after its accepted update finished")
+    end)
+  end)
+end
+
+function test_project_service_rolls_back_earlier_modules_when_later_result_is_missing(
+    _context: test.Context)
+  test_runtime.run(function ()
+    with_fixture(function (fixture: Fixture)
+      fixture:mkdir("src")
+      configure_source_root(fixture)
+      fixture:write("src/a.titan", "-- first a\n")
+      fixture:write("src/b.titan", "-- first b\n")
+      local malformed = false
+      local recorder = new_analyzer()
+      local analyzer: project_service.Analyzer = function (
+          request: project_service.AnalysisRequest): compiler_bridge.Analysis
+        local result = recorder:analyze(request)
+        if malformed then
+          test.assert(#result.modules == 2, "rollback fixture lost its two project results")
+          result.modules[2] = nil
+        end
+        return result
+      end
+      local service?, failure? = project_service.load_with_analyzer(
+        fixture.root, "/sdk/lib/titan/0.6", analyzer)
+      if service ~= nil then fixture.services[#fixture.services + 1] = service end
+      test.assert(service ~= nil and failure == nil, "rollback fixture did not load")
+      if service == nil then raise "rollback fixture Service is missing" end
+      local before = service:latest()
+      local original? = before.project_modules[1].compiler_snapshot
+      fixture:write("src/a.titan", "-- PUBLIC_TWO a\n")
+      fixture:write("src/b.titan", "-- PUBLIC_TWO b\n")
+      malformed = true
+      local report?, failure? = service:refresh()
+      test.assert(report == nil and failure ~= nil,
+        "incomplete multi-module analysis unexpectedly committed")
+      local after = service:latest()
+      test.assert(#after.dirty_modules == 2 and
+        after.project_modules[1].compiler_snapshot == original and
+        #after.project_modules[1].diagnostics == 0,
+        "failed publication kept an earlier module's new handle or diagnostics")
+      malformed = false
+      local recovered?, recovery_error? = service:run_pending()
+      test.assert(recovered ~= nil and recovery_error == nil and
+        #recovered.committed_modules == 2 and #recovered.dirty_modules == 0,
+        "rolled-back publication could not retry both modules")
+    end)
+  end)
+end
+
+function test_project_service_hydrates_only_projects_revalidated_after_store_reopen(
+    _context: test.Context)
+  test_runtime.run(function ()
+    with_fixture(function (fixture: Fixture)
+      fixture:mkdir("src")
+      fixture:mkdir("include")
+      configure_source_root(fixture)
+      fixture:write("src/main.titan", "-- saved header consumer\n")
+      fixture:write("include/value.h", "#define VALUE 1\n")
+      fixture:write("cache.sqlite3", "")
+      local path = fixture:path("cache.sqlite3")
+      local header = fixture:path("include/value.h")
+      local analyzer = new_analyzer()
+      analyzer.project_header_inputs["main"] = {
+        header_input(compiler_bridge.CHeaderDependencyKind.file(), header),
+      }
+      local store = stores.open(path)
+      local initial?, initial_error? = project_service.create_with_store(
+        fixture.root, "/sdk/lib/titan/0.6", analyzer:analyze, nil,
+        restat_test_headers, store)
+      if initial ~= nil then fixture.services[#fixture.services + 1] = initial end
+      test.assert(initial ~= nil and initial_error == nil, "persistent fixture did not initialize")
+      if initial == nil then store:close() raise "persistent fixture Service is missing" end
+      local checked?, check_error? = initial:run_pending()
+      local snapshot? = initial:project_ast("main")
+      test.assert(checked ~= nil and check_error == nil and snapshot ~= nil,
+        "persistent fixture did not produce a checked project handle")
+      initial:close()
+
+      local reopened_store = stores.open(path)
+      local reopened?, reopen_error? = project_service.create_with_store(
+        fixture.root, "/sdk/lib/titan/0.6", analyzer:analyze, nil,
+        restat_test_headers, reopened_store)
+      if reopened ~= nil then fixture.services[#fixture.services + 1] = reopened end
+      test.assert(reopened ~= nil and reopen_error == nil, "unchanged persistent fixture did not reopen")
+      if reopened == nil then reopened_store:close() raise "reopened Service is missing" end
+      test.assert(reopened:project_ast("main") == nil and
+        #reopened:latest().dirty_modules == 0 and
+        reopened:hydrate_project_snapshot("main", snapshot),
+        "reopen fabricated a compiler handle or rejected validated clean hydration")
+      local warm?, warm_error? = reopened:run_pending()
+      test.assert(warm ~= nil and warm_error == nil and not warm.analyzed and
+        reopened:counters().analysis_runs == 0,
+        "unchanged hydrated project was submitted to the compiler again")
+      reopened:close()
+
+      fixture:write("include/value.h", "#define VALUE 2\n")
+      local changed_store = stores.open(path)
+      local changed?, change_error? = project_service.create_with_store(
+        fixture.root, "/sdk/lib/titan/0.6", analyzer:analyze, nil,
+        restat_test_headers, changed_store)
+      if changed ~= nil then fixture.services[#fixture.services + 1] = changed end
+      test.assert(changed ~= nil and change_error == nil, "changed-header persistent fixture did not reopen")
+      if changed == nil then changed_store:close() raise "changed-header Service is missing" end
+      test.assert(contains(changed:latest().dirty_modules, "main") and
+        not changed:hydrate_project_snapshot("main", snapshot),
+        "persisted header inputs were not revalidated before project hydration")
+    end)
+  end)
+end
+
+function test_project_service_rolls_back_header_baseline_with_its_invalidated_revision(
+    _context: test.Context)
+  test_runtime.run(function ()
+    with_fixture(function (fixture: Fixture)
+      fixture:mkdir("src")
+      fixture:mkdir("include")
+      configure_source_root(fixture)
+      fixture:write("src/main.titan", "-- header consumer\n")
+      fixture:write("include/value.h", "#define VALUE 1\n")
+      local header = fixture:path("include/value.h")
+      local analyzer = new_analyzer()
+      analyzer.project_header_inputs["main"] = {
+        header_input(compiler_bridge.CHeaderDependencyKind.file(), header),
+      }
+      local service = require_service(fixture, analyzer)
+      local store = service:workspace_store()
+      local access = store:acquire()
+      defer access:release()
+      local old = stores.rows(access.connection,
+        "SELECT identity FROM main.header_inputs WHERE scope=0 AND module=?",
+        sqlite3.Blob.new("main"))
+      local original_identity = stores.bytes(old[1], 1)
+      stores.execute(access.connection,
+        "CREATE TRIGGER main.reject_header_invalidation BEFORE UPDATE OF state " ..
+        "ON graph_modules WHEN NEW.state=0 AND NEW.name='main' " ..
+        "BEGIN SELECT RAISE(ABORT,'injected invalidation failure'); END")
+      access:release()
+      fixture:write("include/value.h", "#define VALUE 2\n")
+      local scanned?, scan_error? = service:scan()
+      test.assert(scanned == nil and scan_error ~= nil,
+        "injected metadata invalidation failure was ignored")
+      local read = store:acquire()
+      defer read:release()
+      local restored = stores.rows(read.connection,
+        "SELECT identity FROM main.header_inputs WHERE scope=0 AND module=?",
+        sqlite3.Blob.new("main"))
+      test.assert(stores.bytes(restored[1], 1) == original_identity and
+        stores.scalar_integer(read.connection,
+          "SELECT state FROM main.graph_modules WHERE name='main'") == 2,
+        "failed invalidation advanced its observation baseline independently")
+      stores.execute(read.connection, "DROP TRIGGER main.reject_header_invalidation")
+      read:release()
+      local retried?, retry_error? = service:scan()
+      test.assert(retried ~= nil and retry_error == nil and
+        contains(retried.dirty_modules, "main"),
+        "rolled-back header observation could not invalidate its project on retry")
+    end)
+  end)
+end
+
+function test_project_service_persists_configuration_with_interrupted_graph_work(
+    _context: test.Context)
+  test_runtime.run(function ()
+    with_fixture(function (fixture: Fixture)
+      fixture:mkdir("src")
+      fixture:mkdir("include")
+      fixture:write("src/clean.titan", "-- saved clean module\n")
+      fixture:write("src/failed.titan", "-- saved configuration-dependent module\n")
+      fixture:write("include/config.h", "/* unchanged header bytes */\n")
+      fixture:write("cache.sqlite3", "")
+      local configuration_a = [[
+include = { "src" }
+binary_modules_root = "binary-modules"
+extra_ffi_cppflags = "-DVARIANT=1"
+]]
+      local configuration_b = [[
+include = { "src" }
+binary_modules_root = "binary-modules"
+extra_ffi_cppflags = "-DVARIANT=2"
+]]
+      fixture:write("titan-config.lua", configuration_a)
+      local headers = {header_input(compiler_bridge.CHeaderDependencyKind.file(),
+        fixture:path("include/config.h"))}
+      local analyzer: project_service.Analyzer = function (
+          request: project_service.AnalysisRequest): compiler_bridge.Analysis
+        local snapshots: {compiler_bridge.ModuleSnapshot} = {}
+        local diagnostics: {compiler_bridge.Diagnostic} = {}
+        for index = 1, #request.dirty_modules do
+          local module = find_bridge_project(request.project_modules,
+            request.dirty_modules[index])
+          if module.module_name == "failed" and
+             request.config.extra_ffi_cppflags == "-DVARIANT=2" then
+            snapshots[#snapshots + 1] = failed_project(module, headers)
+            diagnostics[#diagnostics + 1] = compiler_bridge.Diagnostic.new(
+              compiler_bridge.DiagnosticKind.type_error(),
+              "configuration B rejects this saved module", location(module))
+          else
+            snapshots[#snapshots + 1] = successful_project(module, headers)
+          end
+        end
+        return compiler_bridge.Analysis.new(request.root_module, diagnostics,
+          snapshots, {}, {}, {})
+      end
+      local reopen: () -> project_service.Service = function (): project_service.Service
+        local store = stores.open(fixture:path("cache.sqlite3"))
+        local service?, failure? = project_service.create_with_store(
+          fixture.root, "/sdk/lib/titan/0.6", analyzer, nil,
+          restat_test_headers, store)
+        if service == nil then
+          store:close()
+          raise "persistent configuration fixture failed: " .. failure.message
+        end
+        fixture.services[#fixture.services + 1] = service
+        return service
+      end
+      local service = reopen()
+      local initial?, initial_error? = service:run_pending()
+      test.assert(initial ~= nil and initial_error == nil and
+        #initial.committed_modules == 2, "configuration A did not check both modules")
+      local original? = service:project_ast("clean")
+      local access = service:workspace_store():acquire()
+      defer access:release()
+      local old_identity = stores.bytes(stores.rows(access.connection,
+        "SELECT value FROM main.cache_meta WHERE key=?",
+        sqlite3.Blob.new("graph_configuration"))[1], 1)
+      stores.execute(access.connection,
+        "CREATE TRIGGER main.reject_graph_configuration BEFORE UPDATE OF value " ..
+        "ON cache_meta WHEN NEW.key=CAST('graph_configuration' AS BLOB) " ..
+        "BEGIN SELECT RAISE(ABORT,'injected configuration failure'); END")
+      access:release()
+      fixture:write("titan-config.lua", configuration_b)
+      local aborted?, abort_error? = service:scan()
+      test.assert(aborted == nil and abort_error ~= nil,
+        "configuration identity write failure did not abort graph invalidation")
+      local rolled_back = service:workspace_store():acquire()
+      defer rolled_back:release()
+      local retained = stores.bytes(stores.rows(rolled_back.connection,
+        "SELECT value FROM main.cache_meta WHERE key=?",
+        sqlite3.Blob.new("graph_configuration"))[1], 1)
+      test.assert(retained == old_identity and
+        stores.scalar_integer(rolled_back.connection,
+          "SELECT count(*) FROM main.graph_modules WHERE state=2") == 2 and
+        stores.scalar_integer(rolled_back.connection,
+          "SELECT count(*) FROM main.header_inputs WHERE scope=0") == 2,
+        "failed configuration transaction changed graph or header baselines")
+      stores.execute(rolled_back.connection, "DROP TRIGGER main.reject_graph_configuration")
+      rolled_back:release()
+      test.assert(service:project_ast("clean") == original,
+        "failed configuration transaction discarded the live checked handle")
+
+      local changed?, change_error? = service:refresh()
+      test.assert(changed ~= nil and change_error == nil and
+        #changed.committed_modules == 1 and #changed.failed_modules == 1,
+        "configuration B did not commit its clean and failed graph states")
+      local snapshot_b? = service:project_ast("clean")
+      local before_close = service:workspace_store():acquire()
+      defer before_close:release()
+      test.assert(stores.scalar_integer(before_close.connection,
+        "SELECT published_generation FROM main.store_state WHERE singleton=1") == 0,
+        "fixture accidentally published a completed feature view")
+      before_close:release()
+      service:close()
+
+      -- The process stopped after B's graph commit, before a completed-view
+      -- publication could update any cache compatibility marker.
+      fixture:write("titan-config.lua", configuration_a)
+      local recovered = reopen()
+      local pending = recovered:latest().dirty_modules
+      test.assert(#pending == 2 and contains(pending, "clean") and
+        contains(pending, "failed") and snapshot_b ~= nil and
+        not recovered:hydrate_project_snapshot("clean", snapshot_b),
+        "restart trusted clean or failed graph work from configuration B")
+      local after_reopen = recovered:workspace_store():acquire()
+      defer after_reopen:release()
+      test.assert(stores.scalar_integer(after_reopen.connection,
+        "SELECT count(*) FROM main.header_inputs") == 0,
+        "restart retained a header baseline from configuration B")
+      after_reopen:release()
+      local checked?, check_error? = recovered:run_pending()
+      test.assert(checked ~= nil and check_error == nil and
+        #checked.committed_modules == 2 and #checked.failed_modules == 0,
+        "restored configuration A did not recheck both unchanged sources")
+    end)
+  end)
 end

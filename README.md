@@ -12,7 +12,7 @@ runtime modules, the embedded Lua interpreter, and the selected native
 dependencies. Initialized statically linked modules register their runtime
 openers in `package.preload`. Separately, the executable carries a metadata-only
 inventory of all 21 canonical Titan standard-module interfaces; compiler
-language-server API 5 validates and decodes those serialized interfaces and
+language-server API 6 validates and decodes those serialized interfaces and
 their build target's C type profile for project typechecking. The inventory
 contains no standard-module implementation, provider archive, header, or SDK
 payload.
@@ -210,9 +210,10 @@ VSIX is therefore self-contained for compiler discovery and does not inherit
 ambient `LUA_PATH` or `LUA_CPATH` defaults. Configured values replace the
 corresponding packaged template verbatim, so an override must be a complete Lua
 search path. Compatibility still requires both the matching Titan ABI and
-`titan-compiler.driver.LANGUAGE_SERVER_API_VERSION == 5`; API 5 includes the
+`titan-compiler.driver.LANGUAGE_SERVER_API_VERSION == 6`; API 6 includes the
 compiler's typed semantic metadata, incremental-analysis hooks, C-header
-dependency restat contract, resolver-scoped I/O strategy with named
+dependency restat contract, checked-project graph codecs, completed C-header
+and FFI conversion cache transport, resolver-scoped I/O strategy with named
 completed-module yield checkpoints, and the validated metadata-only embedded
 interface provider used before disk-backed compiled providers. The provider's
 validated build target profile describes portable C types in those interfaces
@@ -353,6 +354,24 @@ watched, indexed, or a navigation target in version 1. This restriction does
 not prohibit opening the workspace root itself through a symlink, as described
 above.
 
+The server stores its saved index and dependency metadata in
+`.titan-ls/index.sqlite3` inside the resolved workspace root. It also stores
+compiler-owned checked-project and completed C-header graphs there, allowing a
+compatible restart to reuse work. The directory excludes itself from Git and
+is always omitted from source discovery and watchers. If it cannot be created
+or opened, the server logs that persistence is unavailable and uses the same
+SQLite backend in memory.
+
+Startup checks saved file contents, recorded header/search inputs, configuration,
+compiler files, and the native target before publishing reused answers. Changed
+inputs invalidate affected modules; incompatible or damaged cache data rebuilds.
+Changing only `exclude` changes watcher policy without invalidating compatible
+semantics. The cache is disposable: close the server before removing
+`.titan-ls` to force a fresh index.
+
+See [workspace SQLite measurements](docs/sqlite-backend-benchmarks.md) for
+restart and saved-edit timings, memory and disk usage, and reproduction commands.
+
 ## Package and install the VSIX
 
 ```sh
@@ -404,8 +423,9 @@ functions, methods, associated functions, and supported foreign callables.
 Function-valued variables retain their bare function type. Record, union, and
 interface hovers summarize the members visible at that occurrence; module
 hovers summarize visible top-level members without recursively expanding
-nominal types. These summaries are normalized and cached with the immutable
-semantic index rather than rebuilt by individual hover requests.
+nominal types. These summaries, hover types, and folding ranges are materialized
+in the completed SQLite view during indexing. Individual feature queries read
+that view without traversing compiler ASTs or writing saved rows.
 
 An unchanged read-only request uses the immutable completed generation without
 rescanning the project. Before the initial index is ready it returns the

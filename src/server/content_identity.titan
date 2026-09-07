@@ -1,0 +1,32 @@
+local sha = foreign import "openssl/sha.h"
+local fs = import "fs"
+local strings = import "string"
+
+-- OpenSSL is already a static-provider dependency. Hash arbitrary saved bytes
+-- through its length-bearing API, with a traced owner for the output buffer.
+function digest(contents: string): string
+  local output: owned unsigned char[] = unsigned char.new_array(32)
+  if sha.SHA256(contents, #contents, output) == nil then
+    raise "cannot hash saved input"
+  end
+  return output as string
+end
+
+local function stamp(metadata: fs.Stat?): string
+  if metadata == nil then return "missing" end
+  return metadata.kind .. ":" .. metadata.device .. ":" .. metadata.inode ..
+    ":" .. metadata.size .. ":" .. metadata.modified_seconds .. ":" ..
+    metadata.modified_nanoseconds .. ":" .. metadata.mode
+end
+
+function stat_identity(filename: string): string
+  local output = strings.writer()
+  output:write(stamp(fs.lstat(filename)))
+  output:write("\0")
+  output:write(stamp(fs.stat(filename)))
+  return digest(output:drain())
+end
+
+function file(filename: string, contents: string): string
+  return digest(digest(contents) .. stat_identity(filename))
+end

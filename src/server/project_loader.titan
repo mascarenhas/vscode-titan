@@ -1,0 +1,187 @@
+local async = import "async"
+local strings = import "string"
+local sqlite3 = import "sqlite3"
+local bridge = import "server.compiler_bridge"
+local config = import "server.project_config"
+local service = import "server.project_service"
+local caches = import "server.workspace_cache"
+local logging = import "server.logging"
+local monotonic = foreign import "compiler_io_clock.h"
+
+local function phase(name: string,cpu: float,wall: float)
+  local elapsed = monotonic.vscode_titan_monotonic_ms() - wall
+  if elapsed < 0.0 then elapsed = 0.0 end
+  logging.emit("debug","cache.startup.phase",{
+    ["phase"] = name,["cpu_ms"] = logging.elapsed_ms(cpu),["wall_ms"] = elapsed,
+  })
+end
+
+local function project_inputs(snapshot: service.Snapshot): {bridge.ProjectModule}
+  local projects: {bridge.ProjectModule} = {}
+  for index = 1, #snapshot.project_modules do
+    local module = snapshot.project_modules[index]
+    local files: {bridge.SourceFile} = {}
+    for file_index = 1, #module.source_files do
+      local file = module.source_files[file_index]
+      files[file_index] = bridge.SourceFile.new(file.filename,file.contents)
+    end
+    projects[index] = bridge.ProjectModule.new(module.module_name,files)
+  end
+  return projects
+end
+
+local function configure(compiler: bridge.Compiler, settings: config.ProjectConfig)
+  compiler:configure_paths(settings:source_path(),settings.binary_modules_root,
+    settings.extra_ffi_include_dirs,settings.extra_ffi_cppflags)
+end
+
+local function clean_names(snapshot: service.Snapshot): {string: boolean}
+  local names: {string: boolean} = {}
+  for index = 1, #snapshot.project_modules do
+    local module = snapshot.project_modules[index]
+    case module.analysis_state
+    when clean then names[module.module_name] = true
+    when failed then
+    when dirty then
+    end
+  end
+  return names
+end
+
+local function clean_payloads(payloads: {bridge.ProjectPayload},
+                               names: {string: boolean}): {bridge.ProjectPayload}
+  local result: {bridge.ProjectPayload} = {}
+  for index = 1, #payloads do
+    if names[payloads[index].module_name] then result[#result + 1] = payloads[index] end
+  end
+  return result
+end
+
+local function load_or_raise(project_root: string,
+    progress_listener: bridge.ProgressListener?,
+    snapshot_listener: service.SnapshotListener?): (service.Service?,service.Error?)
+  local cpu = logging.clock()
+  local wall = monotonic.vscode_titan_monotonic_ms()
+  local compiler = bridge.load()
+  local installed_root = compiler:installed_binary_modules_root()
+  local settings?, config_error? = config.load(project_root,installed_root)
+  if settings == nil then
+    return nil,service.Error.new(config_error.path,config_error.message)
+  end
+  configure(compiler,settings)
+  local inventory = compiler:cache_identity()
+  local current_configuration = settings:semantic_identity()
+  local compatibility = inventory .. current_configuration
+  local cache = caches.open(settings.project_root,compatibility)
+  phase("inventory",cpu,wall)
+  local loaded?: service.Service
+  local complete = false
+  defer do
+    if not complete then
+      if loaded ~= nil then loaded:close() else cache.store:close() end
+    end
+  end
+  compiler:configure_cache(
+    function (kind: string,key: string): string? return cache:lookup(kind,key) end,
+    function (kind: string,key: string,payload: string,inputs: {bridge.CHeaderDependency})
+      cache:stage(kind,key,payload,inputs)
+    end)
+  cpu = logging.clock()
+  wall = monotonic.vscode_titan_monotonic_ms()
+  local native_context = compiler:native_cache_identity()
+  if not cache:accept_native_context(native_context) then
+    cache = cache:rebuild()
+    if not cache:accept_native_context(native_context) then
+      raise "fresh workspace cache rejected its native context"
+    end
+  end
+  phase("native_context",cpu,wall)
+  local analyzer: service.Analyzer = function (
+      request: service.AnalysisRequest): bridge.Analysis
+    configure(compiler,request.config)
+    return compiler:analyze_incremental(request.project_modules,request.dirty_modules,
+      request.cached_sources,progress_listener)
+  end
+  local resolver: service.ExternalResolver = function (
+      current: config.ProjectConfig,projects: {string},
+      requests: {bridge.ExternalResolutionRequest}): {bridge.ExternalResolution}
+    configure(compiler,current)
+    return compiler:resolve_external_modules(projects,requests)
+  end
+  local restater: service.HeaderRestater = function (
+      inputs: {bridge.CHeaderDependency}): {bridge.CHeaderDependency}
+    return compiler:restat_c_header_dependencies(inputs)
+  end
+  local failure?: service.Error
+  cpu = logging.clock()
+  wall = monotonic.vscode_titan_monotonic_ms()
+  loaded,failure = service.create_with_store(project_root,installed_root,
+    analyzer,resolver,restater,cache.store)
+  if loaded == nil then return nil,failure end
+  phase("input_validation",cpu,wall)
+  cpu = logging.clock()
+  wall = monotonic.vscode_titan_monotonic_ms()
+  local current = loaded:latest()
+  local projects = project_inputs(current)
+  local names = clean_names(current)
+  local restored = compiler:hydrate_projects(projects,
+    clean_payloads(cache:project_payloads(),names))
+  local hydrated: {string: boolean} = {}
+  for index = 1, #restored do
+    local snapshot = restored[index]
+    if loaded:hydrate_project_snapshot(snapshot.module_name,snapshot) then
+      hydrated[snapshot.module_name] = true
+    else
+      compiler:drop_project_ast(snapshot.module_name)
+    end
+  end
+  for index = 1, #projects do
+    local name = projects[index].module_name
+    if names[name] and not hydrated[name] then loaded:invalidate_cached_project(name) end
+  end
+  phase("project_hydration",cpu,wall)
+  loaded:set_publication_hooks(service.PublicationHooks.new(
+    function (snapshot: service.Snapshot): boolean
+      local next_configuration = snapshot.config:semantic_identity()
+      if next_configuration ~= current_configuration then
+        configure(compiler,snapshot.config)
+        native_context = compiler:native_cache_identity()
+        current_configuration = next_configuration
+      end
+      cache:stage_context(snapshot.config.project_root,
+        inventory .. current_configuration,native_context)
+      local reusable = cache:prepare()
+      if not reusable then
+        local selected = cache:projects_to_export()
+        if #selected > 0 then
+          cache:set_projects(compiler:export_projects(project_inputs(snapshot),selected))
+        end
+      end
+      return reusable
+    end,
+    function (connection: sqlite3.Connection) cache:publish(connection) end,
+    function () cache:publication_committed() end))
+  local report?, refresh_error? = loaded:run_pending(snapshot_listener)
+  if report == nil then return nil,refresh_error end
+  complete = true
+  return loaded,nil
+end
+
+function load(project_root: string,progress_listener: bridge.ProgressListener?,
+               snapshot_listener: service.SnapshotListener?):
+    (service.Service?,service.Error?)
+  do
+    return load_or_raise(project_root,progress_listener,snapshot_listener)
+  catch
+    if error is async.CancellationReason then raise end
+    if error is bridge.BridgeError then
+      local failure = error as bridge.BridgeError
+      return nil,service.Error.new(failure.module_name,failure.message)
+    end
+    if error is service.Error then return nil,error as service.Error end
+    if error is sqlite3.Error then
+      return nil,service.Error.new(project_root,(error as sqlite3.Error).message)
+    end
+    return nil,service.Error.new(project_root,strings.tostring(error))
+  end
+end

@@ -8,6 +8,7 @@ local features = import "server.semantic_features"
 local logging = import "server.logging"
 local source_text = import "server.source_text"
 local test_runtime = import "server.test_runtime"
+local content_identity = import "server.content_identity"
 
 local type EmptyFunction = () -> ()
 local type FixtureInstaller = (string, string?) -> value
@@ -71,13 +72,21 @@ return function(mode, contextual_provider_file)
     TITAN_VERSION = "0.6.0",
     TITAN_LIBRARY_VERSION = "0.6",
     LANGUAGE_SERVER_API_VERSION =
-      mode == "wrong-language-server-api" and 4 or 5,
+      mode == "wrong-language-server-api" and 5 or 6,
     TITAN_SOURCE_PATH = ".",
     TITAN_BIN_PATH = "",
     INSTALL_PATHS = { titan_bin = "/opt/titan/lib/titan/0.6" },
     imported = {},
   }
   if mode == "missing-abi" then driver.TITAN_ABI_VERSION = nil end
+  driver.encode_project_entry = function() return nil, "fixture has no graph codec" end
+  driver.decode_project_entry = function() return nil, "fixture has no graph codec" end
+  driver.project_entries_registry = function() return {} end
+  driver.language_server_cache_identity = function() return "fixture-cache-identity" end
+  driver.compiler_cache_stats = function()
+    return { headers = { lookups = 0, hits = 0, misses = 0 },
+      conversion = { lookups = 0, hits = 0, misses = 0 } }
+  end
   if mode == "older-same-abi" then
     driver.LANGUAGE_SERVER_API_VERSION = nil
   end
@@ -664,11 +673,11 @@ function test_compiler_bridge_rejects_missing_incompatible_and_malformed_modules
   expect_bridge_error("older-same-abi",
                       "matching Titan ABI alone is insufficient")
   expect_bridge_error("wrong-language-server-api",
-                      "requires LANGUAGE_SERVER_API_VERSION 5")
+                      "requires LANGUAGE_SERVER_API_VERSION 6")
   expect_bridge_error("same-api-missing-restat",
                       "'restat_c_header_dependencies' must be a function, " ..
                       "found nil. Install a Titan compiler implementing " ..
-                      "LANGUAGE_SERVER_API_VERSION 5")
+                      "LANGUAGE_SERVER_API_VERSION 6")
   expect_bridge_error("same-api-missing-c-header-analysis",
                       "'new_c_header_analysis' must be a function, found nil")
   expect_bridge_error("same-api-missing-split-shell-words",
@@ -1426,6 +1435,98 @@ function test_compiler_bridge_reuses_unchanged_full_ast_incrementally(
   test_runtime.run(runs_incremental_full_ast_cache)
 end
 
+local function preserves_mixed_sparse_project_payloads()
+  preload_real_compiler()
+  local compiler = bridge.load()
+  local provider_name = "sparse_provider"
+  local consumer_name = "sparse_consumer"
+  local provider_file = "/workspace/sparse_provider.titan"
+  local consumer_file = "/workspace/sparse_consumer.titan"
+  local provider = bridge.ProjectModule.new(provider_name,{bridge.SourceFile.new(provider_file,
+    "record Box<A> item: A end\n" ..
+    "local function secret<A>(item: A): A return item end\n")})
+  local consumer_source: (integer) -> string = function (extra: integer): string
+    return "local provider = import \"sparse_provider.titan\"\n" ..
+      "function answer(): integer\n" ..
+      "  local box = provider.Box<integer>.new(42)\n" ..
+      "  return provider.secret<integer>(box.item) + " .. extra .. "\n" ..
+      "end\n"
+  end
+  local consumer = bridge.ProjectModule.new(consumer_name,{
+    bridge.SourceFile.new(consumer_file,consumer_source(0))})
+  local projects = {provider,consumer}
+  local initial = compiler:analyze(consumer_name,projects)
+  test.assert(#initial.diagnostics == 0,"initial generic source-private payload fixture failed")
+  local original = features.build(projects,initial.modules)
+  defer original:close()
+  local secret_position = source_text.Position.new(3,20)
+  local owner_position = source_text.Position.new(2,24)
+  local initial_secret? = original:hover(consumer_file,secret_position)
+  local initial_owner? = original:hover(consumer_file,owner_position)
+  test.assert(initial_secret ~= nil and initial_owner ~= nil,
+    "initial payload fixture had no source-private or generic hover")
+  local complete = compiler:export_projects(projects,{provider_name,consumer_name})
+  test.assert(#complete == 2 and complete[1].module_name == provider_name and
+    complete[2].module_name == consumer_name,"initial project payloads were not encoded")
+
+  local edited = bridge.ProjectModule.new(consumer_name,{
+    bridge.SourceFile.new(consumer_file,consumer_source(1))})
+  local current = {provider,edited}
+  local changed = compiler:analyze_incremental(current,{consumer_name},{})
+  test.assert(#changed.diagnostics == 0 and changed:find_module(provider_name) == nil,
+    "body-only consumer edit reparsed/rechecked its unchanged provider")
+  -- Consumer annotations can reach the provider AST. Selecting one encoder
+  -- must still pass every current project file to the compiler-owned codec.
+  local sparse = compiler:export_projects(current,{consumer_name})
+  test.assert(#sparse == 1 and sparse[1].module_name == consumer_name,
+    "sparse export encoded an unchanged provider or narrowed the project file allowlist")
+  test.assert(#compiler:export_projects(current,{}) == 0,
+    "empty sparse selection re-encoded project state")
+  test.assert(#compiler:export_projects({edited},{provider_name}) == 0,
+    "sparse selection exported an entry outside the current project set")
+  local restarted = bridge.load()
+  local restored = restarted:hydrate_projects(current,{complete[1],sparse[1]})
+  test.assert(#restored == 2,"mixed unchanged/new payloads did not hydrate together")
+  local replayed = features.build(current,restored)
+  defer replayed:close()
+  local secret? = replayed:hover(consumer_file,secret_position)
+  local owner? = replayed:hover(consumer_file,owner_position)
+  test.assert(secret ~= nil and owner ~= nil and
+    secret:markdown() == (initial_secret as features.Hover):markdown() and
+    owner:markdown() == (initial_owner as features.Hover):markdown(),
+    "mixed payload hydration changed source-private or generic owner metadata")
+  local definition? = replayed:definition(consumer_file,secret_position)
+  test.assert(definition ~= nil and definition.uri == "file://" .. provider_file and
+    definition.range.start.line == 1 and definition.range.start.character == 15,
+    "mixed payload hydration lost the unchanged provider's declaration identity")
+  local next_consumer = bridge.ProjectModule.new(consumer_name,{
+    bridge.SourceFile.new(consumer_file,consumer_source(2))})
+  local next_change = restarted:analyze_incremental({provider,next_consumer},{consumer_name},{})
+  test.assert(#next_change.diagnostics == 0 and next_change:find_module(provider_name) == nil,
+    "rehydrated provider was not reusable on the next source-private edit")
+end
+
+function test_compiler_bridge_preserves_mixed_sparse_project_payloads(_context: test.Context)
+  run_bridge(preserves_mixed_sparse_project_payloads)
+end
+
+function test_compiler_bridge_native_sha_matches_the_compiler_binary_digest(_context: test.Context)
+  test_runtime.run(function ()
+    preload_real_compiler()
+    local compiler_digest = lua.load(
+      "return require('titan-compiler.sha256').binary",
+      "=compiler_bridge_sha256_equivalence",nil)() as (string) -> string
+    local sources = {"", "a\0b\255", "\0\255boundary0123456789abcdefghijklmnopqrstuvwxyz" ..
+      "0123456789abcdefghijklmnopqrstuvwxyz0123456789abcdefghijklmnopqrstuvwxyz"}
+    for index = 1, #sources do
+      local source = sources[index]
+      local native = content_identity.digest(source)
+      test.assert(#native == 32 and native == compiler_digest(source),
+        "native SHA callback differs from the compiler's binary graph checksum")
+    end
+  end)
+end
+
 local function joins_source_imported_local_function_definition_identity()
   local generated_archive = "bridge_source_definition_consumer.a"
   local generated_shared = "bridge_source_definition_consumer.so"
@@ -1532,7 +1633,9 @@ local function joins_source_imported_local_function_definition_identity()
                 "source:bridge_source_definition_provider:type:SecretAlias",
               "source-imported local type alias did not join its declaration")
 
-  local definition? = features.build(projects, analysis.modules):definition(
+  local saved_features = features.build(projects, analysis.modules)
+  defer saved_features:close()
+  local definition? = saved_features:definition(
     consumer_file, source_text.Position.new(1, 44))
   local provider_uri?, provider_uri_error? =
     source_text.path_to_file_uri(provider_file)
@@ -1547,7 +1650,7 @@ local function joins_source_imported_local_function_definition_identity()
               "source-imported local function resolved to no exact definition")
 
   local variable_definition? =
-    features.build(projects, analysis.modules):definition(
+    saved_features:definition(
       consumer_file, source_text.Position.new(2, 49))
   test.assert(variable_definition ~= nil and
               variable_definition.uri == provider_uri and
@@ -1557,7 +1660,7 @@ local function joins_source_imported_local_function_definition_identity()
               "source-imported local variable resolved to no exact definition")
 
   local foreign_definition? =
-    features.build(projects, analysis.modules):definition(
+    saved_features:definition(
       consumer_file, source_text.Position.new(3, 50))
   test.assert(foreign_definition == nil,
               "source-imported foreign function became a definition target")
@@ -1888,6 +1991,7 @@ end
   assert_joined_symbol(module, "last", 3)
 
   local model = features.build(projects, analysis.modules)
+  defer model:close()
   local first_definition? = model:definition(
     filename, source_text.Position.new(5, 18))
   test.assert(first_definition ~= nil and
@@ -2049,7 +2153,8 @@ end
               "fixture did not exercise generic case payload lowering")
   test.assert(source_item_spans >= 4,
               "source-written generic bindings lost their exact spans")
-  features.build(projects, analysis.modules)
+  local model = features.build(projects, analysis.modules)
+  model:close()
 end
 
 function test_compiler_bridge_excludes_lowered_generic_case_payloads_from_exact_spans(
@@ -2081,6 +2186,7 @@ end
   test.assert(#analysis.diagnostics == 0,
               "compiler rejected source-grounded semantic acceptance fixture")
   local model = features.build(projects, analysis.modules)
+  defer model:close()
 
   local outer_definition? = model:definition(
     filename, source_text.Position.new(5, 20))
@@ -2197,6 +2303,7 @@ end
               #external.symbols == 0,
               "external source AST escaped the compiler boundary")
   local model = features.build(projects, analysis.modules)
+  defer model:close()
 
   local foreign_definition? = model:definition(
     filename, source_text.Position.new(3, 12))
@@ -2293,6 +2400,7 @@ end
               "external callable AST escaped the compiler boundary")
 
   local model = features.build(projects, analysis.modules)
+  defer model:close()
   local top_level? = model:hover(
     filename, source_text.Position.new(1, 10))
   test.assert(top_level ~= nil and top_level:markdown() ==
@@ -2367,6 +2475,7 @@ end
               "compiler rejected generic callable-hover fixture: " ..
               diagnostic_messages:drain())
   local model = features.build({project}, analysis.modules)
+  defer model:close()
 
   local owner? = model:hover(
     filename, source_text.Position.new(0, 8))
@@ -2496,6 +2605,7 @@ end
               source_module ~= public_module,
               "repeated or contextual occurrences used the wrong summary id")
   local model = features.build(projects, analysis.modules)
+  defer model:close()
 
   local defining? = model:hover(
     provider_filename, source_text.Position.new(2, 8))
@@ -2643,6 +2753,7 @@ end
               "compiler rejected nontransitive visibility fixture: " ..
               diagnostic_messages:drain())
   local model = features.build(projects, analysis.modules)
+  defer model:close()
 
   local reexported? = model:hover(
     consumer_filename, source_text.Position.new(2, 31))
@@ -2709,6 +2820,7 @@ end
               diagnostic_messages:drain())
 
   local model = features.build(projects, analysis.modules)
+  defer model:close()
   local module_hover? = model:hover(
     consumer_filename, source_text.Position.new(0, 7))
   local markdown = module_hover ~= nil and
@@ -2833,6 +2945,7 @@ end
   test.assert(cached_summaries == nil or #cached_summaries == 0,
               "serialized external snapshot retained hover summaries")
   local model = features.build({consumer}, reloaded.modules)
+  defer model:close()
 
   local module_hover? = model:hover(
     filename, source_text.Position.new(0, 7))
@@ -3105,6 +3218,7 @@ end
               "compiler rejected direct-C hover fixture: " ..
               diagnostic_messages:drain())
   local model = features.build({project}, analysis.modules)
+  defer model:close()
 
   local named? = model:hover(filename, source_text.Position.new(2, 40))
   test.assert(named ~= nil and named:markdown() ==
@@ -3220,6 +3334,7 @@ end
               "named label did not join its formal parameter")
 
   local model = features.build(projects, analysis.modules)
+  defer model:close()
   local candidate?, candidate_error? = model:rename(
     provider_file, source_text.Position.new(4, 17), "primary")
   test.assert(candidate_error == nil and candidate ~= nil,
@@ -3336,6 +3451,7 @@ local function separates_declaration_namespaces(is_interface: boolean,
   test.assert(#analysis.diagnostics == 0,
               "compiler rejected same-spelled type and value declarations")
   local model = features.build(projects, analysis.modules)
+  defer model:close()
   local type_definition = marked_name_position(
     provider_source, is_interface and "interface Shared" or "type Shared", "Shared")
   local value_definition = marked_name_position(
@@ -3410,6 +3526,7 @@ end
   local analysis = bridge.load():analyze("namespace_rename", projects)
   test.assert(#analysis.diagnostics == 0, "namespace rename fixture did not compile")
   local model = features.build(projects, analysis.modules)
+  defer model:close()
   local position = marked_name_position(
     source, rename_type and "input: Input" or "return Shared",
     rename_type and "Input" or "Shared")
@@ -3475,7 +3592,8 @@ end
   test.assert(symbol_identity(provider, "Box") ~= symbol_identity(provider, "BoxAlias") and
               symbol_identity(provider, "Choice") ~= symbol_identity(provider, "ChoiceAlias"),
               "a transparent alias merged with its target declaration")
-  features.build(projects, analysis.modules)
+  local model = features.build(projects, analysis.modules)
+  model:close()
 end
 
 function test_compiler_bridge_joins_nominal_type_and_constructor_namespaces(

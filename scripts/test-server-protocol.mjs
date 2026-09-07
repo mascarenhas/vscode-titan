@@ -4,21 +4,12 @@ import { once } from "node:events";
 import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const server = process.argv[2];
 const mode = process.argv[3] ?? "full";
-if (!server) {
-  console.error(
-    "usage: node scripts/test-server-protocol.mjs PATH-TO-SERVER " +
-      "[--self-contained-smoke]"
-  );
-  process.exit(2);
-}
-if (!["full", "--self-contained-smoke"].includes(mode)) {
-  console.error(`unsupported protocol-test mode: ${mode}`);
-  process.exit(2);
-}
+const isMain = process.argv[1] !== undefined &&
+  path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
 
 function frame(message) {
   const body = Buffer.from(JSON.stringify(message), "utf8");
@@ -126,11 +117,12 @@ function structuredLogRecords(buffer) {
   });
 }
 
-function launch(cwd = process.cwd(), logLevel = "off") {
+function launch(cwd = process.cwd(), logLevel = "off", environment = {}) {
   return spawn(path.resolve(server), [], {
     cwd,
     env: {
       ...process.env,
+      ...environment,
       TITAN_LANGUAGE_SERVER_LOG_LEVEL: logLevel
     },
     stdio: ["pipe", "pipe", "pipe"]
@@ -1725,19 +1717,39 @@ async function testTruncatedFrame() {
   }
 }
 
-await testLuaModulePathConfiguration();
-if (mode === "--self-contained-smoke") {
-  await testSelfContainedCompilerModules();
-  console.log("self-contained compiler-module protocol smoke passed");
-} else {
-  await testCoalescedIndexingResetStatus();
-  await testLifecycle();
-  await testSavedProjectSemantics();
-  await testUnmappedSourceWarnings();
-  await testConfigCannotWriteProtocolStdout();
-  await testSourceImportCppflagsAndUnchangedRequests();
-  await testCrossModuleFolderAndIncrementalSemantics();
-  await testDebugCompilerProgress();
-  await testTruncatedFrame();
-  console.log("native server protocol transcript passed");
+export {
+  FrameReader, collect, exitOf, frame, launch, makePhysicalTemporaryRoot,
+  printedLuaPaths, request, semanticRequest, structuredLogRecords, waitForIndexing,
+  withTimeout, writeSavedGeneration
+};
+
+if (isMain) {
+  if (!server) {
+    console.error(
+      "usage: node scripts/test-server-protocol.mjs PATH-TO-SERVER " +
+        "[--self-contained-smoke]"
+    );
+    process.exit(2);
+  }
+  if (!["full", "--self-contained-smoke"].includes(mode)) {
+    console.error(`unsupported protocol-test mode: ${mode}`);
+    process.exit(2);
+  }
+
+  await testLuaModulePathConfiguration();
+  if (mode === "--self-contained-smoke") {
+    await testSelfContainedCompilerModules();
+    console.log("self-contained compiler-module protocol smoke passed");
+  } else {
+    await testCoalescedIndexingResetStatus();
+    await testLifecycle();
+    await testSavedProjectSemantics();
+    await testUnmappedSourceWarnings();
+    await testConfigCannotWriteProtocolStdout();
+    await testSourceImportCppflagsAndUnchangedRequests();
+    await testCrossModuleFolderAndIncrementalSemantics();
+    await testDebugCompilerProgress();
+    await testTruncatedFrame();
+    console.log("native server protocol transcript passed");
+  }
 }

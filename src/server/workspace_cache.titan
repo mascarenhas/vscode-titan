@@ -1,0 +1,378 @@
+local async = import "async"
+local fs = import "fs"
+local sqlite3 = import "sqlite3"
+local strings = import "string"
+local sql = import "server.workspace_store"
+local identity = import "server.content_identity"
+local bridge = import "server.compiler_bridge"
+local logging = import "server.logging"
+
+local SCHEMA_VERSION = 2
+
+type ProjectPayload = bridge.ProjectPayload
+
+local record Artifact
+  const kind: string
+  const key: string
+  const payload: string
+  const inputs: {bridge.CHeaderDependency}
+end
+
+record Cache
+  const store: sql.Store
+  const path: string
+  local pending: {Artifact}
+  local projects: {ProjectPayload}?
+  local publication_key: string?
+  local publication_compatibility: string?
+  local publication_native_context: string?
+end
+
+local function artifact_table(kind: string): string?
+  if kind == "c-header-v1" then return "main.header_graphs" end
+  if kind == "ffi-conversion-v1" then return "main.ffi_conversion_snapshots" end
+  return nil
+end
+
+local function metadata(connection: sqlite3.Connection, key: string): string?
+  local rows = sql.rows(connection,
+    "SELECT value FROM main.cache_meta WHERE key=?",sqlite3.Blob.new(key))
+  if #rows == 0 then return nil end
+  return sql.bytes(rows[1], 1)
+end
+
+local function write_metadata(connection: sqlite3.Connection,
+                              key: string, payload: string)
+  sql.execute(connection,
+    "INSERT INTO main.cache_meta VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+    sqlite3.Blob.new(key), sqlite3.Blob.new(payload))
+end
+
+-- Nil means a disposable schema/root/compiler compatibility mismatch. The
+-- caller closes this attempt before replacing the workspace cache file.
+local function open_compatible(path: string, compatibility: string): Cache?
+  local store = sql.open(path)
+  local accepted = false
+  defer do if not accepted then store:close() end end
+  local access = store:acquire()
+  defer access:release()
+  local connection = access.connection
+  local version = sql.scalar_integer(connection, "PRAGMA main.user_version")
+  if version ~= 0 and version ~= SCHEMA_VERSION then return nil end
+  if sql.scalar_integer(connection,
+      "SELECT count(*) FROM main.cache_meta WHERE typeof(key)<>'blob' OR typeof(value)<>'blob'") > 0 then
+    return nil
+  end
+  local previous? = metadata(connection, "compatibility")
+  if version ~= 0 and previous == nil then return nil end
+  if previous ~= nil and previous ~= compatibility then return nil end
+  if previous ~= nil then
+    local checked = sql.rows(connection,"PRAGMA main.quick_check")
+    if #checked ~= 1 or checked[1]:get(1) ~= "ok" then return nil end
+  end
+  local schema = {
+    "CREATE TABLE IF NOT EXISTS main.project_snapshots(module BLOB PRIMARY KEY,payload BLOB NOT NULL,revision INTEGER NOT NULL) WITHOUT ROWID",
+    "CREATE TABLE IF NOT EXISTS main.header_graphs(key BLOB PRIMARY KEY,payload BLOB NOT NULL) WITHOUT ROWID",
+    "CREATE TABLE IF NOT EXISTS main.ffi_conversion_snapshots(key BLOB PRIMARY KEY,payload BLOB NOT NULL) WITHOUT ROWID",
+    "CREATE TABLE IF NOT EXISTS main.cached_header_inputs(graph_key BLOB NOT NULL REFERENCES header_graphs(key) ON DELETE CASCADE,ordinal INTEGER NOT NULL,kind INTEGER NOT NULL,path BLOB NOT NULL,identity BLOB NOT NULL,PRIMARY KEY(graph_key,ordinal)) WITHOUT ROWID",
+  }
+  for index = 1, #schema do sql.execute(connection, schema[index]) end
+  sql.execute(connection, "PRAGMA main.user_version=2")
+  if sql.scalar_integer(connection, "PRAGMA main.user_version") ~= SCHEMA_VERSION then
+    raise "workspace cache schema version was not installed"
+  end
+  write_metadata(connection,"compatibility",compatibility)
+  accepted = true
+  return Cache.new(store, path, {}, nil, nil, nil, nil)
+end
+
+local function cache_directory(root: string): string
+  if root == "/" then return "/.titan-ls" end
+  return root .. "/.titan-ls"
+end
+
+local function disk_cache(root: string, compatibility: string): Cache
+  local directory = cache_directory(root)
+  local existing? = fs.lstat(directory)
+  if existing == nil then
+    fs.mkdir(directory)
+  elseif existing.kind ~= "directory" then
+    raise "workspace cache path is not a directory"
+  end
+  local ignore = directory .. "/.gitignore"
+  if fs.lstat(ignore) == nil then fs.write_file(ignore, "*\n") end
+  local path = directory .. "/index.sqlite3"
+  local existing_file? = fs.lstat(path)
+  if existing_file ~= nil and existing_file.kind ~= "file" then
+    raise "cache database is not a regular file"
+  end
+  local cached?: Cache
+  local rebuild = false
+  do
+    cached = open_compatible(path, compatibility)
+    rebuild = cached == nil
+  catch
+    if error is async.CancellationReason then raise end
+    if error is sqlite3.Error then
+      local failure = error as sqlite3.Error
+      -- SQLITE_CORRUPT / SQLITE_NOTADB. Access and filesystem failures use
+      -- memory; only a known damaged disposable database is replaced.
+      rebuild = failure.code == 11 or failure.code == 26
+    end
+    if not rebuild then raise end
+  end
+  if cached ~= nil then return cached end
+  if rebuild then
+    local metadata? = fs.lstat(path)
+    if metadata ~= nil then
+      if metadata.kind ~= "file" then raise "cache database is not a regular file" end
+      fs.unlink(path)
+    end
+    cached = open_compatible(path, compatibility)
+  end
+  if cached == nil then raise "cannot initialize workspace cache schema" end
+  return cached
+end
+
+function open(root: string, compatibility: string): Cache
+  do
+    local physical_root = fs.realpath(root)
+    local key = identity.digest(physical_root .. "\0" .. compatibility)
+    local cache = disk_cache(physical_root, key)
+    logging.emit("debug", "cache.open", {["path"] = cache.path,["mode"] = "file"})
+    return cache
+  catch
+    if error is async.CancellationReason then raise end
+    local reason = strings.tostring(error)
+    if error is sqlite3.Error then reason = (error as sqlite3.Error).message end
+    if error is async.OperationError then reason = (error as async.OperationError).message end
+    logging.emit("info", "cache.memory_fallback", {
+      ["root"] = root, ["message"] = "Workspace persistence is unavailable: " .. reason,
+    })
+    return open_compatible(":memory:",compatibility)
+  end
+end
+
+function memory(compatibility: string): Cache
+  return open_compatible(":memory:",compatibility)
+end
+
+function Cache:accept_native_context(context: string): boolean
+  local access = self.store:acquire()
+  defer access:release()
+  local previous? = metadata(access.connection,"native_context")
+  if previous ~= nil then return previous == context end
+  write_metadata(access.connection,"native_context",context)
+  return true
+end
+
+-- The preliminary inventory can match while PATH, CC, or the native SDK has
+-- changed. Discard project/semantic state before discovery, retaining only the
+-- freshly validated header records staged while identifying the new context.
+function Cache:rebuild(): Cache
+  local compatibility = ""
+  do
+    local access = self.store:acquire()
+    defer access:release()
+    compatibility = metadata(access.connection,"compatibility")
+  end
+  self.store:close()
+  local replacement?: Cache
+  do
+    if self.path ~= ":memory:" then fs.unlink(self.path) end
+    replacement = open_compatible(self.path,compatibility)
+  catch
+    if error is async.CancellationReason then raise end
+    replacement = open_compatible(":memory:",compatibility)
+  end
+  replacement.pending = self.pending
+  self.pending = {}
+  return replacement
+end
+
+function Cache:lookup(kind: string, key: string): string?
+  for index = #self.pending, 1, -1 do
+    local item = self.pending[index]
+    if item.kind == kind and item.key == key then return item.payload end
+  end
+  local table? = artifact_table(kind)
+  if table == nil then return nil end
+  local access = self.store:acquire()
+  defer access:release()
+  local rows = sql.rows(access.connection,
+    "SELECT payload FROM " .. table .. " WHERE key=?",sqlite3.Blob.new(key))
+  if #rows == 0 then return nil end
+  local payload: value = rows[1]:get(1)
+  if not (payload is sqlite3.Blob) then return nil end
+  return (payload as sqlite3.Blob).bytes
+end
+
+-- Compiler hooks only stage successful records. SQLite writes remain with the
+-- updater's completed-view publication; speculative rename has no such hook.
+function Cache:stage(kind: string, key: string, payload: string,
+                      inputs: {bridge.CHeaderDependency})
+  if artifact_table(kind) == nil then return end
+  local item = Artifact.new(kind,key,payload,inputs)
+  for index = 1, #self.pending do
+    if self.pending[index].kind == kind and self.pending[index].key == key then
+      self.pending[index] = item
+      return
+    end
+  end
+  self.pending[#self.pending + 1] = item
+end
+
+function Cache:project_payloads(): {ProjectPayload}
+  local access = self.store:acquire()
+  defer access:release()
+  local rows = sql.rows(access.connection,
+    "SELECT p.module,p.payload FROM main.project_snapshots AS p " ..
+    "JOIN main.graph_modules AS g ON g.name=CAST(p.module AS TEXT) " ..
+    "WHERE g.provenance=0 AND g.state=2 AND typeof(p.revision)='integer' " ..
+    "AND g.revision=p.revision ORDER BY p.module")
+  local result: {ProjectPayload} = {}
+  for index = 1, #rows do
+    local module: value = rows[index]:get(1)
+    local payload: value = rows[index]:get(2)
+    if module is sqlite3.Blob and payload is sqlite3.Blob then
+      result[#result + 1] = ProjectPayload.new(
+        (module as sqlite3.Blob).bytes,(payload as sqlite3.Blob).bytes)
+    else
+      logging.emit("debug","cache.project.miss",{
+        ["message"] = "persisted project payload has invalid SQLite storage types",
+      })
+    end
+  end
+  return result
+end
+
+-- Work revisions are separate from the feature generation. A same-generation
+-- header or external dependency invalidation still changes this exact key.
+local function revision_key(connection: sqlite3.Connection): string
+  local rows = sql.rows(connection,
+    "SELECT name,provenance,state,revision FROM main.graph_modules ORDER BY name COLLATE BINARY")
+  local output = strings.writer()
+  for index = 1, #rows do
+    local row = rows[index]
+    local name: string = row:get(1)
+    local provenance: integer = row:get(2)
+    local state: integer = row:get(3)
+    local revision: integer = row:get(4)
+    output:write(#name .. ":" .. name .. ":" .. provenance .. ":" .. state .. ":" .. revision .. ";")
+  end
+  return identity.digest(output:drain())
+end
+
+function Cache:prepare(): boolean
+  self.projects = nil
+  local access = self.store:acquire()
+  defer access:release()
+  self.publication_key = revision_key(access.connection)
+  local previous? = metadata(access.connection,"published_revisions")
+  return previous ~= nil and previous == self.publication_key and
+    sql.scalar_integer(access.connection,
+      "SELECT published_generation FROM main.store_state WHERE singleton=1") > 0 and
+    sql.scalar_integer(access.connection,
+      "SELECT count(*) FROM main.sqlite_master WHERE type='table' AND name IN (" ..
+      "'semantic_projects','semantic_files','semantic_summaries','semantic_occurrences'," ..
+      "'semantic_hovers','semantic_folds','semantic_diagnostic_publications','semantic_diagnostic_items')") == 8
+end
+
+function Cache:set_projects(projects: {ProjectPayload})
+  self.projects = projects
+end
+
+-- A completed module revision owns its opaque compiler payload independently
+-- of the current feature publication. Preserve it until that revision changes.
+function Cache:projects_to_export(): {string}
+  local access = self.store:acquire()
+  defer access:release()
+  local rows = sql.rows(access.connection,
+    "SELECT g.name FROM main.graph_modules AS g WHERE g.provenance=0 AND g.state=2 " ..
+    "AND NOT EXISTS(SELECT 1 FROM main.project_snapshots AS p " ..
+      "WHERE p.module=CAST(g.name AS BLOB) AND typeof(p.payload)='blob' " ..
+      "AND typeof(p.revision)='integer' AND p.revision=g.revision) " ..
+    "ORDER BY g.name COLLATE BINARY")
+  local result: {string} = {}
+  for index = 1, #rows do result[index] = rows[index]:get(1) as string end
+  return result
+end
+
+-- Publish the context which produced these rows, including live configuration
+-- transitions. Keeping the startup key would mislabel a later completed view.
+function Cache:stage_context(root: string,compatibility: string,native_context: string)
+  self.publication_compatibility = identity.digest(fs.realpath(root) .. "\0" .. compatibility)
+  self.publication_native_context = native_context
+end
+
+local function publish_header_inputs(connection: sqlite3.Connection, item: Artifact)
+  sql.execute(connection,"DELETE FROM main.cached_header_inputs WHERE graph_key=?",sqlite3.Blob.new(item.key))
+  -- Forty five-column rows keep binding below Titan's 200-value call bound.
+  for first = 1, #item.inputs, 40 do
+    local last = first + 39
+    if last > #item.inputs then last = #item.inputs end
+    local query = strings.writer()
+    query:write("INSERT INTO main.cached_header_inputs VALUES")
+    local parameters: {value} = {}
+    for index = first, last do
+      if index > first then query:write(",") end
+      query:write("(?,?,?,?,?)")
+      local input = item.inputs[index]
+      local kind = 0
+      case input.kind when search then kind = 1 when file then end
+      parameters[#parameters + 1] = sqlite3.Blob.new(item.key)
+      parameters[#parameters + 1] = index
+      parameters[#parameters + 1] = kind
+      parameters[#parameters + 1] = sqlite3.Blob.new(input.path)
+      parameters[#parameters + 1] = sqlite3.Blob.new(input.identity)
+    end
+    sql.execute(connection,query:drain(),...parameters)
+  end
+end
+
+function Cache:publish(connection: sqlite3.Connection)
+  if self.publication_key == nil then raise "cache publication was not prepared" end
+  -- Pruning belongs to the same completed publication as replacement facts.
+  -- A selected module whose compiler graph cannot be encoded loses its old
+  -- revision here, while unchanged clean rows are never rewritten.
+  sql.execute(connection,
+    "DELETE FROM main.project_snapshots AS p WHERE typeof(p.module)<>'blob' " ..
+    "OR typeof(p.payload)<>'blob' OR typeof(p.revision)<>'integer' OR NOT EXISTS(" ..
+      "SELECT 1 FROM main.graph_modules AS g WHERE g.name=CAST(p.module AS TEXT) " ..
+      "AND g.provenance=0 AND g.state=2 AND p.revision=g.revision)")
+  if self.projects ~= nil then
+    local insert = connection:prepare("INSERT INTO main.project_snapshots(module,payload,revision) " ..
+      "SELECT ?,?,revision FROM main.graph_modules WHERE name=? AND provenance=0 AND state=2 " ..
+      "ON CONFLICT(module) DO UPDATE SET payload=excluded.payload,revision=excluded.revision")
+    defer insert:close()
+    for index = 1, #self.projects do
+      local item = self.projects[index]
+      insert:execute(sqlite3.Blob.new(item.module_name),sqlite3.Blob.new(item.payload),item.module_name)
+    end
+  end
+  for index = 1, #self.pending do
+    local item = self.pending[index]
+    local table = artifact_table(item.kind)
+    sql.execute(connection,"INSERT INTO " .. table ..
+      " VALUES(?,?) ON CONFLICT(key) DO UPDATE SET payload=excluded.payload",
+      sqlite3.Blob.new(item.key),sqlite3.Blob.new(item.payload))
+    if item.kind == "c-header-v1" then
+      publish_header_inputs(connection,item)
+    end
+  end
+  write_metadata(connection,"published_revisions",self.publication_key)
+  if self.publication_compatibility ~= nil then
+    write_metadata(connection,"compatibility",self.publication_compatibility)
+    write_metadata(connection,"native_context",self.publication_native_context)
+  end
+  -- Keep staged immutable records until the next prepare so a caller rolling
+  -- back this transaction can retry the same complete publication.
+end
+
+function Cache:publication_committed()
+  self.pending = {}
+  self.projects = nil
+  self.publication_key = nil
+  self.publication_compatibility = nil
+  self.publication_native_context = nil
+end

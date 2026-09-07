@@ -1,0 +1,128 @@
+local bridge = import "server.compiler_bridge"
+local diagnostics = import "server.diagnostics"
+local indexer = import "server.semantic_index"
+local source_text = import "server.source_text"
+local sqlite3 = import "sqlite3"
+local stores = import "server.workspace_store"
+
+-- Diagnostics are published with the semantic rows. Listener replay reads that
+-- completed revision without retaining its source files or AST snapshots.
+function initialize_schema(connection: sqlite3.Connection)
+  stores.execute(connection,
+    "CREATE TABLE IF NOT EXISTS main.semantic_diagnostic_publications(" ..
+    "publication_order INTEGER PRIMARY KEY,uri BLOB NOT NULL)")
+  stores.execute(connection,
+    "CREATE TABLE IF NOT EXISTS main.semantic_diagnostic_items(" ..
+    "publication_order INTEGER NOT NULL,item_order INTEGER NOT NULL," ..
+    "kind INTEGER NOT NULL,message BLOB NOT NULL,start_line INTEGER NOT NULL," ..
+    "start_character INTEGER NOT NULL,finish_line INTEGER NOT NULL," ..
+    "finish_character INTEGER NOT NULL,PRIMARY KEY(publication_order,item_order)," ..
+    "FOREIGN KEY(publication_order) REFERENCES " ..
+    "semantic_diagnostic_publications(publication_order))")
+end
+
+local function kind_code(kind: diagnostics.Kind): integer
+  case kind
+  when compiler: compiler_kind then
+    case compiler_kind
+    when syntax then return 0
+    when type_error then return 1
+    when compiler then return 2
+    end
+  when unmapped_source then return 3
+  end
+end
+
+local function read_kind(code: integer): diagnostics.Kind
+  if code == 0 then return diagnostics.Kind.compiler(bridge.DiagnosticKind.syntax()) end
+  if code == 1 then return diagnostics.Kind.compiler(bridge.DiagnosticKind.type_error()) end
+  if code == 2 then return diagnostics.Kind.compiler(bridge.DiagnosticKind.compiler()) end
+  return diagnostics.Kind.unmapped_source()
+end
+
+function publish(connection: sqlite3.Connection,
+                 publications: {diagnostics.Publication})
+  stores.execute(connection, "DELETE FROM main.semantic_diagnostic_items")
+  stores.execute(connection, "DELETE FROM main.semantic_diagnostic_publications")
+  local offset = 1
+  while offset <= #publications do
+    local finish = offset + 99
+    if finish > #publications then finish = #publications end
+    local sql = "INSERT INTO main.semantic_diagnostic_publications VALUES "
+    local bindings: {value} = {}
+    for index = offset, finish do
+      if index > offset then sql = sql .. "," end
+      sql = sql .. "(" .. indexer.binding(bindings, index) .. "," ..
+        indexer.binding(bindings, indexer.blob(publications[index].uri)) .. ")"
+    end
+    local statement = connection:prepare(sql)
+    defer statement:close()
+    statement:execute(...bindings)
+    offset = finish + 1
+  end
+  local sql = "INSERT INTO main.semantic_diagnostic_items VALUES "
+  local bindings: {value} = {}
+  local count = 0
+  for publication_index = 1, #publications do
+    local publication = publications[publication_index]
+    for item_index = 1, #publication.items do
+      local item = publication.items[item_index]
+      if count > 0 then sql = sql .. "," end
+      sql = sql .. "(" .. indexer.binding(bindings, publication_index) .. "," ..
+        indexer.binding(bindings, item_index) .. "," ..
+        indexer.binding(bindings, kind_code(item.kind)) .. "," ..
+        indexer.binding(bindings, indexer.blob(item.message)) .. "," ..
+        indexer.binding(bindings, item.range.start.line) .. "," ..
+        indexer.binding(bindings, item.range.start.character) .. "," ..
+        indexer.binding(bindings, item.range.finish.line) .. "," ..
+        indexer.binding(bindings, item.range.finish.character) .. ")"
+      count = count + 1
+      if count == 25 then
+        local statement = connection:prepare(sql)
+        defer statement:close()
+        statement:execute(...bindings)
+        sql = "INSERT INTO main.semantic_diagnostic_items VALUES "
+        bindings = {}
+        count = 0
+      end
+    end
+  end
+  if count > 0 then
+    local statement = connection:prepare(sql)
+    defer statement:close()
+    statement:execute(...bindings)
+  end
+end
+
+function read(store: stores.Store, generation: integer): {diagnostics.Publication}
+  local access = store:acquire()
+  defer access:release()
+  indexer.check_generation(access.connection, generation)
+  local statement = access.connection:prepare(
+    "SELECT p.publication_order,p.uri,i.kind,i.message,i.start_line,i.start_character," ..
+    "i.finish_line,i.finish_character FROM main.semantic_diagnostic_publications AS p " ..
+    "LEFT JOIN main.semantic_diagnostic_items AS i ON i.publication_order=p.publication_order " ..
+    "ORDER BY p.publication_order,i.item_order")
+  defer statement:close()
+  local cursor = statement:query()
+  defer cursor:close()
+  local result: {diagnostics.Publication} = {}
+  local current: diagnostics.Publication? = nil
+  local publication_order = 0
+  for row in cursor:fetch do
+    local ordinal = row:get(1) as integer
+    if current == nil or ordinal ~= publication_order then
+      current = diagnostics.Publication.new(indexer.bytes(row, 2), {})
+      result[#result + 1] = current
+      publication_order = ordinal
+    end
+    local kind? = row:get(3) as integer?
+    if kind ~= nil then
+      current.items[#current.items + 1] = diagnostics.Item.new(read_kind(kind),
+        indexer.bytes(row, 4), source_text.Span.new(
+          source_text.Position.new(row:get(5) as integer, row:get(6) as integer),
+          source_text.Position.new(row:get(7) as integer, row:get(8) as integer)))
+    end
+  end
+  return result
+end

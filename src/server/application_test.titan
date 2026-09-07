@@ -19,6 +19,7 @@ local project_watcher = import "server.project_watcher"
 local project_service = import "server.project_service"
 local semantic_features = import "server.semantic_features"
 local source_text = import "server.source_text"
+local stores = import "server.workspace_store"
 local test_runtime = import "server.test_runtime"
 
 local record YieldingAnalyzer
@@ -401,7 +402,10 @@ local function with_application_state(
     app = application.create_unindexed_with_service(root, service)
   end
   local actual = app as application.Application
-  defer actual:close()
+  defer do
+    analyzer.block = false
+    actual:close()
+  end
   body(filename, analyzer, actual)
 end
 
@@ -444,7 +448,10 @@ local function with_cold_application(
         project_root, "/sdk/lib/titan/0.6", analyzer:analyze, nil,
         snapshot_listener)
     end)
-  defer app:close()
+  defer do
+    analyzer.block = false
+    app:close()
+  end
   body(filename, analyzer, app)
 end
 
@@ -934,6 +941,12 @@ local function filters_irrelevant_watcher_hints()
                     editor_directory)) and
                 not application.relevant_watch_change(
                   saved, project_watcher.PathChange.modified(
+                    source_root .. "/.titan-ls/generated.titan")) and
+                not application.relevant_watch_change(
+                  saved, project_watcher.PathChange.modified(
+                    project_root .. "/.titan-ls/workspace.sqlite3")) and
+                not application.relevant_watch_change(
+                  saved, project_watcher.PathChange.modified(
                     dotted_directory)) and
                 not application.relevant_watch_change(
                   saved, project_watcher.PathChange.modified(
@@ -947,6 +960,20 @@ local function filters_irrelevant_watcher_hints()
                 not application.relevant_watch_change(
                   saved, project_watcher.PathChange.modified(makefile)),
                 "unrelated build/editor path was treated as a project change")
+
+    local cache_root = project_root .. "/.titan-ls"
+    local cache_config = project_config.ProjectConfig.new(project_root, nil,
+      {cache_root}, {}, {cache_root}, saved.config.binary_modules_root,
+      saved.config.extra_ffi_include_dirs, saved.config.extra_ffi_cppflags)
+    local cache_snapshot = project_service.Snapshot.new(saved.generation,
+      cache_config, {}, {cache_root}, {}, {}, {})
+    test.assert(not application.relevant_watch_change(cache_snapshot,
+      project_watcher.PathChange.modified(cache_root)) and
+      not application.relevant_watch_change(cache_snapshot,
+        project_watcher.PathChange.created(cache_root .. "/nested")) and
+      not application.relevant_watch_change(cache_snapshot,
+        project_watcher.PathChange.modified(cache_root .. "/generated.titan")),
+      "explicitly mapped cache source root escaped the private-cache exclusion")
 
     local previous_log_level = logging.level()
     defer logging.configure(previous_log_level)
@@ -1094,6 +1121,7 @@ local function refreshes_unmapped_warnings_only_during_ordinary_discovery()
               #snapshots == 1 and projects[1].module_name == "main",
               "unmapped sources reached compiler or semantic project inputs")
   local features = semantic_features.build(projects, snapshots)
+  defer features:close()
   test.assert(features:hover(loose, source_text.Position.new(0, 0)) == nil and
               #features:folding_ranges(loose) == 0,
               "unmapped source acquired semantic navigation data")
@@ -1208,6 +1236,7 @@ local function builds_semantics_from_independently_valid_modules()
                 "partial semantic inputs lost saved source or retained a " ..
                 "failed module's stale compiler snapshot")
     local features = semantic_features.build(projects, snapshots)
+    defer features:close()
     test.assert(#features:folding_ranges(valid.source_files[1].filename) == 1,
                 "valid module lost its compiler-backed semantics")
     test.assert(#features:folding_ranges(failed_filename) == 0 and
@@ -1648,6 +1677,13 @@ local function classifies_canonical_symlink_watcher_paths()
   local snapshot? = app:snapshot_for_testing()
   test.assert(snapshot ~= nil, "symlinked project fixture has no snapshot")
   local saved = snapshot as project_service.Snapshot
+
+  local canonical_cache = fs.realpath(linked_root) .. "/.titan-ls"
+  test.assert(not application.relevant_watch_change(saved,
+    project_watcher.PathChange.modified(canonical_cache)) and
+    not application.relevant_watch_change(saved,
+      project_watcher.PathChange.modified(canonical_cache .. "/generated.titan")),
+    "canonical workspace cache alias triggered saved-project indexing")
 
   local canonical_source = fs.realpath(linked_root .. "/src")
   local canonical_file = canonical_source .. "/main.titan"
@@ -2298,4 +2334,91 @@ end
 function test_application_rejects_save_during_successful_rename_preflight(
     _context: test.Context)
   test_runtime.run(rejects_save_during_successful_rename_preflight)
+end
+
+local function rejects_query_captured_before_sql_publication()
+  with_application(function (filename: string, _analyzer: YieldingAnalyzer,
+                             app: application.Application)
+    app:stop_watching_for_testing()
+    local service = app.service as project_service.Service
+    local store = service:workspace_store()
+    local before = app.completed_view as application.View
+    local access = store:acquire()
+    defer access:release()
+    local queued = async.run<dispatcher.SemanticOutcome, value>(function ():
+        dispatcher.SemanticOutcome
+      return app:handle(request_for(filename, 501, "textDocument/foldingRange"))
+    end)
+    timer.yield()
+    test.assert(not queued:status():has_finished(),
+      "semantic query did not wait for the active publication lease")
+    local generation = before.published_generation + 1
+    stores.execute(access.connection,
+      "UPDATE main.store_state SET published_generation=? WHERE singleton=1", generation)
+    app.completed_view = application.View.new(before.work_generation, generation,
+      before.dirty_signature, semantic_features.open(store, generation))
+    access:release()
+    local rejected = false
+    case join_outcome(queued, "query queued behind publication")
+    when failure: failure then
+      rejected = failure.code == -32803 and
+        strings.find(failure.message, "retry", 1, true) ~= nil
+    else
+    end
+    test.assert(rejected, "a captured old Features handle read the replacement generation")
+    test.assert(result_array_length(app:handle(request_for(
+      filename, 502, "textDocument/foldingRange")), "new published view query") == 1,
+      "new query could not read the replacement publication")
+  end)
+end
+
+function test_application_rejects_query_captured_before_sql_publication(
+    _context: test.Context)
+  test_runtime.run(rejects_query_captured_before_sql_publication)
+end
+
+local function close_drains_updater_and_readers()
+  with_application(function (filename: string, analyzer: YieldingAnalyzer,
+                             app: application.Application)
+    app:stop_watching_for_testing()
+    local service = app.service as project_service.Service
+    analyzer.block = true
+    analyzer.started = false
+    fs.write_file(filename, "function answer(): integer return 123 end\n")
+    app:note_saved_change()
+    wait_until(function (): boolean return analyzer.started end,
+      "close-drain analyzer did not start")
+    local closer = async.run<nil, value>(function (): nil
+      app:close()
+      return nil
+    end)
+    wait_until(function (): boolean return app.closed end,
+      "close owner did not begin draining")
+    local closed_epoch = app:change_epoch_for_testing()
+    app:note_saved_change()
+    test.assert(not closer:status():has_finished() and
+      app:change_epoch_for_testing() == closed_epoch,
+      "close cancelled the updater or accepted a new saved hint")
+    -- A reader accepted before Store.close still owns its complete SQL lease.
+    local reader = service:workspace_store():acquire()
+    defer reader:release()
+    analyzer.block = false
+    timer.yield()
+    test.assert(not closer:status():has_finished(),
+      "close released SQLite while an accepted reader still owned it")
+    reader:release()
+    case async.join<nil, value>(closer)
+    when succeeded then
+    when failed: failed then raise failed.error
+    else raise "close did not drain the accepted updater"
+    end
+    test.assert(analyzer.finished, "close cancelled the accepted compiler recheck")
+    local closed = false
+    do service:workspace_store():acquire() catch closed = true end
+    test.assert(closed, "close left the workspace Store open")
+  end)
+end
+
+function test_application_close_drains_updater_and_readers(_context: test.Context)
+  test_runtime.run(close_drains_updater_and_readers)
 end

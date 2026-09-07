@@ -4,6 +4,7 @@ local iteration = import "iteration"
 local lua = import "lua"
 local strings = import "string"
 local source_text = import "server.source_text"
+local content_identity = import "server.content_identity"
 
 record Error
   path: string
@@ -28,6 +29,22 @@ function ProjectConfig:source_path(): string
     output:write(self.source_module_roots[index])
   end
   return output:drain()
+end
+
+-- Persist the same semantic fields used by live invalidation. Exclude only
+-- changes watcher policy and must not invalidate a compatible checked graph.
+function ProjectConfig:semantic_identity(): string
+  local output = strings.writer()
+  local fields = {self.project_root,self.config_file or "",self.binary_modules_root,
+    self.extra_ffi_cppflags or ""}
+  for index = 1, #fields do output:write(#fields[index] .. ":" .. fields[index]) end
+  local groups = {self.include,self.source_module_roots,self.extra_ffi_include_dirs}
+  for group_index = 1, #groups do
+    local group = groups[group_index]
+    output:write(#group .. ":")
+    for index = 1, #group do output:write(#group[index] .. ":" .. group[index]) end
+  end
+  return content_identity.digest(output:drain())
 end
 
 local function fail<T>(path: string, message: string): T

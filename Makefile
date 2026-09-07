@@ -181,6 +181,9 @@ server-protocol-test: $(SERVER)
 	TITAN_LS_LUA_PATH='$(DEVELOPMENT_LUA_PATH)' \
 	TITAN_LS_LUA_CPATH='$(DEVELOPMENT_LUA_CPATH)' \
 		node scripts/test-server-protocol.mjs "$(SERVER)"
+	TITAN_LS_LUA_PATH='$(DEVELOPMENT_LUA_PATH)' \
+	TITAN_LS_LUA_CPATH='$(DEVELOPMENT_LUA_CPATH)' \
+		node scripts/test-workspace-cache.mjs "$(SERVER)"
 
 codex-native-test: $(SERVER)
 	TITAN_LS_LUA_PATH='$(DEVELOPMENT_LUA_PATH)' \
