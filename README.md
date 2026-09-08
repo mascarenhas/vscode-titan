@@ -12,7 +12,7 @@ runtime modules, the embedded Lua interpreter, and the selected native
 dependencies. Initialized statically linked modules register their runtime
 openers in `package.preload`. Separately, the executable carries a metadata-only
 inventory of all 21 canonical Titan standard-module interfaces; compiler
-language-server API 5 validates and decodes those serialized interfaces and
+language-server API 1 validates and decodes those serialized interfaces and
 their build target's C type profile for project typechecking. The inventory
 contains no standard-module implementation, provider archive, header, or SDK
 payload.
@@ -109,10 +109,13 @@ The benchmark defaults to the extension's `debug` server-emission level so its
 numbers represent normal VS Code use. Pass `--log-level off` only when measuring
 the lower bound without structured-log overhead.
 
-For a controlled persistent-cache fill/warm comparison, set one unique
-`TITAN_PROBE_CACHE_IDENTITY` value and reuse it for the consecutive server
-processes. The value selects an isolated hashed cache namespace; changing it
-starts another namespace without deleting ordinary developer cache entries.
+For a controlled persistent-cache fill/warm comparison, set `TITAN_PREFIX` to
+a fresh absolute directory and reuse it for the consecutive server processes.
+Keep `TITAN_ROCKS_ROOT` pointed at the actual compiler installation, normally
+this repository's `.titan` directory. The private prefix holds ordinary
+source-only probe records under `var/cache/titan-probes/1`; it does not change
+their raw-source keys or delete ordinary developer cache entries. The workspace
+cache benchmark below manages this isolation automatically.
 
 An alternate saved target and additional ready-state probes can exercise a
 larger workspace in the same persistent server session. Probe positions are
@@ -210,16 +213,22 @@ VSIX is therefore self-contained for compiler discovery and does not inherit
 ambient `LUA_PATH` or `LUA_CPATH` defaults. Configured values replace the
 corresponding packaged template verbatim, so an override must be a complete Lua
 search path. Compatibility still requires both the matching Titan ABI and
-`titan-compiler.driver.LANGUAGE_SERVER_API_VERSION == 5`; API 5 includes the
+`titan-compiler.driver.LANGUAGE_SERVER_API_VERSION == 1`; API 1 includes the
 compiler's typed semantic metadata, incremental-analysis hooks, C-header
-dependency restat contract, resolver-scoped I/O strategy with named
-completed-module yield checkpoints, and the validated metadata-only embedded
+dependency restat contract, checked-project graph codecs, completed C-header
+and FFI conversion cache transport with separately refreshed timestamp observations,
+resolver-scoped I/O strategy with named completed-module yield checkpoints,
+bounded graph decoding and registry validation, and the validated metadata-only embedded
 interface provider used before disk-backed compiled providers. The provider's
 validated build target profile describes portable C types in those interfaces
 and their numeric conversions, allowing reflection imports and ordinary
 semantic analysis without a C compiler or Titan SDK. C header imports and
 native compilation still require the configured C toolchain and SDK. The ABI
 alone is not the language-server API contract.
+
+Titan is not publicly released; its language-server API version remains `1`
+until the first public release. Prerelease compiler and server changes are
+developed together against the exact pinned compiler revision.
 
 The two bundled trees contain ordinary Lua source and native Lua modules; they
 are not embedded into the executable. They contain no `lib/titan` provider tree,
@@ -353,6 +362,33 @@ watched, indexed, or a navigation target in version 1. This restriction does
 not prohibit opening the workspace root itself through a symlink, as described
 above.
 
+The server stores its saved index and dependency metadata in
+`.titan-ls/index.sqlite3` inside the resolved workspace root. It also stores
+compiler-owned checked-project and completed C-header graphs there, allowing a
+compatible restart to reuse work. The directory excludes itself from Git and
+is always omitted from source discovery and watchers. If it cannot be created
+or opened, the server logs that persistence is unavailable and uses the same
+SQLite backend in memory.
+
+Startup checks saved source, header and compiler-input metadata, search inputs,
+configuration and the native target before publishing reused answers. Matching
+precise timestamps and physical metadata reuse stored content and hashes without
+rereading files. A timestamp change reads and hashes the file; unchanged content
+updates only the observation. Replacements, symlink changes and new earlier
+search candidates still invalidate affected inputs. Deliberate byte changes that
+preserve all trusted metadata are outside this policy.
+
+Validated SQL answers become available before compiler graphs finish hydrating.
+Hydration runs in an owned background task with frequent yields; saved edits and
+compiler-verified rename coordinate with that task. Incompatible or damaged
+cache data rebuilds through the ordinary indexing path.
+Changing only `exclude` changes watcher policy without invalidating compatible
+semantics. The cache is disposable: close the server before removing
+`.titan-ls` to force a fresh index.
+
+See [workspace SQLite measurements](docs/sqlite-backend-benchmarks.md) for
+restart and saved-edit timings, memory and disk usage, and reproduction commands.
+
 ## Package and install the VSIX
 
 ```sh
@@ -404,8 +440,9 @@ functions, methods, associated functions, and supported foreign callables.
 Function-valued variables retain their bare function type. Record, union, and
 interface hovers summarize the members visible at that occurrence; module
 hovers summarize visible top-level members without recursively expanding
-nominal types. These summaries are normalized and cached with the immutable
-semantic index rather than rebuilt by individual hover requests.
+nominal types. These summaries, hover types, and folding ranges are materialized
+in the completed SQLite view during indexing. Individual feature queries read
+that view without traversing compiler ASTs or writing saved rows.
 
 An unchanged read-only request uses the immutable completed generation without
 rescanning the project. Before the initial index is ready it returns the

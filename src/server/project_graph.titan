@@ -1,3 +1,7 @@
+local iteration = import "iteration"
+local sqlite3 = import "sqlite3"
+local sql = import "server.workspace_store"
+
 -- The graph is deliberately independent from filesystem and compiler APIs.
 -- Callers normalize those boundaries, then provide immutable stamps, manifests,
 -- imports, and a typed annotated-AST value.
@@ -7,6 +11,9 @@ record FileStamp
   const modified_seconds: integer
   const modified_nanoseconds: integer
   const size: integer
+  -- Content identity is independent of the last observed modification time.
+  const identity: string?
+  const physical_identity: string?
 end
 
 record Manifest
@@ -58,49 +65,25 @@ union CommitResult
   stale
 end
 
--- One explicit state prevents a failed diagnostic result from masquerading as
--- dirty work while still distinguishing an in-flight check from an available
--- retry. The revision remains the exact invalidation identity carried by a
--- CheckToken.
-local union ProjectAnalysisState
-  dirty
-  checking
-  clean
-  failed
-end
 
-local record ProjectEntry<A>
-  stamps: {FileStamp}
-  manifest: Manifest?
-  ast: A?
-  imports: {ImportEdge}
-  analysis_state: ProjectAnalysisState
-  -- Retain failure lineage while an input-triggered retry moves through
-  -- dirty/checking. A successful retry whose manifest is unchanged must still
-  -- wake failed importers that could not compile against the failed provider.
-  recovering_from_failure: boolean
-  revision: integer
-end
-
-local record ExternalEntry
-  stamps: {FileStamp}
-  manifest: Manifest
-  imports: {ImportEdge}
-end
-
--- Only the project variant has an AST field. External variants cannot retain
--- an AST accidentally; they carry only file/manifest and graph metadata.
-local union Entry<A>
-  project: ProjectEntry<A>
-  external_source: ExternalEntry
-  external_binary: ExternalEntry
+-- Metadata has one owner: main. Only live project compiler values remain in
+-- memory. This adapter borrows its caller's complete-operation connection lease
+-- and never begins/ends a transaction or closes the connection.
+record AstSnapshot<A>
+  local const asts: {string: A}
 end
 
 record Graph<A>
-  local current_generation: integer
-  local modules: {string: Entry<A>}
-  local names: {string}
-  local reverse: {string: {ReverseImport}}
+  const connection: sqlite3.Connection
+  local asts: {string: A}
+end
+
+local record Module
+  provenance: integer
+  state: integer
+  recovering: boolean
+  revision: integer
+  manifest: Manifest?
 end
 
 local function copy_stamps(stamps: {FileStamp}): {FileStamp}
@@ -115,10 +98,6 @@ local function copy_stamps(stamps: {FileStamp}): {FileStamp}
     result[position] = stamp
   end
   return result
-end
-
-local function copy_manifest(manifest: Manifest): Manifest
-  return Manifest.new(manifest.public_digest, manifest.source_digest)
 end
 
 local function source_required(visibility: ImportVisibility): boolean
@@ -186,27 +165,7 @@ local function normalize_imports(imports: {ImportEdge}): {ImportEdge}
   return result
 end
 
-local function copy_imports(imports: {ImportEdge}): {ImportEdge}
-  local result: {ImportEdge} = {}
-  for index = 1, #imports do
-    local edge = imports[index]
-    result[index] = ImportEdge.new(
-      edge.module_name, copy_visibility(edge.visibility))
-  end
-  return result
-end
-
-local function copy_reverse(imports: {ReverseImport}): {ReverseImport}
-  local result: {ReverseImport} = {}
-  for index = 1, #imports do
-    local edge = imports[index]
-    result[index] = ReverseImport.new(
-      edge.importer, copy_visibility(edge.visibility))
-  end
-  return result
-end
-
-local function same_stamps(left: {FileStamp}, right: {FileStamp}): boolean
+local function same_observations(left: {FileStamp}, right: {FileStamp}): boolean
   if #left ~= #right then return false end
   for index = 1, #left do
     local a = left[index]
@@ -214,9 +173,25 @@ local function same_stamps(left: {FileStamp}, right: {FileStamp}): boolean
     if a.path ~= b.path or
        a.modified_seconds ~= b.modified_seconds or
        a.modified_nanoseconds ~= b.modified_nanoseconds or
-       a.size ~= b.size then
+       a.size ~= b.size or a.identity ~= b.identity or
+       a.physical_identity ~= b.physical_identity then
       return false
     end
+  end
+  return true
+end
+
+local function same_stamps(left: {FileStamp}, right: {FileStamp}): boolean
+  if #left ~= #right then return false end
+  for index = 1, #left do
+    local a = left[index]
+    local b = right[index]
+    if a.path ~= b.path or a.size ~= b.size or a.identity ~= b.identity or
+       a.physical_identity ~= b.physical_identity then return false end
+    -- Callers without content identities retain conservative stamp semantics.
+    if a.identity == nil and
+       (a.modified_seconds ~= b.modified_seconds or
+        a.modified_nanoseconds ~= b.modified_nanoseconds) then return false end
   end
   return true
 end
@@ -226,234 +201,12 @@ local function same_manifest(left: Manifest, right: Manifest): boolean
          left.source_digest == right.source_digest
 end
 
-local function state_is_dirty(state: ProjectAnalysisState): boolean
-  case state
-  when dirty then return true
-  else return false
-  end
-end
-
-local function state_is_checking(state: ProjectAnalysisState): boolean
-  case state
-  when checking then return true
-  else return false
-  end
-end
-
-local function state_is_clean(state: ProjectAnalysisState): boolean
-  case state
-  when clean then return true
-  else return false
-  end
-end
-
-local function state_is_failed(state: ProjectAnalysisState): boolean
-  case state
-  when failed then return true
-  else return false
-  end
-end
-
 local function same_imports(left: {ImportEdge}, right: {ImportEdge}): boolean
   if #left ~= #right then return false end
   for index = 1, #left do
     if not same_edge(left[index], right[index]) then return false end
   end
   return true
-end
-
-local function relevant_manifest_changed(old_manifest: Manifest?,
-                                         new_manifest: Manifest,
-                                         visibility: ImportVisibility): boolean
-  if old_manifest == nil then return true end
-  if old_manifest.public_digest ~= new_manifest.public_digest then return true end
-  return source_required(visibility) and
-         old_manifest.source_digest ~= new_manifest.source_digest
-end
-
-local function entry_imports<A>(entry: Entry<A>): {ImportEdge}
-  case entry
-  when project: project then return project.imports
-  when external_source: external then return external.imports
-  when external_binary: external then return external.imports
-  end
-end
-
-local function entry_manifest<A>(entry: Entry<A>): Manifest?
-  case entry
-  when project: project then return project.manifest
-  when external_source: external then return external.manifest
-  when external_binary: external then return external.manifest
-  end
-end
-
-local function entry_stamps<A>(entry: Entry<A>): {FileStamp}
-  case entry
-  when project: project then return project.stamps
-  when external_source: external then return external.stamps
-  when external_binary: external then return external.stamps
-  end
-end
-
-local function same_provenance<A>(entry: Entry<A>,
-                                  provenance: Provenance): boolean
-  case entry
-  when project then
-    case provenance
-    when project then return true
-    else return false
-    end
-  when external_source then
-    case provenance
-    when external_source then return true
-    else return false
-    end
-  when external_binary then
-    case provenance
-    when external_binary then return true
-    else return false
-    end
-  end
-end
-
-function create<A>(): Graph<A>
-  return Graph<A>.new(0, {}, {}, {})
-end
-
-function Graph:generation(): integer
-  return self.current_generation
-end
-
-local function Graph:add_name(module_name: string)
-  local position = #self.names + 1
-  while position > 1 and module_name < self.names[position - 1] do
-    self.names[position] = self.names[position - 1]
-    position = position - 1
-  end
-  self.names[position] = module_name
-end
-
-local function Graph:remove_name(module_name: string)
-  for index = 1, #self.names do
-    if self.names[index] == module_name then
-      for following = index, #self.names - 1 do
-        self.names[following] = self.names[following + 1]
-      end
-      self.names[#self.names] = nil
-      return
-    end
-  end
-end
-
-local function Graph:advance_generation()
-  self.current_generation = self.current_generation + 1
-  -- Every outstanding token names an older disk snapshot. Make in-flight
-  -- modules immediately restartable; the generation comparison rejects old
-  -- results. A failed result for an unchanged module remains current.
-  for index = 1, #self.names do
-    local entry? = self.modules[self.names[index]]
-    if entry ~= nil then
-      case entry
-      when project: project then
-        if state_is_checking(project.analysis_state) then
-          project.analysis_state = ProjectAnalysisState.dirty()
-        end
-      else
-      end
-    end
-  end
-end
-
-local function reverse_less(left: ReverseImport,
-                            right: ReverseImport): boolean
-  if left.importer ~= right.importer then
-    return left.importer < right.importer
-  end
-  return visibility_rank(left.visibility) < visibility_rank(right.visibility)
-end
-
-local function Graph:add_reverse(imported: string, edge: ReverseImport)
-  local bucket? = self.reverse[imported]
-  if bucket == nil then
-    bucket = {}
-    self.reverse[imported] = bucket
-  end
-  for index = 1, #bucket do
-    local current = bucket[index]
-    if current.importer == edge.importer and
-       same_visibility(current.visibility, edge.visibility) then
-      return
-    end
-  end
-  local position = #bucket + 1
-  while position > 1 and reverse_less(edge, bucket[position - 1]) do
-    bucket[position] = bucket[position - 1]
-    position = position - 1
-  end
-  bucket[position] = edge
-end
-
-local function Graph:remove_reverse(imported: string, importer: string,
-                                    visibility: ImportVisibility)
-  local bucket? = self.reverse[imported]
-  if bucket == nil then return end
-  for index = 1, #bucket do
-    local current = bucket[index]
-    if current.importer == importer and
-       same_visibility(current.visibility, visibility) then
-      for following = index, #bucket - 1 do
-        bucket[following] = bucket[following + 1]
-      end
-      bucket[#bucket] = nil
-      if #bucket == 0 then self.reverse[imported] = nil end
-      return
-    end
-  end
-end
-
-local function Graph:detach_imports(importer: string,
-                                    imports: {ImportEdge})
-  for index = 1, #imports do
-    local edge = imports[index]
-    self:remove_reverse(edge.module_name, importer, edge.visibility)
-  end
-end
-
-local function Graph:attach_imports(importer: string,
-                                    imports: {ImportEdge})
-  for index = 1, #imports do
-    local edge = imports[index]
-    self:add_reverse(edge.module_name, ReverseImport.new(
-      importer, copy_visibility(edge.visibility)))
-  end
-end
-
-local function Graph:set_imports(module_name: string, entry: Entry<A>,
-                                 imports: {ImportEdge})
-  local old_imports = entry_imports(entry)
-  self:detach_imports(module_name, old_imports)
-  case entry
-  when project: project then project.imports = imports
-  when external_source: external then external.imports = imports
-  when external_binary: external then external.imports = imports
-  end
-  self:attach_imports(module_name, imports)
-end
-
-local function Graph:dirty_project(module_name: string): boolean
-  local entry? = self.modules[module_name]
-  if entry == nil then return false end
-  case entry
-  when project: project then
-    -- Every invalidation is a new work revision, including dirty -> dirty and
-    -- failed -> dirty. The latter makes a current diagnostic result eligible
-    -- only when its source or one of its observed dependencies changes.
-    project.analysis_state = ProjectAnalysisState.dirty()
-    project.revision = project.revision + 1
-    return true
-  else
-    return false
-  end
 end
 
 local function add_sorted_name(names: {string}, module_name: string)
@@ -476,520 +229,561 @@ local function name_set(names: {string}): {string: boolean}
   return result
 end
 
-local function Graph:invalidate_importers(
-    module_name: string, old_manifest: Manifest?, new_manifest: Manifest?,
-    force: boolean, satisfied_projects: {string: boolean}): {string}
+function initialize_schema(connection: sqlite3.Connection)
+  sql.execute(connection, "CREATE TABLE IF NOT EXISTS main.graph_state (" ..
+    "singleton INTEGER PRIMARY KEY CHECK(singleton=1), generation INTEGER NOT NULL, " ..
+    "work_revision INTEGER NOT NULL)")
+  sql.execute(connection, "INSERT OR IGNORE INTO main.graph_state VALUES(1,0,0)")
+  sql.execute(connection, "CREATE TABLE IF NOT EXISTS main.graph_modules (" ..
+    "name TEXT PRIMARY KEY COLLATE BINARY, provenance INTEGER NOT NULL, " ..
+    "state INTEGER NOT NULL, recovering INTEGER NOT NULL, revision INTEGER NOT NULL, " ..
+    "public_digest BLOB, source_digest BLOB, " ..
+    "CHECK(provenance BETWEEN 0 AND 2), CHECK(state BETWEEN 0 AND 3), " ..
+    "CHECK((public_digest IS NULL)=(source_digest IS NULL))) WITHOUT ROWID")
+  sql.execute(connection, "CREATE TABLE IF NOT EXISTS main.graph_files (" ..
+    "module_name TEXT NOT NULL REFERENCES graph_modules(name) ON DELETE CASCADE, " ..
+    "path TEXT NOT NULL COLLATE BINARY, seconds INTEGER NOT NULL, " ..
+    "nanoseconds INTEGER NOT NULL, size INTEGER NOT NULL, identity BLOB, physical_identity BLOB, " ..
+    "PRIMARY KEY(module_name,path)) WITHOUT ROWID")
+  -- imported deliberately has no foreign key: incoming edges to a missing
+  -- provider must survive its removal and wake importers when it reappears.
+  sql.execute(connection, "CREATE TABLE IF NOT EXISTS main.graph_imports (" ..
+    "importer TEXT NOT NULL REFERENCES graph_modules(name) ON DELETE CASCADE, " ..
+    "imported TEXT NOT NULL COLLATE BINARY, visibility INTEGER NOT NULL, " ..
+    "PRIMARY KEY(importer,imported,visibility), " ..
+    "CHECK(visibility IN (0,1))) WITHOUT ROWID")
+  sql.execute(connection, "CREATE INDEX IF NOT EXISTS main.graph_reverse " ..
+    "ON graph_imports(imported,importer,visibility)")
+  sql.execute(connection, "CREATE INDEX IF NOT EXISTS main.graph_project_work " ..
+    "ON graph_modules(provenance,state,name)")
+end
+
+function create<A>(connection: sqlite3.Connection): Graph<A>
+  initialize_schema(connection)
+  return Graph<A>.new(connection, {})
+end
+
+function Graph:checkpoint_asts(): AstSnapshot<A>
+  local copy: {string: A} = {}
+  for name, ast in iteration.pairs<string, A>(self.asts) do copy[name] = ast end
+  return AstSnapshot<A>.new(copy)
+end
+
+function Graph:restore_asts(snapshot: AstSnapshot<A>)
+  self.asts = snapshot.asts
+end
+
+local function Graph:module(module_name: string): Module?
+  local statement = self.connection:prepare(
+    "SELECT provenance,state,recovering,revision,public_digest,source_digest " ..
+    "FROM main.graph_modules WHERE name=?")
+  defer statement:close()
+  local cursor = statement:query(module_name)
+  defer cursor:close()
+  local row? = cursor:fetch()
+  if row == nil then return nil end
+  local public_digest: sqlite3.Blob? = row:get(5)
+  local source_digest: sqlite3.Blob? = row:get(6)
+  local output: Manifest?
+  if public_digest ~= nil and source_digest ~= nil then
+    output = Manifest.new(public_digest.bytes, source_digest.bytes)
+  end
+  local recovering: integer = row:get(3)
+  return Module.new(row:get(1), row:get(2), recovering ~= 0, row:get(4), output)
+end
+
+local function Graph:names(query: string, ...: value): {string}
+  local statement = self.connection:prepare(query)
+  defer statement:close()
+  local cursor = statement:query(...)
+  defer cursor:close()
+  local names: {string} = {}
+  for row in cursor:fetch do names[#names + 1] = row:get(1) end
+  return names
+end
+
+function Graph:generation(): integer
+  return sql.scalar_integer(self.connection,
+    "SELECT generation FROM main.graph_state WHERE singleton=1")
+end
+
+local function Graph:advance_generation()
+  sql.execute(self.connection,
+    "UPDATE main.graph_state SET generation=generation+1 WHERE singleton=1")
+  -- Old tokens become stale; in-flight work immediately becomes retryable.
+  sql.execute(self.connection,
+    "UPDATE main.graph_modules SET state=0 WHERE provenance=0 AND state=1")
+end
+
+-- Work identity must survive removal and recreation of every module. A
+-- per-module counter can repeat while an older completed payload still exists.
+-- Allocate from the same transaction as the graph mutation so rollback restores
+-- both the input state and its allocator together.
+local function Graph:next_revision(): integer
+  sql.execute(self.connection,
+    "UPDATE main.graph_state SET work_revision=work_revision+1 WHERE singleton=1")
+  return sql.scalar_integer(self.connection,
+    "SELECT work_revision FROM main.graph_state WHERE singleton=1")
+end
+
+local function Graph:dirty_project(module_name: string): boolean
+  local revision = self:next_revision()
+  return sql.execute(self.connection,
+    "UPDATE main.graph_modules SET state=0,revision=? " ..
+    "WHERE name=? AND provenance=0", revision, module_name) ~= 0
+end
+
+local function Graph:set_stamps(module_name: string, stamps: {FileStamp})
+  sql.execute(self.connection,
+    "DELETE FROM main.graph_files WHERE module_name=?", module_name)
+  local first = 1
+  while first <= #stamps do
+    -- At most 196 parameters, below Titan's 200-position call bound.
+    local last = first + 27
+    if last > #stamps then last = #stamps end
+    local query = "INSERT INTO main.graph_files VALUES "
+    local bindings: {value} = {}
+    for index = first, last do
+      if index > first then query = query .. "," end
+      local stamp = stamps[index]
+      local offset = #bindings
+      bindings[offset + 1] = module_name
+      bindings[offset + 2] = stamp.path
+      bindings[offset + 3] = stamp.modified_seconds
+      bindings[offset + 4] = stamp.modified_nanoseconds
+      bindings[offset + 5] = stamp.size
+      query = query .. "(?,?,?,?,?"
+      if stamp.identity ~= nil then
+        query = query .. ",?"
+        bindings[#bindings + 1] = sqlite3.Blob.new(stamp.identity)
+      else
+        -- Array nil assignment removes a slot, so NULL is SQL syntax while
+        -- every present value remains a bound parameter.
+        query = query .. ",NULL"
+      end
+      if stamp.physical_identity ~= nil then
+        query = query .. ",?"
+        bindings[#bindings + 1] = sqlite3.Blob.new(stamp.physical_identity)
+      else
+        query = query .. ",NULL"
+      end
+      query = query .. ")"
+    end
+    sql.execute(self.connection, query, ...bindings)
+    first = last + 1
+  end
+end
+
+local function Graph:set_imports(module_name: string, imports: {ImportEdge})
+  sql.execute(self.connection,
+    "DELETE FROM main.graph_imports WHERE importer=?", module_name)
+  local first = 1
+  while first <= #imports do
+    local last = first + 49
+    if last > #imports then last = #imports end
+    local query = "INSERT OR IGNORE INTO main.graph_imports VALUES "
+    local bindings: {value} = {}
+    for index = first, last do
+      if index > first then query = query .. "," end
+      query = query .. "(?,?,?)"
+      local edge = imports[index]
+      bindings[#bindings + 1] = module_name
+      bindings[#bindings + 1] = edge.module_name
+      bindings[#bindings + 1] = visibility_rank(edge.visibility)
+    end
+    sql.execute(self.connection, query, ...bindings)
+    first = last + 1
+  end
+end
+
+-- The recursive relation crosses metadata-only external nodes and stops at
+-- project roots. UNION eliminates cycles and duplicate paths in SQLite.
+local const reverse_walk =
+  "WITH RECURSIVE affected(name) AS (" ..
+  "SELECT importer FROM main.graph_imports WHERE imported=? AND " ..
+  "(?<>0 OR (?<>0 AND visibility=1)) UNION " ..
+  "SELECT edge.importer FROM affected AS previous " ..
+  "JOIN main.graph_modules AS provider ON provider.name=previous.name " ..
+  "JOIN main.graph_imports AS edge ON edge.imported=previous.name " ..
+  "WHERE provider.provenance<>0) "
+
+local function Graph:invalidate_importers(module_name: string,
+    old_manifest: Manifest?, new_manifest: Manifest?, force: boolean,
+    satisfied: {string: boolean}): {string}
+  local public_changed = force or new_manifest == nil or old_manifest == nil
+  local source_changed = public_changed
+  if not public_changed and old_manifest ~= nil and new_manifest ~= nil then
+    public_changed = old_manifest.public_digest ~= new_manifest.public_digest
+    source_changed = old_manifest.source_digest ~= new_manifest.source_digest
+  end
+  local public_flag = 0
+  local source_flag = 0
+  if public_changed then public_flag = 1 end
+  if source_changed then source_flag = 1 end
+  local names = self:names(reverse_walk ..
+    "SELECT module.name FROM affected JOIN main.graph_modules AS module " ..
+    "ON module.name=affected.name WHERE module.provenance=0 " ..
+    "ORDER BY module.name COLLATE BINARY", module_name, public_flag, source_flag)
   local invalidated: {string} = {}
-  local bucket? = self.reverse[module_name]
-  if bucket == nil then return invalidated end
-
-  -- External modules cannot be rechecked independently by this graph. Walk
-  -- through their reverse edges until reaching project roots, then let those
-  -- projects' newly computed manifests drive the ordinary fixed point. This is
-  -- deliberately iterative and cycle-safe because external metadata may
-  -- contain dependency cycles even when a source project would reject one.
-  local pending: {string} = {}
-  local queued: {string: boolean} = {}
-  local visited_projects: {string: boolean} = {}
-
-  local invalidate_or_enqueue: (string) -> () = function (importer: string)
-    local entry? = self.modules[importer]
-    if entry == nil then return end
-    case entry
-    when project then
-      if visited_projects[importer] then return end
-      visited_projects[importer] = true
-      if not satisfied_projects[importer] and self:dirty_project(importer) then
-        add_sorted_name(invalidated, importer)
-      end
-    when external_source then
-      if not queued[importer] then
-        queued[importer] = true
-        pending[#pending + 1] = importer
-      end
-    when external_binary then
-      if not queued[importer] then
-        queued[importer] = true
-        pending[#pending + 1] = importer
-      end
-    end
-  end
-
-  for index = 1, #bucket do
-    local reverse = bucket[index]
-    local changed = force or new_manifest == nil
-    if not changed then
-      changed = relevant_manifest_changed(
-        old_manifest, new_manifest, reverse.visibility)
-    end
-    if changed then invalidate_or_enqueue(reverse.importer) end
-  end
-
-  local next_pending = 1
-  while next_pending <= #pending do
-    local external_name = pending[next_pending]
-    next_pending = next_pending + 1
-    local external_reverse? = self.reverse[external_name]
-    if external_reverse ~= nil then
-      -- Once an upstream external may have changed, its own public/source
-      -- surface is unknown until a project analysis encounters it again.
-      -- Conservatively cross every external edge, but stop at project roots.
-      for index = 1, #external_reverse do
-        invalidate_or_enqueue(external_reverse[index].importer)
-      end
+  for index = 1, #names do
+    local name = names[index]
+    if not satisfied[name] and self:dirty_project(name) then
+      invalidated[#invalidated + 1] = name
     end
   end
   return invalidated
 end
 
--- A dependency's failed -> clean transition is itself relevant to importers
--- which are still failed, even when the recovered manifest is byte-identical
--- to its last successful one. Clean importers retain the ordinary
--- visibility/manifest fast path. As with external invalidation, walk through
--- metadata-only external nodes until a failed project root is reached.
-local function Graph:invalidate_failed_importers(
-    module_name: string, already_invalidated: {string: boolean}): {string}
+local function Graph:invalidate_failed_importers(module_name: string,
+    already_invalidated: {string: boolean}): {string}
+  local names = self:names(reverse_walk ..
+    "SELECT module.name FROM affected JOIN main.graph_modules AS module " ..
+    "ON module.name=affected.name WHERE module.provenance=0 AND module.state=3 " ..
+    "ORDER BY module.name COLLATE BINARY", module_name, 1, 1)
   local invalidated: {string} = {}
-  local pending: {string} = {}
-  local queued: {string: boolean} = {}
-  local visited_projects: {string: boolean} = {}
-
-  local invalidate_or_enqueue: (string) -> () = function (importer: string)
-    local entry? = self.modules[importer]
-    if entry == nil then return end
-    case entry
-    when project: project then
-      if visited_projects[importer] then return end
-      visited_projects[importer] = true
-      if not already_invalidated[importer] and
-         state_is_failed(project.analysis_state) and
-         self:dirty_project(importer) then
-        add_sorted_name(invalidated, importer)
-      end
-    when external_source then
-      if not queued[importer] then
-        queued[importer] = true
-        pending[#pending + 1] = importer
-      end
-    when external_binary then
-      if not queued[importer] then
-        queued[importer] = true
-        pending[#pending + 1] = importer
-      end
-    end
-  end
-
-  local direct? = self.reverse[module_name]
-  if direct ~= nil then
-    for index = 1, #direct do
-      invalidate_or_enqueue(direct[index].importer)
-    end
-  end
-  local next_pending = 1
-  while next_pending <= #pending do
-    local external_name = pending[next_pending]
-    next_pending = next_pending + 1
-    local reverse? = self.reverse[external_name]
-    if reverse ~= nil then
-      for index = 1, #reverse do
-        invalidate_or_enqueue(reverse[index].importer)
-      end
+  for index = 1, #names do
+    local name = names[index]
+    if not already_invalidated[name] and self:dirty_project(name) then
+      invalidated[#invalidated + 1] = name
     end
   end
   return invalidated
 end
 
 function Graph:module_names(): {string}
-  local result: {string} = {}
-  for index = 1, #self.names do result[index] = self.names[index] end
-  return result
+  return self:names("SELECT name FROM main.graph_modules ORDER BY name COLLATE BINARY")
 end
 
 function Graph:has_module(module_name: string): boolean
-  return self.modules[module_name] ~= nil
+  return sql.scalar_integer(self.connection,
+    "SELECT count(*) FROM main.graph_modules WHERE name=?", module_name) ~= 0
 end
 
 function Graph:provenance(module_name: string): Provenance?
-  local entry? = self.modules[module_name]
+  local entry? = self:module(module_name)
   if entry == nil then return nil end
-  case entry
-  when project then return Provenance.project()
-  when external_source then return Provenance.external_source()
-  when external_binary then return Provenance.external_binary()
-  end
+  if entry.provenance == 0 then return Provenance.project() end
+  if entry.provenance == 1 then return Provenance.external_source() end
+  return Provenance.external_binary()
 end
 
 function Graph:file_stamps(module_name: string): {FileStamp}
-  local entry? = self.modules[module_name]
-  if entry == nil then return {} end
-  return copy_stamps(entry_stamps(entry))
-end
-
-function Graph:manifest(module_name: string): Manifest?
-  local entry? = self.modules[module_name]
-  if entry == nil then return nil end
-  local manifest? = entry_manifest(entry)
-  if manifest == nil then return nil end
-  return copy_manifest(manifest)
-end
-
-function Graph:direct_imports(module_name: string): {ImportEdge}
-  local entry? = self.modules[module_name]
-  if entry == nil then return {} end
-  return copy_imports(entry_imports(entry))
-end
-
-function Graph:reverse_imports(module_name: string): {ReverseImport}
-  local imports? = self.reverse[module_name]
-  if imports == nil then return {} end
-  return copy_reverse(imports)
-end
-
-function Graph:is_dirty(module_name: string): boolean
-  local entry? = self.modules[module_name]
-  if entry == nil then return false end
-  case entry
-  when project: project then return state_is_dirty(project.analysis_state)
-  else return false
-  end
-end
-
-function Graph:is_failed(module_name: string): boolean
-  local entry? = self.modules[module_name]
-  if entry == nil then return false end
-  case entry
-  when project: project then return state_is_failed(project.analysis_state)
-  else return false
-  end
-end
-
-function Graph:dirty_modules(): {string}
-  local result: {string} = {}
-  for index = 1, #self.names do
-    local module_name = self.names[index]
-    if self:is_dirty(module_name) then
-      result[#result + 1] = module_name
-    end
+  local statement = self.connection:prepare(
+    "SELECT path,seconds,nanoseconds,size,identity,physical_identity FROM main.graph_files " ..
+    "WHERE module_name=? ORDER BY path COLLATE BINARY")
+  defer statement:close()
+  local cursor = statement:query(module_name)
+  defer cursor:close()
+  local result: {FileStamp} = {}
+  for row in cursor:fetch do
+    local identity_blob: sqlite3.Blob? = row:get(5)
+    local identity: string?
+    if identity_blob ~= nil then identity = identity_blob.bytes end
+    local physical_blob: sqlite3.Blob? = row:get(6)
+    local physical_identity: string?
+    if physical_blob ~= nil then physical_identity = physical_blob.bytes end
+    result[#result + 1] = FileStamp.new(row:get(1), row:get(2), row:get(3), row:get(4),
+      identity, physical_identity)
   end
   return result
 end
 
-function Graph:project_ast(module_name: string): A?
-  local entry? = self.modules[module_name]
+function Graph:manifest(module_name: string): Manifest?
+  local entry? = self:module(module_name)
   if entry == nil then return nil end
-  case entry
-  when project: project then
-    if not state_is_clean(project.analysis_state) then return nil end
-    return project.ast
-  else
-    return nil
+  return entry.manifest
+end
+
+function Graph:direct_imports(module_name: string): {ImportEdge}
+  local statement = self.connection:prepare(
+    "SELECT imported,visibility FROM main.graph_imports WHERE importer=? " ..
+    "ORDER BY imported COLLATE BINARY,visibility")
+  defer statement:close()
+  local cursor = statement:query(module_name)
+  defer cursor:close()
+  local result: {ImportEdge} = {}
+  for row in cursor:fetch do
+    local visibility: integer = row:get(2)
+    local access = ImportVisibility.ordinary()
+    if visibility == 1 then access = ImportVisibility.source_required() end
+    result[#result + 1] = ImportEdge.new(row:get(1), access)
   end
+  return result
+end
+
+function Graph:reverse_imports(module_name: string): {ReverseImport}
+  local statement = self.connection:prepare(
+    "SELECT importer,visibility FROM main.graph_imports WHERE imported=? " ..
+    "ORDER BY importer COLLATE BINARY,visibility")
+  defer statement:close()
+  local cursor = statement:query(module_name)
+  defer cursor:close()
+  local result: {ReverseImport} = {}
+  for row in cursor:fetch do
+    local visibility: integer = row:get(2)
+    local access = ImportVisibility.ordinary()
+    if visibility == 1 then access = ImportVisibility.source_required() end
+    result[#result + 1] = ReverseImport.new(row:get(1), access)
+  end
+  return result
+end
+
+function Graph:is_dirty(module_name: string): boolean
+  return sql.scalar_integer(self.connection,
+    "SELECT count(*) FROM main.graph_modules WHERE name=? AND provenance=0 AND state=0",
+    module_name) ~= 0
+end
+
+function Graph:is_failed(module_name: string): boolean
+  return sql.scalar_integer(self.connection,
+    "SELECT count(*) FROM main.graph_modules WHERE name=? AND provenance=0 AND state=3",
+    module_name) ~= 0
+end
+
+function Graph:dirty_modules(): {string}
+  return self:names("SELECT name FROM main.graph_modules " ..
+    "WHERE provenance=0 AND state=0 ORDER BY name COLLATE BINARY")
+end
+
+function Graph:project_ast(module_name: string): A?
+  if sql.scalar_integer(self.connection,
+    "SELECT count(*) FROM main.graph_modules WHERE name=? AND provenance=0 AND state=2",
+    module_name) == 0 then return nil end
+  return self.asts[module_name]
+end
+
+-- Diagnostic/state snapshots preserve the last project compiler handle while
+-- work is dirty and may retain an authoritative failed compiler result. This
+-- is separate from project_ast's clean-only language-feature contract.
+function Graph:project_snapshot(module_name: string): A?
+  if sql.scalar_integer(self.connection,
+    "SELECT count(*) FROM main.graph_modules WHERE name=? AND provenance=0",
+    module_name) == 0 then return nil end
+  return self.asts[module_name]
+end
+
+function Graph:set_project_snapshot(module_name: string, ast: A?): boolean
+  if sql.scalar_integer(self.connection,
+    "SELECT count(*) FROM main.graph_modules WHERE name=? AND provenance=0",
+    module_name) == 0 then return false end
+  self.asts[module_name] = ast
+  return true
+end
+
+-- The caller has validated and decoded this persisted project payload. A
+-- restored compiler handle does not perform work or change published metadata.
+function Graph:hydrate_project_ast(module_name: string, ast: A): boolean
+  if sql.scalar_integer(self.connection,
+    "SELECT count(*) FROM main.graph_modules WHERE name=? AND provenance=0 AND state=2",
+    module_name) == 0 then return false end
+  self.asts[module_name] = ast
+  return true
+end
+
+function Graph:hydrate_project_ast_at_revision(module_name: string,
+    expected_revision: integer, ast: A): boolean
+  local entry? = self:module(module_name)
+  if entry == nil or entry.provenance ~= 0 or entry.state ~= 2 or
+     entry.revision ~= expected_revision then return false end
+  self.asts[module_name] = ast
+  return true
+end
+
+-- Observation refresh is deliberately separate from semantic work. A touch
+-- whose content and physical input match preserves active check tokens too.
+function Graph:refresh_file_observations(module_name: string,
+    stamps: {FileStamp}): boolean
+  local normalized = copy_stamps(stamps)
+  local previous = self:file_stamps(module_name)
+  if not same_stamps(previous, normalized) then return false end
+  if same_observations(previous, normalized) then return true end
+  for index = 1, #normalized do
+    local stamp = normalized[index]
+    sql.execute(self.connection,
+      "UPDATE main.graph_files SET seconds=?,nanoseconds=?,size=? " ..
+      "WHERE module_name=? AND path=?", stamp.modified_seconds,
+      stamp.modified_nanoseconds, stamp.size, module_name, stamp.path)
+  end
+  return true
+end
+
+-- A prior process cannot finish in-flight work. Preserve completed and failed
+-- revisions; only interrupted checks become available for a fresh attempt.
+function Graph:restart_interrupted_checks()
+  sql.execute(self.connection,
+    "UPDATE main.graph_modules SET state=0 WHERE provenance=0 AND state=1")
 end
 
 function Graph:observe_project(module_name: string,
-                               stamps: {FileStamp}): ChangeReport
+    stamps: {FileStamp}): ChangeReport
   local normalized = copy_stamps(stamps)
-  local existing? = self.modules[module_name]
-  if existing ~= nil then
-    case existing
-    when project: project then
-      if same_stamps(project.stamps, normalized) then
-        return ChangeReport.new(false, self.current_generation, {})
-      end
-      self:advance_generation()
-      project.stamps = normalized
-      self:dirty_project(module_name)
-      return ChangeReport.new(true, self.current_generation, {})
-    else
+  local existing? = self:module(module_name)
+  if existing ~= nil and existing.provenance == 0 then
+    if same_stamps(self:file_stamps(module_name), normalized) then
+      self:refresh_file_observations(module_name, normalized)
+      return ChangeReport.new(false, self:generation(), {})
     end
+    self:advance_generation()
+    self:set_stamps(module_name, normalized)
+    self:dirty_project(module_name)
+    return ChangeReport.new(true, self:generation(), {})
   end
-
   self:advance_generation()
-  if existing ~= nil then
-    self:detach_imports(module_name, entry_imports(existing))
-  else
-    self:add_name(module_name)
-  end
-  self.modules[module_name] = Entry<A>.project(ProjectEntry<A>.new(
-    normalized, nil, nil, {}, ProjectAnalysisState.dirty(), false, 1))
-  local invalidated = self:invalidate_importers(
-    module_name, nil, nil, true, {})
-  return ChangeReport.new(true, self.current_generation, invalidated)
+  sql.execute(self.connection, "DELETE FROM main.graph_modules WHERE name=?", module_name)
+  sql.execute(self.connection,
+    "INSERT INTO main.graph_modules VALUES(?,0,0,0,?,NULL,NULL)",
+    module_name, self:next_revision())
+  self.asts[module_name] = nil
+  self:set_stamps(module_name, normalized)
+  local invalidated = self:invalidate_importers(module_name, nil, nil, true, {})
+  return ChangeReport.new(true, self:generation(), invalidated)
 end
 
 function Graph:invalidate_project(module_name: string): ChangeReport
-  local entry? = self.modules[module_name]
-  if entry == nil then
-    return ChangeReport.new(false, self.current_generation, {})
+  local entry? = self:module(module_name)
+  if entry == nil or entry.provenance ~= 0 then
+    return ChangeReport.new(false, self:generation(), {})
   end
-  case entry
-  when project then
-    self:advance_generation()
-    self:dirty_project(module_name)
-    return ChangeReport.new(true, self.current_generation, {})
-  else
-    return ChangeReport.new(false, self.current_generation, {})
-  end
+  self:advance_generation()
+  self:dirty_project(module_name)
+  return ChangeReport.new(true, self:generation(), {})
 end
 
 function Graph:begin_project_check(module_name: string): CheckToken?
-  local entry? = self.modules[module_name]
-  if entry == nil then return nil end
-  case entry
-  when project: project then
-    if not state_is_dirty(project.analysis_state) then return nil end
-    project.analysis_state = ProjectAnalysisState.checking()
-    return CheckToken.new(
-      module_name, self.current_generation, project.revision)
-  else
-    return nil
-  end
+  if sql.execute(self.connection,
+    "UPDATE main.graph_modules SET state=1 WHERE name=? AND provenance=0 AND state=0",
+    module_name) == 0 then return nil end
+  local entry? = self:module(module_name)
+  if entry == nil then raise "project disappeared while holding store access" end
+  return CheckToken.new(module_name, self:generation(), entry.revision)
 end
 
--- Abandon an analysis result without changing the saved revision. Exceptions
--- and cancelled work remain retryable; an exact compiler diagnostic uses
--- fail_project_check instead and becomes current for this revision.
+local function Graph:accepts(token: CheckToken): Module?
+  if token.generation ~= self:generation() then return nil end
+  local entry? = self:module(token.module_name)
+  if entry == nil or entry.provenance ~= 0 or entry.state ~= 1 or
+     entry.revision ~= token.revision then return nil end
+  return entry
+end
+
 function Graph:abort_project_check(token: CheckToken): boolean
-  if token.generation ~= self.current_generation then return false end
-  local entry? = self.modules[token.module_name]
-  if entry == nil then return false end
-  case entry
-  when project: project then
-    if not state_is_checking(project.analysis_state) or
-       project.revision ~= token.revision then
-      return false
-    end
-    project.analysis_state = ProjectAnalysisState.dirty()
-    return true
-  else
-    return false
-  end
+  if self:accepts(token) == nil then return false end
+  sql.execute(self.connection,
+    "UPDATE main.graph_modules SET state=0 WHERE name=?", token.module_name)
+  return true
 end
 
--- Accept an exact diagnostic result for the current revision. Its observed
--- imports replace the last known dependency frame so later dependency changes
--- can schedule a retry. No AST is exposed, while the previous successful
--- manifest remains available for recovery-time propagation.
 function Graph:fail_project_check(token: CheckToken,
-                                  imports: {ImportEdge}): boolean
-  if token.generation ~= self.current_generation then return false end
-  local entry? = self.modules[token.module_name]
-  if entry == nil then return false end
-  case entry
-  when project: project then
-    if not state_is_checking(project.analysis_state) or
-       project.revision ~= token.revision then
-      return false
-    end
-    self:set_imports(
-      token.module_name, entry, normalize_imports(imports))
-    project.ast = nil
-    project.analysis_state = ProjectAnalysisState.failed()
-    project.recovering_from_failure = true
-    return true
-  else
-    return false
-  end
+    imports: {ImportEdge}): boolean
+  if self:accepts(token) == nil then return false end
+  self:set_imports(token.module_name, imports)
+  sql.execute(self.connection,
+    "UPDATE main.graph_modules SET state=3,recovering=1 WHERE name=?", token.module_name)
+  self.asts[token.module_name] = nil
+  return true
 end
 
 function Graph:commit_project(token: CheckToken, manifest: Manifest,
-                              imports: {ImportEdge}, ast: A): CommitResult
-  if token.generation ~= self.current_generation then
-    return CommitResult.stale()
-  end
-  local entry? = self.modules[token.module_name]
+    imports: {ImportEdge}, ast: A): CommitResult
+  local entry? = self:accepts(token)
   if entry == nil then return CommitResult.stale() end
-  case entry
-  when project: project then
-    if not state_is_checking(project.analysis_state) or
-       project.revision ~= token.revision then
-      return CommitResult.stale()
-    end
-
-    local recovered = project.recovering_from_failure
-    local old_manifest? = project.manifest
-    local normalized_imports = normalize_imports(imports)
-    self:set_imports(token.module_name, entry, normalized_imports)
-    project.manifest = copy_manifest(manifest)
-    project.ast = ast
-    project.analysis_state = ProjectAnalysisState.clean()
-    project.recovering_from_failure = false
-    local invalidated = self:invalidate_importers(
-      token.module_name, old_manifest, project.manifest, false, {})
-    if recovered then
-      local recovery_invalidated = self:invalidate_failed_importers(
-        token.module_name, name_set(invalidated))
-      for index = 1, #recovery_invalidated do
-        add_sorted_name(invalidated, recovery_invalidated[index])
-      end
-    end
-    return CommitResult.accepted(CommitAccepted.new(invalidated))
-  else
-    return CommitResult.stale()
+  self:set_imports(token.module_name, imports)
+  sql.execute(self.connection,
+    "UPDATE main.graph_modules SET state=2,recovering=0,public_digest=?,source_digest=? " ..
+    "WHERE name=?", sqlite3.Blob.new(manifest.public_digest),
+    sqlite3.Blob.new(manifest.source_digest), token.module_name)
+  self.asts[token.module_name] = ast
+  local invalidated = self:invalidate_importers(
+    token.module_name, entry.manifest, manifest, false, {})
+  if entry.recovering then
+    local recovery = self:invalidate_failed_importers(token.module_name, name_set(invalidated))
+    for index = 1, #recovery do add_sorted_name(invalidated, recovery[index]) end
   end
+  return CommitResult.accepted(CommitAccepted.new(invalidated))
 end
 
-local function Graph:upsert_external(
-    module_name: string, provenance: Provenance, stamps: {FileStamp},
-    manifest: Manifest, imports: {ImportEdge}, advance: boolean,
-    satisfied_projects: {string: boolean}): ChangeReport
+local function Graph:upsert_external(module_name: string, provenance: integer,
+    stamps: {FileStamp}, manifest: Manifest, imports: {ImportEdge},
+    advance: boolean, satisfied: {string: boolean}): ChangeReport
   local normalized_stamps = copy_stamps(stamps)
   local normalized_imports = normalize_imports(imports)
-  local existing? = self.modules[module_name]
+  local existing? = self:module(module_name)
   local old_manifest: Manifest?
   local force = existing == nil
   if existing ~= nil then
-    old_manifest = entry_manifest(existing)
-    force = not same_provenance(existing, provenance)
-    if not force and
-       same_stamps(entry_stamps(existing), normalized_stamps) and
+    old_manifest = existing.manifest
+    force = existing.provenance ~= provenance
+    if not force and same_stamps(self:file_stamps(module_name), normalized_stamps) and
        old_manifest ~= nil and same_manifest(old_manifest, manifest) and
-       same_imports(entry_imports(existing), normalized_imports) then
-      return ChangeReport.new(false, self.current_generation, {})
+       same_imports(self:direct_imports(module_name), normalized_imports) then
+      self:refresh_file_observations(module_name, normalized_stamps)
+      return ChangeReport.new(false, self:generation(), {})
     end
   end
-
   if advance then self:advance_generation() end
-  if existing ~= nil then
-    self:detach_imports(module_name, entry_imports(existing))
-  else
-    self:add_name(module_name)
-  end
-  local external = ExternalEntry.new(
-    normalized_stamps, copy_manifest(manifest), normalized_imports)
-  case provenance
-  when external_source then
-    self.modules[module_name] = Entry<A>.external_source(external)
-  when external_binary then
-    self.modules[module_name] = Entry<A>.external_binary(external)
-  when project then
-    -- This private helper is only called by the two external entry points.
-    raise "project provenance passed to external cache"
-  end
-  self:attach_imports(module_name, normalized_imports)
+  sql.execute(self.connection, "DELETE FROM main.graph_modules WHERE name=?", module_name)
+  sql.execute(self.connection,
+    "INSERT INTO main.graph_modules VALUES(?,?,2,0,0,?,?)", module_name, provenance,
+    sqlite3.Blob.new(manifest.public_digest), sqlite3.Blob.new(manifest.source_digest))
+  self.asts[module_name] = nil
+  self:set_stamps(module_name, normalized_stamps)
+  self:set_imports(module_name, normalized_imports)
   local invalidated = self:invalidate_importers(
-    module_name, old_manifest, manifest, force, satisfied_projects)
-  return ChangeReport.new(true, self.current_generation, invalidated)
+    module_name, old_manifest, manifest, force, satisfied)
+  return ChangeReport.new(true, self:generation(), invalidated)
 end
 
-function Graph:upsert_external_source(
-    module_name: string, stamps: {FileStamp}, manifest: Manifest,
-    imports: {ImportEdge}): ChangeReport
-  return self:upsert_external(module_name, Provenance.external_source(),
-                              stamps, manifest, imports, true, {})
+function Graph:upsert_external_source(module_name: string, stamps: {FileStamp},
+    manifest: Manifest, imports: {ImportEdge}): ChangeReport
+  return self:upsert_external(module_name, 1, stamps, manifest, imports, true, {})
 end
 
-function Graph:upsert_external_binary(
-    module_name: string, stamps: {FileStamp}, manifest: Manifest,
-    imports: {ImportEdge}): ChangeReport
-  return self:upsert_external(module_name, Provenance.external_binary(),
-                              stamps, manifest, imports, true, {})
+function Graph:upsert_external_binary(module_name: string, stamps: {FileStamp},
+    manifest: Manifest, imports: {ImportEdge}): ChangeReport
+  return self:upsert_external(module_name, 2, stamps, manifest, imports, true, {})
 end
 
--- Publish metadata produced from the already-validated current analysis
--- generation. Unlike observing new disk stamps, this derived cache write must
--- not create a new generation or invalidate project results that were produced
--- by that same analysis.
-function Graph:publish_external_source(
-    module_name: string, stamps: {FileStamp}, manifest: Manifest,
-    imports: {ImportEdge}, satisfied_project_names: {string}): ChangeReport
-  return self:upsert_external(
-    module_name, Provenance.external_source(), stamps, manifest, imports,
+function Graph:publish_external_source(module_name: string, stamps: {FileStamp},
+    manifest: Manifest, imports: {ImportEdge}, satisfied_project_names: {string}): ChangeReport
+  return self:upsert_external(module_name, 1, stamps, manifest, imports,
     false, name_set(satisfied_project_names))
 end
 
-function Graph:publish_external_binary(
-    module_name: string, stamps: {FileStamp}, manifest: Manifest,
-    imports: {ImportEdge}, satisfied_project_names: {string}): ChangeReport
-  return self:upsert_external(
-    module_name, Provenance.external_binary(), stamps, manifest, imports,
+function Graph:publish_external_binary(module_name: string, stamps: {FileStamp},
+    manifest: Manifest, imports: {ImportEdge}, satisfied_project_names: {string}): ChangeReport
+  return self:upsert_external(module_name, 2, stamps, manifest, imports,
     false, name_set(satisfied_project_names))
 end
 
--- A changed or missing external provider has an unknown new manifest. Force a
--- reverse walk through any external metadata nodes to every first project
--- consumer. Project-to-project propagation remains manifest driven.
 function Graph:invalidate_external_change(module_name: string): {string}
   return self:invalidate_importers(module_name, nil, nil, true, {})
 end
 
 function Graph:reachable_external_modules(): {string}
-  local result: {string} = {}
-  local pending: {string} = {}
-  local queued: {string: boolean} = {}
-
-  local enqueue: (string) -> () = function (module_name: string)
-    if not queued[module_name] then
-      queued[module_name] = true
-      pending[#pending + 1] = module_name
-    end
-  end
-
-  for index = 1, #self.names do
-    local entry? = self.modules[self.names[index]]
-    if entry ~= nil then
-      case entry
-      when project: project then
-        for import_index = 1, #project.imports do
-          enqueue(project.imports[import_index].module_name)
-        end
-      else
-      end
-    end
-  end
-
-  local next_pending = 1
-  while next_pending <= #pending do
-    local module_name = pending[next_pending]
-    next_pending = next_pending + 1
-    local entry? = self.modules[module_name]
-    if entry ~= nil then
-      case entry
-      when project then
-        -- Every project root was seeded above.
-      when external_source: external then
-        add_sorted_name(result, module_name)
-        for index = 1, #external.imports do
-          enqueue(external.imports[index].module_name)
-        end
-      when external_binary: external then
-        add_sorted_name(result, module_name)
-        for index = 1, #external.imports do
-          enqueue(external.imports[index].module_name)
-        end
-      end
-    end
-  end
-  return result
+  return self:names("WITH RECURSIVE reachable(name) AS (" ..
+    "SELECT imported FROM main.graph_imports AS edge " ..
+    "JOIN main.graph_modules AS provider ON provider.name=edge.importer " ..
+    "WHERE provider.provenance=0 UNION " ..
+    "SELECT imported FROM reachable AS previous " ..
+    "JOIN main.graph_modules AS provider ON provider.name=previous.name " ..
+    "JOIN main.graph_imports AS edge ON edge.importer=previous.name " ..
+    "WHERE provider.provenance<>0) " ..
+    "SELECT module.name FROM reachable " ..
+    "JOIN main.graph_modules AS module ON module.name=reachable.name " ..
+    "WHERE module.provenance<>0 ORDER BY module.name COLLATE BINARY")
 end
 
--- Drop derived metadata proven unreachable from every project entry. This is
--- not a disk observation and therefore does not advance the generation.
 function Graph:prune_external(module_name: string): boolean
-  local entry? = self.modules[module_name]
-  if entry == nil then return false end
-  case entry
-  when project then return false
-  else
-  end
-  self:detach_imports(module_name, entry_imports(entry))
-  self.modules[module_name] = nil
-  self:remove_name(module_name)
-  return true
+  return sql.execute(self.connection,
+    "DELETE FROM main.graph_modules WHERE name=? AND provenance<>0", module_name) ~= 0
 end
 
 function Graph:remove_module(module_name: string): ChangeReport
-  local entry? = self.modules[module_name]
-  if entry == nil then
-    return ChangeReport.new(false, self.current_generation, {})
-  end
+  local entry? = self:module(module_name)
+  if entry == nil then return ChangeReport.new(false, self:generation(), {}) end
   self:advance_generation()
-  self:detach_imports(module_name, entry_imports(entry))
-  self.modules[module_name] = nil
-  self:remove_name(module_name)
-  -- Keep incoming reverse edges: importers still name the now-missing module,
-  -- and adding a provider for that logical name must invalidate them again.
-  local invalidated = self:invalidate_importers(
-    module_name, entry_manifest(entry), nil, true, {})
-  return ChangeReport.new(true, self.current_generation, invalidated)
+  sql.execute(self.connection, "DELETE FROM main.graph_modules WHERE name=?", module_name)
+  self.asts[module_name] = nil
+  local invalidated = self:invalidate_importers(module_name, entry.manifest, nil, true, {})
+  return ChangeReport.new(true, self:generation(), invalidated)
 end

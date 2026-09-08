@@ -25,7 +25,7 @@ The executable contains the selected statically linked Titan runtime modules,
 embedded Lua interpreter, and selected native dependencies. Each initialized
 statically linked module registers its runtime opener in `package.preload`.
 Separately, the executable embeds a metadata-only inventory of all 21 canonical
-Titan standard-module interfaces. Compiler language-server API 5 validates and
+Titan standard-module interfaces. Compiler language-server API 1 validates and
 decodes this inventory and its build target's C type profile for project
 typechecking; it is not module code, a Titan provider archive, headers, or an
 SDK payload.
@@ -111,9 +111,11 @@ returns a `WorkspaceEdit` with `applied: false`. It never changes source files.
   folding.
 - The compiler modules and any native Lua dependencies must be ABI-compatible
   with the embedded Lua/Titan runtime in the executable. The compiler driver
-  must also export `LANGUAGE_SERVER_API_VERSION = 5`; API 5 includes the typed
-  metadata, incremental-analysis hooks, C-header dependency restat contract,
-  resolver-scoped I/O strategy with checked-module yield sequencing, and the
+  must also export `LANGUAGE_SERVER_API_VERSION = 1`; API 1 includes the typed
+  metadata, checked-project and C-header graph codecs, FFI conversion reuse,
+  incremental-analysis hooks, timestamp observations and C-header dependency
+  restat contract, resolver-scoped I/O strategy with checked-module yield sequencing,
+  bounded graph decoding and registry validation, and the
   validated metadata-only embedded-interface resolver used here. The provider's
   validated build target profile supports portable C types and their numeric
   conversions without requiring a C compiler or Titan SDK for reflection

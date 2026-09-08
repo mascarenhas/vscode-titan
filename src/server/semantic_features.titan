@@ -3,6 +3,8 @@ local bridge = import "server.compiler_bridge"
 local lsp = import "server.lsp_types"
 local indexer = import "server.semantic_index"
 local source_text = import "server.source_text"
+local sqlite3 = import "sqlite3"
+local workspace_store = import "server.workspace_store"
 
 record Error
   const message: string
@@ -32,13 +34,17 @@ end
 
 type Yield = () -> ()
 
-local function semantic_index_for(projects: {bridge.ProjectModule},
-                                  snapshots: {bridge.ModuleSnapshot},
-                                  yield_now: Yield?): indexer.Index
-  if yield_now ~= nil then
-    return indexer.build_with_yield(projects, snapshots, yield_now)
-  end
-  return indexer.build(projects, snapshots)
+local record ExtractionState
+  const yield_now: Yield?
+  work: integer
+end
+
+local function account(state: ExtractionState)
+  if state.yield_now == nil then return end
+  state.work = state.work + 1
+  if state.work < 1024 then return end
+  state.work = 0
+  state.yield_now()
 end
 
 local record RenameAnchor
@@ -71,10 +77,30 @@ record VerifiedRename
 end
 
 record Features
-  local const projects: {bridge.ProjectModule}
-  local const snapshots: {bridge.ModuleSnapshot}
-  local const files: {string: SavedFile}
+  local const store: workspace_store.Store
+  local const published_generation: integer
   local const index: indexer.Index
+  local const owns_store: boolean
+end
+
+local record MaterializedHover
+  const filename: string
+  const byte_start: integer
+  const inferred_type: bridge.TypeInfo?
+  const declared_type: bridge.TypeInfo?
+  const original_type: bridge.TypeInfo?
+  const coerced_type: bridge.TypeInfo?
+end
+
+local record MaterializedFold
+  const filename: string
+  const range: lsp.FoldingRange
+end
+
+record PreparedView
+  local const index: indexer.Prepared
+  local const hovers: {MaterializedHover}
+  local const folds: {MaterializedFold}
 end
 
 local function fail<T>(message: string): T
@@ -128,7 +154,7 @@ local function copy_projects(source: {bridge.ProjectModule}):
 end
 
 local function saved_files(projects: {bridge.ProjectModule},
-                           index: indexer.Index):
+                           index: indexer.Prepared):
     {string: SavedFile}
   local result: {string: SavedFile} = {}
   local modules: {string: boolean} = {}
@@ -157,46 +183,6 @@ local function saved_files(projects: {bridge.ProjectModule},
     end
   end
   return result
-end
-
-local function build_internal(projects: {bridge.ProjectModule},
-                              snapshots: {bridge.ModuleSnapshot},
-                              yield_now: Yield?): Features
-  local owned_projects = copy_projects(projects)
-  local owned_snapshots: {bridge.ModuleSnapshot} = {}
-  for index = 1, #snapshots do owned_snapshots[index] = snapshots[index] end
-  local index = semantic_index_for(
-    owned_projects, owned_snapshots, yield_now)
-  return Features.new(
-    owned_projects, owned_snapshots,
-    saved_files(owned_projects, index), index)
-catch
-  if error is indexer.Error then
-    local failure = error as indexer.Error
-    local context = ""
-    if failure.module_name ~= nil then
-      context = "Titan module '" .. failure.module_name .. "'"
-    end
-    if failure.filename ~= nil then
-      if context ~= "" then context = context .. ", " end
-      context = context .. "file '" .. failure.filename .. "'"
-    end
-    if context ~= "" then context = context .. ": " end
-    raise Error.new(context .. failure.message)
-  end
-  raise
-end
-
-
-function build(projects: {bridge.ProjectModule},
-               snapshots: {bridge.ModuleSnapshot}): Features
-  return build_internal(projects, snapshots, nil)
-end
-
-function build_with_yield(projects: {bridge.ProjectModule},
-                          snapshots: {bridge.ModuleSnapshot},
-                          yield_now: Yield): Features
-  return build_internal(projects, snapshots, yield_now)
 end
 
 local function location_for(occurrence: indexer.Occurrence): Location
@@ -254,46 +240,43 @@ local function compiler_offset(coordinates: source_text.CoordinateIndex,
   return target
 end
 
-local function matching_hover_node(snapshot: bridge.ModuleSnapshot,
-                                   saved: SavedFile,
-                                   occurrence: indexer.Occurrence): bridge.Node?
-  local selected: bridge.Node? = nil
-  local selected_score = -1
+local function hover_key(filename: string, offset: integer, name: string): string
+  return #filename .. ":" .. filename .. offset .. ":" .. name
+end
+
+local function node_score(node: bridge.Node): integer
+  local score = 0
+  if node.inferred_type ~= nil then score = score + 1 end
+  if node.declared_type ~= nil then score = score + 2 end
+  if node.original_type ~= nil and node.coerced_type ~= nil then score = score + 4 end
+  return score
+end
+
+-- These lookups are local to extraction; a published Features owns no ASTs.
+local function hover_nodes(snapshot: bridge.ModuleSnapshot,
+                          files: {string: SavedFile}, state: ExtractionState):
+    ({string: bridge.Node}, {integer: bridge.Node})
+  local selected: {string: bridge.Node} = {}
+  local by_id: {integer: bridge.Node} = {}
   for index = 1, #snapshot.nodes do
+    account(state)
     local node = snapshot.nodes[index]
+    by_id[node.id] = node
     local location? = node.location
-    if not node.synthetic and location ~= nil and node.name ~= nil and
-       location.filename == occurrence.filename and
-       node.name == occurrence.name and
-       compiler_offset(saved.coordinates, location) == occurrence.byte_span.start
-    then
-      local score = 0
-      if node.inferred_type ~= nil then score = score + 1 end
-      if node.declared_type ~= nil then score = score + 2 end
-      if node.original_type ~= nil and node.coerced_type ~= nil then
-        score = score + 4
-      end
-      -- Later nodes are normally the more specific child in the compiler's
-      -- preorder AST, so equal richness deliberately replaces its parent.
-      if score >= selected_score then
-        selected = node
-        selected_score = score
+    if not node.synthetic and location ~= nil and node.name ~= nil then
+      local saved? = files[location.filename]
+      if saved ~= nil then
+        local offset? = compiler_offset(saved.coordinates, location)
+        if offset ~= nil then
+          local key = hover_key(location.filename, offset, node.name)
+          local old? = selected[key]
+          -- Equal richness deliberately prefers the later preorder child.
+          if old == nil or node_score(node) >= node_score(old) then selected[key] = node end
+        end
       end
     end
   end
-  return selected
-end
-
-local function node_by_id(snapshot: bridge.ModuleSnapshot,
-                          id: integer): bridge.Node?
-  if id >= 1 and id <= #snapshot.nodes and
-     snapshot.nodes[id].id == id then
-    return snapshot.nodes[id]
-  end
-  for index = 1, #snapshot.nodes do
-    if snapshot.nodes[index].id == id then return snapshot.nodes[index] end
-  end
-  return nil
+  return selected, by_id
 end
 
 local function semantic_container(kind: bridge.NodeKind): boolean
@@ -341,47 +324,61 @@ local function snapshot_for_module(snapshots: {bridge.ModuleSnapshot},
   return nil
 end
 
-function Features:hover(filename: string,
-                        position: source_text.Position): Hover?
-  local occurrence? = self.index:occurrence_at(filename, position)
-  if occurrence == nil then return nil end
-  local saved? = self.files[occurrence.filename]
-  if saved == nil then return nil end
-
+local function materialize_hover(occurrence: indexer.Occurrence,
+                                 saved: SavedFile,
+                                 nodes: {string: bridge.Node},
+                                 by_id: {integer: bridge.Node},
+                                 state: ExtractionState): MaterializedHover
   local inferred: bridge.TypeInfo? = nil
   local declared: bridge.TypeInfo? = nil
   local original: bridge.TypeInfo? = nil
   local coerced: bridge.TypeInfo? = nil
-  local snapshot? = snapshot_for_module(
-    self.snapshots, occurrence.module_name)
-  if snapshot ~= nil then
-    local node? = matching_hover_node(snapshot, saved, occurrence)
-    local current? = node
-    while current ~= nil and
-          node_covers_occurrence(current, saved, occurrence) do
-      if inferred == nil and current.inferred_type ~= nil then
-        inferred = current.inferred_type
-      end
-      if declared == nil and current.declared_type ~= nil then
-        declared = current.declared_type
-      end
-      if original == nil and coerced == nil and
-         current.original_type ~= nil and current.coerced_type ~= nil and
-         not same_type(current.original_type, current.coerced_type) then
-        original = current.original_type
-        coerced = current.coerced_type
-      end
-      local parent_id? = current.parent_id
-      if parent_id == nil then current = nil
-      else current = node_by_id(snapshot, parent_id) end
+  local current? = nodes[hover_key(
+    occurrence.filename, occurrence.byte_span.start, occurrence.name)]
+  while current ~= nil and node_covers_occurrence(current, saved, occurrence) do
+    account(state)
+    if inferred == nil and current.inferred_type ~= nil then inferred = current.inferred_type end
+    if declared == nil and current.declared_type ~= nil then declared = current.declared_type end
+    if original == nil and coerced == nil and current.original_type ~= nil and
+       current.coerced_type ~= nil and not same_type(current.original_type, current.coerced_type) then
+      original = current.original_type
+      coerced = current.coerced_type
     end
+    local parent_id? = current.parent_id
+    if parent_id == nil then current = nil else current = by_id[parent_id] end
   end
   if inferred == nil then inferred = occurrence.type_info end
-  local summary_markdown? = self.index:hover_summary(occurrence)
+  return MaterializedHover.new(occurrence.filename, occurrence.byte_span.start,
+    inferred, declared, original, coerced)
+end
 
-  return Hover.new(copy_span(occurrence.span), inferred, declared,
-                   original, coerced, occurrence.visibility,
-                   occurrence.callable_signature, summary_markdown)
+function Features:hover(filename: string, position: source_text.Position): Hover?
+  local occurrence? = self.index:occurrence_at(filename, position)
+  if occurrence == nil then return nil end
+  local inferred: bridge.TypeInfo? = nil
+  local declared: bridge.TypeInfo? = nil
+  local original: bridge.TypeInfo? = nil
+  local coerced: bridge.TypeInfo? = nil
+  do
+    local access = self.store:acquire()
+    defer access:release()
+    indexer.check_generation(access.connection, self.published_generation)
+    local statement = access.connection:prepare(
+      "SELECT inferred_tag,inferred_display,declared_tag,declared_display," ..
+      "original_tag,original_display,coerced_tag,coerced_display " ..
+      "FROM main.semantic_hovers WHERE filename=? AND byte_start=?")
+    defer statement:close()
+    local cursor = statement:query(indexer.blob(filename), occurrence.byte_span.start)
+    defer cursor:close()
+    local row? = cursor:fetch()
+    if row == nil then return nil end
+    inferred = indexer.row_type(row, 1)
+    declared = indexer.row_type(row, 3)
+    original = indexer.row_type(row, 5)
+    coerced = indexer.row_type(row, 7)
+  end
+  return Hover.new(copy_span(occurrence.span), inferred, declared, original, coerced,
+    occurrence.visibility, occurrence.callable_signature, self.index:hover_summary(occurrence))
 end
 
 local function write_type_line(output: strings.StringWriter, label: string,
@@ -467,35 +464,9 @@ local function lsp_span_for_compiler_span(saved: SavedFile,
   return converted
 end
 
-local function fold_less(left: lsp.FoldingRange,
-                         right: lsp.FoldingRange): boolean
-  if left.start_line ~= right.start_line then
-    return left.start_line < right.start_line
-  end
-  -- Outer ranges precede nested ranges that begin on the same line.
-  return left.end_line > right.end_line
-end
-
-local function same_fold(left: lsp.FoldingRange,
-                         right: lsp.FoldingRange): boolean
-  return left.start_line == right.start_line and
-         left.end_line == right.end_line
-end
-
-local function insert_fold(ranges: {lsp.FoldingRange},
-                           range: lsp.FoldingRange)
-  -- Reject an equal range before making room for an insertion. Comments are
-  -- added after structural ranges, so a duplicate can otherwise be discovered
-  -- only after later entries have already been shifted.
-  for index = 1, #ranges do
-    if same_fold(ranges[index], range) then return end
-  end
-  local target = #ranges + 1
-  while target > 1 and fold_less(range, ranges[target - 1]) do
-    ranges[target] = ranges[target - 1]
-    target = target - 1
-  end
-  ranges[target] = range
+local function insert_fold(ranges: {lsp.FoldingRange}, range: lsp.FoldingRange)
+  -- SQLite deduplicates and orders these during publication/query.
+  ranges[#ranges + 1] = range
 end
 
 local record LongBracket
@@ -506,25 +477,30 @@ end
 -- Titan's compiler AST intentionally drops comments. Mirror only the lexical
 -- long-bracket boundary used by the Titan lexer; all language structures
 -- continue to come from compiler source spans.
-local function long_bracket(source: string, index: integer): LongBracket?
+local function long_bracket(source: string, index: integer,
+                            state: ExtractionState): LongBracket?
   if index > #source or strings.byte(source, index) ~= 91 then return nil end
   local cursor = index + 1
   while cursor <= #source and strings.byte(source, cursor) == 61 do
+    account(state)
     cursor = cursor + 1
   end
   if cursor > #source or strings.byte(source, cursor) ~= 91 then return nil end
   return LongBracket.new(cursor - index - 1, cursor + 1)
 end
 
-local function long_bracket_finish(source: string, bracket: LongBracket):
+local function long_bracket_finish(source: string, bracket: LongBracket,
+                                   state: ExtractionState):
     integer?
   local index = bracket.contents_start
   while index <= #source do
+    account(state)
     if strings.byte(source, index) == 93 then
       local cursor = index + 1
       local equals = 0
       while equals < bracket.level and cursor <= #source and
           strings.byte(source, cursor) == 61 do
+        account(state)
         cursor = cursor + 1
         equals = equals + 1
       end
@@ -538,10 +514,12 @@ local function long_bracket_finish(source: string, bracket: LongBracket):
   return nil
 end
 
-local function skip_short_string(source: string, index: integer): integer
+local function skip_short_string(source: string, index: integer,
+                                 state: ExtractionState): integer
   local delimiter: integer = strings.byte(source, index)
   local cursor = index + 1
   while cursor <= #source do
+    account(state)
     local byte: integer = strings.byte(source, cursor)
     if byte == delimiter then return cursor + 1 end
     if byte == 92 then
@@ -568,7 +546,8 @@ end
 local function insert_comment_fold(coordinates: source_text.CoordinateIndex,
                                    source: string, start_offset: integer,
                                    finish_offset: integer,
-                                   ranges: {lsp.FoldingRange})
+                                   ranges: {lsp.FoldingRange},
+                                   state: ExtractionState)
   local start?, start_error? = coordinates:position_for_offset(start_offset)
   local finish?, finish_error? = coordinates:position_for_offset(finish_offset)
   if start_error ~= nil or finish_error ~= nil or
@@ -580,6 +559,7 @@ local function insert_comment_fold(coordinates: source_text.CoordinateIndex,
   local end_line = finish.line
   local cursor = finish_offset + 1
   while cursor <= #source do
+    account(state)
     local byte: integer = strings.byte(source, cursor)
     if byte == 10 or byte == 13 then break end
     if byte ~= 9 and byte ~= 11 and byte ~= 12 and byte ~= 32 then
@@ -594,35 +574,38 @@ local function insert_comment_fold(coordinates: source_text.CoordinateIndex,
 end
 
 local function insert_long_comment_folds(saved: SavedFile,
-                                         ranges: {lsp.FoldingRange})
+                                         ranges: {lsp.FoldingRange},
+                                         state: ExtractionState)
   local source = saved.contents
   local index = 1
   while index <= #source do
+    account(state)
     local byte: integer = strings.byte(source, index)
     if byte == 34 or byte == 39 then
-      index = skip_short_string(source, index)
+      index = skip_short_string(source, index, state)
     elseif byte == 91 then
-      local literal? = long_bracket(source, index)
+      local literal? = long_bracket(source, index, state)
       if literal == nil then
         index = index + 1
       else
-        local finish? = long_bracket_finish(source, literal)
+        local finish? = long_bracket_finish(source, literal, state)
         if finish == nil then return end
         index = finish
       end
     elseif byte == 45 and index < #source and
         strings.byte(source, index + 1) == 45 then
-      local comment? = long_bracket(source, index + 2)
+      local comment? = long_bracket(source, index + 2, state)
       if comment == nil then
         index = index + 2
         while index <= #source and strings.byte(source, index) ~= 10 do
+          account(state)
           index = index + 1
         end
       else
-        local finish? = long_bracket_finish(source, comment)
+        local finish? = long_bracket_finish(source, comment, state)
         if finish == nil then return end
         insert_comment_fold(
-          saved.coordinates, source, index - 1, finish - 1, ranges)
+          saved.coordinates, source, index - 1, finish - 1, ranges, state)
         index = finish
       end
     else
@@ -632,30 +615,203 @@ local function insert_long_comment_folds(saved: SavedFile,
 end
 
 function Features:folding_ranges(filename: string): {lsp.FoldingRange}
-  local saved? = self.files[filename]
-  if saved == nil then return {} end
-  local snapshot? = snapshot_for_module(self.snapshots, saved.module_name)
-  if snapshot == nil then return {} end
-
+  local access = self.store:acquire()
+  defer access:release()
+  indexer.check_generation(access.connection, self.published_generation)
+  local statement = access.connection:prepare(
+    "SELECT start_line,end_line,kind FROM main.semantic_folds WHERE filename=? " ..
+    "ORDER BY start_line,end_line DESC")
+  defer statement:close()
+  local cursor = statement:query(indexer.blob(filename))
+  defer cursor:close()
   local result: {lsp.FoldingRange} = {}
-  for index = 1, #snapshot.nodes do
-    local node = snapshot.nodes[index]
-    local span? = node.source_span
-    if not node.synthetic and span ~= nil and foldable_tag(node.tag) and
-       span.start.filename == filename then
-      local converted = lsp_span_for_compiler_span(saved, span)
-      -- The compiler's half-open finish is the start of the closing `end` or
-      -- `until`. LSP folding endLine is inclusive, so leave that closing line
-      -- visible and fold through the preceding line.
-      local end_line = converted.finish.line - 1
-      if end_line > converted.start.line then
-        insert_fold(result, lsp.FoldingRange.new(
-          converted.start.line, nil, end_line, nil, nil))
+  for row in cursor:fetch do
+    result[#result + 1] = lsp.FoldingRange.new(row:get(1) as integer, nil,
+      row:get(2) as integer, nil, indexer.optional_bytes(row, 3))
+  end
+  return result
+end
+
+function initialize_schema(connection: sqlite3.Connection)
+  indexer.initialize_schema(connection)
+  indexer.execute(connection, "CREATE TABLE IF NOT EXISTS main.semantic_hovers(" ..
+    "filename BLOB NOT NULL,byte_start INTEGER NOT NULL," ..
+    "inferred_tag BLOB,inferred_display BLOB,declared_tag BLOB,declared_display BLOB," ..
+    "original_tag BLOB,original_display BLOB,coerced_tag BLOB,coerced_display BLOB," ..
+    "PRIMARY KEY(filename,byte_start))")
+  indexer.execute(connection, "CREATE TABLE IF NOT EXISTS main.semantic_folds(" ..
+    "filename BLOB NOT NULL,start_line INTEGER NOT NULL,end_line INTEGER NOT NULL," ..
+    "kind BLOB,PRIMARY KEY(filename,start_line,end_line))")
+end
+
+local function prepare_internal(projects: {bridge.ProjectModule},
+                               snapshots: {bridge.ModuleSnapshot},
+                               yield_now: Yield?): PreparedView
+  local state = ExtractionState.new(yield_now, 0)
+  local owned_projects = copy_projects(projects)
+  local prepared = indexer.prepare(owned_projects, snapshots, yield_now)
+  local files = saved_files(owned_projects, prepared)
+  local hovers: {MaterializedHover} = {}
+  local folds: {MaterializedFold} = {}
+  -- Partition once during extraction, avoiding an AST scan for every token.
+  local module_occurrences: {string: {indexer.Occurrence}} = {}
+  for index = 1, #prepared.occurrences do
+    local item = prepared.occurrences[index]
+    local bucket? = module_occurrences[item.module_name]
+    if bucket == nil then
+      bucket = {}
+      module_occurrences[item.module_name] = bucket
+    end
+    bucket[#bucket + 1] = item
+    account(state)
+  end
+  for module_index = 1, #owned_projects do
+    local project = owned_projects[module_index]
+    local snapshot? = snapshot_for_module(snapshots, project.module_name)
+    if snapshot ~= nil then
+      local nodes, by_id = hover_nodes(snapshot, files, state)
+      local occurrences? = module_occurrences[project.module_name]
+      if occurrences ~= nil then
+        for index = 1, #occurrences do
+          local occurrence = occurrences[index]
+          local saved = files[occurrence.filename] as SavedFile
+          hovers[#hovers + 1] = materialize_hover(occurrence, saved, nodes, by_id, state)
+          account(state)
+        end
+      end
+      for index = 1, #snapshot.nodes do
+        local node = snapshot.nodes[index]
+        local span? = node.source_span
+        if not node.synthetic and span ~= nil and foldable_tag(node.tag) then
+          local saved? = files[span.start.filename]
+          if saved ~= nil and saved.module_name == project.module_name then
+            local converted = lsp_span_for_compiler_span(saved, span)
+            local end_line = converted.finish.line - 1
+            if end_line > converted.start.line then
+              folds[#folds + 1] = MaterializedFold.new(span.start.filename,
+                lsp.FoldingRange.new(converted.start.line, nil, end_line, nil, nil))
+            end
+          end
+        end
+        account(state)
+      end
+      -- Structural entries precede comments so equal spans retain structure.
+      for file_index = 1, #project.files do
+        local file = project.files[file_index]
+        local saved = files[file.filename] as SavedFile
+        local ranges: {lsp.FoldingRange} = {}
+        insert_long_comment_folds(saved, ranges, state)
+        for index = 1, #ranges do
+          folds[#folds + 1] = MaterializedFold.new(file.filename, ranges[index])
+        end
       end
     end
   end
-  insert_long_comment_folds(saved, result)
-  return result
+  return PreparedView.new(prepared, hovers, folds)
+catch
+  if error is indexer.Error then
+    local failure = error as indexer.Error
+    local context = ""
+    if failure.module_name ~= nil then context = "Titan module '" .. failure.module_name .. "'" end
+    if failure.filename ~= nil then
+      if context ~= "" then context = context .. ", " end
+      context = context .. "file '" .. failure.filename .. "'"
+    end
+    if context ~= "" then context = context .. ": " end
+    raise Error.new(context .. failure.message)
+  end
+  raise
+end
+
+function prepare(projects: {bridge.ProjectModule}, snapshots: {bridge.ModuleSnapshot},
+                 yield_now: Yield?): PreparedView
+  return prepare_internal(projects, snapshots, yield_now)
+end
+
+function PreparedView:publish(connection: sqlite3.Connection)
+  self.index:publish(connection)
+  indexer.execute(connection, "DELETE FROM main.semantic_hovers")
+  indexer.execute(connection, "DELETE FROM main.semantic_folds")
+  local offset = 1
+  while offset <= #self.hovers do
+    local finish = offset + 19
+    if finish > #self.hovers then finish = #self.hovers end
+    local parameters: {value} = {}
+    local sql = "INSERT OR REPLACE INTO main.semantic_hovers VALUES "
+    for index = offset, finish do
+      if index > offset then sql = sql .. "," end
+      local item = self.hovers[index]
+      sql = sql .. "(" .. indexer.binding(parameters, indexer.blob(item.filename)) .. "," ..
+        indexer.binding(parameters, item.byte_start) .. "," ..
+        indexer.binding(parameters, indexer.type_tag(item.inferred_type)) .. "," ..
+        indexer.binding(parameters, indexer.type_display(item.inferred_type)) .. "," ..
+        indexer.binding(parameters, indexer.type_tag(item.declared_type)) .. "," ..
+        indexer.binding(parameters, indexer.type_display(item.declared_type)) .. "," ..
+        indexer.binding(parameters, indexer.type_tag(item.original_type)) .. "," ..
+        indexer.binding(parameters, indexer.type_display(item.original_type)) .. "," ..
+        indexer.binding(parameters, indexer.type_tag(item.coerced_type)) .. "," ..
+        indexer.binding(parameters, indexer.type_display(item.coerced_type)) .. ")"
+    end
+    local statement = connection:prepare(sql)
+    defer statement:close()
+    statement:execute(...parameters)
+    offset = finish + 1
+  end
+  offset = 1
+  while offset <= #self.folds do
+    local finish = offset + 49
+    if finish > #self.folds then finish = #self.folds end
+    local parameters: {value} = {}
+    local sql = "INSERT OR IGNORE INTO main.semantic_folds VALUES "
+    for index = offset, finish do
+      if index > offset then sql = sql .. "," end
+      local item = self.folds[index]
+      sql = sql .. "(" .. indexer.binding(parameters, indexer.blob(item.filename)) .. "," ..
+        indexer.binding(parameters, item.range.start_line) .. "," ..
+        indexer.binding(parameters, item.range.end_line) .. "," ..
+        indexer.binding(parameters, indexer.blob(item.range.kind)) .. ")"
+    end
+    local statement = connection:prepare(sql)
+    defer statement:close()
+    statement:execute(...parameters)
+    offset = finish + 1
+  end
+end
+
+function open(store: workspace_store.Store, published_generation: integer): Features
+  return Features.new(store, published_generation, indexer.open(store, published_generation), false)
+end
+
+function Features:close()
+  if self.owns_store then self.store:close() end
+end
+
+local function build_internal(projects: {bridge.ProjectModule}, snapshots: {bridge.ModuleSnapshot},
+                             yield_now: Yield?): Features
+  local prepared = prepare(projects, snapshots, yield_now)
+  local store = workspace_store.open(":memory:")
+  local completed = false
+  defer do
+    if not completed then store:close() end
+  end
+  do
+    local access = store:acquire()
+    defer access:release()
+    local connection = access.connection
+    initialize_schema(connection)
+    prepared:publish(connection)
+  end
+  completed = true
+  return Features.new(store, 0, indexer.open(store, 0), true)
+end
+
+function build(projects: {bridge.ProjectModule}, snapshots: {bridge.ModuleSnapshot}): Features
+  return build_internal(projects, snapshots, nil)
+end
+
+function build_with_yield(projects: {bridge.ProjectModule}, snapshots: {bridge.ModuleSnapshot},
+                          yield_now: Yield): Features
+  return build_internal(projects, snapshots, yield_now)
 end
 
 local function edited_file(source: string,
@@ -741,6 +897,14 @@ function Features:rename(filename: string, position: source_text.Position,
     return rejected<RenameCandidate>(
       "cannot rename a symbol with no project occurrences")
   end
+  local projects = self.index:project_modules()
+  local files: {string: bridge.SourceFile} = {}
+  for module_index = 1, #projects do
+    for file_index = 1, #projects[module_index].files do
+      local file = projects[module_index].files[file_index]
+      files[file.filename] = file
+    end
+  end
   local edited_contents: {string: string} = {}
   local anchors: {RenameAnchor} = {}
   local documents: {lsp.DocumentEdits} = {}
@@ -748,7 +912,7 @@ function Features:rename(filename: string, position: source_text.Position,
   for file_index = 1, #filenames do
     local current = occurrences_for_file(occurrences, filenames[file_index])
     if #current > 0 then
-      local saved? = self.files[filenames[file_index]]
+      local saved? = files[filenames[file_index]]
       if saved == nil then
         return rejected<RenameCandidate>(
           "rename occurrence has no saved project source")
@@ -769,8 +933,8 @@ function Features:rename(filename: string, position: source_text.Position,
   end
 
   local edited_projects: {bridge.ProjectModule} = {}
-  for module_index = 1, #self.projects do
-    local module = self.projects[module_index]
+  for module_index = 1, #projects do
+    local module = projects[module_index]
     local files: {bridge.SourceFile} = {}
     for file_index = 1, #module.files do
       local file = module.files[file_index]
@@ -850,6 +1014,7 @@ function RenameCandidate:preflight(analysis: bridge.Analysis):
   end
 
   local checked = indexer.build(self.edited_projects, project_snapshots)
+  defer checked:close()
   local resolved: indexer.SymbolId? = nil
   for index = 1, #self.anchors do
     local anchor = self.anchors[index]

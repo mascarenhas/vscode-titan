@@ -19,7 +19,7 @@ needed by the server, together with the embedded Lua interpreter and configured
 native dependencies. Initialized statically linked modules register their
 runtime openers in `package.preload`. The executable separately embeds a
 metadata-only inventory of all 21 canonical standard-module interfaces;
-compiler language-server API 5 validates and decodes it and its build target's
+compiler language-server API 1 validates and decodes it and its build target's
 C type profile for project typechecking. This inventory is analysis data, not
 module implementation or a linkable provider.
 
@@ -89,7 +89,7 @@ defaults. On ELF systems the server link must export the embedded Lua API (for
 example with `-Wl,-E`) so native Lua modules bind to the same Lua state.
 
 Project typechecking does not discover Titan standard-module interfaces through
-an on-disk provider. API 5 validates and decodes the executable's metadata-only
+an on-disk provider. API 1 validates and decodes the executable's metadata-only
 21-entry inventory before considering disk-backed compiled providers. The
 inventory covers `titan.async`, `titan.coroutine`, `titan.fs`, `titan.gc`,
 `titan.http`, `titan.io`, `titan.iteration`, `titan.json`, `titan.lua`,
@@ -273,7 +273,7 @@ Gate: the single native executable passes protocol transcripts and a real
 - Load compatible compiler Lua modules through normal `package.path`; use the
   VSIX-owned tree by default and report actionable discovery/version failures
   for standalone or configured overrides. Require compiler
-  `LANGUAGE_SERVER_API_VERSION = 5` and give each resolver context the validated
+  `LANGUAGE_SERVER_API_VERSION = 1` and give each resolver context the validated
   metadata-only `embedded_interface_provider` option, including the validated
   `target_profile` exported from the server build toolchain.
 - Identify the smallest compiler API changes required for independent module
@@ -352,7 +352,7 @@ has evidence before moving to Done.
 
 ## Resolved investigation outcomes
 
-- Compiler API 5 exposes resolver-scoped incremental analysis, complete project
+- Compiler API 1 exposes resolver-scoped incremental analysis, complete project
   AST reuse, detached public manifests, exact external provenance, ordered
   checked-module checkpoints, and validation/resolution of the executable's
   metadata-only standard-interface provider and its build target profile without

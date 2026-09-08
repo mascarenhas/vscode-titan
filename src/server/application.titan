@@ -11,6 +11,11 @@ local logging = import "server.logging"
 local lsp = import "server.lsp_types"
 local project_discovery = import "server.project_discovery"
 local project_service = import "server.project_service"
+local project_loader = import "server.project_loader"
+local published_diagnostics = import "server.published_diagnostics"
+local semantic_index = import "server.semantic_index"
+local sqlite3 = import "sqlite3"
+local stores = import "server.workspace_store"
 local project_watcher = import "server.project_watcher"
 local semantic_features = import "server.semantic_features"
 
@@ -19,7 +24,9 @@ record Error
 end
 
 local record View
-  const snapshot: project_service.Snapshot
+  const work_generation: integer
+  const published_generation: integer
+  const dirty_signature: string
   const features: semantic_features.Features
 end
 
@@ -37,6 +44,7 @@ local record WatchFilter
   const include_roots: {string}
   const source_roots: {string}
   const excluded_paths: {string}
+  const cache_paths: {string}
   const configuration_paths: {string: boolean}
   const known_directories: {string: boolean}
 end
@@ -65,7 +73,7 @@ type RenameAnalyzer = (
   project_service.Snapshot, {bridge.ProjectModule}) -> bridge.Analysis
 type ProjectLoader = (
   string, bridge.ProgressListener?, project_service.SnapshotListener?) ->
-  (project_service.Service?, project_service.Error?)
+  (project_service.Service?, project_service.Error?, project_loader.Restoration?)
 
 local record RefreshChain
   const id: integer
@@ -98,6 +106,7 @@ record Application
   local directory_probes: DirectoryProbes
   local const rename_analyzer: RenameAnalyzer
   local const diagnostic_publisher: diagnostics.Publisher
+  local restoration: project_loader.Restoration?
 end
 
 -- Source-imported application tests use these counters to assert coalescing and
@@ -128,6 +137,13 @@ local function runtime_error(candidate: value): Error
   if candidate is bridge.BridgeError then
     local item = candidate as bridge.BridgeError
     return Error.new(item.module_name .. ": " .. item.message)
+  end
+  if candidate is sqlite3.Error then
+    local item = candidate as sqlite3.Error
+    return Error.new(item.operation .. ": " .. item.message)
+  end
+  if candidate is semantic_index.Error then
+    return Error.new((candidate as semantic_index.Error).message)
   end
   if candidate is semantic_features.Error then
     return Error.new((candidate as semantic_features.Error).message)
@@ -295,6 +311,24 @@ local function rebase_path(path: string, source_root: string,
   return observed_root .. strings.sub(path, #source_root + 1)
 end
 
+local function cache_watch_paths(project_root: string, include_roots: {string},
+                                 canonical_includes: {string}): {string}
+  local cache = child_path(project_root, ".titan-ls")
+  local canonical = canonical_configured_path(cache)
+  local result = {cache, canonical, canonical_file_path(cache)}
+  for index = 1, #include_roots do
+    local include_root = include_roots[index]
+    local observed_root = canonical_includes[index]
+    if path_within(canonical, observed_root) then
+      -- A source/include alias pointing into the private cache stays private.
+      result[#result + 1] = include_root
+    elseif path_within(observed_root, canonical) then
+      result[#result + 1] = rebase_path(canonical, observed_root, include_root)
+    end
+  end
+  return result
+end
+
 local function build_watch_filter(snapshot: project_service.Snapshot):
     WatchFilter
   local include_roots: {string} = {}
@@ -391,7 +425,8 @@ local function build_watch_filter(snapshot: project_service.Snapshot):
   end
   return WatchFilter.new(
     include_roots, source_roots, excluded_paths,
-    configuration_paths, known_directories)
+    cache_watch_paths(snapshot.config.project_root, snapshot.config.include,
+      canonical_includes), configuration_paths, known_directories)
 end
 
 -- A failed configuration load or source discovery cannot provide a Snapshot
@@ -411,7 +446,9 @@ local function provisional_watch_filter(project_root: string): WatchFilter
   known_directories[project_root] = true
   known_directories[canonical_root] = true
   return WatchFilter.new(
-    include_roots, include_roots, {}, configuration_paths, known_directories)
+    include_roots, include_roots, {},
+    cache_watch_paths(project_root, {project_root}, {canonical_root}),
+    configuration_paths, known_directories)
 end
 
 -- The directory watcher is intentionally broader than the saved project: it
@@ -426,6 +463,11 @@ local function watch_change_disposition(filter: WatchFilter,
                                         change: project_watcher.PathChange):
     WatchDisposition
   local path = project_watcher.change_path(change)
+  for index = 1, #filter.cache_paths do
+    if path_within(filter.cache_paths[index], path) then
+      return WatchDisposition.irrelevant()
+    end
+  end
   if filter.configuration_paths[path] then
     return WatchDisposition.relevant()
   end
@@ -528,13 +570,6 @@ local function project_inputs(snapshot: project_service.Snapshot):
   return projects, snapshots
 end
 
-local function same_module_names(left: {string}, right: {string}): boolean
-  if #left ~= #right then return false end
-  for index = 1, #left do
-    if left[index] ~= right[index] then return false end
-  end
-  return true
-end
 
 local function log_watch_failure(failure: project_watcher.WatchFailure)
   logging.emit("error", "project.watch.failure", {
@@ -598,6 +633,7 @@ end
 
 local function Application:watch_callback(
     batch: project_watcher.RediscoveryBatch)
+  if self.closed then return end
   local relevant = batch.watch_set_changed
   local possible_directories: {string} = {}
   local filter? = self.watch_filter
@@ -660,7 +696,7 @@ function Application:note_saved_change()
 end
 
 local function Application:ensure_provisional_watcher()
-  if self.watcher ~= nil then return end
+  if self.closed or self.watcher ~= nil then return end
   -- Publish the filter before starting the poll Task so even a callback on the
   -- first scheduler turn classifies project-root noise conservatively.
   self.watch_filter = provisional_watch_filter(self.project_root)
@@ -673,11 +709,13 @@ end
 
 local function Application:reconcile_watcher(
     snapshot: project_service.Snapshot)
+  if self.closed then return end
   -- Canonicalization may yield or fail, so finish it before changing watcher
   -- registrations. The callback retains the preceding immutable filter until
   -- a complete replacement is ready.
   local next_filter = build_watch_filter(snapshot)
   local scope = watcher_scope(snapshot)
+  if self.closed then return end
   if self.watcher == nil then
     self.watcher = project_watcher.start(
       scope,
@@ -689,21 +727,102 @@ local function Application:reconcile_watcher(
   end
   -- Cooperative scheduling cannot run the newly started poll callback between
   -- the successful reconcile return and this non-yielding assignment.
-  self.watch_filter = next_filter
+  if not self.closed then self.watch_filter = next_filter end
 end
 
-local function Application:install_view(
-    snapshot: project_service.Snapshot): View
-  self.view_builds = self.view_builds + 1
-  -- Establish the saved-tree watcher before any validation or yielding semantic
-  -- view construction. A failed initial compiler snapshot must still be able to
-  -- observe the save which repairs it.
+local function dirty_signature(names: {string}): string
+  local output = strings.writer()
+  for index = 1, #names do
+    output:write(#names[index] .. ":" .. names[index])
+  end
+  return output:drain()
+end
+
+local function publication_revision(connection: sqlite3.Connection): string
+  local generation = stores.scalar_integer(connection,
+    "SELECT generation FROM main.graph_state WHERE singleton=1")
+  local output = strings.writer()
+  output:write(generation .. ":")
+  local statement = connection:prepare(
+    "SELECT name,provenance,state,revision FROM main.graph_modules ORDER BY name")
+  defer statement:close()
+  local cursor = statement:query()
+  defer cursor:close()
+  for row in cursor:fetch do
+    local name = row:get(1) as string
+    output:write(#name .. ":" .. name .. ":" ..
+      (row:get(2) as integer) .. ":" .. (row:get(3) as integer) .. ":" ..
+      (row:get(4) as integer) .. ";")
+  end
+  return output:drain()
+end
+
+local function Application:publish_view(service: project_service.Service,
+    snapshot: project_service.Snapshot, reuse: View?): View
+  local store = service:workspace_store()
+  local revision = ""
+  do
+    local access = store:acquire()
+    defer access:release()
+    if stores.scalar_integer(access.connection,
+        "SELECT generation FROM main.graph_state WHERE singleton=1") ~= snapshot.generation then
+      raise Error.new("saved Titan project changed before semantic preparation; retry")
+    end
+    revision = publication_revision(access.connection)
+  end
   self:reconcile_watcher(snapshot)
-  local projects, snapshots = project_inputs(snapshot)
-  local view = View.new(
-    snapshot, semantic_features.build_with_yield(
-      projects, snapshots, function () async.yield() end))
-  return view
+  -- Source extraction and cache serialization can yield without monopolizing
+  -- the Store. Requests keep reading the preceding completed SQL revision.
+  local warm_reuse = service:prepare_publication(snapshot)
+  local prepared: semantic_features.PreparedView? = nil
+  if reuse == nil and not warm_reuse then
+    self.view_builds = self.view_builds + 1
+    local projects, snapshots = project_inputs(snapshot)
+    prepared = semantic_features.prepare(
+      projects, snapshots, function () async.yield() end)
+  end
+  local diagnostic_rows = diagnostics.from_snapshot_with_yield(snapshot)
+  local access = store:acquire()
+  defer access:release()
+  local connection = access.connection
+  if publication_revision(connection) ~= revision then
+    raise Error.new("saved Titan project changed during semantic preparation; retry")
+  end
+  semantic_features.initialize_schema(connection)
+  published_diagnostics.initialize_schema(connection)
+  local generation = stores.scalar_integer(connection,
+    "SELECT published_generation FROM main.store_state WHERE singleton=1")
+  if reuse ~= nil then
+    semantic_index.check_generation(connection, reuse.published_generation)
+  elseif not warm_reuse then
+    generation = generation + 1
+  end
+  connection:set_autocommit(false)
+  do
+    if prepared ~= nil then prepared:publish(connection) end
+    published_diagnostics.publish(connection, diagnostic_rows)
+    service:publish_prepared(connection)
+    stores.execute(connection,
+      "UPDATE main.store_state SET published_generation=? WHERE singleton=1", generation)
+    connection:commit()
+  catch
+    -- Only the uncancelled updater owns this transaction; request cancellation
+    -- detaches a reader and Application.close joins the updater before close.
+    if not connection:get_autocommit() then connection:rollback() end
+    raise
+  end
+  service:publication_committed()
+  local features = semantic_features.open(store, generation)
+  if reuse ~= nil then features = reuse.features end
+  return View.new(snapshot.generation, generation,
+    dirty_signature(snapshot.dirty_modules), features)
+end
+
+local function Application:install_view(snapshot: project_service.Snapshot): View
+  -- Establish the watcher before validation so a failed initial compiler
+  -- snapshot can still observe the save which repairs it.
+  local service = self.service as project_service.Service
+  return self:publish_view(service, snapshot, nil)
 end
 
 local function Application:refresh_once(): RefreshOutcome
@@ -711,7 +830,7 @@ local function Application:refresh_once(): RefreshOutcome
     local service? = self.service
     if service == nil then
       self:ensure_provisional_watcher()
-      local loaded?, load_error? = self.project_loader(
+      local loaded?, load_error?, restoration? = self.project_loader(
         self.project_root,
         function (progress: bridge.AnalysisProgress)
           self:emit_compiler_progress(progress)
@@ -727,9 +846,17 @@ local function Application:refresh_once(): RefreshOutcome
         return RefreshOutcome.failure(Error.new(message))
       end
       self.service = loaded
+      self.restoration = restoration
       return RefreshOutcome.ready(self:install_view(loaded:latest()))
     end
 
+    -- Saved changes and rename preflight share the foreground updater. Join
+    -- outside a Store lease before mutating the live compiler or graph.
+    local restoration? = self.restoration
+    if restoration ~= nil then
+      restoration:finish(service)
+      self.restoration = nil
+    end
     local report?, refresh_error? = service:refresh_with_snapshot_listener(
       function (snapshot: project_service.Snapshot)
         self:reconcile_watcher(snapshot)
@@ -743,19 +870,17 @@ local function Application:refresh_once(): RefreshOutcome
     end
     local snapshot = service:latest()
     local completed? = self.completed_view
-    if completed ~= nil and completed.snapshot.generation ==
+    if completed ~= nil and completed.work_generation ==
          report.generation and #report.committed_modules == 0 and
        #report.failed_modules == 0 and
-       same_module_names(
-         completed.snapshot.dirty_modules, snapshot.dirty_modules) then
+       completed.dirty_signature == dirty_signature(snapshot.dirty_modules) then
       -- A refresh still rediscovers directories and external inputs. When its
       -- semantic generation and pending-work membership did not change and no
       -- clean or failed project result was published, retain the immutable
       -- Features. In particular, a same-generation external invalidation can
       -- turn a formerly clean module into a failed one; that result must
       -- rebuild the View so its preceding AST is no longer exposed.
-      self:reconcile_watcher(snapshot)
-      return RefreshOutcome.ready(View.new(snapshot, completed.features))
+      return RefreshOutcome.ready(self:publish_view(service, snapshot, completed))
     end
     return RefreshOutcome.ready(self:install_view(snapshot))
   catch
@@ -767,7 +892,7 @@ end
 local function Application:status_generation(): integer?
   local completed? = self.completed_view
   if completed == nil then return nil end
-  return completed.snapshot.generation
+  return completed.published_generation
 end
 
 local function Application:emit_indexing_status(
@@ -921,8 +1046,9 @@ local function Application:start_refresh(force: boolean, reason: string):
         self.failed_epoch = nil
         if self.diagnostic_publisher:enabled() and
            self.change_epoch == target_epoch then
-          diagnostic_publications = diagnostics.from_snapshot_with_yield(
-            view.snapshot)
+          diagnostic_publications = published_diagnostics.read(
+            (self.service as project_service.Service):workspace_store(),
+            view.published_generation)
         end
       end
 
@@ -965,6 +1091,14 @@ local function Application:start_refresh(force: boolean, reason: string):
             indexing_status.State.failed(), failure.message)
         when ready: view then
           self:emit_indexing_status(indexing_status.State.ready(), nil)
+          local restoration? = self.restoration
+          if restoration ~= nil and not self.closed then
+            restoration:start(function ()
+              -- Recovery belongs to the ordinary single writer. This callback
+              -- only schedules it while readers retain the completed SQL View.
+              if not self.closed then self:note_saved_change() end
+            end)
+          end
         end
       end
       return completed
@@ -1001,11 +1135,19 @@ function Application:set_indexing_listener(listener: indexing_status.Listener?)
 end
 
 function Application:set_diagnostics_listener(listener: diagnostics.Listener?)
+  if self.closed then return end
   self.diagnostic_publisher:set_listener(listener)
   local completed? = self.completed_view
   if not self.closed and listener ~= nil and completed ~= nil then
-    self.diagnostic_publisher:publish(
-      diagnostics.from_snapshot_with_yield(completed.snapshot))
+    do
+      local service = self.service as project_service.Service
+      local publications = published_diagnostics.read(
+        service:workspace_store(), completed.published_generation)
+      if not self.closed then self.diagnostic_publisher:publish(publications) end
+    catch
+      -- A publication which overtook listener replay owns its replacement.
+      if not (error is semantic_index.StaleView) then raise end
+    end
   end
 end
 
@@ -1230,13 +1372,21 @@ end
 local function Application:rename_analysis(
     view: View, candidate: semantic_features.RenameCandidate):
     (bridge.Analysis?, Error?)
-  if #view.snapshot.project_modules == 0 then
+  local service = self.service as project_service.Service
+  local snapshot = service:latest()
+  if snapshot.generation ~= view.work_generation then
+    raise semantic_index.StaleView.new(view.work_generation, snapshot.generation)
+  end
+  do
+    local access = service:workspace_store():acquire()
+    defer access:release()
+    semantic_index.check_generation(access.connection, view.published_generation)
+  end
+  if #snapshot.project_modules == 0 then
     return nil, Error.new("cannot rename in an empty Titan project")
   end
-
   do
-    return self.rename_analyzer(
-      view.snapshot, candidate:edited_project_modules()), nil
+    return self.rename_analyzer(snapshot, candidate:edited_project_modules()), nil
   catch
     if error is async.CancellationReason then raise end
     return nil, runtime_error(error)
@@ -1277,7 +1427,8 @@ local function Application:handle_rename(
   if latest == nil then
     return failure(REQUEST_FAILED, latest_error.message)
   end
-  if latest.snapshot.generation ~= view.snapshot.generation then
+  if latest.work_generation ~= view.work_generation or
+     latest.published_generation ~= view.published_generation then
     return failure(
       REQUEST_FAILED, "saved Titan project changed during rename; retry")
   end
@@ -1287,7 +1438,7 @@ end
 
 function create(project_root: string): Application
   return Application.new(
-    project_root, project_service.load_default, nil, nil, nil, nil, nil, nil,
+    project_root, project_loader.load, nil, nil, nil, nil, nil, nil,
     nil, 1, 0, nil, nil, false, 0, 0, 0, nil, false,
     new_directory_probes(), default_rename_analyzer, diagnostics.create())
 end
@@ -1298,7 +1449,7 @@ end
 function create_with_service(project_root: string,
                              service: project_service.Service): Application
   local application = Application.new(
-    project_root, project_service.load_default, service, nil, nil, nil, nil,
+    project_root, project_loader.load, service, nil, nil, nil, nil,
     nil, nil, 0, 0, nil, nil, false, 0, 0, 0, nil, false,
     new_directory_probes(), default_rename_analyzer, diagnostics.create())
   application.completed_view = application:install_view(service:latest())
@@ -1310,7 +1461,7 @@ end
 local function create_unindexed_with_service(
     project_root: string, service: project_service.Service): Application
   return Application.new(
-    project_root, project_service.load_default, service, nil, nil, nil, nil,
+    project_root, project_loader.load, service, nil, nil, nil, nil,
     nil, nil, 1, 0, nil, nil, false, 0, 0, 0, nil, false,
     new_directory_probes(), default_rename_analyzer, diagnostics.create())
 end
@@ -1330,7 +1481,7 @@ function create_with_service_and_rename_analyzer(
     project_root: string, service: project_service.Service,
     rename_analyzer: RenameAnalyzer): Application
   local application = Application.new(
-    project_root, project_service.load_default, service, nil, nil, nil, nil,
+    project_root, project_loader.load, service, nil, nil, nil, nil,
     nil, nil, 0, 0, nil, nil, false, 0, 0, 0, nil, false,
     new_directory_probes(), rename_analyzer, diagnostics.create())
   application.completed_view = application:install_view(service:latest())
@@ -1353,6 +1504,9 @@ function Application:handle(
   return failure(METHOD_NOT_FOUND, "Method not found")
 catch
   if error is async.CancellationReason then raise end
+  if error is semantic_index.StaleView then
+    return failure(REQUEST_FAILED, "saved Titan project changed while reading; retry")
+  end
   return failure(INTERNAL_ERROR, runtime_error(error).message)
 end
 
@@ -1361,6 +1515,9 @@ function Application:close()
   self.closed = true
   self.diagnostic_publisher:stop()
   self.indexing_listener = nil
+  -- Stop accepting hints immediately. A reconciliation may already be inside
+  -- its watcher lifecycle operation, so stop that backend after its owner joins.
+  self.watch_filter = nil
 
   local directory_probe? = self.directory_probes.task
   if directory_probe ~= nil then
@@ -1376,12 +1533,12 @@ function Application:close()
   self.directory_probes.next_index = 1
 
   local attempted_epoch? = self.active_refresh_epoch
+  local restoration? = self.restoration
+  if restoration ~= nil then restoration:cancel() end
   local refresh? = self.refresh_task
   if refresh ~= nil then
-    if not refresh:status():has_finished() then
-      refresh:cancel(async.CancellationReason.simple(
-        "language server application is closing"))
-    end
+    -- Cancellation cannot submit ordinary SQLite rollback. Drain the updater
+    -- after stopping hints, then close the Store after all readers release it.
     async.join(refresh)
     self.refresh_task = nil
   end
@@ -1391,9 +1548,14 @@ function Application:close()
       "cancelled", attempted_epoch as integer, nil)
   end
   self.active_refresh_epoch = nil
+  if restoration ~= nil then restoration:close() end
+  self.restoration = nil
 
   local watcher? = self.watcher
   self.watcher = nil
   self.watch_filter = nil
   if watcher ~= nil then watcher:stop() end
+  local service? = self.service
+  if service ~= nil then service:close() end
+  self.completed_view = nil
 end

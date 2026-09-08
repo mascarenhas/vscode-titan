@@ -1,5 +1,9 @@
 local strings = import "string"
+local fs = import "fs"
+local stores = import "server.workspace_store"
+local indexer = import "server.semantic_index"
 local test = import "test"
+local runtime = import "server.test_runtime"
 local bridge = import "server.compiler_bridge"
 local features = import "server.semantic_features"
 local wire = import "server.wire"
@@ -121,562 +125,609 @@ end
 
 function test_semantic_features_reports_index_build_context(
     _context: test.Context)
-  local filename = "/workspace/invalid-index.titan"
-  local rejected = false
-  do
-    features.build({project("invalid_index", {
-      bridge.SourceFile.new(filename, "local item = 1\n"),
-    })}, {snapshot("invalid_index", filename, {filename}, {}, {
-      occurrence(filename, 1, 7, 11, "wrong", "local:item",
-                 bridge.OccurrenceRole.definition(), true, nil),
-    })})
-  catch
-    rejected = true
-    test.assert(error is features.Error,
-                "index build failure escaped the semantic feature boundary")
-    local failure = error as features.Error
-    test.assert(strings.find(failure.message,
-                             "Titan module 'invalid_index'") ~= nil and
-                strings.find(failure.message, filename) ~= nil and
-                strings.find(failure.message,
-                             "saved source does not contain identifier") ~= nil,
-                failure.message)
-  end
-  test.assert(rejected, "invalid index unexpectedly built semantic features")
+  runtime.run(function ()
+    local filename = "/workspace/invalid-index.titan"
+    local rejected = false
+    do
+      features.build({project("invalid_index", {
+        bridge.SourceFile.new(filename, "local item = 1\n"),
+      })}, {snapshot("invalid_index", filename, {filename}, {}, {
+        occurrence(filename, 1, 7, 11, "wrong", "local:item",
+                   bridge.OccurrenceRole.definition(), true, nil),
+      })})
+    catch
+      rejected = true
+      test.assert(error is features.Error,
+                  "index build failure escaped the semantic feature boundary")
+      local failure = error as features.Error
+      test.assert(strings.find(failure.message,
+                               "Titan module 'invalid_index'") ~= nil and
+                  strings.find(failure.message, filename) ~= nil and
+                  strings.find(failure.message,
+                               "saved source does not contain identifier") ~= nil,
+                  failure.message)
+    end
+    test.assert(rejected, "invalid index unexpectedly built semantic features")
+  end)
 end
 
 function test_semantic_features_reuses_indexed_file_coordinates(
     _context: test.Context)
-  local files: {bridge.SourceFile} = {}
-  local filenames: {string} = {}
-  for index = 1, 8 do
-    local filename = "/workspace/reuse" .. index .. ".titan"
-    filenames[index] = filename
-    files[index] = bridge.SourceFile.new(
-      filename, strings.rep("a", 1100) .. "\n")
-  end
+  runtime.run(function ()
+    local files: {bridge.SourceFile} = {}
+    local filenames: {string} = {}
+    for index = 1, 8 do
+      local filename = "/workspace/reuse" .. index .. ".titan"
+      filenames[index] = filename
+      files[index] = bridge.SourceFile.new(
+        filename, strings.rep("a", 1100) .. "\n")
+    end
 
-  local yield_count = 0
-  local model = features.build_with_yield({
-    project("coordinate_reuse", files),
-  }, {
-    snapshot("coordinate_reuse", filenames[1], filenames, {}, {}),
-  }, function () yield_count = yield_count + 1 end)
-  test.assert(#model:folding_ranges(filenames[1]) == 0,
-              "coordinate-reuse fixture unexpectedly produced folds")
-  test.assert(yield_count == 8,
-              "semantic features rebuilt per-file coordinate indexes")
+    local yield_count = 0
+    local model = features.build_with_yield({
+      project("coordinate_reuse", files),
+    }, {
+      snapshot("coordinate_reuse", filenames[1], filenames, {}, {}),
+    }, function () yield_count = yield_count + 1 end)
+    defer model:close()
+    test.assert(#model:folding_ranges(filenames[1]) == 0,
+                "coordinate-reuse fixture unexpectedly produced folds")
+    test.assert(yield_count == 16,
+                "coordinate decoding and comment extraction did not share bounded work")
+  end)
 end
 
 function test_semantic_features_definition_and_all_project_references(
     _context: test.Context)
-  local main_file = "/workspace/pkg/pkg.titan"
-  local part_file = "/workspace/pkg/use.titan"
-  local user_file = "/workspace/use.titan"
-  local symbol = "export:pkg:answer"
-  local model = features.build({
-    project("use", {
-      bridge.SourceFile.new(
-        user_file, "-- 😀\nlocal item = answer\n"),
-    }),
-    project("pkg", {
-      bridge.SourceFile.new(main_file, "answer = 1\n"),
-      bridge.SourceFile.new(part_file, "local copy = answer\n"),
-    }),
-  }, {
-    snapshot("use", user_file, {user_file}, {}, {
-      occurrence(user_file, 2, 14, 20, "answer", symbol,
-                 bridge.OccurrenceRole.reference(), false, nil),
-    }),
-    snapshot("pkg", main_file, {main_file, part_file}, {}, {
-      occurrence(part_file, 1, 14, 20, "answer", symbol,
-                 bridge.OccurrenceRole.reference(), false, nil),
-      occurrence(main_file, 1, 1, 7, "answer", symbol,
-                 bridge.OccurrenceRole.definition(), false, nil),
-    }),
-  })
+  runtime.run(function ()
+    local main_file = "/workspace/pkg/pkg.titan"
+    local part_file = "/workspace/pkg/use.titan"
+    local user_file = "/workspace/use.titan"
+    local symbol = "export:pkg:answer"
+    local model = features.build({
+      project("use", {
+        bridge.SourceFile.new(
+          user_file, "-- 😀\nlocal item = answer\n"),
+      }),
+      project("pkg", {
+        bridge.SourceFile.new(main_file, "answer = 1\n"),
+        bridge.SourceFile.new(part_file, "local copy = answer\n"),
+      }),
+    }, {
+      snapshot("use", user_file, {user_file}, {}, {
+        occurrence(user_file, 2, 14, 20, "answer", symbol,
+                   bridge.OccurrenceRole.reference(), false, nil),
+      }),
+      snapshot("pkg", main_file, {main_file, part_file}, {}, {
+        occurrence(part_file, 1, 14, 20, "answer", symbol,
+                   bridge.OccurrenceRole.reference(), false, nil),
+        occurrence(main_file, 1, 1, 7, "answer", symbol,
+                   bridge.OccurrenceRole.definition(), false, nil),
+      }),
+    })
+    defer model:close()
 
-  local definition? = model:definition(
-    user_file, source_text.Position.new(1, 16))
-  test.assert(definition ~= nil and
-              definition.uri == "file:///workspace/pkg/pkg.titan" and
-              definition.range.start.line == 0 and
-              definition.range.start.character == 0 and
-              definition.range.finish.character == 6,
-              "definition did not remain project-only and exact")
+    local definition? = model:definition(
+      user_file, source_text.Position.new(1, 16))
+    test.assert(definition ~= nil and
+                definition.uri == "file:///workspace/pkg/pkg.titan" and
+                definition.range.start.line == 0 and
+                definition.range.start.character == 0 and
+                definition.range.finish.character == 6,
+                "definition did not remain project-only and exact")
 
-  local without = model:references(
-    user_file, source_text.Position.new(1, 16), false)
-  test.assert(#without == 2 and
-              without[1].uri == "file:///workspace/pkg/use.titan" and
-              without[2].uri == "file:///workspace/use.titan",
-              "references did not exclude the declaration or sort by path")
-  local with_declaration = model:references(
-    user_file, source_text.Position.new(1, 16), true)
-  test.assert(#with_declaration == 3 and
-              with_declaration[1].uri ==
-                "file:///workspace/pkg/pkg.titan",
-              "includeDeclaration did not include the project definition")
+    local without = model:references(
+      user_file, source_text.Position.new(1, 16), false)
+    test.assert(#without == 2 and
+                without[1].uri == "file:///workspace/pkg/use.titan" and
+                without[2].uri == "file:///workspace/use.titan",
+                "references did not exclude the declaration or sort by path")
+    local with_declaration = model:references(
+      user_file, source_text.Position.new(1, 16), true)
+    test.assert(#with_declaration == 3 and
+                with_declaration[1].uri ==
+                  "file:///workspace/pkg/pkg.titan",
+                "includeDeclaration did not include the project definition")
+  end)
 end
 
 function test_semantic_features_excludes_external_definition_locations(
     _context: test.Context)
-  local project_file = "/workspace/main.titan"
-  local external_file = "/vendor/dep.titan"
-  local symbol = "export:vendor.dep:remote"
-  local model = features.build({project("main", {
-    bridge.SourceFile.new(project_file, "local x = remote\n"),
-  })}, {
-    external_snapshot("vendor.dep", external_file, {}, {
-      occurrence(external_file, 1, 1, 7, "remote", symbol,
-                 bridge.OccurrenceRole.definition(), false, nil),
-    }),
-    snapshot("main", project_file, {project_file}, {}, {
-      occurrence(project_file, 1, 11, 17, "remote", symbol,
-                 bridge.OccurrenceRole.reference(), false, nil),
-    }),
-  })
+  runtime.run(function ()
+    local project_file = "/workspace/main.titan"
+    local external_file = "/vendor/dep.titan"
+    local symbol = "export:vendor.dep:remote"
+    local model = features.build({project("main", {
+      bridge.SourceFile.new(project_file, "local x = remote\n"),
+    })}, {
+      external_snapshot("vendor.dep", external_file, {}, {
+        occurrence(external_file, 1, 1, 7, "remote", symbol,
+                   bridge.OccurrenceRole.definition(), false, nil),
+      }),
+      snapshot("main", project_file, {project_file}, {}, {
+        occurrence(project_file, 1, 11, 17, "remote", symbol,
+                   bridge.OccurrenceRole.reference(), false, nil),
+      }),
+    })
+    defer model:close()
 
-  local definition? = model:definition(
-    project_file, source_text.Position.new(0, 12))
-  test.assert(definition == nil,
-              "definition navigation escaped into external source")
-  local references = model:references(
-    project_file, source_text.Position.new(0, 12), true)
-  test.assert(#references == 1 and
-              references[1].uri == "file:///workspace/main.titan",
-              "external source leaked into all-project references")
-  local rename?, rename_error? = model:rename(
-    project_file, source_text.Position.new(0, 12), "renamed")
-  test.assert(rename == nil and rename_error ~= nil and
-              strings.find(rename_error.message, "outside project") ~= nil,
-              "rename accepted an externally declared symbol")
+    local definition? = model:definition(
+      project_file, source_text.Position.new(0, 12))
+    test.assert(definition == nil,
+                "definition navigation escaped into external source")
+    local references = model:references(
+      project_file, source_text.Position.new(0, 12), true)
+    test.assert(#references == 1 and
+                references[1].uri == "file:///workspace/main.titan",
+                "external source leaked into all-project references")
+    local rename?, rename_error? = model:rename(
+      project_file, source_text.Position.new(0, 12), "renamed")
+    test.assert(rename == nil and rename_error ~= nil and
+                strings.find(rename_error.message, "outside project") ~= nil,
+                "rename accepted an externally declared symbol")
+  end)
 end
 
 function test_semantic_features_hover_preserves_compiler_type_views(
     _context: test.Context)
-  local filename = "/workspace/hover.titan"
-  local integer_type = bridge.TypeInfo.new("Type.Integer", "integer")
-  local float_type = bridge.TypeInfo.new("Type.Float", "float")
-  local symbol = "ast:hover:/workspace/hover.titan:1:7:count"
-  local model = features.build({project("hover", {
-    bridge.SourceFile.new(filename, "local count: float = 1\n"),
-  })}, {snapshot("hover", filename, {filename}, {
-    node(1, "Ast.Decl", bridge.NodeKind.declaration(),
-         filename, 1, 7, "count", true, float_type, float_type,
-         integer_type, float_type, nil),
-  }, {
-    occurrence(filename, 1, 7, 12, "count", symbol,
-               bridge.OccurrenceRole.definition(), true, float_type),
-  })})
+  runtime.run(function ()
+    local filename = "/workspace/hover.titan"
+    local integer_type = bridge.TypeInfo.new("Type.Integer", "integer")
+    local float_type = bridge.TypeInfo.new("Type.Float", "float")
+    local symbol = "ast:hover:/workspace/hover.titan:1:7:count"
+    local model = features.build({project("hover", {
+      bridge.SourceFile.new(filename, "local count: float = 1\n"),
+    })}, {snapshot("hover", filename, {filename}, {
+      node(1, "Ast.Decl", bridge.NodeKind.declaration(),
+           filename, 1, 7, "count", true, float_type, float_type,
+           integer_type, float_type, nil),
+    }, {
+      occurrence(filename, 1, 7, 12, "count", symbol,
+                 bridge.OccurrenceRole.definition(), true, float_type),
+    })})
+    defer model:close()
 
-  local hover? = model:hover(filename, source_text.Position.new(0, 8))
-  test.assert(hover ~= nil and hover.inferred_type ~= nil and
-              hover.inferred_type.display == "float" and
-              hover.declared_type ~= nil and
-              hover.original_type ~= nil and
-              hover.original_type.display == "integer" and
-              hover.coerced_type ~= nil and
-              visibility_name(hover.visibility) == "block",
-              "hover lost typed compiler metadata or local status")
-  test.assert(hover:markdown() ==
-    "- Type: `float`\n" ..
-    "- Visibility: block\n",
-    "hover markdown repeated equivalent declared and inferred types")
+    local hover? = model:hover(filename, source_text.Position.new(0, 8))
+    test.assert(hover ~= nil and hover.inferred_type ~= nil and
+                hover.inferred_type.display == "float" and
+                hover.declared_type ~= nil and
+                hover.original_type ~= nil and
+                hover.original_type.display == "integer" and
+                hover.coerced_type ~= nil and
+                visibility_name(hover.visibility) == "block",
+                "hover lost typed compiler metadata or local status")
+    test.assert(hover:markdown() ==
+      "- Type: `float`\n" ..
+      "- Visibility: block\n",
+      "hover markdown repeated equivalent declared and inferred types")
+  end)
 end
 
 function test_semantic_features_hover_matches_nodes_after_unicode_prefix(
     _context: test.Context)
-  local filename = "/workspace/unicode_hover.titan"
-  local integer_type = bridge.TypeInfo.new("Type.Integer", "integer")
-  local symbol = "ast:unicode-hover:count"
-  local model = features.build({project("unicode_hover", {
-    bridge.SourceFile.new(filename, "-- 😀 count\n"),
-  })}, {snapshot("unicode_hover", filename, {filename}, {
-    node(1, "Ast.VarName", bridge.NodeKind.variable(),
-         filename, 1, 9, "count", true, integer_type, nil,
-         nil, nil, nil),
-  }, {
-    occurrence(filename, 1, 9, 14, "count", symbol,
-               bridge.OccurrenceRole.reference(), true, integer_type),
-  })})
+  runtime.run(function ()
+    local filename = "/workspace/unicode_hover.titan"
+    local integer_type = bridge.TypeInfo.new("Type.Integer", "integer")
+    local symbol = "ast:unicode-hover:count"
+    local model = features.build({project("unicode_hover", {
+      bridge.SourceFile.new(filename, "-- 😀 count\n"),
+    })}, {snapshot("unicode_hover", filename, {filename}, {
+      node(1, "Ast.VarName", bridge.NodeKind.variable(),
+           filename, 1, 9, "count", true, integer_type, nil,
+           nil, nil, nil),
+    }, {
+      occurrence(filename, 1, 9, 14, "count", symbol,
+                 bridge.OccurrenceRole.reference(), true, integer_type),
+    })})
+    defer model:close()
 
-  local hover? = model:hover(filename, source_text.Position.new(0, 7))
-  test.assert(hover ~= nil and hover.inferred_type ~= nil and
-              hover.inferred_type.display == "integer" and
-              hover.range.start.character == 6 and
-              hover.range.finish.character == 11,
-              "hover did not reuse UTF-16 coordinates for compiler byte columns")
+    local hover? = model:hover(filename, source_text.Position.new(0, 7))
+    test.assert(hover ~= nil and hover.inferred_type ~= nil and
+                hover.inferred_type.display == "integer" and
+                hover.range.start.character == 6 and
+                hover.range.finish.character == 11,
+                "hover did not reuse UTF-16 coordinates for compiler byte columns")
+  end)
 end
 
 function test_semantic_features_hover_reads_unnamed_adjustment_ancestors(
     _context: test.Context)
-  local filename = "/workspace/ancestor_hover.titan"
-  local integer_type = bridge.TypeInfo.new("Type.Integer", "integer")
-  local float_type = bridge.TypeInfo.new("Type.Float", "float")
-  local symbol = "ast:hover:/workspace/ancestor_hover.titan:1:7:count"
-  local model = features.build({project("hover", {
-    bridge.SourceFile.new(filename,
-      "local count = 1\nlocal result = count as float\n"),
-  })}, {snapshot("hover", filename, {filename}, {
-    node(1, "Ast.Decl", bridge.NodeKind.declaration(),
-         filename, 1, 7, "count", true, integer_type, integer_type,
-         nil, nil, nil),
-    node(2, "Ast.ExpCast", bridge.NodeKind.expression(),
-         filename, 2, 16, nil, true, float_type, nil,
-         integer_type, float_type, nil),
-    child_node(3, 2, "Ast.ExpVar", bridge.NodeKind.expression(),
-               filename, 2, 16, nil, true, integer_type, nil,
-               nil, nil),
-    child_node(4, 3, "Ast.VarName", bridge.NodeKind.variable(),
-               filename, 2, 16, "count", true, integer_type, nil,
-               nil, nil),
-  }, {
-    occurrence(filename, 1, 7, 12, "count", symbol,
-               bridge.OccurrenceRole.definition(), true, integer_type),
-    occurrence(filename, 2, 16, 21, "count", symbol,
-               bridge.OccurrenceRole.reference(), true, integer_type),
-  })})
+  runtime.run(function ()
+    local filename = "/workspace/ancestor_hover.titan"
+    local integer_type = bridge.TypeInfo.new("Type.Integer", "integer")
+    local float_type = bridge.TypeInfo.new("Type.Float", "float")
+    local symbol = "ast:hover:/workspace/ancestor_hover.titan:1:7:count"
+    local model = features.build({project("hover", {
+      bridge.SourceFile.new(filename,
+        "local count = 1\nlocal result = count as float\n"),
+    })}, {snapshot("hover", filename, {filename}, {
+      node(1, "Ast.Decl", bridge.NodeKind.declaration(),
+           filename, 1, 7, "count", true, integer_type, integer_type,
+           nil, nil, nil),
+      node(2, "Ast.ExpCast", bridge.NodeKind.expression(),
+           filename, 2, 16, nil, true, float_type, nil,
+           integer_type, float_type, nil),
+      child_node(3, 2, "Ast.ExpVar", bridge.NodeKind.expression(),
+                 filename, 2, 16, nil, true, integer_type, nil,
+                 nil, nil),
+      child_node(4, 3, "Ast.VarName", bridge.NodeKind.variable(),
+                 filename, 2, 16, "count", true, integer_type, nil,
+                 nil, nil),
+    }, {
+      occurrence(filename, 1, 7, 12, "count", symbol,
+                 bridge.OccurrenceRole.definition(), true, integer_type),
+      occurrence(filename, 2, 16, 21, "count", symbol,
+                 bridge.OccurrenceRole.reference(), true, integer_type),
+    })})
+    defer model:close()
 
-  local hover? = model:hover(filename, source_text.Position.new(1, 17))
-  test.assert(hover ~= nil and hover.inferred_type ~= nil and
-              hover.inferred_type.display == "integer" and
-              hover.original_type ~= nil and
-              hover.original_type.display == "integer" and
-              hover.coerced_type ~= nil and
-              hover.coerced_type.display == "float",
-              "hover ignored coercion metadata on an unnamed ancestor")
-  test.assert(hover:markdown() ==
-                "- Type: `integer`\n" ..
-                "- Cast to: `float`\n" ..
-                "- Visibility: block\n",
-              "hover did not render the distinct enclosing cast target")
+    local hover? = model:hover(filename, source_text.Position.new(1, 17))
+    test.assert(hover ~= nil and hover.inferred_type ~= nil and
+                hover.inferred_type.display == "integer" and
+                hover.original_type ~= nil and
+                hover.original_type.display == "integer" and
+                hover.coerced_type ~= nil and
+                hover.coerced_type.display == "float",
+                "hover ignored coercion metadata on an unnamed ancestor")
+    test.assert(hover:markdown() ==
+                  "- Type: `integer`\n" ..
+                  "- Cast to: `float`\n" ..
+                  "- Visibility: block\n",
+                "hover did not render the distinct enclosing cast target")
+  end)
 end
 
 function test_semantic_features_hover_prefers_named_callable_signatures(
     _context: test.Context)
-  local filename = "/workspace/callable_hover.titan"
-  local function_type = bridge.TypeInfo.new(
-    "Type.Function", "(integer) -> string")
-  local model = features.build({project("sample", {
-    bridge.SourceFile.new(filename,
-      "function render(value: integer): string\n" ..
-      "end\n" ..
-      "local callback: (integer) -> string = " ..
-      "function(value) return \"\" end\n"),
-  })}, {snapshot("sample", filename, {filename}, {}, {
-    occurrence(filename, 1, 10, 16, "render", "export:sample:render",
-               bridge.OccurrenceRole.definition(), false, function_type,
-               bridge.CallableSignature.new(
-                 "sample.render(value: integer): string")),
-    occurrence(filename, 3, 7, 15, "callback", "ast:sample:callback",
-               bridge.OccurrenceRole.definition(), true, function_type),
-  })})
+  runtime.run(function ()
+    local filename = "/workspace/callable_hover.titan"
+    local function_type = bridge.TypeInfo.new(
+      "Type.Function", "(integer) -> string")
+    local model = features.build({project("sample", {
+      bridge.SourceFile.new(filename,
+        "function render(value: integer): string\n" ..
+        "end\n" ..
+        "local callback: (integer) -> string = " ..
+        "function(value) return \"\" end\n"),
+    })}, {snapshot("sample", filename, {filename}, {}, {
+      occurrence(filename, 1, 10, 16, "render", "export:sample:render",
+                 bridge.OccurrenceRole.definition(), false, function_type,
+                 bridge.CallableSignature.new(
+                   "sample.render(value: integer): string")),
+      occurrence(filename, 3, 7, 15, "callback", "ast:sample:callback",
+                 bridge.OccurrenceRole.definition(), true, function_type),
+    })})
+    defer model:close()
 
-  local callable? = model:hover(filename, source_text.Position.new(0, 11))
-  test.assert(callable ~= nil and callable:markdown() ==
-                "- Signature: `sample.render(value: integer): string`\n" ..
-                "- Visibility: exported\n",
-              "named function hover fell back to a bare function type")
+    local callable? = model:hover(filename, source_text.Position.new(0, 11))
+    test.assert(callable ~= nil and callable:markdown() ==
+                  "- Signature: `sample.render(value: integer): string`\n" ..
+                  "- Visibility: exported\n",
+                "named function hover fell back to a bare function type")
 
-  local variable? = model:hover(filename, source_text.Position.new(2, 8))
-  test.assert(variable ~= nil and variable:markdown() ==
-                "- Type: `(integer) -> string`\n" ..
-                "- Visibility: block\n",
-              "ordinary function-valued variable did not keep its bare type")
+    local variable? = model:hover(filename, source_text.Position.new(2, 8))
+    test.assert(variable ~= nil and variable:markdown() ==
+                  "- Type: `(integer) -> string`\n" ..
+                  "- Visibility: block\n",
+                "ordinary function-valued variable did not keep its bare type")
+  end)
 end
 
 function test_semantic_features_hover_appends_cached_aggregate_summary(
     _context: test.Context)
-  local filename = "/workspace/aggregate_hover.titan"
-  local record_type = bridge.TypeInfo.new(
-    "Type.Record", "sample.Box<integer>")
-  local symbol = occurrence(
-    filename, 1, 1, 4, "Box", "export:sample:Box",
-    bridge.OccurrenceRole.definition(), false, record_type,
-    bridge.CallableSignature.new("wrong.signature(): nil"), 1)
-  local fields = bridge.HoverSummarySection.new(
-    "Fields", {"value: integer"})
-  local methods = bridge.HoverSummarySection.new(
-    "Methods", {"sample.Box<integer>:get(): integer"})
-  local summary = bridge.HoverSummary.new(
-    1, bridge.HoverSummaryKind.record_summary(), "sample.Box<integer>",
-    {fields, methods})
-  local saved = project("sample", {
-    bridge.SourceFile.new(filename, "Box\n"),
-  })
-  local compiler_snapshot = snapshot(
-    "sample", filename, {filename}, {}, {symbol}, {summary})
-  local model = features.build({saved}, {compiler_snapshot})
+  runtime.run(function ()
+    local filename = "/workspace/aggregate_hover.titan"
+    local record_type = bridge.TypeInfo.new(
+      "Type.Record", "sample.Box<integer>")
+    local symbol = occurrence(
+      filename, 1, 1, 4, "Box", "export:sample:Box",
+      bridge.OccurrenceRole.definition(), false, record_type,
+      bridge.CallableSignature.new("wrong.signature(): nil"), 1)
+    local fields = bridge.HoverSummarySection.new(
+      "Fields", {"value: integer"})
+    local methods = bridge.HoverSummarySection.new(
+      "Methods", {"sample.Box<integer>:get(): integer"})
+    local summary = bridge.HoverSummary.new(
+      1, bridge.HoverSummaryKind.record_summary(), "sample.Box<integer>",
+      {fields, methods})
+    local saved = project("sample", {
+      bridge.SourceFile.new(filename, "Box\n"),
+    })
+    local compiler_snapshot = snapshot(
+      "sample", filename, {filename}, {}, {symbol}, {summary})
+    local model = features.build({saved}, {compiler_snapshot})
+    defer model:close()
 
-  local hover? = model:hover(filename, source_text.Position.new(0, 1))
-  test.assert(hover ~= nil and hover:markdown() ==
-                "**record** `sample.Box<integer>`\n\n" ..
-                "Fields\n\n" ..
-                "- `value: integer`\n\n" ..
-                "Methods\n\n" ..
-                "- `sample.Box<integer>:get(): integer`\n\n" ..
-                "- Visibility: exported\n",
-              "hover rebuilt or failed to append its cached summary")
+    local hover? = model:hover(filename, source_text.Position.new(0, 1))
+    test.assert(hover ~= nil and hover:markdown() ==
+                  "**record** `sample.Box<integer>`\n\n" ..
+                  "Fields\n\n" ..
+                  "- `value: integer`\n\n" ..
+                  "Methods\n\n" ..
+                  "- `sample.Box<integer>:get(): integer`\n\n" ..
+                  "- Visibility: exported\n",
+                "hover rebuilt or failed to append its cached summary")
+  end)
 end
 
 function test_semantic_features_hover_reports_imported_terms(
     _context: test.Context)
-  local filename = "/workspace/import_hover.titan"
-  local module_type = bridge.TypeInfo.new(
-    "Type.Module", "module titan.math")
-  local float_type = bridge.TypeInfo.new("Type.Float", "float")
-  local import_symbol =
-    "ast:import_hover:/workspace/import_hover.titan:1:7:math"
-  local member_symbol = "export:titan.math:pi"
-  local model = features.build({project("import_hover", {
-    bridge.SourceFile.new(filename,
-      "local math = import \"math\"\n" ..
-      "function result(): float\n" ..
-      "  return math.pi\n" ..
-      "end\n"),
-  })}, {snapshot("import_hover", filename, {filename}, {
-    node(1, "Ast.TopLevelImport", bridge.NodeKind.declaration(),
-         filename, 1, 7, "math", true, module_type, module_type,
-         nil, nil, nil),
-    node(2, "Ast.VarName", bridge.NodeKind.variable(),
-         filename, 3, 10, "math", true, module_type, nil,
-         nil, nil, nil),
-    node(3, "Ast.VarDot", bridge.NodeKind.variable(),
-         filename, 3, 15, "pi", false, float_type, nil,
-         nil, nil, nil),
-  }, {
-    occurrence(filename, 1, 7, 11, "math", import_symbol,
-               bridge.OccurrenceRole.import_alias(), true, module_type,
-               nil, nil, bridge.DeclarationVisibility.module()),
-    occurrence(filename, 3, 10, 14, "math", import_symbol,
-               bridge.OccurrenceRole.reference(), true, module_type,
-               nil, nil, bridge.DeclarationVisibility.module()),
-    occurrence(filename, 3, 15, 17, "pi", member_symbol,
-               bridge.OccurrenceRole.reference(), false, float_type),
-  })})
+  runtime.run(function ()
+    local filename = "/workspace/import_hover.titan"
+    local module_type = bridge.TypeInfo.new(
+      "Type.Module", "module titan.math")
+    local float_type = bridge.TypeInfo.new("Type.Float", "float")
+    local import_symbol =
+      "ast:import_hover:/workspace/import_hover.titan:1:7:math"
+    local member_symbol = "export:titan.math:pi"
+    local model = features.build({project("import_hover", {
+      bridge.SourceFile.new(filename,
+        "local math = import \"math\"\n" ..
+        "function result(): float\n" ..
+        "  return math.pi\n" ..
+        "end\n"),
+    })}, {snapshot("import_hover", filename, {filename}, {
+      node(1, "Ast.TopLevelImport", bridge.NodeKind.declaration(),
+           filename, 1, 7, "math", true, module_type, module_type,
+           nil, nil, nil),
+      node(2, "Ast.VarName", bridge.NodeKind.variable(),
+           filename, 3, 10, "math", true, module_type, nil,
+           nil, nil, nil),
+      node(3, "Ast.VarDot", bridge.NodeKind.variable(),
+           filename, 3, 15, "pi", false, float_type, nil,
+           nil, nil, nil),
+    }, {
+      occurrence(filename, 1, 7, 11, "math", import_symbol,
+                 bridge.OccurrenceRole.import_alias(), true, module_type,
+                 nil, nil, bridge.DeclarationVisibility.module()),
+      occurrence(filename, 3, 10, 14, "math", import_symbol,
+                 bridge.OccurrenceRole.reference(), true, module_type,
+                 nil, nil, bridge.DeclarationVisibility.module()),
+      occurrence(filename, 3, 15, 17, "pi", member_symbol,
+                 bridge.OccurrenceRole.reference(), false, float_type),
+    })})
+    defer model:close()
 
-  local alias? = model:hover(filename, source_text.Position.new(0, 8))
-  test.assert(alias ~= nil and alias.inferred_type ~= nil and
-              alias.inferred_type.display == "module titan.math" and
-              alias.declared_type ~= nil and
-              visibility_name(alias.visibility) == "module",
-              "hover lost the compiler type or localness of an import alias")
+    local alias? = model:hover(filename, source_text.Position.new(0, 8))
+    test.assert(alias ~= nil and alias.inferred_type ~= nil and
+                alias.inferred_type.display == "module titan.math" and
+                alias.declared_type ~= nil and
+                visibility_name(alias.visibility) == "module",
+                "hover lost the compiler type or localness of an import alias")
 
-  local alias_use? = model:hover(filename, source_text.Position.new(2, 10))
-  test.assert(alias_use ~= nil and alias_use.inferred_type ~= nil and
-              alias_use.inferred_type.display == "module titan.math" and
-              visibility_name(alias_use.visibility) == "module",
-              "hover lost the compiler type or localness of an imported name")
+    local alias_use? = model:hover(filename, source_text.Position.new(2, 10))
+    test.assert(alias_use ~= nil and alias_use.inferred_type ~= nil and
+                alias_use.inferred_type.display == "module titan.math" and
+                visibility_name(alias_use.visibility) == "module",
+                "hover lost the compiler type or localness of an imported name")
 
-  local member? = model:hover(filename, source_text.Position.new(2, 15))
-  test.assert(member ~= nil and member.inferred_type ~= nil and
-              member.inferred_type.display == "float" and
-              visibility_name(member.visibility) == "exported" and
-              member.range.start.character == 14 and
-              member.range.finish.character == 16,
-              "hover lost the type, localness, or range of an imported term")
-  test.assert(member:markdown() ==
-                "- Type: `float`\n" ..
-                "- Visibility: exported\n",
-              "imported-term hover did not produce stable Markdown")
+    local member? = model:hover(filename, source_text.Position.new(2, 15))
+    test.assert(member ~= nil and member.inferred_type ~= nil and
+                member.inferred_type.display == "float" and
+                visibility_name(member.visibility) == "exported" and
+                member.range.start.character == 14 and
+                member.range.finish.character == 16,
+                "hover lost the type, localness, or range of an imported term")
+    test.assert(member:markdown() ==
+                  "- Type: `float`\n" ..
+                  "- Visibility: exported\n",
+                "imported-term hover did not produce stable Markdown")
+  end)
 end
 
 function test_semantic_features_hover_returns_nil_at_empty_position(
     _context: test.Context)
-  local filename = "/workspace/empty_hover.titan"
-  local integer_type = bridge.TypeInfo.new("Type.Integer", "integer")
-  local symbol =
-    "ast:empty_hover:/workspace/empty_hover.titan:1:7:item"
-  local model = features.build({project("empty_hover", {
-    bridge.SourceFile.new(filename, "local item = 1\n\n"),
-  })}, {snapshot("empty_hover", filename, {filename}, {
-    node(1, "Ast.Decl", bridge.NodeKind.declaration(),
-         filename, 1, 7, "item", true, integer_type, integer_type,
-         nil, nil, nil),
-  }, {
-    occurrence(filename, 1, 7, 11, "item", symbol,
-               bridge.OccurrenceRole.definition(), true, integer_type),
-  })})
+  runtime.run(function ()
+    local filename = "/workspace/empty_hover.titan"
+    local integer_type = bridge.TypeInfo.new("Type.Integer", "integer")
+    local symbol =
+      "ast:empty_hover:/workspace/empty_hover.titan:1:7:item"
+    local model = features.build({project("empty_hover", {
+      bridge.SourceFile.new(filename, "local item = 1\n\n"),
+    })}, {snapshot("empty_hover", filename, {filename}, {
+      node(1, "Ast.Decl", bridge.NodeKind.declaration(),
+           filename, 1, 7, "item", true, integer_type, integer_type,
+           nil, nil, nil),
+    }, {
+      occurrence(filename, 1, 7, 11, "item", symbol,
+                 bridge.OccurrenceRole.definition(), true, integer_type),
+    })})
+    defer model:close()
 
-  test.assert(model:hover(filename, source_text.Position.new(0, 5)) == nil and
-              model:hover(filename, source_text.Position.new(1, 0)) == nil,
-              "hover returned compiler data for an empty source position")
+    test.assert(model:hover(filename, source_text.Position.new(0, 5)) == nil and
+                model:hover(filename, source_text.Position.new(1, 0)) == nil,
+                "hover returned compiler data for an empty source position")
+  end)
 end
 
 function test_semantic_features_uses_half_open_structural_folding_spans(
     _context: test.Context)
-  local filename = "/workspace/fold.titan"
-  local external_file = "/vendor/fold.titan"
-  local contents =
-    "function outer()\n" ..
-    "  if ready then\n" ..
-    "    local callback = function()\n" ..
-    "      work()\n" ..
-    "    end\n" ..
-    "    do\n" ..
-    "      work()\n" ..
-    "    end\n" ..
-    "  end\n" ..
-    "end\n"
-  local outer_span = compiler_span(filename, 1, 1, 10, 1)
-  local model = features.build({project("fold", {
-    bridge.SourceFile.new(filename, contents),
-  })}, {
-    external_snapshot("vendor.fold", external_file, {
-      node(1, "Ast.TopLevelFunc", bridge.NodeKind.declaration(),
-           external_file, 1, 10, "outside", false, nil, nil, nil, nil,
-           compiler_span(external_file, 1, 1, 5, 1)),
-    }, {}),
-    snapshot("fold", filename, {filename}, {
-      node(1, "Ast.TopLevelFunc", bridge.NodeKind.declaration(),
-           filename, 1, 10, "outer", false, nil, nil, nil, nil,
-           outer_span),
-      -- A duplicate parser carrier is normalized to one structural range.
-      node(2, "Ast.StatBlock", bridge.NodeKind.statement(),
-           filename, 1, 1, nil, false, nil, nil, nil, nil, outer_span),
-      node(3, "Ast.StatIf", bridge.NodeKind.statement(),
-           filename, 2, 3, nil, false, nil, nil, nil, nil,
-           compiler_span(filename, 2, 3, 9, 3)),
-      node(4, "Ast.ExpFunction", bridge.NodeKind.expression(),
-           filename, 3, 22, nil, false, nil, nil, nil, nil,
-           compiler_span(filename, 3, 22, 5, 5)),
-      -- Catch/defer lowering can make a source `do` or module initializer a
-      -- StatTry while preserving the parser's exact structure span.
-      node(5, "Ast.StatTry", bridge.NodeKind.statement(),
-           filename, 6, 5, nil, false, nil, nil, nil, nil,
-           compiler_span(filename, 6, 5, 8, 5)),
-      -- A closing keyword on the following line leaves no body line to fold.
-      node(6, "Ast.StatBlock", bridge.NodeKind.statement(),
-           filename, 1, 1, nil, false, nil, nil, nil, nil,
-           compiler_span(filename, 1, 1, 2, 3)),
-    }, {}),
-  })
+  runtime.run(function ()
+    local filename = "/workspace/fold.titan"
+    local external_file = "/vendor/fold.titan"
+    local contents =
+      "function outer()\n" ..
+      "  if ready then\n" ..
+      "    local callback = function()\n" ..
+      "      work()\n" ..
+      "    end\n" ..
+      "    do\n" ..
+      "      work()\n" ..
+      "    end\n" ..
+      "  end\n" ..
+      "end\n"
+    local outer_span = compiler_span(filename, 1, 1, 10, 1)
+    local model = features.build({project("fold", {
+      bridge.SourceFile.new(filename, contents),
+    })}, {
+      external_snapshot("vendor.fold", external_file, {
+        node(1, "Ast.TopLevelFunc", bridge.NodeKind.declaration(),
+             external_file, 1, 10, "outside", false, nil, nil, nil, nil,
+             compiler_span(external_file, 1, 1, 5, 1)),
+      }, {}),
+      snapshot("fold", filename, {filename}, {
+        node(1, "Ast.TopLevelFunc", bridge.NodeKind.declaration(),
+             filename, 1, 10, "outer", false, nil, nil, nil, nil,
+             outer_span),
+        -- A duplicate parser carrier is normalized to one structural range.
+        node(2, "Ast.StatBlock", bridge.NodeKind.statement(),
+             filename, 1, 1, nil, false, nil, nil, nil, nil, outer_span),
+        node(3, "Ast.StatIf", bridge.NodeKind.statement(),
+             filename, 2, 3, nil, false, nil, nil, nil, nil,
+             compiler_span(filename, 2, 3, 9, 3)),
+        node(4, "Ast.ExpFunction", bridge.NodeKind.expression(),
+             filename, 3, 22, nil, false, nil, nil, nil, nil,
+             compiler_span(filename, 3, 22, 5, 5)),
+        -- Catch/defer lowering can make a source `do` or module initializer a
+        -- StatTry while preserving the parser's exact structure span.
+        node(5, "Ast.StatTry", bridge.NodeKind.statement(),
+             filename, 6, 5, nil, false, nil, nil, nil, nil,
+             compiler_span(filename, 6, 5, 8, 5)),
+        -- A closing keyword on the following line leaves no body line to fold.
+        node(6, "Ast.StatBlock", bridge.NodeKind.statement(),
+             filename, 1, 1, nil, false, nil, nil, nil, nil,
+             compiler_span(filename, 1, 1, 2, 3)),
+      }, {}),
+    })
+    defer model:close()
 
-  local ranges = model:folding_ranges(filename)
-  test.assert(#ranges == 4 and
-              ranges[1].start_line == 0 and ranges[1].end_line == 8 and
-              ranges[2].start_line == 1 and ranges[2].end_line == 7 and
-              ranges[3].start_line == 2 and ranges[3].end_line == 3 and
-              ranges[4].start_line == 5 and ranges[4].end_line == 6 and
-              ranges[1].kind == nil and ranges[2].kind == nil and
-              ranges[3].kind == nil and ranges[4].kind == nil,
-              "structural folds did not retain closing keyword lines")
-  test.assert(#model:folding_ranges(external_file) == 0,
-              "external source contributed folding ranges")
+    local ranges = model:folding_ranges(filename)
+    test.assert(#ranges == 4 and
+                ranges[1].start_line == 0 and ranges[1].end_line == 8 and
+                ranges[2].start_line == 1 and ranges[2].end_line == 7 and
+                ranges[3].start_line == 2 and ranges[3].end_line == 3 and
+                ranges[4].start_line == 5 and ranges[4].end_line == 6 and
+                ranges[1].kind == nil and ranges[2].kind == nil and
+                ranges[3].kind == nil and ranges[4].kind == nil,
+                "structural folds did not retain closing keyword lines")
+    test.assert(#model:folding_ranges(external_file) == 0,
+                "external source contributed folding ranges")
+  end)
 end
 
 function test_semantic_features_folds_multiline_comments_only(
     _context: test.Context)
-  local filename = "/workspace/comment_fold.titan"
-  local contents =
-    "--[=[\n" ..
-    "header 😀\n" ..
-    "details\n" ..
-    "]=]\n" ..
-    "local quoted = \"--[[not a comment]]\"\n" ..
-    "local long = [==[\n" ..
-    "--[[also not a comment]]\n" ..
-    "]==]\n" ..
-    "function work()\n" ..
-    "  --[[\n" ..
-    "  body\n" ..
-    "  ]]\n" ..
-    "end\n"
-  local model = features.build({project("comment_fold", {
-    bridge.SourceFile.new(filename, contents),
-  })}, {snapshot("comment_fold", filename, {filename}, {
-    node(1, "Ast.TopLevelFunc", bridge.NodeKind.declaration(),
-         filename, 9, 1, "work", false, nil, nil, nil, nil,
-         compiler_span(filename, 9, 1, 13, 1)),
-  }, {})})
+  runtime.run(function ()
+    local filename = "/workspace/comment_fold.titan"
+    local contents =
+      "--[=[\n" ..
+      "header 😀\n" ..
+      "details\n" ..
+      "]=]\n" ..
+      "local quoted = \"--[[not a comment]]\"\n" ..
+      "local long = [==[\n" ..
+      "--[[also not a comment]]\n" ..
+      "]==]\n" ..
+      "function work()\n" ..
+      "  --[[\n" ..
+      "  body\n" ..
+      "  ]]\n" ..
+      "end\n"
+    local model = features.build({project("comment_fold", {
+      bridge.SourceFile.new(filename, contents),
+    })}, {snapshot("comment_fold", filename, {filename}, {
+      node(1, "Ast.TopLevelFunc", bridge.NodeKind.declaration(),
+           filename, 9, 1, "work", false, nil, nil, nil, nil,
+           compiler_span(filename, 9, 1, 13, 1)),
+    }, {})})
+    defer model:close()
 
-  local ranges = model:folding_ranges(filename)
-  test.assert(#ranges == 3 and
-              ranges[1].start_line == 0 and ranges[1].end_line == 3 and
-              ranges[1].kind == "comment" and
-              ranges[2].start_line == 8 and ranges[2].end_line == 11 and
-              ranges[2].kind == nil and
-              ranges[3].start_line == 9 and ranges[3].end_line == 11 and
-              ranges[3].kind == "comment",
-              "multiline comment folds were missing or string text folded")
+    local ranges = model:folding_ranges(filename)
+    test.assert(#ranges == 3 and
+                ranges[1].start_line == 0 and ranges[1].end_line == 3 and
+                ranges[1].kind == "comment" and
+                ranges[2].start_line == 8 and ranges[2].end_line == 11 and
+                ranges[2].kind == nil and
+                ranges[3].start_line == 9 and ranges[3].end_line == 11 and
+                ranges[3].kind == "comment",
+                "multiline comment folds were missing or string text folded")
+  end)
 end
 
 function test_semantic_features_deduplicates_equal_comment_and_structural_folds(
     _context: test.Context)
-  local filename = "/workspace/equal_fold.titan"
-  local contents =
-    "function first() --[[\n" ..
-    "body\n" ..
-    "]]\n" ..
-    "end\n" ..
-    "function second()\n" ..
-    "body()\n" ..
-    "end\n"
-  local model = features.build({project("equal_fold", {
-    bridge.SourceFile.new(filename, contents),
-  })}, {snapshot("equal_fold", filename, {filename}, {
-    node(1, "Ast.TopLevelFunc", bridge.NodeKind.declaration(),
-         filename, 1, 1, "first", false, nil, nil, nil, nil,
-         compiler_span(filename, 1, 1, 4, 1)),
-    node(2, "Ast.TopLevelFunc", bridge.NodeKind.declaration(),
-         filename, 5, 1, "second", false, nil, nil, nil, nil,
-         compiler_span(filename, 5, 1, 7, 1)),
-  }, {})})
+  runtime.run(function ()
+    local filename = "/workspace/equal_fold.titan"
+    local contents =
+      "function first() --[[\n" ..
+      "body\n" ..
+      "]]\n" ..
+      "end\n" ..
+      "function second()\n" ..
+      "body()\n" ..
+      "end\n"
+    local model = features.build({project("equal_fold", {
+      bridge.SourceFile.new(filename, contents),
+    })}, {snapshot("equal_fold", filename, {filename}, {
+      node(1, "Ast.TopLevelFunc", bridge.NodeKind.declaration(),
+           filename, 1, 1, "first", false, nil, nil, nil, nil,
+           compiler_span(filename, 1, 1, 4, 1)),
+      node(2, "Ast.TopLevelFunc", bridge.NodeKind.declaration(),
+           filename, 5, 1, "second", false, nil, nil, nil, nil,
+           compiler_span(filename, 5, 1, 7, 1)),
+    }, {})})
+    defer model:close()
 
-  local ranges = model:folding_ranges(filename)
-  test.assert(#ranges == 2 and
-              ranges[1].start_line == 0 and ranges[1].end_line == 2 and
-              ranges[2].start_line == 4 and ranges[2].end_line == 5,
-              "equal comment fold corrupted later structural ranges")
+    local ranges = model:folding_ranges(filename)
+    test.assert(#ranges == 2 and
+                ranges[1].start_line == 0 and ranges[1].end_line == 2 and
+                ranges[2].start_line == 4 and ranges[2].end_line == 5,
+                "equal comment fold corrupted later structural ranges")
+  end)
 end
 
 function test_semantic_features_comment_fold_keeps_trailing_code_visible(
     _context: test.Context)
-  local filename = "/workspace/comment_trailing_code.titan"
-  local contents =
-    "--[[\n" ..
-    "comment\n" ..
-    "]] local item = 1\n"
-  local model = features.build({project("comment_trailing_code", {
-    bridge.SourceFile.new(filename, contents),
-  })}, {snapshot("comment_trailing_code", filename, {filename}, {}, {})})
+  runtime.run(function ()
+    local filename = "/workspace/comment_trailing_code.titan"
+    local contents =
+      "--[[\n" ..
+      "comment\n" ..
+      "]] local item = 1\n"
+    local model = features.build({project("comment_trailing_code", {
+      bridge.SourceFile.new(filename, contents),
+    })}, {snapshot("comment_trailing_code", filename, {filename}, {}, {})})
+    defer model:close()
 
-  local ranges = model:folding_ranges(filename)
-  test.assert(#ranges == 1 and
-              ranges[1].start_line == 0 and ranges[1].end_line == 1 and
-              ranges[1].kind == "comment",
-              "comment fold hid source after its closing delimiter")
+    local ranges = model:folding_ranges(filename)
+    test.assert(#ranges == 1 and
+                ranges[1].start_line == 0 and ranges[1].end_line == 1 and
+                ranges[1].kind == "comment",
+                "comment fold hid source after its closing delimiter")
+  end)
 end
 
 function test_semantic_features_folds_incomplete_parseable_saved_source(
     _context: test.Context)
-  local filename = "/workspace/draft_fold.titan"
-  -- This is a valid checked draft despite its empty unfinished branch and
-  -- missing trailing newline. Compiler spans, not keyword guessing, own both
-  -- structural ranges.
-  local contents =
-    "function draft(ready: boolean)\n" ..
-    "  if ready then\n" ..
-    "\n" ..
-    "  end\n" ..
-    "end"
-  local model = features.build({project("draft_fold", {
-    bridge.SourceFile.new(filename, contents),
-  })}, {snapshot("draft_fold", filename, {filename}, {
-    node(1, "Ast.TopLevelFunc", bridge.NodeKind.declaration(),
-         filename, 1, 1, "draft", false, nil, nil, nil, nil,
-         compiler_span(filename, 1, 1, 5, 1)),
-    node(2, "Ast.StatIf", bridge.NodeKind.statement(),
-         filename, 2, 3, nil, false, nil, nil, nil, nil,
-         compiler_span(filename, 2, 3, 4, 3)),
-  }, {})})
+  runtime.run(function ()
+    local filename = "/workspace/draft_fold.titan"
+    -- This is a valid checked draft despite its empty unfinished branch and
+    -- missing trailing newline. Compiler spans, not keyword guessing, own both
+    -- structural ranges.
+    local contents =
+      "function draft(ready: boolean)\n" ..
+      "  if ready then\n" ..
+      "\n" ..
+      "  end\n" ..
+      "end"
+    local model = features.build({project("draft_fold", {
+      bridge.SourceFile.new(filename, contents),
+    })}, {snapshot("draft_fold", filename, {filename}, {
+      node(1, "Ast.TopLevelFunc", bridge.NodeKind.declaration(),
+           filename, 1, 1, "draft", false, nil, nil, nil, nil,
+           compiler_span(filename, 1, 1, 5, 1)),
+      node(2, "Ast.StatIf", bridge.NodeKind.statement(),
+           filename, 2, 3, nil, false, nil, nil, nil, nil,
+           compiler_span(filename, 2, 3, 4, 3)),
+    }, {})})
+    defer model:close()
 
-  local ranges = model:folding_ranges(filename)
-  test.assert(#ranges == 2 and
-              ranges[1].start_line == 0 and ranges[1].end_line == 3 and
-              ranges[2].start_line == 1 and ranges[2].end_line == 2,
-              "parseable draft source lost valid compiler-derived folds")
+    local ranges = model:folding_ranges(filename)
+    test.assert(#ranges == 2 and
+                ranges[1].start_line == 0 and ranges[1].end_line == 3 and
+                ranges[2].start_line == 1 and ranges[2].end_line == 2,
+                "parseable draft source lost valid compiler-derived folds")
+  end)
 end
 
 local function rename_fixture(): features.Features
@@ -708,95 +759,223 @@ end
 
 function test_semantic_features_rename_requires_successful_compiler_preflight(
     _context: test.Context)
-  local model = rename_fixture()
-  local candidate?, candidate_error? = model:rename(
-    "/workspace/pkg/pkg.titan", source_text.Position.new(0, 2), "sum")
-  test.assert(candidate_error == nil and candidate ~= nil and
-              candidate:source_name() == "answer" and
-              candidate:target_name() == "sum",
-              "valid rename did not produce an unverified candidate")
-  local edited = candidate:edited_project_modules()
-  test.assert(find_contents(edited, "/workspace/pkg/pkg.titan") ==
-                "sum = 1\n" and
-              find_contents(edited, "/workspace/pkg/use.titan") ==
-                "local other = sum\n" and
-              find_contents(edited, "/workspace/use.titan") ==
-                "local copy = sum\n",
-              "rename candidate did not edit the complete saved project")
+  runtime.run(function ()
+    local model = rename_fixture()
+    defer model:close()
+    local candidate?, candidate_error? = model:rename(
+      "/workspace/pkg/pkg.titan", source_text.Position.new(0, 2), "sum")
+    test.assert(candidate_error == nil and candidate ~= nil and
+                candidate:source_name() == "answer" and
+                candidate:target_name() == "sum",
+                "valid rename did not produce an unverified candidate")
+    local edited = candidate:edited_project_modules()
+    test.assert(find_contents(edited, "/workspace/pkg/pkg.titan") ==
+                  "sum = 1\n" and
+                find_contents(edited, "/workspace/pkg/use.titan") ==
+                  "local other = sum\n" and
+                find_contents(edited, "/workspace/use.titan") ==
+                  "local copy = sum\n",
+                "rename candidate did not edit the complete saved project")
 
-  local renamed = "export:pkg:sum"
-  local checked = bridge.Analysis.new("pkg", {}, {
-    snapshot("pkg", "/workspace/pkg/pkg.titan", {
-      "/workspace/pkg/pkg.titan", "/workspace/pkg/use.titan",
-    }, {}, {
-      occurrence("/workspace/pkg/pkg.titan", 1, 1, 4, "sum", renamed,
-                 bridge.OccurrenceRole.definition(), false, nil),
-      occurrence("/workspace/pkg/use.titan", 1, 15, 18, "sum", renamed,
-                 bridge.OccurrenceRole.reference(), false, nil),
-    }),
-    snapshot("use", "/workspace/use.titan", {"/workspace/use.titan"}, {}, {
-      occurrence("/workspace/use.titan", 1, 14, 17, "sum", renamed,
-                 bridge.OccurrenceRole.reference(), false, nil),
-    }),
-  }, {}, {}, {})
-  local verified?, verification_error? = candidate:preflight(checked)
-  test.assert(verification_error == nil and verified ~= nil,
-              "consistent compiler bindings did not verify the rename")
-  local documents = verified:document_edits()
-  test.assert(#documents == 3 and
-              documents[1].uri == "file:///workspace/pkg/pkg.titan" and
-              documents[2].uri == "file:///workspace/pkg/use.titan" and
-              documents[3].uri == "file:///workspace/use.titan" and
-              documents[1].edits[1].range.finish.character == 6 and
-              documents[1].edits[1].new_text == "sum",
-              "verified workspace edits were not deterministic or pre-edit")
+    local renamed = "export:pkg:sum"
+    local checked = bridge.Analysis.new("pkg", {}, {
+      snapshot("pkg", "/workspace/pkg/pkg.titan", {
+        "/workspace/pkg/pkg.titan", "/workspace/pkg/use.titan",
+      }, {}, {
+        occurrence("/workspace/pkg/pkg.titan", 1, 1, 4, "sum", renamed,
+                   bridge.OccurrenceRole.definition(), false, nil),
+        occurrence("/workspace/pkg/use.titan", 1, 15, 18, "sum", renamed,
+                   bridge.OccurrenceRole.reference(), false, nil),
+      }),
+      snapshot("use", "/workspace/use.titan", {"/workspace/use.titan"}, {}, {
+        occurrence("/workspace/use.titan", 1, 14, 17, "sum", renamed,
+                   bridge.OccurrenceRole.reference(), false, nil),
+      }),
+    }, {}, {}, {})
+    local verified?, verification_error? = candidate:preflight(checked)
+    test.assert(verification_error == nil and verified ~= nil,
+                "consistent compiler bindings did not verify the rename")
+    local documents = verified:document_edits()
+    test.assert(#documents == 3 and
+                documents[1].uri == "file:///workspace/pkg/pkg.titan" and
+                documents[2].uri == "file:///workspace/pkg/use.titan" and
+                documents[3].uri == "file:///workspace/use.titan" and
+                documents[1].edits[1].range.finish.character == 6 and
+                documents[1].edits[1].new_text == "sum",
+                "verified workspace edits were not deterministic or pre-edit")
 
-  local encoded = lsp.workspace_edit_value(documents)
-  test.assert(strings.find(wire.encode(encoded), [["changes"]]) ~= nil,
-              "verified rename could not reach the LSP encoding boundary")
+    local encoded = lsp.workspace_edit_value(documents)
+    test.assert(strings.find(wire.encode(encoded), [["changes"]]) ~= nil,
+                "verified rename could not reach the LSP encoding boundary")
+  end)
 end
 
 function test_semantic_features_rename_rejects_invalid_names_and_capture(
     _context: test.Context)
-  local model = rename_fixture()
-  local invalid?, invalid_error? = model:rename(
-    "/workspace/pkg/pkg.titan", source_text.Position.new(0, 2), "function")
-  test.assert(invalid == nil and invalid_error ~= nil,
-              "rename accepted a Titan keyword")
+  runtime.run(function ()
+    local model = rename_fixture()
+    defer model:close()
+    local invalid?, invalid_error? = model:rename(
+      "/workspace/pkg/pkg.titan", source_text.Position.new(0, 2), "function")
+    test.assert(invalid == nil and invalid_error ~= nil,
+                "rename accepted a Titan keyword")
 
-  local candidate?, candidate_error? = model:rename(
-    "/workspace/pkg/pkg.titan", source_text.Position.new(0, 2), "sum")
-  test.assert(candidate_error == nil and candidate ~= nil,
-              "capture fixture did not produce a candidate")
-  local exported = "export:pkg:sum"
-  local captured = "ast:pkg:/workspace/pkg/use.titan:1:7:sum"
-  local split = bridge.Analysis.new("pkg", {}, {
-    snapshot("pkg", "/workspace/pkg/pkg.titan", {
-      "/workspace/pkg/pkg.titan", "/workspace/pkg/use.titan",
-    }, {}, {
-      occurrence("/workspace/pkg/pkg.titan", 1, 1, 4, "sum", exported,
-                 bridge.OccurrenceRole.definition(), false, nil),
-      occurrence("/workspace/pkg/use.titan", 1, 7, 12, "other", captured,
-                 bridge.OccurrenceRole.definition(), true, nil),
-      occurrence("/workspace/pkg/use.titan", 1, 15, 18, "sum", captured,
-                 bridge.OccurrenceRole.reference(), true, nil),
-    }),
-    snapshot("use", "/workspace/use.titan", {"/workspace/use.titan"}, {}, {
-      occurrence("/workspace/use.titan", 1, 14, 17, "sum", exported,
-                 bridge.OccurrenceRole.reference(), false, nil),
-    }),
-  }, {}, {}, {})
-  local verified?, capture_error? = candidate:preflight(split)
-  test.assert(verified == nil and capture_error ~= nil and
-              strings.find(capture_error.message, "capture") ~= nil,
-              "compiler-observed capture did not reject all edits")
+    local candidate?, candidate_error? = model:rename(
+      "/workspace/pkg/pkg.titan", source_text.Position.new(0, 2), "sum")
+    test.assert(candidate_error == nil and candidate ~= nil,
+                "capture fixture did not produce a candidate")
+    local exported = "export:pkg:sum"
+    local captured = "ast:pkg:/workspace/pkg/use.titan:1:7:sum"
+    local split = bridge.Analysis.new("pkg", {}, {
+      snapshot("pkg", "/workspace/pkg/pkg.titan", {
+        "/workspace/pkg/pkg.titan", "/workspace/pkg/use.titan",
+      }, {}, {
+        occurrence("/workspace/pkg/pkg.titan", 1, 1, 4, "sum", exported,
+                   bridge.OccurrenceRole.definition(), false, nil),
+        occurrence("/workspace/pkg/use.titan", 1, 7, 12, "other", captured,
+                   bridge.OccurrenceRole.definition(), true, nil),
+        occurrence("/workspace/pkg/use.titan", 1, 15, 18, "sum", captured,
+                   bridge.OccurrenceRole.reference(), true, nil),
+      }),
+      snapshot("use", "/workspace/use.titan", {"/workspace/use.titan"}, {}, {
+        occurrence("/workspace/use.titan", 1, 14, 17, "sum", exported,
+                   bridge.OccurrenceRole.reference(), false, nil),
+      }),
+    }, {}, {}, {})
+    local verified?, capture_error? = candidate:preflight(split)
+    test.assert(verified == nil and capture_error ~= nil and
+                strings.find(capture_error.message, "capture") ~= nil,
+                "compiler-observed capture did not reject all edits")
 
-  local diagnostics = bridge.Analysis.new("pkg", {
-    bridge.Diagnostic.new(
-      bridge.DiagnosticKind.type_error(), "duplicate declaration", nil),
-  }, {}, {}, {}, {})
-  local diagnostic_result?, diagnostic_error? =
-    candidate:preflight(diagnostics)
-  test.assert(diagnostic_result == nil and diagnostic_error ~= nil,
-              "compiler diagnostics did not reject the rename candidate")
+    local diagnostics = bridge.Analysis.new("pkg", {
+      bridge.Diagnostic.new(
+        bridge.DiagnosticKind.type_error(), "duplicate declaration", nil),
+    }, {}, {}, {}, {})
+    local diagnostic_result?, diagnostic_error? =
+      candidate:preflight(diagnostics)
+    test.assert(diagnostic_result == nil and diagnostic_error ~= nil,
+                "compiler diagnostics did not reject the rename candidate")
+  end)
+end
+
+local function assert_materialized_view(view: features.Features, filename: string)
+  local at = source_text.Position.new(24, 2)
+  local hover? = view:hover(filename, at)
+  test.assert(hover ~= nil and hover.inferred_type ~= nil and
+    hover.inferred_type.display == "integer" and hover.declared_type ~= nil and
+    hover.declared_type.display == "value" and hover.original_type ~= nil and
+    hover.original_type.display == "integer" and hover.coerced_type ~= nil and
+    hover.coerced_type.display == "float",
+    "materialized hover batch lost an optional type view")
+  local definition? = view:definition(filename, at)
+  test.assert(definition ~= nil and definition.range.start.line == 24,
+    "reopened definition did not use its saved occurrence")
+  test.assert(#view:references(filename, at, true) == 1,
+    "reopened references did not use their saved identity")
+  local folds = view:folding_ranges(filename)
+  test.assert(#folds == 1 and folds[1].start_line == 0 and folds[1].end_line == 24,
+    "materialized fold did not survive publication")
+  local candidate?, failure? = view:rename(filename, at, "replacement")
+  test.assert(candidate ~= nil and failure == nil,
+    "reopened rename could not reconstruct the published source")
+  test.assert(strings.find(find_contents(candidate:edited_project_modules(), filename),
+    "replacement\nend\n", 1, true) ~= nil,
+    "reopened rename edited the wrong source token")
+end
+
+local function materialized_roundtrip(path: string)
+  local filename = "/workspace/materialized.titan"
+  local output = strings.writer()
+  local nodes: {bridge.Node} = {}
+  local symbols: {bridge.SymbolOccurrence} = {}
+  local integer_type = bridge.TypeInfo.new("Type.Integer", "integer")
+  local value_type = bridge.TypeInfo.new("Type.Value", "value")
+  local float_type = bridge.TypeInfo.new("Type.Float", "float")
+  for index = 1, 25 do
+    local name = "item" .. index
+    output:write(name .. "\n")
+    nodes[index] = node(index, "Ast.Decl", bridge.NodeKind.declaration(),
+      filename, index, 1, name, false, integer_type, value_type,
+      integer_type, float_type, nil)
+    symbols[index] = occurrence(filename, index, 1, #name + 1, name,
+      "identity\0" .. index, bridge.OccurrenceRole.definition(), false, integer_type)
+  end
+  output:write("end\n")
+  nodes[26] = node(26, "Ast.TopLevelFunc", bridge.NodeKind.declaration(),
+    filename, 1, 1, nil, false, nil, nil, nil, nil,
+    compiler_span(filename, 1, 1, 26, 1))
+  local saved = project("materialized", {bridge.SourceFile.new(filename, output:drain())})
+  local prepared = features.prepare({saved}, {
+    snapshot("materialized", filename, {filename}, nodes, symbols),
+  })
+  local store = stores.open(path)
+  defer store:close()
+  do
+    local access = store:acquire()
+    defer access:release()
+    features.initialize_schema(access.connection)
+    stores.execute(access.connection, "CREATE TEMP TABLE semantic_occurrences(unrelated INTEGER)")
+    stores.execute(access.connection, "CREATE TEMP TABLE semantic_hovers(unrelated INTEGER)")
+    access.connection:set_autocommit(false)
+    prepared:publish(access.connection)
+    stores.execute(access.connection,
+      "UPDATE main.store_state SET published_generation=4 WHERE singleton=1")
+    access.connection:commit()
+  end
+  -- Mutating extraction input cannot affect the durable query view.
+  nodes[25] = node(25, "Ast.Decl", bridge.NodeKind.declaration(),
+    filename, 25, 1, "item25", false, float_type, float_type, nil, nil, nil)
+  local view = features.open(store, 4)
+  assert_materialized_view(view, filename)
+  local invalid = features.prepare({saved}, {
+    snapshot("materialized", filename, {filename}, {}, {
+      symbols[1], occurrence(filename, 1, 1, 6, "item1", "other",
+        bridge.OccurrenceRole.reference(), false, integer_type),
+    }),
+  })
+  do
+    local access = store:acquire()
+    defer access:release()
+    access.connection:set_autocommit(false)
+    local rejected = false
+    do
+      invalid:publish(access.connection)
+    catch
+      rejected = true
+      test.assert(error is indexer.Error, "invalid publication did not report a semantic error")
+    end
+    access.connection:rollback()
+    test.assert(rejected, "overlapping publication unexpectedly succeeded")
+  end
+  assert_materialized_view(view, filename)
+  do
+    local access = store:acquire()
+    defer access:release()
+    stores.execute(access.connection,
+      "UPDATE main.store_state SET published_generation=5 WHERE singleton=1")
+  end
+  local stale = false
+  do
+    view:folding_ranges(filename)
+  catch
+    stale = true
+    test.assert(error is indexer.StaleView, "old query facade did not report its stale generation")
+  end
+  test.assert(stale, "old query facade read a newer publication")
+  store:close()
+  if path ~= ":memory:" then
+    local reopened = stores.open(path)
+    defer reopened:close()
+    assert_materialized_view(features.open(reopened, 5), filename)
+  end
+end
+
+function test_semantic_features_materialization_rollback_and_file_reopen(
+    _context: test.Context)
+  runtime.run(function ()
+    materialized_roundtrip(":memory:")
+    local path = fs.tmpname()
+    defer fs.unlink(path)
+    materialized_roundtrip(path)
+  end)
 end

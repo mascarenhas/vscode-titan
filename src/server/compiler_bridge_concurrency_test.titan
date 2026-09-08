@@ -4,6 +4,7 @@ local lua = import "lua"
 local strings = import "string"
 local test = import "test"
 local timer = import "timer"
+local file_times = foreign import "utime.h"
 local bridge = import "server.compiler_bridge.titan"
 local test_runtime = import "server.test_runtime"
 
@@ -290,7 +291,7 @@ local function serializes_real_compilers_across_cancellation()
   end)
 
   while not a_started do async.yield() end
-  -- API 4 deliberately yields at async filesystem operations before external
+  -- The compiler yields at async filesystem operations before external
   -- resolution. Wait for the semantic state this test needs instead of
   -- assuming that the first cooperative yield has already published it.
   local active_provider?: string = nil
@@ -736,4 +737,190 @@ end
 function test_compiler_bridge_yields_during_large_diagnostic_normalization(
     _context: test.Context)
   test_runtime.run(large_diagnostic_normalization_yields)
+end
+
+local type PayloadHookCounts = () -> (integer,integer,integer)
+local type InstallPayloadHooks = ({string: value}) -> (() -> (),PayloadHookCounts)
+
+local function observe_payload_hooks(driver: {string: value}):
+    (() -> (),PayloadHookCounts)
+  local install = lua.load([==[
+return function(driver)
+  local names = {"encode_project_entry", "decode_project_entry", "project_entries_registry"}
+  local original, counts = {}, {0, 0, 0}
+  for index, name in ipairs(names) do
+    original[index] = driver[name]
+    driver[name] = function(input, options)
+      assert(type(options.yield) == "function", name .. " omitted cooperative work hook")
+      local yield = options.yield
+      options.yield = function()
+        counts[index] = counts[index] + 1
+        yield()
+      end
+      return original[index](input, options)
+    end
+  end
+  return function()
+    for index, name in ipairs(names) do driver[name] = original[index] end
+  end, function() return counts[1], counts[2], counts[3] end
+end
+]==],"=project_payload_hook_observer",nil)() as InstallPayloadHooks
+  return install(driver)
+end
+
+local function large_project_payload_restoration_yields_and_cleans_up()
+  local source = strings.writer()
+  for index = 1, 384 do
+    source:write("function item_" .. index .. "(item: integer): integer\n" ..
+      "  local answer = item + " .. index .. "\n  return answer\nend\n")
+  end
+  local name = "large_restoration"
+  local projects = {bridge.ProjectModule.new(name,{
+    bridge.SourceFile.new("/workspace/large_restoration.titan",source:drain())})}
+  local compiler = bridge.load()
+  local analysis = compiler:analyze(name,projects)
+  test.assert(#analysis.diagnostics == 0,"large restoration fixture failed analysis")
+  local driver = lua.require(DRIVER_MODULE) as {string: value}
+  local restore_hooks, counts = observe_payload_hooks(driver)
+  defer restore_hooks()
+  local payloads = compiler:export_projects(projects,{name})
+  test.assert(#payloads == 1,"large single project payload was not exported")
+  local encode_yields, _decode_yields, _registry_yields = counts()
+  test.assert(encode_yields > 1,"single project encoding did not yield repeatedly")
+  local restored = bridge.load()
+  local reads = 0
+  local rejected = restored:hydrate_project_cache(projects,{name},
+    function (requested: string): (string?,{bridge.CHeaderDependency}?)
+      test.assert(requested == name,"restoration read an unselected payload")
+      reads = reads + 1
+      return payloads[1].payload,nil
+    end,
+    function (_name: string,_snapshot: bridge.ModuleSnapshot): boolean
+      return false
+    end)
+  local _encoded, decode_yields, registry_yields = counts()
+  test.assert(reads == 1 and #rejected == 0 and not restored:has_project_ast(name),
+    "rejected revision installed compiler state or duplicated its BLOB read")
+  test.assert(decode_yields > 1 and registry_yields > 1,
+    "single project decoding or registry assembly did not yield repeatedly")
+
+  local types = lua.require("titan-compiler.types") as {string: value}
+  local previous: value = types["registry"]
+  local cancelled = bridge.load()
+  local task = async.run<{bridge.ModuleSnapshot},value>(function (): {bridge.ModuleSnapshot}
+    return cancelled:hydrate_projects(projects,payloads)
+  end)
+  local saw_registry = false
+  while not task:status():has_finished() do
+    if types["registry"] ~= previous then
+      saw_registry = true
+      task:cancel(async.CancellationReason.simple("cancel payload normalization"))
+      break
+    end
+    async.yield()
+  end
+  local cancellation = false
+  case async.join(task)
+  when cancelled then cancellation = true
+  when failed: failure then raise failure.error
+  else
+  end
+  test.assert(saw_registry and cancellation,
+    "large payload normalization offered no cancellable scheduler turn")
+  test.assert(types["registry"] == previous and not cancelled:has_project_ast(name),
+    "cancelled normalization leaked the temporary registry or a partial project AST")
+  local recovered = bridge.load():hydrate_projects(projects,payloads)
+  test.assert(#recovered == 1,
+    "cancellation did not release the compiler permit for a later restoration")
+end
+
+function test_compiler_bridge_large_payload_restoration_yields_and_cleans_up(
+    _context: test.Context)
+  test_runtime.run(large_project_payload_restoration_yields_and_cleans_up)
+end
+
+local type HeaderReadCounts = () -> (integer,integer)
+local type InstallHeaderReadObserver = ({string: value}) -> (() -> (),HeaderReadCounts)
+
+local function observe_header_reads(driver: {string: value}): (() -> (),HeaderReadCounts)
+  local install = lua.load([==[
+return function(driver)
+  local original = driver.new_resolver_context
+  local strategy
+  driver.new_resolver_context = function(options)
+    strategy = options.io
+    return original(options)
+  end
+  return function() driver.new_resolver_context = original end,
+    function()
+      local headers = driver.compiler_cache_stats({context={io=strategy}}).headers
+      return headers.file_reads, headers.file_hashes
+    end
+end
+]==],"=live_project_header_read_observer",nil)() as InstallHeaderReadObserver
+  return install(driver)
+end
+
+local function live_header_touch_uses_current_analysis_baselines()
+  local root = temporary_root()
+  local header = root .. "/live_observed.h"
+  fs.write_file(header,"typedef long live_observed_word;\n")
+  defer do fs.unlink(header); fs.rmdir(root) end
+  local times = file_times.utimbuf.new()
+  times.actime = 1700000000
+  times.modtime = 1700000000
+  test.assert(file_times.utime(header,times) == 0,"cannot set initial header timestamp")
+  local provider = bridge.ProjectModule.new("live_observed_provider",{
+    bridge.SourceFile.new(root .. "/live_observed_provider.titan",
+      "local c = foreign import \"" .. header .. "\"\n" ..
+      "local function cast(item: integer): c.live_observed_word return item end\n")})
+  local consumer_source: (integer) -> string = function (amount: integer): string
+    return "local provider = import \"live_observed_provider.titan\"\n" ..
+      "function answer(): integer return provider.cast(" .. amount .. ") end\n"
+  end
+  local consumer = bridge.ProjectModule.new("live_observed_consumer",{
+    bridge.SourceFile.new(root .. "/live_observed_consumer.titan",consumer_source(41))})
+  local compiler = bridge.load()
+  local driver = lua.require(DRIVER_MODULE) as {string: value}
+  local restore, counts = observe_header_reads(driver)
+  defer restore()
+  local initial = compiler:analyze("live_observed_consumer",{provider,consumer})
+  if #initial.diagnostics > 0 then
+    raise "live observed header fixture failed analysis: " .. initial.diagnostics[1].message
+  end
+  local inputs: {bridge.CHeaderDependency} = {}
+  local seen: {string: boolean} = {}
+  for module_index = 1, #initial.modules do
+    local dependencies = initial.modules[module_index].c_header_dependencies
+    for index = 1, #dependencies do
+      local input = dependencies[index]
+      local kind = "file"
+      case input.kind
+      when file then
+      when search then kind = "search"
+      end
+      local key = kind .. "\0" .. input.path
+      if not seen[key] then seen[key] = true; inputs[#inputs + 1] = input end
+    end
+  end
+  times.modtime = 1700000001
+  test.assert(file_times.utime(header,times) == 0,"cannot touch live header")
+  local current, changed = compiler:restat_c_header_dependencies(inputs)
+  test.assert(not changed,"same-content header touch changed semantic identity")
+  local before_reads,before_hashes = counts()
+  local edited = bridge.ProjectModule.new("live_observed_consumer",{
+    bridge.SourceFile.new(root .. "/live_observed_consumer.titan",consumer_source(42))})
+  local result = compiler:analyze_incremental({provider,edited},
+    {"live_observed_consumer"},{},nil,current)
+  test.assert(#result.diagnostics == 0 and
+    result:find_module("live_observed_provider") == nil,
+    "same-content header touch invalidated the retained source-private provider")
+  local after_reads,after_hashes = counts()
+  test.assert(after_reads == before_reads and after_hashes == before_hashes,
+    "live importer edit reread or rehashed a header already validated after its touch")
+end
+
+function test_compiler_bridge_live_header_touch_uses_current_analysis_baselines(
+    _context: test.Context)
+  test_runtime.run(live_header_touch_uses_current_analysis_baselines)
 end

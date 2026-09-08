@@ -1,4 +1,6 @@
 local test = import "test"
+local sqlite3 = import "sqlite3"
+local runtime = import "server.test_runtime"
 local strings = import "string"
 local bridge = import "server.compiler_bridge"
 local indexer = import "server.semantic_index.titan"
@@ -99,443 +101,537 @@ end
 
 function test_semantic_index_joins_exported_identities_across_modules(
     _context: test.Context)
-  local a_file = "/workspace/a.titan"
-  local b_file = "/workspace/b.titan"
-  local symbol = "export:app.a:answer"
-  local index = indexer.build({
-    project("app.b", b_file, "local copy = answer\n"),
-    project("app.a", a_file, "answer = 42\n"),
-  }, {
-    project_snapshot("app.b", b_file, {
-      occurrence(b_file, 1, 14, 20, "answer", symbol,
-                 bridge.OccurrenceRole.reference(), false),
-    }),
-    project_snapshot("app.a", a_file, {
-      occurrence(a_file, 1, 1, 7, "answer", symbol,
-                 bridge.OccurrenceRole.definition(), false),
-    }),
-  })
+  runtime.run(function ()
+    local a_file = "/workspace/a.titan"
+    local b_file = "/workspace/b.titan"
+    local symbol = "export:app.a:answer"
+    local index = indexer.build({
+      project("app.b", b_file, "local copy = answer\n"),
+      project("app.a", a_file, "answer = 42\n"),
+    }, {
+      project_snapshot("app.b", b_file, {
+        occurrence(b_file, 1, 14, 20, "answer", symbol,
+                   bridge.OccurrenceRole.reference(), false),
+      }),
+      project_snapshot("app.a", a_file, {
+        occurrence(a_file, 1, 1, 7, "answer", symbol,
+                   bridge.OccurrenceRole.definition(), false),
+      }),
+    })
+    defer index:close()
 
-  local at_use? = index:occurrence_at(
-    b_file, source_text.Position.new(0, 15))
-  test.assert(at_use ~= nil and
-              at_use.symbol_id.declaration_id == symbol,
-              "cross-module use did not resolve to its exported identity")
-  local definition? = index:definition(at_use.symbol_id)
-  test.assert(definition ~= nil and definition.filename == a_file,
-              "exported identity did not resolve to its project definition")
+    local at_use? = index:occurrence_at(
+      b_file, source_text.Position.new(0, 15))
+    test.assert(at_use ~= nil and
+                at_use.symbol_id.declaration_id == symbol,
+                "cross-module use did not resolve to its exported identity")
+    local definition? = index:definition(at_use.symbol_id)
+    test.assert(definition ~= nil and definition.filename == a_file,
+                "exported identity did not resolve to its project definition")
 
-  local references = index:occurrences(at_use.symbol_id, false)
-  test.assert(#references == 1 and references[1].filename == b_file,
-              "references query did not exclude the declaration")
-  local all = index:occurrences(at_use.symbol_id, true)
-  test.assert(#all == 2 and all[1].filename == a_file and
-              all[2].filename == b_file,
-              "symbol occurrences were not complete and deterministic")
+    local references = index:occurrences(at_use.symbol_id, false)
+    test.assert(#references == 1 and references[1].filename == b_file,
+                "references query did not exclude the declaration")
+    local all = index:occurrences(at_use.symbol_id, true)
+    test.assert(#all == 2 and all[1].filename == a_file and
+                all[2].filename == b_file,
+                "symbol occurrences were not complete and deterministic")
+  end)
 end
 
 function test_semantic_index_caches_snapshot_local_hover_summaries(
     _context: test.Context)
-  local filename = "/workspace/summary.titan"
-  local identity = "export:summary:Box"
-  local summaries = {
-    record_hover_summary(1, "summary.Box<integer>", "item: integer"),
-    record_hover_summary(2, "summary.Box<string>", "item: string"),
-  }
-  local symbols = {
-    occurrence(filename, 1, 1, 4, "Box", identity,
-               bridge.OccurrenceRole.definition(), false, 1),
-    occurrence(filename, 2, 1, 4, "Box", identity,
-               bridge.OccurrenceRole.reference(), false, 1),
-    occurrence(filename, 3, 1, 4, "Box", identity,
-               bridge.OccurrenceRole.reference(), false, 2),
-    occurrence(filename, 4, 1, 4, "Box", identity,
-               bridge.OccurrenceRole.reference(), false),
-  }
-  local index = one_module_index(
-    "summary", filename, "Box\nBox\nBox\nBox\n", symbols, summaries)
-  local items = index:file_occurrences(filename)
-  local integer_summary =
-    "**record** `summary.Box<integer>`\n\n" ..
-    "Fields\n\n- `item: integer`\n"
-  test.assert(#items == 4 and
-              index:hover_summary(items[1]) == integer_summary and
-              index:hover_summary(items[2]) == integer_summary,
-              "equal occurrence views did not share cached summary text")
-  test.assert(index:hover_summary(items[3]) ==
-                "**record** `summary.Box<string>`\n\n" ..
-                "Fields\n\n- `item: string`\n" and
-              index:hover_summary(items[4]) == nil and
-              index:hover_summary_count() == 2,
-              "distinct or absent occurrence views borrowed another summary")
+  runtime.run(function ()
+    local filename = "/workspace/summary.titan"
+    local identity = "export:summary:Box"
+    local summaries = {
+      record_hover_summary(1, "summary.Box<integer>", "item: integer"),
+      record_hover_summary(2, "summary.Box<string>", "item: string"),
+    }
+    local symbols = {
+      occurrence(filename, 1, 1, 4, "Box", identity,
+                 bridge.OccurrenceRole.definition(), false, 1),
+      occurrence(filename, 2, 1, 4, "Box", identity,
+                 bridge.OccurrenceRole.reference(), false, 1),
+      occurrence(filename, 3, 1, 4, "Box", identity,
+                 bridge.OccurrenceRole.reference(), false, 2),
+      occurrence(filename, 4, 1, 4, "Box", identity,
+                 bridge.OccurrenceRole.reference(), false),
+    }
+    local index = one_module_index(
+      "summary", filename, "Box\nBox\nBox\nBox\n", symbols, summaries)
+    defer index:close()
+    local items = index:file_occurrences(filename)
+    local integer_summary =
+      "**record** `summary.Box<integer>`\n\n" ..
+      "Fields\n\n- `item: integer`\n"
+    test.assert(#items == 4 and
+                index:hover_summary(items[1]) == integer_summary and
+                index:hover_summary(items[2]) == integer_summary,
+                "equal occurrence views did not share cached summary text")
+    test.assert(index:hover_summary(items[3]) ==
+                  "**record** `summary.Box<string>`\n\n" ..
+                  "Fields\n\n- `item: string`\n" and
+                index:hover_summary(items[4]) == nil and
+                index:hover_summary_count() == 2,
+                "distinct or absent occurrence views borrowed another summary")
 
-  local other_filename = "/workspace/other-summary.titan"
-  local summary_project = project("summary", filename, "Box\n")
-  local other_project = project("other", other_filename, "Box\n")
-  local summary_symbol = occurrence(
-    filename, 1, 1, 4, "Box", identity,
-    bridge.OccurrenceRole.definition(), false, 1)
-  local other_symbol = occurrence(
-    other_filename, 1, 1, 4, "Box", "export:other:Box",
-    bridge.OccurrenceRole.definition(), false, 1)
-  local summary_snapshot = project_snapshot(
-    "summary", filename, {summary_symbol}, {summaries[1]})
-  local other_summary = record_hover_summary(
-    1, "other.Box<float>", "item: float")
-  local other_snapshot = project_snapshot(
-    "other", other_filename, {other_symbol}, {other_summary})
-  local scoped = indexer.build(
-    {summary_project, other_project}, {summary_snapshot, other_snapshot})
-  local summary_items = scoped:file_occurrences(filename)
-  local other_items = scoped:file_occurrences(other_filename)
-  test.assert(scoped:hover_summary(summary_items[1]) ==
-                integer_summary and
-              scoped:hover_summary(other_items[1]) ==
-                "**record** `other.Box<float>`\n\n" ..
-                "Fields\n\n- `item: float`\n" and
-              scoped:hover_summary_count() == 2,
-              "snapshot-local summary ids collided across modules")
-
-  expect_index_error(function ()
-    local invalid = occurrence(
-      filename, 1, 1, 4, "Box", identity,
-      bridge.OccurrenceRole.definition(), false, 0)
-    one_module_index(
-      "summary", filename, "Box\n", {invalid}, summaries)
-  end, "non-positive hover summary id")
-
-  expect_index_error(function ()
-    local invalid = occurrence(
-      filename, 1, 1, 4, "Box", identity,
-      bridge.OccurrenceRole.definition(), false, 3)
-    one_module_index(
-      "summary", filename, "Box\n", {invalid}, summaries)
-  end, "unknown hover summary id")
-
-  expect_index_error(function ()
-    local valid = occurrence(
+    local other_filename = "/workspace/other-summary.titan"
+    local summary_project = project("summary", filename, "Box\n")
+    local other_project = project("other", other_filename, "Box\n")
+    local summary_symbol = occurrence(
       filename, 1, 1, 4, "Box", identity,
       bridge.OccurrenceRole.definition(), false, 1)
-    local invalid = bridge.HoverSummary.new(
-      2, bridge.HoverSummaryKind.record_summary(), "summary.Box", {})
-    one_module_index(
-      "summary", filename, "Box\n", {valid}, {invalid})
-  end, "registry slot")
+    local other_symbol = occurrence(
+      other_filename, 1, 1, 4, "Box", "export:other:Box",
+      bridge.OccurrenceRole.definition(), false, 1)
+    local summary_snapshot = project_snapshot(
+      "summary", filename, {summary_symbol}, {summaries[1]})
+    local other_summary = record_hover_summary(
+      1, "other.Box<float>", "item: float")
+    local other_snapshot = project_snapshot(
+      "other", other_filename, {other_symbol}, {other_summary})
+    local scoped = indexer.build(
+      {summary_project, other_project}, {summary_snapshot, other_snapshot})
+    defer scoped:close()
+    local summary_items = scoped:file_occurrences(filename)
+    local other_items = scoped:file_occurrences(other_filename)
+    test.assert(scoped:hover_summary(summary_items[1]) ==
+                  integer_summary and
+                scoped:hover_summary(other_items[1]) ==
+                  "**record** `other.Box<float>`\n\n" ..
+                  "Fields\n\n- `item: float`\n" and
+                scoped:hover_summary_count() == 2,
+                "snapshot-local summary ids collided across modules")
+
+    expect_index_error(function ()
+      local invalid = occurrence(
+        filename, 1, 1, 4, "Box", identity,
+        bridge.OccurrenceRole.definition(), false, 0)
+      one_module_index(
+        "summary", filename, "Box\n", {invalid}, summaries)
+    end, "non-positive hover summary id")
+
+    expect_index_error(function ()
+      local invalid = occurrence(
+        filename, 1, 1, 4, "Box", identity,
+        bridge.OccurrenceRole.definition(), false, 3)
+      one_module_index(
+        "summary", filename, "Box\n", {invalid}, summaries)
+    end, "unknown hover summary id")
+
+    expect_index_error(function ()
+      local valid = occurrence(
+        filename, 1, 1, 4, "Box", identity,
+        bridge.OccurrenceRole.definition(), false, 1)
+      local invalid = bridge.HoverSummary.new(
+        2, bridge.HoverSummaryKind.record_summary(), "summary.Box", {})
+      one_module_index(
+        "summary", filename, "Box\n", {valid}, {invalid})
+    end, "registry slot")
+  end)
 end
 
 function test_semantic_index_yields_while_rendering_large_hover_summaries(
     _context: test.Context)
-  local count = 2050
-  local lines: {string} = {}
-  for index = 1, count do
-    lines[index] = "field" .. index .. ": integer"
-  end
-  local section = bridge.HoverSummarySection.new("Fields", lines)
-  local summary = bridge.HoverSummary.new(
-    1, bridge.HoverSummaryKind.record_summary(), "large.Record", {section})
-  local filename = "/workspace/large-summary.titan"
-  local saved = project("large_summary", filename, "\n")
-  local compiler_snapshot = project_snapshot(
-    "large_summary", filename, {}, {summary})
-  local yields = 0
-  local index = indexer.build_with_yield(
-    {saved}, {compiler_snapshot}, function () yields = yields + 1 end)
-  test.assert(index:hover_summary_count() == 1 and yields >= 2,
-              "large cached summary rendering did not cooperatively yield")
+  runtime.run(function ()
+    local count = 2050
+    local lines: {string} = {}
+    for index = 1, count do
+      lines[index] = "field" .. index .. ": integer"
+    end
+    local section = bridge.HoverSummarySection.new("Fields", lines)
+    local summary = bridge.HoverSummary.new(
+      1, bridge.HoverSummaryKind.record_summary(), "large.Record", {section})
+    local filename = "/workspace/large-summary.titan"
+    local saved = project("large_summary", filename, "\n")
+    local compiler_snapshot = project_snapshot(
+      "large_summary", filename, {}, {summary})
+    local yields = 0
+    local index = indexer.build_with_yield(
+      {saved}, {compiler_snapshot}, function () yields = yields + 1 end)
+    defer index:close()
+    test.assert(index:hover_summary_count() == 1 and yields >= 2,
+                "large cached summary rendering did not cooperatively yield")
+  end)
 end
 
 function test_semantic_index_keeps_shadowed_locals_nominally_distinct(
     _context: test.Context)
-  local filename = "/workspace/shadow.titan"
-  local outer = "ast:app.shadow:/workspace/shadow.titan:2:9:count"
-  local inner = "ast:app.shadow:/workspace/shadow.titan:5:11:count"
-  local index = indexer.build({project(
-    "app.shadow", filename,
-    "function sample()\n" ..
-    "  local count = 1\n" ..
-    "  count = count\n" ..
-    "  do\n" ..
-    "    local count = 2\n" ..
-    "    count = count\n" ..
-    "  end\n" ..
-    "end\n")}, {
-    project_snapshot("app.shadow", filename, {
-      occurrence(filename, 2, 9, 14, "count", outer,
-                 bridge.OccurrenceRole.definition(), true),
-      occurrence(filename, 3, 3, 8, "count", outer,
-                 bridge.OccurrenceRole.write(), true),
-      occurrence(filename, 3, 11, 16, "count", outer,
-                 bridge.OccurrenceRole.reference(), true),
-      occurrence(filename, 5, 11, 16, "count", inner,
-                 bridge.OccurrenceRole.definition(), true),
-      occurrence(filename, 6, 5, 10, "count", inner,
-                 bridge.OccurrenceRole.write(), true),
-      occurrence(filename, 6, 13, 18, "count", inner,
-                 bridge.OccurrenceRole.reference(), true),
-    }),
-  })
+  runtime.run(function ()
+    local filename = "/workspace/shadow.titan"
+    local outer = "ast:app.shadow:/workspace/shadow.titan:2:9:count"
+    local inner = "ast:app.shadow:/workspace/shadow.titan:5:11:count"
+    local index = indexer.build({project(
+      "app.shadow", filename,
+      "function sample()\n" ..
+      "  local count = 1\n" ..
+      "  count = count\n" ..
+      "  do\n" ..
+      "    local count = 2\n" ..
+      "    count = count\n" ..
+      "  end\n" ..
+      "end\n")}, {
+      project_snapshot("app.shadow", filename, {
+        occurrence(filename, 2, 9, 14, "count", outer,
+                   bridge.OccurrenceRole.definition(), true),
+        occurrence(filename, 3, 3, 8, "count", outer,
+                   bridge.OccurrenceRole.write(), true),
+        occurrence(filename, 3, 11, 16, "count", outer,
+                   bridge.OccurrenceRole.reference(), true),
+        occurrence(filename, 5, 11, 16, "count", inner,
+                   bridge.OccurrenceRole.definition(), true),
+        occurrence(filename, 6, 5, 10, "count", inner,
+                   bridge.OccurrenceRole.write(), true),
+        occurrence(filename, 6, 13, 18, "count", inner,
+                   bridge.OccurrenceRole.reference(), true),
+      }),
+    })
+    defer index:close()
 
-  local outer_items = index:occurrences(indexer.SymbolId.new(outer), true)
-  local inner_items = index:occurrences(indexer.SymbolId.new(inner), true)
-  test.assert(#outer_items == 3 and #inner_items == 3,
-              "shadowed declarations were merged by identifier text")
-  test.assert(index:definition(indexer.SymbolId.new(outer)).span.start.line == 1
-              and
-              index:definition(indexer.SymbolId.new(inner)).span.start.line == 4,
-              "nominal local identities resolved to the wrong declarations")
+    local outer_items = index:occurrences(indexer.SymbolId.new(outer), true)
+    local inner_items = index:occurrences(indexer.SymbolId.new(inner), true)
+    test.assert(#outer_items == 3 and #inner_items == 3,
+                "shadowed declarations were merged by identifier text")
+    test.assert(index:definition(indexer.SymbolId.new(outer)).span.start.line == 1
+                and
+                index:definition(indexer.SymbolId.new(inner)).span.start.line == 4,
+                "nominal local identities resolved to the wrong declarations")
+  end)
 end
 
 function test_semantic_index_converts_unicode_prefixes_to_utf16(
     _context: test.Context)
-  local filename = "/workspace/unicode.titan"
-  local contents = "--[[😀]] local count = 1\n"
-  local index = indexer.build({project("app.unicode", filename, contents)}, {
-    project_snapshot("app.unicode", filename, {
-      occurrence(filename, 1, 18, 23, "count", "export:app.unicode:count",
-                 bridge.OccurrenceRole.definition(), false),
-    }),
-  })
-  local items = index:file_occurrences(filename)
-  test.assert(#items == 1 and items[1].byte_span.start == 17 and
-              items[1].byte_span.finish == 22,
-              "compiler byte columns did not preserve exact byte offsets")
-  test.assert(items[1].span.start.character == 15 and
-              items[1].span.finish.character == 20,
-              "SourceText did not convert an astral prefix to UTF-16")
-  test.assert(index:occurrence_at(
-                filename, source_text.Position.new(0, 16)) ~= nil and
-              index:occurrence_at(
-                filename, source_text.Position.new(0, 20)) == nil,
-              "per-file lookup did not use a half-open UTF-16 span")
+  runtime.run(function ()
+    local filename = "/workspace/unicode.titan"
+    local contents = "--[[😀]] local count = 1\n"
+    local index = indexer.build({project("app.unicode", filename, contents)}, {
+      project_snapshot("app.unicode", filename, {
+        occurrence(filename, 1, 18, 23, "count", "export:app.unicode:count",
+                   bridge.OccurrenceRole.definition(), false),
+      }),
+    })
+    defer index:close()
+    local items = index:file_occurrences(filename)
+    test.assert(#items == 1 and items[1].byte_span.start == 17 and
+                items[1].byte_span.finish == 22,
+                "compiler byte columns did not preserve exact byte offsets")
+    test.assert(items[1].span.start.character == 15 and
+                items[1].span.finish.character == 20,
+                "SourceText did not convert an astral prefix to UTF-16")
+    test.assert(index:occurrence_at(
+                  filename, source_text.Position.new(0, 16)) ~= nil and
+                index:occurrence_at(
+                  filename, source_text.Position.new(0, 20)) == nil,
+                "per-file lookup did not use a half-open UTF-16 span")
+  end)
 end
 
 function test_semantic_index_preserves_compiler_columns_across_lone_cr(
     _context: test.Context)
-  local filename = "/workspace/cr.titan"
-  local index = indexer.build({project(
-    "app.cr", filename, "left\rright\n")}, {
-    project_snapshot("app.cr", filename, {
-      -- titan-compiler.location counts only LF as a source line ending, so
-      -- this name remains on compiler line 1 at byte column 6. SourceText
-      -- correctly presents it on LSP line 1 at UTF-16 character 0.
-      occurrence(filename, 1, 6, 11, "right", "export:app.cr:right",
-                 bridge.OccurrenceRole.definition(), false),
-    }),
-  })
-  local items = index:file_occurrences(filename)
-  test.assert(#items == 1 and items[1].byte_span.start == 5 and
-              items[1].span.start.line == 1 and
-              items[1].span.start.character == 0,
-              "compiler byte columns and SourceText line rules were conflated")
+  runtime.run(function ()
+    local filename = "/workspace/cr.titan"
+    local index = indexer.build({project(
+      "app.cr", filename, "left\rright\n")}, {
+      project_snapshot("app.cr", filename, {
+        -- titan-compiler.location counts only LF as a source line ending, so
+        -- this name remains on compiler line 1 at byte column 6. SourceText
+        -- correctly presents it on LSP line 1 at UTF-16 character 0.
+        occurrence(filename, 1, 6, 11, "right", "export:app.cr:right",
+                   bridge.OccurrenceRole.definition(), false),
+      }),
+    })
+    defer index:close()
+    local items = index:file_occurrences(filename)
+    test.assert(#items == 1 and items[1].byte_span.start == 5 and
+                items[1].span.start.line == 1 and
+                items[1].span.start.character == 0,
+                "compiler byte columns and SourceText line rules were conflated")
+  end)
 end
 
 function test_semantic_index_skips_missing_spans_unresolved_and_external_data(
     _context: test.Context)
-  local filename = "/workspace/main.titan"
-  local external_file = "/external/dep.titan"
-  local external = bridge.ModuleSnapshot.new(
-    "vendor.dep",
-    bridge.Provenance.external_source(
-      bridge.SourceProvenance.new(external_file, {external_file})),
-    nil, {}, {
-      occurrence(external_file, 1, 1, 4, "dep", "export:vendor.dep:dep",
-                 bridge.OccurrenceRole.definition(), false),
-    }, {}, {}, nil, nil)
-  local index = indexer.build({project(
-    "app.main", filename, "known missing remote\n")}, {
-    external,
-    project_snapshot("app.main", filename, {
-      occurrence(filename, 1, 1, 6, "known", "export:app.main:known",
-                 bridge.OccurrenceRole.definition(), false),
-      missing_span(filename, 1, 7, "missing", "export:app.main:missing"),
-      occurrence(filename, 1, 15, 21, "remote", nil,
-                 bridge.OccurrenceRole.reference(), false),
-      occurrence(external_file, 1, 1, 4, "dep", "export:vendor.dep:dep",
-                 bridge.OccurrenceRole.definition(), false),
-    }),
-  })
-  local files = index:file_names()
-  test.assert(#files == 1 and files[1] == filename and
-              #index:file_occurrences(filename) == 1 and
-              #index:file_occurrences(external_file) == 0,
-              "inexact, unresolved, or external entries leaked into the index")
+  runtime.run(function ()
+    local filename = "/workspace/main.titan"
+    local external_file = "/external/dep.titan"
+    local external = bridge.ModuleSnapshot.new(
+      "vendor.dep",
+      bridge.Provenance.external_source(
+        bridge.SourceProvenance.new(external_file, {external_file})),
+      nil, {}, {
+        occurrence(external_file, 1, 1, 4, "dep", "export:vendor.dep:dep",
+                   bridge.OccurrenceRole.definition(), false),
+      }, {}, {}, nil, nil)
+    local index = indexer.build({project(
+      "app.main", filename, "known missing remote\n")}, {
+      external,
+      project_snapshot("app.main", filename, {
+        occurrence(filename, 1, 1, 6, "known", "export:app.main:known",
+                   bridge.OccurrenceRole.definition(), false),
+        missing_span(filename, 1, 7, "missing", "export:app.main:missing"),
+        occurrence(filename, 1, 15, 21, "remote", nil,
+                   bridge.OccurrenceRole.reference(), false),
+        occurrence(external_file, 1, 1, 4, "dep", "export:vendor.dep:dep",
+                   bridge.OccurrenceRole.definition(), false),
+      }),
+    })
+    defer index:close()
+    local files = index:file_names()
+    test.assert(#files == 1 and files[1] == filename and
+                #index:file_occurrences(filename) == 1 and
+                #index:file_occurrences(external_file) == 0,
+                "inexact, unresolved, or external entries leaked into the index")
+  end)
 end
 
 function test_semantic_index_deduplicates_and_sorts_each_file(
     _context: test.Context)
-  local a_file = "/workspace/a.titan"
-  local z_file = "/workspace/z.titan"
-  local first = occurrence(a_file, 1, 1, 4, "aaa", "export:m.a:aaa",
-                           bridge.OccurrenceRole.definition(), false)
-  local index = indexer.build({
-    project("m.z", z_file, "zzz aaa\n"),
-    project("m.a", a_file, "aaa zzz\n"),
-  }, {
-    project_snapshot("m.z", z_file, {
-      occurrence(z_file, 1, 5, 8, "aaa", "export:m.a:aaa",
-                 bridge.OccurrenceRole.reference(), false),
-      occurrence(z_file, 1, 1, 4, "zzz", "export:m.z:zzz",
-                 bridge.OccurrenceRole.definition(), false),
-    }),
-    project_snapshot("m.a", a_file, {
-      occurrence(a_file, 1, 5, 8, "zzz", "export:m.z:zzz",
-                 bridge.OccurrenceRole.reference(), false),
-      first,
-      first,
-    }),
-  })
-  local files = index:file_names()
-  test.assert(#files == 2 and files[1] == a_file and files[2] == z_file,
-              "indexed filenames were not bytewise deterministic")
-  local a = index:file_occurrences(a_file)
-  test.assert(#a == 2 and a[1].name == "aaa" and a[2].name == "zzz",
-              "file occurrences were not sorted or deduplicated")
-  local z = index:file_occurrences(z_file)
-  test.assert(#z == 2 and z[1].name == "zzz" and z[2].name == "aaa",
-              "per-file source order was not deterministic")
+  runtime.run(function ()
+    local a_file = "/workspace/a.titan"
+    local z_file = "/workspace/z.titan"
+    local first = occurrence(a_file, 1, 1, 4, "aaa", "export:m.a:aaa",
+                             bridge.OccurrenceRole.definition(), false)
+    local index = indexer.build({
+      project("m.z", z_file, "zzz aaa\n"),
+      project("m.a", a_file, "aaa zzz\n"),
+    }, {
+      project_snapshot("m.z", z_file, {
+        occurrence(z_file, 1, 5, 8, "aaa", "export:m.a:aaa",
+                   bridge.OccurrenceRole.reference(), false),
+        occurrence(z_file, 1, 1, 4, "zzz", "export:m.z:zzz",
+                   bridge.OccurrenceRole.definition(), false),
+      }),
+      project_snapshot("m.a", a_file, {
+        occurrence(a_file, 1, 5, 8, "zzz", "export:m.z:zzz",
+                   bridge.OccurrenceRole.reference(), false),
+        first,
+        first,
+      }),
+    })
+    defer index:close()
+    local files = index:file_names()
+    test.assert(#files == 2 and files[1] == a_file and files[2] == z_file,
+                "indexed filenames were not bytewise deterministic")
+    local a = index:file_occurrences(a_file)
+    test.assert(#a == 2 and a[1].name == "aaa" and a[2].name == "zzz",
+                "file occurrences were not sorted or deduplicated")
+    local z = index:file_occurrences(z_file)
+    test.assert(#z == 2 and z[1].name == "zzz" and z[2].name == "aaa",
+                "per-file source order was not deterministic")
+  end)
 end
 
 function test_semantic_index_rejects_stale_inexact_and_overlapping_spans(
     _context: test.Context)
-  local filename = "/workspace/bad.titan"
-  expect_index_error(function ()
-    indexer.build({project("bad", filename, "other\n")}, {
-      project_snapshot("bad", filename, {
-        occurrence(filename, 1, 1, 6, "count", "export:bad:count",
-                   bridge.OccurrenceRole.definition(), false),
-      }),
-    })
-  end, "does not contain identifier")
+  runtime.run(function ()
+    local filename = "/workspace/bad.titan"
+    expect_index_error(function ()
+      indexer.build({project("bad", filename, "other\n")}, {
+        project_snapshot("bad", filename, {
+          occurrence(filename, 1, 1, 6, "count", "export:bad:count",
+                     bridge.OccurrenceRole.definition(), false),
+        }),
+      })
+    end, "does not contain identifier")
 
-  expect_index_error(function ()
-    local start = location(filename, 1, 1)
-    local shifted = bridge.SymbolOccurrence.new(
-      "count", "export:bad:count", bridge.OccurrenceRole.definition(), start,
-      bridge.SourceSpan.new(location(filename, 1, 2),
-                            location(filename, 1, 7)), false,
-      bridge.DeclarationVisibility.exported(), nil)
-    indexer.build({project("bad", filename, " count\n")}, {
-      project_snapshot("bad", filename, {shifted}),
-    })
-  end, "does not start")
+    expect_index_error(function ()
+      local start = location(filename, 1, 1)
+      local shifted = bridge.SymbolOccurrence.new(
+        "count", "export:bad:count", bridge.OccurrenceRole.definition(), start,
+        bridge.SourceSpan.new(location(filename, 1, 2),
+                              location(filename, 1, 7)), false,
+        bridge.DeclarationVisibility.exported(), nil)
+      indexer.build({project("bad", filename, " count\n")}, {
+        project_snapshot("bad", filename, {shifted}),
+      })
+    end, "does not start")
 
-  expect_index_error(function ()
-    indexer.build({project("bad", filename, "count\n")}, {
-      project_snapshot("bad", filename, {
-        occurrence(filename, 1, 1, 6, "count", "export:bad:count",
-                   bridge.OccurrenceRole.definition(), false),
-        occurrence(filename, 1, 2, 5, "oun", "export:bad:oun",
-                   bridge.OccurrenceRole.reference(), false),
-      }),
-    })
-  end, "overlap")
+    expect_index_error(function ()
+      indexer.build({project("bad", filename, "count\n")}, {
+        project_snapshot("bad", filename, {
+          occurrence(filename, 1, 1, 6, "count", "export:bad:count",
+                     bridge.OccurrenceRole.definition(), false),
+          occurrence(filename, 1, 2, 5, "oun", "export:bad:oun",
+                     bridge.OccurrenceRole.reference(), false),
+        }),
+      })
+    end, "overlap")
+  end)
 end
 
 function test_semantic_index_treats_import_alias_as_a_declaration(
     _context: test.Context)
-  local filename = "/workspace/imports.titan"
-  local identity = "ast:app.imports:/workspace/imports.titan:1:7:dep"
-  local index = indexer.build({project(
-    "app.imports", filename, "local dep = dep\n")}, {
-    project_snapshot("app.imports", filename, {
-      occurrence(filename, 1, 7, 10, "dep", identity,
-                 bridge.OccurrenceRole.import_alias(), true),
-      occurrence(filename, 1, 13, 16, "dep", identity,
-                 bridge.OccurrenceRole.type_reference(), true),
-    }),
-  })
-  local definition? = index:definition(indexer.SymbolId.new(identity))
-  test.assert(definition ~= nil, "import alias was not a definition target")
-  assert_role(definition.role, "import_alias")
-  local uses = index:occurrences(indexer.SymbolId.new(identity), false)
-  test.assert(#uses == 1, "include-declaration omitted the wrong roles")
-  assert_role(uses[1].role, "type_reference")
+  runtime.run(function ()
+    local filename = "/workspace/imports.titan"
+    local identity = "ast:app.imports:/workspace/imports.titan:1:7:dep"
+    local index = indexer.build({project(
+      "app.imports", filename, "local dep = dep\n")}, {
+      project_snapshot("app.imports", filename, {
+        occurrence(filename, 1, 7, 10, "dep", identity,
+                   bridge.OccurrenceRole.import_alias(), true),
+        occurrence(filename, 1, 13, 16, "dep", identity,
+                   bridge.OccurrenceRole.type_reference(), true),
+      }),
+    })
+    defer index:close()
+    local definition? = index:definition(indexer.SymbolId.new(identity))
+    test.assert(definition ~= nil, "import alias was not a definition target")
+    assert_role(definition.role, "import_alias")
+    local uses = index:occurrences(indexer.SymbolId.new(identity), false)
+    test.assert(#uses == 1, "include-declaration omitted the wrong roles")
+    assert_role(uses[1].role, "type_reference")
+  end)
 end
 
-function test_semantic_index_large_build_has_bounded_sort_and_yields(
+function test_semantic_index_large_build_queries_sql_order_and_yields(
     _context: test.Context)
-  -- Deliberately not a power of two: the final merge pass must preserve the
-  -- short tail as well as meeting the comparison budget.
-  local count = 2053
-  local filename = "/workspace/stress.titan"
-  local output = strings.writer()
-  local in_source_order: {bridge.SymbolOccurrence} = {}
-  for line = 1, count do
-    local name = "item" .. line
-    output:write(name)
-    output:write("\n")
-    in_source_order[line] = occurrence(
-      filename, line, 1, #name + 1, name,
-      "export:stress:" .. name,
-      bridge.OccurrenceRole.definition(), false)
-  end
-  local contents = output:drain()
-  local reverse_order: {bridge.SymbolOccurrence} = {}
-  for index = 1, count do
-    reverse_order[index] = in_source_order[count - index + 1]
-  end
+  runtime.run(function ()
+    -- Deliberately not a power of two: the final merge pass must preserve the
+    -- short tail as well as meeting the comparison budget.
+    local count = 2053
+    local filename = "/workspace/stress.titan"
+    local output = strings.writer()
+    local in_source_order: {bridge.SymbolOccurrence} = {}
+    for line = 1, count do
+      local name = "item" .. line
+      output:write(name)
+      output:write("\n")
+      in_source_order[line] = occurrence(
+        filename, line, 1, #name + 1, name,
+        "export:stress:" .. name,
+        bridge.OccurrenceRole.definition(), false)
+    end
+    local contents = output:drain()
+    local reverse_order: {bridge.SymbolOccurrence} = {}
+    for index = 1, count do
+      reverse_order[index] = in_source_order[count - index + 1]
+    end
 
-  local yield_count = 0
-  local index = indexer.build_with_yield({
-    project("stress", filename, contents),
-  }, {
-    project_snapshot("stress", filename, reverse_order),
-  }, function () yield_count = yield_count + 1 end)
-  local items = index:file_occurrences(filename)
-  test.assert(#items == count and
-              items[1].byte_span.start == 0 and
-              items[count].name == "item" .. count,
-              "large semantic build did not retain deterministic source order")
-  local levels = 0
-  local width = 1
-  while width < count do
-    levels = levels + 1
-    width = width * 2
-  end
-  -- Coordinate decoding, project/file/snapshot collection, each merge-sort
-  -- output, normalization, and bucket construction all share one counter.
-  -- This exact oracle catches a missing yield account in any large loop.
-  local expected_work = #contents + 3 + count * (levels + 3)
-  test.assert(yield_count == expected_work // 1024,
-              "large semantic build did not account all bounded work")
-
-  local reversed: {indexer.Occurrence} = {}
-  for item_index = 1, count do
-    reversed[item_index] = items[count - item_index + 1]
-  end
-  local comparisons = indexer.sort_occurrences(reversed)
-  test.assert(comparisons > count and comparisons <= count * levels,
-              "occurrence ordering exceeded an n log n comparison budget")
-  for item_index = 2, count do
-    test.assert(
-      reversed[item_index - 1].byte_span.start <
-        reversed[item_index].byte_span.start,
-      "merge sort did not restore deterministic occurrence order")
-  end
+    local yield_count = 0
+    local index = indexer.build_with_yield({
+      project("stress", filename, contents),
+    }, {
+      project_snapshot("stress", filename, reverse_order),
+    }, function () yield_count = yield_count + 1 end)
+    defer index:close()
+    local items = index:file_occurrences(filename)
+    test.assert(#items == count and
+                items[1].byte_span.start == 0 and
+                items[count].name == "item" .. count,
+                "large semantic build did not retain deterministic source order")
+    test.assert(yield_count >= #contents // 1024,
+                "large semantic preparation did not yield for source decoding")
+    local middle? = index:occurrence_at(filename, source_text.Position.new(1024, 2))
+    test.assert(middle ~= nil and middle.name == "item1025",
+                "large indexed position query missed its token")
+  end)
 end
 
 function test_semantic_index_shares_yield_budget_across_small_files(
     _context: test.Context)
-  local projects: {bridge.ProjectModule} = {}
-  local snapshots: {bridge.ModuleSnapshot} = {}
-  for index = 1, 8 do
-    local module_name = "small" .. index
-    local filename = "/workspace/small" .. index .. ".titan"
-    local name = "item" .. index
-    local contents = strings.rep(" ", 900) .. name .. "\n"
-    projects[index] = project(module_name, filename, contents)
-    snapshots[index] = project_snapshot(module_name, filename, {
-      occurrence(filename, 1, 901, 901 + #name, name,
-                 "export:" .. module_name .. ":" .. name,
-                 bridge.OccurrenceRole.definition(), false),
-    })
-  end
+  runtime.run(function ()
+    local projects: {bridge.ProjectModule} = {}
+    local snapshots: {bridge.ModuleSnapshot} = {}
+    for index = 1, 8 do
+      local module_name = "small" .. index
+      local filename = "/workspace/small" .. index .. ".titan"
+      local name = "item" .. index
+      local contents = strings.rep(" ", 900) .. name .. "\n"
+      projects[index] = project(module_name, filename, contents)
+      snapshots[index] = project_snapshot(module_name, filename, {
+        occurrence(filename, 1, 901, 901 + #name, name,
+                   "export:" .. module_name .. ":" .. name,
+                   bridge.OccurrenceRole.definition(), false),
+      })
+    end
 
-  local yield_count = 0
-  local index = indexer.build_with_yield(
-    projects, snapshots, function () yield_count = yield_count + 1 end)
-  test.assert(#index:file_names() == 8,
-              "small-file semantic build lost indexed files")
-  test.assert(yield_count == 7,
-              "coordinate work did not share one bounded yield budget")
+    local yield_count = 0
+    local index = indexer.build_with_yield(
+      projects, snapshots, function () yield_count = yield_count + 1 end)
+    defer index:close()
+    test.assert(#index:file_names() == 8,
+                "small-file semantic build lost indexed files")
+    test.assert(yield_count == 7,
+                "coordinate work did not share one bounded yield budget")
+  end)
+end
+
+function test_semantic_index_binds_binary_identities_and_uses_query_indexes(
+    _context: test.Context)
+  runtime.run(function ()
+    local filename = "/workspace/raw\255.titan"
+    local identity = "declaration\0\255"
+    local index = one_module_index("binary", filename, "item item\n", {
+      occurrence(filename, 1, 1, 5, "item", identity,
+        bridge.OccurrenceRole.definition(), false),
+      occurrence(filename, 1, 6, 10, "item", identity,
+        bridge.OccurrenceRole.reference(), false),
+    }, {})
+    defer index:close()
+    local selected? = index:occurrence_at(filename, source_text.Position.new(0, 7))
+    test.assert(selected ~= nil and selected.symbol_id.declaration_id == identity,
+      "binary path or declaration identity changed across SQL")
+    test.assert(#index:occurrences(indexer.SymbolId.new(identity), true) == 2,
+      "binary symbol identity was not joined exactly")
+    local access = index.store:acquire()
+    defer access:release()
+    local queries = {
+      "SELECT * FROM main.semantic_occurrences WHERE filename=? AND start_line=0 " ..
+        "AND start_character<=7 AND finish_character>7 ORDER BY start_character DESC LIMIT 1",
+      "SELECT * FROM main.semantic_occurrences WHERE declaration_id=? AND role IN (0,1)",
+      "SELECT * FROM main.semantic_occurrences WHERE declaration_id=? ORDER BY filename,byte_start",
+    }
+    local indexes = {"semantic_occurrences_file", "semantic_declarations", "semantic_occurrences_symbol"}
+    for query_index = 1, #queries do
+      local statement = access.connection:prepare("EXPLAIN QUERY PLAN " .. queries[query_index])
+      defer statement:close()
+      local cursor = statement:query(indexer.blob(query_index == 1 and filename or identity))
+      defer cursor:close()
+      local used_index = false
+      for row in cursor:fetch do
+        local detail = row:get(4) as string
+        if strings.find(detail, indexes[query_index], 1, true) ~= nil then used_index = true end
+      end
+      test.assert(used_index, "semantic SQL query did not use its supporting index")
+    end
+    local constrained = false
+    do
+      indexer.execute(access.connection,
+        "INSERT INTO main.semantic_occurrences SELECT * FROM main.semantic_occurrences WHERE role=0")
+    catch
+      constrained = error is sqlite3.Error and (error as sqlite3.Error).code == 19
+    end
+    test.assert(constrained, "published declarations lacked the SQLite uniqueness constraint")
+
+  end)
+end
+
+function test_semantic_index_preserves_empty_modules_and_blob_source_batches(
+    _context: test.Context)
+  runtime.run(function ()
+    local files: {bridge.SourceFile} = {}
+    for index = 1, 45 do
+      files[index] = bridge.SourceFile.new("/workspace/batch" .. index .. ".titan",
+        "-- raw source " .. index .. "\0\255\n")
+    end
+    local summaries: {bridge.HoverSummary} = {}
+    for index = 1, 105 do
+      summaries[index] = record_hover_summary(index, "Record" .. index, "field: integer")
+    end
+    local index = indexer.build({
+      bridge.ProjectModule.new("empty", {}),
+      bridge.ProjectModule.new("batch", files),
+    }, {project_snapshot("batch", files[1].filename, {}, summaries)})
+    defer index:close()
+    local projects = index:project_modules()
+    test.assert(#projects == 2 and projects[1].module_name == "empty" and
+      #projects[1].files == 0 and projects[2].module_name == "batch" and
+      #projects[2].files == 45,
+      "published source batches lost module order or empty modules")
+    test.assert(projects[2].files[45].contents == files[45].contents,
+      "arbitrary source bytes changed across the last source batch")
+    test.assert(index:hover_summary_count() == 105,
+      "summary publication lost rows across its binding batch limit")
+  end)
 end

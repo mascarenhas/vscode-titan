@@ -1,4 +1,5 @@
 local async = import "async"
+local sqlite3 = import "sqlite3"
 local fs = import "fs"
 local iteration = import "iteration"
 local strings = import "string"
@@ -8,17 +9,16 @@ local logging = import "server.logging"
 local project_config = import "server.project_config"
 local project_discovery = import "server.project_discovery"
 local project_graph = import "server.project_graph"
+local metadata = import "server.project_metadata"
+local sql = import "server.workspace_store"
+local content_identity = import "server.content_identity"
 
 record Error
   path: string
   message: string
 end
 
-record SourceFileSnapshot
-  const filename: string
-  const contents: string
-  const stamp: project_graph.FileStamp
-end
+type SourceFileSnapshot = metadata.SourceFileSnapshot
 
 -- `dirty` means an input changed and compiler work is required. A failed
 -- result is instead current for its exact revision: it carries authoritative
@@ -37,54 +37,12 @@ record ProjectModule
   const analysis_state: ProjectAnalysisState
 end
 
-record ExternalSource
-  const main_file: string
-  const source_files: {string}
-end
-
-record ExternalBinary
-  const provider_file: string
-end
-
-union ExternalOrigin
-  source: ExternalSource
-  dynamic_binary: ExternalBinary
-  static_binary: ExternalBinary
-end
-
--- This record intentionally cannot carry compiler nodes, symbols, or a raw
--- AST. External compiler snapshots are converted to this metadata-only shape
--- immediately when a generation is committed.
-record ExternalModule
-  const module_name: string
-  const origin: ExternalOrigin
-  const manifest: project_graph.Manifest
-  const stamps: {project_graph.FileStamp}
-  const analyzed_input_identity: string?
-  const imports: {project_graph.ImportEdge}
-  const compiler_imports: {compiler_bridge.Import}
-  const c_header_dependencies: {compiler_bridge.CHeaderDependency}
-end
-
--- Immutable pre-analysis identity for one external import name. The optional
--- origin represents a clean resolver miss/error. It never carries a compiler
--- type, AST, or symbol table.
-record ExternalFingerprint
-  const module_name: string
-  const source_required: boolean
-  const topology_resolved: boolean
-  const origin: ExternalOrigin?
-  const stamps: {project_graph.FileStamp}
-  const error: string?
-end
-
--- Exact compiler-observed inputs for one module's C preprocessor closure.
--- These are deliberately path identities rather than watched directories:
--- `search` entries include misses and therefore notice a new earlier shadow.
-record HeaderFingerprint
-  const module_name: string
-  const dependencies: {compiler_bridge.CHeaderDependency}
-end
+type ExternalSource = metadata.ExternalSource
+type ExternalBinary = metadata.ExternalBinary
+type ExternalOrigin = metadata.ExternalOrigin
+type ExternalModule = metadata.ExternalModule
+type ExternalFingerprint = metadata.ExternalFingerprint
+type HeaderFingerprint = metadata.HeaderFingerprint
 
 record Snapshot
   const generation: integer
@@ -117,8 +75,9 @@ type ExternalResolver = (
   project_config.ProjectConfig, {string},
   {compiler_bridge.ExternalResolutionRequest}) ->
   {compiler_bridge.ExternalResolution}
-type HeaderRestater = ({compiler_bridge.CHeaderDependency}) ->
-                      {compiler_bridge.CHeaderDependency}
+type HeaderRestater = ({compiler_bridge.CHeaderDependency},
+                      compiler_bridge.HeaderValidation?) ->
+                      ({compiler_bridge.CHeaderDependency}, boolean)
 -- Lifecycle owners use the saved snapshot after discovery to establish their
 -- watcher before compiler analysis begins. The cold loader immediately scans
 -- once more after its first callback, closing the initial
@@ -126,10 +85,19 @@ type HeaderRestater = ({compiler_bridge.CHeaderDependency}) ->
 -- before analysis.
 type SnapshotListener = (Snapshot) -> ()
 
+record PublicationHooks
+  const prepare: (Snapshot) -> boolean
+  const publish: (sqlite3.Connection) -> ()
+  const committed: (() -> ())?
+end
+
 record Counters
   const file_reads: integer
   const analysis_runs: integer
   const project_modules_submitted: integer
+  const external_file_reads: integer
+  const file_hashes: integer
+  const external_file_hashes: integer
 end
 
 record RefreshReport
@@ -141,12 +109,7 @@ record RefreshReport
   const dirty_modules: {string}
 end
 
-local record ProjectState
-  module_name: string
-  source_files: {SourceFileSnapshot}
-  compiler_snapshot: compiler_bridge.ModuleSnapshot?
-  diagnostics: {compiler_bridge.Diagnostic}
-end
+local type ProjectState = metadata.ProjectState
 
 record Service
   local project_root: string
@@ -157,22 +120,45 @@ record Service
   local current_config: project_config.ProjectConfig
   local catalog: project_discovery.Discovery
   local graph: project_graph.Graph<compiler_bridge.ModuleSnapshot>
-  local projects: {string: ProjectState}
-  local project_names: {string}
-  local externals: {string: ExternalModule}
-  local external_names: {string}
-  local external_fingerprints: {string: ExternalFingerprint}
-  local external_fingerprint_names: {string}
-  local header_fingerprints: {string: HeaderFingerprint}
-  local header_fingerprint_names: {string}
+  local const store: sql.Store
+  local const metadata: metadata.Metadata
   local read_count: integer
+  local external_read_count: integer
+  local hash_count: integer
+  local external_hash_count: integer
   local analysis_count: integer
   local submitted_count: integer
   local analysis_active: boolean
+  local analysis_task: async.Task<value, value>?
+  local publication_hooks: PublicationHooks?
 end
 
 local function fail<T>(path: string, message: string): T
   raise Error.new(path, message)
+end
+
+-- Call after collecting filesystem/compiler observations and while holding
+-- the Store lease. An observation baseline and the work it invalidates must
+-- survive a process interruption together. Nested adapters borrow the caller's
+-- transaction; only the outer updater owns COMMIT/ROLLBACK.
+local function Service:update_metadata(body: () -> ())
+  local connection = self.graph.connection
+  if not connection:get_autocommit() then
+    body()
+    return
+  end
+  local saved_asts = self.graph:checkpoint_asts()
+  connection:set_autocommit(false)
+  local complete = false
+  defer do
+    if not complete then
+      connection:rollback()
+      self.graph:restore_asts(saved_asts)
+    end
+  end
+  body()
+  connection:commit()
+  complete = true
 end
 
 local function copy_strings(source: {string}): {string}
@@ -195,7 +181,7 @@ local function copy_stamps(
     local stamp = source[index]
     result[index] = project_graph.FileStamp.new(
       stamp.path, stamp.modified_seconds, stamp.modified_nanoseconds,
-      stamp.size)
+      stamp.size, stamp.identity, stamp.physical_identity)
   end
   return result
 end
@@ -219,8 +205,15 @@ local function copy_header_dependencies(
     when search then kind = compiler_bridge.CHeaderDependencyKind.search()
     when file then
     end
+    local observation: compiler_bridge.HeaderObservation?
+    if dependency.observation ~= nil then
+      observation = compiler_bridge.HeaderObservation.new(
+        dependency.observation.modified_seconds,
+        dependency.observation.modified_nanoseconds,
+        dependency.observation.physical_identity)
+    end
     result[index] = compiler_bridge.CHeaderDependency.new(
-      kind, dependency.path, dependency.identity)
+      kind, dependency.path, dependency.identity, observation)
   end
   return result
 end
@@ -234,6 +227,25 @@ local function same_header_dependencies(
     local after = right[index]
     if header_kind_name(before.kind) ~= header_kind_name(after.kind) or
        before.path ~= after.path or before.identity ~= after.identity then
+      return false
+    end
+  end
+  return true
+end
+
+local function same_header_observations(
+    left: {compiler_bridge.CHeaderDependency},
+    right: {compiler_bridge.CHeaderDependency}): boolean
+  if not same_header_dependencies(left, right) then return false end
+  for index = 1, #left do
+    local before? = left[index].observation
+    local after? = right[index].observation
+    if before == nil then
+      if after ~= nil then return false end
+    elseif after == nil or
+           before.modified_seconds ~= after.modified_seconds or
+           before.modified_nanoseconds ~= after.modified_nanoseconds or
+           before.physical_identity ~= after.physical_identity then
       return false
     end
   end
@@ -330,12 +342,31 @@ local function copy_config(source: project_config.ProjectConfig):
     copy_strings(source.extra_ffi_include_dirs), source.extra_ffi_cppflags)
 end
 
-local function same_stamp(left: project_graph.FileStamp,
-                          right: project_graph.FileStamp): boolean
+local function same_observed_stamp(left: project_graph.FileStamp,
+                                   right: project_graph.FileStamp): boolean
   return left.path == right.path and
          left.modified_seconds == right.modified_seconds and
          left.modified_nanoseconds == right.modified_nanoseconds and
-         left.size == right.size
+         left.size == right.size and left.identity == right.identity and
+         left.physical_identity == right.physical_identity
+end
+
+local function same_stamp(left: project_graph.FileStamp,
+                          right: project_graph.FileStamp): boolean
+  if left.path ~= right.path or left.size ~= right.size or
+     left.identity ~= right.identity or
+     left.physical_identity ~= right.physical_identity then return false end
+  if left.identity == nil then return same_observed_stamp(left, right) end
+  return true
+end
+
+local function same_observed_stamps(left: {project_graph.FileStamp},
+                                    right: {project_graph.FileStamp}): boolean
+  if #left ~= #right then return false end
+  for index = 1, #left do
+    if not same_observed_stamp(left[index], right[index]) then return false end
+  end
+  return true
 end
 
 local function same_stamps(left: {project_graph.FileStamp},
@@ -374,15 +405,52 @@ local function external_matches_fingerprint(
          same_stamps(external.stamps, fingerprint.stamps)
 end
 
-local function stamp_for(path: string): project_graph.FileStamp?
-  local metadata? = fs.stat(path)
-  if metadata == nil then return nil end
-  if metadata.kind ~= "file" then
-    return fail<project_graph.FileStamp>(path, "path is not a regular file")
+-- An unchanged observation reuses its certified content without reading it.
+-- Replacement and symlink retargeting are new physical inputs, irrespective
+-- of the saved timestamp. Changed timestamps trigger one stable read/hash.
+local function read_saved_file(path: string, previous: project_graph.FileStamp?,
+    cached_contents: string?): (string?, project_graph.FileStamp?, integer, integer)
+  local reads = 0
+  for _attempt = 1, 3 do
+    local before? = content_identity.observe(path)
+    if before == nil then return nil, nil, reads, 0 end
+    if before.kind ~= "file" then
+      return fail<string>(path, "path is not a regular file"), nil, reads, 0
+    end
+    if previous ~= nil and previous.path == path and previous.identity ~= nil and
+       previous.physical_identity == before.physical_identity and
+       previous.modified_seconds == before.modified_seconds and
+       previous.modified_nanoseconds == before.modified_nanoseconds and
+       previous.size == before.size then
+      return cached_contents, previous, reads, 0
+    end
+    local contents = fs.read_file(path)
+    reads = reads + 1
+    local after? = content_identity.observe(path)
+    if after ~= nil and content_identity.same_observation(before, after) then
+      return contents, project_graph.FileStamp.new(
+        path, after.modified_seconds, after.modified_nanoseconds,
+        after.size, content_identity.digest(contents), after.physical_identity), reads, 1
+    end
   end
-  return project_graph.FileStamp.new(
-    path, metadata.modified_seconds, metadata.modified_nanoseconds,
-    metadata.size)
+  return fail<string>(path,
+    "saved input changed repeatedly while it was being read"), nil, reads, 0
+end
+
+local function Service:stamp_for(path: string, previous: project_graph.FileStamp?):
+    project_graph.FileStamp?
+  local _contents?, stamp?, reads, hashes = read_saved_file(path, previous)
+  self.external_read_count = self.external_read_count + reads
+  self.external_hash_count = self.external_hash_count + hashes
+  return stamp
+end
+
+local function find_stamp(stamps: {project_graph.FileStamp}, path: string):
+    project_graph.FileStamp?
+  for index = 1, #stamps do
+    if stamps[index].path == path then return stamps[index] end
+  end
+  return nil
 end
 
 local function find_file(source: {SourceFileSnapshot},
@@ -395,36 +463,31 @@ end
 
 local function Service:read_stable_file(
     filename: string, previous: SourceFileSnapshot?): SourceFileSnapshot
-  local observed? = stamp_for(filename)
-  if observed == nil then
+  local previous_stamp: project_graph.FileStamp?
+  local previous_contents: string?
+  if previous ~= nil then
+    previous_stamp = previous.stamp
+    previous_contents = previous.contents
+  end
+  local contents?, observed?, reads, hashes = read_saved_file(
+    filename, previous_stamp, previous_contents)
+  self.read_count = self.read_count + reads
+  self.hash_count = self.hash_count + hashes
+  if contents == nil or observed == nil then
     return fail<SourceFileSnapshot>(filename, "saved source file disappeared")
   end
-  if previous ~= nil and same_stamp(previous.stamp, observed) then
-    return previous
-  end
-
-  -- fs operations can yield. Re-stat after each read so the bytes and stamp
-  -- represent one stable saved-file observation instead of a torn update.
-  for _attempt = 1, 3 do
-    local before? = stamp_for(filename)
-    if before == nil then
-      return fail<SourceFileSnapshot>(filename,
-        "saved source file disappeared before it could be read")
-    end
-    self.read_count = self.read_count + 1
-    local contents = fs.read_file(filename)
-    local after? = stamp_for(filename)
-    if after ~= nil and same_stamp(before, after) then
-      return SourceFileSnapshot.new(filename, contents, after)
+  if previous ~= nil then
+    if same_observed_stamp(previous.stamp, observed) then return previous end
+    if same_stamp(previous.stamp, observed) then
+      return SourceFileSnapshot.new(filename, previous.contents, observed)
     end
   end
-  return fail<SourceFileSnapshot>(filename,
-    "saved source file changed repeatedly while it was being read")
+  return SourceFileSnapshot.new(filename, contents, observed)
 end
 
 local function Service:snapshot_discovered_module(
-    module: project_discovery.Module): ProjectState
-  local previous? = self.projects[module.name]
+    module: project_discovery.Module): (ProjectState, boolean, boolean)
+  local previous? = self.metadata:project(module.name)
   local files: {SourceFileSnapshot} = {}
   for index = 1, #module.files do
     local old_file: SourceFileSnapshot? = nil
@@ -435,11 +498,25 @@ local function Service:snapshot_discovered_module(
   end
 
   if previous ~= nil then
+    local changed = #previous.source_files ~= #files
+    local observed = changed
+    if not changed then
+      for index = 1, #files do
+        if previous.source_files[index].filename ~= files[index].filename or
+           not same_stamp(previous.source_files[index].stamp, files[index].stamp) then
+          changed = true
+          observed = true
+          break
+        end
+        if not same_observed_stamp(previous.source_files[index].stamp,
+            files[index].stamp) then observed = true end
+      end
+    end
     return ProjectState.new(module.name, files,
                             previous.compiler_snapshot,
-                            previous.diagnostics)
+                            previous.diagnostics), changed, observed
   end
-  return ProjectState.new(module.name, files, nil, {})
+  return ProjectState.new(module.name, files, nil, {}), true, true
 end
 
 local function state_stamps(state: ProjectState): {project_graph.FileStamp}
@@ -448,27 +525,6 @@ local function state_stamps(state: ProjectState): {project_graph.FileStamp}
     result[index] = state.source_files[index].stamp
   end
   return result
-end
-
-local function same_string_arrays(left: {string}, right: {string}): boolean
-  if #left ~= #right then return false end
-  for index = 1, #left do
-    if left[index] ~= right[index] then return false end
-  end
-  return true
-end
-
-local function same_analysis_config(left: project_config.ProjectConfig,
-                                    right: project_config.ProjectConfig): boolean
-  return left.project_root == right.project_root and
-         left.config_file == right.config_file and
-         same_string_arrays(left.include, right.include) and
-         same_string_arrays(left.source_module_roots,
-                            right.source_module_roots) and
-         left.binary_modules_root == right.binary_modules_root and
-         same_string_arrays(left.extra_ffi_include_dirs,
-                            right.extra_ffi_include_dirs) and
-         left.extra_ffi_cppflags == right.extra_ffi_cppflags
 end
 
 local function contains_name(names: {string}, name: string): boolean
@@ -501,32 +557,30 @@ local function remove_name(names: {string}, name: string)
 end
 
 local function Service:forget_header_fingerprint(module_name: string)
-  self.header_fingerprints[module_name] = nil
-  remove_name(self.header_fingerprint_names, module_name)
+  self.metadata:remove_header(module_name)
 end
 
 local function Service:remember_header_fingerprint(
     module_name: string,
     dependencies: {compiler_bridge.CHeaderDependency})
-  self.header_fingerprints[module_name] = HeaderFingerprint.new(
-    module_name, copy_header_dependencies(dependencies))
-  insert_name(self.header_fingerprint_names, module_name)
+  self.metadata:write_header(module_name, dependencies)
 end
 
 local function Service:restat_header_dependencies(
     module_name: string,
-    dependencies: {compiler_bridge.CHeaderDependency}):
-    {compiler_bridge.CHeaderDependency}
-  if #dependencies == 0 then return {} end
+    dependencies: {compiler_bridge.CHeaderDependency},
+    validation: compiler_bridge.HeaderValidation?):
+    ({compiler_bridge.CHeaderDependency}, boolean)
+  if #dependencies == 0 then return {}, false end
   if self.header_restater == nil then
     return fail<{compiler_bridge.CHeaderDependency}>(module_name,
-      "analyzer reported C header dependencies without a header restater")
+      "analyzer reported C header dependencies without a header restater"), false
   end
-  local current = (self.header_restater as HeaderRestater)(
-    copy_header_dependencies(dependencies))
+  local current, changed = (self.header_restater as HeaderRestater)(
+    copy_header_dependencies(dependencies), validation)
   if #current ~= #dependencies then
     return fail<{compiler_bridge.CHeaderDependency}>(module_name,
-      "header restater returned the wrong number of dependencies")
+      "header restater returned the wrong number of dependencies"), false
   end
   for index = 1, #dependencies do
     local before = dependencies[index]
@@ -534,32 +588,39 @@ local function Service:restat_header_dependencies(
     if header_kind_name(before.kind) ~= header_kind_name(after.kind) or
        before.path ~= after.path then
       return fail<{compiler_bridge.CHeaderDependency}>(module_name,
-        "header restater changed dependency kind/path at index " .. index)
+        "header restater changed dependency kind/path at index " .. index), false
     elseif after.identity == "" then
       return fail<{compiler_bridge.CHeaderDependency}>(module_name,
-        "header restater returned an empty identity at index " .. index)
+        "header restater returned an empty identity at index " .. index), false
     end
   end
-  return copy_header_dependencies(current)
+  return copy_header_dependencies(current), changed
 end
 
 local function Service:accept_revalidated_headers(
     module_name: string,
-    current: {compiler_bridge.CHeaderDependency}): boolean
-  local previous? = self.header_fingerprints[module_name]
-  if previous ~= nil and
+    current: {compiler_bridge.CHeaderDependency}, changed: boolean?): boolean
+  local previous? = self.metadata:header(module_name)
+  if changed ~= true and previous ~= nil and
      same_header_dependencies(previous.dependencies, current) then
+    if not same_header_observations(previous.dependencies, current) then
+      self:update_metadata(function ()
+        self.metadata:refresh_header_observations(module_name, current)
+      end)
+    end
     return false
   end
-  self:remember_header_fingerprint(module_name, current)
-  if previous ~= nil then
-    if self.projects[module_name] ~= nil then
-      self.graph:invalidate_project(module_name)
-    elseif self.externals[module_name] ~= nil or
-           #self.graph:reverse_imports(module_name) > 0 then
-      self.graph:invalidate_external_change(module_name)
+  self:update_metadata(function ()
+    self:remember_header_fingerprint(module_name, current)
+    if previous ~= nil then
+      if self.metadata:has_project(module_name) then
+        self.graph:invalidate_project(module_name)
+      elseif self.metadata:has_external(module_name) or
+             #self.graph:reverse_imports(module_name) > 0 then
+        self.graph:invalidate_external_change(module_name)
+      end
     end
-  end
+  end)
   return true
 end
 
@@ -567,40 +628,39 @@ end
 -- identity before invalidation so repeated scans of the same filesystem state
 -- do not advance the graph revision forever.
 local function Service:revalidate_known_headers()
-  local names = copy_strings(self.header_fingerprint_names)
+  local names = copy_strings(self.metadata:header_names())
+  local validation = compiler_bridge.header_validation()
   for index = 1, #names do
     local name = names[index]
-    local previous? = self.header_fingerprints[name]
+    local previous? = self.metadata:header(name)
     if previous ~= nil then
-      local current = self:restat_header_dependencies(
-        name, previous.dependencies)
-      if not same_header_dependencies(previous.dependencies, current) then
-        self:accept_revalidated_headers(name, current)
+      local current, changed = self:restat_header_dependencies(
+        name, previous.dependencies, validation)
+      if changed or not same_header_observations(previous.dependencies, current) then
+        self:accept_revalidated_headers(name, current, changed)
       end
     end
   end
 end
 
 local function Service:invalidate_all_projects()
-  for index = 1, #self.project_names do
-    self.graph:invalidate_project(self.project_names[index])
+  local project_names = self.metadata:project_names()
+  for index = 1, #project_names do
+    self.graph:invalidate_project(project_names[index])
   end
 end
 
 local function Service:clear_external_cache()
-  local names = copy_strings(self.external_names)
+  local names = copy_strings(self.metadata:external_names())
   for index = 1, #names do
     self.graph:prune_external(names[index])
     self:forget_header_fingerprint(names[index])
   end
-  self.externals = {}
-  self.external_names = {}
-  self.external_fingerprints = {}
-  self.external_fingerprint_names = {}
+  self.metadata:clear_externals()
 end
 
 local function Service:source_required_for_external(name: string): boolean
-  local remembered? = self.external_fingerprints[name]
+  local remembered? = self.metadata:fingerprint(name)
   if remembered ~= nil then return remembered.source_required end
   local reverse = self.graph:reverse_imports(name)
   for index = 1, #reverse do
@@ -612,9 +672,9 @@ local function Service:source_required_for_external(name: string): boolean
   return false
 end
 
-local function fingerprint_from_resolution(
+local function Service:fingerprint_from_resolution(
     resolution: compiler_bridge.ExternalResolution,
-    source_required: boolean): ExternalFingerprint
+    source_required: boolean, previous: ExternalFingerprint?): ExternalFingerprint
   local origin?: ExternalOrigin = nil
   local paths: {string} = {}
   if resolution.provenance ~= nil then
@@ -640,7 +700,9 @@ local function fingerprint_from_resolution(
   local stamps: {project_graph.FileStamp} = {}
   local message? = resolution.error
   for index = 1, #paths do
-    local stamp? = stamp_for(paths[index])
+    local old: project_graph.FileStamp?
+    if previous ~= nil then old = find_stamp(previous.stamps, paths[index]) end
+    local stamp? = self:stamp_for(paths[index], old)
     if stamp == nil then
       message = "resolved external file disappeared before analysis: " ..
                 paths[index]
@@ -653,7 +715,7 @@ local function fingerprint_from_resolution(
     resolution.module_name, source_required, true, origin, stamps, message)
 end
 
-local function restat_external_fingerprint(
+local function Service:restat_external_fingerprint(
     previous: ExternalFingerprint): ExternalFingerprint
   local origin?: ExternalOrigin = nil
   local paths: {string} = {}
@@ -669,7 +731,7 @@ local function restat_external_fingerprint(
   local message? = previous.error
   if origin ~= nil then message = nil end
   for index = 1, #paths do
-    local stamp? = stamp_for(paths[index])
+    local stamp? = self:stamp_for(paths[index], find_stamp(previous.stamps, paths[index]))
     if stamp == nil then
       message = "resolved external file disappeared before analysis: " ..
                 paths[index]
@@ -685,20 +747,33 @@ end
 
 local function Service:accept_revalidated_fingerprint(
     current: ExternalFingerprint)
-  local previous? = self.external_fingerprints[current.module_name]
+  local previous? = self.metadata:fingerprint(current.module_name)
+  local external? = self.metadata:external(current.module_name)
   local changed = false
   if previous ~= nil then
     changed = not same_external_fingerprint(previous, current)
   else
-    local external? = self.externals[current.module_name]
     changed = external ~= nil and
               not external_matches_fingerprint(external, current)
   end
-  self.external_fingerprints[current.module_name] = current
-  insert_name(self.external_fingerprint_names, current.module_name)
-  if changed then
-    self.graph:invalidate_external_change(current.module_name)
-  end
+  local observation_changed = previous == nil or
+    not same_observed_stamps(previous.stamps, current.stamps)
+  local refresh_external = external ~= nil and
+    external_matches_fingerprint(external, current) and
+    not same_observed_stamps(external.stamps, current.stamps)
+  if not changed and not observation_changed and not refresh_external then return end
+  self:update_metadata(function ()
+    if changed or previous == nil then
+      self.metadata:write_fingerprint(current)
+    elseif observation_changed then
+      self.metadata:refresh_fingerprint_observations(current.module_name, current.stamps)
+    end
+    if refresh_external then
+      self.metadata:refresh_external_observations(current.module_name, current.stamps)
+      self.graph:refresh_file_observations(current.module_name, current.stamps)
+    end
+    if changed then self.graph:invalidate_external_change(current.module_name) end
+  end)
 end
 
 -- Re-resolve only import names already present in committed or pending
@@ -708,11 +783,12 @@ end
 -- metadata-only fingerprints are re-statted without inventing an ordinary
 -- resolver/import choice.
 local function Service:revalidate_external_topology()
-  if #self.external_fingerprint_names == 0 then return end
+  local fingerprint_names = self.metadata:fingerprint_names()
+  if #fingerprint_names == 0 then return end
   local requests: {compiler_bridge.ExternalResolutionRequest} = {}
-  for index = 1, #self.external_fingerprint_names do
-    local name = self.external_fingerprint_names[index]
-    local previous? = self.external_fingerprints[name]
+  for index = 1, #fingerprint_names do
+    local name = fingerprint_names[index]
+    local previous? = self.metadata:fingerprint(name)
     if previous ~= nil then
       if previous.topology_resolved and self.external_resolver ~= nil then
         requests[#requests + 1] =
@@ -720,14 +796,14 @@ local function Service:revalidate_external_topology()
             name, self:source_required_for_external(name))
       else
         self:accept_revalidated_fingerprint(
-          restat_external_fingerprint(previous))
+          self:restat_external_fingerprint(previous))
       end
     end
   end
   if #requests == 0 then return end
   local resolver = self.external_resolver as ExternalResolver
   local resolutions = resolver(
-    copy_config(self.current_config), copy_strings(self.project_names), requests)
+    copy_config(self.current_config), copy_strings(self.metadata:project_names()), requests)
   if #resolutions ~= #requests then
     raise Error.new(self.project_root,
       "external resolver returned the wrong number of results")
@@ -741,22 +817,23 @@ local function Service:revalidate_external_topology()
         "external resolver returned '" .. resolution.module_name ..
         "' while resolving '" .. request.module_name .. "'")
     end
-    local current = fingerprint_from_resolution(
-      resolution, request.source_required)
+    local current = self:fingerprint_from_resolution(
+      resolution, request.source_required, self.metadata:fingerprint(request.module_name))
     self:accept_revalidated_fingerprint(current)
   end
 end
 
 local function Service:revalidate_external_files()
-  local names = copy_strings(self.external_names)
+  local names = copy_strings(self.metadata:external_names())
   for index = 1, #names do
     local name = names[index]
-    local external? = self.externals[name]
+    local external? = self.metadata:external(name)
     if external ~= nil then
       local current: {project_graph.FileStamp} = {}
       local missing = false
       for file_index = 1, #external.stamps do
-        local stamp? = stamp_for(external.stamps[file_index].path)
+        local previous_stamp = external.stamps[file_index]
+        local stamp? = self:stamp_for(previous_stamp.path, previous_stamp)
         if stamp == nil then
           missing = true
           break
@@ -765,32 +842,40 @@ local function Service:revalidate_external_files()
       end
 
       if missing then
-        self.graph:remove_module(name)
-        self.externals[name] = nil
-        remove_name(self.external_names, name)
-        self:forget_header_fingerprint(name)
+        self:update_metadata(function ()
+          self.graph:remove_module(name)
+          self.metadata:remove_external(name)
+          self:forget_header_fingerprint(name)
+        end)
       elseif not same_stamps(current, external.stamps) then
-        case external.origin
-        when source then
-          self.graph:upsert_external_source(
-            name, current, external.manifest, external.imports)
-        when dynamic_binary then
-          self.graph:upsert_external_binary(
-            name, current, external.manifest, external.imports)
-        when static_binary then
-          self.graph:upsert_external_binary(
-            name, current, external.manifest, external.imports)
-        end
-        self.externals[name] = ExternalModule.new(
-          name, external.origin, external.manifest, current,
-          external.analyzed_input_identity,
-          external.imports, external.compiler_imports,
-          external.c_header_dependencies)
-        -- The old manifest cannot prove that changed external bytes kept the
-        -- same interface. Cross external metadata nodes to every first project
-        -- consumer; those projects' recomputed manifests govern propagation
-        -- through the project graph.
-        self.graph:invalidate_external_change(name)
+        self:update_metadata(function ()
+          case external.origin
+          when source then
+            self.graph:upsert_external_source(
+              name, current, external.manifest, external.imports)
+          when dynamic_binary then
+            self.graph:upsert_external_binary(
+              name, current, external.manifest, external.imports)
+          when static_binary then
+            self.graph:upsert_external_binary(
+              name, current, external.manifest, external.imports)
+          end
+          self.metadata:write_external(ExternalModule.new(
+            name, external.origin, external.manifest, current,
+            external.analyzed_input_identity,
+            external.imports, external.compiler_imports,
+            external.c_header_dependencies))
+          -- The old manifest cannot prove that changed external bytes kept the
+          -- same interface. Cross external metadata nodes to every first project
+          -- consumer; those projects' recomputed manifests govern propagation
+          -- through the project graph.
+          self.graph:invalidate_external_change(name)
+        end)
+      elseif not same_observed_stamps(current, external.stamps) then
+        self:update_metadata(function ()
+          self.graph:refresh_file_observations(name, current)
+          self.metadata:refresh_external_observations(name, current)
+        end)
       end
     end
   end
@@ -798,6 +883,10 @@ end
 
 local function Service:scan_or_raise(): Snapshot
   local started = logging.clock()
+  local reads_before = self.read_count
+  local hashes_before = self.hash_count
+  local external_reads_before = self.external_read_count
+  local external_hashes_before = self.external_hash_count
   logging.emit("debug", "project.scan.start", {
     ["root"] = self.project_root,
     ["generation"] = self.graph:generation(),
@@ -813,55 +902,93 @@ local function Service:scan_or_raise(): Snapshot
     return fail<Snapshot>(discovery_error.path, discovery_error.message)
   end
 
-  -- Exclude is watcher policy only. It changes the published Snapshot and
-  -- reconciled registrations without invalidating compiler results.
-  local config_changed = not same_analysis_config(self.current_config, loaded)
+  -- Compare with the configuration that produced the persisted graph, even
+  -- when construction loaded a newer configuration before this first scan.
+  -- Exclude remains watcher policy and is omitted from semantic_identity.
+  local configuration = loaded:semantic_identity()
+  local remembered_configuration = sql.rows(self.graph.connection,
+    "SELECT value FROM main.cache_meta WHERE key=?",
+    sqlite3.Blob.new("graph_configuration"))
+  local config_changed = #remembered_configuration == 0 or
+    sql.bytes(remembered_configuration[1], 1) ~= configuration
   local next_projects: {string: ProjectState} = {}
+  local changed_sources: {string: boolean} = {}
+  local observed_sources: {string: boolean} = {}
   local next_names: {string} = {}
   for index = 1, #found.modules do
     local module = found.modules[index]
-    local state = self:snapshot_discovered_module(module)
+    local state, changed, observed = self:snapshot_discovered_module(module)
     next_projects[module.name] = state
+    changed_sources[module.name] = changed
+    observed_sources[module.name] = observed
     next_names[index] = module.name
   end
 
-  local old_names = copy_strings(self.project_names)
-  for index = 1, #old_names do
-    local name = old_names[index]
-    if next_projects[name] == nil then
-      self.graph:remove_module(name)
-      self:forget_header_fingerprint(name)
+  do
+    local connection = self.graph.connection
+    local saved_asts = self.graph:checkpoint_asts()
+    connection:set_autocommit(false)
+    local published = false
+    defer do
+      if not published then
+        connection:rollback()
+        self.graph:restore_asts(saved_asts)
+      end
     end
+    local old_names = copy_strings(self.metadata:project_names())
+    for index = 1, #old_names do
+      local name = old_names[index]
+      if next_projects[name] == nil then
+        self.graph:remove_module(name)
+        self.metadata:remove_project(name)
+        self:forget_header_fingerprint(name)
+      end
+    end
+    for index = 1, #next_names do
+      local name = next_names[index]
+      local state = next_projects[name]
+      local observation = self.graph:observe_project(name, state_stamps(state))
+      if changed_sources[name] then
+        if not observation.changed then self.graph:invalidate_project(name) end
+        self.metadata:write_project_sources(name, state.source_files)
+      elseif observed_sources[name] then
+        self.metadata:refresh_project_observations(name, state.source_files)
+      end
+    end
+    if config_changed then
+      self:invalidate_all_projects()
+      -- Every resolution input is configuration-dependent, including FFI
+      -- include paths used while checking external source. Do not carry an old
+      -- serialized interface or provider identity across any config change.
+      self:clear_external_cache()
+      -- Search observations are relative to the configured compiler paths. The
+      -- projects are already dirty, so let their next compiler result establish
+      -- a fresh closure instead of restatting obsolete candidates.
+      self.metadata:clear_headers()
+      -- A process can stop after graph checking but before semantic/cache
+      -- publication. Keep this identity with the work revisions themselves.
+      sql.execute(connection,
+        "INSERT INTO main.cache_meta(key,value) VALUES(?,?) " ..
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        sqlite3.Blob.new("graph_configuration"), sqlite3.Blob.new(configuration))
+    end
+    connection:commit()
+    published = true
   end
-  for index = 1, #next_names do
-    local name = next_names[index]
-    self.graph:observe_project(name, state_stamps(next_projects[name]))
-  end
-
   self.current_config = loaded
   self.catalog = found
-  self.projects = next_projects
-  self.project_names = next_names
-  if config_changed then
-    self:invalidate_all_projects()
-    -- Every resolution input is configuration-dependent, including FFI
-    -- include paths used while checking external source. Do not carry an old
-    -- serialized interface or provider identity across any config change.
-    self:clear_external_cache()
-    -- Search observations are relative to the configured compiler paths. The
-    -- projects are already dirty, so let their next compiler result establish
-    -- a fresh closure instead of restatting obsolete candidates.
-    self.header_fingerprints = {}
-    self.header_fingerprint_names = {}
-  end
   if self.external_resolver == nil then
     self:revalidate_external_files()
   end
   self:revalidate_external_topology()
   self:revalidate_known_headers()
-  local snapshot = self:latest()
+  local snapshot = self:latest_inner()
   logging.emit("debug", "project.scan.complete", {
     ["generation"] = snapshot.generation,
+    ["source_content_reads"] = self.read_count - reads_before,
+    ["source_content_hashes"] = self.hash_count - hashes_before,
+    ["external_content_reads"] = self.external_read_count - external_reads_before,
+    ["external_content_hashes"] = self.external_hash_count - external_hashes_before,
     ["project_modules"] = #snapshot.project_modules,
     ["project_directories"] = #snapshot.project_directories,
     ["dirty_modules"] = logging.summarize_strings(
@@ -873,6 +1000,8 @@ local function Service:scan_or_raise(): Snapshot
 end
 
 function Service:scan(): (Snapshot?, Error?)
+  local access = self.store:acquire()
+  defer access:release()
   do
     return self:scan_or_raise(), nil
   catch
@@ -899,8 +1028,16 @@ local function stamp_digest(stamps: {project_graph.FileStamp}): string
     local stamp = stamps[index]
     output:write(#stamp.path .. ":")
     output:write(stamp.path)
-    output:write(":" .. stamp.modified_seconds .. ":" ..
-                 stamp.modified_nanoseconds .. ":" .. stamp.size .. ";")
+    output:write(":" .. stamp.size .. ";")
+    if stamp.identity ~= nil then
+      output:write(#stamp.identity .. ":" .. stamp.identity)
+    else
+      output:write("uncertified:" .. stamp.modified_seconds .. ":" ..
+        stamp.modified_nanoseconds)
+    end
+    if stamp.physical_identity ~= nil then
+      output:write(";" .. #stamp.physical_identity .. ":" .. stamp.physical_identity)
+    end
   end
   return output:drain()
 end
@@ -924,11 +1061,10 @@ end
 
 local function Service:prepare_work_avoiding(
     blocked_revisions: {string: integer}): AnalysisRequest?
-  -- Fixed-point iterations do not necessarily re-enter scan. Revalidate the
-  -- exact compiler-observed paths before every token selection as well.
-  self:revalidate_known_headers()
   local dirty = self.graph:dirty_modules()
-  if #dirty == 0 or #self.project_names == 0 then return nil end
+  if #dirty == 0 then return nil end
+  local project_names = self.metadata:project_names()
+  if #project_names == 0 then return nil end
 
   local selected: {string} = {}
   local tokens: {project_graph.CheckToken} = {}
@@ -946,14 +1082,15 @@ local function Service:prepare_work_avoiding(
   if #selected == 0 then return nil end
 
   local modules: {compiler_bridge.ProjectModule} = {}
-  for index = 1, #self.project_names do
-    local name = self.project_names[index]
-    modules[index] = bridge_project(self.projects[name])
+  for index = 1, #project_names do
+    local name = project_names[index]
+    modules[index] = bridge_project(self.metadata:project(name))
   end
 
   local cached_sources: {compiler_bridge.CachedSourceInterface} = {}
-  for index = 1, #self.external_names do
-    local external = self.externals[self.external_names[index]]
+  local external_names = self.metadata:external_names()
+  for index = 1, #external_names do
+    local external = self.metadata:external(external_names[index])
     -- A stamp mismatch marks old serialized metadata as untrusted until this
     -- analysis encounters and republishes the external source. Binary provider
     -- resolution is always left to the compiler.
@@ -963,13 +1100,13 @@ local function Service:prepare_work_avoiding(
                         stamp_digest(external.stamps),
                         external.c_header_dependencies)
     local header_fingerprint? =
-      self.header_fingerprints[external.module_name]
+      self.metadata:header(external.module_name)
     trusted = trusted and header_fingerprint ~= nil and
               same_header_dependencies(
                 external.c_header_dependencies,
                 header_fingerprint.dependencies)
     if self.external_resolver ~= nil then
-      local fingerprint? = self.external_fingerprints[external.module_name]
+      local fingerprint? = self.metadata:fingerprint(external.module_name)
       trusted = trusted and fingerprint ~= nil and
                 external_matches_fingerprint(external, fingerprint)
     end
@@ -989,18 +1126,20 @@ local function Service:prepare_work_avoiding(
   end
 
   local fingerprints: {ExternalFingerprint} = {}
-  for index = 1, #self.external_fingerprint_names do
+  local fingerprint_names = self.metadata:fingerprint_names()
+  for index = 1, #fingerprint_names do
     local fingerprint? =
-      self.external_fingerprints[self.external_fingerprint_names[index]]
+      self.metadata:fingerprint(fingerprint_names[index])
     if fingerprint ~= nil then
       fingerprints[#fingerprints + 1] =
         copy_external_fingerprint(fingerprint)
     end
   end
   local header_fingerprints: {HeaderFingerprint} = {}
-  for index = 1, #self.header_fingerprint_names do
+  local header_names = self.metadata:header_names()
+  for index = 1, #header_names do
     local fingerprint? =
-      self.header_fingerprints[self.header_fingerprint_names[index]]
+      self.metadata:header(header_names[index])
     if fingerprint ~= nil then
       header_fingerprints[#header_fingerprints + 1] =
         copy_header_fingerprint(fingerprint)
@@ -1023,7 +1162,14 @@ local function Service:prepare_work_avoiding(
 end
 
 function Service:prepare_work(): AnalysisRequest?
-  return self:prepare_work_avoiding({})
+  local access = self.store:acquire()
+  defer access:release()
+  -- Fixed-point iterations may skip scan. Hash observed headers before the
+  -- short transaction which selects tokens and snapshots their SQL metadata.
+  self:revalidate_known_headers()
+  local request: AnalysisRequest?
+  self:update_metadata(function () request = self:prepare_work_avoiding({}) end)
+  return request
 end
 
 local function graph_imports(snapshot: compiler_bridge.ModuleSnapshot):
@@ -1075,7 +1221,7 @@ local function failed_project_headers(
     ({compiler_bridge.CHeaderDependency}, boolean)
   local result: {compiler_bridge.CHeaderDependency} = {}
   local known = false
-  local previous? = service.header_fingerprints[module_name]
+  local previous? = service.metadata:header(module_name)
   if previous ~= nil then
     result = copy_header_dependencies(previous.dependencies)
     known = true
@@ -1119,44 +1265,54 @@ local function Service:publish_failed_project(
     for index = 1, #imports do
       local edge = imports[index]
       local name = edge.module_name
-      if self.projects[name] == nil and self.externals[name] == nil then
+      if not self.metadata:has_project(name) and not self.metadata:has_external(name) then
         local requires_source = false
         case edge.visibility
         when source_required then requires_source = true
         when ordinary then
         end
-        local previous? = self.external_fingerprints[name]
+        local previous? = self.metadata:fingerprint(name)
         if previous == nil then
-          self.external_fingerprints[name] = ExternalFingerprint.new(
-            name, requires_source, true, nil, {}, nil)
-          insert_name(self.external_fingerprint_names, name)
+          self.metadata:write_fingerprint(ExternalFingerprint.new(
+            name, requires_source, true, nil, {}, nil))
         elseif previous.origin == nil and
                requires_source and not previous.source_required then
-          self.external_fingerprints[name] = ExternalFingerprint.new(
+          self.metadata:write_fingerprint(ExternalFingerprint.new(
             name, true, previous.topology_resolved, nil,
-            copy_stamps(previous.stamps), previous.error)
+            copy_stamps(previous.stamps), previous.error))
         end
       end
     end
   end
   state.diagnostics = diagnostics
   state.compiler_snapshot = snapshot
+  self.graph:set_project_snapshot(module_name, snapshot)
+  self.metadata:write_diagnostics(module_name, diagnostics)
   if headers_known then self:remember_header_fingerprint(module_name, headers) end
   return true
 end
 
-local function external_candidate(
+local function Service:external_candidate(
     snapshot: compiler_bridge.ModuleSnapshot,
     contextual_resolutions: {compiler_bridge.ContextualResolution}):
     ExternalModule?
   if snapshot.manifest == nil then return nil end
   local stamps: {project_graph.FileStamp} = {}
+  local prior_stamps: {project_graph.FileStamp} = {}
+  local fingerprint? = self.metadata:fingerprint(snapshot.module_name)
+  if fingerprint ~= nil then
+    prior_stamps = fingerprint.stamps
+  else
+    local external? = self.metadata:external(snapshot.module_name)
+    if external ~= nil then prior_stamps = external.stamps end
+  end
   local origin?: ExternalOrigin
   local analyzed_input_identity: string? = nil
   case snapshot.provenance
   when external_source: source then
     for index = 1, #source.source_files do
-      local stamp? = stamp_for(source.source_files[index])
+      local path = source.source_files[index]
+      local stamp? = self:stamp_for(path, find_stamp(prior_stamps, path))
       if stamp == nil then
         return fail<ExternalModule>(source.source_files[index],
           "external source disappeared while compiler results were committed")
@@ -1168,7 +1324,8 @@ local function external_candidate(
     analyzed_input_identity = analyzed_input_digest(
       stamp_digest(stamps), snapshot.c_header_dependencies)
   when dynamic_binary: binary then
-    local stamp? = stamp_for(binary.provider_file)
+    local stamp? = self:stamp_for(binary.provider_file,
+      find_stamp(prior_stamps, binary.provider_file))
     if stamp == nil then
       return fail<ExternalModule>(binary.provider_file,
         "external binary disappeared while compiler results were committed")
@@ -1177,7 +1334,8 @@ local function external_candidate(
     origin = ExternalOrigin.dynamic_binary(
       ExternalBinary.new(binary.provider_file))
   when static_binary: binary then
-    local stamp? = stamp_for(binary.provider_file)
+    local stamp? = self:stamp_for(binary.provider_file,
+      find_stamp(prior_stamps, binary.provider_file))
     if stamp == nil then
       return fail<ExternalModule>(binary.provider_file,
         "external static provider disappeared while compiler results were committed")
@@ -1320,8 +1478,7 @@ local function Service:replace_external(
       external.module_name, external.stamps, external.manifest,
       external.imports, satisfied_projects)
   end
-  self.externals[external.module_name] = external
-  insert_name(self.external_names, external.module_name)
+  self.metadata:write_external(external)
   self:remember_header_fingerprint(
     external.module_name, external.c_header_dependencies)
 end
@@ -1387,11 +1544,12 @@ local function candidate_fingerprint(
     copy_stamps(external.stamps), nil)
 end
 
-local function contextual_fingerprint(
+local function Service:contextual_fingerprint(
     resolution: compiler_bridge.ContextualResolution): ExternalFingerprint
   local raw = compiler_bridge.ExternalResolution.new(
     resolution.owner_module, resolution.provenance, nil)
-  local observed = fingerprint_from_resolution(raw, false)
+  local observed = self:fingerprint_from_resolution(raw, false,
+    self.metadata:fingerprint(resolution.owner_module))
   return ExternalFingerprint.new(
     observed.module_name, false, resolution.ordinary_lookup,
     observed.origin, observed.stamps, observed.error)
@@ -1503,17 +1661,29 @@ local function merge_observed_fingerprint(
     origin, copy_stamps(existing.stamps), existing.error)
 end
 
-local function Service:abort_request(request: AnalysisRequest)
+local function Service:abort_request_inner(request: AnalysisRequest)
   for index = 1, #request.check_tokens do
     self.graph:abort_project_check(request.check_tokens[index])
   end
+end
+
+local function Service:abort_request(request: AnalysisRequest)
+  local access = self.store:acquire()
+  defer access:release()
+  self:abort_request_inner(request)
+end
+
+local function Service:current_generation(): integer
+  local access = self.store:acquire()
+  defer access:release()
+  return self.graph:generation()
 end
 
 local function Service:commit_or_raise(
     request: AnalysisRequest,
     analysis: compiler_bridge.Analysis): RefreshReport
   if request.generation ~= self.graph:generation() then
-    self:abort_request(request)
+    self:abort_request_inner(request)
     return RefreshReport.new(
       true, true, self.graph:generation(), {}, {},
       self.graph:dirty_modules())
@@ -1530,7 +1700,7 @@ local function Service:commit_or_raise(
   -- advances the graph generation and rejects this result.
   self:scan_or_raise()
   if request.generation ~= self.graph:generation() then
-    self:abort_request(request)
+    self:abort_request_inner(request)
     return RefreshReport.new(
       true, true, self.graph:generation(), {}, {},
       self.graph:dirty_modules())
@@ -1543,10 +1713,10 @@ local function Service:commit_or_raise(
     -- generation, so make this rejection explicit before any project commit.
     for index = 1, #request.external_fingerprints do
       local before = request.external_fingerprints[index]
-      local current? = self.external_fingerprints[before.module_name]
+      local current? = self.metadata:fingerprint(before.module_name)
       if current == nil or
          not same_external_fingerprint(before, current) then
-        self:abort_request(request)
+        self:abort_request_inner(request)
         return RefreshReport.new(
           true, true, self.graph:generation(), {}, {},
           self.graph:dirty_modules())
@@ -1559,11 +1729,11 @@ local function Service:commit_or_raise(
   -- still be the one selected before compiler work began.
   for index = 1, #request.header_fingerprints do
     local before = request.header_fingerprints[index]
-    local current? = self.header_fingerprints[before.module_name]
+    local current? = self.metadata:header(before.module_name)
     if current == nil or
        not same_header_dependencies(before.dependencies,
                                     current.dependencies) then
-      self:abort_request(request)
+      self:abort_request_inner(request)
       return RefreshReport.new(
         true, true, self.graph:generation(), {}, {},
         self.graph:dirty_modules())
@@ -1606,7 +1776,7 @@ local function Service:commit_or_raise(
         insert_name(snapshot_binary_names, snapshot.module_name)
       else
       end
-      local external? = external_candidate(
+      local external? = self:external_candidate(
         snapshot, analysis.contextual_resolutions)
       if external ~= nil then
         external_candidates[#external_candidates + 1] = external
@@ -1625,12 +1795,13 @@ local function Service:commit_or_raise(
     binary_observations[key] = observation
   end
   for index = 1, #analysis.contextual_resolutions do
-    local observed = contextual_fingerprint(
+    local observed = self:contextual_fingerprint(
       analysis.contextual_resolutions[index])
     contextual_names[observed.module_name] = true
     merge_observed_fingerprint(
       observed_fingerprints, observed_names, observed)
   end
+  local staged_fingerprints: {ExternalFingerprint} = {}
   for index = 1, #observed_names do
     local name = observed_names[index]
     if self.external_resolver ~= nil or contextual_names[name] then
@@ -1638,8 +1809,6 @@ local function Service:commit_or_raise(
       local before? = request_external_fingerprint(request, name)
       local changed = before == nil or
                       not same_external_fingerprint(before, observed)
-      self.external_fingerprints[name] = observed
-      insert_name(self.external_fingerprint_names, name)
       if changed then
         local validate_first_seen = false
         if before == nil and contextual_names[name] then
@@ -1652,8 +1821,15 @@ local function Service:commit_or_raise(
           validate_first_seen = true
         end
         if not validate_first_seen then
-          self.graph:invalidate_external_change(name)
+          self:update_metadata(function ()
+            self.metadata:write_fingerprint(observed)
+            self.graph:invalidate_external_change(name)
+          end)
           if self.external_resolver ~= nil then unstable_external = true end
+        else
+          -- This first-seen baseline is valid only if the provider checks
+          -- below succeed. Publish it with the checked project graph.
+          staged_fingerprints[#staged_fingerprints + 1] = observed
         end
       end
     end
@@ -1666,27 +1842,32 @@ local function Service:commit_or_raise(
   -- cached modules used by this request; the second protects newly discovered
   -- direct/transitive headers and first-seen external source modules.
   local unstable_headers = false
+  local header_validation = compiler_bridge.header_validation()
   for index = 1, #request.header_fingerprints do
     local before = request.header_fingerprints[index]
-    local current = self:restat_header_dependencies(
-      before.module_name, before.dependencies)
-    if not same_header_dependencies(before.dependencies, current) then
-      self:accept_revalidated_headers(before.module_name, current)
+    local current, changed = self:restat_header_dependencies(
+      before.module_name, before.dependencies, header_validation)
+    if changed or not same_header_dependencies(before.dependencies, current) then
+      self:accept_revalidated_headers(before.module_name, current, changed)
       unstable_headers = true
+    elseif not same_header_observations(before.dependencies, current) then
+      self:accept_revalidated_headers(before.module_name, current, false)
     end
   end
   for index = 1, #analysis.modules do
     local snapshot = analysis.modules[index]
-    local current = self:restat_header_dependencies(
-      snapshot.module_name, snapshot.c_header_dependencies)
-    if not same_header_dependencies(
+    local current, changed = self:restat_header_dependencies(
+      snapshot.module_name, snapshot.c_header_dependencies, header_validation)
+    if changed or not same_header_dependencies(
         snapshot.c_header_dependencies, current) then
-      self:accept_revalidated_headers(snapshot.module_name, current)
+      self:accept_revalidated_headers(snapshot.module_name, current, changed)
       unstable_headers = true
+    else
+      snapshot.c_header_dependencies = copy_header_dependencies(current)
     end
   end
   if unstable_headers then
-    self:abort_request(request)
+    self:abort_request_inner(request)
     return RefreshReport.new(
       true, true, self.graph:generation(), {}, {},
       self.graph:dirty_modules())
@@ -1726,19 +1907,32 @@ local function Service:commit_or_raise(
     unstable_external = true
   end
   if unstable_external then
-    self:abort_request(request)
+    self:abort_request_inner(request)
     return RefreshReport.new(
       true, true, self.graph:generation(), {}, {},
       self.graph:dirty_modules())
   end
 
+  local connection = self.graph.connection
+  local saved_asts = self.graph:checkpoint_asts()
+  connection:set_autocommit(false)
+  local published = false
+  defer do
+    if not published then
+      connection:rollback()
+      self.graph:restore_asts(saved_asts)
+    end
+  end
   local committed: {string} = {}
   local failed: {string} = {}
+  for index = 1, #staged_fingerprints do
+    self.metadata:write_fingerprint(staged_fingerprints[index])
+  end
   local order = project_commit_order(
     request.dirty_modules, project_snapshots)
   for index = 1, #order do
     local name = order[index]
-    local state? = self.projects[name]
+    local state? = self.metadata:project(name)
     local snapshot? = project_snapshots[name]
     local token? = request_token(request, name)
     if state ~= nil and token ~= nil then
@@ -1760,6 +1954,7 @@ local function Service:commit_or_raise(
           when accepted then
             state.diagnostics = diagnostics
             state.compiler_snapshot = snapshot
+            self.metadata:write_diagnostics(name, diagnostics)
             self:remember_header_fingerprint(
               name, snapshot.c_header_dependencies)
             committed[#committed + 1] = name
@@ -1791,15 +1986,20 @@ local function Service:commit_or_raise(
       external_candidates[index], request.dirty_modules)
   end
 
-  return RefreshReport.new(
+  local report = RefreshReport.new(
     true, false, self.graph:generation(), committed, failed,
     self.graph:dirty_modules())
+  connection:commit()
+  published = true
+  return report
 end
 
 function Service:commit(request: AnalysisRequest,
                         analysis: compiler_bridge.Analysis):
     (RefreshReport?, Error?)
-  defer self:abort_request(request)
+  local access = self.store:acquire()
+  defer access:release()
+  defer self:abort_request_inner(request)
   do
     return self:commit_or_raise(request, analysis), nil
   catch
@@ -1815,11 +2015,11 @@ end
 
 local function Service:analyze_or_raise(
     request: AnalysisRequest): RefreshReport
-  if request.generation ~= self.graph:generation() then
+  if request.generation ~= self:current_generation() then
     self:abort_request(request)
     return RefreshReport.new(
-      false, true, self.graph:generation(), {}, {},
-      self.graph:dirty_modules())
+      false, true, self:current_generation(), {}, {},
+      self:latest().dirty_modules)
   end
   if self.analysis_active then
     return fail<RefreshReport>(self.project_root,
@@ -1827,6 +2027,8 @@ local function Service:analyze_or_raise(
   end
   self.analysis_active = true
   defer self.analysis_active = false
+  self.analysis_task = async.running()
+  defer self.analysis_task = nil
   defer self:abort_request(request)
   self.analysis_count = self.analysis_count + 1
   self.submitted_count = self.submitted_count + #request.dirty_modules
@@ -1838,7 +2040,8 @@ local function Service:analyze_or_raise(
       request.dirty_modules),
   })
   local analysis = self.analyzer(request)
-  local report = self:commit_or_raise(request, analysis)
+  local report?, commit_error? = self:commit(request, analysis)
+  if report == nil then raise commit_error end
   logging.emit("debug", "analysis.complete", {
     ["generation"] = report.generation,
     ["root_module"] = request.root_module,
@@ -1875,30 +2078,27 @@ local function Service:prune_unreachable_externals()
   for index = 1, #reachable_names do
     reachable[reachable_names[index]] = true
   end
-  local old_names = copy_strings(self.external_names)
+  local old_names = copy_strings(self.metadata:external_names())
   for index = 1, #old_names do
     local name = old_names[index]
     if not reachable[name] and self.graph:prune_external(name) then
-      self.externals[name] = nil
-      remove_name(self.external_names, name)
+      self.metadata:remove_external(name)
       self:forget_header_fingerprint(name)
-      self.external_fingerprints[name] = nil
-      remove_name(self.external_fingerprint_names, name)
+      self.metadata:remove_fingerprint(name)
     end
   end
-  local pending_names = copy_strings(self.external_fingerprint_names)
+  local pending_names = copy_strings(self.metadata:fingerprint_names())
   for index = 1, #pending_names do
     local name = pending_names[index]
-    if self.externals[name] == nil and
+    if not self.metadata:has_external(name) and
        #self.graph:reverse_imports(name) == 0 then
-      self.external_fingerprints[name] = nil
-      remove_name(self.external_fingerprint_names, name)
+      self.metadata:remove_fingerprint(name)
     end
   end
-  local header_names = copy_strings(self.header_fingerprint_names)
+  local header_names = copy_strings(self.metadata:header_names())
   for index = 1, #header_names do
     local name = header_names[index]
-    if self.projects[name] == nil and self.externals[name] == nil and
+    if not self.metadata:has_project(name) and not self.metadata:has_external(name) and
        #self.graph:reverse_imports(name) == 0 then
       self:forget_header_fingerprint(name)
     end
@@ -1935,7 +2135,9 @@ local function Service:analyze_to_fixed_point(): (RefreshReport?, Error?)
   -- Absence from one partial compiler result says nothing about externals used
   -- by clean modules. Prune only after the graph reaches a fixed point and only
   -- by reachability from every committed project import edge.
-  self:prune_unreachable_externals()
+  local access = self.store:acquire()
+  defer access:release()
+  self:update_metadata(function () self:prune_unreachable_externals() end)
   local report = RefreshReport.new(
     analyzed, saw_stale, self.graph:generation(), committed, failed,
     self.graph:dirty_modules())
@@ -1956,7 +2158,7 @@ local function Service:refresh_internal(snapshot_listener: SnapshotListener?):
     (RefreshReport?, Error?)
   local started = logging.clock()
   logging.emit("debug", "project.refresh.start", {
-    ["generation"] = self.graph:generation(),
+    ["generation"] = self:current_generation(),
   })
   local scanned?, scan_error? = self:scan()
   if scanned == nil then
@@ -2006,26 +2208,35 @@ end
 
 function Service:counters(): Counters
   return Counters.new(
-    self.read_count, self.analysis_count, self.submitted_count)
+    self.read_count, self.analysis_count, self.submitted_count, self.external_read_count,
+    self.hash_count, self.external_hash_count)
 end
 
 function Service:direct_imports(module_name: string):
     {project_graph.ImportEdge}
+  local access = self.store:acquire()
+  defer access:release()
   return self.graph:direct_imports(module_name)
 end
 
 function Service:reverse_imports(module_name: string):
     {project_graph.ReverseImport}
+  local access = self.store:acquire()
+  defer access:release()
   return self.graph:reverse_imports(module_name)
 end
 
 function Service:project_ast(module_name: string):
     compiler_bridge.ModuleSnapshot?
+  local access = self.store:acquire()
+  defer access:release()
   return self.graph:project_ast(module_name)
 end
 
 function Service:external_module(module_name: string): ExternalModule?
-  return self.externals[module_name]
+  local access = self.store:acquire()
+  defer access:release()
+  return self.metadata:external(module_name)
 end
 
 -- Discovery records only watched directories traversed below the configured
@@ -2035,11 +2246,12 @@ function Service:project_directories(): {string}
   return copy_strings(self.catalog.directories)
 end
 
-function Service:latest(): Snapshot
+local function Service:latest_inner(): Snapshot
   local projects: {ProjectModule} = {}
-  for index = 1, #self.project_names do
-    local name = self.project_names[index]
-    local state = self.projects[name]
+  local project_names = self.metadata:project_names()
+  for index = 1, #project_names do
+    local name = project_names[index]
+    local state = self.metadata:project(name)
     local analysis_state = ProjectAnalysisState.clean()
     if self.graph:is_dirty(name) then
       analysis_state = ProjectAnalysisState.dirty()
@@ -2051,8 +2263,9 @@ function Service:latest(): Snapshot
       copy_diagnostics(state.diagnostics), analysis_state)
   end
   local externals: {ExternalModule} = {}
-  for index = 1, #self.external_names do
-    externals[index] = self.externals[self.external_names[index]]
+  local external_names = self.metadata:external_names()
+  for index = 1, #external_names do
+    externals[index] = self.metadata:external(external_names[index])
   end
   local issues: {project_discovery.Issue} = {}
   for index = 1, #self.catalog.issues do issues[index] = self.catalog.issues[index] end
@@ -2062,11 +2275,75 @@ function Service:latest(): Snapshot
     self.graph:dirty_modules())
 end
 
+function Service:latest(): Snapshot
+  local access = self.store:acquire()
+  defer access:release()
+  return self:latest_inner()
+end
+
+function Service:workspace_store(): sql.Store
+  return self.store
+end
+
+function Service:set_publication_hooks(hooks: PublicationHooks)
+  self.publication_hooks = hooks
+end
+
+function Service:prepare_publication(snapshot: Snapshot): boolean
+  if self.publication_hooks == nil then return false end
+  return self.publication_hooks.prepare(snapshot)
+end
+
+function Service:publish_prepared(connection: sqlite3.Connection)
+  if self.publication_hooks ~= nil then self.publication_hooks.publish(connection) end
+end
+
+function Service:publication_committed()
+  if self.publication_hooks ~= nil and self.publication_hooks.committed ~= nil then
+    self.publication_hooks.committed()
+  end
+end
+
+function Service:hydrate_project_snapshot(module_name: string,
+    snapshot: compiler_bridge.ModuleSnapshot): boolean
+  local access = self.store:acquire()
+  defer access:release()
+  return self.graph:hydrate_project_ast(module_name, snapshot)
+end
+
+function Service:hydrate_project_snapshot_at_revision(module_name: string,
+    expected_revision: integer, snapshot: compiler_bridge.ModuleSnapshot): boolean
+  local access = self.store:acquire()
+  defer access:release()
+  return self.graph:hydrate_project_ast_at_revision(
+    module_name, expected_revision, snapshot)
+end
+
+function Service:invalidate_cached_project(module_name: string)
+  local access = self.store:acquire()
+  defer access:release()
+  self.graph:invalidate_project(module_name)
+end
+
+function Service:close()
+  local active? = self.analysis_task
+  if active ~= nil then
+    if active == async.running() then
+      raise "project service cannot close from its own analyzer"
+    end
+    -- Cancellation is not a drain: the accepted updater must finish any native
+    -- COMMIT/ROLLBACK before its connection can be closed.
+    async.join<value, value>(active)
+  end
+  self.store:close()
+end
+
 local function create_or_raise(project_root: string,
                                installed_binary_modules_root: string,
                                analyzer: Analyzer,
                                external_resolver: ExternalResolver?,
-                               header_restater: HeaderRestater?): Service
+                               header_restater: HeaderRestater?,
+                               existing_store: sql.Store?): Service
   local loaded?, config_error? = project_config.load(
     project_root, installed_binary_modules_root)
   if loaded == nil then
@@ -2077,13 +2354,41 @@ local function create_or_raise(project_root: string,
   if found == nil then
     return fail<Service>(discovery_error.path, discovery_error.message)
   end
+  local store? = existing_store
+  if store == nil then store = sql.open(":memory:") end
+  local initialized = false
+  defer do
+    if not initialized and existing_store == nil then store:close() end
+  end
+  local access = store:acquire()
+  defer access:release()
+  local graph = project_graph.create<compiler_bridge.ModuleSnapshot>(access.connection)
+  graph:restart_interrupted_checks()
+  local saved_metadata = metadata.create(access.connection, graph)
   local service = Service.new(
     loaded.project_root, installed_binary_modules_root, analyzer,
     external_resolver, header_restater, loaded, found,
-    project_graph.create<compiler_bridge.ModuleSnapshot>(), {}, {}, {}, {},
-    {}, {}, {}, {}, 0, 0, 0, false)
+    graph, store, saved_metadata, 0, 0, 0, 0, 0, 0, false, nil, nil)
   service:scan_or_raise()
+  initialized = true
   return service
+end
+
+-- On success Service owns the supplied Store until close. On failure its
+-- caller retains that Store for cache recovery/fallback. No compiler analysis
+-- runs here, leaving the loader an interval to hydrate validated graph payloads.
+function create_with_store(project_root: string,
+    installed_binary_modules_root: string, analyzer: Analyzer,
+    external_resolver: ExternalResolver?, header_restater: HeaderRestater?,
+    store: sql.Store): (Service?, Error?)
+  do
+    return create_or_raise(project_root, installed_binary_modules_root,
+      analyzer, external_resolver, header_restater, store), nil
+  catch
+    if error is async.CancellationReason then raise end
+    if error is Error then return nil, error as Error end
+    return nil, Error.new(project_root, strings.tostring(error))
+  end
 end
 
 function create_with_analyzer(project_root: string,
@@ -2137,6 +2442,19 @@ local function load_with_services(
   end
   if service == nil then return nil, failure end
 
+  local complete = false
+  defer do
+    if not complete then service:close() end
+  end
+  local report?, refresh_error? = service:run_pending(snapshot_listener)
+  if report == nil then return nil, refresh_error end
+  complete = true
+  return service, nil
+end
+
+function Service:run_pending(snapshot_listener: SnapshotListener?):
+    (RefreshReport?, Error?)
+  local service = self
   if snapshot_listener ~= nil then
     local listener: SnapshotListener = snapshot_listener
     do
@@ -2150,13 +2468,12 @@ local function load_with_services(
     catch
       if error is async.CancellationReason then raise end
       if error is Error then return nil, error as Error end
-      return nil, Error.new(project_root, strings.tostring(error))
+      return nil, Error.new(self.project_root, strings.tostring(error))
     end
   end
 
   local report?, refresh_error? = service:analyze_to_fixed_point()
-  if report == nil then return nil, refresh_error end
-  return service, nil
+  return report, refresh_error
 end
 
 function load_with_analyzer(project_root: string,
@@ -2223,9 +2540,10 @@ local function load_with_compiler(
     return compiler:resolve_external_modules(project_modules, requests)
   end
   local header_restater: HeaderRestater = function (
-      dependencies: {compiler_bridge.CHeaderDependency}):
-      {compiler_bridge.CHeaderDependency}
-    return compiler:restat_c_header_dependencies(dependencies)
+      dependencies: {compiler_bridge.CHeaderDependency},
+      validation: compiler_bridge.HeaderValidation?):
+      ({compiler_bridge.CHeaderDependency}, boolean)
+    return compiler:restat_c_header_dependencies(dependencies, validation)
   end
   return load_with_services(
     project_root, installed_binary_modules_root, analyzer,

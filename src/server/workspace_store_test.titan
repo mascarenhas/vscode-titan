@@ -1,0 +1,141 @@
+local async = import "async"
+local fs = import "fs"
+local sqlite3 = import "sqlite3"
+local strings = import "string"
+local test = import "test"
+local stores = import "server.workspace_store"
+local test_runtime = import "server.test_runtime"
+
+local function joins(task: async.Task<nil, value>, subject: string)
+  case async.join<nil, value>(task)
+  when succeeded then
+  when cancelled then
+  when failed: failure then raise subject .. ": " .. strings.tostring(failure.error)
+  else raise subject .. " did not finish"
+  end
+end
+
+function test_workspace_store_serializes_operations_and_cancelled_reservations(
+    _context: test.Context)
+  test_runtime.run(function ()
+    local store = stores.open(":memory:")
+    defer store:close()
+    local first = store:acquire()
+    local trace = ""
+    local cancelled = async.run<nil, value>(function (): nil
+      local access = store:acquire()
+      defer access:release()
+      trace = trace .. "cancelled>"
+      return nil
+    end)
+    async.yield()
+    local second = async.run<nil, value>(function (): nil
+      local access = store:acquire()
+      defer access:release()
+      stores.scalar_integer(access.connection, "SELECT published_generation " ..
+        "FROM main.store_state WHERE singleton=1")
+      trace = trace .. "second>"
+      return nil
+    end)
+    async.yield()
+    cancelled:cancel(async.CancellationReason.simple("cancel queued reader"))
+    first:release()
+    first:release()
+    joins(cancelled, "cancelled reader")
+    joins(second, "next reader")
+    test.assert(trace == "second>", "cancelled waiter kept connection ownership")
+
+    local held = store:acquire()
+    local granted = async.run<nil, value>(function (): nil
+      local access = store:acquire()
+      defer access:release()
+      trace = trace .. "granted>"
+      return nil
+    end)
+    async.yield()
+    local successor = async.run<nil, value>(function (): nil
+      local access = store:acquire()
+      defer access:release()
+      trace = trace .. "successor>"
+      return nil
+    end)
+    async.yield()
+    held:release()
+    granted:cancel(async.CancellationReason.simple("cancel reserved reader"))
+    joins(granted, "reserved reader")
+    joins(successor, "successor reader")
+    test.assert(trace == "second>successor>", "cancelled reservation blocked FIFO handoff")
+  end)
+end
+
+function test_workspace_store_close_waits_for_the_writer_transaction(
+    _context: test.Context)
+  test_runtime.run(function ()
+    local store = stores.open(":memory:")
+    local writer = store:acquire()
+    writer.connection:set_autocommit(false)
+    stores.execute(writer.connection,
+      "UPDATE main.store_state SET published_generation=7 WHERE singleton=1")
+    local closed = false
+    local closer = async.run<nil, value>(function (): nil
+      store:close()
+      closed = true
+      return nil
+    end)
+    async.yield()
+    test.assert(not closed, "store closed while writer still owned publication")
+    writer.connection:commit()
+    writer:release()
+    joins(closer, "drained store close")
+    test.assert(closed, "store did not close after transaction drained")
+    store:close()
+    local rejected = false
+    do
+      store:acquire()
+    catch
+      rejected = true
+    end
+    test.assert(rejected, "closed store accepted another reader")
+  end)
+end
+
+function test_workspace_store_file_reopen_and_rolled_back_publication(
+    _context: test.Context)
+  test_runtime.run(function ()
+    local path = fs.tmpname()
+    defer fs.unlink(path)
+    local store = stores.open(path)
+    local access = store:acquire()
+    test.assert(stores.scalar_integer(access.connection, "PRAGMA foreign_keys") == 1,
+      "foreign keys were not enabled")
+    access.connection:set_autocommit(false)
+    stores.execute(access.connection, "INSERT INTO main.cache_meta VALUES(?,?)",
+      sqlite3.Blob.new("key\0\255"), sqlite3.Blob.new("first\0\255"))
+    stores.execute(access.connection,
+      "UPDATE main.store_state SET published_generation=4 WHERE singleton=1")
+    access.connection:commit()
+    access.connection:set_autocommit(false)
+    stores.execute(access.connection, "UPDATE main.cache_meta SET value=?",
+      sqlite3.Blob.new("unpublished"))
+    stores.execute(access.connection,
+      "UPDATE main.store_state SET published_generation=5 WHERE singleton=1")
+    access.connection:rollback()
+    local rows = stores.rows(access.connection, "SELECT value FROM main.cache_meta")
+    -- Materialized rows remain owned after a subsequent statement and close.
+    access:release()
+    store:close()
+    test.assert(#rows == 1 and stores.bytes(rows[1], 1) == "first\0\255",
+      "row snapshot or binary payload did not survive cursor retirement")
+    local reopened = stores.open(path)
+    defer reopened:close()
+    local read = reopened:acquire()
+    defer read:release()
+    test.assert(stores.scalar_integer(read.connection,
+      "SELECT published_generation FROM main.store_state WHERE singleton=1") == 4,
+      "reopen exposed a rolled-back publication generation")
+    local durable = stores.rows(read.connection,
+      "SELECT value FROM main.cache_meta WHERE key=?", sqlite3.Blob.new("key\0\255"))
+    test.assert(#durable == 1 and stores.bytes(durable[1], 1) == "first\0\255",
+      "reopen lost completed binary payload")
+  end)
+end

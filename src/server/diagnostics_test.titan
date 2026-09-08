@@ -1,4 +1,9 @@
 local test = import "test"
+local fs = import "fs"
+local stores = import "server.workspace_store"
+local published = import "server.published_diagnostics"
+local source_text = import "server.source_text"
+local test_runtime = import "server.test_runtime"
 local bridge = import "server.compiler_bridge"
 local diagnostics = import "server.diagnostics"
 local wire = import "server.wire"
@@ -153,4 +158,58 @@ function test_diagnostics_filter_external_locations_and_clear_stale_files(
   test.assert(#observed == 4 and #observed[4].items == 0 and
               observed[4].uri == "file:///workspace/main.titan",
               "publisher shutdown did not clear its active diagnostic URI")
+end
+
+function test_diagnostics_replays_published_rows_after_file_reopen(
+    _context: test.Context)
+  test_runtime.run(function ()
+    local path = fs.tmpname()
+    defer fs.unlink(path)
+    local input: {diagnostics.Publication} = {}
+    for index = 1, 101 do
+      local items: {diagnostics.Item} = {}
+      if index ~= 100 then
+        local position = source_text.Position.new(index, 3)
+        items[1] = diagnostics.Item.new(diagnostics.Kind.unmapped_source(),
+          "binary message\0\255" .. index, source_text.Span.new(position, position))
+      end
+      input[index] = diagnostics.Publication.new("file:///workspace/source" .. index .. ".titan", items)
+    end
+    do
+      local store = stores.open(path)
+      defer store:close()
+      local access = store:acquire()
+      defer access:release()
+      published.initialize_schema(access.connection)
+      access.connection:set_autocommit(false)
+      published.publish(access.connection, input)
+      stores.execute(access.connection,
+        "UPDATE main.store_state SET published_generation=7 WHERE singleton=1")
+      access.connection:commit()
+    end
+    local store = stores.open(path)
+    defer store:close()
+    local rows = published.read(store, 7)
+    test.assert(#rows == 101 and rows[1].uri == input[1].uri and
+      #rows[100].items == 0 and rows[101].items[1].message == input[101].items[1].message and
+      rows[101].items[1].range.start.line == 101,
+      "published diagnostic order, empty replacement, or BLOB batch did not survive reopen")
+    local before = 0
+    do
+      local access = store:acquire()
+      defer access:release()
+      before = stores.scalar_integer(access.connection, "SELECT total_changes()")
+    end
+    local listener_count = 0
+    local publisher = diagnostics.create()
+    publisher:set_listener(function (_publication: diagnostics.Publication)
+      listener_count = listener_count + 1
+    end)
+    publisher:publish(published.read(store, 7))
+    local access = store:acquire()
+    defer access:release()
+    test.assert(listener_count == 101 and before ==
+      stores.scalar_integer(access.connection, "SELECT total_changes()"),
+      "diagnostic listener replay mutated the workspace database")
+  end)
 end

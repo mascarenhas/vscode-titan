@@ -57,6 +57,11 @@ if grep -Eq '^extension/(\.agents|\.build|\.titan|node_modules|plugins|src|test)
   exit 1
 fi
 
+if grep -Eq '(^|/)\.titan-ls(/|$)' <<<"$contents"; then
+  echo "VSIX contains a workspace analysis cache" >&2
+  exit 1
+fi
+
 if grep -Eq '[.]map$' <<<"$contents"; then
   echo "VSIX contains a source map" >&2
   exit 1
