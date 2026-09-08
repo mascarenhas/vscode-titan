@@ -62,6 +62,11 @@ if grep -Eq '(^|/)\.titan-ls(/|$)' <<<"$contents"; then
   exit 1
 fi
 
+if grep -Eq '^extension/docs/ffi-probe-profile-data/' <<<"$contents"; then
+  echo "VSIX contains experimental profiling evidence" >&2
+  exit 1
+fi
+
 if grep -Eq '[.]map$' <<<"$contents"; then
   echo "VSIX contains a source map" >&2
   exit 1

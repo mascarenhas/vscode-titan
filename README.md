@@ -391,6 +391,10 @@ restart and saved-edit timings, memory and disk usage, and reproduction commands
 The [SQLite schema reference](docs/sqlite-backend-schema.md) documents every
 table and column, compiler graph payloads, measured storage costs, and the
 storage and probe-profiling research workflow.
+The [cold FFI probe investigation](docs/ffi-probe-profile.md) attributes
+individual probes to declarations and source uses, measures compiler/server
+phases, and evaluates a combined-header environment with a reserved `ffi`
+namespace and a single-result enum-carrier probe.
 
 ## Package and install the VSIX
 

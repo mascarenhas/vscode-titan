@@ -1,0 +1,1698 @@
+diff --git a/src/server/application.titan b/src/server/application.titan
+index 2a0b3580c073eb2e6277623e0183e8daf2accd0b..2207e8cf7813019b6d074fb5dcd6706d92e87efc 100644
+--- a/src/server/application.titan
++++ b/src/server/application.titan
+@@ -709,6 +709,8 @@ end
+ 
+ local function Application:reconcile_watcher(
+     snapshot: project_service.Snapshot)
++  local profile_span? = logging.profile_begin("project.watch_reconcile")
++  defer logging.profile_finish(profile_span)
+   if self.closed then return end
+   -- Canonicalization may yield or fail, so finish it before changing watcher
+   -- registrations. The callback retains the preceding immutable filter until
+@@ -739,15 +741,21 @@ local function dirty_signature(names: {string}): string
+ end
+ 
+ local function publication_revision(connection: sqlite3.Connection): string
++  local profile_span? = logging.profile_begin("publication.revision_read")
++  defer logging.profile_finish(profile_span)
+   local generation = stores.scalar_integer(connection,
+     "SELECT generation FROM main.graph_state WHERE singleton=1")
+   local output = strings.writer()
+   output:write(generation .. ":")
+-  local statement = connection:prepare(
++  local statement = stores.profile_prepare(connection,
+     "SELECT name,provenance,state,revision FROM main.graph_modules ORDER BY name")
+-  defer statement:close()
+-  local cursor = statement:query()
+-  defer cursor:close()
++  defer stores.profile_statement_close(statement)
++  local cursor = stores.profile_query(statement)
++  defer stores.profile_cursor_close(cursor)
++  local iteration_span? = logging.profile_begin("sqlite.cursor_iteration", {
++    ["measurement"] = "fetch_api_and_revision_rendering",
++  })
++  defer logging.profile_finish(iteration_span)
+   for row in cursor:fetch do
+     local name = row:get(1) as string
+     output:write(#name .. ":" .. name .. ":" ..
+@@ -759,6 +767,10 @@ end
+ 
+ local function Application:publish_view(service: project_service.Service,
+     snapshot: project_service.Snapshot, reuse: View?): View
++  local profile_span? = logging.profile_begin("publication.view", {
++    ["generation"] = snapshot.generation,
++  })
++  defer logging.profile_finish(profile_span)
+   local store = service:workspace_store()
+   local revision = ""
+   do
+@@ -777,11 +789,17 @@ local function Application:publish_view(service: project_service.Service,
+   local prepared: semantic_features.PreparedView? = nil
+   if reuse == nil and not warm_reuse then
+     self.view_builds = self.view_builds + 1
++    local inputs_span? = logging.profile_begin("semantic.inputs_prepare")
++    defer logging.profile_finish(inputs_span)
+     local projects, snapshots = project_inputs(snapshot)
++    logging.profile_finish(inputs_span)
+     prepared = semantic_features.prepare(
+       projects, snapshots, function () async.yield() end)
+   end
++  local diagnostics_span? = logging.profile_begin("diagnostics.materialize")
++  defer logging.profile_finish(diagnostics_span)
+   local diagnostic_rows = diagnostics.from_snapshot_with_yield(snapshot)
++  logging.profile_finish(diagnostics_span, {["publications"] = #diagnostic_rows})
+   local access = store:acquire()
+   defer access:release()
+   local connection = access.connection
+@@ -797,20 +815,23 @@ local function Application:publish_view(service: project_service.Service,
+   elseif not warm_reuse then
+     generation = generation + 1
+   end
+-  connection:set_autocommit(false)
++  local transaction_span? = logging.profile_begin("publication.transaction")
++  defer logging.profile_finish(transaction_span)
++  stores.profile_set_autocommit(connection, false)
+   do
+     if prepared ~= nil then prepared:publish(connection) end
+     published_diagnostics.publish(connection, diagnostic_rows)
+     service:publish_prepared(connection)
+     stores.execute(connection,
+       "UPDATE main.store_state SET published_generation=? WHERE singleton=1", generation)
+-    connection:commit()
++    stores.profile_commit(connection)
+   catch
+     -- Only the uncancelled updater owns this transaction; request cancellation
+     -- detaches a reader and Application.close joins the updater before close.
+-    if not connection:get_autocommit() then connection:rollback() end
++    if not stores.profile_get_autocommit(connection) then stores.profile_rollback(connection) end
+     raise
+   end
++  logging.profile_finish(transaction_span)
+   service:publication_committed()
+   local features = semantic_features.open(store, generation)
+   if reuse ~= nil then features = reuse.features end
+@@ -826,6 +847,8 @@ local function Application:install_view(snapshot: project_service.Snapshot): Vie
+ end
+ 
+ local function Application:refresh_once(): RefreshOutcome
++  local profile_span? = logging.profile_begin("application.refresh_once")
++  defer logging.profile_finish(profile_span)
+   do
+     local service? = self.service
+     if service == nil then
+@@ -1512,6 +1535,11 @@ end
+ 
+ function Application:close()
+   if self.closed then return end
++  -- Flush the compiler observer only after every application-owned operation
++  -- and this close span have retired, including an exceptional unwind.
++  defer bridge.finish_profile()
++  local profile_span? = logging.profile_begin("application.close")
++  defer logging.profile_finish(profile_span)
+   self.closed = true
+   self.diagnostic_publisher:stop()
+   self.indexing_listener = nil
+diff --git a/src/server/compiler_bridge.titan b/src/server/compiler_bridge.titan
+index e79024992e4b10484f1a983fa162ae00a3327c24..d23328792b881aa7c1be970c62a89ef96a543cb4 100644
+--- a/src/server/compiler_bridge.titan
++++ b/src/server/compiler_bridge.titan
+@@ -952,6 +952,14 @@ function load(): Compiler
+     embedded_provider_identity(raw_identity, provider_file))
+ end
+ 
++-- Called once after process-owned server cleanup, never per resolver.
++function finish_profile()
++  if not logging.profile_is_enabled() then return end
++  local module = lua.require("titan-compiler.probeprofile") as {string: value}
++  local close = module["close"] as (value) -> ()
++  close({["shutdown"] = "application_closed"} as {string: value})
++end
++
+ function Compiler:compiler_abi(): string
+   return COMPILER_ABI
+ end
+@@ -3877,8 +3885,13 @@ local function Compiler:run_attempt_inner(
+     pending: {string: boolean}, cached: {string: CachedSourceInterface},
+     raw_cached_interfaces: {string: value},
+     c_header_analysis: value, header_inputs: value): AttemptResult
++  local attempt_span? = logging.profile_begin("compiler.attempt", {["root_module"] = root_module})
++  defer logging.profile_finish(attempt_span, nil)
++  local compile_span? = logging.profile_begin("compiler.resolve_check", {["root_module"] = root_module})
++  defer logging.profile_finish(compile_span, nil)
+   local normalization_work = NormalizationWork.new(0)
+   local options: {string: value} = { ["io"] = self.io }
++  if compile_span ~= nil then options["profile_parent_span_id"] = compile_span.id end
+   options["c_header_analysis"] = c_header_analysis
+   if header_inputs ~= nil then options["header_inputs"] = header_inputs end
+   local profiling = logging.enabled("trace")
+@@ -4034,6 +4047,7 @@ local function Compiler:run_attempt_inner(
+       context, normalization_work)
+   end
+ 
++  logging.profile_finish(compile_span, {["checked_modules"] = #checked})
+   local failed = failed_projects(
+     root_module, diagnostics, projects, not ok, normalization_work)
+   local checked_set: {string: boolean} = {}
+@@ -4071,9 +4085,14 @@ local function Compiler:run_attempt_inner(
+       end
+       local normalization_started = 0.0
+       if profiling then normalization_started = logging.clock() end
++      local normalization_span? = logging.profile_begin("compiler.module_normalization", {
++        ["root_module"] = root_module, ["module_name"] = name,
++      })
++      defer logging.profile_finish(normalization_span, nil)
+       local normalized = snapshot_module(
+         self, name, imported[name], projects, cached, valid,
+         normalization_work)
++      logging.profile_finish(normalization_span, nil)
+       local snapshot = normalized.snapshot
+       modules[#modules + 1] = snapshot
+       if normalized.embedded_provider then embedded_modules[name] = true end
+@@ -4430,8 +4449,13 @@ end
+ 
+ function Compiler:export_projects(projects: {ProjectModule}, selected_names: {string}):
+     {ProjectPayload}
++  local profile? = logging.profile_begin("compiler.export_projects", {["selected_modules"] = #selected_names})
++  defer logging.profile_finish(profile, nil)
+   local started = logging.clock()
++  local permit_span? = logging.profile_begin("compiler.export_permit_wait", nil)
++  defer logging.profile_finish(permit_span, nil)
+   local permit = compiler_scheduler.acquire()
++  logging.profile_finish(permit_span, nil)
+   defer permit:release()
+   local encode = checked_function(self.driver, DRIVER_MODULE,
+     "encode_project_entry", self.type_of) as (value, value) -> (value, value)
+@@ -4448,7 +4472,13 @@ function Compiler:export_projects(projects: {ProjectModule}, selected_names: {st
+     local name = selected_names[index]
+     local entry: value = self.project_entries[name]
+     if current_projects[name] ~= nil and entry ~= nil then
++      local encode_span? = logging.profile_begin("compiler.project_encode", {["module_name"] = name})
++      defer logging.profile_finish(encode_span, nil)
++      if encode_span ~= nil then options["profile_parent_span_id"] = encode_span.id end
+       local raw, failure = encode(entry, options)
++      local encoded_bytes = 0
++      if raw is string then encoded_bytes = #(raw as string) end
++      logging.profile_finish(encode_span, {["bytes"] = encoded_bytes})
+       if raw is string then
+         result[#result + 1] = ProjectPayload.new(name,raw as string)
+         encoded_names[#encoded_names + 1] = name
+@@ -4476,8 +4506,13 @@ end
+ function Compiler:hydrate_project_cache(projects: {ProjectModule},
+     names: {string}, read: ProjectPayloadReader,
+     install: ProjectSnapshotInstaller): {string}
++  local profile? = logging.profile_begin("compiler.hydrate_project_cache", {["requested_modules"] = #names})
++  defer logging.profile_finish(profile, nil)
+   local started = logging.clock()
++  local permit_span? = logging.profile_begin("compiler.hydrate_permit_wait", nil)
++  defer logging.profile_finish(permit_span, nil)
+   local permit = compiler_scheduler.acquire()
++  logging.profile_finish(permit_span, nil)
+   defer permit:release()
+   local decode = checked_function(self.driver, DRIVER_MODULE,
+     "decode_project_entry",self.type_of) as (string, value) -> (value, value)
+@@ -4498,7 +4533,13 @@ function Compiler:hydrate_project_cache(projects: {ProjectModule},
+       if header_inputs ~= nil then
+         options["header_inputs"] = raw_c_header_dependencies(header_inputs)
+       end
++      local decode_span? = logging.profile_begin("compiler.project_decode", {
++        ["module_name"] = name, ["bytes"] = #payload,
++      })
++      defer logging.profile_finish(decode_span, nil)
++      if decode_span ~= nil then options["profile_parent_span_id"] = decode_span.id end
+       local entry, failure = decode(payload,options)
++      logging.profile_finish(decode_span, nil)
+       if entry ~= nil and entry ~= false then
+         entries[name] = entry
+       else
+@@ -4509,7 +4550,10 @@ function Compiler:hydrate_project_cache(projects: {ProjectModule},
+     end
+     if index < #names then async.yield() end
+   end
++  local registry_span? = logging.profile_begin("compiler.hydrated_registry", nil)
++  defer logging.profile_finish(registry_span, nil)
+   local registry, registry_error = make_registry(entries,{["yield"] = function () async.yield() end})
++  logging.profile_finish(registry_span, nil)
+   if registry == nil or registry == false then
+     logging.emit("debug","cache.project.registry_miss",{
+       ["message"] = strings.tostring(registry_error),
+@@ -4526,8 +4570,15 @@ function Compiler:hydrate_project_cache(projects: {ProjectModule},
+     local entry: value = entries[name]
+     if entry ~= nil then
+       do
++        local normalize_span? = logging.profile_begin("compiler.hydrated_module_normalization", {["module_name"] = name})
++        defer logging.profile_finish(normalize_span, nil)
+         local normalized = snapshot_module(self,name,entry,project_map,{},true,work,true)
+-        if install(name,normalized.snapshot) then
++        logging.profile_finish(normalize_span, nil)
++        local install_span? = logging.profile_begin("compiler.hydrated_module_install", {["module_name"] = name})
++        defer logging.profile_finish(install_span, nil)
++        local installed = install(name,normalized.snapshot)
++        logging.profile_finish(install_span, nil)
++        if installed then
+           self.project_asts[name] = required_map(entry,DRIVER_MODULE,
+             "hydrated project entry")["ast"]
+           self.project_entries[name] = entry
+diff --git a/src/server/compiler_io_clock.c b/src/server/compiler_io_clock.c
+index 9d2b23a70a53ef19fbd057784acafba8d804fdef..9adb8041297205abb3062f62a3c9ead650910bf5 100644
+--- a/src/server/compiler_io_clock.c
++++ b/src/server/compiler_io_clock.c
+@@ -9,6 +9,9 @@
+ 
+ #endif
+ 
++#include <sys/resource.h>
++#include <time.h>
++
+ #include "compiler_io_clock.h"
+ 
+ double vscode_titan_monotonic_ms(void) {
+@@ -27,3 +30,26 @@ double vscode_titan_monotonic_ms(void) {
+     return (double)now.tv_sec * 1000.0 + (double)now.tv_nsec / 1000000.0;
+ #endif
+ }
++
++/* Experimental profile clocks: child counters cover authoritatively reaped
++ * children only. CPU clocks must not be interpreted as elapsed wall time. */
++double vscode_titan_process_cpu_ms(void) {
++    struct timespec now;
++    if (clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &now) != 0) return -1.0;
++    return (double)now.tv_sec * 1000.0 + (double)now.tv_nsec / 1000000.0;
++}
++double vscode_titan_thread_cpu_ms(void) {
++    struct timespec now;
++    if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &now) != 0) return -1.0;
++    return (double)now.tv_sec * 1000.0 + (double)now.tv_nsec / 1000000.0;
++}
++double vscode_titan_child_user_ms(void) {
++    struct rusage usage;
++    if (getrusage(RUSAGE_CHILDREN, &usage) != 0) return -1.0;
++    return (double)usage.ru_utime.tv_sec * 1000.0 + (double)usage.ru_utime.tv_usec / 1000.0;
++}
++double vscode_titan_child_system_ms(void) {
++    struct rusage usage;
++    if (getrusage(RUSAGE_CHILDREN, &usage) != 0) return -1.0;
++    return (double)usage.ru_stime.tv_sec * 1000.0 + (double)usage.ru_stime.tv_usec / 1000.0;
++}
+diff --git a/src/server/compiler_io_clock.h b/src/server/compiler_io_clock.h
+index 652c914c210c86a0b286a2e164e37409065d429b..b0d2bba424e8bd54ee1558d479f4fb5ed72871d8 100644
+--- a/src/server/compiler_io_clock.h
++++ b/src/server/compiler_io_clock.h
+@@ -6,5 +6,9 @@
+  * compiled implementation supplies this one narrow, typed boundary. A
+  * negative result means that the platform clock could not be sampled. */
+ double vscode_titan_monotonic_ms(void);
++double vscode_titan_process_cpu_ms(void);
++double vscode_titan_thread_cpu_ms(void);
++double vscode_titan_child_user_ms(void);
++double vscode_titan_child_system_ms(void);
+ 
+ #endif
+diff --git a/src/server/logging.titan b/src/server/logging.titan
+index c1440fc3a0bc9d04647b3e94712e887b473bd41a..3cd115c288130b840bf0eeb66192717485ea5052 100644
+--- a/src/server/logging.titan
++++ b/src/server/logging.titan
+@@ -1,6 +1,8 @@
+ local async = import "async"
+ local iteration = import "iteration"
+ local os = import "os"
++local strings = import "string"
++local profile_clock = foreign import "compiler_io_clock.h"
+ local wire = import "server.wire"
+ local response_queue = import "server.response_queue"
+ 
+@@ -111,6 +113,7 @@ local function stop_writer(queue: response_queue.ResponseQueue,
+ end
+ 
+ function close()
++  profile_summary()
+   local queue? = output
+   local task? = writer
+   output = nil
+@@ -153,3 +156,138 @@ function emit(level: string, event: string, fields: wire.Object?)
+     return
+   end
+ end
++
++-- Experimental evidence-only spans. Each async Task has its own parent chain;
++-- overlapping Tasks never become each other's children merely by interleaving.
++local record ProfileSample
++  monotonic_ms: float
++  process_cpu_ms: float
++  thread_cpu_ms: float
++  child_user_ms: float
++  child_system_ms: float
++end
++
++record ProfileSpan
++  id: string
++  local name: string
++  local owner: async.Task<value, value>
++  local started: ProfileSample
++  local finished: boolean
++end
++
++local profile_spans: {ProfileSpan} = {}
++local profile_serial = 0
++local profile_sequence = 0
++local profile_overhead_wall_ms = 0.0
++local profile_overhead_cpu_ms = 0.0
++local profile_bytes = 0
++local profile_directory?: string = nil
++local profile_configured = false
++
++function profile_is_enabled(): boolean
++  if not profile_configured then
++    profile_directory = os.getenv("TITAN_FFI_PROFILE_DIR")
++    profile_configured = true
++  end
++  return profile_directory ~= nil and profile_directory ~= ""
++end
++
++local function profile_sample(): ProfileSample
++  return ProfileSample.new(
++    profile_clock.vscode_titan_monotonic_ms(),
++    profile_clock.vscode_titan_process_cpu_ms(),
++    profile_clock.vscode_titan_thread_cpu_ms(),
++    profile_clock.vscode_titan_child_user_ms(),
++    profile_clock.vscode_titan_child_system_ms())
++end
++
++local function profile_sample_fields(sample: ProfileSample): wire.Object
++  return {
++    ["monotonic_ms"] = sample.monotonic_ms,
++    ["process_cpu_ms"] = sample.process_cpu_ms,
++    ["thread_cpu_ms"] = sample.thread_cpu_ms,
++    ["child_user_ms"] = sample.child_user_ms,
++    ["child_system_ms"] = sample.child_system_ms,
++  }
++end
++
++local function profile_write(event: string, fields: wire.Object)
++  local before = profile_sample()
++  do
++    profile_sequence = profile_sequence + 1
++    fields["event"] = event
++    fields["producer"] = "server"
++    fields["schema_version"] = 1
++    fields["sequence"] = profile_sequence
++    fields["sample"] = profile_sample_fields(before)
++    local rendered = "titan-language-server-profile " .. wire.encode(fields)
++    local queue? = output
++    if queue ~= nil then queue:push(rendered) end
++    profile_bytes = profile_bytes + #rendered + 1
++  catch
++    return
++  end
++  local after = profile_sample()
++  profile_overhead_wall_ms = profile_overhead_wall_ms + after.monotonic_ms - before.monotonic_ms
++  profile_overhead_cpu_ms = profile_overhead_cpu_ms + after.process_cpu_ms - before.process_cpu_ms
++end
++
++function profile_begin(name: string, fields: wire.Object?): ProfileSpan?
++  if not profile_is_enabled() then return nil end
++  local owner = async.running()
++  local parent?: string = nil
++  for index = #profile_spans, 1, -1 do
++    local candidate = profile_spans[index]
++    if not candidate.finished and candidate.owner == owner then
++      parent = candidate.id
++      break
++    end
++  end
++  local metadata: wire.Object = {}
++  if parent ~= nil then metadata["parent_span_id"] = parent end
++  if fields ~= nil then
++    for key, item in iteration.pairs<string, value>(fields) do metadata[key] = item end
++  end
++  profile_serial = profile_serial + 1
++  local span = ProfileSpan.new("server-span:" .. strings.tostring(profile_serial),
++    name, owner, profile_sample(), false)
++  profile_spans[#profile_spans + 1] = span
++  profile_write("span_begin", {
++    ["name"] = name, ["span_id"] = span.id, ["fields"] = metadata,
++  })
++  return span
++end
++
++function profile_finish(span: ProfileSpan?, fields: wire.Object?)
++  if span == nil or span.finished then return end
++  local ending = profile_sample()
++  span.finished = true
++  while #profile_spans > 0 and profile_spans[#profile_spans].finished do
++    profile_spans[#profile_spans] = nil
++  end
++  local metadata: wire.Object = {}
++  if fields ~= nil then metadata = fields end
++  local start = span.started
++  profile_write("span_end", {
++    ["name"] = span.name, ["span_id"] = span.id, ["fields"] = metadata,
++    ["start"] = profile_sample_fields(start), ["finish"] = profile_sample_fields(ending),
++    ["delta"] = {
++      ["monotonic_ms"] = ending.monotonic_ms - start.monotonic_ms,
++      ["process_cpu_ms"] = ending.process_cpu_ms - start.process_cpu_ms,
++      ["thread_cpu_ms"] = ending.thread_cpu_ms - start.thread_cpu_ms,
++      ["child_user_ms"] = ending.child_user_ms - start.child_user_ms,
++      ["child_system_ms"] = ending.child_system_ms - start.child_system_ms,
++    } as wire.Object,
++  })
++end
++
++function profile_summary()
++  if not profile_is_enabled() then return end
++  profile_write("profile_summary", {
++    ["spans_started"] = profile_serial, ["active_spans"] = #profile_spans,
++    ["observer_wall_ms"] = profile_overhead_wall_ms,
++    ["observer_process_cpu_ms"] = profile_overhead_cpu_ms,
++    ["observer_bytes"] = profile_bytes,
++    ["observer_excludes"] = "clock sampling and async stderr writer",
++  })
++end
+diff --git a/src/server/project_service.titan b/src/server/project_service.titan
+index f9e73b378d832391e5fa194cefd715e6461b6634..dd4b101c36f30aba23e80b12dc2b3659c7558f72 100644
+--- a/src/server/project_service.titan
++++ b/src/server/project_service.titan
+@@ -142,22 +142,24 @@ end
+ -- survive a process interruption together. Nested adapters borrow the caller's
+ -- transaction; only the outer updater owns COMMIT/ROLLBACK.
+ local function Service:update_metadata(body: () -> ())
++  local profile_span? = logging.profile_begin("project.metadata_update")
++  defer logging.profile_finish(profile_span)
+   local connection = self.graph.connection
+-  if not connection:get_autocommit() then
++  if not sql.profile_get_autocommit(connection) then
+     body()
+     return
+   end
+   local saved_asts = self.graph:checkpoint_asts()
+-  connection:set_autocommit(false)
++  sql.profile_set_autocommit(connection, false)
+   local complete = false
+   defer do
+     if not complete then
+-      connection:rollback()
++      sql.profile_rollback(connection)
+       self.graph:restore_asts(saved_asts)
+     end
+   end
+   body()
+-  connection:commit()
++  sql.profile_commit(connection)
+   complete = true
+ end
+ 
+@@ -628,6 +630,8 @@ end
+ -- identity before invalidation so repeated scans of the same filesystem state
+ -- do not advance the graph revision forever.
+ local function Service:revalidate_known_headers()
++  local profile_span? = logging.profile_begin("project.header_revalidation")
++  defer logging.profile_finish(profile_span)
+   local names = copy_strings(self.metadata:header_names())
+   local validation = compiler_bridge.header_validation()
+   for index = 1, #names do
+@@ -783,6 +787,8 @@ end
+ -- metadata-only fingerprints are re-statted without inventing an ordinary
+ -- resolver/import choice.
+ local function Service:revalidate_external_topology()
++  local profile_span? = logging.profile_begin("project.external_topology_revalidation")
++  defer logging.profile_finish(profile_span)
+   local fingerprint_names = self.metadata:fingerprint_names()
+   if #fingerprint_names == 0 then return end
+   local requests: {compiler_bridge.ExternalResolutionRequest} = {}
+@@ -824,6 +830,8 @@ local function Service:revalidate_external_topology()
+ end
+ 
+ local function Service:revalidate_external_files()
++  local profile_span? = logging.profile_begin("project.external_file_revalidation")
++  defer logging.profile_finish(profile_span)
+   local names = copy_strings(self.metadata:external_names())
+   for index = 1, #names do
+     local name = names[index]
+@@ -882,6 +890,8 @@ local function Service:revalidate_external_files()
+ end
+ 
+ local function Service:scan_or_raise(): Snapshot
++  local profile_span? = logging.profile_begin("project.scan")
++  defer logging.profile_finish(profile_span)
+   local started = logging.clock()
+   local reads_before = self.read_count
+   local hashes_before = self.hash_count
+@@ -891,13 +901,19 @@ local function Service:scan_or_raise(): Snapshot
+     ["root"] = self.project_root,
+     ["generation"] = self.graph:generation(),
+   })
++  local config_span? = logging.profile_begin("project.configuration_load")
++  defer logging.profile_finish(config_span)
+   local loaded?, config_error? = project_config.load(
+     self.project_root, self.installed_binary_modules_root)
++  logging.profile_finish(config_span)
+   if loaded == nil then
+     return fail<Snapshot>(config_error.path, config_error.message)
+   end
++  local discovery_span? = logging.profile_begin("project.discovery")
++  defer logging.profile_finish(discovery_span)
+   local found?, discovery_error? = project_discovery.discover(
+     loaded.include, loaded.exclude, loaded.source_module_roots)
++  logging.profile_finish(discovery_span)
+   if found == nil then
+     return fail<Snapshot>(discovery_error.path, discovery_error.message)
+   end
+@@ -915,6 +931,10 @@ local function Service:scan_or_raise(): Snapshot
+   local changed_sources: {string: boolean} = {}
+   local observed_sources: {string: boolean} = {}
+   local next_names: {string} = {}
++  local observation_span? = logging.profile_begin("project.source_observation", {
++    ["modules"] = #found.modules,
++  })
++  defer logging.profile_finish(observation_span)
+   for index = 1, #found.modules do
+     local module = found.modules[index]
+     local state, changed, observed = self:snapshot_discovered_module(module)
+@@ -923,15 +943,21 @@ local function Service:scan_or_raise(): Snapshot
+     observed_sources[module.name] = observed
+     next_names[index] = module.name
+   end
++  logging.profile_finish(observation_span, {
++    ["content_reads"] = self.read_count - reads_before,
++    ["content_hashes"] = self.hash_count - hashes_before,
++  })
+ 
+   do
++    local graph_span? = logging.profile_begin("project.scan_graph_transaction")
++    defer logging.profile_finish(graph_span)
+     local connection = self.graph.connection
+     local saved_asts = self.graph:checkpoint_asts()
+-    connection:set_autocommit(false)
++    sql.profile_set_autocommit(connection, false)
+     local published = false
+     defer do
+       if not published then
+-        connection:rollback()
++        sql.profile_rollback(connection)
+         self.graph:restore_asts(saved_asts)
+       end
+     end
+@@ -972,7 +998,7 @@ local function Service:scan_or_raise(): Snapshot
+         "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+         sqlite3.Blob.new("graph_configuration"), sqlite3.Blob.new(configuration))
+     end
+-    connection:commit()
++    sql.profile_commit(connection)
+     published = true
+   end
+   self.current_config = loaded
+@@ -1682,6 +1708,13 @@ end
+ local function Service:commit_or_raise(
+     request: AnalysisRequest,
+     analysis: compiler_bridge.Analysis): RefreshReport
++  local profile_span? = logging.profile_begin("project.result_commit", {
++    ["root_module"] = request.root_module,
++    ["generation"] = request.generation,
++  })
++  defer logging.profile_finish(profile_span)
++  local preparation_span? = logging.profile_begin("project.commit_prepare")
++  defer logging.profile_finish(preparation_span)
+   if request.generation ~= self.graph:generation() then
+     self:abort_request_inner(request)
+     return RefreshReport.new(
+@@ -1913,13 +1946,16 @@ local function Service:commit_or_raise(
+       self.graph:dirty_modules())
+   end
+ 
++  logging.profile_finish(preparation_span)
++  local publication_span? = logging.profile_begin("project.graph_publish_transaction")
++  defer logging.profile_finish(publication_span)
+   local connection = self.graph.connection
+   local saved_asts = self.graph:checkpoint_asts()
+-  connection:set_autocommit(false)
++  sql.profile_set_autocommit(connection, false)
+   local published = false
+   defer do
+     if not published then
+-      connection:rollback()
++      sql.profile_rollback(connection)
+       self.graph:restore_asts(saved_asts)
+     end
+   end
+@@ -1989,7 +2025,7 @@ local function Service:commit_or_raise(
+   local report = RefreshReport.new(
+     true, false, self.graph:generation(), committed, failed,
+     self.graph:dirty_modules())
+-  connection:commit()
++  sql.profile_commit(connection)
+   published = true
+   return report
+ end
+@@ -2290,11 +2326,15 @@ function Service:set_publication_hooks(hooks: PublicationHooks)
+ end
+ 
+ function Service:prepare_publication(snapshot: Snapshot): boolean
++  local profile_span? = logging.profile_begin("publication.cache_prepare")
++  defer logging.profile_finish(profile_span)
+   if self.publication_hooks == nil then return false end
+   return self.publication_hooks.prepare(snapshot)
+ end
+ 
+ function Service:publish_prepared(connection: sqlite3.Connection)
++  local profile_span? = logging.profile_begin("publication.cache_write")
++  defer logging.profile_finish(profile_span)
+   if self.publication_hooks ~= nil then self.publication_hooks.publish(connection) end
+ end
+ 
+diff --git a/src/server/published_diagnostics.titan b/src/server/published_diagnostics.titan
+index 5ce6d99861f2e9cd76fc2793c1e24af94e90a62f..8c3e231911feb3b8fdc1b7298ae833727daf4311 100644
+--- a/src/server/published_diagnostics.titan
++++ b/src/server/published_diagnostics.titan
+@@ -4,6 +4,7 @@ local indexer = import "server.semantic_index"
+ local source_text = import "server.source_text"
+ local sqlite3 = import "sqlite3"
+ local stores = import "server.workspace_store"
++local logging = import "server.logging"
+ 
+ -- Diagnostics are published with the semantic rows. Listener replay reads that
+ -- completed revision without retaining its source files or AST snapshots.
+@@ -42,8 +43,14 @@ end
+ 
+ function publish(connection: sqlite3.Connection,
+                  publications: {diagnostics.Publication})
++  local profile_span? = logging.profile_begin("diagnostics.publish", {
++    ["publications"] = #publications,
++  })
++  defer logging.profile_finish(profile_span)
+   stores.execute(connection, "DELETE FROM main.semantic_diagnostic_items")
+   stores.execute(connection, "DELETE FROM main.semantic_diagnostic_publications")
++  local publications_span? = logging.profile_begin("diagnostics.publication_rows_write")
++  defer logging.profile_finish(publications_span)
+   local offset = 1
+   while offset <= #publications do
+     local finish = offset + 99
+@@ -55,11 +62,14 @@ function publish(connection: sqlite3.Connection,
+       sql = sql .. "(" .. indexer.binding(bindings, index) .. "," ..
+         indexer.binding(bindings, indexer.blob(publications[index].uri)) .. ")"
+     end
+-    local statement = connection:prepare(sql)
+-    defer statement:close()
+-    statement:execute(...bindings)
++    local statement = stores.profile_prepare(connection, sql)
++    defer stores.profile_statement_close(statement)
++    stores.profile_execute(statement, ...bindings)
+     offset = finish + 1
+   end
++  logging.profile_finish(publications_span)
++  local items_span? = logging.profile_begin("diagnostics.item_rows_write")
++  defer logging.profile_finish(items_span)
+   local sql = "INSERT INTO main.semantic_diagnostic_items VALUES "
+   local bindings: {value} = {}
+   local count = 0
+@@ -78,9 +88,9 @@ function publish(connection: sqlite3.Connection,
+         indexer.binding(bindings, item.range.finish.character) .. ")"
+       count = count + 1
+       if count == 25 then
+-        local statement = connection:prepare(sql)
+-        defer statement:close()
+-        statement:execute(...bindings)
++        local statement = stores.profile_prepare(connection, sql)
++        defer stores.profile_statement_close(statement)
++        stores.profile_execute(statement, ...bindings)
+         sql = "INSERT INTO main.semantic_diagnostic_items VALUES "
+         bindings = {}
+         count = 0
+@@ -88,27 +98,33 @@ function publish(connection: sqlite3.Connection,
+     end
+   end
+   if count > 0 then
+-    local statement = connection:prepare(sql)
+-    defer statement:close()
+-    statement:execute(...bindings)
++    local statement = stores.profile_prepare(connection, sql)
++    defer stores.profile_statement_close(statement)
++    stores.profile_execute(statement, ...bindings)
+   end
+ end
+ 
+ function read(store: stores.Store, generation: integer): {diagnostics.Publication}
++  local profile_span? = logging.profile_begin("diagnostics.read")
++  defer logging.profile_finish(profile_span)
+   local access = store:acquire()
+   defer access:release()
+   indexer.check_generation(access.connection, generation)
+-  local statement = access.connection:prepare(
++  local statement = stores.profile_prepare(access.connection,
+     "SELECT p.publication_order,p.uri,i.kind,i.message,i.start_line,i.start_character," ..
+     "i.finish_line,i.finish_character FROM main.semantic_diagnostic_publications AS p " ..
+     "LEFT JOIN main.semantic_diagnostic_items AS i ON i.publication_order=p.publication_order " ..
+     "ORDER BY p.publication_order,i.item_order")
+-  defer statement:close()
+-  local cursor = statement:query()
+-  defer cursor:close()
++  defer stores.profile_statement_close(statement)
++  local cursor = stores.profile_query(statement)
++  defer stores.profile_cursor_close(cursor)
+   local result: {diagnostics.Publication} = {}
+   local current: diagnostics.Publication? = nil
+   local publication_order = 0
++  local iteration_span? = logging.profile_begin("sqlite.cursor_iteration", {
++    ["measurement"] = "fetch_api_and_diagnostic_materialization",
++  })
++  defer logging.profile_finish(iteration_span)
+   for row in cursor:fetch do
+     local ordinal = row:get(1) as integer
+     if current == nil or ordinal ~= publication_order then
+@@ -124,5 +140,6 @@ function read(store: stores.Store, generation: integer): {diagnostics.Publicatio
+           source_text.Position.new(row:get(7) as integer, row:get(8) as integer)))
+     end
+   end
++  logging.profile_finish(iteration_span)
+   return result
+ end
+diff --git a/src/server/semantic_features.titan b/src/server/semantic_features.titan
+index cb27a94fe420ff6598b845403db18ccbacaa9cf3..1c91fa86b1c2bff426e134aad10011838b4c4fdc 100644
+--- a/src/server/semantic_features.titan
++++ b/src/server/semantic_features.titan
+@@ -5,6 +5,7 @@ local indexer = import "server.semantic_index"
+ local source_text = import "server.source_text"
+ local sqlite3 = import "sqlite3"
+ local workspace_store = import "server.workspace_store"
++local logging = import "server.logging"
+ 
+ record Error
+   const message: string
+@@ -363,14 +364,14 @@ function Features:hover(filename: string, position: source_text.Position): Hover
+     local access = self.store:acquire()
+     defer access:release()
+     indexer.check_generation(access.connection, self.published_generation)
+-    local statement = access.connection:prepare(
++    local statement = workspace_store.profile_prepare(access.connection,
+       "SELECT inferred_tag,inferred_display,declared_tag,declared_display," ..
+       "original_tag,original_display,coerced_tag,coerced_display " ..
+       "FROM main.semantic_hovers WHERE filename=? AND byte_start=?")
+-    defer statement:close()
+-    local cursor = statement:query(indexer.blob(filename), occurrence.byte_span.start)
+-    defer cursor:close()
+-    local row? = cursor:fetch()
++    defer workspace_store.profile_statement_close(statement)
++    local cursor = workspace_store.profile_query(statement, indexer.blob(filename), occurrence.byte_span.start)
++    defer workspace_store.profile_cursor_close(cursor)
++    local row? = workspace_store.profile_fetch(cursor)
+     if row == nil then return nil end
+     inferred = indexer.row_type(row, 1)
+     declared = indexer.row_type(row, 3)
+@@ -615,20 +616,27 @@ local function insert_long_comment_folds(saved: SavedFile,
+ end
+ 
+ function Features:folding_ranges(filename: string): {lsp.FoldingRange}
++  local profile_span? = logging.profile_begin("semantic.folding_read")
++  defer logging.profile_finish(profile_span)
+   local access = self.store:acquire()
+   defer access:release()
+   indexer.check_generation(access.connection, self.published_generation)
+-  local statement = access.connection:prepare(
++  local statement = workspace_store.profile_prepare(access.connection,
+     "SELECT start_line,end_line,kind FROM main.semantic_folds WHERE filename=? " ..
+     "ORDER BY start_line,end_line DESC")
+-  defer statement:close()
+-  local cursor = statement:query(indexer.blob(filename))
+-  defer cursor:close()
++  defer workspace_store.profile_statement_close(statement)
++  local cursor = workspace_store.profile_query(statement, indexer.blob(filename))
++  defer workspace_store.profile_cursor_close(cursor)
+   local result: {lsp.FoldingRange} = {}
++  local iteration_span? = logging.profile_begin("sqlite.cursor_iteration", {
++    ["measurement"] = "fetch_api_and_fold_materialization",
++  })
++  defer logging.profile_finish(iteration_span)
+   for row in cursor:fetch do
+     result[#result + 1] = lsp.FoldingRange.new(row:get(1) as integer, nil,
+       row:get(2) as integer, nil, indexer.optional_bytes(row, 3))
+   end
++  logging.profile_finish(iteration_span, {["rows"] = #result})
+   return result
+ end
+ 
+@@ -647,6 +655,10 @@ end
+ local function prepare_internal(projects: {bridge.ProjectModule},
+                                snapshots: {bridge.ModuleSnapshot},
+                                yield_now: Yield?): PreparedView
++  local profile_span? = logging.profile_begin("semantic.features_prepare", {
++    ["projects"] = #projects, ["snapshots"] = #snapshots,
++  })
++  defer logging.profile_finish(profile_span)
+   local state = ExtractionState.new(yield_now, 0)
+   local owned_projects = copy_projects(projects)
+   local prepared = indexer.prepare(owned_projects, snapshots, yield_now)
+@@ -707,6 +719,9 @@ local function prepare_internal(projects: {bridge.ProjectModule},
+       end
+     end
+   end
++  logging.profile_finish(profile_span, {
++    ["hovers"] = #hovers, ["folds"] = #folds,
++  })
+   return PreparedView.new(prepared, hovers, folds)
+ catch
+   if error is indexer.Error then
+@@ -729,6 +744,10 @@ function prepare(projects: {bridge.ProjectModule}, snapshots: {bridge.ModuleSnap
+ end
+ 
+ function PreparedView:publish(connection: sqlite3.Connection)
++  local profile_span? = logging.profile_begin("semantic.features_publish", {
++    ["hovers"] = #self.hovers, ["folds"] = #self.folds,
++  })
++  defer logging.profile_finish(profile_span)
+   self.index:publish(connection)
+   indexer.execute(connection, "DELETE FROM main.semantic_hovers")
+   indexer.execute(connection, "DELETE FROM main.semantic_folds")
+@@ -736,6 +755,12 @@ function PreparedView:publish(connection: sqlite3.Connection)
+   while offset <= #self.hovers do
+     local finish = offset + 19
+     if finish > #self.hovers then finish = #self.hovers end
++    local batch_span? = logging.profile_begin("semantic.hover_batch", {
++      ["rows"] = finish - offset + 1,
++    })
++    defer logging.profile_finish(batch_span)
++    local construction_span? = logging.profile_begin("sqlite.arguments_construct")
++    defer logging.profile_finish(construction_span)
+     local parameters: {value} = {}
+     local sql = "INSERT OR REPLACE INTO main.semantic_hovers VALUES "
+     for index = offset, finish do
+@@ -752,15 +777,24 @@ function PreparedView:publish(connection: sqlite3.Connection)
+         indexer.binding(parameters, indexer.type_tag(item.coerced_type)) .. "," ..
+         indexer.binding(parameters, indexer.type_display(item.coerced_type)) .. ")"
+     end
+-    local statement = connection:prepare(sql)
+-    defer statement:close()
+-    statement:execute(...parameters)
++    logging.profile_finish(construction_span, {
++      ["parameters"] = #parameters, ["sql_bytes"] = #sql,
++    })
++    local statement = workspace_store.profile_prepare(connection, sql)
++    defer workspace_store.profile_statement_close(statement)
++    workspace_store.profile_execute(statement, ...parameters)
+     offset = finish + 1
+   end
+   offset = 1
+   while offset <= #self.folds do
+     local finish = offset + 49
+     if finish > #self.folds then finish = #self.folds end
++    local batch_span? = logging.profile_begin("semantic.fold_batch", {
++      ["rows"] = finish - offset + 1,
++    })
++    defer logging.profile_finish(batch_span)
++    local construction_span? = logging.profile_begin("sqlite.arguments_construct")
++    defer logging.profile_finish(construction_span)
+     local parameters: {value} = {}
+     local sql = "INSERT OR IGNORE INTO main.semantic_folds VALUES "
+     for index = offset, finish do
+@@ -771,9 +805,12 @@ function PreparedView:publish(connection: sqlite3.Connection)
+         indexer.binding(parameters, item.range.end_line) .. "," ..
+         indexer.binding(parameters, indexer.blob(item.range.kind)) .. ")"
+     end
+-    local statement = connection:prepare(sql)
+-    defer statement:close()
+-    statement:execute(...parameters)
++    logging.profile_finish(construction_span, {
++      ["parameters"] = #parameters, ["sql_bytes"] = #sql,
++    })
++    local statement = workspace_store.profile_prepare(connection, sql)
++    defer workspace_store.profile_statement_close(statement)
++    workspace_store.profile_execute(statement, ...parameters)
+     offset = finish + 1
+   end
+ end
+diff --git a/src/server/semantic_index.titan b/src/server/semantic_index.titan
+index 5ff1017834ffcf070599b139dc135a248711be98..8134389e612124eaca229cb1154e3a4c1676cd19 100644
+--- a/src/server/semantic_index.titan
++++ b/src/server/semantic_index.titan
+@@ -4,6 +4,7 @@ local bridge = import "server.compiler_bridge"
+ local source_text = import "server.source_text"
+ local sqlite3 = import "sqlite3"
+ local workspace_store = import "server.workspace_store"
++local logging = import "server.logging"
+ 
+ -- Symbol identity is nominal at the server boundary even though the compiler
+ -- bridge supplies its stable representation as a string.
+@@ -354,6 +355,10 @@ end
+ function prepare(projects: {bridge.ProjectModule},
+                  snapshots: {bridge.ModuleSnapshot},
+                  yield_now: Yield?): Prepared
++  local profile_span? = logging.profile_begin("semantic.occurrences_prepare", {
++    ["projects"] = #projects, ["snapshots"] = #snapshots,
++  })
++  defer logging.profile_finish(profile_span)
+   local state = YieldState.new(yield_now, 0)
+   local files, project_names = project_files(projects, state)
+   local occurrences: {Occurrence} = {}
+@@ -364,6 +369,7 @@ function prepare(projects: {bridge.ProjectModule},
+     append_snapshot_occurrences(
+       occurrences, snapshots[index], files, project_names, state)
+   end
++  logging.profile_finish(profile_span, {["occurrences"] = #occurrences})
+   return Prepared.new(projects, occurrences, files, summaries)
+ end
+ 
+@@ -375,9 +381,13 @@ function Prepared:coordinate_index(filename: string):
+ end
+ 
+ function execute(connection: sqlite3.Connection, sql: string)
+-  local statement = connection:prepare(sql)
+-  defer statement:close()
+-  statement:execute()
++  local profile_span? = logging.profile_begin("sqlite.semantic_statement", {
++    ["sql_bytes"] = #sql, ["sql_prefix"] = strings.sub(sql, 1, 120),
++  })
++  defer logging.profile_finish(profile_span)
++  local statement = workspace_store.profile_prepare(connection, sql)
++  defer workspace_store.profile_statement_close(statement)
++  workspace_store.profile_execute(statement)
+ end
+ 
+ function bytes(row: sqlite3.Row, column: integer): string
+@@ -469,10 +479,20 @@ end
+ -- all seventeen columns are non-NULL. SQL orders and normalizes the rows.
+ local function publish_occurrences(connection: sqlite3.Connection,
+                                    items: {Occurrence})
++  local profile_span? = logging.profile_begin("semantic.occurrences_publish", {
++    ["rows"] = #items,
++  })
++  defer logging.profile_finish(profile_span)
+   local offset = 1
+   while offset <= #items do
+     local finish = offset + 10
+     if finish > #items then finish = #items end
++    local batch_span? = logging.profile_begin("semantic.occurrence_batch", {
++      ["rows"] = finish - offset + 1,
++    })
++    defer logging.profile_finish(batch_span)
++    local construction_span? = logging.profile_begin("sqlite.arguments_construct")
++    defer logging.profile_finish(construction_span)
+     local parameters: {value} = {}
+     local sql = "INSERT INTO main.semantic_occurrence_inputs VALUES "
+     for index = offset, finish do
+@@ -496,40 +516,45 @@ local function publish_occurrences(connection: sqlite3.Connection,
+         binding(parameters, signature_blob(item.callable_signature)) .. "," ..
+         binding(parameters, item.summary_id) .. ")"
+     end
+-    local statement = connection:prepare(sql)
+-    defer statement:close()
+-    statement:execute(...parameters)
++    logging.profile_finish(construction_span, {
++      ["parameters"] = #parameters, ["sql_bytes"] = #sql,
++    })
++    local statement = workspace_store.profile_prepare(connection, sql)
++    defer workspace_store.profile_statement_close(statement)
++    workspace_store.profile_execute(statement, ...parameters)
+     offset = finish + 1
+   end
+ end
+ 
+ local function validate_published(connection: sqlite3.Connection)
++  local profile_span? = logging.profile_begin("semantic.occurrences_validate")
++  defer logging.profile_finish(profile_span)
+   execute(connection, "DELETE FROM main.semantic_occurrence_inputs WHERE rowid NOT IN " ..
+     "(SELECT MIN(rowid) FROM main.semantic_occurrence_inputs GROUP BY " ..
+     OCCURRENCE_COLUMNS .. ")")
+   do
+-    local statement = connection:prepare(
++    local statement = workspace_store.profile_prepare(connection,
+       "SELECT module_name,filename FROM (SELECT module_name,filename,byte_start," ..
+       "LAG(byte_finish) OVER (PARTITION BY filename ORDER BY byte_start," ..
+       "byte_finish,declaration_id,role) AS previous_finish " ..
+       "FROM main.semantic_occurrence_inputs) WHERE byte_start < previous_finish LIMIT 1")
+-    defer statement:close()
+-    local cursor = statement:query()
+-    defer cursor:close()
+-    local row? = cursor:fetch()
++    defer workspace_store.profile_statement_close(statement)
++    local cursor = workspace_store.profile_query(statement)
++    defer workspace_store.profile_cursor_close(cursor)
++    local row? = workspace_store.profile_fetch(cursor)
+     if row ~= nil then
+       fail<value>(bytes(row, 1), bytes(row, 2),
+         "compiler symbol spans overlap in saved source")
+     end
+   end
+   do
+-    local statement = connection:prepare(
++    local statement = workspace_store.profile_prepare(connection,
+       "SELECT module_name,filename,declaration_id FROM main.semantic_occurrence_inputs " ..
+       "WHERE role IN (0,1) GROUP BY declaration_id HAVING COUNT(*) > 1 LIMIT 1")
+-    defer statement:close()
+-    local cursor = statement:query()
+-    defer cursor:close()
+-    local row? = cursor:fetch()
++    defer workspace_store.profile_statement_close(statement)
++    local cursor = workspace_store.profile_query(statement)
++    defer workspace_store.profile_cursor_close(cursor)
++    local row? = workspace_store.profile_fetch(cursor)
+     if row ~= nil then
+       fail<value>(bytes(row, 1), bytes(row, 2),
+         "symbol '" .. bytes(row, 3) .. "' has more than one exact declaration")
+@@ -538,19 +563,29 @@ local function validate_published(connection: sqlite3.Connection)
+ end
+ 
+ function Prepared:publish(connection: sqlite3.Connection)
++  local profile_span? = logging.profile_begin("semantic.index_publish", {
++    ["projects"] = #self.projects, ["occurrences"] = #self.occurrences,
++  })
++  defer logging.profile_finish(profile_span)
+   execute(connection, "DELETE FROM main.semantic_occurrences")
+   execute(connection, "DELETE FROM main.semantic_occurrence_inputs")
+   execute(connection, "DELETE FROM main.semantic_files")
+   execute(connection, "DELETE FROM main.semantic_projects")
+   execute(connection, "DELETE FROM main.semantic_summaries")
+   do
+-    local insert = connection:prepare("INSERT INTO main.semantic_projects VALUES (?,?)")
+-    defer insert:close()
++    local projects_span? = logging.profile_begin("semantic.projects_publish", {
++      ["rows"] = #self.projects,
++    })
++    defer logging.profile_finish(projects_span)
++    local insert = workspace_store.profile_prepare(connection, "INSERT INTO main.semantic_projects VALUES (?,?)")
++    defer workspace_store.profile_statement_close(insert)
+     for module_index = 1, #self.projects do
+-      insert:execute(blob(self.projects[module_index].module_name), module_index)
++      workspace_store.profile_execute(insert, blob(self.projects[module_index].module_name), module_index)
+     end
+   end
+   -- Build fixed-size file batches without retaining a second file registry.
++  local files_span? = logging.profile_begin("semantic.files_publish")
++  defer logging.profile_finish(files_span)
+   local file_bindings: {value} = {}
+   local file_sql = "INSERT INTO main.semantic_files VALUES "
+   local file_count = 0
+@@ -566,9 +601,9 @@ function Prepared:publish(connection: sqlite3.Connection)
+         binding(file_bindings, file_index) .. ")"
+       file_count = file_count + 1
+       if file_count == 40 then
+-        local statement = connection:prepare(file_sql)
+-        defer statement:close()
+-        statement:execute(...file_bindings)
++        local statement = workspace_store.profile_prepare(connection, file_sql)
++        defer workspace_store.profile_statement_close(statement)
++        workspace_store.profile_execute(statement, ...file_bindings)
+         file_bindings = {}
+         file_sql = "INSERT INTO main.semantic_files VALUES "
+         file_count = 0
+@@ -576,10 +611,13 @@ function Prepared:publish(connection: sqlite3.Connection)
+     end
+   end
+   if file_count > 0 then
+-    local statement = connection:prepare(file_sql)
+-    defer statement:close()
+-    statement:execute(...file_bindings)
++    local statement = workspace_store.profile_prepare(connection, file_sql)
++    defer workspace_store.profile_statement_close(statement)
++    workspace_store.profile_execute(statement, ...file_bindings)
+   end
++  logging.profile_finish(files_span)
++  local summaries_span? = logging.profile_begin("semantic.summaries_publish")
++  defer logging.profile_finish(summaries_span)
+   local summary_bindings: {value} = {}
+   local summary_sql = "INSERT INTO main.semantic_summaries VALUES "
+   local summary_count = 0
+@@ -589,19 +627,20 @@ function Prepared:publish(connection: sqlite3.Connection)
+       binding(summary_bindings, blob(markdown)) .. ")"
+     summary_count = summary_count + 1
+     if summary_count == 100 then
+-      local statement = connection:prepare(summary_sql)
+-      defer statement:close()
+-      statement:execute(...summary_bindings)
++      local statement = workspace_store.profile_prepare(connection, summary_sql)
++      defer workspace_store.profile_statement_close(statement)
++      workspace_store.profile_execute(statement, ...summary_bindings)
+       summary_bindings = {}
+       summary_sql = "INSERT INTO main.semantic_summaries VALUES "
+       summary_count = 0
+     end
+   end
+   if summary_count > 0 then
+-    local statement = connection:prepare(summary_sql)
+-    defer statement:close()
+-    statement:execute(...summary_bindings)
++    local statement = workspace_store.profile_prepare(connection, summary_sql)
++    defer workspace_store.profile_statement_close(statement)
++    workspace_store.profile_execute(statement, ...summary_bindings)
+   end
++  logging.profile_finish(summaries_span)
+   publish_occurrences(connection, self.occurrences)
+   validate_published(connection)
+   execute(connection, "INSERT INTO main.semantic_occurrences SELECT " ..
+@@ -610,12 +649,12 @@ function Prepared:publish(connection: sqlite3.Connection)
+ end
+ 
+ function check_generation(connection: sqlite3.Connection, expected: integer)
+-  local statement = connection:prepare(
++  local statement = workspace_store.profile_prepare(connection,
+     "SELECT published_generation FROM main.store_state WHERE singleton=1")
+-  defer statement:close()
+-  local cursor = statement:query()
+-  defer cursor:close()
+-  local row? = cursor:fetch()
++  defer workspace_store.profile_statement_close(statement)
++  local cursor = workspace_store.profile_query(statement)
++  defer workspace_store.profile_cursor_close(cursor)
++  local row? = workspace_store.profile_fetch(cursor)
+   local actual = -1
+   if row ~= nil then actual = row:get(1) as integer end
+   if actual ~= expected then raise StaleView.new(expected, actual) end
+@@ -692,38 +731,55 @@ local function row_occurrence(row: sqlite3.Row): Occurrence
+ end
+ 
+ local function collect(cursor: sqlite3.Cursor): {Occurrence}
++  local profile_span? = logging.profile_begin("sqlite.cursor_iteration", {
++    ["measurement"] = "fetch_api_and_occurrence_materialization",
++  })
++  defer logging.profile_finish(profile_span)
+   local result: {Occurrence} = {}
+   for row in cursor:fetch do result[#result + 1] = row_occurrence(row) end
+   return result
+ end
+ 
+ function Index:file_names(): {string}
++  local profile_span? = logging.profile_begin("semantic.file_names_read")
++  defer logging.profile_finish(profile_span)
+   local access = self.store:acquire()
+   defer access:release()
+   check_generation(access.connection, self.published_generation)
+-  local statement = access.connection:prepare(
++  local statement = workspace_store.profile_prepare(access.connection,
+     "SELECT DISTINCT filename FROM main.semantic_occurrences ORDER BY filename")
+-  defer statement:close()
+-  local cursor = statement:query()
+-  defer cursor:close()
++  defer workspace_store.profile_statement_close(statement)
++  local cursor = workspace_store.profile_query(statement)
++  defer workspace_store.profile_cursor_close(cursor)
+   local result: {string} = {}
++  local iteration_span? = logging.profile_begin("sqlite.cursor_iteration", {
++    ["measurement"] = "fetch_api_and_file_name_materialization",
++  })
++  defer logging.profile_finish(iteration_span)
+   for row in cursor:fetch do result[#result + 1] = bytes(row, 1) end
++  logging.profile_finish(iteration_span, {["rows"] = #result})
+   return result
+ end
+ 
+ function Index:project_modules(): {bridge.ProjectModule}
++  local profile_span? = logging.profile_begin("semantic.project_modules_read")
++  defer logging.profile_finish(profile_span)
+   local access = self.store:acquire()
+   defer access:release()
+   check_generation(access.connection, self.published_generation)
+-  local statement = access.connection:prepare(
++  local statement = workspace_store.profile_prepare(access.connection,
+     "SELECT p.module_name,f.filename,f.contents FROM main.semantic_projects AS p " ..
+     "LEFT JOIN main.semantic_files AS f ON f.module_name=p.module_name " ..
+     "ORDER BY p.module_order,f.file_order")
+-  defer statement:close()
+-  local cursor = statement:query()
+-  defer cursor:close()
++  defer workspace_store.profile_statement_close(statement)
++  local cursor = workspace_store.profile_query(statement)
++  defer workspace_store.profile_cursor_close(cursor)
+   local result: {bridge.ProjectModule} = {}
+   local current: bridge.ProjectModule? = nil
++  local iteration_span? = logging.profile_begin("sqlite.cursor_iteration", {
++    ["measurement"] = "fetch_api_and_project_materialization",
++  })
++  defer logging.profile_finish(iteration_span)
+   for row in cursor:fetch do
+     local module_name = bytes(row, 1)
+     if current == nil or current.module_name ~= module_name then
+@@ -735,6 +791,7 @@ function Index:project_modules(): {bridge.ProjectModule}
+       current.files[#current.files + 1] = bridge.SourceFile.new(filename, bytes(row, 3))
+     end
+   end
++  logging.profile_finish(iteration_span)
+   return result
+ end
+ 
+@@ -742,12 +799,12 @@ function Index:coordinate_index(filename: string): source_text.CoordinateIndex?
+   local access = self.store:acquire()
+   defer access:release()
+   check_generation(access.connection, self.published_generation)
+-  local statement = access.connection:prepare(
++  local statement = workspace_store.profile_prepare(access.connection,
+     "SELECT contents FROM main.semantic_files WHERE filename=?")
+-  defer statement:close()
+-  local cursor = statement:query(blob(filename))
+-  defer cursor:close()
+-  local row? = cursor:fetch()
++  defer workspace_store.profile_statement_close(statement)
++  local cursor = workspace_store.profile_query(statement, blob(filename))
++  defer workspace_store.profile_cursor_close(cursor)
++  local row? = workspace_store.profile_fetch(cursor)
+   if row == nil then return nil end
+   return source_text.coordinate_index(bytes(row, 1))
+ end
+@@ -758,12 +815,12 @@ function Index:hover_summary(occurrence: Occurrence): string?
+   local access = self.store:acquire()
+   defer access:release()
+   check_generation(access.connection, self.published_generation)
+-  local statement = access.connection:prepare(
++  local statement = workspace_store.profile_prepare(access.connection,
+     "SELECT markdown FROM main.semantic_summaries WHERE identity=?")
+-  defer statement:close()
+-  local cursor = statement:query(blob(summary_key(occurrence.module_name, summary_id)))
+-  defer cursor:close()
+-  local row? = cursor:fetch()
++  defer workspace_store.profile_statement_close(statement)
++  local cursor = workspace_store.profile_query(statement, blob(summary_key(occurrence.module_name, summary_id)))
++  defer workspace_store.profile_cursor_close(cursor)
++  local row? = workspace_store.profile_fetch(cursor)
+   if row == nil then return nil end
+   return bytes(row, 1)
+ end
+@@ -772,11 +829,11 @@ function Index:hover_summary_count(): integer
+   local access = self.store:acquire()
+   defer access:release()
+   check_generation(access.connection, self.published_generation)
+-  local statement = access.connection:prepare("SELECT COUNT(*) FROM main.semantic_summaries")
+-  defer statement:close()
+-  local cursor = statement:query()
+-  defer cursor:close()
+-  local row = cursor:fetch() as sqlite3.Row
++  local statement = workspace_store.profile_prepare(access.connection, "SELECT COUNT(*) FROM main.semantic_summaries")
++  defer workspace_store.profile_statement_close(statement)
++  local cursor = workspace_store.profile_query(statement)
++  defer workspace_store.profile_cursor_close(cursor)
++  local row = workspace_store.profile_fetch(cursor) as sqlite3.Row
+   return row:get(1) as integer
+ end
+ 
+@@ -784,11 +841,11 @@ function Index:file_occurrences(filename: string): {Occurrence}
+   local access = self.store:acquire()
+   defer access:release()
+   check_generation(access.connection, self.published_generation)
+-  local statement = access.connection:prepare("SELECT " .. OCCURRENCE_COLUMNS ..
++  local statement = workspace_store.profile_prepare(access.connection, "SELECT " .. OCCURRENCE_COLUMNS ..
+     " FROM main.semantic_occurrences WHERE filename=?" .. SOURCE_ORDER)
+-  defer statement:close()
+-  local cursor = statement:query(blob(filename))
+-  defer cursor:close()
++  defer workspace_store.profile_statement_close(statement)
++  local cursor = workspace_store.profile_query(statement, blob(filename))
++  defer workspace_store.profile_cursor_close(cursor)
+   return collect(cursor)
+ end
+ 
+@@ -796,13 +853,13 @@ function Index:occurrence_at(filename: string, position: source_text.Position):
+   local access = self.store:acquire()
+   defer access:release()
+   check_generation(access.connection, self.published_generation)
+-  local statement = access.connection:prepare("SELECT " .. OCCURRENCE_COLUMNS ..
++  local statement = workspace_store.profile_prepare(access.connection, "SELECT " .. OCCURRENCE_COLUMNS ..
+     " FROM main.semantic_occurrences WHERE filename=? AND start_line=? " ..
+     "AND start_character<=? AND finish_character>? ORDER BY start_character DESC LIMIT 1")
+-  defer statement:close()
+-  local cursor = statement:query(blob(filename), position.line, position.character, position.character)
+-  defer cursor:close()
+-  local row? = cursor:fetch()
++  defer workspace_store.profile_statement_close(statement)
++  local cursor = workspace_store.profile_query(statement, blob(filename), position.line, position.character, position.character)
++  defer workspace_store.profile_cursor_close(cursor)
++  local row? = workspace_store.profile_fetch(cursor)
+   if row == nil then return nil end
+   return row_occurrence(row)
+ end
+@@ -811,12 +868,12 @@ function Index:definition(symbol_id: SymbolId): Occurrence?
+   local access = self.store:acquire()
+   defer access:release()
+   check_generation(access.connection, self.published_generation)
+-  local statement = access.connection:prepare("SELECT " .. OCCURRENCE_COLUMNS ..
++  local statement = workspace_store.profile_prepare(access.connection, "SELECT " .. OCCURRENCE_COLUMNS ..
+     " FROM main.semantic_occurrences WHERE declaration_id=? AND role IN (0,1)")
+-  defer statement:close()
+-  local cursor = statement:query(blob(symbol_id.declaration_id))
+-  defer cursor:close()
+-  local row? = cursor:fetch()
++  defer workspace_store.profile_statement_close(statement)
++  local cursor = workspace_store.profile_query(statement, blob(symbol_id.declaration_id))
++  defer workspace_store.profile_cursor_close(cursor)
++  local row? = workspace_store.profile_fetch(cursor)
+   if row == nil then return nil end
+   return row_occurrence(row)
+ end
+@@ -827,10 +884,10 @@ function Index:occurrences(symbol_id: SymbolId, include_declaration: boolean): {
+   check_generation(access.connection, self.published_generation)
+   local predicate = " WHERE declaration_id=?"
+   if not include_declaration then predicate = predicate .. " AND role NOT IN (0,1)" end
+-  local statement = access.connection:prepare("SELECT " .. OCCURRENCE_COLUMNS ..
++  local statement = workspace_store.profile_prepare(access.connection, "SELECT " .. OCCURRENCE_COLUMNS ..
+     " FROM main.semantic_occurrences" .. predicate .. SOURCE_ORDER)
+-  defer statement:close()
+-  local cursor = statement:query(blob(symbol_id.declaration_id))
+-  defer cursor:close()
++  defer workspace_store.profile_statement_close(statement)
++  local cursor = workspace_store.profile_query(statement, blob(symbol_id.declaration_id))
++  defer workspace_store.profile_cursor_close(cursor)
+   return collect(cursor)
+ end
+diff --git a/src/server/workspace_cache.titan b/src/server/workspace_cache.titan
+index 9fc262cf9b4394326bc1a6714af70c286ae80ff5..d0a636bbae8397d7c77044fc0c790f97e97690a6 100644
+--- a/src/server/workspace_cache.titan
++++ b/src/server/workspace_cache.titan
+@@ -259,22 +259,24 @@ function Cache:inventory_metrics(): InventoryMetrics
+ end
+ 
+ local function Cache:publish_inventory()
++  local profile_span? = logging.profile_begin("cache.inventory_publish")
++  defer logging.profile_finish(profile_span)
+   local access = self.store:acquire()
+   defer access:release()
+   -- This small observation list is temporary startup work. Its replacement is
+   -- independent of semantic publication and cannot expose an unvalidated view.
+-  access.connection:set_autocommit(false)
++  sql.profile_set_autocommit(access.connection, false)
+   local committed = false
+-  defer do if not committed then access.connection:rollback() end end
++  defer do if not committed then sql.profile_rollback(access.connection) end end
+   sql.execute(access.connection,"DELETE FROM main.compiler_inputs")
+-  local insert = access.connection:prepare("INSERT INTO main.compiler_inputs VALUES(?,?,?)")
+-  defer insert:close()
++  local insert = sql.profile_prepare(access.connection, "INSERT INTO main.compiler_inputs VALUES(?,?,?)")
++  defer sql.profile_statement_close(insert)
+   for index = 1, #self.inventory do
+     local input = self.inventory[index]
+-    insert:execute(sqlite3.Blob.new(input.path),sqlite3.Blob.new(input.observation),
++    sql.profile_execute(insert, sqlite3.Blob.new(input.path),sqlite3.Blob.new(input.observation),
+       sqlite3.Blob.new(input.fingerprint))
+   end
+-  access.connection:commit()
++  sql.profile_commit(access.connection)
+   committed = true
+ end
+ 
+@@ -536,6 +538,8 @@ function Cache:can_reuse_publication(): boolean
+ end
+ 
+ function Cache:prepare(): boolean
++  local profile_span? = logging.profile_begin("cache.publication_prepare")
++  defer logging.profile_finish(profile_span)
+   self.projects = nil
+   local access = self.store:acquire()
+   defer access:release()
+@@ -550,6 +554,8 @@ end
+ -- A completed module revision owns its opaque compiler payload independently
+ -- of the current feature publication. Preserve it until that revision changes.
+ function Cache:projects_to_export(): {string}
++  local profile_span? = logging.profile_begin("cache.export_selection")
++  defer logging.profile_finish(profile_span)
+   local access = self.store:acquire()
+   defer access:release()
+   local rows = sql.rows(access.connection,
+@@ -571,12 +577,22 @@ function Cache:stage_context(root: string,compatibility: string,native_context:
+ end
+ 
+ local function publish_header_inputs(connection: sqlite3.Connection, item: Artifact)
++  local profile_span? = logging.profile_begin("cache.header_inputs_publish", {
++    ["artifact_kind"] = item.kind, ["rows"] = #item.inputs,
++  })
++  defer logging.profile_finish(profile_span)
+   sql.execute(connection,"DELETE FROM main.cached_header_inputs WHERE artifact_kind=? AND graph_key=?",
+     item.kind,sqlite3.Blob.new(item.key))
+   -- Twenty nine-column rows stay below Titan's 200-value call bound.
+   for first = 1, #item.inputs, 20 do
+     local last = first + 19
+     if last > #item.inputs then last = #item.inputs end
++    local batch_span? = logging.profile_begin("cache.header_input_batch", {
++      ["rows"] = last - first + 1,
++    })
++    defer logging.profile_finish(batch_span)
++    local construction_span? = logging.profile_begin("sqlite.arguments_construct")
++    defer logging.profile_finish(construction_span)
+     local query = strings.writer()
+     query:write("INSERT INTO main.cached_header_inputs VALUES")
+     local parameters: {value} = {}
+@@ -602,11 +618,19 @@ local function publish_header_inputs(connection: sqlite3.Connection, item: Artif
+         parameters[#parameters + 1] = sqlite3.Blob.new(input.observation.physical_identity)
+       end
+     end
+-    sql.execute(connection,query:drain(),...parameters)
++    local query_text = query:drain()
++    logging.profile_finish(construction_span, {
++      ["parameters"] = #parameters, ["sql_bytes"] = #query_text,
++    })
++    sql.execute(connection,query_text,...parameters)
+   end
+ end
+ 
+ function Cache:publish(connection: sqlite3.Connection)
++  local profile_span? = logging.profile_begin("cache.payloads_publish", {
++    ["pending_artifacts"] = #self.pending,
++  })
++  defer logging.profile_finish(profile_span)
+   if self.publication_key == nil then raise "cache publication was not prepared" end
+   -- Pruning belongs to the same completed publication as replacement facts.
+   -- A selected module whose compiler graph cannot be encoded loses its old
+@@ -617,17 +641,25 @@ function Cache:publish(connection: sqlite3.Connection)
+       "SELECT 1 FROM main.graph_modules AS g WHERE g.name=CAST(p.module AS TEXT) " ..
+       "AND g.provenance=0 AND g.state=2 AND p.revision=g.revision)")
+   if self.projects ~= nil then
+-    local insert = connection:prepare("INSERT INTO main.project_snapshots(module,payload,revision) " ..
++    local insert = sql.profile_prepare(connection, "INSERT INTO main.project_snapshots(module,payload,revision) " ..
+       "SELECT ?,?,revision FROM main.graph_modules WHERE name=? AND provenance=0 AND state=2 " ..
+       "ON CONFLICT(module) DO UPDATE SET payload=excluded.payload,revision=excluded.revision")
+-    defer insert:close()
++    defer sql.profile_statement_close(insert)
+     for index = 1, #self.projects do
+       local item = self.projects[index]
+-      insert:execute(sqlite3.Blob.new(item.module_name),sqlite3.Blob.new(item.payload),item.module_name)
++      local artifact_span? = logging.profile_begin("cache.project_payload_publish", {
++        ["module"] = item.module_name, ["payload_bytes"] = #item.payload,
++      })
++      defer logging.profile_finish(artifact_span)
++      sql.profile_execute(insert, sqlite3.Blob.new(item.module_name),sqlite3.Blob.new(item.payload),item.module_name)
+     end
+   end
+   for index = 1, #self.pending do
+     local item = self.pending[index]
++    local artifact_span? = logging.profile_begin("cache.artifact_publish", {
++      ["artifact_kind"] = item.kind,
++    })
++    defer logging.profile_finish(artifact_span)
+     local table = artifact_table(item.kind)
+     if item.payload ~= nil then
+       sql.execute(connection,"INSERT INTO " .. table ..
+diff --git a/src/server/workspace_store.titan b/src/server/workspace_store.titan
+index 2c98f38d763e7074e9d8f41bc99d09a7adfea866..9a25be135291a31f8f5b18734d0f1f695d40c3e5 100644
+--- a/src/server/workspace_store.titan
++++ b/src/server/workspace_store.titan
+@@ -1,5 +1,93 @@
+ local async = import "async"
+ local sqlite3 = import "sqlite3"
++local strings = import "string"
++local logging = import "server.logging"
++
++-- Experimental profiling at the public SQLite API boundary. These intervals
++-- include marshaling, worker queueing, native work, and completion delivery;
++-- they do not claim separate native bind/step or worker-thread CPU timings.
++function profile_prepare(connection: sqlite3.Connection, query: string): sqlite3.Statement
++  if not logging.profile_is_enabled() then return connection:prepare(query) end
++  local span? = logging.profile_begin("sqlite.prepare_api", {
++    ["sql_bytes"] = #query, ["sql_prefix"] = strings.sub(query, 1, 120),
++    ["measurement"] = "combined_api_worker_queue",
++  })
++  defer logging.profile_finish(span)
++  return connection:prepare(query)
++end
++
++function profile_execute(statement: sqlite3.Statement, ...: value): integer
++  if not logging.profile_is_enabled() then return statement:execute(...) end
++  local span? = logging.profile_begin("sqlite.execute_api", {
++    ["measurement"] = "combined_api_worker_queue",
++  })
++  defer logging.profile_finish(span)
++  return statement:execute(...)
++end
++
++function profile_query(statement: sqlite3.Statement, ...: value): sqlite3.Cursor
++  if not logging.profile_is_enabled() then return statement:query(...) end
++  local span? = logging.profile_begin("sqlite.query_api", {
++    ["measurement"] = "combined_api_worker_queue",
++  })
++  defer logging.profile_finish(span)
++  return statement:query(...)
++end
++
++-- Scalar queries only. Streaming loops retain one aggregate iteration span
++-- including their row decoding, rather than emitting an event for every row.
++function profile_fetch(cursor: sqlite3.Cursor): sqlite3.Row?
++  if not logging.profile_is_enabled() then return cursor:fetch() end
++  local span? = logging.profile_begin("sqlite.scalar_fetch_api", {
++    ["measurement"] = "combined_api_worker_queue",
++  })
++  defer logging.profile_finish(span)
++  return cursor:fetch()
++end
++
++function profile_statement_close(statement: sqlite3.Statement)
++  local span? = logging.profile_begin("sqlite.statement_close_api")
++  defer logging.profile_finish(span)
++  statement:close()
++end
++
++function profile_cursor_close(cursor: sqlite3.Cursor)
++  local span? = logging.profile_begin("sqlite.cursor_close_api")
++  defer logging.profile_finish(span)
++  cursor:close()
++end
++
++function profile_connection_close(connection: sqlite3.Connection)
++  local span? = logging.profile_begin("sqlite.connection_close_api")
++  defer logging.profile_finish(span)
++  connection:close()
++end
++
++function profile_get_autocommit(connection: sqlite3.Connection): boolean
++  local span? = logging.profile_begin("sqlite.get_autocommit_api")
++  defer logging.profile_finish(span)
++  return connection:get_autocommit()
++end
++
++function profile_set_autocommit(connection: sqlite3.Connection, enabled: boolean)
++  local span? = logging.profile_begin("sqlite.set_autocommit_api", {
++    ["autocommit"] = enabled,
++  })
++  defer logging.profile_finish(span)
++  connection:set_autocommit(enabled)
++end
++
++function profile_commit(connection: sqlite3.Connection)
++  local span? = logging.profile_begin("sqlite.commit_api")
++  defer logging.profile_finish(span)
++  connection:commit()
++end
++
++function profile_rollback(connection: sqlite3.Connection)
++  local span? = logging.profile_begin("sqlite.rollback_api")
++  defer logging.profile_finish(span)
++  connection:rollback()
++end
+ 
+ -- One connection is leased for a complete logical operation. The updater owns
+ -- transactions; a request only reads while holding its lease. Releasing access
+@@ -27,18 +115,26 @@ end
+ 
+ function execute(connection: sqlite3.Connection, sql: string,
+                  ...: value): integer
+-  local statement = connection:prepare(sql)
+-  defer statement:close()
+-  return statement:execute(...)
++  local span? = logging.profile_begin("sqlite.execute_statement", {
++    ["sql_bytes"] = #sql, ["sql_prefix"] = strings.sub(sql, 1, 120),
++  })
++  defer logging.profile_finish(span)
++  local statement = profile_prepare(connection, sql)
++  defer profile_statement_close(statement)
++  return profile_execute(statement, ...)
+ end
+ 
+ function scalar_integer(connection: sqlite3.Connection, sql: string,
+                  ...: value): integer
+-  local statement = connection:prepare(sql)
+-  defer statement:close()
+-  local cursor = statement:query(...)
+-  defer cursor:close()
+-  local row? = cursor:fetch()
++  local span? = logging.profile_begin("sqlite.scalar_statement", {
++    ["sql_bytes"] = #sql, ["sql_prefix"] = strings.sub(sql, 1, 120),
++  })
++  defer logging.profile_finish(span)
++  local statement = profile_prepare(connection, sql)
++  defer profile_statement_close(statement)
++  local cursor = profile_query(statement, ...)
++  defer profile_cursor_close(cursor)
++  local row? = profile_fetch(cursor)
+   if row == nil then raise "workspace store scalar query returned no row" end
+   return row:get(1)
+ end
+@@ -47,12 +143,21 @@ end
+ -- temporary transport rows immediately into their typed domain records.
+ function rows(connection: sqlite3.Connection, query: string,
+               ...: value): {sqlite3.Row}
+-  local statement = connection:prepare(query)
+-  defer statement:close()
+-  local cursor = statement:query(...)
+-  defer cursor:close()
++  local span? = logging.profile_begin("sqlite.rows_statement", {
++    ["sql_bytes"] = #query, ["sql_prefix"] = strings.sub(query, 1, 120),
++  })
++  defer logging.profile_finish(span)
++  local statement = profile_prepare(connection, query)
++  defer profile_statement_close(statement)
++  local cursor = profile_query(statement, ...)
++  defer profile_cursor_close(cursor)
+   local result: {sqlite3.Row} = {}
++  local iteration_span? = logging.profile_begin("sqlite.cursor_iteration", {
++    ["measurement"] = "fetch_api_and_row_collection",
++  })
++  defer logging.profile_finish(iteration_span)
+   for row in cursor:fetch do result[#result + 1] = row end
++  logging.profile_finish(iteration_span, {["rows"] = #result})
+   return result
+ end
+ 
+@@ -68,11 +173,16 @@ function optional_bytes(row: sqlite3.Row, column: integer): string?
+ end
+ 
+ function open(path: string): Store
++  local span? = logging.profile_begin("store.open")
++  defer logging.profile_finish(span)
++  local connect_span? = logging.profile_begin("sqlite.connect_api")
++  defer logging.profile_finish(connect_span)
+   local connection = sqlite3.connect(path)
+   local initialized = false
+   defer do
+-    if not initialized then connection:close() end
++    if not initialized then profile_connection_close(connection) end
+   end
++  logging.profile_finish(connect_span)
+   execute(connection, "PRAGMA foreign_keys=ON")
+   if scalar_integer(connection, "PRAGMA foreign_keys") ~= 1 then
+     raise "workspace store requires SQLite foreign keys"
+@@ -118,6 +228,10 @@ local function Store:release_owner()
+ end
+ 
+ local function Store:acquire_owner(): Access
++  local span? = logging.profile_begin("store.acquire", {
++    ["contended"] = self.active, ["queued_waiters"] = #self.waiters,
++  })
++  defer logging.profile_finish(span)
+   if not self.active then
+     self.active = true
+     return Access.new(self.connection,
+@@ -127,7 +241,12 @@ local function Store:acquire_owner(): Access
+     async.ResumeToken.new("server.workspace_store"), true, false)
+   self.waiters[#self.waiters + 1] = waiter
+   do
++    local wait_span? = logging.profile_begin("store.lease_wait", {
++      ["measurement"] = "wait",
++    })
++    defer logging.profile_finish(wait_span)
+     async.suspend(waiter.token, function () self:abandon(waiter) end)
++    logging.profile_finish(wait_span)
+     waiter.queued = false
+     return Access.new(self.connection,
+       function () self:release_owner() end, false)
+@@ -150,6 +269,8 @@ function Access:release()
+ end
+ 
+ function Store:close()
++  local span? = logging.profile_begin("store.close")
++  defer logging.profile_finish(span)
+   if self.closed then return end
+   self.closing = true
+   -- Join the queue after every previously accepted reader/updater. The caller
+@@ -158,9 +279,9 @@ function Store:close()
+   local access = self:acquire_owner()
+   defer access:release()
+   if self.closed then return end
+-  if not self.connection:get_autocommit() then
++  if not profile_get_autocommit(self.connection) then
+     raise "workspace store closed before its transaction was drained"
+   end
+-  self.connection:close()
++  profile_connection_close(self.connection)
+   self.closed = true
+ end

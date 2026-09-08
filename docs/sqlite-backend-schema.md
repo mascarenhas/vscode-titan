@@ -1733,6 +1733,12 @@ the simple raw-source-only cache key:
 No batching, probe cache redesign, compiler change or new profiling run is part
 of this schema-documentation change.
 
+The subsequent [cold FFI probe investigation](ffi-probe-profile.md) captures
+exact sources, candidate demand, GCC pass timings and native phase spans. It
+also evaluates a proposed combined-header environment with a reserved `ffi`
+namespace and a single-result enum-carrier probe, with last-declaration-wins
+as a smaller alternative to the namespace change.
+
 ## Storage and serialization research workflow
 
 Use the dictionary and accounting above to rank experiments by affected bytes

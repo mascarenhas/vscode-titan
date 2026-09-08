@@ -1,0 +1,1596 @@
+diff --git a/c-parser/cdriver.lua b/c-parser/cdriver.lua
+index ecf60c5efd2f5c72abb36d9d5a41c7067b13ee91..b4dd657fba6982407abe0050581d27bd1cc7174f 100644
+--- a/c-parser/cdriver.lua
++++ b/c-parser/cdriver.lua
+@@ -1,6 +1,7 @@
+ local _, module_loader_path = ...
+ 
+ local cdriver = {}
++local profile = require "titan-compiler.probeprofile"
+ 
+ local cpp = require("c-parser.cpp")
+ local c99 = require("c-parser.c99")
+@@ -462,8 +463,14 @@ end
+ -- non-yielding sink only at trace log level; ordinary compiler calls pay no
+ -- clock or allocation cost. Telemetry is best-effort and can never change a
+ -- parse result.
+-function cdriver.process_phase_clock(options)
++function cdriver.process_phase_clock(options, phase)
+     options = normalize_options(options)
++    if profile.enabled then
++        return { cpu_started = os.clock(), span = profile.begin("c_header." .. (phase or "phase"), {
++            parent_span_id = options.process_profile_parent_id,
++            identity = options.process_trace_identity,
++        }) }
++    end
+     if type(options.process_trace) ~= "function" then return nil end
+     return os.clock()
+ end
+@@ -471,6 +478,11 @@ end
+ function cdriver.emit_process_phase(
+         options, filename, include, phase, outcome, started)
+     options = normalize_options(options)
++    if type(started) == "table" then
++        profile.finish(started.span, { phase = phase, outcome = outcome,
++            filename = filename, resolved_header = type(include) == "table" and include.resolved })
++        started = started.cpu_started
++    end
+     local sink = options.process_trace
+     if type(sink) ~= "function" or started == nil then return end
+     local resolved = type(include) == "table"
+@@ -708,14 +720,15 @@ local function decode_header_entry(payload, key, adapter)
+     return entry
+ end
+ 
+-local function encode_header_entry(entry, key, adapter)
++local function encode_header_entry(entry, key, adapter, profile_parent_span_id)
+     return cpp.encode_graph({
+         version = cdriver.HEADER_CACHE_VERSION,
+         key = key,
+         ffi_types = entry.ffi_types,
+         dependencies = entry.dependencies,
+         search_inputs = entry.search_inputs,
+-    }, { sha256_binary = adapter.sha256_binary, yield = adapter.yield })
++    }, { sha256_binary = adapter.sha256_binary, yield = adapter.yield,
++        profile_parent_span_id = profile_parent_span_id })
+ end
+ 
+ local function header_entry_inputs(entry)
+@@ -912,7 +925,7 @@ local function process_file_inner(filename, options)
+             and analysis_entries[cache_key] or nil
+         local analysis_reuse = analysis_entry ~= nil
+             and analysis_entry.entry == cached
+-        local validation_started = cdriver.process_phase_clock(options)
++        local validation_started = cdriver.process_phase_clock(options, "hit_validation")
+         local prefix_compatible =
+             input_tail_matches_prefix(
+                 cached.dependencies, dependency_identities)
+@@ -937,11 +950,11 @@ local function process_file_inner(filename, options)
+             local ffi_types
+             if analysis_reuse then
+                 ffi_types = analysis_entry.ffi_types
+-                local reuse_started = cdriver.process_phase_clock(options)
++                local reuse_started = cdriver.process_phase_clock(options, "graph_clone")
+                 cdriver.emit_process_phase(options, filename, include,
+                     "graph_clone", "analysis_reuse", reuse_started)
+             else
+-                local clone_started = cdriver.process_phase_clock(options)
++                local clone_started = cdriver.process_phase_clock(options, "graph_clone")
+                 ffi_types = clone_graph(cached.ffi_types)
+                 cdriver.emit_process_phase(options, filename, include,
+                     "graph_clone", "hit", clone_started)
+@@ -979,7 +992,7 @@ local function process_file_inner(filename, options)
+     end
+     cache.misses = cache.misses + 1
+ 
+-    local preprocessing_started = cdriver.process_phase_clock(options)
++    local preprocessing_started = cdriver.process_phase_clock(options, "preprocessing")
+     ctx, err = cpp.parse_file(parse_filename, nil, ctx)
+     cdriver.emit_process_phase(options, filename, include,
+         "preprocessing", ctx and "complete" or "failed",
+@@ -989,6 +1002,9 @@ local function process_file_inner(filename, options)
+     end
+     -- Parsing is a fresh publication boundary, separate from any attempted
+     -- reuse pass above. Matching observed mtime needs no second content read.
++    local revalidation_span <close> = profile.begin("c_header.final_validation", {
++        parent_span_id = options.process_profile_parent_id, filename = filename,
++    })
+     local final_validation = { io = strategy, header_validation = {}, cache_adapter = options.cache_adapter,
+         header_observations = validation_options.header_observations }
+     for _, input in ipairs(dependencies) do
+@@ -1006,6 +1022,7 @@ local function process_file_inner(filename, options)
+                 filename .. "': " .. input.path
+         end
+     end
++    profile.finish(revalidation_span)
+     include.c_header_dependencies = dependencies
+     include.c_header_search_inputs = search_inputs
+     ctx.c_header_dependencies = dependencies
+@@ -1013,9 +1030,13 @@ local function process_file_inner(filename, options)
+     ctx.header_dependency_observer = nil
+     ctx.include_search_observer = nil
+ 
++    local concat_span <close> = profile.begin("c_header.preprocessor_concat", {
++        parent_span_id = options.process_profile_parent_id, filename = filename,
++    })
+     local srccode = table.concat(ctx.output, "\n").." $EOF$"
++    profile.finish(concat_span, { bytes = #srccode, lines = #ctx.output })
+ 
+-    local c_parse_started = cdriver.process_phase_clock(options)
++    local c_parse_started = cdriver.process_phase_clock(options, "c_parse")
+     local res, err, line, col, fragment = c99.match_language_grammar(srccode)
+     cdriver.emit_process_phase(options, filename, include,
+         "c_parse", res and "complete" or "failed", c_parse_started)
+@@ -1028,6 +1049,9 @@ local function process_file_inner(filename, options)
+     -- repeated by independent header extraction. Source identity alone never
+     -- proves that the declaration is valid in the cumulative include state;
+     -- the final ordered-header compiler baseline remains authoritative.
++    local provenance_span <close> = profile.begin("c_header.source_provenance", {
++        parent_span_id = options.process_profile_parent_id, filename = filename,
++    })
+     local line_starts = {}
+     local next_start = 1
+     for index, output_line in ipairs(ctx.output) do
+@@ -1082,7 +1106,8 @@ local function process_file_inner(filename, options)
+         declaration._source_position = nil
+     end
+ 
+-    local type_conversion_started = cdriver.process_phase_clock(options)
++    profile.finish(provenance_span, { declarations = #res })
++    local type_conversion_started = cdriver.process_phase_clock(options, "c_type_conversion")
+     local ffi_types, err = ctypes.register_types(res, {
+         header = filename,
+         resolved_header = include.resolved,
+@@ -1094,7 +1119,7 @@ local function process_file_inner(filename, options)
+         return nil, err
+     end
+ 
+-    local macro_conversion_started = cdriver.process_phase_clock(options)
++    local macro_conversion_started = cdriver.process_phase_clock(options, "macro_conversion")
+     cdefines.register_defines(ffi_types, ctx.defines)
+     ffi_types.macro_definitions = ctx.defines
+     ffi_types.macro_changes = {}
+@@ -1132,7 +1157,7 @@ local function process_file_inner(filename, options)
+     end
+     entry.weight = cache_weight
+     if make_cache_room(cache, cache_key, cache_weight) then
+-        local retained_clone_started = cdriver.process_phase_clock(options)
++        local retained_clone_started = cdriver.process_phase_clock(options, "graph_clone")
+         entry.ffi_types = clone_graph(ffi_types)
+         store_cache_entry(cache, cache_key, entry)
+         if analysis_entries then
+@@ -1144,9 +1169,19 @@ local function process_file_inner(filename, options)
+         cdriver.emit_process_phase(options, filename, include,
+             "graph_clone", "retained_store", retained_clone_started)
+         if options.cache_adapter and options.cache_adapter.put then
+-            local payload = encode_header_entry(entry, cache_key, options.cache_adapter)
++            local encode_span <close> = profile.begin("c_header.cache_encode", {
++                parent_span_id = options.process_profile_parent_id,
++                filename = filename, cache_key = cache_key,
++            })
++            local payload = encode_header_entry(entry, cache_key, options.cache_adapter,
++                encode_span and encode_span.id)
++            profile.finish(encode_span, { bytes = payload and #payload or 0 })
+             if payload and cache.entries[cache_key] == entry then
+                 local inputs = header_entry_inputs(entry)
++                local put_span <close> = profile.begin("c_header.cache_put", {
++                    parent_span_id = options.process_profile_parent_id,
++                    filename = filename, cache_key = cache_key, bytes = #payload,
++                })
+                 cacheadapter.put(options.cache_adapter,
+                     HEADER_CACHE_KIND, cache_key, payload, inputs)
+             end
+@@ -1169,6 +1204,16 @@ end
+ -- aborts its analysis and may omit terminal best-effort telemetry.
+ function cdriver.process_file(filename, options)
+     options = normalize_options(options)
++    local span <close> = profile.begin("c_header.process", {
++        parent_span_id = options.process_profile_parent_id,
++        filename = filename, identity = options.process_trace_identity,
++    })
++    if span then
++        local captured = {}
++        for key, value in pairs(options) do captured[key] = value end
++        options = captured
++        options.process_profile_parent_id = span.id
++    end
+     if type(options.process_trace) ~= "function" then
+         return process_file_inner(filename, options)
+     end
+diff --git a/titan-compiler/checker/c_types.lua b/titan-compiler/checker/c_types.lua
+index b5480d92d4542e4398ddb43ab351628e4d94535f..0cf80c88139961b5b6481b84c5143ce1106bbfda 100644
+--- a/titan-compiler/checker/c_types.lua
++++ b/titan-compiler/checker/c_types.lua
+@@ -1,6 +1,27 @@
+ local core = require "titan-compiler.checker.core"
++local probeprofile = require "titan-compiler.probeprofile"
+ local _ENV = core
+ 
++local function profile_redeclaration(st, declaration, index)
++    if not probeprofile.enabled then return nil end
++    return {
++        purpose = "foreign_redeclaration",
++        candidate_id = probeprofile.object_id(declaration, "candidate"),
++        module_name = st.modname, ordinary_name = declaration.name,
++        queue_index = index, compatibility = declaration.compatibility,
++        previous_header = declaration.previous.header,
++        current_header = declaration.header,
++        previous = probeprofile.declaration(declaration.previous.declaration),
++        current = probeprofile.declaration(declaration.declaration),
++        left = probeprofile.type_summary(declaration.previous.type,
++            c_resolve(declaration.previous.type)),
++        right = probeprofile.type_summary(declaration.current,
++            c_resolve(declaration.current)),
++        location = probeprofile.location(declaration.node.loc),
++        parent_span_id = st.profile_parent_span_id,
++    }
++end
++
+ -- The compiler driver installs the exact C toolchain configuration used for
+ -- generated code. Keeping this small hook in the checker makes every foreign
+ -- import use the same compiler, language mode, and already parsed CPP flags,
+@@ -245,6 +266,7 @@ function ensure_module_probe(st)
+         module = st.modname,
+         source_dir = st.source_dir or ".",
+         includes = st.foreign_includes or {},
++        profile_parent_span_id = st.profile_parent_span_id,
+     })
+     if not module_probe then
+         st.module_probe_error = err or
+@@ -314,6 +336,7 @@ function checker._probe_for_c_types(st, probed_types)
+         module = st.modname,
+         source_dir = st.source_dir or ".",
+         includes = includes,
++        profile_parent_span_id = st.profile_parent_span_id,
+     })
+     if not probe then return nil, err end
+     -- These origin headers can be needed only by a source-private C type.
+@@ -391,12 +414,32 @@ function checker._ensure_c_enum_supported(
+                     candidates[#candidates + 1] = {
+                         left_type = declaration_type,
+                         right_type = entry.type,
++                        profile = probeprofile.enabled and {
++                            purpose = "enum_carrier", module_name = st.modname,
++                            candidate_id = probeprofile.id("candidate"),
++                            enum_spelling = types.tostring(typ),
++                            enumerator_name = resolved._c_enum_enumerator,
++                            carrier_name = name, carrier_index = #candidates + 1,
++                            carrier_signed = entry.type.signed,
++                            carrier_bits = entry.type.bits, carrier_rank = entry.type.rank,
++                            carrier_fits_lua_integer = fits,
++                            left = probeprofile.type_summary(typ, resolved),
++                            right = probeprofile.type_summary(entry.type),
++                            location = probeprofile.location(loc),
++                            parent_span_id = st.profile_parent_span_id,
++                        } or nil,
+                     }
+                     entries[#entries + 1] = entry
+                 end
+             end
+         end
+ 
++        if probeprofile.enabled then
++            for _, candidate in ipairs(candidates) do
++                candidate.profile.eligible_carrier_count = #candidates
++                probeprofile.event("candidate", candidate.profile)
++            end
++        end
+         local results = probe:validate_declaration_compatibilities(candidates)
+         local selected
+         for index, result in ipairs(results) do
+@@ -459,6 +502,16 @@ function checker._ensure_c_enum_supported(
+                     probe:validate_declaration_compatibilities({ {
+                         left_type = fit_type,
+                         right_type = fit_type,
++                        profile = probeprofile.enabled and {
++                            purpose = "enumerator_fit", module_name = st.modname,
++                            candidate_id = probeprofile.id("candidate"),
++                            enumerator_name = name, predicate = fit_expression,
++                            carrier_name = selected.type.spelling,
++                            lua_integer = lua_entry.type.spelling,
++                            lua_integer_maximum = maximum,
++                            location = probeprofile.location(loc),
++                            parent_span_id = st.profile_parent_span_id,
++                        } or nil,
+                     } })[1]
+                 if fit_result.status == "infrastructure_failure" then
+                     checker.typeerror(errors, loc,
+@@ -597,6 +650,10 @@ function queue_foreign_redeclaration(
+         declaration = current.declaration,
+         compatibility = compatibility,
+     }
++    if probeprofile.enabled then
++        probeprofile.event("candidate_queued",
++            profile_redeclaration(st, queue[#queue], #queue))
++    end
+     return queue[#queue]
+ end
+ 
+@@ -790,7 +847,7 @@ end
+ 
+ function validate_foreign_declaration_compatibility(
+         module_probe, left_type, right_type,
+-        left_declaration, right_declaration)
++        left_declaration, right_declaration, fields)
+     local method = module_probe.validate_declaration_compatibility
+     if type(method) ~= "function" then
+         return {
+@@ -801,7 +858,7 @@ function validate_foreign_declaration_compatibility(
+     end
+     local ok, validated = invoke_module_probe(
+         module_probe, method, left_type, right_type,
+-        left_declaration, right_declaration)
++        left_declaration, right_declaration, fields)
+     if ok and type(validated) == "table" then return validated end
+     return {
+         status = "infrastructure_failure",
+@@ -814,6 +871,11 @@ end
+ 
+ function finalize_foreign_redeclarations(st, errors)
+     local pending = st.pending_foreign_redeclarations
++    local finalize_span <close> = probeprofile.begin("ffi_redeclaration_finalization", {
++        module_name = st.modname, candidate_count = #pending,
++        header_count = #st.foreign_includes,
++        parent_span_id = st.profile_parent_span_id,
++    })
+     -- Independent parsing supplies each import's member graph, but only the C
+     -- compiler can validate the macro/tag/declaration state produced by their
+     -- exact cumulative order. Validate every nonempty preamble: the
+@@ -839,7 +901,8 @@ function finalize_foreign_redeclarations(st, errors)
+         }
+     else
+         local ok, validated = invoke_module_probe(
+-            module_probe, module_probe.validate_baseline)
++            module_probe, module_probe.validate_baseline, nil,
++            finalize_span and finalize_span.id)
+         if ok and type(validated) == "table" then
+             result = validated
+         else
+@@ -855,18 +918,28 @@ function finalize_foreign_redeclarations(st, errors)
+ 
+     if result.status == "success" then
+         local rejected = {}
+-        for _, declaration in ipairs(pending) do
++        for index, declaration in ipairs(pending) do
+             local compatibility
++            local fields = profile_redeclaration(st, declaration, index)
++            if fields then fields.parent_span_id = finalize_span.id end
+             if declaration.compatibility == "source-repeat" then
+                 -- An exact source repeat emitted only one declaration in the
+                 -- ordered headers. Synthetic duplicates would invent two
+                 -- prototype scopes, so the baseline already proves this case.
+                 compatibility = { status = "success" }
++                if fields then
++                    fields.decision = "baseline_only"
++                    probeprofile.event("candidate_decision", fields)
++                end
+             else
++                if fields then
++                    fields.decision = "request"
++                    probeprofile.event("candidate_decision", fields)
++                end
+                 compatibility = validate_foreign_declaration_compatibility(
+                     module_probe, declaration.previous.type,
+                     declaration.current, declaration.previous.declaration,
+-                    declaration.declaration)
++                    declaration.declaration, fields)
+             end
+ 
+             if compatibility.status == "success" then
+@@ -879,9 +952,23 @@ function finalize_foreign_redeclarations(st, errors)
+                 report_foreign_redeclaration_failure(
+                     declaration, errors, compatibility)
+             end
++            if fields then
++                probeprofile.event("candidate_result", {
++                    candidate_id = fields.candidate_id,
++                    module_name = st.modname, status = compatibility.status,
++                })
++            end
+         end
+         restore_rejected_foreign_type_registries(st, rejected)
+     else
++        if probeprofile.enabled then
++            for index, declaration in ipairs(pending) do
++                local fields = profile_redeclaration(st, declaration, index)
++                fields.decision = "blocked_by_baseline"
++                fields.baseline_status = result.status
++                probeprofile.event("candidate_decision", fields)
++            end
++        end
+         restore_rejected_foreign_type_registries(st, pending)
+         report_foreign_header_context_failure(st, errors, result)
+         if result.status == "rejected" then
+@@ -1479,6 +1566,16 @@ function checker._validate_automatic_fam_extent(plan, st, loc, errors)
+     local result = probe:validate_declaration_compatibilities({ {
+         left_type = sentinel,
+         right_type = sentinel,
++        profile = probeprofile.enabled and {
++            purpose = "fam_extent", module_name = st.modname,
++            candidate_id = probeprofile.id("candidate"),
++            owner_type_spelling = cdeclarator.render_type_name(plan.payload_type),
++            field_name = field.name,
++            element_type_spelling = cdeclarator.render_type_name(array.elem),
++            count_literal = tostring(count), predicate = predicate,
++            location = probeprofile.location(loc),
++            parent_span_id = st.profile_parent_span_id,
++        } or nil,
+     } })[1]
+     if not result or result.status == "infrastructure_failure" then
+         checker.typeerror(errors, loc,
+diff --git a/titan-compiler/checker/declarations.lua b/titan-compiler/checker/declarations.lua
+index 0b46152c294d484e26ac9c08014bdcdb87749114..f8cdd5de80fc1adaee07bdbfedd07d4f602db446 100644
+--- a/titan-compiler/checker/declarations.lua
++++ b/titan-compiler/checker/declarations.lua
+@@ -1,4 +1,5 @@
+ local core = require "titan-compiler.checker.core"
++local probeprofile = require "titan-compiler.probeprofile"
+ local _ENV = core
+ 
+ --
+@@ -614,6 +615,7 @@ function prepare_foreign_import(node, st)
+             if options then
+                 process_options, strategy = options, options.io
+                 options.source_dir = st.source_dir
++                options.process_profile_parent_id = st.profile_parent_span_id
+                 ftypes, err, include = cdriver.process_file(node.headername, options)
+             end
+         end
+@@ -806,6 +808,26 @@ toplevel_visitor = util.make_visitor({
+                 bind_pending_foreign_slot(
+                     pending, members, type_members,
+                     current.type_declaration)
++                if probeprofile.enabled then
++                    probeprofile.event("foreign_name_inventory", {
++                        module_name = st.modname, header = name,
++                        import_id = probeprofile.object_id(node, "import"),
++                        ordinary_name = fname,
++                        category = current.type_declaration and "type" or "value",
++                        macro_definition_present = ftypes.macro_definitions
++                            and ftypes.macro_definitions[fname] ~= nil or false,
++                        current = probeprofile.type_summary(current.type,
++                            c_resolve(current.type)),
++                        current_declaration = probeprofile.declaration(current.declaration),
++                        previous_header = previous and previous.header,
++                        previous = previous and probeprofile.type_summary(previous.type,
++                            c_resolve(previous.type)),
++                        candidate_id = pending and probeprofile.object_id(pending, "candidate"),
++                        decision = pending and "queued" or previous and "conflict" or "first",
++                        location = probeprofile.location(node.loc),
++                        parent_span_id = st.profile_parent_span_id,
++                    })
++                end
+             end
+             -- Named file-scope struct/union tags are projected into this
+             -- import's Titan type namespace under their base spelling only
+diff --git a/titan-compiler/checker/entry.lua b/titan-compiler/checker/entry.lua
+index eace961bbfad8aa42589b73fc91bb85790cede48..4523b42a53cdd2845ac02e19caeb51e1c4a01546 100644
+--- a/titan-compiler/checker/entry.lua
++++ b/titan-compiler/checker/entry.lua
+@@ -24,6 +24,7 @@ function checker.check(modname, ast, subject, filename, loader, options)
+     loop_depth = 0
+     loop_frames = {}
+     local st = symtab.new(modname)
++    st.profile_parent_span_id = options.profile_parent_span_id
+     st.cache_adapter = options.cache_adapter
+     local previous_check_state = active_check_state
+     active_check_state = st
+diff --git a/titan-compiler/cprobe.lua b/titan-compiler/cprobe.lua
+index d8891afe20e6e6bb565414d16628ba5157f6720e..91d14516abd520389609ea79fa494186e2b423c3 100644
+--- a/titan-compiler/cprobe.lua
++++ b/titan-compiler/cprobe.lua
+@@ -13,6 +13,7 @@ local types = require "titan-compiler.types"
+ local sha256 = require "titan-compiler.sha256"
+ local cdriver = require "c-parser.cdriver"
+ local compiler_io = require "titan-compiler.io"
++local probeprofile = require "titan-compiler.probeprofile"
+ 
+ local default_io = compiler_io.new_sync()
+ 
+@@ -1422,7 +1423,7 @@ local function normalize_private_diagnostic(
+ end
+ 
+ function Service:_execute_source(
+-        stage, source, key, probe_label, wrappers, diagnostic_aliases)
++        stage, source, key, probe_label, wrappers, diagnostic_aliases, request)
+     if self.closed then
+         return infrastructure_run(stage, "closed", {
+             diagnostic = "probe service is closed",
+@@ -1514,6 +1515,31 @@ function Service:_execute_source(
+     local execution_digest = key
+     local run
+     local call_ok, raw_result, secondary
++    local execution_id = request and probeprofile.id("execution")
++    if request then request.execution_id = execution_id end
++    if probeprofile.enabled then
++        probeprofile.event("execution_start", {
++            execution_id = execution_id, request_id = request and request.id,
++            context_id = request and request.context_id,
++            purpose = request and request.purpose, key = key,
++            stage = stage, argv = argv, source_path = source_path,
++        })
++    end
++    local execution_span <close> = probeprofile.begin("probe_runner", {
++        execution_id = execution_id, request_id = request and request.id,
++        key = key, parent_span_id = request and request.span.id,
++    })
++    if execution_span then
++        execution_span.on_close = function(err)
++            probeprofile.event("execution_result", {
++                execution_id = execution_id, request_id = request and request.id,
++                context_id = request and request.context_id, key = key,
++                purpose = request and request.purpose,
++                outcome = "scope_error", execution_started_unknown = true,
++                error = err ~= nil and tostring(err) or nil,
++            })
++        end
++    end
+     if self.runner_is_strategy then
+         raw_result, secondary = self.runner(copy_array(argv), metadata)
+         call_ok = true
+@@ -1537,6 +1563,10 @@ function Service:_execute_source(
+     else
+         run = normalize_custom_runner_result(raw_result, secondary)
+     end
++    probeprofile.finish(execution_span, {
++        started = run.started, outcome = run.classification,
++        reason = run.reason, status = run.status, interrupted = run.interrupted,
++    })
+     local diagnostic_persistent_safe
+     run.diagnostic, diagnostic_persistent_safe = normalize_private_diagnostic(
+         run.diagnostic, source_path, object_path, workspace.root,
+@@ -1601,6 +1631,46 @@ function Service:_execute_source(
+     return run
+ end
+ 
++local profile_result
++local function profile_request(context, kind, fields, parent_request_id, parent_span_id)
++    if not probeprofile.enabled then return nil end
++    local request = { id = probeprofile.id("request"),
++        context_id = context and context.profile_context_id,
++        purpose = fields and fields.purpose or kind }
++    local metadata = {
++        request_id = request.id, parent_request_id = parent_request_id,
++        context_id = request.context_id, purpose = request.purpose,
++        probe_kind = kind, module_name = context and context.module_name,
++        service_id = context and context.service.profile_service_id,
++        parent_span_id = parent_span_id or fields and fields.parent_span_id
++            or context and context.profile_parent_span_id,
++        caller = fields,
++    }
++    request.span = probeprofile.begin("probe_request", metadata)
++    request.span.on_close = function(err)
++        profile_result(request, { classification = "scope_error" }, {
++            resolution = err ~= nil and "scope_error" or "scope_return",
++            error = err ~= nil and tostring(err) or nil,
++        })
++    end
++    probeprofile.event("request_start", metadata)
++    return request
++end
++
++profile_result = function(request, run, fields)
++    if not request then return end
++    local record = {
++        request_id = request.id, context_id = request.context_id,
++        purpose = request.purpose, execution_id = request.execution_id,
++        key = run.key, outcome = run.classification, reason = run.reason,
++        cache_tier = run.cache_tier, cached = run.cached,
++        interrupted = run.interrupted, status = run.status,
++    }
++    for key, value in pairs(fields or {}) do record[key] = value end
++    probeprofile.event("request_result", record)
++    probeprofile.finish(request.span, record)
++end
++
+ -- All memory and disk reuse answers the same question: has this exact raw C
+ -- source already completed? Environment changes deliberately do not invalidate
+ -- either outcome. Removing the cache is the programmer's refresh mechanism.
+@@ -1746,31 +1816,49 @@ end
+ 
+ -- One source, one lookup, one compiler invocation, one result. Candidate
+ -- misses first establish whether the shared header preamble itself compiles.
+-function Service:_run_source(stage, source, kind, context)
++function Service:_run_source(stage, source, kind, context, request)
+     kind = kind or "raw_source"
++    request = request or profile_request(context, kind)
++    local request_scope <close> = request and request.span
+     local path, key = self:_cache_location(source)
++    if request then
++        probeprofile.source(key, source)
++        probeprofile.event("request_source", {
++            request_id = request.id, context_id = request.context_id,
++            key = key, source_bytes = #source,
++        })
++    end
+     if self.closed then
+         local run = infrastructure_run(stage, "closed", {
+             diagnostic = "probe service is closed", source = source,
+         })
+         run.key = key
++        profile_result(request, run, { resolution = "closed" })
+         self:_trace_semantic(key, kind, context, run)
+         return run
+     end
++    local lookup_span <close> = probeprofile.begin("probe_lookup", {
++        request_id = request and request.id, key = key,
++        parent_span_id = request and request.span.id,
++    })
+     local semantic, tier, lookup = self:_lookup_result(
+         key, path, stage, context and context.module_name)
++    probeprofile.finish(lookup_span, { hit = semantic ~= nil,
++        cache_tier = tier, lookup = lookup })
+     self:_emit({ kind = "cache", cache = stage,
+         hit = semantic ~= nil, key = key })
+     if semantic then
+         local run = semantic_run(semantic, source, tier, path)
+         run.baseline_cached = true
+         run.key = key
++        profile_result(request, run, { resolution = tier .. "_hit", lookup = lookup })
+         self:_trace_semantic(key, kind, context, run)
+         return run
+     end
+     local baseline
+     if context and stage == "candidate" then
+-        baseline = context:validate_baseline()
++        baseline = context:validate_baseline(request and request.id,
++            request and request.span.id)
+         if baseline.status ~= "success" then
+             local run = {
+                 classification = "infrastructure_failure",
+@@ -1788,16 +1876,37 @@ function Service:_run_source(stage, source, kind, context)
+                 started = baseline.started,
+             }
+             run.key = key
++            profile_result(request, run, { resolution = "baseline_failed",
++                lookup = lookup })
+             self:_trace_semantic(key, kind, context, run)
+             return run
+         end
+     end
+     local execution = self:_execute_source(stage, source, key,
+         kind:gsub("_", "-"), context and context.probe_wrappers,
+-        context and context.probe_diagnostic_aliases)
++        context and context.probe_diagnostic_aliases, request)
++    local publication_span <close> = probeprofile.begin("probe_publication", {
++        request_id = request and request.id, key = key,
++        parent_span_id = request and request.span.id,
++    })
+     local run, publication = self:_publish_result(key, path, execution)
++    probeprofile.finish(publication_span, { publication = publication })
+     run.key = key
+     if baseline then run.baseline_cached = baseline.cached end
++    if request then
++        probeprofile.event("execution_result", {
++            request_id = request.id, execution_id = request.execution_id,
++            context_id = request.context_id, key = key, purpose = request.purpose,
++            outcome = execution.classification, started = execution.started,
++            reason = execution.reason, status = execution.status,
++            interrupted = execution.interrupted, diagnostic = execution.diagnostic,
++            wall_ms = execution.wall_ms, publication = publication,
++            preparation_failed = request.execution_id == nil,
++        })
++    end
++    profile_result(request, run, { resolution = request and request.execution_id
++        and "executed" or "preparation_failed", lookup = lookup,
++        publication = publication })
+     self:_trace_execution(key, kind, context, execution, lookup, publication)
+     self:_trace_semantic(key, kind, context, run, publication)
+     return run
+@@ -1854,18 +1963,24 @@ local function probe_result(context, kind, stage, source, run, rejection)
+     return result
+ end
+ 
+-function ModuleContext:validate_baseline()
++function ModuleContext:validate_baseline(parent_request_id, parent_span_id)
+     local source = self.baseline_source
++    local request = profile_request(self, "header_baseline", nil,
++        parent_request_id, parent_span_id)
++    local request_scope <close> = request and request.span
+     local run = self.service:_run_source(
+-        "baseline", source, "header_baseline", self)
++        "baseline", source, "header_baseline", self, request)
+     return probe_result(self, "header_baseline", "baseline", source, run,
+         "the final ordered foreign header context")
+ end
+ 
+-function ModuleContext:_candidate(kind, render_source, ...)
++function ModuleContext:_candidate(kind, fields, render_source, ...)
++    local request = profile_request(self, kind, fields)
++    local request_scope <close> = request and request.span
+     if self.service.closed then
+         local run = { classification = "infrastructure_failure", stage = "service",
+             reason = "closed", diagnostic = "probe service is closed" }
++        profile_result(request, run, { resolution = "closed" })
+         self.service:_trace_semantic("", kind, self, run)
+         return probe_result(self, kind, "service", "", run, "")
+     end
+@@ -1886,15 +2001,28 @@ function ModuleContext:_candidate(kind, render_source, ...)
+         self.service:_trace_semantic("", kind, self, {
+             classification = "infrastructure_failure",
+         })
++        profile_result(request, { classification = "infrastructure_failure",
++            reason = "render" }, { resolution = "render_failed", diagnostic = diagnostic,
++                returned_status = result.status, returned_accepted = result.accepted })
+         return result
+     end
++    if request then
++        probeprofile.event("request_rendered", {
++            request_id = request.id,
++            rendered_left = rendered.left_declaration,
++            rendered_right = rendered.right_declaration,
++            source_type = rendered.source_type, target_type = rendered.target_type,
++            operator = rendered.cop, operator_kind = rendered.kind,
++            expression = rendered.expression,
++        })
++    end
+     local rejection = kind == "declaration_compatibility"
+         and "the declaration compatibility candidate"
+         or kind == "unsafe_object_pointer"
+         and "conversion from '" .. rendered.source_type .. "' to '"
+             .. rendered.target_type .. "'"
+         or rendered.kind .. " operator expression '" .. rendered.expression .. "'"
+-    local run = self.service:_run_source("candidate", source, kind, self)
++    local run = self.service:_run_source("candidate", source, kind, self, request)
+     local result = probe_result(self, kind, "candidate", source, run, rejection)
+     for name, value in pairs(rendered) do result[name] = value end
+     if kind == "c_operator" then
+@@ -1907,8 +2035,8 @@ function ModuleContext:_candidate(kind, render_source, ...)
+ end
+ 
+ function ModuleContext:validate_declaration_compatibility(
+-        left_type, right_type, left_declaration, right_declaration)
+-    return self:_candidate("declaration_compatibility",
++        left_type, right_type, left_declaration, right_declaration, fields)
++    return self:_candidate("declaration_compatibility", fields,
+         render_declaration_compatibility_source,
+         left_type, right_type, left_declaration, right_declaration)
+ end
+@@ -1918,18 +2046,18 @@ function ModuleContext:validate_declaration_compatibilities(candidates)
+     for index, candidate in ipairs(candidates) do
+         results[index] = self:validate_declaration_compatibility(
+             candidate.left_type, candidate.right_type,
+-            candidate.left_declaration, candidate.right_declaration)
++            candidate.left_declaration, candidate.right_declaration, candidate.profile)
+     end
+     return results
+ end
+ 
+ function ModuleContext:probe_unsafe_object_pointer(source_type, target_type)
+-    return self:_candidate("unsafe_object_pointer", render_pointer_source,
++    return self:_candidate("unsafe_object_pointer", nil, render_pointer_source,
+         source_type, target_type)
+ end
+ 
+ function ModuleContext:probe_operator(trait)
+-    return self:_candidate("c_operator", render_operator_source, trait)
++    return self:_candidate("c_operator", nil, render_operator_source, trait)
+ end
+ 
+ ModuleContext.unsafe_object_pointer = ModuleContext.probe_unsafe_object_pointer
+@@ -2025,6 +2153,31 @@ function Service:module_context(options)
+     }, ModuleContext)
+     context.baseline_source = render_baseline_source(context)
+     context.baseline_key = sha256.hex(context.baseline_source)
++    if probeprofile.enabled then
++        context.profile_context_id = probeprofile.id("context")
++        context.profile_parent_span_id = options.profile_parent_span_id
++        local ordered = {}
++        for _, include in ipairs(includes) do
++            local wrapper = include.probe_wrapper
++            ordered[#ordered + 1] = {
++                original = include.original, resolved = include.resolved,
++                rendered = include.rendered, include_kind = include.include_kind,
++                include_name = include.include_name,
++                c_header_graph_key = include.c_header_graph_key,
++                wrapper_path = wrapper and probeprofile.wrapper(
++                    wrapper.name, wrapper.contents),
++                wrapper_name = wrapper and wrapper.name,
++            }
++        end
++        probeprofile.source(context.baseline_key, context.baseline_source)
++        probeprofile.context(context.profile_context_id, {
++            module_name = module_name, service_id = self.profile_service_id,
++            source_dir = source_dir, cwd = cwd, includes = ordered,
++            diagnostic_aliases = probe_diagnostic_aliases,
++            baseline_key = context.baseline_key,
++            parent_span_id = options.profile_parent_span_id,
++        })
++    end
+     return context
+ end
+ 
+@@ -2396,6 +2549,17 @@ function cprobe.new_service(options)
+         workspace = nil,
+         closed = false,
+     }, Service)
++    if probeprofile.enabled then
++        service.profile_service_id = probeprofile.id("service")
++        probeprofile.event("probe_service", {
++            service_id = service.profile_service_id,
++            compiler_argv = compiler_argv, compile_flags = compile_flags,
++            language_mode = language_mode, language_flag = language_flag,
++            cppflags = cppflags, cflags = cflags, include_dirs = include_dirs,
++            syntax_only = syntax_only, cache_directory = cache_directory,
++            profile_identity = profile_identity,
++        })
++    end
+     return service
+ end
+ 
+diff --git a/titan-compiler/driver.lua b/titan-compiler/driver.lua
+index 85741873d29965b531e26bd7e9e91ff7d0a1960d..b2a4dd1711baaff77a9189daf420d613d85f8ca2 100644
+--- a/titan-compiler/driver.lua
++++ b/titan-compiler/driver.lua
+@@ -1,3 +1,5 @@
++local profile = require "titan-compiler.probeprofile"
++local profile_demand = require "titan-compiler.probeprofile_demand"
+ local parser = require  "titan-compiler.parser"
+ local util = require "titan-compiler.util"
+ local checker = require "titan-compiler.checker"
+@@ -807,6 +809,7 @@ function driver.new_resolver_context(options)
+     end
+     local context = {
+         _resolver_context = true,
++        _profile_parent_span_id = options.profile_parent_span_id,
+         io = io_strategy,
+         cache_adapter = options.cache_adapter,
+         header_observations = cdriver.header_observation_index(options.header_inputs),
+@@ -3425,6 +3428,7 @@ end
+ local function check_source_module(
+         context, modname, ast, input, filename, loader)
+     local check_options = {
++        profile_parent_span_id = context._profile_check_span_id,
+         cache_adapter = context.cache_adapter,
+         header_observations = context.header_observations,
+         target_profile_provider = function()
+@@ -4015,7 +4019,12 @@ function driver.defaultloader(static_deps, options)
+                 if not input then return false, err end
+             end
+             local parse_started = profile_frame and os.clock() or nil
++            local parse_span <close> = profile.begin("source.parse", {
++                parent_span_id = context._profile_source_span_id,
++                module_name = modname, filename = filename, input_bytes = #input,
++            })
+             local nodes, perr = parser.parse(filename, input)
++            profile.finish(parse_span, { outcome = nodes and "complete" or "failed" })
+             if profile_frame then
+                 local parse_cpu_ms = (os.clock() - parse_started) * 1000
+                 if parse_cpu_ms < 0 then parse_cpu_ms = 0 end
+@@ -4052,8 +4061,26 @@ function driver.defaultloader(static_deps, options)
+         local check_started = profile_frame and os.clock() or nil
+         local check_child_started = profile_frame
+             and profile_frame.child_cpu_ms or 0
++        local check_span <close> = profile.begin("source.check", {
++            parent_span_id = context._profile_source_span_id,
++            module_name = modname, filename = source.main,
++        })
++        local previous_check_span_id = context._profile_check_span_id
++        local restore_check_span <close> = setmetatable({}, { __close = function()
++            context._profile_check_span_id = previous_check_span_id
++        end })
++        if check_span then context._profile_check_span_id = check_span.id end
+         local modt, errors = check_source_module(
+             context, modname, ast, main_input, source.main, loader)
++        if profile.enabled then
++            profile_demand.capture(ast, modname, {
++                parent_span_id = check_span and check_span.id,
++                filename = source.main,
++            })
++        end
++        profile.finish(check_span, { outcome = #errors == 0 and "complete" or "failed",
++            errors = #errors })
++        context._profile_check_span_id = previous_check_span_id
+         if profile_frame then
+             local inclusive_check_cpu_ms =
+                 (os.clock() - check_started) * 1000
+@@ -4091,8 +4118,12 @@ function driver.defaultloader(static_deps, options)
+             checking_foreign_header = checking_foreign_header,
+         }
+         if #errors == 0 then
++            local manifest_span <close> = profile.begin("source.interface_manifest", {
++                parent_span_id = context._profile_source_span_id, module_name = modname,
++            })
+             local source_manifest, manifest_error =
+                 driver.serialize_source_interface(entry)
++            profile.finish(manifest_span, { outcome = source_manifest and "complete" or "failed" })
+             if not source_manifest then
+                 errors[#errors + 1] = "could not serialize source interface " ..
+                     "for module '" .. modname .. "': " ..
+@@ -4127,10 +4158,26 @@ function driver.defaultloader(static_deps, options)
+     end
+ 
+     local function parse_source(modname, source, loader)
++        local source_span <close> = profile.begin("source.module", {
++            parent_span_id = context._profile_check_span_id or context._profile_parent_span_id,
++            module_name = modname, filename = source.main,
++        })
++        local previous_source_span_id = context._profile_source_span_id
++        local restore_source_span <close> = setmetatable({}, { __close = function()
++            context._profile_source_span_id = previous_source_span_id
++        end })
++        if source_span then context._profile_source_span_id = source_span.id end
+         if source_process_trace == nil then
+             local ok, modtype, errors, info =
+                 parse_source_inner(modname, source, loader, nil)
+-            if ok then context.io:yield(modname) end
++            profile.finish(source_span, { outcome = ok and "complete" or "failed" })
++            if ok then
++                local yield_span <close> = profile.begin("source.checkpoint_yield", {
++                    parent_span_id = context._profile_check_span_id or context._profile_parent_span_id,
++                    module_name = modname,
++                })
++                context.io:yield(modname)
++            end
+             return ok, modtype, errors, info
+         end
+ 
+@@ -4139,13 +4186,19 @@ function driver.defaultloader(static_deps, options)
+             parse_source_inner(modname, source, loader, frame)
+         local parent = finish_source_profile(
+             frame, modname, source.main, ok and "complete" or "failed")
++        profile.finish(source_span, { outcome = ok and "complete" or "failed" })
+         if ok then
+             -- The module itself is complete before this cooperative checkpoint.
+             -- Its caller's frame is still live, so exclude process CPU consumed
+             -- by other Tasks while this source-check Task is suspended rather
+             -- than charging that scheduler work to the importing module.
++            local yield_span <close> = profile.begin("source.checkpoint_yield", {
++                parent_span_id = context._profile_check_span_id or context._profile_parent_span_id,
++                module_name = modname,
++            })
+             local yield_started = os.clock()
+             context.io:yield(modname)
++            profile.finish(yield_span)
+             if parent then
+                 local yield_cpu_ms = (os.clock() - yield_started) * 1000
+                 if yield_cpu_ms > 0 then
+diff --git a/titan-compiler/foreigncache.lua b/titan-compiler/foreigncache.lua
+index 8a49ce0312e8161d93b68d30e3f22778d83f6149..188683aee4752515f5ab967e606beb53218f081a 100644
+--- a/titan-compiler/foreigncache.lua
++++ b/titan-compiler/foreigncache.lua
+@@ -4,6 +4,7 @@
+ local cpp = require "c-parser.cpp"
+ local sha256 = require "titan-compiler.sha256"
+ local cacheadapter = require "titan-compiler.cacheadapter"
++local probeprofile = require "titan-compiler.probeprofile"
+ 
+ local foreigncache = { VERSION = 1, KIND = "ffi-conversion-v1" }
+ local roots = {
+@@ -34,6 +35,10 @@ function foreigncache.stats(strategy)
+ end
+ 
+ function foreigncache.key(st, imports, prepared)
++    local scope <close> = probeprofile.begin("ffi_conversion_cache.key", {
++        module_name = st.modname, import_count = #imports,
++        parent_span_id = st.profile_parent_span_id,
++    })
+     if #imports == 0 or not st.probe_service then return nil end
+     local pieces = {}
+     local function add(value)
+@@ -78,7 +83,11 @@ local function references(imports)
+     return external, restored
+ end
+ 
+-function foreigncache.encode(st, imports, key)
++function foreigncache.encode(st, imports, key, parent_span_id)
++    local scope <close> = probeprofile.begin("ffi_conversion_cache.encode", {
++        module_name = st.modname, import_count = #imports, key = key,
++        parent_span_id = parent_span_id or st.profile_parent_span_id,
++    })
+     local snapshot = {
+         version = foreigncache.VERSION, key = key, roots = {},
+         node_types = {}, node_includes = {},
+@@ -92,11 +101,15 @@ function foreigncache.encode(st, imports, key)
+             node._type, node._include
+     end
+     local external = references(imports)
+-    return cpp.encode_graph(snapshot, {
++    local payload, err = cpp.encode_graph(snapshot, {
+         external = external,
+         sha256_binary = st.cache_adapter and st.cache_adapter.sha256_binary,
+         yield = st.cache_adapter and st.cache_adapter.yield,
++        profile_parent_span_id = scope and scope.id,
+     })
++    probeprofile.finish(scope, { bytes = type(payload) == "string" and #payload or nil,
++        success = payload ~= nil })
++    return payload, err
+ end
+ 
+ local function valid_snapshot(snapshot, imports, key)
+@@ -191,21 +204,36 @@ local function prepare_snapshot(snapshot, imports, key, st, saved_inputs)
+ end
+ 
+ function foreigncache.restore(st, imports, key)
++    local scope <close> = probeprofile.begin("ffi_conversion_cache.restore", {
++        module_name = st.modname, import_count = #imports, key = key,
++        parent_span_id = st.profile_parent_span_id,
++    })
+     local stats = counters(st)
+     if stats then stats.lookups = stats.lookups + 1 end
++    local get_scope <close> = probeprofile.begin("ffi_conversion_cache.get", {
++        module_name = st.modname, parent_span_id = scope and scope.id,
++    })
+     local payload, saved_inputs = cacheadapter.get(st.cache_adapter, foreigncache.KIND, key)
++    probeprofile.finish(get_scope, { bytes = type(payload) == "string" and #payload or nil,
++        hit = payload ~= nil })
+     local _, current = references(imports)
+     local snapshot = payload and cpp.decode_graph(payload, {
+         references = current,
+         sha256_binary = st.cache_adapter and st.cache_adapter.sha256_binary,
+         yield = st.cache_adapter and st.cache_adapter.yield,
++        profile_parent_span_id = scope and scope.id,
++    })
++    local validation_scope <close> = probeprofile.begin("ffi_conversion_cache.validate", {
++        module_name = st.modname, parent_span_id = scope and scope.id,
+     })
+     local checked, valid, observations_changed = pcall(
+         prepare_snapshot, snapshot, imports, key, st, saved_inputs)
+     if not checked and type(valid) ~= "string" then error(valid, 0) end
+     valid = checked and valid
++    probeprofile.finish(validation_scope, { valid = valid })
+     if not valid then
+         if stats then stats.misses = stats.misses + 1 end
++        probeprofile.finish(scope, { hit = false })
+         return false
+     end
+     -- Decode and validate every root before mutating the current checker.
+@@ -221,16 +249,22 @@ function foreigncache.restore(st, imports, key)
+         local inputs = collect_inputs(imports)
+         local refreshed = cacheadapter.refresh_inputs(st.cache_adapter, foreigncache.KIND, key, inputs)
+         if refreshed == nil and st.cache_adapter.put then
+-            local updated = foreigncache.encode(st, imports, key)
++            local updated = foreigncache.encode(st, imports, key, scope and scope.id)
+             if updated then cacheadapter.put(st.cache_adapter, foreigncache.KIND, key, updated, inputs) end
+         end
+     end
+     if stats then stats.hits = stats.hits + 1 end
++    probeprofile.finish(scope, { hit = true, observations_changed = observations_changed })
+     return true
+ end
+ 
+ 
+ function foreigncache.store(st, key, payload, imports)
++    local scope <close> = probeprofile.begin("ffi_conversion_cache.store", {
++        module_name = st.modname, key = key,
++        bytes = type(payload) == "string" and #payload or nil,
++        parent_span_id = st.profile_parent_span_id,
++    })
+     if cacheadapter.put(st.cache_adapter, foreigncache.KIND, key, payload, collect_inputs(imports)) then
+         local stats = counters(st)
+         if stats then stats.stores = stats.stores + 1 end
+diff --git a/titan-compiler/graphcodec.lua b/titan-compiler/graphcodec.lua
+index b10d100f09796921011130335b5e0d962993aeb1..9be332c4dedb6be98703a617ebaf57ddfbcece58 100644
+--- a/titan-compiler/graphcodec.lua
++++ b/titan-compiler/graphcodec.lua
+@@ -2,6 +2,7 @@
+ -- source. Table allocation precedes reference resolution, preserving cycles,
+ -- shared aliases, table keys and caller-owned sidecars without constructors.
+ local sha256 = require "titan-compiler.sha256"
++local profile = require "titan-compiler.probeprofile"
+ 
+ local graphcodec = { VERSION = 1 }
+ local MAGIC = "TITAN-GRAPH\0\1"
+@@ -42,6 +43,10 @@ function graphcodec.work(options)
+ end
+ 
+ local function checksum(bytes, options)
++    local span <close> = profile.begin("graph.checksum", {
++        parent_span_id = options._profile_graph_span_id or options.profile_parent_span_id,
++        bytes = #bytes, native_digest = options.sha256_binary ~= nil,
++    })
+     local digest = options.sha256_binary
+     if digest == nil then digest = sha256.binary end
+     assert(type(digest) == "function", "graph sha256_binary must be a function")
+@@ -52,6 +57,16 @@ local function checksum(bytes, options)
+ end
+ 
+ local function encode(root, options)
++    local total <close> = profile.begin("graph.encode", {
++        parent_span_id = options.profile_parent_span_id,
++        graph_kind = type(root) == "table" and root.kind or nil,
++    })
++    if total then
++        local copied = {}
++        for key, item in pairs(options) do copied[key] = item end
++        options = copied
++        options._profile_graph_span_id = total.id
++    end
+     local bound = limits(options)
+     local work = graphcodec.work(options)
+     work(0, true)
+@@ -102,6 +117,9 @@ local function encode(root, options)
+         charge(5)
+         return "r" .. string.pack(">I4", id)
+     end
++    local enumerate <close> = profile.begin("graph.enumerate_pack", {
++        parent_span_id = total and total.id,
++    })
+     local root_value = value(root)
+     local index = 1
+     while nodes[index] do
+@@ -126,6 +144,10 @@ local function encode(root, options)
+         records[index] = record
+         index = index + 1
+     end
++    profile.finish(enumerate, { nodes = #nodes, entries = entry_count })
++    local chunks_span <close> = profile.begin("graph.chunks", {
++        parent_span_id = total and total.id,
++    })
+     append(string.pack(">I4", #nodes))
+     append(root_value)
+     for _, record in ipairs(records) do
+@@ -134,14 +156,31 @@ local function encode(root, options)
+         append(record.annotations)
+         for _, entry in ipairs(record) do append(entry) end
+     end
++    profile.finish(chunks_span, { chunks = #chunks })
++    local concat <close> = profile.begin("graph.body_concat", { parent_span_id = total and total.id })
+     local body = table.concat(chunks)
++    profile.finish(concat, { bytes = #body })
+     work(0, true)
+-    local payload = MAGIC .. checksum(body, options) .. body
++    local digest = checksum(body, options)
++    local envelope <close> = profile.begin("graph.envelope_concat", { parent_span_id = total and total.id })
++    local payload = MAGIC .. digest .. body
++    profile.finish(envelope, { bytes = #payload })
+     work(0, true)
++    profile.finish(total, { bytes = #payload, nodes = #nodes, entries = entry_count })
+     return payload
+ end
+ 
+ local function decode(payload, options)
++    local total <close> = profile.begin("graph.decode", {
++        parent_span_id = options.profile_parent_span_id,
++        bytes = type(payload) == "string" and #payload or 0,
++    })
++    if total then
++        local copied = {}
++        for key, item in pairs(options) do copied[key] = item end
++        options = copied
++        options._profile_graph_span_id = total.id
++    end
+     local bound = limits(options)
+     local work = graphcodec.work(options)
+     work(0, true)
+diff --git a/titan-compiler/projectcache.lua b/titan-compiler/projectcache.lua
+index eaef9f1606c0261569786dc35d5c642bcaede9a2..1f6521035c26e597bca77b7dda44f2595970b910 100644
+--- a/titan-compiler/projectcache.lua
++++ b/titan-compiler/projectcache.lua
+@@ -2,6 +2,7 @@
+ -- External source/provider ASTs are never made persistent through a project
+ -- type's navigation edges. Importing an entry does not register it or touch I/O.
+ local cpp = require "c-parser.cpp"
++local profile = require "titan-compiler.probeprofile"
+ local graphcodec = require "titan-compiler.graphcodec"
+ local staticmetadata = require "titan-compiler.staticmetadata"
+ local version = require "titan-compiler.version"
+@@ -95,16 +96,25 @@ end
+ 
+ function projectcache.encode(entry, options)
+     options = options or {}
++    local validation <close> = profile.begin("project_cache.validate_encode", {
++        parent_span_id = options.profile_parent_span_id,
++        module_name = type(entry) == "table" and type(entry.type) == "table" and entry.type.name,
++    })
+     local valid, err = valid_entry(entry, options)
++    profile.finish(validation, { outcome = valid and "complete" or "failed" })
+     if not valid then return nil, err end
+     -- A shallow root copy excludes resolver-owned paths; all semantic children
+     -- are encoded together, preserving their existing sharing and cycles.
++    local projection <close> = profile.begin("project_cache.root_projection", {
++        parent_span_id = options.profile_parent_span_id,
++    })
+     local retained = {}
+     for key, value in next, entry do
+         if key ~= "checking_foreign_header" and key ~= "_cached_source_entry" then
+             retained[key] = value
+         end
+     end
++    profile.finish(projection)
+     return cpp.encode_graph({
+         kind = "titan-project-entry",
+         version = projectcache.VERSION,
+diff --git a/titan-compiler/probeprofile.lua b/titan-compiler/probeprofile.lua
+new file mode 100644
+index 0000000000000000000000000000000000000000..25f7b38548ab98bb98993d7dcec3d716a9c0c46a
+--- /dev/null
++++ b/titan-compiler/probeprofile.lua
+@@ -0,0 +1,272 @@
++-- EXPERIMENTAL evidence capture. This module is deliberately outside every
++-- source/cache identity and is enabled only by TITAN_FFI_PROFILE_DIR.
++local M = { enabled = false }
++local directory = os.getenv("TITAN_FFI_PROFILE_DIR")
++local serial, event_sequence = 0, 0
++local stream, clock, failed, closed
++local sources, contexts = {}, {}
++local object_ids = setmetatable({}, { __mode = "k" })
++local wrappers = {}
++local overhead = { wall_ms = 0, process_cpu_ms = 0, bytes = 0 }
++local clock_fields = { "monotonic_ms", "process_cpu_ms", "thread_cpu_ms",
++    "child_user_ms", "child_system_ms" }
++
++local function fail(message)
++    if failed then return end
++    failed = tostring(message)
++    M.enabled = false
++    io.stderr:write("TITAN FFI PROFILE INCOMPLETE: ", failed, "\n")
++    if directory and directory ~= "" then
++        local marker = io.open(directory .. "/INCOMPLETE", "wb")
++        if marker then marker:write(failed, "\n"); marker:close() end
++    end
++end
++
++local function sample()
++    local values = { clock.sample() }
++    local result = {}
++    for index, name in ipairs(clock_fields) do
++        local value = values[index]
++        assert(type(value) == "number", "profile clock lacks " .. name)
++        result[name] = value
++    end
++    return result
++end
++
++local function quote(value)
++    return '"' .. value:gsub('[%z\1-\31\\"]', function(byte)
++        if byte == '"' then return '\\"' end
++        if byte == '\\' then return '\\\\' end
++        return ("\\u%04x"):format(byte:byte())
++    end) .. '"'
++end
++
++local function encode(value, depth, seen)
++    local kind = type(value)
++    if kind == "nil" then return "null" end
++    if kind == "string" then return quote(value) end
++    if kind == "boolean" then return value and "true" or "false" end
++    if kind == "number" then
++        assert(value == value and math.abs(value) ~= math.huge,
++            "profile metadata contains a nonfinite number")
++        return tostring(value)
++    end
++    assert(kind == "table", "profile metadata must be plain data: " .. kind)
++    depth = (depth or 0) + 1
++    assert(depth <= 12, "profile metadata exceeds depth bound")
++    seen = seen or {}
++    assert(not seen[value], "profile metadata contains a cycle")
++    seen[value] = true
++    local count, array = 0, #value > 0
++    for key in pairs(value) do
++        count = count + 1
++        if type(key) ~= "number" or key % 1 ~= 0 or key < 1
++            or key > #value then array = false end
++    end
++    assert(count <= 8192, "profile metadata exceeds table bound")
++    local result = {}
++    if array then
++        for _, item in ipairs(value) do
++            result[#result + 1] = encode(item, depth, seen)
++        end
++    else
++        for key, item in pairs(value) do
++            assert(type(key) == "string", "profile metadata key is not a string")
++            result[#result + 1] = quote(key) .. ":" .. encode(item, depth, seen)
++        end
++    end
++    seen[value] = nil
++    return (array and "[" or "{") .. table.concat(result, ",")
++        .. (array and "]" or "}")
++end
++
++local function capture(operation)
++    if not M.enabled then return end
++    local before = sample()
++    local ok, result = pcall(operation)
++    local after = sample()
++    overhead.wall_ms = overhead.wall_ms + after.monotonic_ms - before.monotonic_ms
++    overhead.process_cpu_ms = overhead.process_cpu_ms
++        + after.process_cpu_ms - before.process_cpu_ms
++    if not ok then fail(result) end
++    return ok and result or nil
++end
++
++function M.id(prefix)
++    if not M.enabled then return nil end
++    serial = serial + 1
++    return (prefix or "id") .. ":" .. serial
++end
++
++function M.object_id(object, prefix)
++    if not M.enabled or type(object) ~= "table" then return nil end
++    local id = object_ids[object]
++    if not id then id = M.id(prefix); object_ids[object] = id end
++    return id
++end
++
++function M.location(loc)
++    if not M.enabled or type(loc) ~= "table" then return nil end
++    return { file = loc.filename or loc.file, line = loc.line,
++        column = loc.col or loc.column }
++end
++
++function M.type_summary(typ, resolved)
++    if not M.enabled or type(typ) ~= "table" then return nil end
++    resolved = resolved or typ
++    return { type_id = M.object_id(typ, "type"), tag = typ._tag,
++        spelling = typ.spelling, name = typ.name,
++        resolved_type_id = M.object_id(resolved, "type"), resolved_tag = resolved._tag,
++        resolved_spelling = resolved.spelling, signed = resolved.signed,
++        bits = resolved.bits, rank = resolved.rank,
++        enum_identity = resolved._c_enum_identity,
++        enumerator = resolved._c_enum_enumerator }
++end
++
++function M.declaration(declaration)
++    if not M.enabled or type(declaration) ~= "table" then return nil end
++    local origin, provenance = declaration.origin_header, declaration.provenance
++    return { origin = origin and (origin.rendered or origin.original),
++        location = M.location(provenance),
++        device = provenance and provenance.device,
++        inode = provenance and provenance.inode,
++        qualifiers = declaration.qualifiers }
++end
++
++function M.wrapper(name, raw)
++    if not M.enabled then return nil end
++    local by_contents = wrappers[name]
++    if by_contents and by_contents[raw] then return by_contents[raw] end
++    local path = "wrappers/" .. M.id("wrapper"):gsub(":", "-") .. ".h"
++    local written = capture(function()
++        local file = assert(io.open(directory .. "/" .. path, "wb"))
++        local ok, err = file:write(raw)
++        local close_ok, close_err = file:close()
++        assert(ok, err); assert(close_ok, close_err)
++        overhead.bytes = overhead.bytes + #raw
++        return true
++    end)
++    if written then
++        if not by_contents then by_contents = {}; wrappers[name] = by_contents end
++        by_contents[raw] = path
++        M.event("wrapper", { name = name, path = path, bytes = #raw })
++        return path
++    end
++end
++
++function M.event(name, fields)
++    if not M.enabled then return end
++    capture(function()
++        local record = {}
++        for key, value in pairs(fields or {}) do record[key] = value end
++        event_sequence = event_sequence + 1
++        record.event, record.sequence, record.schema_version = name, event_sequence, 1
++        record.producer = "compiler"
++        record.sample = sample()
++        local line = encode(record) .. "\n"
++        assert(stream:write(line))
++        overhead.bytes = overhead.bytes + #line
++        if event_sequence % 256 == 0 then assert(stream:flush()) end
++    end)
++end
++
++local span_meta = { __close = function(span, err)
++    if not span.finished and span.on_close then span.on_close(err) end
++    if not span.finished then
++        M.finish(span, { scope_exit = err == nil and "return" or "error",
++            error = err ~= nil and tostring(err) or nil })
++    end
++end }
++
++function M.begin(name, fields)
++    if not M.enabled then return nil end
++    local span = setmetatable({ id = M.id("span"), name = name,
++        start = sample() }, span_meta)
++    span.span_id = span.id
++    local record = { name = name, span_id = span.id, fields = fields }
++    M.event("span_begin", record)
++    return span
++end
++
++function M.finish(span, fields)
++    if not span or span.finished then return end
++    span.finished = true
++    span.on_close = nil
++    if not M.enabled then return end
++    local ending, delta = sample(), {}
++    for _, name in ipairs(clock_fields) do
++        delta[name] = ending[name] - span.start[name]
++    end
++    M.event("span_end", { name = span.name, span_id = span.id,
++        fields = fields, start = span.start, finish = ending, delta = delta })
++end
++
++-- Artifacts use caller-provided identity. Never hash/normalize source here.
++function M.source(key, raw)
++    if not M.enabled then return nil end
++    local path = "sources/" .. key .. ".c"
++    if sources[key] then return path end
++    local written = capture(function()
++        assert(type(key) == "string" and key:match("^[0-9a-f]+$") and #key == 64,
++            "profile source key must be the existing SHA256")
++        local file = assert(io.open(directory .. "/" .. path, "wb"))
++        local ok, err = file:write(raw)
++        local close_ok, close_err = file:close()
++        assert(ok, err); assert(close_ok, close_err)
++        overhead.bytes = overhead.bytes + #raw
++        return true
++    end)
++    if written then
++        sources[key] = true
++        M.event("source", { key = key, path = path, bytes = #raw })
++        return path
++    end
++end
++
++function M.context(id, fields)
++    if not M.enabled or contexts[id] then return end
++    contexts[id] = true
++    M.event("context", { context_id = id, fields = fields })
++end
++
++function M.close(fields)
++    if closed then return end
++    closed = true
++    M.event("profile_end", { fields = fields, overhead = overhead,
++        events_before_end = event_sequence, complete = not failed })
++    if stream then
++        local ok, err = stream:flush()
++        if not ok then fail(err) end
++        ok, err = stream:close()
++        if not ok then fail(err) end
++    end
++    M.enabled = false
++    return not failed, failed
++end
++
++if directory and directory ~= "" then
++    local ok, err = pcall(function()
++        clock = require "probe_profile_clock"
++        sample()
++        local lfs = require "lfs"
++        local function mkdir(path)
++            if lfs.attributes(path, "mode") == "directory" then return end
++            local parent = path:match("^(.*)/[^/]+$")
++            if parent and parent ~= "" then mkdir(parent) end
++            assert(lfs.mkdir(path))
++        end
++        mkdir(directory)
++        assert(not lfs.attributes(directory .. "/events.jsonl"),
++            "profile directory already contains events.jsonl; choose a fresh directory")
++        mkdir(directory .. "/sources")
++        mkdir(directory .. "/wrappers")
++        stream = assert(io.open(directory .. "/events.jsonl", "wb"))
++        assert(stream:setvbuf("full", 65536))
++        M.enabled = true
++        M.event("profile_start", { directory = directory, lua_version = _VERSION,
++            clock = "CLOCK_MONOTONIC/process/thread/rusage_children" })
++    end)
++    if not ok then fail(err) end
++end
++
++return M
+diff --git a/titan-compiler/probeprofile_demand.lua b/titan-compiler/probeprofile_demand.lua
+new file mode 100644
+index 0000000000000000000000000000000000000000..e5af58d9396cb4a5956e3f19ac0037106c7adae9
+--- /dev/null
++++ b/titan-compiler/probeprofile_demand.lua
+@@ -0,0 +1,119 @@
++-- EXPERIMENTAL post-check observations, not an elimination/compatibility rule.
++-- Walk syntax edges only. Never turn an imported module's complete members or
++-- a C provenance/cache graph into evidence that the source used every member.
++local profile = require "titan-compiler.probeprofile"
++local types = require "titan-compiler.types"
++local M = {}
++
++function M.capture(ast, module_name, fields)
++    if not profile.enabled then return end
++    local span <close> = profile.begin("ffi_demand_observation", {
++        module_name = module_name, parent_span_id = fields and fields.parent_span_id,
++        scope = "syntax roots and selected C signature edges; no reachability claim",
++    })
++    local seen_syntax, seen_types = {}, {}
++    local roots, syntax_nodes, type_nodes = 0, 0, 0
++    local function ctype(typ)
++        return type(typ) == "table" and type(typ._tag) == "string"
++            and typ._tag:match("^Type%.C") and typ._tag ~= "Type.CModule"
++    end
++    local function observe_type(typ)
++        if not ctype(typ) or seen_types[typ] then return end
++        seen_types[typ] = true
++        type_nodes = type_nodes + 1
++        local edges = {}
++        local function edge(role, child, index)
++            if not ctype(child) then return end
++            edges[#edges + 1] = { role = role, index = index,
++                type_id = profile.object_id(child, "type") }
++            observe_type(child)
++        end
++        local tag = typ._tag
++        if tag == "Type.CTypedef" then edge("target", typ.target)
++        elseif tag == "Type.CPointer" or tag == "Type.COwned" then
++            edge("pointee_spelling", typ.pointee)
++        elseif tag == "Type.CArray" then edge("element", typ.elem)
++        elseif tag == "Type.CFunction" then
++            edge("return", typ.ret)
++            for index, param in ipairs(typ.params or {}) do edge("parameter", param, index) end
++        elseif tag == "Type.CField" then
++            edge("selected_field_type", typ.type)
++        end
++        -- Aggregate fields are intentionally excluded here: a pointer's tag
++        -- spelling does not establish demand for every field's full layout.
++        profile.event("demand_type", { module_name = module_name,
++            type = profile.type_summary(typ, types.resolve_c_typedef(typ)),
++            edges = edges, aggregate_fields_traversed = false })
++    end
++    local function root(node, role, typ, member, foreign_module)
++        if not ctype(typ) and not (foreign_module and type(typ) == "table") then return end
++        roots = roots + 1
++        observe_type(typ)
++        profile.event("demand_root", {
++            module_name = module_name, demand_id = profile.id("demand"),
++            ast_tag = node._tag, role = role, name = node.name,
++            written_module = type(node.module) == "string" and node.module or nil,
++            location = profile.location(node.loc),
++            type = profile.type_summary(typ, types.resolve_c_typedef(typ)),
++            member_name = member and member.name,
++            member_module = member and member.modname,
++            member_id = member and profile.object_id(member, "member"),
++            direct_foreign_use = foreign_module ~= nil,
++            foreign_header = foreign_module and foreign_module.name,
++            ordinary_name = foreign_module and node.name,
++            layout_closure = "unknown",
++            parent_span_id = span and span.id,
++        })
++    end
++    local function visit(node)
++        if type(node) ~= "table" or seen_syntax[node] then return end
++        seen_syntax[node] = true
++        local tag = node._tag
++        if tag == nil then
++            for _, child in ipairs(node) do visit(child) end
++            return
++        end
++        if type(tag) ~= "string" or not tag:match("^Ast%.") then return end
++        syntax_nodes = syntax_nodes + 1
++        if tag ~= "Ast.TopLevelImport" and tag ~= "Ast.TopLevelForeignImport" then
++            root(node, "annotated_syntax_type", node._type)
++            local declaration = node._decl
++            if type(declaration) == "table" then
++                local receiver_type = tag == "Ast.VarDot" and node.exp
++                    and node.exp._type
++                local foreign_module = receiver_type
++                    and receiver_type._tag == "Type.CModule" and receiver_type or nil
++                root(node, "resolved_member", declaration.type, declaration, foreign_module)
++            end
++            if tag == "Ast.TypeQualName" then
++                local module_decl = node._module_decl
++                local module_type = module_decl and module_decl._type
++                if module_type and module_type._tag == "Type.CModule" then
++                    -- This is one resolved syntax-selected type namespace slot,
++                    -- including aliases whose selected type is a Titan primitive.
++                    local selected = module_type.type_members and module_type.type_members[node.name]
++                    root(node, "resolved_foreign_type_name", selected, nil, module_type)
++                end
++            end
++            root(node, "direct_c_call", node._c_pointer_call)
++            -- Top-level and local Titan callable annotations have explicit
++            -- parameter/result lists. Record only C entries in that signature.
++            local typ = node._type
++            if type(typ) == "table" and (typ._tag == "Type.Function"
++                    or typ._tag == "Type.Method") then
++                for _, param in ipairs(typ.params or {}) do root(node, "signature_parameter", param) end
++                for _, ret in ipairs(typ.rettypes or {}) do root(node, "signature_return", ret) end
++            end
++        end
++        for name, child in pairs(node) do
++            if type(name) == "string" and name:sub(1, 1) ~= "_" and name ~= "loc" then
++                visit(child)
++            end
++        end
++    end
++    visit(ast)
++    profile.finish(span, { module_name = module_name, syntax_nodes = syntax_nodes,
++        roots = roots, type_nodes = type_nodes, fields = fields })
++end
++
++return M
