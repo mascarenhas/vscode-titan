@@ -6,18 +6,30 @@ local test = import "test"
 local strings = import "string"
 local compiler_bridge = import "server.compiler_bridge"
 local compiler_io = import "server.compiler_io"
+local content_identity = import "server.content_identity"
 local project_config = import "server.project_config"
 local project_service = import "server.project_service"
 local project_graph = import "server.project_graph"
 local stores = import "server.workspace_store"
 local test_runtime = import "server.test_runtime"
 
-local function fixed_modified_time(path: string)
+local function set_modified_time(path: string, seconds: integer)
   local times = file_times.utimbuf.new()
-  times.actime = 1700000000
-  times.modtime = 1700000000
+  times.actime = seconds
+  times.modtime = seconds
   test.assert(file_times.utime(path, times) == 0,
     "could not set deterministic saved-file timestamp")
+end
+
+local function fixed_modified_time(path: string)
+  set_modified_time(path, 1700000000)
+end
+
+local function work_revision(service: project_service.Service, name: string): integer
+  local access = service:workspace_store():acquire()
+  defer access:release()
+  return stores.scalar_integer(access.connection,
+    "SELECT revision FROM main.graph_modules WHERE name=?", name)
 end
 
 local record Fixture
@@ -211,10 +223,19 @@ local function observed_provider_identity(
 end
 
 
+local function header_observation(path: string): compiler_bridge.HeaderObservation?
+  local observed? = content_identity.observe(path)
+  if observed == nil or observed.kind ~= "file" then return nil end
+  return compiler_bridge.HeaderObservation.new(observed.modified_seconds,
+    observed.modified_nanoseconds, observed.physical_identity)
+end
+
 local function restat_test_headers(
-    dependencies: {compiler_bridge.CHeaderDependency}):
-    {compiler_bridge.CHeaderDependency}
+    dependencies: {compiler_bridge.CHeaderDependency},
+    _validation: compiler_bridge.HeaderValidation?):
+    ({compiler_bridge.CHeaderDependency}, boolean)
   local result: {compiler_bridge.CHeaderDependency} = {}
+  local changed = false
   for index = 1, #dependencies do
     local dependency = dependencies[index]
     local kind = compiler_bridge.CHeaderDependencyKind.file()
@@ -222,17 +243,25 @@ local function restat_test_headers(
     when search then kind = compiler_bridge.CHeaderDependencyKind.search()
     when file then
     end
+    local observed? = header_observation(dependency.path)
+    local previous? = dependency.observation
+    local reuse = previous ~= nil and observed ~= nil and
+      previous.modified_seconds == observed.modified_seconds and
+      previous.modified_nanoseconds == observed.modified_nanoseconds and
+      previous.physical_identity == observed.physical_identity
+    local identity = dependency.identity
+    if not reuse then identity = current_header_identity(dependency.kind, dependency.path) end
+    if identity ~= dependency.identity then changed = true end
     result[index] = compiler_bridge.CHeaderDependency.new(
-      kind, dependency.path,
-      current_header_identity(dependency.kind, dependency.path))
+      kind, dependency.path, identity, observed)
   end
-  return result
+  return result, changed
 end
 
 local function header_input(kind: compiler_bridge.CHeaderDependencyKind,
                             path: string): compiler_bridge.CHeaderDependency
   return compiler_bridge.CHeaderDependency.new(
-    kind, path, current_header_identity(kind, path))
+    kind, path, current_header_identity(kind, path), header_observation(path))
 end
 
 local function has_missing_file_header(
@@ -630,7 +659,7 @@ local function loads_multi_module_folder_and_external_metadata()
                 "valid folder module did not retain its compiler snapshot")
 
     local counters = service:counters()
-    test.assert(counters.file_reads == 6 and
+    test.assert(counters.file_reads == 3 and
                 counters.analysis_runs == 1 and
                 counters.project_modules_submitted == 2 and
                 analyzer.runs == 1 and analyzer.last_module_count == 2,
@@ -1004,7 +1033,7 @@ local function stops_propagation_at_unchanged_manifests()
     local analyzer = new_analyzer()
     local service = require_service(fixture, analyzer)
     local before = service:counters()
-    test.assert(before.file_reads == 8 and before.analysis_runs == 1 and
+    test.assert(before.file_reads == 4 and before.analysis_runs == 1 and
                 before.project_modules_submitted == 4,
                 "initial dependency fixture was not analyzed once")
 
@@ -1018,8 +1047,8 @@ local function stops_propagation_at_unchanged_manifests()
                 #report.dirty_modules == 0,
                 "body-only edit propagated beyond its provider")
     local after = service:counters()
-    test.assert(after.file_reads == before.file_reads + 8,
-                "refresh did not validate every project source before publication")
+    test.assert(after.file_reads == before.file_reads + 1,
+                "refresh reread a source whose timestamp and physical input were unchanged")
     test.assert(after.analysis_runs == before.analysis_runs + 1 and
                 after.project_modules_submitted ==
                   before.project_modules_submitted + 1 and
@@ -1290,7 +1319,7 @@ local function revalidates_external_source_when_encountered_again()
                 not report.stale,
                 "external mtime change did not schedule a project refresh")
     local after = service:counters()
-    test.assert(after.file_reads == before.file_reads + 2 and
+    test.assert(after.file_reads == before.file_reads and
                 after.analysis_runs == before.analysis_runs + 1 and
                 analyzer.last_cached_count == 0,
                 "external revalidation did not validate saved sources and analyze once")
@@ -1342,7 +1371,7 @@ local function revalidates_transitive_external_dependency()
                 #report.dirty_modules == 0,
                 "transitive external change did not recheck its project root")
     local after = service:counters()
-    test.assert(after.file_reads == before.file_reads + 2 and
+    test.assert(after.file_reads == before.file_reads and
                 after.analysis_runs == before.analysis_runs + 1 and
                 after.project_modules_submitted ==
                   before.project_modules_submitted + 1 and
@@ -2349,7 +2378,7 @@ local function rejects_save_completed_during_analysis()
                   "public:main:two",
                 "obsolete bytes were published after a mid-analysis save")
     local after = service:counters()
-    test.assert(after.file_reads == before.file_reads + 3 and
+    test.assert(after.file_reads == before.file_reads + 2 and
                 after.analysis_runs == before.analysis_runs + 2 and
                 after.project_modules_submitted ==
                   before.project_modules_submitted + 2,
@@ -2421,7 +2450,7 @@ local function project_header_edit_delete_and_recovery()
     local service = require_service(fixture, analyzer)
     local initial = service:counters()
 
-    -- Exact bytes, rather than source/header mtimes, drive the owner retry.
+    -- Changed header timestamps trigger content validation and the owner retry.
     fixture:write("include/direct.h", "#define DIRECT 2\n")
     local edited?, edit_error? = service:refresh()
     test.assert(edit_error == nil and edited ~= nil and not edited.stale and
@@ -2430,7 +2459,7 @@ local function project_header_edit_delete_and_recovery()
                 edited.committed_modules[2] == "friend",
                 "direct-header edit did not reach exactly its owner and source importer")
     local after_edit = service:counters()
-    test.assert(after_edit.file_reads == initial.file_reads + 12 and
+    test.assert(after_edit.file_reads == initial.file_reads and
                 after_edit.analysis_runs == initial.analysis_runs + 2 and
                 after_edit.project_modules_submitted ==
                   initial.project_modules_submitted + 2,
@@ -2463,8 +2492,7 @@ local function project_header_edit_delete_and_recovery()
     local nested_recovered?, nested_recovery_error? = service:refresh()
     test.assert(nested_recovery_error == nil and nested_recovered ~= nil and
                 contains(nested_recovered.committed_modules, "dep") and
-                service:counters().file_reads == initial.file_reads +
-                  (service:counters().analysis_runs - initial.analysis_runs + 5) * 4,
+                service:counters().file_reads == initial.file_reads,
                 "transitive-header restoration required a Titan source change")
   end)
 end
@@ -2516,7 +2544,7 @@ local function include_shadow_addition_and_removal()
     selected = service:project_ast("main")
     test.assert(restore_error == nil and restored ~= nil and selected ~= nil and
                 selected.c_header_dependencies[3].path == late and
-                service:counters().file_reads == before.file_reads + 4,
+                service:counters().file_reads == before.file_reads,
                 "removing the earlier shadow did not restore the later winner")
   end)
 end
@@ -2643,7 +2671,7 @@ function test_project_service_load_default_uses_compiler_installation_root(
   test_runtime.run(loads_compiler_owned_default_binary_root)
 end
 
-function test_project_service_detects_changed_saved_bytes_with_preserved_mtime_and_size(
+function test_project_service_trusts_unchanged_saved_source_observations(
     _context: test.Context)
   test_runtime.run(function ()
     with_fixture(function (fixture: Fixture)
@@ -2656,20 +2684,127 @@ function test_project_service_detects_changed_saved_bytes_with_preserved_mtime_a
       local service = require_service(fixture, analyzer)
       local before = service:latest()
       local previous = before.project_modules[1].source_files[1]
+      local counters = service:counters()
       fixture:write("src/main.titan", "-- body two\n")
       fixed_modified_time(path)
       local report?, failure? = service:refresh()
       local after = service:latest()
       local current = after.project_modules[1].source_files[1]
-      test.assert(failure == nil and report ~= nil and report.analyzed and
-        #report.committed_modules == 1 and report.committed_modules[1] == "main",
-        "same-mtime same-size content change did not recheck its project module")
+      test.assert(failure == nil and report ~= nil and not report.analyzed and
+        #report.committed_modules == 0 and service:counters().file_reads == counters.file_reads,
+        "unchanged timestamps unexpectedly read or hashed the saved source")
       test.assert(previous.stamp.modified_seconds == current.stamp.modified_seconds and
         previous.stamp.modified_nanoseconds == current.stamp.modified_nanoseconds and
         previous.stamp.size == current.stamp.size and
-        previous.stamp.identity ~= current.stamp.identity and
-        current.contents == "-- body two\n",
-        "saved-byte identity did not distinguish an edit with unchanged metadata")
+        previous.stamp.identity == current.stamp.identity and
+        current.contents == "-- body one\n",
+        "unchanged metadata did not preserve its previously certified source bytes")
+      set_modified_time(path, 1700000001)
+      local changed?, change_error? = service:refresh()
+      current = service:latest().project_modules[1].source_files[1]
+      test.assert(change_error == nil and changed ~= nil and changed.analyzed and
+        #changed.committed_modules == 1 and changed.committed_modules[1] == "main" and
+        current.contents == "-- body two\n" and current.stamp.identity ~= previous.stamp.identity and
+        service:counters().file_reads == counters.file_reads + 1,
+        "changed timestamp did not validate and publish the current saved bytes once")
+    end)
+  end)
+end
+
+function test_project_service_same_content_external_touch_preserves_cached_interfaces(
+    _context: test.Context)
+  test_runtime.run(function ()
+    for mode = 1, 2 do
+      with_fixture(function (fixture: Fixture)
+        fixture:mkdir("src")
+        fixture:mkdir("src/app")
+        fixture:mkdir("external")
+        configure_source_root(fixture)
+        fixture:write("src/app/main.titan", "-- app main\n")
+        fixture:write("external/main.titan", "-- external source\n")
+        local path = fixture:path("external/main.titan")
+        fixed_modified_time(path)
+        local analyzer = new_analyzer()
+        analyzer.external_main = path
+        analyzer.external_files = {path}
+        local service: project_service.Service?
+        if mode == 1 then
+          service = require_service(fixture, analyzer)
+        else
+          local resolver = new_resolver()
+          resolver.provenance["vendor.source"] = compiler_bridge.Provenance.external_source(
+            compiler_bridge.SourceProvenance.new(path, {path}))
+          service = require_resolved_service(fixture, analyzer, resolver)
+        end
+        if service == nil then raise "external touch fixture Service is missing" end
+        local before = service:counters()
+        local generation = service:latest().generation
+        local revision = work_revision(service, "app.main")
+        local ast? = service:project_ast("app.main")
+        local external? = service:external_module("vendor.source")
+        test.assert(external ~= nil, "external touch fixture has no accepted metadata")
+        local unchanged?, unchanged_error? = service:refresh()
+        test.assert(unchanged ~= nil and unchanged_error == nil and not unchanged.analyzed and
+          service:counters().file_reads == before.file_reads and
+          service:counters().external_file_reads == before.external_file_reads and
+          service:counters().external_file_hashes == before.external_file_hashes,
+          "unchanged external validation read or hashed source content")
+        set_modified_time(path, 1700000001)
+        local touched?, touch_error? = service:refresh()
+        local current? = service:external_module("vendor.source")
+        local after = service:counters()
+        test.assert(touched ~= nil and touch_error == nil and not touched.analyzed and
+          current ~= nil and current.stamps[1].modified_seconds == 1700000001 and
+          current.stamps[1].identity == external.stamps[1].identity and
+          current.analyzed_input_identity == external.analyzed_input_identity and
+          service:latest().generation == generation and work_revision(service, "app.main") == revision and
+          service:project_ast("app.main") == ast and after.file_reads == before.file_reads and
+          after.external_file_reads == before.external_file_reads + 1 and
+          after.external_file_hashes == before.external_file_hashes + 1,
+          "same-content external touch invalidated semantics or failed to refresh its observation once")
+        local repeated?, repeated_error? = service:refresh()
+        test.assert(repeated ~= nil and repeated_error == nil and not repeated.analyzed and
+          service:counters().external_file_reads == after.external_file_reads and
+          service:counters().external_file_hashes == after.external_file_hashes,
+          "refreshed external observation was read again on the next pass")
+        fixture:write("src/app/main.titan", "-- app main changed body\n")
+        local edited?, edit_error? = service:refresh()
+        test.assert(edited ~= nil and edit_error == nil and edited.analyzed and
+          analyzer.last_cached_count == 1 and
+          service:counters().external_file_reads == after.external_file_reads,
+          "harmless external touch revoked its cached source interface on a later importer edit")
+      end)
+    end
+  end)
+end
+
+function test_project_service_same_timestamp_physical_replacement_reads_fresh_source(
+    _context: test.Context)
+  test_runtime.run(function ()
+    with_fixture(function (fixture: Fixture)
+      fixture:mkdir("src")
+      configure_source_root(fixture)
+      fixture:write("src/main.titan", "-- identical bytes\n")
+      local path = fixture:path("src/main.titan")
+      fixed_modified_time(path)
+      local analyzer = new_analyzer()
+      local service = require_service(fixture, analyzer)
+      local before = service:counters()
+      local previous = service:latest().project_modules[1].source_files[1].stamp
+      fixture:write("replacement.titan", "-- identical bytes\n")
+      local replacement = fixture:path("replacement.titan")
+      fixed_modified_time(replacement)
+      fs.rename(replacement, path)
+      local report?, failure? = service:refresh()
+      local current = service:latest().project_modules[1].source_files[1].stamp
+      test.assert(report ~= nil and failure == nil and report.analyzed and
+        service:counters().file_reads == before.file_reads + 1 and
+        service:counters().file_hashes == before.file_hashes + 1 and
+        previous.identity == current.identity and
+        previous.modified_seconds == current.modified_seconds and
+        previous.modified_nanoseconds == current.modified_nanoseconds and
+        previous.physical_identity ~= current.physical_identity,
+        "same-timestamp physical replacement reused the previous input observation")
     end)
   end)
 end
@@ -2789,6 +2924,8 @@ function test_project_service_hydrates_only_projects_revalidated_after_store_reo
       configure_source_root(fixture)
       fixture:write("src/main.titan", "-- saved header consumer\n")
       fixture:write("include/value.h", "#define VALUE 1\n")
+      fixed_modified_time(fixture:path("src/main.titan"))
+      fixed_modified_time(fixture:path("include/value.h"))
       fixture:write("cache.sqlite3", "")
       local path = fixture:path("cache.sqlite3")
       local header = fixture:path("include/value.h")
@@ -2807,6 +2944,18 @@ function test_project_service_hydrates_only_projects_revalidated_after_store_reo
       local snapshot? = initial:project_ast("main")
       test.assert(checked ~= nil and check_error == nil and snapshot ~= nil,
         "persistent fixture did not produce a checked project handle")
+      local revision = work_revision(initial, "main")
+      local generation = initial:latest().generation
+      local before_touch = initial:counters()
+      set_modified_time(fixture:path("src/main.titan"), 1700000001)
+      set_modified_time(header, 1700000001)
+      local touched?, touch_error? = initial:refresh()
+      test.assert(touched ~= nil and touch_error == nil and not touched.analyzed and
+        initial:latest().generation == generation and work_revision(initial, "main") == revision and
+        initial:project_ast("main") == snapshot and
+        initial:counters().file_reads == before_touch.file_reads + 1 and
+        initial:counters().file_hashes == before_touch.file_hashes + 1,
+        "same-content source/header touches changed semantic work or skipped source validation")
       initial:close()
 
       local reopened_store = stores.open(path)
@@ -2818,11 +2967,14 @@ function test_project_service_hydrates_only_projects_revalidated_after_store_reo
       if reopened == nil then reopened_store:close() raise "reopened Service is missing" end
       test.assert(reopened:project_ast("main") == nil and
         #reopened:latest().dirty_modules == 0 and
-        reopened:hydrate_project_snapshot("main", snapshot),
+        reopened:counters().file_reads == 0 and reopened:counters().file_hashes == 0 and
+        not reopened:hydrate_project_snapshot_at_revision("main", revision + 1, snapshot) and
+        reopened:hydrate_project_snapshot_at_revision("main", revision, snapshot),
         "reopen fabricated a compiler handle or rejected validated clean hydration")
       local warm?, warm_error? = reopened:run_pending()
       test.assert(warm ~= nil and warm_error == nil and not warm.analyzed and
-        reopened:counters().analysis_runs == 0,
+        reopened:counters().analysis_runs == 0 and reopened:counters().file_reads == 0 and
+        reopened:counters().file_hashes == 0,
         "unchanged hydrated project was submitted to the compiler again")
       reopened:close()
 

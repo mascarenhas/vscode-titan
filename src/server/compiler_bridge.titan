@@ -12,7 +12,7 @@ local wire = import "server.wire"
 local logging = import "server.logging"
 
 local COMPILER_ABI = "2"
-local COMPILER_LANGUAGE_SERVER_API = 6
+local COMPILER_LANGUAGE_SERVER_API = 1
 local COMPILER_LANGUAGE_SERVER_API_MARKER = "LANGUAGE_SERVER_API_VERSION"
 local PARSER_MODULE = "titan-compiler.parser"
 local CHECKER_MODULE = "titan-compiler.checker"
@@ -242,10 +242,28 @@ end
 -- describe one exact include candidate (including a miss) so an earlier
 -- shadow appearing later invalidates the owning module without scanning a
 -- whole external include tree.
+record HeaderObservation
+  modified_seconds: integer
+  modified_nanoseconds: integer
+  physical_identity: string
+end
+
+-- One validation pass shares physical observations without exposing compiler
+-- tables to project metadata or the SQL cache.
+record HeaderValidation
+  local const memo: value
+end
+
+function header_validation(): HeaderValidation
+  local memo: {string: value} = {}
+  return HeaderValidation.new(memo)
+end
+
 record CHeaderDependency
   kind: CHeaderDependencyKind
   path: string
   identity: string
+  observation: HeaderObservation?
 end
 
 record ModuleSnapshot
@@ -330,10 +348,14 @@ end
 record ProjectPayload
   const module_name: string
   const payload: string
+  const header_inputs: {CHeaderDependency}?
 end
 
-type CacheLookup = (string, string) -> string?
+type CacheLookup = (string, string) -> (string?, {CHeaderDependency}?)
 type CachePublisher = (string, string, string, {CHeaderDependency}) -> ()
+type CacheInputRefresher = (string, string, {CHeaderDependency}) -> boolean
+type ProjectPayloadReader = (string) -> (string?, {CHeaderDependency}?)
+type ProjectSnapshotInstaller = (string, ModuleSnapshot) -> boolean
 
 function Analysis:find_module(module_name: string): ModuleSnapshot?
   for index = 1, #self.modules do
@@ -695,7 +717,24 @@ local function normalize_c_header_dependencies(
         subject .. " repeats " .. raw_kind .. " input '" .. path .. "'")
     end
     seen[key] = true
-    result[index] = CHeaderDependency.new(kind, path, identity)
+    local observation: HeaderObservation? = nil
+    local raw_observation: value = item["observation"]
+    if raw_observation ~= nil then
+      local observed = required_map(raw_observation,DRIVER_MODULE,
+        subject .. "[" .. index .. "].observation")
+      local seconds = required_integer(observed["modified_seconds"],DRIVER_MODULE,
+        subject .. " observation.modified_seconds")
+      local nanoseconds = required_integer(observed["modified_nanoseconds"],DRIVER_MODULE,
+        subject .. " observation.modified_nanoseconds")
+      local physical = required_string(observed["physical_identity"],DRIVER_MODULE,
+        subject .. " observation.physical_identity")
+      if nanoseconds < 0 or nanoseconds >= 1000000000 or physical == "" then
+        return fail<{CHeaderDependency}>(DRIVER_MODULE,
+          subject .. " has an invalid header observation")
+      end
+      observation = HeaderObservation.new(seconds,nanoseconds,physical)
+    end
+    result[index] = CHeaderDependency.new(kind, path, identity, observation)
   end
   return result
 end
@@ -714,6 +753,15 @@ local function raw_c_header_dependencies(
     item["kind"] = kind
     item["path"] = dependency.path
     item["identity"] = dependency.identity
+    local observation? = dependency.observation
+    if observation ~= nil then
+      local observed: {string: value} = {
+        ["modified_seconds"] = observation.modified_seconds,
+        ["modified_nanoseconds"] = observation.modified_nanoseconds,
+        ["physical_identity"] = observation.physical_identity,
+      }
+      item["observation"] = observed
+    end
     result[index] = item
   end
   return result
@@ -781,10 +829,21 @@ local function emit_cache_stats(compiler: Compiler)
     ["header_lookups"] = headers["lookups"] as integer,
     ["header_hits"] = headers["hits"] as integer,
     ["header_misses"] = headers["misses"] as integer,
+    ["header_file_reads"] = headers["file_reads"] as integer,
+    ["header_file_hashes"] = headers["file_hashes"] as integer,
+    ["header_metadata_reuses"] = headers["metadata_reuses"] as integer,
+    ["header_search_checks"] = headers["search_checks"] as integer,
+    ["header_memo_reuses"] = headers["memo_reuses"] as integer,
     ["conversion_lookups"] = conversion["lookups"] as integer,
     ["conversion_hits"] = conversion["hits"] as integer,
     ["conversion_misses"] = conversion["misses"] as integer,
   })
+end
+
+function Compiler:log_cache_stats()
+  local permit = compiler_scheduler.acquire()
+  defer permit:release()
+  emit_cache_stats(self)
 end
 
 local function load_with(require_function: RequireFunction,
@@ -1048,24 +1107,30 @@ end
 -- already reported by the compiler. The operation owns the global compiler
 -- permit but its Titan-backed I/O may suspend the current Task.
 function Compiler:restat_c_header_dependencies(
-    dependencies: {CHeaderDependency}): {CHeaderDependency}
+    dependencies: {CHeaderDependency}, validation: HeaderValidation?):
+    ({CHeaderDependency}, boolean)
+  if #dependencies == 0 then return {},false end
   local permit = compiler_scheduler.acquire()
   defer permit:release()
   local context = new_context(self, nil)
   defer close_context(self, context)
   local raw_restat = checked_function(
     self.driver, DRIVER_MODULE, "restat_c_header_dependencies", self.type_of)
-  local restat = raw_restat as (value, value) -> (value, value)
-  local options: {string: value} = { ["context"] = context }
-  local raw_result, raw_error = restat(
+  local restat = raw_restat as (value, value) -> (value, value, value)
+  if validation == nil then validation = header_validation() end
+  local options: {string: value} = {
+    ["context"] = context, ["header_validation"] = validation.memo,
+  }
+  local raw_result, raw_error, raw_changed = restat(
     raw_c_header_dependencies(dependencies), options)
   if raw_result == nil or raw_result == false then
     return fail<{CHeaderDependency}>(DRIVER_MODULE,
       "cannot restat C header dependencies: " ..
-      strings.tostring(raw_error))
+      strings.tostring(raw_error)), false
   end
+  local changed: boolean = raw_changed
   return normalize_c_header_dependencies(
-    raw_result, "driver.restat_c_header_dependencies result")
+    raw_result, "driver.restat_c_header_dependencies result"), changed
 catch
   if error is async.CancellationReason then raise end
   if error is BridgeError then raise end
@@ -2692,8 +2757,8 @@ local function exact_occurrence_span(node: {string: value}, tag: string,
   if name_location ~= nil then
     return exact_name_span(name_location, name)
   end
-  -- API 4 marks every source-written identifier with `_name_loc`. Compiler
-  -- lowerings reuse a nearby diagnostic `loc` for generated names, so that
+  -- The compiler marks every source-written identifier with `_name_loc`.
+  -- Lowerings reuse a nearby diagnostic `loc` for generated names, so that
   -- broader location must never be promoted into an exact navigation span.
   return nil
 end
@@ -3280,7 +3345,8 @@ local function snapshot_module(compiler: Compiler, module_name: string,
                                projects: {string: ProjectModule},
                                cached: {string: CachedSourceInterface},
                                valid_manifest: boolean,
-                               work: NormalizationWork): NormalizedModule
+                               work: NormalizationWork,
+                               defer_ast_install: boolean?): NormalizedModule
   local entry = required_map(
     candidate, DRIVER_MODULE, "driver.imported['" .. module_name .. "']")
   local normalized_origin = provenance(entry, module_name, projects)
@@ -3335,7 +3401,9 @@ local function snapshot_module(compiler: Compiler, module_name: string,
     end
     nodes, symbols, imports, hover_summaries = walk_ast(
       compiler, module_name, raw_ast, work)
-    if valid_manifest then compiler.project_asts[module_name] = raw_ast end
+    if valid_manifest and not defer_ast_install then
+      compiler.project_asts[module_name] = raw_ast
+    end
   elseif cached[module_name] ~= nil then
     local cached_source = cached[module_name]
     for index = 1, #cached_source.imports do
@@ -3483,7 +3551,7 @@ local function copy_provider_identity(
     source.modified_seconds, source.modified_nanoseconds)
 end
 
--- API 4's embedded provider never traverses the compiler's filesystem
+-- The embedded provider never traverses the compiler's filesystem
 -- strategy. Its exact executable path is therefore stamped from the native
 -- live-image observation validated at the end of this analysis; every other
 -- binary provider retains the ordinary per-analysis lstat contract.
@@ -3651,7 +3719,7 @@ local function validate_embedded_provider_baseline(
   return observed
 end
 
--- Installation discovery belongs to the compiler, but API 4 deliberately
+-- Installation discovery belongs to the compiler, which deliberately
 -- defers physical path resolution until a resolver owns an I/O strategy.
 -- Initialize and close that resolver under the shared Lua-state permit before
 -- exposing the compiler's release-versioned library directory to project
@@ -3808,10 +3876,11 @@ local function Compiler:run_attempt_inner(
     overrides: {string: value},
     pending: {string: boolean}, cached: {string: CachedSourceInterface},
     raw_cached_interfaces: {string: value},
-    c_header_analysis: value): AttemptResult
+    c_header_analysis: value, header_inputs: value): AttemptResult
   local normalization_work = NormalizationWork.new(0)
   local options: {string: value} = { ["io"] = self.io }
   options["c_header_analysis"] = c_header_analysis
+  if header_inputs ~= nil then options["header_inputs"] = header_inputs end
   local profiling = logging.enabled("trace")
   if profiling then
     local trace_header_phase:
@@ -4063,7 +4132,7 @@ local function Compiler:run_attempt(
     overrides: {string: value},
     pending: {string: boolean}, cached: {string: CachedSourceInterface},
     raw_cached_interfaces: {string: value},
-    c_header_analysis: value): AttemptResult
+    c_header_analysis: value, header_inputs: value): AttemptResult
   local attempt = compiler_io.begin_attempt(self.io, root_module)
   local debugging = logging.enabled("debug")
   local started_cpu = 0.0
@@ -4085,7 +4154,7 @@ local function Compiler:run_attempt(
   do
     result = self:run_attempt_inner(
       root_module, projects, overrides, pending, cached,
-      raw_cached_interfaces, c_header_analysis)
+      raw_cached_interfaces, c_header_analysis, header_inputs)
   catch
     local outcome = "failed"
     if error is async.CancellationReason then outcome = "cancelled" end
@@ -4103,7 +4172,7 @@ end
 function Compiler:analyze_incremental(
     project_modules: {ProjectModule}, dirty_modules: {string},
     cached_sources: {CachedSourceInterface},
-    progress_listener: ProgressListener?): Analysis
+    progress_listener: ProgressListener?, header_inputs: {CHeaderDependency}?): Analysis
   local started = logging.clock()
   logging.emit("debug", "compiler.analysis.start", {
     ["project_modules"] = #project_modules,
@@ -4114,6 +4183,8 @@ function Compiler:analyze_incremental(
   local requested, ordered = requested_modules(dirty_modules, projects)
   local cached, raw_cached_interfaces = cached_source_map(
     cached_sources, projects)
+  local raw_header_inputs: value = nil
+  if header_inputs ~= nil then raw_header_inputs = raw_c_header_dependencies(header_inputs) end
 
   -- The compiler strategy reports every completed source module, including
   -- transitive external modules and possible repeats across root attempts.
@@ -4206,7 +4277,7 @@ function Compiler:analyze_incremental(
       do
         attempt_result = self:run_attempt(
           root, projects, overrides, pending, cached,
-          raw_cached_interfaces, c_header_analysis)
+          raw_cached_interfaces, c_header_analysis, raw_header_inputs)
       catch
         -- A non-cancellation compiler failure terminally processes this root
         -- even when it fails before the driver's normal publish/yield point.
@@ -4315,9 +4386,13 @@ function Compiler:analyze(root_module: string,
 end
 
 function Compiler:configure_cache(lookup: CacheLookup,
-                                  publish: CachePublisher)
-  local get: (string, string) -> string? = function (kind: string, key: string): string?
-    return lookup(kind, key)
+                                  publish: CachePublisher,
+                                  refresh_inputs: CacheInputRefresher?)
+  local get: (string, string) -> (string?, value) = function (
+      kind: string, key: string): (string?, value)
+    local payload?, inputs? = lookup(kind, key)
+    if inputs == nil then return payload,nil end
+    return payload,raw_c_header_dependencies(inputs)
   end
   local put: (string, string, string, value) -> boolean = function (
       kind: string, key: string, payload: string, raw_inputs: value): boolean
@@ -4328,9 +4403,19 @@ function Compiler:configure_cache(lookup: CacheLookup,
     publish(kind, key, payload, inputs)
     return true
   end
-  self.cache_adapter = {
+  local adapter: {string: value} = {
     ["get"] = get, ["put"] = put, ["sha256_binary"] = content_identity.digest,
+    ["yield"] = function () async.yield() end,
   }
+  if refresh_inputs ~= nil then
+    local refresh: CacheInputRefresher = refresh_inputs
+    adapter["refresh_inputs"] = function (
+        kind: string, key: string, inputs: value): boolean
+      return refresh(kind,key,normalize_c_header_dependencies(
+        inputs,"refreshed persisted header inputs"))
+    end
+  end
+  self.cache_adapter = adapter
 end
 
 local function cache_project_files(projects: {ProjectModule}): {string: value}
@@ -4354,6 +4439,7 @@ function Compiler:export_projects(projects: {ProjectModule}, selected_names: {st
   local files = cache_project_files(projects)
   local options: {string: value} = {
     ["project_files"] = files,["sha256_binary"] = content_identity.digest,
+    ["yield"] = function () async.yield() end,
   }
   local result: {ProjectPayload} = {}
   local encoded_names: {string} = {}
@@ -4387,37 +4473,43 @@ end
 -- Decode literal compiler-owned data before attaching anything to the live
 -- compiler. The temporary complete registry preserves source-private/generic
 -- summary views; it never escapes the existing global compiler permit.
-function Compiler:hydrate_projects(projects: {ProjectModule},
-                                    payloads: {ProjectPayload}): {ModuleSnapshot}
+function Compiler:hydrate_project_cache(projects: {ProjectModule},
+    names: {string}, read: ProjectPayloadReader,
+    install: ProjectSnapshotInstaller): {string}
   local started = logging.clock()
   local permit = compiler_scheduler.acquire()
   defer permit:release()
   local decode = checked_function(self.driver, DRIVER_MODULE,
     "decode_project_entry",self.type_of) as (string, value) -> (value, value)
   local make_registry = checked_function(self.driver, DRIVER_MODULE,
-    "project_entries_registry",self.type_of) as (value) -> (value, value)
+    "project_entries_registry",self.type_of) as (value, value) -> (value, value)
   local project_map = project_index(projects)
   local files = cache_project_files(projects)
   local entries: {string: value} = {}
-  for index = 1, #payloads do
-    local item = payloads[index]
-    if project_map[item.module_name] ~= nil then
+  for index = 1, #names do
+    local name = names[index]
+    local payload?, header_inputs? = read(name)
+    if payload ~= nil and project_map[name] ~= nil then
       local options: {string: value} = {
-        ["module_name"] = item.module_name, ["project_files"] = files,
+        ["module_name"] = name, ["project_files"] = files,
         ["sha256_binary"] = content_identity.digest,
+        ["yield"] = function () async.yield() end,
       }
-      local entry, failure = decode(item.payload,options)
+      if header_inputs ~= nil then
+        options["header_inputs"] = raw_c_header_dependencies(header_inputs)
+      end
+      local entry, failure = decode(payload,options)
       if entry ~= nil and entry ~= false then
-        entries[item.module_name] = entry
+        entries[name] = entry
       else
         logging.emit("debug","cache.project.miss",{
-          ["module"] = item.module_name,["message"] = strings.tostring(failure),
+          ["module"] = name,["message"] = strings.tostring(failure),
         })
       end
     end
-    if index < #payloads then async.yield() end
+    if index < #names then async.yield() end
   end
-  local registry, registry_error = make_registry(entries)
+  local registry, registry_error = make_registry(entries,{["yield"] = function () async.yield() end})
   if registry == nil or registry == false then
     logging.emit("debug","cache.project.registry_miss",{
       ["message"] = strings.tostring(registry_error),
@@ -4427,16 +4519,22 @@ function Compiler:hydrate_projects(projects: {ProjectModule},
   local previous: value = self.types["registry"]
   defer self.types["registry"] = previous
   self.types["registry"] = required_map(registry,DRIVER_MODULE,"hydrated project registry")
-  local result: {ModuleSnapshot} = {}
+  local result: {string} = {}
   local work = NormalizationWork.new(0)
   for index = 1, #projects do
     local name = projects[index].module_name
     local entry: value = entries[name]
     if entry ~= nil then
       do
-        local normalized = snapshot_module(self,name,entry,project_map,{},true,work)
-        result[#result + 1] = normalized.snapshot
-        self.project_entries[name] = entry
+        local normalized = snapshot_module(self,name,entry,project_map,{},true,work,true)
+        if install(name,normalized.snapshot) then
+          self.project_asts[name] = required_map(entry,DRIVER_MODULE,
+            "hydrated project entry")["ast"]
+          self.project_entries[name] = entry
+          result[#result + 1] = name
+        else
+          self:drop_project_ast(name)
+        end
       catch
         if error is async.CancellationReason then raise end
         self:drop_project_ast(name)
@@ -4447,9 +4545,33 @@ function Compiler:hydrate_projects(projects: {ProjectModule},
     end
   end
   logging.emit("debug","cache.projects.hydrate",{
-    ["requested"] = #payloads,["restored"] = #result,["cpu_ms"] = logging.elapsed_ms(started),
+    ["requested"] = #names,["restored"] = #result,["cpu_ms"] = logging.elapsed_ms(started),
   })
   return result
+end
+
+
+function Compiler:hydrate_projects(projects: {ProjectModule},
+                                    payloads: {ProjectPayload}): {ModuleSnapshot}
+  local names: {string} = {}
+  local saved: {string: string} = {}
+  local observed: {string: {CHeaderDependency}} = {}
+  for index = 1, #payloads do
+    local item = payloads[index]
+    names[index] = item.module_name
+    saved[item.module_name] = item.payload
+    if item.header_inputs ~= nil then observed[item.module_name] = item.header_inputs end
+  end
+  local snapshots: {ModuleSnapshot} = {}
+  self:hydrate_project_cache(projects,names,
+    function (name: string): (string?,{CHeaderDependency}?)
+      return saved[name],observed[name]
+    end,
+    function (_name: string,snapshot: ModuleSnapshot): boolean
+      snapshots[#snapshots + 1] = snapshot
+      return true
+    end)
+  return snapshots
 end
 
 local function containing_directory(path: string): string
@@ -4462,7 +4584,8 @@ local function containing_directory(path: string): string
   return strings.sub(path,1,slash-1)
 end
 
-local function hash_compiler_tree(directory: string, output: strings.StringWriter)
+local function hash_compiler_tree(directory: string, output: strings.StringWriter,
+    fingerprint: (string) -> string)
   local entries = fs.list(directory)
   local names: {string} = {}
   for index = 1, #entries do names[index] = entries[index] end
@@ -4472,11 +4595,10 @@ local function hash_compiler_tree(directory: string, output: strings.StringWrite
     local metadata? = fs.stat(path)
     if metadata ~= nil then
       if metadata.kind == "directory" then
-        hash_compiler_tree(path,output)
+        hash_compiler_tree(path,output,fingerprint)
       elseif metadata.kind == "file" and strings.sub(path,-4) == ".lua" then
-        local contents = fs.read_file(path)
         output:write(#path .. ":" .. path)
-        output:write(content_identity.file(path,contents))
+        output:write(fingerprint(path))
       end
     end
   end
@@ -4505,11 +4627,15 @@ end
 -- Resolve the inventory before any C probing. This namespace is sufficient to
 -- open the transport: each header/conversion key also carries its native world.
 -- Project hydration additionally requires native_cache_identity above.
-function Compiler:cache_identity(): string
+function Compiler:cache_identity(observed_fingerprint: ((string) -> string)?): string
   local permit = compiler_scheduler.acquire()
   defer permit:release()
   local output = strings.writer()
-  output:write("titan-ls-sqlite-schema-2-api-" .. COMPILER_LANGUAGE_SERVER_API)
+  output:write("titan-ls-sqlite-schema-3-api-" .. COMPILER_LANGUAGE_SERVER_API)
+  local fingerprint: (string) -> string = function (path: string): string
+    return content_identity.file(path,fs.read_file(path))
+  end
+  if observed_fingerprint ~= nil then fingerprint = observed_fingerprint end
   -- The reviewed Lua helper only resolves the active package search paths.
   -- Filesystem reads and fingerprints stay in typed Titan below this boundary.
   local raw_resolve: value = lua.load([[
@@ -4524,8 +4650,8 @@ end
     return fail<string>(DRIVER_MODULE,"cannot identify compiler sources: " ..
       strings.tostring(compiler_error) .. strings.tostring(parser_error))
   end
-  hash_compiler_tree(containing_directory(compiler_path),output)
-  hash_compiler_tree(containing_directory(parser_path),output)
+  hash_compiler_tree(containing_directory(compiler_path),output,fingerprint)
+  hash_compiler_tree(containing_directory(parser_path),output,fingerprint)
   local dependencies = {"relabel","inspect","lfs","lpeglabel"}
   for index = 1, #dependencies do
     local path?, path_error? = resolve(dependencies[index],index > 2)
@@ -4533,11 +4659,10 @@ end
       return fail<string>(DRIVER_MODULE,"cannot identify compiler dependency: " .. strings.tostring(path_error))
     end
     output:write(#path .. ":" .. path)
-    output:write(content_identity.file(path,fs.read_file(path)))
+    output:write(fingerprint(path))
   end
   -- This image owns the complete static provider and embedded target/interface
   -- inventory, including libraries not linked by application declarations.
-  output:write(content_identity.file(self.embedded_provider_file,
-    fs.read_file(self.embedded_provider_file)))
+  output:write(fingerprint(self.embedded_provider_file))
   return content_identity.digest(output:drain())
 end

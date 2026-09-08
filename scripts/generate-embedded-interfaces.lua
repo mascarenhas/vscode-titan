@@ -766,8 +766,8 @@ end
 local driver = require "titan-compiler.driver"
 local csemantics = require "titan-compiler.csemantics"
 local types = require "titan-compiler.types"
-if driver.LANGUAGE_SERVER_API_VERSION ~= 6 then
-    script_error("compiler language-server API 6 is required for target profiles")
+if driver.LANGUAGE_SERVER_API_VERSION ~= 1 then
+    script_error("compiler language-server API 1 is required for target profiles")
 end
 local context = driver.new_resolver_context()
 local ok, profile, profile_error = pcall(function()

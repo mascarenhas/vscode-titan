@@ -10,6 +10,7 @@ local test_runtime = import "server.test_runtime"
 local features = import "server.semantic_features"
 local published_diagnostics = import "server.published_diagnostics"
 local graph = import "server.project_graph"
+local file_times = foreign import "utime.h"
 
 local function new_root(): string
   local root = fs.tmpname()
@@ -37,6 +38,9 @@ local function initialize_revision(cache: caches.Cache)
     "name TEXT PRIMARY KEY,provenance INTEGER,state INTEGER,revision INTEGER)")
   sql.execute(access.connection,"INSERT INTO main.graph_modules VALUES('main',0,2,1) " ..
     "ON CONFLICT(name) DO NOTHING")
+  sql.execute(access.connection,"CREATE TABLE IF NOT EXISTS main.header_inputs(" ..
+    "scope INTEGER,module BLOB,ordinal INTEGER,kind INTEGER,path BLOB,identity BLOB," ..
+    "observed_seconds INTEGER,observed_nanos INTEGER,physical_identity BLOB)")
 end
 
 function test_workspace_cache_rejects_project_payload_ahead_of_its_publication(
@@ -490,7 +494,7 @@ function test_workspace_cache_rebuilds_the_previous_schema_before_graph_use(
     do
       local access = cache.store:acquire()
       defer access:release()
-      sql.execute(access.connection,"PRAGMA main.user_version=1")
+      sql.execute(access.connection,"PRAGMA main.user_version=2")
     end
     cache.store:close()
     local reopened = caches.open(root,"same-context")
@@ -499,7 +503,203 @@ function test_workspace_cache_rebuilds_the_previous_schema_before_graph_use(
     test.assert(#reopened:project_payloads() == 0,"previous graph schema survived a cache reopen")
     local access = reopened.store:acquire()
     defer access:release()
-    test.assert(sql.scalar_integer(access.connection,"PRAGMA main.user_version") == 2,
+    test.assert(sql.scalar_integer(access.connection,"PRAGMA main.user_version") == 3,
       "rebuild did not install the new graph schema version")
+  end)
+end
+
+local function modified_at(path: string,seconds: integer)
+  local times = file_times.utimbuf.new()
+  times.actime = seconds
+  times.modtime = seconds
+  test.assert(file_times.utime(path,times) == 0,"cannot set inventory test timestamp")
+end
+
+function test_workspace_inventory_reuses_unchanged_files_and_refreshes_touches(
+    _context: test.Context)
+  test_runtime.run(function ()
+    local root = new_root()
+    defer cleanup(root)
+    local source = root .. "/compiler.lua"
+    fs.write_file(source,"return 1\n")
+    modified_at(source,1700000000)
+    local cache = caches.open_for_inventory(root)
+    local first = cache:inventory_identity(source)
+    test.assert(cache:inventory_metrics().reads == 1 and cache:inventory_metrics().hashes == 1,
+      "first inventory did not read and hash its input")
+    cache = cache:validate_inventory(root,first)
+    initialize_revision(cache)
+    cache:prepare()
+    cache:set_projects({bridge.ProjectPayload.new("main","checked-project")})
+    publish(cache)
+    cache.store:close()
+
+    cache = caches.open_for_inventory(root)
+    local unchanged = cache:inventory_identity(source)
+    test.assert(unchanged == first and cache:inventory_metrics().reads == 0 and
+      cache:inventory_metrics().hashes == 0 and cache:inventory_metrics().reused == 1,
+      "restart reread or rehashed unchanged compiler input")
+    cache = cache:validate_inventory(root,unchanged)
+    test.assert(cache:can_reuse_publication(),"unchanged inventory lost its saved view")
+    cache.store:close()
+
+    modified_at(source,1700000001)
+    cache = caches.open_for_inventory(root)
+    local touched = cache:inventory_identity(source)
+    test.assert(touched == first and cache:inventory_metrics().reads == 1 and
+      cache:inventory_metrics().hashes == 1,"a timestamp-only touch changed compiler identity")
+    cache = cache:validate_inventory(root,touched)
+    test.assert(cache:can_reuse_publication() and
+      cache:project_payloads()[1].payload == "checked-project",
+      "a timestamp-only touch invalidated the saved graph")
+    cache.store:close()
+
+    cache = caches.open_for_inventory(root)
+    test.assert(cache:inventory_identity(source) == first and cache:inventory_metrics().reads == 0,
+      "restart failed to persist the refreshed compiler timestamp")
+    cache = cache:validate_inventory(root,first)
+    cache.store:close()
+
+    -- The explicit policy trusts an unchanged timestamp on the same physical
+    -- input. A later observed timestamp change causes content validation again.
+    fs.write_file(source,"return 2\n")
+    modified_at(source,1700000001)
+    cache = caches.open_for_inventory(root)
+    test.assert(cache:inventory_identity(source) == first and cache:inventory_metrics().reads == 0,
+      "unchanged timestamp unexpectedly caused an inventory content read")
+    cache.store:close()
+    modified_at(source,1700000002)
+    cache = caches.open_for_inventory(root)
+    local changed = cache:inventory_identity(source)
+    test.assert(changed ~= first and cache:inventory_metrics().reads == 1,
+      "changed compiler bytes with a changed timestamp were reused")
+    cache = cache:validate_inventory(root,changed)
+    defer cache.store:close()
+    initialize_revision(cache)
+    test.assert(not cache:can_reuse_publication() and #cache:project_payloads() == 0,
+      "changed inventory retained incompatible saved semantics")
+  end)
+end
+
+function test_workspace_inventory_replacement_does_not_trust_the_old_timestamp(
+    _context: test.Context)
+  test_runtime.run(function ()
+    local root = new_root()
+    defer cleanup(root)
+    local source = root .. "/provider"
+    local replacement = root .. "/replacement"
+    fs.write_file(source,"same bytes")
+    modified_at(source,1700000000)
+    local cache = caches.open_for_inventory(root)
+    local first = cache:inventory_identity(source)
+    cache = cache:validate_inventory(root,first)
+    cache.store:close()
+    fs.write_file(replacement,"same bytes")
+    modified_at(replacement,1700000000)
+    fs.rename(replacement,source)
+    cache = caches.open_for_inventory(root)
+    defer cache.store:close()
+    test.assert(cache:inventory_identity(source) ~= first and cache:inventory_metrics().reads == 1,
+      "replacement inherited the previous physical input's trusted timestamp")
+  end)
+end
+
+function test_workspace_cache_reads_only_matching_background_candidates(
+    _context: test.Context)
+  test_runtime.run(function ()
+    local cache = caches.memory("background")
+    defer cache.store:close()
+    initialize_revision(cache)
+    cache:prepare()
+    cache:set_projects({bridge.ProjectPayload.new("main","first")})
+    publish(cache)
+    local candidates = cache:project_candidates()
+    test.assert(#candidates == 1 and candidates[1].module_name == "main" and
+      cache:project_payload(candidates[1]).payload == "first","candidate lookup lost its payload")
+    cache:prepare()
+    cache:set_projects({bridge.ProjectPayload.new("main","second")})
+    test.assert(cache:can_reuse_publication(),"read-only readiness rejected the saved view")
+    publish(cache)
+    test.assert(cache:project_payload(candidates[1]).payload == "second",
+      "read-only readiness reset staged project publication")
+    do
+      local access = cache.store:acquire()
+      defer access:release()
+      sql.execute(access.connection,"INSERT INTO main.header_inputs VALUES(0,?,1,0,?,?,5,6,?)",
+        sqlite3.Blob.new("main"),sqlite3.Blob.new("header.h"),sqlite3.Blob.new("hash"),
+        sqlite3.Blob.new("physical"))
+    end
+    local refreshed = cache:project_payload(candidates[1])
+    test.assert(refreshed.payload == "second" and
+      refreshed.header_inputs[1].observation.modified_seconds == 5,
+      "unchanged project BLOB did not carry current SQL header observations")
+    do
+      local access = cache.store:acquire()
+      defer access:release()
+      sql.execute(access.connection,"UPDATE main.graph_modules SET revision=2 WHERE name='main'")
+      sql.execute(access.connection,"INSERT INTO main.graph_modules VALUES('missing',0,2,1)")
+    end
+    test.assert(cache:project_payload(candidates[1]) == nil,
+      "background lookup returned a payload for an obsolete revision")
+    candidates = cache:project_candidates()
+    test.assert(#candidates == 2 and cache:project_payload(candidates[1]) == nil and
+      cache:project_payload(candidates[2]) == nil,
+      "missing or stale graphs were omitted from recovery candidates")
+  end)
+end
+
+function test_workspace_cache_refreshes_header_observations_without_rewriting_graphs(
+    _context: test.Context)
+  test_runtime.run(function ()
+    local root = new_root()
+    defer cleanup(root)
+    local cache = caches.open(root,"observations")
+    initialize_revision(cache)
+    local inputs = {
+      bridge.CHeaderDependency.new(bridge.CHeaderDependencyKind.file(),"header.h","hash",
+        bridge.HeaderObservation.new(1,2,"physical")),
+      bridge.CHeaderDependency.new(bridge.CHeaderDependencyKind.search(),"missing.h","missing",nil),
+    }
+    cache:prepare()
+    cache:stage("c-header-v1","shared-key","header-graph",inputs)
+    cache:stage("ffi-conversion-v1","shared-key","conversion-graph",inputs)
+    publish(cache)
+    do
+      local access = cache.store:acquire()
+      defer access:release()
+      sql.execute(access.connection,"CREATE TRIGGER reject_header_rewrite BEFORE UPDATE OF payload " ..
+        "ON header_graphs BEGIN SELECT RAISE(ABORT,'header graph was rewritten'); END")
+      sql.execute(access.connection,"CREATE TRIGGER reject_conversion_rewrite BEFORE UPDATE OF payload " ..
+        "ON ffi_conversion_snapshots BEGIN SELECT RAISE(ABORT,'conversion graph was rewritten'); END")
+    end
+    inputs[1] = bridge.CHeaderDependency.new(bridge.CHeaderDependencyKind.file(),"header.h","hash",
+      bridge.HeaderObservation.new(3,4,"physical"))
+    test.assert(cache:refresh_inputs("c-header-v1","shared-key",inputs) and
+      cache:refresh_inputs("ffi-conversion-v1","shared-key",inputs),
+      "existing artifacts rejected observation-only refresh")
+    local payload?,refreshed? = cache:lookup("c-header-v1","shared-key")
+    test.assert(payload == "header-graph" and refreshed[1].observation.modified_seconds == 3,
+      "staged observation lookup lost the immutable graph")
+    do
+      local access = cache.store:acquire()
+      defer access:release()
+      test.assert(sql.scalar_integer(access.connection,
+        "SELECT observed_seconds FROM main.cached_header_inputs " ..
+        "WHERE artifact_kind='c-header-v1' AND ordinal=1") == 1,
+        "compiler observation refresh wrote outside saved publication")
+    end
+    cache:prepare()
+    publish(cache)
+    cache.store:close()
+    cache = caches.open(root,"observations")
+    defer cache.store:close()
+    local header?,header_inputs? = cache:lookup("c-header-v1","shared-key")
+    local conversion?,conversion_inputs? = cache:lookup("ffi-conversion-v1","shared-key")
+    test.assert(header == "header-graph" and conversion == "conversion-graph" and
+      #header_inputs == 2 and #conversion_inputs == 2 and
+      header_inputs[1].observation.modified_seconds == 3 and
+      conversion_inputs[1].observation.modified_nanoseconds == 4 and
+      header_inputs[2].observation == nil,
+      "restart lost refreshed header/FFI observations or artifact namespaces")
   end)
 end

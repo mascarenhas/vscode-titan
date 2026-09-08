@@ -90,13 +90,15 @@ The report keeps these measurements separate:
 - `savedEdit.wallMs` covers the saved file write through the next ready epoch.
   The edit appends a comment without changing the public interface.
 - `headerChange.initialIndex` measures a third startup after appending a C
-  comment to the selected header while retaining its original nanosecond
-  mtime. The source comment from the preceding saved-edit phase remains on
+  comment to the selected header and changing its precise timestamp. The source
+  comment from the preceding saved-edit phase remains on
   disk and already matches the database, isolating the header invalidation.
   Header mutation time is recorded separately. These headers are intentionally
   unwatched; this scenario measures startup revalidation, not detection of a
-  live header save. Header size changes, so it is not the separate same-size,
-  same-mtime correctness regression.
+  live header save. The historical 2026-09-07 runs below preserved the header
+  timestamp; the current harness follows the subsequently requested timestamp
+  validation policy. Separate regressions verify unchanged-mtime trust and
+  timestamp-only touches.
 - `childCpuMs` samples the server subprocess's user and system CPU through
   `/proc/PID/stat`. It has the host clock-tick granularity recorded by the
   operating system. `reapedDescendantCpuMs` separately reports CPU charged for
@@ -105,8 +107,14 @@ The report keeps these measurements separate:
   The saved-edit value is not a peak for only that edit, and descendant RSS is
   not included.
 - Each feature records individual request latencies and their minimum, median,
-  and maximum, together with the actual result and a SHA-256 comparison value.
+  p95 and maximum, together with the actual result and a SHA-256 comparison value.
   Unchanged feature requests must not start an indexing cycle.
+- `graphHydration` records when background hydration finishes relative to SQL
+  readiness, its logged phase, and resource samples after completion. The client
+  continuously cycles through all four feature queries while hydration is active;
+  these latency samples are separate from `featuresAfterHydration`. Hydration wall
+  and process CPU therefore include concurrent query traffic. Fast cold/header
+  paths can finish restoration before readiness, leaving no overlapping samples.
 - Cache sizes include the database and any `-wal`, `-shm`, and `-journal`
   sidecars both at readiness and after shutdown. They exclude the separate
   compiler probe cache and unrelated installation files.
@@ -116,12 +124,16 @@ CPU, source-module names, header preprocessing/parsing counts, downstream FFI
 conversion calls and replay hits, cache statistics, hydration and encoding
 events, and the `cache.startup.phase` CPU/wall records. The existing detailed
 compiler profile aggregation is included as well. `cacheBehavior` states the
-observed restart/edit outcomes explicitly. Final runs also enforce these work
+observed restart/edit outcomes explicitly. `graphHydration.work` records the
+hydration lifecycle and its final counters. Current runs also enforce these work
 checks before reporting success:
 
 - An unchanged restart performs no source analysis/profile visits, header
   preprocessing/parsing, downstream FFI conversion/replay, conversion lookups,
   cache misses, or project-payload encoding.
+- Warm SQL readiness precedes project hydration. Source, external-input, header
+  and compiler-inventory counters prove zero content reads/hashes for unchanged
+  observations. Initial validation and background completion are timed separately.
 - The saved comment parses/checks only the named module, performs no header
   preprocessing/parsing or FFI conversion, records a persisted FFI replay hit,
   and encodes exactly one payload with that module's name.
@@ -140,8 +152,9 @@ was parsed or checked again. Multiple attempts can produce more calls than
 unique module names.
 
 Startup phase times include their named operations. In particular,
-`input_validation` includes saved-byte hashing, discovery, and provider/header
-revalidation; it is not a measurement of hashing alone. Compiler trace CPU is
+`input_validation` includes discovery and provider/header validation, plus content
+reads/hashes only when metadata requires them; it is not a measurement of hashing
+alone. Compiler trace CPU is
 process CPU measured across asynchronous operations. Component phases can
 overlap and must not be added to their containing totals. Trace logging and
 resource sampling add overhead. A single run does not establish a statistically
@@ -279,7 +292,7 @@ header, and absent prior-cache state. The raw trace, exact configuration,
 `live-diagnostics.json`, `cold.partial.json`, and failed `summary.json` are
 retained under `.build/cache-benchmarks/titan-20260907/`.
 
-## Final measurements: 7 September 2026
+## Measurements before the startup follow-up: 7 September 2026
 
 Both complete native repository sequences passed every strict assertion, all
 feature-result comparisons, zero-error diagnostic checks, and SQLite integrity
@@ -411,3 +424,155 @@ phases and do not show a uniform improvement over the baseline. These are
 single trace-enabled runs with five samples per feature, no OS page-cache flush,
 and no claim about stable latency percentiles, descendant peak memory, or
 transient journal size.
+
+## Timestamp validation and background hydration: 8 September 2026 UTC
+
+Both complete sequences passed with server schema 3 and the reviewed compiler
+language-server API 1 implementation in Titan PR
+[#153](https://github.com/mascarenhas/titan/pull/153), commit
+`f628e0aa414e4e0ba2b2e57521a49b3d8458e0bf`. The API remains 1 until the first
+public release. The extension source was based on `ada9e91` with the startup
+follow-up uncommitted; each `setup.json` retains the complete status and host
+configuration. The host, tracing and OS page-cache conditions match the earlier
+runs. All local builds had finished before these measurements. The maintainer
+authorized temporarily pausing the editor's Titan server for the Titan sequence;
+it resumed after benchmark cleanup and its running state was verified.
+
+All six benchmark processes used the same frozen image:
+`.build/cache-benchmarks/startup-api1-image-20260908/titan-language-server`,
+SHA-256 `7053065aa9bb73002968b47f8e8c6f3529fc9e17e1c798d41298421e77ede090`.
+The installed 61 compiler Lua files matched the independently reviewed snapshot.
+
+### Readiness and resources
+
+On an unchanged restart, readiness now means validated SQL answers are available;
+background graph hydration starts afterward. Cold and changed-header startup
+still need analysis before publishing their ready generation. The saved edit
+below starts after hydration completes, so it does not measure an edit arriving
+during restoration; focused lifecycle tests cover that coordination.
+
+| Workspace / workload | Wall (s) | Server CPU (s) | Reaped child CPU (s) | Peak RSS (MiB) | Database at ready (MiB) |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| vscode-titan: Cold startup | 53.392 | 51.130 | 0.860 | 3,717.2 | 217.8 |
+| vscode-titan: Unchanged restart, SQL ready | 1.550 | 1.440 | 0.020 | 157.7 | 217.8 |
+| vscode-titan: Saved importer comment | 5.938 | 5.430 | 0.030 | 1,815.8 | 237.2 |
+| vscode-titan: Header comment startup | 32.637 | 31.110 | 0.340 | 1,895.2 | 237.2 |
+| Titan: Cold startup | 401.665 | 242.670 | 155.360 | 5,459.8 | 873.0 |
+| Titan: Unchanged restart, SQL ready | 5.540 | 5.360 | 0.020 | 182.2 | 873.0 |
+| Titan: Saved importer comment | 21.906 | 21.050 | 0.160 | 3,946.6 | 888.4 |
+| Titan: Header comment startup | 66.549 | 59.940 | 5.340 | 3,744.0 | 888.4 |
+
+The warm readiness memory samples precede graph allocation. Peak RSS by hydration
+completion was 1,358.6 MiB for vscode-titan and 2,776.8 MiB for Titan; saved-edit RSS is the
+process's lifetime peak. No WAL, SHM or journal sidecars existed at the sampled
+readiness or shutdown points. Final databases were 237.2 and 888.4 MiB, excluding
+the separate native-probe cache. These are sampled sizes, not transient peaks.
+
+### Warm validation and hydration
+
+| Workspace / phase | Wall (s) | Process CPU (s) |
+| --- | ---: | ---: |
+| vscode-titan: inventory | 0.287 | 0.243 |
+| vscode-titan: native_context | 0.423 | 0.391 |
+| vscode-titan: input_validation | 0.348 | 0.341 |
+| vscode-titan: background project_hydration | 16.442 | 16.592 |
+| Titan: inventory | 0.489 | 0.403 |
+| Titan: native_context | 0.319 | 0.285 |
+| Titan: input_validation | 1.561 | 1.551 |
+| Titan: background project_hydration | 31.747 | 31.938 |
+
+Both restarts reused 66 compiler-inventory entries with zero content reads or
+hashes. Two source-validation scans per workspace also recorded zero source and
+external-input reads/hashes. Header content reads/hashes were zero before SQL
+readiness, after hydration, and after the saved importer edit. Header search and
+physical-identity checks still ran: initial counters recorded 248 metadata
+reuses / 1,382 search checks for vscode-titan and 951 / 10,599 for Titan.
+Unchanged validation therefore avoids file contents, while retaining discovery,
+metadata and search-precedence checks.
+
+On both unchanged restarts, SQL readiness preceded every hydration-start event.
+All 62 / 63 project payloads
+were restored. Hydration completed 16.442 / 31.747 seconds after SQL readiness,
+or 17.992 / 37.286 seconds after launch. The server answered 291 / 886 sequential
+feature requests during that work. These hydration wall and process-CPU values
+include the concurrent requests; the previous run's hydration phases did not.
+The ready and hydration measurements must not be added to CPU columns with a
+different sampling interval.
+
+### Feature requests during restoration
+
+All concurrent responses matched the cold result. Each row gives the actual
+sample count; p95 is an empirical percentile of this one run.
+
+| Workspace / feature | Requests | Median (ms) | p95 (ms) | Maximum (ms) | Median after hydration (ms) |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| vscode-titan: Hover | 73 | 34.363 | 127.310 | 150.990 | 1.261 |
+| vscode-titan: Definition | 73 | 41.539 | 95.875 | 158.476 | 1.379 |
+| vscode-titan: References | 73 | 35.536 | 71.094 | 95.734 | 2.031 |
+| vscode-titan: Folding | 72 | 99.566 | 281.710 | 453.387 | 30.260 |
+| Titan: Hover | 222 | 25.297 | 59.226 | 225.722 | 0.451 |
+| Titan: Definition | 222 | 26.076 | 53.161 | 401.828 | 0.424 |
+| Titan: References | 221 | 32.651 | 64.350 | 324.873 | 1.262 |
+| Titan: Folding | 221 | 37.372 | 104.692 | 159.890 | 1.757 |
+
+The post-hydration medians use five samples each. Requests remain serviceable
+during restoration, but contention is visible, especially the 453 ms folding
+maximum in vscode-titan. Bounded graph traversal yields do not make native
+hashing, a single SQLite BLOB read, or string copies preemptible. No uniform
+query-latency improvement or hard latency bound is claimed.
+
+### Work performed and avoided
+
+| Workspace / workload | Source parse / check | Header preprocess / parse | FFI convert / replay | Payloads encoded | Encoding CPU (s) |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| vscode-titan: Cold startup | 62 / 62 | 5 / 5 | 9 / 0 | 62 | 12.916 |
+| vscode-titan: Unchanged restart | 0 / 0 | 0 / 0 | 0 / 0 | 0 | 0.000 |
+| vscode-titan: Saved importer comment | 1 / 1 | 0 / 0 | 0 / 1 | 1 | 0.147 |
+| vscode-titan: Header comment startup | 23 / 23 | 1 / 1 | 2 / 2 | 12 | 2.225 |
+| Titan: Cold startup | 63 / 63 | 35 / 35 | 121 / 0 | 63 | 38.866 |
+| Titan: Unchanged restart | 0 / 0 | 0 / 0 | 0 / 0 | 0 | 0.000 |
+| Titan: Saved importer comment | 1 / 1 | 0 / 0 | 0 / 4 | 1 | 0.965 |
+| Titan: Header comment startup | 1 / 1 | 1 / 1 | 4 / 0 | 1 | 1.168 |
+
+The saved edit parsed, checked and encoded only `server.compiler_io`
+(2,206,447 bytes) or `titan.sqlite3` (16,894,944 bytes). Other source profile
+visits were cached dependencies. Warm startup performed no source analysis,
+FFI conversion lookups/misses, header preprocessing/parsing, or payload encoding,
+including during background restoration. The changed header caused fresh
+preprocessing/parsing and conversions; vscode-titan rechecked 12 unique modules
+over 23 attempts, while Titan rechecked only its SQLite module.
+
+### Comparison and evidence
+
+Compared with the preceding run, vscode-titan SQL readiness is 1.550 s versus
+18.626 s, and Titan SQL readiness is 5.540 s versus 67.657 s. The earlier ready
+event included hydration. Comparing full restoration instead gives 17.992 s and
+37.286 s from launch for the current run, with concurrent queries included.
+Saved-edit readiness changed from 17.440 to 5.938 s and from 102.670 to 21.906 s.
+These observations describe the recorded workloads rather than statistical
+speedup estimates. The changed-header workload now advances mtime to follow the
+requested timestamp-trust policy; its earlier version deliberately preserved it.
+
+Schema and corpus differences also matter. The vscode-titan occurrence/fold
+counts increased to 69,450 / 4,213 from 65,153 / 4,012; Titan retains 66,787 /
+4,817. Both contain all 62 / 63 project snapshots. The new schema records header
+observations separately from graph payloads, contributing to database growth.
+Cold vscode-titan startup was slightly slower than the preceding run, and its
+post-hydration folding median increased. The report does not imply that every
+workload became faster or that total graph memory was eliminated.
+
+Retained evidence, including all response samples, compiler counters, database
+and query-plan inspections, exact configuration, raw logs and restoration
+results, is under:
+
+- `.build/cache-benchmarks/vscode-titan-startup-20260908/`
+- `.build/cache-benchmarks/titan-startup-20260908/`
+
+Both summaries report `completed`, all restoration flags, and all three reuse
+assertions as true, with zero error diagnostics or storage-fallback events.
+Both databases passed `quick_check`, and Python SQLite 3.51.2 selected indexed
+`SEARCH` plans for all five representative queries. Cleanup restored source and
+header bytes and exact nanosecond timestamps plus the previous cache state.
+The OS page cache remained intact; trace overhead, single-run sampling, server
+versus descendant resources, and unmeasured transient sidecars retain the
+limits described above.

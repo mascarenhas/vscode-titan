@@ -840,3 +840,80 @@ function test_project_graph_recreated_module_revisions_survive_an_empty_store_re
       "empty-store reopen forgot the last allocated project revision")
   end)
 end
+
+function test_project_graph_timestamp_refresh_preserves_semantic_work_and_rollback(
+    _context: test.Context)
+  test_runtime.run(function ()
+    local store = stores.open(":memory:")
+    defer store:close()
+    local access = store:acquire()
+    defer access:release()
+    local cache = graph.create<TestAst>(access.connection)
+    local original = graph.FileStamp.new("main.titan", 1, 2, 3, "content", "physical")
+    cache:observe_project("main", {original})
+    commit(cache, "main", manifest("public", "source"), {}, "original")
+    local generation = cache:generation()
+    local revision = stores.scalar_integer(access.connection,
+      "SELECT revision FROM main.graph_modules WHERE name='main'")
+    local ast? = cache:project_ast("main")
+    local touched = graph.FileStamp.new("main.titan", 3, 4, 3, "content", "physical")
+    access.connection:set_autocommit(false)
+    test.assert(not cache:observe_project("main", {touched}).changed and
+      cache:file_stamps("main")[1].modified_seconds == 3 and
+      cache:generation() == generation and cache:project_ast("main") == ast and
+      stores.scalar_integer(access.connection,
+        "SELECT revision FROM main.graph_modules WHERE name='main'") == revision,
+      "timestamp-only refresh changed semantic work or the live AST")
+    access.connection:rollback()
+    test.assert(cache:file_stamps("main")[1].modified_seconds == 1,
+      "rollback retained an unpublished timestamp observation")
+    cache:invalidate_project("main")
+    local token? = cache:begin_project_check("main")
+    test.assert(token ~= nil, "timestamp fixture did not start its dirty check")
+    test.assert(not cache:observe_project("main", {touched}).changed,
+      "timestamp refresh invalidated an active check")
+    case cache:commit_project(token, manifest("public", "source"), {}, TestAst.new("checked"))
+    when accepted then
+    when stale then test.assert(false, "timestamp refresh rejected a valid checking token")
+    end
+    test.assert(cache:observe_project("main", {
+      graph.FileStamp.new("main.titan", 3, 4, 3, "content", "replacement")}).changed,
+      "physical replacement was hidden by an equal timestamp and content digest")
+  end)
+end
+
+function test_project_graph_revision_hydration_rejects_replaced_or_unfinished_work(
+    _context: test.Context)
+  test_runtime.run(function ()
+    local store = stores.open(":memory:")
+    defer store:close()
+    local access = store:acquire()
+    defer access:release()
+    local cache = graph.create<TestAst>(access.connection)
+    cache:observe_project("main", {stamp("main.titan", 1)})
+    commit(cache, "main", manifest("public", "source"), {}, "first")
+    local revision = stores.scalar_integer(access.connection,
+      "SELECT revision FROM main.graph_modules WHERE name='main'")
+    local generation = cache:generation()
+    local rejected = not cache:hydrate_project_ast_at_revision("main", revision + 1, TestAst.new("wrong"))
+    local first? = cache:project_ast("main")
+    test.assert(rejected and first ~= nil and first.label == "first" and
+      cache:hydrate_project_ast_at_revision("main", revision, TestAst.new("restored")) and
+      cache:generation() == generation,
+      "revision hydration changed SQL state or admitted the wrong revision")
+    cache:invalidate_project("main")
+    test.assert(not cache:hydrate_project_ast_at_revision("main", revision, TestAst.new("dirty")),
+      "revision hydration admitted invalidated work")
+    cache:remove_module("main")
+    cache:observe_project("main", {stamp("main.titan", 1)})
+    commit(cache, "main", manifest("public", "source"), {}, "replacement")
+    local stale = not cache:hydrate_project_ast_at_revision("main", revision, TestAst.new("old"))
+    local replacement? = cache:project_ast("main")
+    test.assert(stale and replacement ~= nil and replacement.label == "replacement",
+      "delayed hydration replaced a recreated module with an earlier payload")
+    cache:upsert_external_source("external", {stamp("external.titan", 1)},
+      manifest("external", "external"), {})
+    test.assert(not cache:hydrate_project_ast_at_revision("external", 0, TestAst.new("external")),
+      "revision hydration admitted an external compiler graph")
+  end)
+end

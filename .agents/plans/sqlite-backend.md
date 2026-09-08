@@ -1,7 +1,9 @@
 # Workspace SQLite backend (#20)
 
-Status: implementation, correctness verification and both representative benchmarks
-complete; PR/CI/Project evidence pending. Branch: `agent/sqlite-backend`.
+Status: initial implementation, both representative benchmarks, local verification,
+and Linux hosted delivery completed in PR #55 and Titan PR #148. Titan #148 is
+merged at `534abf000ce7957113dfed780508e16535d0acd5`. Startup follow-up below is
+authorized and active. Branch: `agent/sqlite-backend`.
 
 Scope authority: [vscode-titan #20](https://github.com/mascarenhas/vscode-titan/issues/20).
 Baseline: vscode-titan `551d01785ea8cdbbcf2c7706158a2525f1658d31`, Titan
@@ -40,13 +42,94 @@ Hydration recreates resolver-owned generated headers and source-private links.
 A separate safe conversion replay contract must skip unchanged FFI conversion
 after importer-only edits; a parsed-header cache alone is insufficient.
 
-Validate exact source/header bytes and all observed search candidate identities,
+Validate source/header observations and all observed search candidate identities,
 including missing candidates, symlink identities, folder constituents and external
 providers, before warm publication. Cache compatibility includes root, evaluated
 semantic configuration, compiler build/API, semantic/library/ABI versions,
 codec/schema versions, target/provider and ordered preprocessing context.
 Corrupt, incompatible or unsupported payloads rebuild; unavailable workspace
-storage falls back to memory. A same-mtime content change is always a miss.
+storage falls back to memory. The startup follow-up below supersedes the original
+same-mtime content-change guarantee with the maintainer's explicit timestamp-trust
+policy. The completed evidence below describes the original implementation.
+
+## Authorized startup follow-up (2026-09-08)
+
+The maintainer requested metadata-first validation with **no file-content read or
+hash when the saved mtime is unchanged**, and moving graph hydration to a
+background task that yields frequently so it does not block server startup. The
+maintainer also requested reviewing #50 so completion queries do not require the
+hydrated graph, and collecting this pending work in a durable session goal.
+
+### Validation contract
+
+- Separate observed timestamps from semantic content identity. Compare precise
+  mtime plus cheap physical metadata for the same resolved input first. Reuse
+  stored contents/digest when those observations match. A timestamp change reads
+  and hashes stable bytes; unchanged content refreshes only the observation, with
+  no work revision, semantic generation, AST eviction, or dependent reanalysis.
+- Retain checks for missing/replaced files, symlink/target identities, contributor
+  membership and ordered source/header search precedence. Deliberately changing
+  bytes while preserving the trusted timestamp and physical metadata is outside
+  this policy. Tests and issue wording must state that boundary explicitly.
+- Apply the policy to project and external inputs, compiler/header validation,
+  persisted header and FFI replay, and normal in-process cache reuse. Persist
+  refreshed header observations separately from semantic keys. Avoid reopening
+  unchanged headers for content checks; share observations within a validation
+  pass where the same header/search path appears in several module closures.
+- Reuse stored compiler-inventory digests under the same metadata policy; keep
+  compatibility checks for the actual selected compiler/dependencies/provider.
+  Loading compiler code normally is distinct from rereading it for validation.
+- Track incompatible disposable storage and codec formats where old records
+  cannot safely express the new contract. Keep compiler hooks storage-neutral.
+  Per the maintainer's subsequent instruction, the language-server API version
+  is reset to `1` and remains `1` until Titan's first public release; update
+  compiler and consumer guards, tests, and durable guidance together.
+
+### Background hydration and query contract
+
+- Publish a validated saved SQL view without waiting for graph payload decoding.
+  Ordinary definition/reference/hover/folding reads remain SQL-only and usable
+  while hydration is pending. Do not fetch all graph BLOBs on the readiness path.
+- Own hydration in the existing workspace lifecycle. Decode with bounded work
+  checkpoints inside large payloads, yielding frequently without holding a Store
+  lease. Preserve compiler scheduler ownership and non-string cancellation.
+- Coordinate compiler-dependent saved edits and rename with hydration; prevent
+  stale graph installation after invalidation/configuration changes. Unsupported
+  or corrupt graphs fall back to normal analysis. Cancel and drain owned tasks
+  before releasing compiler contexts or closing workspace storage.
+- Review/update #50's design and acceptance criteria, without implementing
+  completion in this follow-up: saved and TEMP structured facts must support the
+  query path without AST access or a hydration barrier. Preparation uses an
+  isolated compiler context and captured saved interfaces/inputs; fallback while
+  preparation is pending must not force global graph hydration.
+
+### Ownership and verification
+
+- Source-validation owner: Service, Graph, Metadata, schema and their tests;
+  coordinate the typed header observation contract with the bridge owner.
+- Hydration owner: application/loader/compiler bridge lifecycle and their tests;
+  coordinate Service entry points before editing shared files.
+- Compiler owner: a new focused Titan branch from merged master, header
+  observation APIs and bounded codec progress hooks, existing Busted regressions,
+  compiler documentation and its own durable plan.
+- Root: compiler inventory integration, #20/#50 contracts, plan/docs, integration
+  transcripts, benchmark harness/report and final review/delivery. Coordinate
+  individual shared-file sections explicitly; use private source/build stages.
+- Prove zero content reads/hashes for unchanged observations across refresh and
+  restart; prove timestamp-only touches preserve semantic results and payload
+  revisions; preserve meaningful changed-input/precedence/ownership regressions.
+- Prove SQL readiness and request responsiveness while hydration is blocked or
+  yielding, safe first-edit/rename coordination, stale-work rejection, cancellation
+  and drained shutdown. Benchmark both actual repositories again, separating SQL
+  readiness from hydration completion, read/hash counts, CPU/RSS and query latency.
+- Run focused gates, compiler broad/native gates as applicable, canonical
+  terminal-backed `make verify`, packaging checks and required Linux hosted CI.
+  Update PR #55 and open a new Titan companion PR only after local integration is
+  complete. Leave PRs open. No merge or macOS dispatch is authorized.
+  The maintainer additionally requires the final extension pin to equal the live
+  Titan `master` HEAD, with CI passing against that exact commit. Any new compiler
+  prerequisite must reach master before this goal can be considered complete;
+  present its verified PR for explicit merge authorization when it is ready.
 
 ## Ownership and sequence
 
@@ -303,12 +386,14 @@ baseline remains separately labeled. Both representative runs satisfy the
 requested work-elimination demonstration while retaining the measured readiness,
 validation, hydration, memory and disk costs.
 
-## Full acceptance evidence appendix
+## Initial delivery acceptance evidence (7 September 2026)
 
 Criterion wording follows the 22 checkboxes in the authoritative issue body
-retrieved 2026-09-07. Evidence labels refer to the verified results above. All
-implementation and benchmark criteria are satisfied; PR/CI/Project results
-remain pending until those delivery actions finish.
+retrieved 2026-09-07. Evidence labels refer to the verified original results above.
+That delivery completed in extension PR #55 and merged Titan PR #148, with local
+and Linux hosted gates passing. The timestamp-trust contract and background
+readiness requirements in the authorized follow-up supersede the corresponding
+historical criteria below; their original wording is retained as dated evidence.
 
 | # | Acceptance criterion | Evidence |
 | --- | --- | --- |
@@ -335,16 +420,81 @@ remain pending until those delivery actions finish.
 | 21 | Demonstrate that the first semantic request after restarting an unchanged representative project does not reparse or typecheck unchanged project modules and does not preprocess, parse, or convert unchanged FFI headers. | O19/BV/BT: first requests after unchanged restart perform zero project parse/check and zero header preprocess/parse/FFI conversion; BV restores all 62 projects and BT all 63, with no project encoding. |
 | 22 | Benchmark restart and saved-edit readiness for both vscode-titan and the Titan repository, reporting disk-cache size, load/revalidation CPU/wall, avoided compiler/header work, and peak RSS. | BV and BT passed all four requested workloads with readiness, database/sidecars, phase CPU/wall, avoided work, query latency and peak RSS recorded. Raw evidence and the durable report preserve baseline failures and final measurement limits. |
 
-## Remaining delivery evidence
+## Startup follow-up verification and delivery
 
-1. Inspect final exact diffs and commits in both focused branches and open the
-   extension PR followed by the Titan PR after local verification. Verify hosted
-   Linux checks use the recorded compiler pin; record PR URLs and exact commits.
-2. Update the dependent issues and GitHub Project status from those results;
-   retain both PRs for maintainer review. No macOS dispatch, default-branch push
-   or merge is authorized.
+Focused gates passed: 72 Graph/Metadata/Service/Store tests, 76
+Application/Loader/Bridge tests, the initial 18 cache tests, and 489 distinct
+compiler tests. The 22-session native cache restart transcript passed after adding
+a diagnostic for a malformed graph row pruned before its background read.
+Independent server review found no actionable gaps in observation refreshes,
+inventory validation, revision checks, lazy recovery, or task ownership.
 
-Compiler/server ownership remains disjoint. Both complete benchmark sequences
-finished and the source freeze is released. Only the root owns shared build
-staging and publication of this plan. Full issue scope and the required delivery
-sequence remain unchanged.
+Independent compiler review identified and verified three repairs: certify
+initial header reads against observations taken before and after the read;
+share the registry yield budget across many small entries; and protect malformed
+FFI observation-overlay validation so it becomes a cache miss without mutating
+checker state. Cancellation-object identity remains intact. The implementation
+uses server schema 3 and compiler language-server API 1. The maintainer reset
+the unreleased API to 1 and requires it to stay there until the first public
+release. Both repositories' guidance and all active consumers record that rule.
+
+The complete API-1 `xvfb-run -a make -j1 verify` passed: 302 native tests,
+56 JavaScript tests, 12 Extension Host tests, the 22-session cache transcript,
+native protocol/Codex checks, plugin validation, staged installation, linkage,
+and self-contained VSIX inspection. The installed 61 compiler Lua files matched
+the reviewed API-1 snapshot. The native image frozen for measurements has SHA-256
+`7053065aa9bb73002968b47f8e8c6f3529fc9e17e1c798d41298421e77ede090`.
+Raw integration evidence is `/tmp/vscode-startup-api1-verify-20260908.log` and
+`/tmp/vscode-startup-api1-verify-20260908-cache/` (22 retained process logs).
+
+The compiler passed 3,478 broad tests and 455 native stdlib tests. Titan
+PR #153 contains the independently audited 21 owned paths at
+`f628e0aa414e4e0ba2b2e57521a49b3d8458e0bf`. All three Linux lanes passed in
+[run 34182203740](https://github.com/mascarenhas/titan/actions/runs/34182203740).
+The exact-commit Codecov project and patch checks passed at 92.56% and 96.83%.
+All 25 hosted compiler invocations had positive counts, totaling 3,349 passing
+tests plus 129 stdlib Lua tests. Hosted native validation passed 454 cases and
+skipped `json.tests.test_core_locale_independent_numbers` because the runner had
+no alternate numeric locale; local native validation passed all 455 cases.
+No macOS workflow was dispatched. The compiler PR remains open pending explicit
+merge authorization.
+
+Both new benchmark sequences passed, and an independent audit verified all
+64 latency distributions, feature-result parity, zero unchanged content
+reads/hashes, source/header byte and nanosecond-mtime restoration, prior cache
+presence, absence of backup residue, and both retained databases' integrity,
+table counts and five indexed query plans. The authorized editor-server pause
+ended after cleanup, and its resumed process state was verified.
+
+| Workspace | Cold ready (s) | Warm SQL ready (s) | Full hydration from launch (s) | Queries during hydration | Saved edit (s) | Header startup (s) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| vscode-titan | 53.392 | 1.550 | 17.992 | 291 | 5.938 | 32.637 |
+| Titan | 401.665 | 5.540 | 37.286 | 886 | 21.906 | 66.549 |
+
+The 8 September UTC section of `docs/sqlite-backend-benchmarks.md` records
+resources, work counters, concurrent latency, restoration and comparison limits.
+Evidence is retained in `.build/cache-benchmarks/vscode-titan-startup-20260908/`
+and `.build/cache-benchmarks/titan-startup-20260908/`. Earlier readiness included
+hydration; current SQL readiness precedes it, and measured hydration now includes
+query traffic. Saved edits start after restoration. No claim of a uniform latency
+improvement, hard responsiveness bound or eliminated graph memory is made.
+
+The final VSIX was repackaged after the report review. The self-contained smoke
+and artifact checks passed; an entry-by-entry comparison proves the final archive
+differs from that inspected package only in the report's wording corrections.
+All 226 entries are present and the native image is unchanged. Final VSIX SHA-256:
+`202978350b6e4d32c120e23354c233e6032bf69fe756a778c161c4dddfdb3eab`.
+
+Remaining delivery steps:
+
+1. Update extension PR #55 and both descriptions with exact source, test and
+   measurement evidence. Verify required Linux hosted checks and Codecov results.
+2. Present the concrete compiler PR for maintainer review and explicit merge
+   authorization. After the prerequisite reaches master, verify its live HEAD,
+   pin that commit in extension CI, and pass CI on the final extension commit.
+3. Update dependent issues and Project status from verified results. Leave the
+   extension PR open; no extension merge or default-branch push is authorized.
+
+Compiler/server ownership remains disjoint. Only the root owns shared extension
+build staging and publication of this plan. Builds and source changes must finish
+before the two benchmark sequences run without competing work.

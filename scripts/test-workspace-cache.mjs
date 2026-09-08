@@ -46,11 +46,39 @@ async function withServer(label, body, environment = {}) {
   const child = launch(root, "trace", environment);
   const exit = exitOf(child);
   const stderr = collect(child.stderr);
+  let logTail = "";
+  let hydrationLogError;
+  const hydration = new Promise((resolve,reject) => {
+    child.stderr.on("data", (chunk) => {
+      try {
+        logTail += chunk.toString("utf8");
+        const lines = logTail.split("\n");
+        logTail = lines.pop();
+        for (const line of lines) {
+          if (!line.startsWith("titan-language-server ")) continue;
+          const record = JSON.parse(line.slice("titan-language-server ".length));
+          if (record.event === "cache.startup.phase" && record.phase === "project_hydration") {
+            resolve(record);
+          }
+        }
+      } catch (cause) {
+        hydrationLogError = cause;
+        reject(cause);
+      }
+    });
+  });
+  hydration.catch(() => undefined);
   const responses = new FrameReader(child.stdout);
   let closed = false;
   let nextId = 10;
   const session = {
     child, responses,
+    async restored() {
+      if (hydrationLogError) throw hydrationLogError;
+      const result = await withTimeout(hydration, "background graph hydration", 30_000);
+      if (hydrationLogError) throw hydrationLogError;
+      return result;
+    },
     async query(method, params) {
       const response = await request(child, responses, nextId++, method, params, 30_000);
       assert.equal(response.error, undefined, JSON.stringify(response.error));
@@ -63,6 +91,7 @@ async function withServer(label, body, environment = {}) {
     child.stdin.write(frame({jsonrpc: "2.0", method: "initialized", params: {}}));
     const ready = await waitForIndexing(responses);
     const result = await body(session, ready);
+    await session.restored();
     const shutdown = await request(child, responses, 2, "shutdown", null, 30_000);
     assert.equal(shutdown.error, undefined);
     child.stdin.end(frame({jsonrpc: "2.0", method: "exit"}));
@@ -159,13 +188,29 @@ function assertWarmInitial(records) {
     assert.equal(records.some((record) => record.event === event), false,
       `unchanged restart performed ${event}`);
   }
-  assert.ok(records.some((record) =>
-    record.event === "cache.projects.hydrate" && record.restored === 2));
+  assert.equal(records.some((record) => record.event === "cache.projects.hydrate"), false,
+    "warm SQL readiness waited for project graph hydration");
+  assert.equal(records.some((record) => record.event === "cache.projects.hydration_start"), false,
+    "project hydration started before the warm SQL view was ready");
+  const inventory = records.find((record) => record.event === "cache.inventory.validation");
+  assert.ok(inventory, "compiler inventory validation omitted its counters");
+  assert.equal(inventory.reads, 0, "warm compiler inventory reread unchanged content");
+  assert.equal(inventory.hashes, 0, "warm compiler inventory rehashed unchanged content");
+  const scans = records.filter((record) => record.event === "project.scan.complete");
+  assert.ok(scans.length > 0,"warm validation omitted source scan counters");
+  for (const scan of scans) {
+    for (const field of ["source_content_reads","source_content_hashes",
+      "external_content_reads","external_content_hashes"]) {
+      assert.equal(scan[field],0,`warm validation performed ${field}`);
+    }
+  }
   const stats = cacheStats(records);
   assert.equal(stats.header_misses, 0,
     "unchanged restart rebuilt a completed header graph");
   assert.equal(stats.conversion_misses, 0,
     "unchanged restart rebuilt an FFI conversion graph");
+  assert.equal(stats.header_file_reads, 0, "warm header validation read unchanged content");
+  assert.equal(stats.header_file_hashes, 0, "warm header validation hashed unchanged content");
   assert.equal(records.some((record) =>
     record.event === "compiler.c_header.phase" &&
     (record.phase === "preprocessing" || record.phase === "c_parse" ||
@@ -224,6 +269,9 @@ try {
   });
   const warmPhases = initialRecords(warm.records);
   const warmInitialCache = assertWarmInitial(warmPhases.initial);
+  assert.ok(warmPhases.later.some((record) =>
+    record.event === "cache.projects.hydrate" && record.restored === 2),
+  "background hydration did not restore unchanged dependencies before the first edit");
   assert.deepEqual(checkedModules(warmPhases.later), ["consumer"],
     "first body edit reparsed or rechecked an unchanged dependency");
   const firstEditEncodes = warmPhases.later.filter((record) =>
@@ -235,17 +283,29 @@ try {
   assert.equal(firstEditEncodes.some((record) => record.module_names.truncated), false);
   assert.ok(cacheStats(warmPhases.later).header_hits > 0);
   assert.ok(cacheStats(warmPhases.later).conversion_hits > 0);
+  for (const field of ["header_file_reads","header_file_hashes"]) {
+    assert.equal(cacheStats(warm.records)[field],0,
+      `hydration or importer-only editing performed ${field}`);
+  }
 
   await writeFile(headerFile, "typedef long fixture_int;\n");
   await utimes(headerFile, headerTimestamp, headerTimestamp);
   const headerAfter = await stat(headerFile);
   assert.equal(headerAfter.size, headerBefore.size);
   assert.equal(headerAfter.mtimeMs, headerBefore.mtimeMs);
+  const trustedHeader = await withServer("trusted-header-mtime", featureSnapshot);
+  assert.deepEqual(trustedHeader.result, cold.result);
+  assertWarmInitial(initialRecords(trustedHeader.records).initial);
+  assert.equal(cacheStats(trustedHeader.records).header_file_reads,0);
+  assert.equal(cacheStats(trustedHeader.records).header_file_hashes,0);
+  assert.deepEqual(checkedModules(trustedHeader.records), [],
+    "unchanged header timestamp caused a content check");
+  await utimes(headerFile, headerTimestamp, new Date(headerTimestamp.getTime() + 1000));
   const changedHeader = await withServer("changed-header", featureSnapshot);
   assert.deepEqual(changedHeader.result, cold.result);
   assert.ok(checkedModules(changedHeader.records).includes("consumer"));
   assert.ok(cacheStats(changedHeader.records).header_misses > 0,
-    "same-size same-mtime header edit reused a stale preprocessor graph");
+    "changed-mtime header edit reused a stale preprocessor graph");
   assert.ok(cacheStats(changedHeader.records).conversion_misses > 0,
     "header type edit reused a stale FFI conversion");
 
@@ -312,8 +372,14 @@ try {
   assert.equal(sourceAfter.mtimeMs, sourceBefore.mtimeMs);
   const preservedSource = await withServer("preserved-mtime-source", featureSnapshot);
   assert.deepEqual(preservedSource.result, cold.result);
-  assert.deepEqual(checkedModules(preservedSource.records), ["consumer"],
-    "same-size same-mtime source edit was not checked independently");
+  assertWarmInitial(initialRecords(preservedSource.records).initial);
+  assert.deepEqual(checkedModules(preservedSource.records), [],
+    "unchanged source timestamp caused a content check");
+  await utimes(consumerFile, headerTimestamp, new Date(headerTimestamp.getTime() + 1000));
+  const changedSource = await withServer("changed-mtime-source", featureSnapshot);
+  assert.deepEqual(changedSource.result, cold.result);
+  assert.deepEqual(checkedModules(changedSource.records), ["consumer"],
+    "changed-mtime source edit did not recheck its module");
 
   const shadowHeader = path.join(sourceRoot, "fixture.h");
   await writeFile(shadowHeader, "typedef const char *fixture_int;\n");
@@ -340,7 +406,13 @@ try {
     } finally {
       database.close();
     }
-    const payload = await withServer(label, featureSnapshot);
+    const payload = await withServer(label, async (session, ready) => {
+      assert.deepEqual(await featureSnapshot(session), cold.result,
+        "valid SQL features were unavailable before corrupt graph recovery");
+      await session.restored();
+      await waitForIndexing(session.responses, "ready", 1, ready.epoch + 1);
+      return featureSnapshot(session);
+    });
     assert.deepEqual(payload.result, cold.result);
     assert.deepEqual(checkedModules(payload.records), ["consumer"]);
     assert.ok(payload.records.some((record) => record.event === "cache.project.miss"));
@@ -416,17 +488,25 @@ try {
     copiedEnvironment);
   assert.deepEqual(compilerWarm.result, cold.result);
   const compilerWarmCache = assertWarmInitial(initialRecords(compilerWarm.records).initial);
+  assert.equal(cacheStats(compilerWarm.records).header_file_reads,0);
+  assert.equal(cacheStats(compilerWarm.records).header_file_hashes,0);
   await writeFile(copiedDriver, Buffer.concat([originalDriver, suffix("B")]));
   await utimes(copiedDriver, headerTimestamp, headerTimestamp);
   const compilerAfter = await stat(copiedDriver);
   assert.equal(compilerAfter.size, compilerBefore.size);
   assert.equal(compilerAfter.mtimeMs, compilerBefore.mtimeMs);
+  const trustedCompiler = await withServer("trusted-compiler-mtime", featureSnapshot,
+    copiedEnvironment);
+  assertWarmInitial(initialRecords(trustedCompiler.records).initial);
+  assert.deepEqual(checkedModules(trustedCompiler.records), [],
+    "unchanged compiler timestamp triggered content validation");
+  await utimes(copiedDriver, headerTimestamp, new Date(headerTimestamp.getTime() + 1000));
   const compilerChanged = await withServer("compiler-content-change", featureSnapshot,
     copiedEnvironment);
   assert.deepEqual(compilerChanged.result, cold.result);
   assertCold(compilerChanged.records);
   assert.deepEqual(checkedModules(compilerChanged.records), ["consumer", "mathlib"],
-    "same-size same-mtime compiler change reused a checked project graph");
+    "changed-mtime compiler change reused a checked project graph");
 
   await rm(path.dirname(databaseFile), {recursive: true});
   await writeFile(path.dirname(databaseFile), "persistence intentionally unavailable\n");
@@ -439,7 +519,7 @@ try {
     cold_checked: checkedModules(cold.records),
     cold_indexing_cpu_ms: initialRecords(cold.records).initial.at(-1).cpu_ms,
     warm_indexing_cpu_ms: warmPhases.initial.at(-1).cpu_ms,
-    warm_hydration: warmPhases.initial.filter((record) =>
+    warm_hydration: warmPhases.later.filter((record) =>
       record.event === "cache.projects.hydrate"),
     warm_startup_phases: warmPhases.initial.filter((record) =>
       record.event === "cache.startup.phase"),
@@ -458,7 +538,8 @@ try {
     },
     verified: ["feature replay", "folder membership", "failure recovery",
       "configuration publication identity", "compiler content identity",
-      "preserved-mtime source", "include-search shadowing", "corrupt project payload",
+      "unchanged-mtime source/header/compiler trust", "changed-mtime source/header/compiler invalidation",
+      "SQL readiness before background hydration", "include-search shadowing", "corrupt project payload",
       "invalid SQLite payload storage types",
       "corrupt rebuild", "incompatible rebuild", "memory fallback"]
   };

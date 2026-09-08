@@ -11,7 +11,9 @@ record FileStamp
   const modified_seconds: integer
   const modified_nanoseconds: integer
   const size: integer
+  -- Content identity is independent of the last observed modification time.
   const identity: string?
+  const physical_identity: string?
 end
 
 record Manifest
@@ -163,7 +165,7 @@ local function normalize_imports(imports: {ImportEdge}): {ImportEdge}
   return result
 end
 
-local function same_stamps(left: {FileStamp}, right: {FileStamp}): boolean
+local function same_observations(left: {FileStamp}, right: {FileStamp}): boolean
   if #left ~= #right then return false end
   for index = 1, #left do
     local a = left[index]
@@ -171,9 +173,25 @@ local function same_stamps(left: {FileStamp}, right: {FileStamp}): boolean
     if a.path ~= b.path or
        a.modified_seconds ~= b.modified_seconds or
        a.modified_nanoseconds ~= b.modified_nanoseconds or
-       a.size ~= b.size or a.identity ~= b.identity then
+       a.size ~= b.size or a.identity ~= b.identity or
+       a.physical_identity ~= b.physical_identity then
       return false
     end
+  end
+  return true
+end
+
+local function same_stamps(left: {FileStamp}, right: {FileStamp}): boolean
+  if #left ~= #right then return false end
+  for index = 1, #left do
+    local a = left[index]
+    local b = right[index]
+    if a.path ~= b.path or a.size ~= b.size or a.identity ~= b.identity or
+       a.physical_identity ~= b.physical_identity then return false end
+    -- Callers without content identities retain conservative stamp semantics.
+    if a.identity == nil and
+       (a.modified_seconds ~= b.modified_seconds or
+        a.modified_nanoseconds ~= b.modified_nanoseconds) then return false end
   end
   return true
 end
@@ -225,7 +243,7 @@ function initialize_schema(connection: sqlite3.Connection)
   sql.execute(connection, "CREATE TABLE IF NOT EXISTS main.graph_files (" ..
     "module_name TEXT NOT NULL REFERENCES graph_modules(name) ON DELETE CASCADE, " ..
     "path TEXT NOT NULL COLLATE BINARY, seconds INTEGER NOT NULL, " ..
-    "nanoseconds INTEGER NOT NULL, size INTEGER NOT NULL, identity BLOB, " ..
+    "nanoseconds INTEGER NOT NULL, size INTEGER NOT NULL, identity BLOB, physical_identity BLOB, " ..
     "PRIMARY KEY(module_name,path)) WITHOUT ROWID")
   -- imported deliberately has no foreign key: incoming edges to a missing
   -- provider must survive its removal and wake importers when it reappears.
@@ -320,8 +338,8 @@ local function Graph:set_stamps(module_name: string, stamps: {FileStamp})
     "DELETE FROM main.graph_files WHERE module_name=?", module_name)
   local first = 1
   while first <= #stamps do
-    -- At most 192 parameters, below Titan's 200-position call bound.
-    local last = first + 31
+    -- At most 196 parameters, below Titan's 200-position call bound.
+    local last = first + 27
     if last > #stamps then last = #stamps end
     local query = "INSERT INTO main.graph_files VALUES "
     local bindings: {value} = {}
@@ -334,14 +352,22 @@ local function Graph:set_stamps(module_name: string, stamps: {FileStamp})
       bindings[offset + 3] = stamp.modified_seconds
       bindings[offset + 4] = stamp.modified_nanoseconds
       bindings[offset + 5] = stamp.size
+      query = query .. "(?,?,?,?,?"
       if stamp.identity ~= nil then
-        query = query .. "(?,?,?,?,?,?)"
-        bindings[offset + 6] = sqlite3.Blob.new(stamp.identity)
+        query = query .. ",?"
+        bindings[#bindings + 1] = sqlite3.Blob.new(stamp.identity)
       else
         -- Array nil assignment removes a slot, so NULL is SQL syntax while
         -- every present value remains a bound parameter.
-        query = query .. "(?,?,?,?,?,NULL)"
+        query = query .. ",NULL"
       end
+      if stamp.physical_identity ~= nil then
+        query = query .. ",?"
+        bindings[#bindings + 1] = sqlite3.Blob.new(stamp.physical_identity)
+      else
+        query = query .. ",NULL"
+      end
+      query = query .. ")"
     end
     sql.execute(self.connection, query, ...bindings)
     first = last + 1
@@ -443,7 +469,7 @@ end
 
 function Graph:file_stamps(module_name: string): {FileStamp}
   local statement = self.connection:prepare(
-    "SELECT path,seconds,nanoseconds,size,identity FROM main.graph_files " ..
+    "SELECT path,seconds,nanoseconds,size,identity,physical_identity FROM main.graph_files " ..
     "WHERE module_name=? ORDER BY path COLLATE BINARY")
   defer statement:close()
   local cursor = statement:query(module_name)
@@ -453,7 +479,11 @@ function Graph:file_stamps(module_name: string): {FileStamp}
     local identity_blob: sqlite3.Blob? = row:get(5)
     local identity: string?
     if identity_blob ~= nil then identity = identity_blob.bytes end
-    result[#result + 1] = FileStamp.new(row:get(1), row:get(2), row:get(3), row:get(4), identity)
+    local physical_blob: sqlite3.Blob? = row:get(6)
+    local physical_identity: string?
+    if physical_blob ~= nil then physical_identity = physical_blob.bytes end
+    result[#result + 1] = FileStamp.new(row:get(1), row:get(2), row:get(3), row:get(4),
+      identity, physical_identity)
   end
   return result
 end
@@ -550,6 +580,33 @@ function Graph:hydrate_project_ast(module_name: string, ast: A): boolean
   return true
 end
 
+function Graph:hydrate_project_ast_at_revision(module_name: string,
+    expected_revision: integer, ast: A): boolean
+  local entry? = self:module(module_name)
+  if entry == nil or entry.provenance ~= 0 or entry.state ~= 2 or
+     entry.revision ~= expected_revision then return false end
+  self.asts[module_name] = ast
+  return true
+end
+
+-- Observation refresh is deliberately separate from semantic work. A touch
+-- whose content and physical input match preserves active check tokens too.
+function Graph:refresh_file_observations(module_name: string,
+    stamps: {FileStamp}): boolean
+  local normalized = copy_stamps(stamps)
+  local previous = self:file_stamps(module_name)
+  if not same_stamps(previous, normalized) then return false end
+  if same_observations(previous, normalized) then return true end
+  for index = 1, #normalized do
+    local stamp = normalized[index]
+    sql.execute(self.connection,
+      "UPDATE main.graph_files SET seconds=?,nanoseconds=?,size=? " ..
+      "WHERE module_name=? AND path=?", stamp.modified_seconds,
+      stamp.modified_nanoseconds, stamp.size, module_name, stamp.path)
+  end
+  return true
+end
+
 -- A prior process cannot finish in-flight work. Preserve completed and failed
 -- revisions; only interrupted checks become available for a fresh attempt.
 function Graph:restart_interrupted_checks()
@@ -563,6 +620,7 @@ function Graph:observe_project(module_name: string,
   local existing? = self:module(module_name)
   if existing ~= nil and existing.provenance == 0 then
     if same_stamps(self:file_stamps(module_name), normalized) then
+      self:refresh_file_observations(module_name, normalized)
       return ChangeReport.new(false, self:generation(), {})
     end
     self:advance_generation()
@@ -658,6 +716,7 @@ local function Graph:upsert_external(module_name: string, provenance: integer,
     if not force and same_stamps(self:file_stamps(module_name), normalized_stamps) and
        old_manifest ~= nil and same_manifest(old_manifest, manifest) and
        same_imports(self:direct_imports(module_name), normalized_imports) then
+      self:refresh_file_observations(module_name, normalized_stamps)
       return ChangeReport.new(false, self:generation(), {})
     end
   end

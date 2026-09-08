@@ -38,7 +38,8 @@ function usage() {
   --help              Show this help
 
 Runs cold startup, unchanged restart, one saved source comment edit, and
-startup after a header comment edit with its original mtime preserved.
+startup after a header comment edit with a changed mtime. Measures SQL readiness,
+background hydration completion, and query latency throughout hydration.
 Temporarily moves aside an existing .titan-ls and restores it afterward.
 Restores the target's original bytes and nanosecond atime/mtime in finally.
 Do not run concurrently with another server or source edits in that workspace.
@@ -281,7 +282,7 @@ class Session {
   }
 }
 
-async function queries(session, target, count) {
+async function queries(session, target, count, observeSample) {
   const result = {};
   for (const operation of ["hover", "definition", "references", "foldingRange"]) {
     const params = { textDocument: { uri: target.uri } };
@@ -291,7 +292,9 @@ async function queries(session, target, count) {
     let responseDigest;
     let firstResult;
     for (let index = 0; index < count; index += 1) {
+      const requestedAt = performance.now();
       const response = await session.request(`textDocument/${operation}`, params);
+      observeSample?.(operation,response.latencyMs,requestedAt);
       assert.notEqual(response.result, null, `${operation} returned no data at benchmark target`);
       if (operation === "hover") assert.ok(response.result.contents, "hover omitted its contents");
       if (operation === "definition") {
@@ -310,7 +313,8 @@ async function queries(session, target, count) {
     }
     const sorted = [...samples].sort((left, right) => left - right);
     result[operation] = { samplesMs: samples, minimumMs: sorted[0],
-      medianMs: sorted[Math.floor(sorted.length / 2)], maximumMs: sorted.at(-1),
+      medianMs: sorted[Math.floor(sorted.length / 2)],
+      p95Ms: sorted[Math.ceil(sorted.length * 0.95) - 1], maximumMs: sorted.at(-1),
       resultSha256: responseDigest, result: firstResult };
   }
   return result;
@@ -351,7 +355,9 @@ function workSummary(records) {
     ffiReplayHits: phases.filter((record) => record.phase === "downstream_ffi_conversion" && record.outcome === "cache_hit").length,
     headerPhaseOutcomes: outcomeCounts,
     cacheStats: latest ?? null,
+    inventoryValidation: records.filter((record) => record.event === "cache.inventory.validation"),
     hydratedProjects: records.filter((record) => record.event === "cache.projects.hydrate"),
+    hydrationStarts: records.filter((record) => record.event === "cache.projects.hydration_start"),
     encodedProjects: records.filter((record) => record.event === "cache.projects.encode"),
     startupPhases: records.filter((record) => record.event === "cache.startup.phase"),
     sourceScans: records.filter((record) => record.event === "project.scan.complete"),
@@ -366,6 +372,22 @@ function assertWarmReuse(work) {
     assert.equal(work[name], 0, `unchanged restart performed ${name}`);
   }
   assert.ok(work.cacheStats, "unchanged restart omitted compiler cache counters");
+  assert.equal(work.hydratedProjects.length,0,"warm SQL readiness waited for project hydration");
+  assert.equal(work.hydrationStarts.length,0,"project hydration began before warm SQL readiness");
+  assert.equal(work.inventoryValidation.length,1,"warm inventory counters were not recorded once");
+  for (const field of ["reads","hashes"]) {
+    assert.equal(work.inventoryValidation[0][field],0,`warm inventory performed ${field}`);
+  }
+  assert.ok(work.sourceScans.length > 0,"warm validation omitted source scan counters");
+  for (const scan of work.sourceScans) {
+    for (const field of ["source_content_reads","source_content_hashes",
+      "external_content_reads","external_content_hashes"]) {
+      assert.equal(scan[field],0,`unchanged validation performed ${field}`);
+    }
+  }
+  for (const field of ["header_file_reads","header_file_hashes"]) {
+    assert.equal(work.cacheStats[field],0,`unchanged header validation performed ${field}`);
+  }
   for (const name of ["header_misses", "conversion_lookups", "conversion_hits", "conversion_misses"]) {
     assert.equal(work.cacheStats[name], 0, `unchanged restart reported ${name}`);
   }
@@ -462,6 +484,30 @@ async function runSession(options, target, label, probeIdentity, edit) {
   outcome.catch(() => undefined);
   options.control.child = child;
   child.stderr.pipe(log);
+  let logTail = "";
+  let hydrationOutcome;
+  let hydrationLogError;
+  const hydrated = new Promise((resolve,reject) => {
+    child.stderr.on("data", (chunk) => {
+      try {
+        logTail += chunk.toString("utf8");
+        const lines = logTail.split("\n");
+        logTail = lines.pop();
+        for (const line of lines) {
+          if (!line.startsWith(PREFIX)) continue;
+          const record = JSON.parse(line.slice(PREFIX.length));
+          if (record.event === "cache.startup.phase" && record.phase === "project_hydration") {
+            hydrationOutcome = { record, receivedAt: performance.now() };
+            resolve(hydrationOutcome);
+          }
+        }
+      } catch (cause) {
+        hydrationLogError = cause;
+        reject(cause);
+      }
+    });
+  });
+  hydrated.catch(() => undefined);
   const session = new Session(child, options.timeoutMs);
   let clean = false;
   const measurements = {};
@@ -481,12 +527,54 @@ async function runSession(options, target, label, probeIdentity, edit) {
     const indexingStarted = performance.now();
     session.send("initialized", {});
     const ready = await session.ready(indexingStarted);
+    const readyAt = performance.now();
     const readyResources = await sample(child.pid, target.ticks);
     measurements.initialIndex = { ...ready, ...difference(readyResources, initializedResources),
       launchToReadyWallMs: round(indexingStarted - started + ready.wallMs), cache: await cacheSizes(target.cache) };
     assertNoErrorDiagnostics(session);
     const queryStatusCount = session.statuses.length;
-    measurements.features = await queries(session, target, options.queries);
+    const hydrationSamples = {};
+    const observeSample = (operation,latencyMs,requestedAt) => {
+      if (hydrationOutcome && requestedAt >= hydrationOutcome.receivedAt) return;
+      (hydrationSamples[operation] ??= []).push(latencyMs);
+    };
+    measurements.features = await queries(session, target, options.queries,observeSample);
+    let hydrationQueryBatches = 0;
+    while (!hydrationOutcome) {
+      if (hydrationLogError) throw hydrationLogError;
+      assert.ok(performance.now() - readyAt < options.timeoutMs,
+        "background hydration exceeded its deadline");
+      assert.ok(hydrationQueryBatches++ < 10_000,"background hydration exceeded query sample bound");
+      const current = await queries(session,target,1,observeSample);
+      for (const operation of Object.keys(current)) {
+        assert.equal(current[operation].resultSha256,measurements.features[operation].resultSha256,
+          `background hydration changed ${operation} result`);
+      }
+    }
+    const completedHydration = await withTimeout(hydrated,"background hydration completion",options.timeoutMs);
+    if (hydrationLogError) throw hydrationLogError;
+    const afterHydration = await sample(child.pid,target.ticks);
+    const duringHydration = {};
+    for (const [operation,samplesMs] of Object.entries(hydrationSamples)) {
+      const sorted = [...samplesMs].sort((left,right) => left-right);
+      duringHydration[operation] = { samplesMs,count:sorted.length,minimumMs:sorted[0],
+        medianMs:sorted[Math.floor(sorted.length/2)],p95Ms:sorted[Math.ceil(sorted.length*0.95)-1],
+        maximumMs:sorted.at(-1) };
+    }
+    measurements.graphHydration = {
+      completionObservedAfterReady: completedHydration.receivedAt > readyAt,
+      readyToCompletionWallMs:round(Math.max(0,completedHydration.receivedAt-readyAt)),
+      launchToCompletionWallMs:round(completedHydration.receivedAt-started),
+      phase:completedHydration.record,queries:duringHydration,
+      resourcesAfterCompletion:afterHydration,
+      resourceSamplingIncludesConcurrentQueries:true,
+    };
+    measurements.featuresAfterHydration = await queries(session,target,options.queries);
+    for (const operation of Object.keys(measurements.features)) {
+      assert.equal(measurements.featuresAfterHydration[operation].resultSha256,
+        measurements.features[operation].resultSha256,
+        `completed hydration changed ${operation} result`);
+    }
     assert.equal(session.statuses.length, queryStatusCount, "unchanged queries triggered indexing");
     measurements.diagnostics = diagnostics(session);
     if (edit) {
@@ -529,6 +617,12 @@ async function runSession(options, target, label, probeIdentity, edit) {
   const records = recordsFromLog(await readFile(logFile, "utf8"));
   const split = splitInitialChain(records);
   measurements.initialWork = workSummary(split.initial);
+  const hydrationStart = records.findIndex((record) => record.event === "cache.projects.hydration_start");
+  const hydrationFinish = records.findIndex((record,index) => index > hydrationStart &&
+    record.event === "cache.startup.phase" && record.phase === "project_hydration");
+  assert.ok(hydrationStart >= 0 && hydrationFinish > hydrationStart,
+    "hydration lifecycle counters were not recorded");
+  measurements.graphHydration.work = workSummary(records.slice(hydrationStart,hydrationFinish+1));
   if (edit) measurements.savedEdit.work = workSummary(split.later);
   measurements.cacheAfterShutdown = await cacheSizes(target.cache);
   await writeFile(path.join(options.output, `${label}.json`), JSON.stringify(measurements, null, 2) + "\n");
@@ -621,6 +715,12 @@ async function benchmark(options) {
     report.restart = await runSession(options, target, "restart-and-edit", probeIdentity, true);
     report.reuseAssertions = { unchangedRestart: false, sparseImporter: false, changedHeader: false };
     assertWarmReuse(report.restart.initialWork);
+    for (const field of ["header_file_reads","header_file_hashes"]) {
+      assert.equal(report.restart.graphHydration.work.cacheStats?.[field],0,
+        `background hydration performed ${field}`);
+      assert.equal(report.restart.savedEdit.work.cacheStats?.[field],0,
+        `hydration or importer-only editing performed ${field}`);
+    }
     report.reuseAssertions.unchangedRestart = true;
     assertImporterReuse(report.restart.savedEdit.work, options.moduleName);
     report.reuseAssertions.sparseImporter = true;
@@ -630,10 +730,13 @@ async function benchmark(options) {
     const headerMutationStarted = performance.now();
     interrupted(options);
     await writeFile(target.header.filename, target.header.edited);
-    restoreTimes(options, target.header);
+    const changedHeaderTime = BigInt(Date.now()) * 1_000_000n > target.header.metadata.mtimeNs
+      ? BigInt(Date.now()) * 1_000_000n : target.header.metadata.mtimeNs + 1_000_000_000n;
+    python(options,"import os, sys; os.utime(sys.argv[1], ns=(int(sys.argv[2]),int(sys.argv[3])))",
+      [target.header.filename,String(target.header.metadata.atimeNs),String(changedHeaderTime)]);
     const headerMutationWallMs = round(performance.now() - headerMutationStarted);
     report.headerChange = await runSession(options, target, "changed-header", probeIdentity, false);
-    report.headerChange.mutation = { wallMs: headerMutationWallMs, mtimePreserved: true,
+    report.headerChange.mutation = { wallMs: headerMutationWallMs, mtimePreserved: false,
       originalBytes: target.header.original.length, changedBytes: target.header.edited.length,
       scenario: "header-only bytes changed while the server was closed; preceding saved source edit retained" };
     assertHeaderInvalidation(report.headerChange.initialWork, options.moduleName);
@@ -664,6 +767,8 @@ async function benchmark(options) {
     interrupted(options);
     report.sqlite = inspectSqlite(options, target);
     await writeFile(path.join(options.output, "sqlite-inspection.json"), JSON.stringify(report.sqlite, null, 2) + "\n");
+    assert.deepEqual(report.sqlite.databaseIntegrity, [["ok"]],
+      "workspace SQLite integrity check failed; see sqlite-inspection.json");
     report.completed = true;
   } catch (cause) {
     failure = options.control.interruption ?? cause;

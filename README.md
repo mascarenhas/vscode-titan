@@ -12,7 +12,7 @@ runtime modules, the embedded Lua interpreter, and the selected native
 dependencies. Initialized statically linked modules register their runtime
 openers in `package.preload`. Separately, the executable carries a metadata-only
 inventory of all 21 canonical Titan standard-module interfaces; compiler
-language-server API 6 validates and decodes those serialized interfaces and
+language-server API 1 validates and decodes those serialized interfaces and
 their build target's C type profile for project typechecking. The inventory
 contains no standard-module implementation, provider archive, header, or SDK
 payload.
@@ -210,17 +210,22 @@ VSIX is therefore self-contained for compiler discovery and does not inherit
 ambient `LUA_PATH` or `LUA_CPATH` defaults. Configured values replace the
 corresponding packaged template verbatim, so an override must be a complete Lua
 search path. Compatibility still requires both the matching Titan ABI and
-`titan-compiler.driver.LANGUAGE_SERVER_API_VERSION == 6`; API 6 includes the
+`titan-compiler.driver.LANGUAGE_SERVER_API_VERSION == 1`; API 1 includes the
 compiler's typed semantic metadata, incremental-analysis hooks, C-header
 dependency restat contract, checked-project graph codecs, completed C-header
-and FFI conversion cache transport, resolver-scoped I/O strategy with named
-completed-module yield checkpoints, and the validated metadata-only embedded
+and FFI conversion cache transport with separately refreshed timestamp observations,
+resolver-scoped I/O strategy with named completed-module yield checkpoints,
+bounded graph decoding and registry validation, and the validated metadata-only embedded
 interface provider used before disk-backed compiled providers. The provider's
 validated build target profile describes portable C types in those interfaces
 and their numeric conversions, allowing reflection imports and ordinary
 semantic analysis without a C compiler or Titan SDK. C header imports and
 native compilation still require the configured C toolchain and SDK. The ABI
 alone is not the language-server API contract.
+
+Titan is not publicly released; its language-server API version remains `1`
+until the first public release. Prerelease compiler and server changes are
+developed together against the exact pinned compiler revision.
 
 The two bundled trees contain ordinary Lua source and native Lua modules; they
 are not embedded into the executable. They contain no `lib/titan` provider tree,
@@ -362,9 +367,18 @@ is always omitted from source discovery and watchers. If it cannot be created
 or opened, the server logs that persistence is unavailable and uses the same
 SQLite backend in memory.
 
-Startup checks saved file contents, recorded header/search inputs, configuration,
-compiler files, and the native target before publishing reused answers. Changed
-inputs invalidate affected modules; incompatible or damaged cache data rebuilds.
+Startup checks saved source, header and compiler-input metadata, search inputs,
+configuration and the native target before publishing reused answers. Matching
+precise timestamps and physical metadata reuse stored content and hashes without
+rereading files. A timestamp change reads and hashes the file; unchanged content
+updates only the observation. Replacements, symlink changes and new earlier
+search candidates still invalidate affected inputs. Deliberate byte changes that
+preserve all trusted metadata are outside this policy.
+
+Validated SQL answers become available before compiler graphs finish hydrating.
+Hydration runs in an owned background task with frequent yields; saved edits and
+compiler-verified rename coordinate with that task. Incompatible or damaged
+cache data rebuilds through the ordinary indexing path.
 Changing only `exclude` changes watcher policy without invalidating compatible
 semantics. The cache is disposable: close the server before removing
 `.titan-ls` to force a fresh index.

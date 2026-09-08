@@ -35,56 +35,170 @@ local function configure(compiler: bridge.Compiler, settings: config.ProjectConf
     settings.extra_ffi_include_dirs,settings.extra_ffi_cppflags)
 end
 
-local function clean_names(snapshot: service.Snapshot): {string: boolean}
-  local names: {string: boolean} = {}
-  for index = 1, #snapshot.project_modules do
-    local module = snapshot.project_modules[index]
-    case module.analysis_state
-    when clean then names[module.module_name] = true
-    when failed then
-    when dirty then
+local function analysis_header_inputs(request: service.AnalysisRequest):
+    {bridge.CHeaderDependency}
+  local inputs: {bridge.CHeaderDependency} = {}
+  local seen: {string: boolean} = {}
+  for index = 1, #request.header_fingerprints do
+    local dependencies = request.header_fingerprints[index].dependencies
+    for dependency_index = 1, #dependencies do
+      local input = dependencies[dependency_index]
+      local kind = "file"
+      case input.kind
+      when file then
+      when search then kind = "search"
+      end
+      local key = kind .. "\0" .. input.path .. "\0" .. input.identity
+      if not seen[key] then
+        seen[key] = true
+        inputs[#inputs + 1] = input
+      end
     end
+    if index < #request.header_fingerprints then async.yield() end
   end
-  return names
+  return inputs
 end
 
-local function clean_payloads(payloads: {bridge.ProjectPayload},
-                               names: {string: boolean}): {bridge.ProjectPayload}
-  local result: {bridge.ProjectPayload} = {}
-  for index = 1, #payloads do
-    if names[payloads[index].module_name] then result[#result + 1] = payloads[index] end
+-- The Application owns this Task. Joining it never gives a query ownership of
+-- cancellation; shutdown explicitly cancels and drains it before Store.close.
+record Restoration
+  local const work: () -> {string}
+  local task: async.Task<{string}, value>?
+  local consumed: boolean
+end
+
+function restoration(work: () -> {string}): Restoration
+  return Restoration.new(work,nil,false)
+end
+
+function Restoration:start(on_miss: (() -> ())?)
+  if self.task ~= nil then return end
+  self.task = async.run<{string},value>(function (): {string}
+    -- READY and the completed SQL View are visible before decoding starts.
+    async.yield()
+    local missing = self.work()
+    if #missing > 0 and on_miss ~= nil then on_miss() end
+    return missing
+  end)
+end
+
+function Restoration:finish(loaded: service.Service)
+  self:start()
+  local missing: {string} = {}
+  case async.join<{string},value>(self.task as async.Task<{string},value>)
+  when succeeded: result then missing = result
+  when failed: failure then raise failure.error
+  when cancelled then
+    raise async.CancellationReason.simple("project restoration was cancelled")
+  else raise "project restoration did not finish"
   end
-  return result
+  if self.consumed then return end
+  -- Only the foreground updater calls finish. Background decoding never
+  -- mutates persisted graph state or the published semantic generation.
+  for index = 1, #missing do loaded:invalidate_cached_project(missing[index]) end
+  self.consumed = true
+end
+
+function Restoration:cancel()
+  local task? = self.task
+  if task ~= nil and not task:status():has_finished() then
+    task:cancel(async.CancellationReason.simple("language server application is closing"))
+  end
+end
+
+function Restoration:close()
+  self:cancel()
+  local task? = self.task
+  if task ~= nil then async.join(task) end
+end
+
+local function project_restoration(compiler: bridge.Compiler,
+    loaded: service.Service, cache: caches.Cache): Restoration
+  -- Snapshot only names/revisions here; BLOB reads belong to the background
+  -- task and release their individual Store leases before decoding can yield.
+  local candidates = cache:project_candidates()
+  return restoration(function (): {string}
+    local cpu = logging.clock()
+    local wall = monotonic.vscode_titan_monotonic_ms()
+    logging.emit("debug","cache.projects.hydration_start",{
+      ["candidates"] = #candidates,
+    })
+    local names: {string} = {}
+    local selected: {string: caches.ProjectCandidate} = {}
+    for index = 1, #candidates do
+      local candidate = candidates[index]
+      names[index] = candidate.module_name
+      selected[candidate.module_name] = candidate
+    end
+    local hydrated: {string: boolean} = {}
+    do
+      compiler:hydrate_project_cache(project_inputs(loaded:latest()),names,
+        function (name: string): (string?,{bridge.CHeaderDependency}?)
+          local payload? = cache:project_payload(selected[name])
+          if payload == nil then return nil,nil end
+          return payload.payload,payload.header_inputs
+        end,
+        function (name: string,snapshot: bridge.ModuleSnapshot): boolean
+          local candidate = selected[name]
+          local accepted = loaded:hydrate_project_snapshot_at_revision(
+            name,candidate.revision,snapshot)
+          if accepted then hydrated[name] = true end
+          return accepted
+        end)
+    catch
+      if error is async.CancellationReason then raise end
+      logging.emit("debug","cache.projects.restoration_miss",{
+        ["message"] = strings.tostring(error),
+      })
+    end
+    local missing: {string} = {}
+    for index = 1, #names do
+      if not hydrated[names[index]] then missing[#missing + 1] = names[index] end
+    end
+    compiler:log_cache_stats()
+    phase("project_hydration",cpu,wall)
+    return missing
+  end)
 end
 
 local function load_or_raise(project_root: string,
     progress_listener: bridge.ProgressListener?,
-    snapshot_listener: service.SnapshotListener?): (service.Service?,service.Error?)
+    snapshot_listener: service.SnapshotListener?): (service.Service?,service.Error?,Restoration?)
   local cpu = logging.clock()
   local wall = monotonic.vscode_titan_monotonic_ms()
   local compiler = bridge.load()
   local installed_root = compiler:installed_binary_modules_root()
   local settings?, config_error? = config.load(project_root,installed_root)
   if settings == nil then
-    return nil,service.Error.new(config_error.path,config_error.message)
+    return nil,service.Error.new(config_error.path,config_error.message),nil
   end
   configure(compiler,settings)
-  local inventory = compiler:cache_identity()
-  local current_configuration = settings:semantic_identity()
-  local compatibility = inventory .. current_configuration
-  local cache = caches.open(settings.project_root,compatibility)
-  phase("inventory",cpu,wall)
+  local cache = caches.open_for_inventory(settings.project_root)
   local loaded?: service.Service
+  local restoring: Restoration? = nil
   local complete = false
   defer do
     if not complete then
+      if restoring ~= nil then restoring:close() end
       if loaded ~= nil then loaded:close() else cache.store:close() end
     end
   end
+  local inventory = compiler:cache_identity(function (path: string): string
+    return cache:inventory_identity(path)
+  end)
+  local current_configuration = settings:semantic_identity()
+  local compatibility = inventory .. current_configuration
+  cache = cache:validate_inventory(settings.project_root,compatibility)
+  phase("inventory",cpu,wall)
   compiler:configure_cache(
-    function (kind: string,key: string): string? return cache:lookup(kind,key) end,
+    function (kind: string,key: string): (string?,{bridge.CHeaderDependency}?)
+      return cache:lookup(kind,key)
+    end,
     function (kind: string,key: string,payload: string,inputs: {bridge.CHeaderDependency})
       cache:stage(kind,key,payload,inputs)
+    end,
+    function (kind: string,key: string,inputs: {bridge.CHeaderDependency}): boolean
+      return cache:refresh_inputs(kind,key,inputs)
     end)
   cpu = logging.clock()
   wall = monotonic.vscode_titan_monotonic_ms()
@@ -98,9 +212,10 @@ local function load_or_raise(project_root: string,
   phase("native_context",cpu,wall)
   local analyzer: service.Analyzer = function (
       request: service.AnalysisRequest): bridge.Analysis
+    if restoring ~= nil and loaded ~= nil then restoring:finish(loaded) end
     configure(compiler,request.config)
     return compiler:analyze_incremental(request.project_modules,request.dirty_modules,
-      request.cached_sources,progress_listener)
+      request.cached_sources,progress_listener,analysis_header_inputs(request))
   end
   local resolver: service.ExternalResolver = function (
       current: config.ProjectConfig,projects: {string},
@@ -109,37 +224,18 @@ local function load_or_raise(project_root: string,
     return compiler:resolve_external_modules(projects,requests)
   end
   local restater: service.HeaderRestater = function (
-      inputs: {bridge.CHeaderDependency}): {bridge.CHeaderDependency}
-    return compiler:restat_c_header_dependencies(inputs)
+      inputs: {bridge.CHeaderDependency},validation: bridge.HeaderValidation?):
+      ({bridge.CHeaderDependency},boolean)
+    return compiler:restat_c_header_dependencies(inputs,validation)
   end
   local failure?: service.Error
   cpu = logging.clock()
   wall = monotonic.vscode_titan_monotonic_ms()
   loaded,failure = service.create_with_store(project_root,installed_root,
     analyzer,resolver,restater,cache.store)
-  if loaded == nil then return nil,failure end
+  if loaded == nil then return nil,failure,nil end
   phase("input_validation",cpu,wall)
-  cpu = logging.clock()
-  wall = monotonic.vscode_titan_monotonic_ms()
-  local current = loaded:latest()
-  local projects = project_inputs(current)
-  local names = clean_names(current)
-  local restored = compiler:hydrate_projects(projects,
-    clean_payloads(cache:project_payloads(),names))
-  local hydrated: {string: boolean} = {}
-  for index = 1, #restored do
-    local snapshot = restored[index]
-    if loaded:hydrate_project_snapshot(snapshot.module_name,snapshot) then
-      hydrated[snapshot.module_name] = true
-    else
-      compiler:drop_project_ast(snapshot.module_name)
-    end
-  end
-  for index = 1, #projects do
-    local name = projects[index].module_name
-    if names[name] and not hydrated[name] then loaded:invalidate_cached_project(name) end
-  end
-  phase("project_hydration",cpu,wall)
+  restoring = project_restoration(compiler,loaded,cache)
   loaded:set_publication_hooks(service.PublicationHooks.new(
     function (snapshot: service.Snapshot): boolean
       local next_configuration = snapshot.config:semantic_identity()
@@ -162,26 +258,32 @@ local function load_or_raise(project_root: string,
     function (connection: sqlite3.Connection) cache:publish(connection) end,
     function () cache:publication_committed() end))
   local report?, refresh_error? = loaded:run_pending(snapshot_listener)
-  if report == nil then return nil,refresh_error end
+  if report == nil then return nil,refresh_error,nil end
+  if not cache:can_reuse_publication() then
+    restoring:finish(loaded)
+    report,refresh_error = loaded:run_pending()
+    if report == nil then return nil,refresh_error,nil end
+  end
+  compiler:log_cache_stats()
   complete = true
-  return loaded,nil
+  return loaded,nil,restoring
 end
 
 function load(project_root: string,progress_listener: bridge.ProgressListener?,
                snapshot_listener: service.SnapshotListener?):
-    (service.Service?,service.Error?)
+    (service.Service?,service.Error?,Restoration?)
   do
     return load_or_raise(project_root,progress_listener,snapshot_listener)
   catch
     if error is async.CancellationReason then raise end
     if error is bridge.BridgeError then
       local failure = error as bridge.BridgeError
-      return nil,service.Error.new(failure.module_name,failure.message)
+      return nil,service.Error.new(failure.module_name,failure.message),nil
     end
-    if error is service.Error then return nil,error as service.Error end
+    if error is service.Error then return nil,error as service.Error,nil end
     if error is sqlite3.Error then
-      return nil,service.Error.new(project_root,(error as sqlite3.Error).message)
+      return nil,service.Error.new(project_root,(error as sqlite3.Error).message),nil
     end
-    return nil,service.Error.new(project_root,strings.tostring(error))
+    return nil,service.Error.new(project_root,strings.tostring(error)),nil
   end
 end

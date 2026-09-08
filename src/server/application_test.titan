@@ -17,6 +17,7 @@ local project_config = import "server.project_config"
 local project_graph = import "server.project_graph"
 local project_watcher = import "server.project_watcher"
 local project_service = import "server.project_service"
+local project_loader = import "server.project_loader"
 local semantic_features = import "server.semantic_features"
 local source_text = import "server.source_text"
 local stores = import "server.workspace_store"
@@ -443,10 +444,11 @@ local function with_cold_application(
     function (project_root: string,
               _progress_listener: bridge.ProgressListener?,
               snapshot_listener: project_service.SnapshotListener?):
-        (project_service.Service?, project_service.Error?)
-      return project_service.load_with_analyzer(
+        (project_service.Service?, project_service.Error?, project_loader.Restoration?)
+      local loaded?,failure? = project_service.load_with_analyzer(
         project_root, "/sdk/lib/titan/0.6", analyzer:analyze, nil,
         snapshot_listener)
+      return loaded,failure,nil
     end)
   defer do
     analyzer.block = false
@@ -598,10 +600,11 @@ local function recovers_configuration_load_failure_from_later_save()
     function (project_root: string,
               _progress_listener: bridge.ProgressListener?,
               snapshot_listener: project_service.SnapshotListener?):
-        (project_service.Service?, project_service.Error?)
-      return project_service.load_with_analyzer(
+        (project_service.Service?, project_service.Error?, project_loader.Restoration?)
+      local loaded?,failure? = project_service.load_with_analyzer(
         project_root, "/sdk/lib/titan/0.6", analyzer:analyze, nil,
         snapshot_listener)
+      return loaded,failure,nil
     end)
   defer app:close()
 
@@ -2421,4 +2424,154 @@ end
 
 function test_application_close_drains_updater_and_readers(_context: test.Context)
   test_runtime.run(close_drains_updater_and_readers)
+end
+
+local record RestorationGate
+  block: boolean
+  started: boolean
+  finished: boolean
+  cancelled: boolean
+  missing: boolean
+end
+
+local function with_restoring_application(missing: boolean,
+    body: (string, YieldingAnalyzer, RestorationGate, application.Application) -> ())
+  local root = fs.tmpname()
+  fs.unlink(root)
+  fs.mkdir(root)
+  local source_root = root .. "/src"
+  fs.mkdir(source_root)
+  local filename = source_root .. "/main.titan"
+  fs.write_file(filename,"function answer(): integer\n  return 1\nend\n")
+  defer do
+    if fs.lstat(filename) ~= nil then fs.unlink(filename) end
+    if fs.lstat(source_root) ~= nil then fs.rmdir(source_root) end
+    if fs.lstat(root) ~= nil then fs.rmdir(root) end
+  end
+  local analyzer = YieldingAnalyzer.new(0,false,false,false,false)
+  local gate = RestorationGate.new(true,false,false,false,missing)
+  local app = application.create_with_project_loader(root,
+    function (project_root: string,_progress: bridge.ProgressListener?,
+        listener: project_service.SnapshotListener?):
+        (project_service.Service?,project_service.Error?,project_loader.Restoration?)
+      local loaded?,failure? = project_service.load_with_analyzer(
+        project_root,"/sdk/lib/titan/0.6",analyzer:analyze,nil,listener)
+      if loaded == nil then return nil,failure,nil end
+      local restoring = project_loader.restoration(function (): {string}
+        gate.started = true
+        defer gate.finished = true
+        do
+          while gate.block do async.yield() end
+        catch
+          if error is async.CancellationReason then gate.cancelled = true end
+          raise
+        end
+        if gate.missing then return {"main"} end
+        return {}
+      end)
+      return loaded,nil,restoring
+    end)
+  defer do gate.block = false; app:close() end
+  body(filename,analyzer,gate,app)
+end
+
+local function serves_published_features_during_restoration()
+  with_restoring_application(false,function (filename: string,
+      analyzer: YieldingAnalyzer,gate: RestorationGate,app: application.Application)
+    local ready = false
+    app:set_indexing_listener(function (status: indexing_status.Status)
+      if indexing_status.state_name(status.state) == "ready" and not ready then
+        test.assert(not gate.started,"project restoration started before READY")
+        ready = true
+      end
+    end)
+    app:start_indexing()
+    wait_until(function (): boolean return gate.started end,
+      "project restoration did not start after publication")
+    app:stop_watching_for_testing()
+    test.assert(ready and not gate.finished,
+      "READY waited for project restoration")
+    local runs = analyzer.runs
+    test.assert(result_array_length(app:handle(request_for(
+      filename,501,"textDocument/foldingRange")),"folding during restoration") == 1,
+      "published folding rows were unavailable during restoration")
+    assert_result(app:handle(position_request_for(
+      filename,502,"textDocument/definition",1)),"definition during restoration")
+    assert_result(app:handle(position_request_for(
+      filename,503,"textDocument/hover",1)),"hover during restoration")
+    local references = position_request_for(filename,504,"textDocument/references",1)
+    local params = references.params as wire.Object
+    local context: wire.Object = {["includeDeclaration"] = true}
+    params["context"] = context
+    assert_result(app:handle(references),"references during restoration")
+    test.assert(analyzer.runs == runs and not gate.finished,
+      "read-only features waited for restoration or started analysis")
+    local rename = async.run<dispatcher.SemanticOutcome,value>(function ():
+        dispatcher.SemanticOutcome
+      return app:handle(request_for(filename,505,"textDocument/rename"))
+    end)
+    timer.yield()
+    test.assert(not rename:status():has_finished(),
+      "rename did not wait for the owned restoration")
+    rename:cancel(async.CancellationReason.simple("cancel waiting rename"))
+    async.join(rename)
+    test.assert(not gate.cancelled and not gate.finished,
+      "request cancellation cancelled application-owned restoration")
+    fs.write_file(filename,"function answer(): integer\n  return 999\nend\n")
+    app:note_saved_change()
+    timer.yield()
+    test.assert(analyzer.runs == runs,
+      "save analysis mutated compiler state before restoration finished")
+    gate.block = false
+    wait_until(function (): boolean
+      return not app:indexing_metrics().refresh_chain_active and analyzer.runs > runs
+    end,"save did not resume after restoration")
+    local snapshot = app:snapshot_for_testing() as project_service.Snapshot
+    test.assert(snapshot.project_modules[1].source_files[1].contents ==
+      "function answer(): integer\n  return 999\nend\n",
+      "save after restoration published stale bytes")
+  end)
+end
+
+function test_application_serves_sql_features_during_background_restoration(
+    _context: test.Context)
+  test_runtime.run(serves_published_features_during_restoration)
+end
+
+local function recovers_missing_restoration_payload()
+  with_restoring_application(true,function (_filename: string,
+      analyzer: YieldingAnalyzer,gate: RestorationGate,app: application.Application)
+    app:start_indexing()
+    wait_until(function (): boolean return gate.started end,
+      "missing-payload restoration did not start")
+    app:stop_watching_for_testing()
+    local before = analyzer.runs
+    gate.block = false
+    wait_until(function (): boolean
+      return analyzer.runs > before and not app:indexing_metrics().refresh_chain_active
+    end,"missing project payload did not schedule ordinary writer recovery")
+    test.assert(gate.finished and not gate.cancelled,
+      "missing-payload restoration was not drained")
+  end)
+end
+
+function test_application_recovers_missing_background_project_payload(
+    _context: test.Context)
+  test_runtime.run(recovers_missing_restoration_payload)
+end
+
+local function closes_blocked_restoration()
+  with_restoring_application(false,function (_filename: string,
+      _analyzer: YieldingAnalyzer,gate: RestorationGate,app: application.Application)
+    app:start_indexing()
+    wait_until(function (): boolean return gate.started end,
+      "shutdown restoration did not start")
+    app:close()
+    test.assert(gate.finished and gate.cancelled,
+      "shutdown did not cancel and drain project restoration before closing")
+  end)
+end
+
+function test_application_closes_blocked_background_restoration(_context: test.Context)
+  test_runtime.run(closes_blocked_restoration)
 end

@@ -45,6 +45,10 @@ project workflow.
 
 ## Toolchain and verification
 
+Titan is not publicly released. Keep its language-server API version at `1`
+until the first public release; update the compiler and its consumers together
+without incrementing that API version during prerelease development.
+
 The project owns an isolated Titan installation at `.titan/`; it is ignored by
 Git. Prefer `.titan/bin/titanc`, `.titan/bin/lua`, and
 `.titan/bin/luarocks` over ambient installations. Keep the package lockfile

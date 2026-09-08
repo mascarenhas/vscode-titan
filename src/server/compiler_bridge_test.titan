@@ -72,7 +72,7 @@ return function(mode, contextual_provider_file)
     TITAN_VERSION = "0.6.0",
     TITAN_LIBRARY_VERSION = "0.6",
     LANGUAGE_SERVER_API_VERSION =
-      mode == "wrong-language-server-api" and 5 or 6,
+      mode == "wrong-language-server-api" and 2 or 1,
     TITAN_SOURCE_PATH = ".",
     TITAN_BIN_PATH = "",
     INSTALL_PATHS = { titan_bin = "/opt/titan/lib/titan/0.6" },
@@ -84,7 +84,9 @@ return function(mode, contextual_provider_file)
   driver.project_entries_registry = function() return {} end
   driver.language_server_cache_identity = function() return "fixture-cache-identity" end
   driver.compiler_cache_stats = function()
-    return { headers = { lookups = 0, hits = 0, misses = 0 },
+    return { headers = { lookups = 0, hits = 0, misses = 0,
+        file_reads = 0, file_hashes = 0, metadata_reuses = 0,
+        search_checks = 0, memo_reuses = 0 },
       conversion = { lookups = 0, hits = 0, misses = 0 } }
   end
   if mode == "older-same-abi" then
@@ -205,11 +207,12 @@ return function(mode, contextual_provider_file)
         result[index] = {
           kind = input.kind,
           path = input.path,
+          observation = input.observation,
           identity = mode == "header-metadata"
             and input.identity .. ":restatted" or input.identity,
         }
       end
-      return result
+      return result, nil, mode == "header-metadata"
     end
   end
   driver.defaultloader = function(_, options)
@@ -377,7 +380,10 @@ return function(mode, contextual_provider_file)
       if mode == "header-metadata" then
         header_dependencies = {
           { kind = "file", path = "/headers/direct.h",
-            identity = "direct bytes" },
+            identity = "direct bytes", observation = {
+              modified_seconds = 123, modified_nanoseconds = 456,
+              physical_identity = "device:inode:target",
+            } },
           { kind = "search", path = "/headers/earlier.h",
             identity = "missing candidate" },
         }
@@ -673,11 +679,11 @@ function test_compiler_bridge_rejects_missing_incompatible_and_malformed_modules
   expect_bridge_error("older-same-abi",
                       "matching Titan ABI alone is insufficient")
   expect_bridge_error("wrong-language-server-api",
-                      "requires LANGUAGE_SERVER_API_VERSION 6")
+                      "requires LANGUAGE_SERVER_API_VERSION 1")
   expect_bridge_error("same-api-missing-restat",
                       "'restat_c_header_dependencies' must be a function, " ..
                       "found nil. Install a Titan compiler implementing " ..
-                      "LANGUAGE_SERVER_API_VERSION 6")
+                      "LANGUAGE_SERVER_API_VERSION 1")
   expect_bridge_error("same-api-missing-c-header-analysis",
                       "'new_c_header_analysis' must be a function, found nil")
   expect_bridge_error("same-api-missing-split-shell-words",
@@ -1187,8 +1193,13 @@ function test_compiler_bridge_normalizes_and_restats_c_header_dependencies(
     when search then
     else test.assert(false, "include candidate used file-input kind")
     end
-    local current = compiler:restat_c_header_dependencies(
-      snapshot.c_header_dependencies)
+    local current, changed = compiler:restat_c_header_dependencies(
+      snapshot.c_header_dependencies,bridge.header_validation())
+    local observation = current[1].observation as bridge.HeaderObservation
+    test.assert(changed and observation.modified_seconds == 123 and
+      observation.modified_nanoseconds == 456 and
+      observation.physical_identity == "device:inode:target",
+      "header restat lost its observation or explicit change result")
     test.assert(current[1].path == "/headers/direct.h" and
                 current[1].identity == "direct bytes:restatted" and
                 current[2].path == "/headers/earlier.h" and
@@ -3599,4 +3610,61 @@ end
 function test_compiler_bridge_joins_nominal_type_and_constructor_namespaces(
     _context: test.Context)
   run_bridge(joins_nominal_type_and_constructor_namespaces)
+end
+
+local function overlays_current_header_observations_on_project_payloads()
+  preload_real_compiler()
+  local root = fs.tmpname()
+  fs.unlink(root)
+  fs.mkdir(root)
+  local header = root .. "/observed.h"
+  fs.write_file(header,"typedef long project_observed_word;\n")
+  defer do fs.unlink(header); fs.rmdir(root) end
+  local name = "project_observed_header"
+  local projects = {bridge.ProjectModule.new(name,{
+    bridge.SourceFile.new(root .. "/project_observed_header.titan",
+      "local c = foreign import \"" .. header .. "\"\n" ..
+      "function answer(): integer return 42 end\n")})}
+  local compiler = bridge.load()
+  local analysis = compiler:analyze(name,projects)
+  test.assert(#analysis.diagnostics == 0,"header observation payload fixture failed")
+  local snapshot = analysis:find_module(name) as bridge.ModuleSnapshot
+  local current: {bridge.CHeaderDependency} = {}
+  local expected: bridge.HeaderObservation? = nil
+  for index = 1, #snapshot.c_header_dependencies do
+    local input = snapshot.c_header_dependencies[index]
+    local observation? = input.observation
+    if input.path == header and observation ~= nil then
+      observation = bridge.HeaderObservation.new(observation.modified_seconds + 1,
+        observation.modified_nanoseconds,observation.physical_identity)
+      expected = observation
+    end
+    current[index] = bridge.CHeaderDependency.new(
+      input.kind,input.path,input.identity,observation)
+  end
+  test.assert(expected ~= nil,"header fixture omitted its physical observation")
+  local payloads = compiler:export_projects(projects,{name})
+  test.assert(#payloads == 1,"header fixture did not encode its project graph")
+  local bytes = payloads[1].payload
+  local observed = bridge.ProjectPayload.new(name,bytes,current)
+  local restored = bridge.load():hydrate_projects(projects,{observed})
+  test.assert(#restored == 1 and observed.payload == bytes,
+    "observation overlay changed or rejected the saved graph bytes")
+  local matched = false
+  for index = 1, #restored[1].c_header_dependencies do
+    local input = restored[1].c_header_dependencies[index]
+    local observation? = input.observation
+    if input.path == header and observation ~= nil then
+      matched = observation.modified_seconds ==
+        (expected as bridge.HeaderObservation).modified_seconds and
+        observation.modified_nanoseconds ==
+          (expected as bridge.HeaderObservation).modified_nanoseconds
+    end
+  end
+  test.assert(matched,"typed decode boundary discarded current SQL header observations")
+end
+
+function test_compiler_bridge_overlays_current_header_observations_on_project_payloads(
+    _context: test.Context)
+  run_bridge(overlays_current_header_observations_on_project_payloads)
 end

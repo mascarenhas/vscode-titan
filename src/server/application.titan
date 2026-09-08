@@ -73,7 +73,7 @@ type RenameAnalyzer = (
   project_service.Snapshot, {bridge.ProjectModule}) -> bridge.Analysis
 type ProjectLoader = (
   string, bridge.ProgressListener?, project_service.SnapshotListener?) ->
-  (project_service.Service?, project_service.Error?)
+  (project_service.Service?, project_service.Error?, project_loader.Restoration?)
 
 local record RefreshChain
   const id: integer
@@ -106,6 +106,7 @@ record Application
   local directory_probes: DirectoryProbes
   local const rename_analyzer: RenameAnalyzer
   local const diagnostic_publisher: diagnostics.Publisher
+  local restoration: project_loader.Restoration?
 end
 
 -- Source-imported application tests use these counters to assert coalescing and
@@ -829,7 +830,7 @@ local function Application:refresh_once(): RefreshOutcome
     local service? = self.service
     if service == nil then
       self:ensure_provisional_watcher()
-      local loaded?, load_error? = self.project_loader(
+      local loaded?, load_error?, restoration? = self.project_loader(
         self.project_root,
         function (progress: bridge.AnalysisProgress)
           self:emit_compiler_progress(progress)
@@ -845,9 +846,17 @@ local function Application:refresh_once(): RefreshOutcome
         return RefreshOutcome.failure(Error.new(message))
       end
       self.service = loaded
+      self.restoration = restoration
       return RefreshOutcome.ready(self:install_view(loaded:latest()))
     end
 
+    -- Saved changes and rename preflight share the foreground updater. Join
+    -- outside a Store lease before mutating the live compiler or graph.
+    local restoration? = self.restoration
+    if restoration ~= nil then
+      restoration:finish(service)
+      self.restoration = nil
+    end
     local report?, refresh_error? = service:refresh_with_snapshot_listener(
       function (snapshot: project_service.Snapshot)
         self:reconcile_watcher(snapshot)
@@ -1082,6 +1091,14 @@ local function Application:start_refresh(force: boolean, reason: string):
             indexing_status.State.failed(), failure.message)
         when ready: view then
           self:emit_indexing_status(indexing_status.State.ready(), nil)
+          local restoration? = self.restoration
+          if restoration ~= nil and not self.closed then
+            restoration:start(function ()
+              -- Recovery belongs to the ordinary single writer. This callback
+              -- only schedules it while readers retain the completed SQL View.
+              if not self.closed then self:note_saved_change() end
+            end)
+          end
         end
       end
       return completed
@@ -1516,6 +1533,8 @@ function Application:close()
   self.directory_probes.next_index = 1
 
   local attempted_epoch? = self.active_refresh_epoch
+  local restoration? = self.restoration
+  if restoration ~= nil then restoration:cancel() end
   local refresh? = self.refresh_task
   if refresh ~= nil then
     -- Cancellation cannot submit ordinary SQLite rollback. Drain the updater
@@ -1529,6 +1548,8 @@ function Application:close()
       "cancelled", attempted_epoch as integer, nil)
   end
   self.active_refresh_epoch = nil
+  if restoration ~= nil then restoration:close() end
+  self.restoration = nil
 
   local watcher? = self.watcher
   self.watcher = nil
