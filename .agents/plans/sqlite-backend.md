@@ -1,9 +1,11 @@
 # Workspace SQLite backend (#20)
 
-Status: initial implementation, both representative benchmarks, local verification,
-and Linux hosted delivery completed in PR #55 and Titan PR #148. Titan #148 is
-merged at `534abf000ce7957113dfed780508e16535d0acd5`. Startup follow-up below is
-authorized and active. Branch: `agent/sqlite-backend`.
+Status: the SQLite backend and startup follow-up are implemented. Both actual-
+workspace sequences, their independent audits, and the complete local gates
+passed. Titan PR #153 is merged at `788b353bed8e2580bbf12bf8ebf4ad9e7f1ab47d`,
+and the extension workflow pins that master. Final packaging passed; the
+extension Linux delivery result is tracked on PR #55. Branch: `agent/sqlite-backend`. The initial delivery
+used Titan #148 at `534abf000ce7957113dfed780508e16535d0acd5`.
 
 Scope authority: [vscode-titan #20](https://github.com/mascarenhas/vscode-titan/issues/20).
 Baseline: vscode-titan `551d01785ea8cdbbcf2c7706158a2525f1658d31`, Titan
@@ -456,8 +458,9 @@ All 25 hosted compiler invocations had positive counts, totaling 3,349 passing
 tests plus 129 stdlib Lua tests. Hosted native validation passed 454 cases and
 skipped `json.tests.test_core_locale_independent_numbers` because the runner had
 no alternate numeric locale; local native validation passed all 455 cases.
-No macOS workflow was dispatched. The compiler PR remains open pending explicit
-merge authorization.
+No macOS workflow was dispatched. At that validation point, the compiler PR
+remained open pending explicit merge authorization; the later reconciliation
+section records the maintainer's authorization and updated prerequisites.
 
 Both new benchmark sequences passed, and an independent audit verified all
 64 latency distributions, feature-result parity, zero unchanged content
@@ -489,8 +492,9 @@ Remaining delivery steps:
 
 1. Update extension PR #55 and both descriptions with exact source, test and
    measurement evidence. Verify required Linux hosted checks and Codecov results.
-2. Present the concrete compiler PR for maintainer review and explicit merge
-   authorization. After the prerequisite reaches master, verify its live HEAD,
+2. Reconcile and verify the compiler prerequisite as described below. The
+   maintainer has authorized merging updated PR #153 after Linux CI is green.
+   After the prerequisite reaches master, verify its live HEAD,
    pin that commit in extension CI, and pass CI on the final extension commit.
 3. Update dependent issues and Project status from verified results. Leave the
    extension PR open; no extension merge or default-branch push is authorized.
@@ -498,3 +502,240 @@ Remaining delivery steps:
 Compiler/server ownership remains disjoint. Only the root owns shared extension
 build staging and publication of this plan. Builds and source changes must finish
 before the two benchmark sequences run without competing work.
+
+## Reconcile the concurrent probe simplification (8 September 2026 UTC)
+
+After the preceding validation, the maintainer merged Titan PR #151 as master
+`9ee0d47ad79a0c28efa0c4c14075f054d86a7ebd` and explicitly requested updating
+PR #153 without reverting any FFI probe-cache simplification. PR #153 at
+`f628e0aa414e4e0ba2b2e57521a49b3d8458e0bf` now conflicts with that master.
+The extension startup implementation and measurements are preserved in local
+commit `2f2d3cced20cd925c1baf7d7f870c5249927c669`; their original compiler tree
+and results remain dated evidence, not validation of the combined changes.
+The maintainer subsequently authorized merging updated PR #153 when its Linux
+CI is green, then pinning the resulting master HEAD in the extension PR. No
+further merge confirmation is needed once the reconciled review and gates pass.
+
+1. Read the new Titan guidance and source-only probe design before edits. Treat
+   the merged simplification as authoritative. Inspect the overlapping compiler,
+   C driver, FFI restoration, tests and documentation changes individually; do
+   not restore whole older files or removed probe context/manifest/result-cache
+   machinery. Independently audit this boundary, including forced-header
+   preprocessing reuse, before publishing a reconciled diff. Preserve raw C
+   source SHA-256 keys, format-1 bounded acceptance/rejection records, the single
+   analysis result cache and individual source-order probes. Parser-owned header
+   and graph validation remains separate from compiled-probe result memoization.
+2. Rebase the focused compiler change in an isolated checkout onto the new
+   master, preserving the metadata-first header/project transport, stable-read
+   certification, observation-only refresh, background yield/cancellation
+   contract and API 1 policy. Keep the active sibling checkout and prior frozen
+   runtime/evidence intact during reconciliation. Only change extension behavior
+   if the new compiler contract requires it, with an explicit regression.
+3. Run the affected focused compiler/probe/FFI tests and the complete compiler
+   and native gates on the combined sources. Refresh the isolated extension SDK,
+   verify the complete extension gate, and rerun both representative benchmarks
+   with a new frozen image after all builds stop. Preserve prior results and
+   report the new compiler/image identities and actual counts separately. Replace
+   the benchmark's removed `TITAN_PROBE_CACHE_IDENTITY` control with the supported
+   child-process `TITAN_PREFIX` cache-root override pointing at a fresh private
+   directory; retain the actual compiler installation via `TITAN_ROCKS_ROOT`.
+   Record that directory and verify probe records stay within it, without adding
+   a namespace to raw-source keys or changing probe policy.
+4. Review the final diff against the new master specifically for regressions of
+   PR #151, then update PR #153 with a lease guarded by its known previous head.
+   Verify all required Linux and Codecov results for the new head, then perform
+   the explicitly authorized merge with the reviewed head guarded. After
+   its prerequisite is merged, pin the then-live master HEAD, publish the final
+   extension commits and pass their Linux CI before completing the goal.
+
+The independent reconciliation review found no actionable blockers: `cprobe`
+retains only two parser-observation pass-through changes relative to master,
+and the checker copies observations through the new header-input collector.
+The new combined regression passed, demonstrating parser refresh with persisted
+raw-source acceptance/rejection reuse. Complete combined-source gates remain
+required before publication.
+
+The benchmark isolation update passed a three-child control fixture and syntax
+checks. It verifies a private format-1 miss followed by shared hits, retains the
+actual compiler installation and Lua paths, rejects disabled caching and wrong
+trace keys/paths/formats, and excludes retained probe files from database sizes.
+That fixture validates the harness controls; the representative runs must still
+validate real compiler traces. The README now documents the supported prefix
+override, and earlier measurements remain explicitly historical.
+
+The reconciled compiler is frozen at
+`189b0b8175ec40c4a73feb4a5263c8ac023888b7`, one commit above `9ee0d47`,
+with tree `e932daf28a59b3bb964213ea127322d98ae933f5`. Its canonical fresh
+`make -j4 test` passed 3,304 compiler/language tests across four shards,
+129 runtime/packaging tests and all 455 native standard-library tests.
+Both the source and installed compiler/parser modules matched the 61-file
+SHA-256 manifest. Evidence is `/tmp/titan-startup-source-only-full.log`
+and `/tmp/titan-startup-source-only-validation.json`.
+
+The extension SDK was rebuilt successfully from a separate source copy at that
+same revision; its installed 61 Lua modules also matched. An initially empty
+libbacktrace source directory was repaired in each private copy by copying only
+source inputs, followed by fresh configuration. No compiler source changes were
+needed. The complete extension verification gate was then run against that
+installed toolchain; the completed result and fixture correction are below. The sibling checkout remains clean and untouched at
+`f628e0aa`; its Titan sources, headers and project configuration are identical to
+the reconciled revision, so the actual workspace benchmark corpus is preserved.
+
+The first reconciled extension gate passed 301 of 302 native tests. Its existing
+`uses_analysis_local_ffi_configuration` fixture first caches a rejected native
+header context, then expects changing only preprocessing flags to invalidate
+that compiled result. That expectation belongs to the probe-context policy
+removed by #151. Review and adapt only this fixture to the source-only contract:
+keep path resolution, ordered flag tokenization, A/B/A parser-profile isolation,
+malformed configuration rejection, permit isolation and header-restat coverage;
+do not restore environment keys or change compiler production behavior. Establish
+a valid native context before testing parser rejection under invalid profiles,
+and use ordinary fixture-file identity where necessary to prevent cross-run
+result contamination. Verify the corrected focused test and rerun the full
+extension gate before publication. The compiler's 3,433/455 gate and frozen
+production revision remain valid unless this investigation finds a source bug.
+
+Two independent real-driver replays passed the corrected fixture. A unique real
+header basename prevents persistent results from earlier test runs; valid A runs
+first and its `#error` guard still requires native flag propagation. The typedef
+exists only under the valid flag profile and the Titan source references it,
+so later bad profiles reject through the parsed C-type view while intentionally
+reusing the stored native acceptance. A/B/A, missing-path and separate-driver
+cases passed with the expected persistent hits. Only the existing test fixture
+changed; no compiler or server production code changed. The complete extension
+gate was restarted with this correction.
+
+The corrected complete extension gate passed: 302 native tests, 56 JavaScript
+tests, 12 Extension Host tests, native protocol/Codex checks, staged installation,
+static linkage and SDK-free VSIX inspection. All 22 retained native workspace
+cache sessions have one `lifecycle.exit` with code 0 and a `server.stop` event.
+The terminal-backed gate exited 0; its log is
+`/tmp/vscode-startup-source-only-verify-20260908-r2.log`, with cache evidence in
+`/tmp/vscode-startup-source-only-verify-20260908-cache/`. The installed 61-file
+compiler/parser SHA-256 manifest was rechecked successfully after completion.
+
+Both new representative runs use one copied 92,127,376-byte native image at
+`.build/cache-benchmarks/startup-source-only-image-20260908/titan-language-server`,
+SHA-256 `91d08215ed7a849c955850ff2d4306fb7ea7e0cdce8cce624226512e8b11d21c`.
+At that checkpoint, the vscode-titan sequence had completed with all reuse and
+restoration assertions true; the Titan sequence and combined evidence audit
+were still pending. PR #153 had been updated to the reviewed `189b0b8` head with
+its exact prior-head lease, with Linux run
+[34189655010](https://github.com/mascarenhas/titan/actions/runs/34189655010).
+The subsequent hosted results, authorized merge, pin and completed measurements
+are recorded below.
+
+The first source-only Titan cold attempt reached the harness's 1,800,000 ms
+framed-response deadline while actively compiling declaration probes. It is
+retained as an incomplete attempt, not a measurement of a finished startup.
+The runner restored source/header bytes and timestamps and the prior workspace
+cache; the wrapper resumed the verified editor server. Before/after snapshots
+confirm that the installed probe cache did not change. The attempt retained
+8,924 private result records. Only the Titan sequence was repeated, with an
+explicit 7,200,000 ms per-phase deadline, a new output directory and empty
+private probe prefix, and the same verified image. Partial probe results were
+not reused, compiled-probe policy was preserved, and the incomplete evidence
+was retained. Reproduction commands now carry that deadline; the completed
+vscode-titan run remains the other completed measurement.
+
+The reconciled compiler Linux run
+[34189655010](https://github.com/mascarenhas/titan/actions/runs/34189655010)
+passed all three Linux lanes on `189b0b8`. Hosted native testing ran 455 cases
+with 454 passes and one unavailable-locale skip; all 455 passed locally. All
+19 sanitizer invocations had positive counts. The compiler/language lane
+confirmed the 3,304 cases and runtime coverage confirmed 129 cases. Both
+[Codecov checks](https://app.codecov.io/gh/mascarenhas/titan/pull/153) passed:
+92.52% project and 96.55% patch against 90% targets. macOS was skipped.
+
+Following the maintainer's explicit authorization, PR #153 was squash-merged
+on 2026-09-08 at 05:53:32 UTC with the exact reviewed head guarded. The resulting
+live master is `788b353bed8e2580bbf12bf8ebf4ad9e7f1ab47d`, with parent `9ee0d47`
+and tree `e932daf28a59b3bb964213ea127322d98ae933f5`, exactly matching the source
+tree used for local verification and both benchmark attempts. The extension
+workflow now pins that master commit. No SDK rebuild is required merely for
+the squash commit identity: the production tree and installed 61 Lua module
+checksums are unchanged. The completed Titan benchmark and report audit are
+recorded next; final package verification and the extension's own Linux gate
+remain separate delivery checks.
+
+### Completed reconciled measurements and independent audits
+
+Both complete sequences passed all three reuse assertions, feature parity,
+SQLite integrity, and input/cache restoration checks. They used the same frozen
+`91d08215...` image and compiler tree as the full local gates and merged master.
+Vscode-titan cold/warm-SQL/edit/header readiness was 66.807 / 1.542 / 6.054 /
+33.091 seconds; Titan R2 was 2,011.724 / 7.509 / 21.103 / 54.016 seconds. The
+33.5-minute Titan cold run includes the empty individual compiled-probe cache;
+it is reported directly, separately from the incomplete deadline attempt.
+No general cold-start improvement is claimed.
+
+Warm hydration completed 18.354 / 44.085 seconds after launch, while serving
+291 / 854 matching feature queries. The largest observed request latencies were
+457.443 / 503.564 ms; cooperative yielding establishes service availability,
+not a hard latency bound. All 64 retained latency distributions were recomputed,
+and actual stored feature result objects were rehashed and compared. Both warm
+validation sequences recorded zero source, external, header and compiler-
+inventory content reads/hashes and reused all 66 inventory observations. These
+are instrumented validation counters, not total filesystem I/O. Saved edits
+parsed, checked and encoded only `server.compiler_io` or `titan.sqlite3`, with
+1 / 4 FFI replay sites; changed headers triggered fresh preprocessing/parsing
+and 2 / 4 FFI conversion sites.
+
+Independent read-only SQLite checks matched all table counts and all five
+indexed `SEARCH` plans in each database. Final database sizes were 248,745,984 /
+918,376,448 bytes, with 62 / 63 project snapshots and no retained sidecars.
+Full CPU, lifetime peak RSS, phase boundaries, exact payload sizes and query
+distributions are in the refreshed benchmark report.
+
+All observed compiled-probe paths were controlled format-1 paths. Vscode-titan
+recorded 190 cold misses, one hit over the whole restart-and-edit process, and
+seven header-process hits; it retained 190 accepted records totaling 3,610 bytes.
+Titan recorded 9,496 cold misses, 285 restart-and-edit hits and 285 header hits;
+it retained 9,496 records (9,042 acceptance and 454 rejection), totaling 357,363
+bytes. These whole-process counters do not attribute hits to a subphase. Probe
+bytes are separate from SQLite; installation cache snapshots matched before
+and after each complete sequence.
+
+The runner restored source/header bytes and exact nanosecond timestamps and
+the prior workspace cache. Subsequent independent checks confirmed current
+bytes, precise mtime and mode with `O_NOATIME`; later ordinary reads may advance
+atime. Titan's editor process was resumed and verified running after both the
+incomplete attempt and completed R2. The actual Titan corpus remained clean at
+`f628e0aa`; its `.titan` files, headers and project configuration are identical
+to the reviewed `189b0b8` sources and therefore the merged master tree.
+
+Completed retained evidence is under
+`.build/cache-benchmarks/vscode-titan-startup-source-only-20260908/` and
+`.build/cache-benchmarks/titan-startup-source-only-20260908-r2/`. The three
+independent probe/statistical/database audits for each are under `/tmp` with
+prefixes `vscode-titan-source-only-20260908-` and
+`titan-source-only-20260908-r2-`. Compiler issue #150 closed automatically on
+the authorized merge; its Project 3 item is Done, with P1 priority and L size
+preserved. Extension PR #55 and its issues remain open for maintainer review.
+
+### Final package and extension publication
+
+The final Linux x64 package passed on 2026-09-08 after the completed report
+was included. It contains 226 entries and is 33,884,067 bytes, with SHA-256
+`a09957a15cdbff51f1cd5dd2a2018da147902d3588abda955a1ad7d320ca27d4`.
+Its 92,127,376-byte native server retains SHA-256
+`91d08215ed7a849c955850ff2d4306fb7ea7e0cdce8cce624226512e8b11d21c`,
+exactly the image measured in both complete benchmark sequences. All 61
+packaged compiler Lua modules match the reviewed source manifest; the packaged
+benchmark report is byte-identical to the tracked report. README content also
+matches after the packager's standard relative-link expansion.
+
+Final verification covered native linkage and exported Lua API, the plugin
+manifest, staged standalone installation and licenses, target-specific VSIX
+inspection, and the self-contained compiler-module protocol smoke without an
+SDK. The initial packaging attempt lacked two ignored LuaRocks source/notice
+files in the private source kit; copying those version-matched files from the
+validated source installation repaired license staging without changing any
+tracked compiler module or executable. The successful final run is retained at
+`/tmp/vscode-startup-source-only-package-20260908-r2.log`; its independent ZIP
+audit is `/tmp/vscode-final-package-audit-20260908.json`.
+
+The startup implementation, reconciled fixture/harness, compiler pin and report
+are delivered through [PR #55](https://github.com/mascarenhas/vscode-titan/pull/55).
+Its final Linux run and issue/Project evidence are recorded there after the
+commit is published. The extension PR remains open for maintainer review.

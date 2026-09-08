@@ -1819,12 +1819,17 @@ local function uses_analysis_local_ffi_configuration()
   local include_root = fs.tmpname()
   fs.unlink(include_root)
   fs.mkdir(include_root)
-  local header = include_root .. "/vscode_titan_lsp_project_only.h"
+  -- The literal include is part of a native probe's source-only cache key.
+  -- Give this temporary fixture its own real header name across test runs.
+  local header_name = "vscode_titan_lsp_project_only_" ..
+    strings.sub(include_root, #fs.tmpdir() + 2) .. ".h"
+  local header = include_root .. "/" .. header_name
   fs.write_file(header, [[
 #if VSCODE_TITAN_LSP_PROJECT_FLAG != 42
 #error project preprocessing flag is missing
-#endif
+#else
 typedef int vscode_titan_lsp_project_only_int;
+#endif
 ]])
   defer do
     fs.unlink(header)
@@ -1834,20 +1839,10 @@ typedef int vscode_titan_lsp_project_only_int;
   local module = bridge.ProjectModule.new("bridge_ffi_include", {
     bridge.SourceFile.new(
       "/workspace/bridge_ffi_include.titan",
-      "local c = foreign import \"vscode_titan_lsp_project_only.h\"\n" ..
+      "local c = foreign import \"" .. header_name .. "\"\n" ..
+      "local type ProjectInteger = c.vscode_titan_lsp_project_only_int\n" ..
       "function answer(): integer return 42 end\n")
   })
-  local missing = bridge.load()
-  local rejected = missing:analyze("bridge_ffi_include", {module})
-  test.assert(#rejected.diagnostics > 0,
-              "project-only FFI header unexpectedly resolved globally")
-
-  local include_only = bridge.load()
-  include_only:configure_paths(nil, nil, {include_root})
-  local missing_flag = include_only:analyze("bridge_ffi_include", {module})
-  test.assert(#missing_flag.diagnostics > 0,
-              "project FFI header ignored its required preprocessing flag")
-
   local configured = bridge.load()
   configured:configure_paths(
     nil, nil, {include_root},
@@ -1877,8 +1872,21 @@ typedef int vscode_titan_lsp_project_only_int;
   test.assert(observed ~= nil,
               "compiler bridge lost the resolved project FFI header")
 
-  -- Reconfigure one Compiler A -> B -> A. The middle analysis must not reuse
-  -- a probe cached under A, while the final analysis must accept A again.
+  -- Invalid profiles omit the required typedef from the parsed header;
+  -- #error also checks the real native compiler on the first valid analysis.
+  local missing = bridge.load()
+  local rejected = missing:analyze("bridge_ffi_include", {module})
+  test.assert(#rejected.diagnostics > 0,
+              "project-only FFI header unexpectedly resolved globally")
+
+  local include_only = bridge.load()
+  include_only:configure_paths(nil, nil, {include_root})
+  local missing_flag = include_only:analyze("bridge_ffi_include", {module})
+  test.assert(#missing_flag.diagnostics > 0,
+              "project FFI header ignored its required preprocessing flag")
+
+  -- Reconfigure one Compiler A -> B -> A. Each analysis must use its current
+  -- preprocessing profile; identical completed native probes may be reused.
   configured:configure_paths(nil, nil, {include_root})
   local reconfigured_without_flag =
     configured:analyze("bridge_ffi_include", {module})

@@ -5,7 +5,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { constants, createWriteStream } from "node:fs";
 import {
-  access, copyFile, lstat, mkdir, readFile, realpath, rename, rm, stat, writeFile
+  access, copyFile, lstat, mkdir, readFile, readdir, realpath, rename, rm, stat, writeFile
 } from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -42,6 +42,9 @@ startup after a header comment edit with a changed mtime. Measures SQL readiness
 background hydration completion, and query latency throughout hydration.
 Temporarily moves aside an existing .titan-ls and restores it afterward.
 Restores the target's original bytes and nanosecond atime/mtime in finally.
+Each run retains a fresh format-1 probe cache under OUTPUT/probe-prefix, shared
+by its three server processes and excluded from workspace database byte totals.
+TITAN_PROBE_CACHE_DISABLE=1 is rejected; compiler discovery keeps its real prefix.
 Do not run concurrently with another server or source edits in that workspace.
 Trace logging is always enabled; OS page caches are not flushed.`;
 }
@@ -111,6 +114,83 @@ async function futureRealpath(filename) {
     existing = path.dirname(existing);
   }
   return path.join(await realpath(existing), ...missing);
+}
+
+async function probeCacheConfiguration(options, inherited = process.env) {
+  assert.notEqual(inherited.TITAN_PROBE_CACHE_DISABLE, "1",
+    "TITAN_PROBE_CACHE_DISABLE=1 prevents a cache-enabled benchmark; unset it before measuring");
+  const rocksRoot = await realpath(inherited.TITAN_ROCKS_ROOT || path.join(REPOSITORY, ".titan"));
+  assert.ok((await stat(rocksRoot)).isDirectory(), "the actual Titan installation must be a directory");
+  const prefix = path.join(options.output, "probe-prefix");
+  assert.ok(path.isAbsolute(prefix), "the private probe prefix must be absolute");
+  return {
+    prefix, directory: path.join(prefix, "var/cache/titan-probes/1"), format: 1,
+    key: "SHA-256 of exact raw C source", rocksRoot,
+    sharedAcrossProcesses: true, retained: true, excludedFromDatabaseBytes: true,
+    inheritedEnvironment: Object.fromEntries([
+      "TITAN_PREFIX", "TITAN_ROCKS_ROOT", "TITAN_PROBE_CACHE_DISABLE", "TITAN_PROBE_CACHE_IDENTITY"
+    ].map((name) => [name, inherited[name] ?? null]))
+  };
+}
+
+function benchmarkEnvironment(probeCache, inherited = process.env) {
+  assert.notEqual(inherited.TITAN_PROBE_CACHE_DISABLE, "1",
+    "TITAN_PROBE_CACHE_DISABLE changed to 1 before process launch");
+  const luaRoot = path.join(probeCache.rocksRoot, "share/lua/5.5");
+  const environment = { ...inherited,
+    TITAN_PREFIX: probeCache.prefix, TITAN_ROCKS_ROOT: probeCache.rocksRoot,
+    TITAN_LS_LUA_PATH: inherited.TITAN_LS_LUA_PATH ?? `${luaRoot}/?.lua;${luaRoot}/?/init.lua`,
+    TITAN_LS_LUA_CPATH: inherited.TITAN_LS_LUA_CPATH ?? path.join(probeCache.rocksRoot, "lib/lua/5.5/?.so"),
+    TITAN_LANGUAGE_SERVER_LOG_LEVEL: "trace" };
+  // Raw-source probe keys have no namespace. The supported prefix changes only
+  // the disk-cache location and must not replace compiler installation discovery.
+  delete environment.TITAN_PROBE_CACHE_IDENTITY;
+  return environment;
+}
+
+async function probeCacheEvidence(records, probeCache, requireColdLookups = false) {
+  assert.equal(await futureRealpath(probeCache.directory), probeCache.directory,
+    "private probe cache may not traverse symlinks");
+  const paths = new Set();
+  let hits = 0;
+  let misses = 0;
+  for (const record of records) {
+    if (record.event !== "compiler.c_probe.cache") continue;
+    assert.equal(typeof record.key, "string", "probe cache trace omitted its raw-source key");
+    assert.match(record.key, /^[a-f0-9]{64}$/, "probe cache key must be a raw-source SHA-256 digest");
+    assert.equal(record.path, path.join(probeCache.directory, `${record.key}.result`),
+      "probe cache lookup escaped the controlled format-1 directory");
+    assert.equal(typeof record.hit, "boolean", "probe cache trace omitted hit/miss evidence");
+    paths.add(record.path);
+    if (record.hit) hits += 1; else misses += 1;
+  }
+  if (requireColdLookups) assert.ok(misses > 0,
+    "cold startup recorded no private probe-cache miss; cache-enabled cold storage was not demonstrated");
+  return { directory: probeCache.directory, format: probeCache.format,
+    observedRecords: hits + misses, uniquePaths: paths.size, hits, misses,
+    allObservedPathsControlled: true };
+}
+
+async function probeCacheSizes(probeCache) {
+  let files = 0;
+  let totalBytes = 0;
+  async function visit(directory) {
+    for (const entry of await readdir(directory, { withFileTypes: true })) {
+      const filename = path.join(directory, entry.name);
+      assert.ok(!entry.isSymbolicLink(), "retained probe cache contains a symlink");
+      if (entry.isDirectory()) await visit(filename);
+      else {
+        assert.ok(entry.isFile(), "retained probe cache contains a non-file entry");
+        files += 1;
+        totalBytes += (await stat(filename)).size;
+      }
+    }
+  }
+  assert.equal(await realpath(probeCache.prefix), probeCache.prefix,
+    "private probe prefix may not traverse symlinks");
+  await visit(probeCache.prefix);
+  return { prefix: probeCache.prefix, directory: probeCache.directory, format: probeCache.format,
+    files, totalBytes, retained: true, excludedFromDatabaseBytes: true };
 }
 
 async function savedInput(root, configured, subject) {
@@ -458,26 +538,26 @@ function assertNoErrorDiagnostics(session) {
     `workspace published ${errors.length} error diagnostics; see the partial session evidence`);
 }
 
-async function runSession(options, target, label, probeIdentity, edit) {
+async function runSession(options, target, label, probeCache, edit) {
   interrupted(options);
   const executable = await stat(options.server, { bigint: true });
   for (const field of ["dev", "ino", "size", "mtimeNs", "ctimeNs"]) {
     assert.equal(executable[field], target.serverMetadata[field],
       "native executable changed during the benchmark; rebuild before measuring");
   }
+  assert.equal(await realpath(probeCache.prefix), probeCache.prefix,
+    "private probe prefix changed before process launch");
+  assert.equal(await futureRealpath(probeCache.directory), probeCache.directory,
+    "private probe cache may not traverse symlinks");
   const logFile = path.join(options.output, `${label}.stderr.log`);
   const log = createWriteStream(logFile, { flags: "wx" });
   const logged = finished(log);
   // Observe failures immediately even while a long indexing phase is active.
   logged.catch(() => undefined);
   const started = performance.now();
-  const luaRoot = path.join(REPOSITORY, ".titan", "share", "lua", "5.5");
   const child = spawn(options.server, [], {
     cwd: options.root,
-    env: { ...process.env,
-      TITAN_LS_LUA_PATH: process.env.TITAN_LS_LUA_PATH ?? `${luaRoot}/?.lua;${luaRoot}/?/init.lua`,
-      TITAN_LS_LUA_CPATH: process.env.TITAN_LS_LUA_CPATH ?? path.join(REPOSITORY, ".titan/lib/lua/5.5/?.so"),
-      TITAN_PROBE_CACHE_IDENTITY: probeIdentity, TITAN_LANGUAGE_SERVER_LOG_LEVEL: "trace" },
+    env: benchmarkEnvironment(probeCache),
     stdio: ["pipe", "pipe", "pipe"]
   });
   const outcome = exitOf(child);
@@ -615,6 +695,7 @@ async function runSession(options, target, label, probeIdentity, edit) {
     await writeFile(path.join(options.output, `${label}.partial.json`), JSON.stringify(measurements, null, 2) + "\n");
   }
   const records = recordsFromLog(await readFile(logFile, "utf8"));
+  measurements.probeCache = await probeCacheEvidence(records, probeCache, label === "cold");
   const split = splitInitialChain(records);
   measurements.initialWork = workSummary(split.initial);
   const hydrationStart = records.findIndex((record) => record.event === "cache.projects.hydration_start");
@@ -662,14 +743,24 @@ print(json.dumps(result))
 }
 
 async function benchmark(options) {
+  assert.notEqual(process.env.TITAN_PROBE_CACHE_DISABLE, "1",
+    "TITAN_PROBE_CACHE_DISABLE=1 prevents a cache-enabled benchmark; unset it before measuring");
   const target = await validate(options);
   const token = randomUUID();
-  const probeIdentity = `workspace-cache-benchmark-${token}`;
+  const probeCache = await probeCacheConfiguration(options);
   const backup = path.join(options.root, `.titan-ls-benchmark-backup-${token}`);
   target.edited = Buffer.concat([target.original, Buffer.from(`\n-- workspace cache benchmark ${token}\n`)]);
   target.header.edited = Buffer.concat([target.header.original,
     Buffer.from(`\n/* workspace cache benchmark ${token} */\n`)]);
   await mkdir(options.output, { recursive: true });
+  await mkdir(probeCache.prefix);
+  assert.deepEqual(await readdir(probeCache.prefix), [], "the new private probe prefix must be empty");
+  probeCache.emptyBeforeCold = true;
+  const childEnvironment = benchmarkEnvironment(probeCache);
+  probeCache.effectiveEnvironment = Object.fromEntries([
+    "TITAN_PREFIX", "TITAN_ROCKS_ROOT", "TITAN_PROBE_CACHE_DISABLE", "TITAN_PROBE_CACHE_IDENTITY",
+    "TITAN_LS_LUA_PATH", "TITAN_LS_LUA_CPATH"
+  ].map((name) => [name, childEnvironment[name] ?? null]));
   await writeFile(path.join(options.output, "source-original.bin"), target.original, { flag: "wx" });
   await writeFile(path.join(options.output, "header-original.bin"), target.header.original, { flag: "wx" });
   const configPath = path.join(options.root, "titan-config.lua");
@@ -685,7 +776,7 @@ async function benchmark(options) {
       cpuModel: os.cpus()[0]?.model, logicalCpus: os.cpus().length, totalMemoryBytes: os.totalmem(),
       node: process.version, clockTicksPerSecond: target.ticks },
     checkout: checkoutState(options.root),
-    setup: { logLevel: "trace", probeIdentity, queriesPerFeature: options.queries,
+    setup: { logLevel: "trace", probeCache, queriesPerFeature: options.queries,
       timeoutMs: options.timeoutMs, osPageCacheFlushed: false, source: inputEvidence(target),
       header: inputEvidence(target.header),
       inheritedProbeCacheDisable: process.env.TITAN_PROBE_CACHE_DISABLE ?? null,
@@ -711,8 +802,8 @@ async function benchmark(options) {
     interrupted(options);
     if (target.cacheMetadata) { await rename(target.cache, backup); movedCache = true; }
     ownsCache = true;
-    report.cold = await runSession(options, target, "cold", probeIdentity, false);
-    report.restart = await runSession(options, target, "restart-and-edit", probeIdentity, true);
+    report.cold = await runSession(options, target, "cold", probeCache, false);
+    report.restart = await runSession(options, target, "restart-and-edit", probeCache, true);
     report.reuseAssertions = { unchangedRestart: false, sparseImporter: false, changedHeader: false };
     assertWarmReuse(report.restart.initialWork);
     for (const field of ["header_file_reads","header_file_hashes"]) {
@@ -735,7 +826,7 @@ async function benchmark(options) {
     python(options,"import os, sys; os.utime(sys.argv[1], ns=(int(sys.argv[2]),int(sys.argv[3])))",
       [target.header.filename,String(target.header.metadata.atimeNs),String(changedHeaderTime)]);
     const headerMutationWallMs = round(performance.now() - headerMutationStarted);
-    report.headerChange = await runSession(options, target, "changed-header", probeIdentity, false);
+    report.headerChange = await runSession(options, target, "changed-header", probeCache, false);
     report.headerChange.mutation = { wallMs: headerMutationWallMs, mtimePreserved: false,
       originalBytes: target.header.original.length, changedBytes: target.header.edited.length,
       scenario: "header-only bytes changed while the server was closed; preceding saved source edit retained" };
@@ -817,6 +908,13 @@ async function benchmark(options) {
       restorationErrors.push(cause.stack ?? String(cause));
       failure ??= cause;
     }
+    try {
+      report.probeCache = await probeCacheSizes(probeCache);
+    } catch (cause) {
+      report.completed = false;
+      report.probeCacheError = cause.stack ?? String(cause);
+      failure ??= cause;
+    }
     report.restored = report.sourceRestored && report.headerRestored && report.cacheRestored;
     if (restorationErrors.length > 0) report.restorationErrors = restorationErrors;
     report.completed = report.completed && report.restored;
@@ -847,4 +945,5 @@ async function main() {
 
 if (process.argv[1] !== undefined && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) await main();
 
-export { assertHeaderInvalidation, assertImporterReuse, assertWarmReuse, parseArguments, recordsFromLog, workSummary };
+export { assertHeaderInvalidation, assertImporterReuse, assertWarmReuse, benchmarkEnvironment,
+  parseArguments, probeCacheConfiguration, probeCacheEvidence, probeCacheSizes, recordsFromLog, workSummary };

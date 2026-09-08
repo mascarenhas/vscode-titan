@@ -109,10 +109,13 @@ The benchmark defaults to the extension's `debug` server-emission level so its
 numbers represent normal VS Code use. Pass `--log-level off` only when measuring
 the lower bound without structured-log overhead.
 
-For a controlled persistent-cache fill/warm comparison, set one unique
-`TITAN_PROBE_CACHE_IDENTITY` value and reuse it for the consecutive server
-processes. The value selects an isolated hashed cache namespace; changing it
-starts another namespace without deleting ordinary developer cache entries.
+For a controlled persistent-cache fill/warm comparison, set `TITAN_PREFIX` to
+a fresh absolute directory and reuse it for the consecutive server processes.
+Keep `TITAN_ROCKS_ROOT` pointed at the actual compiler installation, normally
+this repository's `.titan` directory. The private prefix holds ordinary
+source-only probe records under `var/cache/titan-probes/1`; it does not change
+their raw-source keys or delete ordinary developer cache entries. The workspace
+cache benchmark below manages this isolation automatically.
 
 An alternate saved target and additional ready-state probes can exercise a
 larger workspace in the same persistent server session. Probe positions are
