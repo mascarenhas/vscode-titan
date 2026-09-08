@@ -388,6 +388,9 @@ semantics. The cache is disposable: close the server before removing
 
 See [workspace SQLite measurements](docs/sqlite-backend-benchmarks.md) for
 restart and saved-edit timings, memory and disk usage, and reproduction commands.
+The [SQLite schema reference](docs/sqlite-backend-schema.md) documents every
+table and column, compiler graph payloads, measured storage costs, and the
+storage and probe-profiling research workflow.
 
 ## Package and install the VSIX
 
