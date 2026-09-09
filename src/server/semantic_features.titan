@@ -646,11 +646,25 @@ end
 
 local function prepare_internal(projects: {bridge.ProjectModule},
                                snapshots: {bridge.ModuleSnapshot},
+                               plan: indexer.PublicationPlan?,
                                yield_now: Yield?): PreparedView
   local state = ExtractionState.new(yield_now, 0)
   local owned_projects = copy_projects(projects)
-  local prepared = indexer.prepare(owned_projects, snapshots, yield_now)
-  local files = saved_files(owned_projects, prepared)
+  local prepared = plan ~= nil and
+    indexer.prepare_update(owned_projects, snapshots, plan, yield_now) or
+    indexer.prepare(owned_projects, snapshots, yield_now)
+  local extracted_projects = owned_projects
+  if plan ~= nil then
+    extracted_projects = {}
+    for index = 1, #owned_projects do
+      local project = owned_projects[index]
+      if plan:replaces(project.module_name) then
+        extracted_projects[#extracted_projects + 1] = project
+      end
+      account(state)
+    end
+  end
+  local files = saved_files(extracted_projects, prepared)
   local hovers: {MaterializedHover} = {}
   local folds: {MaterializedFold} = {}
   -- Partition once during extraction, avoiding an AST scan for every token.
@@ -665,8 +679,8 @@ local function prepare_internal(projects: {bridge.ProjectModule},
     bucket[#bucket + 1] = item
     account(state)
   end
-  for module_index = 1, #owned_projects do
-    local project = owned_projects[module_index]
+  for module_index = 1, #extracted_projects do
+    local project = extracted_projects[module_index]
     local snapshot? = snapshot_for_module(snapshots, project.module_name)
     if snapshot ~= nil then
       local nodes, by_id = hover_nodes(snapshot, files, state)
@@ -725,13 +739,42 @@ end
 
 function prepare(projects: {bridge.ProjectModule}, snapshots: {bridge.ModuleSnapshot},
                  yield_now: Yield?): PreparedView
-  return prepare_internal(projects, snapshots, yield_now)
+  return prepare_internal(projects, snapshots, nil, yield_now)
+end
+
+function prepare_update(projects: {bridge.ProjectModule},
+                        snapshots: {bridge.ModuleSnapshot},
+                        plan: indexer.PublicationPlan, yield_now: Yield?): PreparedView
+  return prepare_internal(projects, snapshots, plan, yield_now)
+end
+
+local function prune_module_features(connection: sqlite3.Connection, name: string)
+  workspace_store.execute(connection,
+    "DELETE FROM main.semantic_hovers WHERE filename IN " ..
+    "(SELECT filename FROM main.semantic_files WHERE module_name=?)", indexer.blob(name))
+  workspace_store.execute(connection,
+    "DELETE FROM main.semantic_folds WHERE filename IN " ..
+    "(SELECT filename FROM main.semantic_files WHERE module_name=?)", indexer.blob(name))
 end
 
 function PreparedView:publish(connection: sqlite3.Connection)
+  self.index:check_publication(connection)
+  -- File ownership must be read from the preceding publication. A removed
+  -- constituent, or a file transferred to another module, is no longer in the
+  -- replacement semantic_files rows after index publication.
+  local plan? = self.index.plan
+  if plan == nil or plan.rebuild_all then
+    indexer.execute(connection, "DELETE FROM main.semantic_hovers")
+    indexer.execute(connection, "DELETE FROM main.semantic_folds")
+  else
+    for index = 1, #plan.replaced_modules do
+      prune_module_features(connection, plan.replaced_modules[index])
+    end
+    for index = 1, #plan.removed_modules do
+      prune_module_features(connection, plan.removed_modules[index])
+    end
+  end
   self.index:publish(connection)
-  indexer.execute(connection, "DELETE FROM main.semantic_hovers")
-  indexer.execute(connection, "DELETE FROM main.semantic_folds")
   local offset = 1
   while offset <= #self.hovers do
     local finish = offset + 19

@@ -120,7 +120,7 @@ local function project_restoration(compiler: bridge.Compiler,
   return restoration(function (): {string}
     local cpu = logging.clock()
     local wall = ffi.vscode_titan_monotonic_ms()
-    logging.emit("debug","cache.projects.hydration_start",{
+    logging.emit("debug","cache.projects.restoration_start",{
       ["candidates"] = #candidates,
     })
     local names: {string} = {}
@@ -130,19 +130,18 @@ local function project_restoration(compiler: bridge.Compiler,
       names[index] = candidate.module_name
       selected[candidate.module_name] = candidate
     end
-    local hydrated: {string: boolean} = {}
+    local restored: {string: boolean} = {}
     do
-      compiler:hydrate_project_cache(project_inputs(loaded:latest()),names,
+      compiler:restore_project_cache(project_inputs(loaded:latest()),names,
         function (name: string): (string?,{bridge.CHeaderDependency}?)
           local payload? = cache:project_payload(selected[name])
           if payload == nil then return nil,nil end
           return payload.payload,payload.header_inputs
         end,
-        function (name: string,snapshot: bridge.ModuleSnapshot): boolean
+        function (name: string): boolean
           local candidate = selected[name]
-          local accepted = loaded:hydrate_project_snapshot_at_revision(
-            name,candidate.revision,snapshot)
-          if accepted then hydrated[name] = true end
+          local accepted = loaded:accepts_project_manifest(name,candidate.revision)
+          if accepted then restored[name] = true end
           return accepted
         end)
     catch
@@ -153,10 +152,10 @@ local function project_restoration(compiler: bridge.Compiler,
     end
     local missing: {string} = {}
     for index = 1, #names do
-      if not hydrated[names[index]] then missing[#missing + 1] = names[index] end
+      if not restored[names[index]] then missing[#missing + 1] = names[index] end
     end
     compiler:log_cache_stats()
-    phase("project_hydration",cpu,wall)
+    phase("project_restoration",cpu,wall)
     return missing
   end)
 end
@@ -235,6 +234,8 @@ local function load_or_raise(project_root: string,
     analyzer,resolver,restater,cache.store)
   if loaded == nil then return nil,failure,nil end
   phase("input_validation",cpu,wall)
+  local unpublished = cache:unpublished_projects()
+  for index = 1, #unpublished do loaded:invalidate_cached_project(unpublished[index]) end
   restoring = project_restoration(compiler,loaded,cache)
   loaded:set_publication_hooks(service.PublicationHooks.new(
     function (snapshot: service.Snapshot): boolean

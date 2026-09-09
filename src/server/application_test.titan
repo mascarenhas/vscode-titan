@@ -2,6 +2,7 @@ local async = import "async"
 local fs = import "fs"
 local json = import "json"
 local os = import "os"
+local sqlite3 = import "sqlite3"
 local strings = import "string"
 local test = import "test"
 local timer = import "timer"
@@ -1119,9 +1120,10 @@ local function refreshes_unmapped_warnings_only_during_ordinary_discovery()
               #publications[removed_uri].items == 1,
               "initial saved discovery did not publish unmapped warnings")
   local saved = service:latest()
-  local projects, snapshots = application.project_inputs(saved)
+  local projects, snapshots = application.project_inputs(saved, {})
   test.assert(#saved.project_modules == 1 and #projects == 1 and
-              #snapshots == 1 and projects[1].module_name == "main",
+              #snapshots == 0 and projects[1].module_name == "main" and
+              saved.project_modules[1].compiler_snapshot == nil,
               "unmapped sources reached compiler or semantic project inputs")
   local features = semantic_features.build(projects, snapshots)
   defer features:close()
@@ -1214,7 +1216,18 @@ local function builds_semantics_from_independently_valid_modules()
     local saved = snapshot as project_service.Snapshot
     test.assert(#saved.project_modules == 1,
                 "partial semantic-view fixture has unexpected modules")
-    local valid = saved.project_modules[1]
+    local completed = saved.project_modules[1]
+    test.assert(completed.compiler_snapshot == nil,
+      "accepted publication retained the valid module's body snapshot")
+    local fresh_files: {bridge.SourceFile} = {}
+    for index = 1, #completed.source_files do
+      local file = completed.source_files[index]
+      fresh_files[index] = bridge.SourceFile.new(file.filename, file.contents)
+    end
+    local valid = project_service.ProjectModule.new(completed.module_name,
+      completed.source_files,
+      project_snapshot(bridge.ProjectModule.new(completed.module_name, fresh_files)),
+      {}, project_service.ProjectAnalysisState.clean())
     local original_stamp = valid.source_files[1].stamp
     local failed_filename = saved.config.include[1] ..
                             "/failed.titan"
@@ -1231,7 +1244,7 @@ local function builds_semantics_from_independently_valid_modules()
       saved.project_directories, {valid, failed}, saved.external_modules,
       {})
 
-    local projects, snapshots = application.project_inputs(partial)
+    local projects, snapshots = application.project_inputs(partial, {valid.module_name, "failed"})
     test.assert(#projects == 2 and projects[1].module_name ==
                   valid.module_name and projects[2].module_name == "failed" and
                 #snapshots == 1 and snapshots[1].module_name ==
@@ -1247,8 +1260,8 @@ local function builds_semantics_from_independently_valid_modules()
                   failed_filename, source_text.Position.new(0, 0)) == nil,
                 "failed module exposed stale compiler semantics")
 
-    -- A clean module without a checked snapshot is an internal service
-    -- inconsistency, not a recoverable source diagnostic.
+    -- A retained clean module needs no body. Replacing its SQL facts still
+    -- requires the fresh checked snapshot for that exact revision.
     local malformed = project_service.ProjectModule.new(
       "malformed", valid.source_files, nil, {},
       project_service.ProjectAnalysisState.clean())
@@ -1256,8 +1269,11 @@ local function builds_semantics_from_independently_valid_modules()
       saved.generation, saved.config, saved.discovery_issues,
       saved.project_directories, {malformed}, saved.external_modules, {})
     local rejected = false
+    local retained_projects, retained_snapshots = application.project_inputs(inconsistent, {})
+    test.assert(#retained_projects == 1 and #retained_snapshots == 0,
+      "retained clean SQL facts required a body snapshot")
     do
-      application.project_inputs(inconsistent)
+      application.project_inputs(inconsistent, {"malformed"})
     catch
       rejected = error is application.Error
     end
@@ -2372,6 +2388,66 @@ local function rejects_query_captured_before_sql_publication()
     test.assert(result_array_length(app:handle(request_for(
       filename, 502, "textDocument/foldingRange")), "new published view query") == 1,
       "new query could not read the replacement publication")
+  end)
+end
+
+function test_application_rolls_back_missing_schema_and_retries_publication(
+    _context: test.Context)
+  test_runtime.run(function ()
+    with_application(function (filename: string, _analyzer: YieldingAnalyzer,
+                               app: application.Application)
+      app:stop_watching_for_testing()
+      local service = app.service as project_service.Service
+      local store = service:workspace_store()
+      local before = app.completed_view as application.View
+      fs.write_file(filename, "function answer(): integer return 2 end\n")
+      local report?, failure? = service:refresh()
+      test.assert(report ~= nil and failure == nil,
+        "missing-schema fixture did not produce a fresh clean snapshot")
+      local snapshot = service:latest()
+      do
+        local access = store:acquire()
+        defer access:release()
+        stores.execute(access.connection, "DROP TABLE main.semantic_files")
+      end
+      local reject = true
+      service:set_publication_hooks(project_service.PublicationHooks.new(
+        function (_snapshot: project_service.Snapshot): boolean return false end,
+        function (_connection: sqlite3.Connection)
+          if reject then raise "reject recreated semantic schema" end
+        end))
+      local rejected = false
+      do app:publish_view(service, snapshot, nil)
+      catch rejected = error == "reject recreated semantic schema" end
+      test.assert(rejected, "publication fixture did not reject its recreated schema")
+      do
+        local access = store:acquire()
+        defer access:release()
+        test.assert(access.connection:get_autocommit() and
+          stores.scalar_integer(access.connection,
+            "SELECT COUNT(*) FROM main.sqlite_master WHERE type='table' AND name='semantic_files'") == 0 and
+          stores.scalar_integer(access.connection,
+            "SELECT published_generation FROM main.store_state WHERE singleton=1") == before.published_generation and
+          stores.scalar_integer(access.connection, "SELECT COUNT(*) FROM main.semantic_folds") == 1,
+          "rollback committed empty recreated tables or changed the preceding publication")
+      end
+      test.assert(service:project_ast("main") ~= nil,
+        "failed publication released the fresh snapshot needed by its retry")
+      reject = false
+      local recovered = app:publish_view(service, snapshot, nil)
+      app.completed_view = recovered
+      test.assert(recovered.published_generation == before.published_generation + 1 and
+        #recovered.features:folding_ranges(filename) == 0 and
+        service:project_ast("main") == nil,
+        "retry retained stale folds or failed to commit and release its fresh snapshot")
+      local access = store:acquire()
+      defer access:release()
+      local files = stores.rows(access.connection,
+        "SELECT contents FROM main.semantic_files WHERE filename=?", sqlite3.Blob.new(filename))
+      test.assert(#files == 1 and stores.bytes(files[1], 1) ==
+        "function answer(): integer return 2 end\n",
+        "retry treated its missing saved-file table as reusable")
+    end)
   end)
 end
 

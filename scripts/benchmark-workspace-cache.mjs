@@ -39,10 +39,10 @@ function usage() {
 
 Runs cold startup, unchanged restart, one saved source comment edit, and
 startup after a header comment edit with a changed mtime. Measures SQL readiness,
-background hydration completion, and query latency throughout hydration.
+background restoration completion, and query latency throughout restoration.
 Temporarily moves aside an existing .titan-ls and restores it afterward.
 Restores the target's original bytes and nanosecond atime/mtime in finally.
-Each run retains a fresh format-1 probe cache under OUTPUT/probe-prefix, shared
+Each run retains a fresh format-2 probe cache under OUTPUT/probe-prefix, shared
 by its three server processes and excluded from workspace database byte totals.
 TITAN_PROBE_CACHE_DISABLE=1 is rejected; compiler discovery keeps its real prefix.
 Do not run concurrently with another server or source edits in that workspace.
@@ -124,7 +124,7 @@ async function probeCacheConfiguration(options, inherited = process.env) {
   const prefix = path.join(options.output, "probe-prefix");
   assert.ok(path.isAbsolute(prefix), "the private probe prefix must be absolute");
   return {
-    prefix, directory: path.join(prefix, "var/cache/titan-probes/1"), format: 1,
+    prefix, directory: path.join(prefix, "var/cache/titan-probes/2"), format: 2,
     key: "SHA-256 of exact raw C source", rocksRoot,
     sharedAcrossProcesses: true, retained: true, excludedFromDatabaseBytes: true,
     inheritedEnvironment: Object.fromEntries([
@@ -159,7 +159,7 @@ async function probeCacheEvidence(records, probeCache, requireColdLookups = fals
     assert.equal(typeof record.key, "string", "probe cache trace omitted its raw-source key");
     assert.match(record.key, /^[a-f0-9]{64}$/, "probe cache key must be a raw-source SHA-256 digest");
     assert.equal(record.path, path.join(probeCache.directory, `${record.key}.result`),
-      "probe cache lookup escaped the controlled format-1 directory");
+      "probe cache lookup escaped the controlled format-2 directory");
     assert.equal(typeof record.hit, "boolean", "probe cache trace omitted hit/miss evidence");
     paths.add(record.path);
     if (record.hit) hits += 1; else misses += 1;
@@ -436,8 +436,8 @@ function workSummary(records) {
     headerPhaseOutcomes: outcomeCounts,
     cacheStats: latest ?? null,
     inventoryValidation: records.filter((record) => record.event === "cache.inventory.validation"),
-    hydratedProjects: records.filter((record) => record.event === "cache.projects.hydrate"),
-    hydrationStarts: records.filter((record) => record.event === "cache.projects.hydration_start"),
+    restoredProjects: records.filter((record) => record.event === "cache.projects.restore"),
+    restorationStarts: records.filter((record) => record.event === "cache.projects.restoration_start"),
     encodedProjects: records.filter((record) => record.event === "cache.projects.encode"),
     startupPhases: records.filter((record) => record.event === "cache.startup.phase"),
     sourceScans: records.filter((record) => record.event === "project.scan.complete"),
@@ -452,8 +452,8 @@ function assertWarmReuse(work) {
     assert.equal(work[name], 0, `unchanged restart performed ${name}`);
   }
   assert.ok(work.cacheStats, "unchanged restart omitted compiler cache counters");
-  assert.equal(work.hydratedProjects.length,0,"warm SQL readiness waited for project hydration");
-  assert.equal(work.hydrationStarts.length,0,"project hydration began before warm SQL readiness");
+  assert.equal(work.restoredProjects.length,0,"warm SQL readiness waited for project restoration");
+  assert.equal(work.restorationStarts.length,0,"project restoration began before warm SQL readiness");
   assert.equal(work.inventoryValidation.length,1,"warm inventory counters were not recorded once");
   for (const field of ["reads","hashes"]) {
     assert.equal(work.inventoryValidation[0][field],0,`warm inventory performed ${field}`);
@@ -565,9 +565,9 @@ async function runSession(options, target, label, probeCache, edit) {
   options.control.child = child;
   child.stderr.pipe(log);
   let logTail = "";
-  let hydrationOutcome;
-  let hydrationLogError;
-  const hydrated = new Promise((resolve,reject) => {
+  let restorationOutcome;
+  let restorationLogError;
+  const restored = new Promise((resolve,reject) => {
     child.stderr.on("data", (chunk) => {
       try {
         logTail += chunk.toString("utf8");
@@ -576,18 +576,18 @@ async function runSession(options, target, label, probeCache, edit) {
         for (const line of lines) {
           if (!line.startsWith(PREFIX)) continue;
           const record = JSON.parse(line.slice(PREFIX.length));
-          if (record.event === "cache.startup.phase" && record.phase === "project_hydration") {
-            hydrationOutcome = { record, receivedAt: performance.now() };
-            resolve(hydrationOutcome);
+          if (record.event === "cache.startup.phase" && record.phase === "project_restoration") {
+            restorationOutcome = { record, receivedAt: performance.now() };
+            resolve(restorationOutcome);
           }
         }
       } catch (cause) {
-        hydrationLogError = cause;
+        restorationLogError = cause;
         reject(cause);
       }
     });
   });
-  hydrated.catch(() => undefined);
+  restored.catch(() => undefined);
   const session = new Session(child, options.timeoutMs);
   let clean = false;
   const measurements = {};
@@ -613,47 +613,47 @@ async function runSession(options, target, label, probeCache, edit) {
       launchToReadyWallMs: round(indexingStarted - started + ready.wallMs), cache: await cacheSizes(target.cache) };
     assertNoErrorDiagnostics(session);
     const queryStatusCount = session.statuses.length;
-    const hydrationSamples = {};
+    const restorationSamples = {};
     const observeSample = (operation,latencyMs,requestedAt) => {
-      if (hydrationOutcome && requestedAt >= hydrationOutcome.receivedAt) return;
-      (hydrationSamples[operation] ??= []).push(latencyMs);
+      if (restorationOutcome && requestedAt >= restorationOutcome.receivedAt) return;
+      (restorationSamples[operation] ??= []).push(latencyMs);
     };
     measurements.features = await queries(session, target, options.queries,observeSample);
-    let hydrationQueryBatches = 0;
-    while (!hydrationOutcome) {
-      if (hydrationLogError) throw hydrationLogError;
+    let restorationQueryBatches = 0;
+    while (!restorationOutcome) {
+      if (restorationLogError) throw restorationLogError;
       assert.ok(performance.now() - readyAt < options.timeoutMs,
-        "background hydration exceeded its deadline");
-      assert.ok(hydrationQueryBatches++ < 10_000,"background hydration exceeded query sample bound");
+        "background restoration exceeded its deadline");
+      assert.ok(restorationQueryBatches++ < 10_000,"background restoration exceeded query sample bound");
       const current = await queries(session,target,1,observeSample);
       for (const operation of Object.keys(current)) {
         assert.equal(current[operation].resultSha256,measurements.features[operation].resultSha256,
-          `background hydration changed ${operation} result`);
+          `background restoration changed ${operation} result`);
       }
     }
-    const completedHydration = await withTimeout(hydrated,"background hydration completion",options.timeoutMs);
-    if (hydrationLogError) throw hydrationLogError;
-    const afterHydration = await sample(child.pid,target.ticks);
-    const duringHydration = {};
-    for (const [operation,samplesMs] of Object.entries(hydrationSamples)) {
+    const completedRestoration = await withTimeout(restored,"background restoration completion",options.timeoutMs);
+    if (restorationLogError) throw restorationLogError;
+    const afterRestoration = await sample(child.pid,target.ticks);
+    const duringRestoration = {};
+    for (const [operation,samplesMs] of Object.entries(restorationSamples)) {
       const sorted = [...samplesMs].sort((left,right) => left-right);
-      duringHydration[operation] = { samplesMs,count:sorted.length,minimumMs:sorted[0],
+      duringRestoration[operation] = { samplesMs,count:sorted.length,minimumMs:sorted[0],
         medianMs:sorted[Math.floor(sorted.length/2)],p95Ms:sorted[Math.ceil(sorted.length*0.95)-1],
         maximumMs:sorted.at(-1) };
     }
-    measurements.graphHydration = {
-      completionObservedAfterReady: completedHydration.receivedAt > readyAt,
-      readyToCompletionWallMs:round(Math.max(0,completedHydration.receivedAt-readyAt)),
-      launchToCompletionWallMs:round(completedHydration.receivedAt-started),
-      phase:completedHydration.record,queries:duringHydration,
-      resourcesAfterCompletion:afterHydration,
+    measurements.manifestRestoration = {
+      completionObservedAfterReady: completedRestoration.receivedAt > readyAt,
+      readyToCompletionWallMs:round(Math.max(0,completedRestoration.receivedAt-readyAt)),
+      launchToCompletionWallMs:round(completedRestoration.receivedAt-started),
+      phase:completedRestoration.record,queries:duringRestoration,
+      resourcesAfterCompletion:afterRestoration,
       resourceSamplingIncludesConcurrentQueries:true,
     };
-    measurements.featuresAfterHydration = await queries(session,target,options.queries);
+    measurements.featuresAfterRestoration = await queries(session,target,options.queries);
     for (const operation of Object.keys(measurements.features)) {
-      assert.equal(measurements.featuresAfterHydration[operation].resultSha256,
+      assert.equal(measurements.featuresAfterRestoration[operation].resultSha256,
         measurements.features[operation].resultSha256,
-        `completed hydration changed ${operation} result`);
+        `completed restoration changed ${operation} result`);
     }
     assert.equal(session.statuses.length, queryStatusCount, "unchanged queries triggered indexing");
     measurements.diagnostics = diagnostics(session);
@@ -698,12 +698,12 @@ async function runSession(options, target, label, probeCache, edit) {
   measurements.probeCache = await probeCacheEvidence(records, probeCache, label === "cold");
   const split = splitInitialChain(records);
   measurements.initialWork = workSummary(split.initial);
-  const hydrationStart = records.findIndex((record) => record.event === "cache.projects.hydration_start");
-  const hydrationFinish = records.findIndex((record,index) => index > hydrationStart &&
-    record.event === "cache.startup.phase" && record.phase === "project_hydration");
-  assert.ok(hydrationStart >= 0 && hydrationFinish > hydrationStart,
-    "hydration lifecycle counters were not recorded");
-  measurements.graphHydration.work = workSummary(records.slice(hydrationStart,hydrationFinish+1));
+  const restorationStart = records.findIndex((record) => record.event === "cache.projects.restoration_start");
+  const restorationFinish = records.findIndex((record,index) => index > restorationStart &&
+    record.event === "cache.startup.phase" && record.phase === "project_restoration");
+  assert.ok(restorationStart >= 0 && restorationFinish > restorationStart,
+    "restoration lifecycle counters were not recorded");
+  measurements.manifestRestoration.work = workSummary(records.slice(restorationStart,restorationFinish+1));
   if (edit) measurements.savedEdit.work = workSummary(split.later);
   measurements.cacheAfterShutdown = await cacheSizes(target.cache);
   await writeFile(path.join(options.output, `${label}.json`), JSON.stringify(measurements, null, 2) + "\n");
@@ -768,7 +768,7 @@ async function benchmark(options) {
   if (configBytes !== undefined) {
     await writeFile(path.join(options.output, "workspace-config.lua"), configBytes, { flag: "wx" });
   }
-  const report = { schemaVersion: 1, startedAt: new Date().toISOString(), completed: false,
+  const report = { schemaVersion: 2, startedAt: new Date().toISOString(), completed: false,
     server: options.server, serverSha256: digest(await readFile(options.server)),
     workspace: options.root, target: { file: options.file, moduleName: options.moduleName,
       symbol: options.symbol, position: target.position },
@@ -807,10 +807,10 @@ async function benchmark(options) {
     report.reuseAssertions = { unchangedRestart: false, sparseImporter: false, changedHeader: false };
     assertWarmReuse(report.restart.initialWork);
     for (const field of ["header_file_reads","header_file_hashes"]) {
-      assert.equal(report.restart.graphHydration.work.cacheStats?.[field],0,
-        `background hydration performed ${field}`);
+      assert.equal(report.restart.manifestRestoration.work.cacheStats?.[field],0,
+        `background restoration performed ${field}`);
       assert.equal(report.restart.savedEdit.work.cacheStats?.[field],0,
-        `hydration or importer-only editing performed ${field}`);
+        `restoration or importer-only editing performed ${field}`);
     }
     report.reuseAssertions.unchangedRestart = true;
     assertImporterReuse(report.restart.savedEdit.work, options.moduleName);

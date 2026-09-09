@@ -797,13 +797,13 @@ function test_project_graph_reopens_metadata_and_restores_only_clean_project_han
       "missing-provider incoming edge did not persist")
     test.assert(hydrated:project_ast("folder") == nil,
       "reopening metadata fabricated a live compiler graph")
-    test.assert(hydrated:hydrate_project_ast("folder", TestAst.new("validated")) and
-      not hydrated:hydrate_project_ast("external", TestAst.new("invalid")) and
-      not hydrated:hydrate_project_ast("interrupted", TestAst.new("invalid")),
-      "hydration admitted an external or unfinished compiler graph")
-    local ast? = hydrated:project_ast("folder")
-    test.assert(ast ~= nil and ast.label == "validated",
-      "validated clean project compiler handle was not restored")
+    local revision = stores.scalar_integer(read.connection,
+      "SELECT revision FROM main.graph_modules WHERE name='folder'")
+    test.assert(hydrated:accepts_project_manifest("folder", revision) and
+      not hydrated:accepts_project_manifest("external", 0) and
+      not hydrated:accepts_project_manifest("interrupted", 0) and
+      hydrated:project_ast("folder") == nil,
+      "manifest restoration admitted unfinished work or fabricated a body")
   end)
 end
 
@@ -882,7 +882,7 @@ function test_project_graph_timestamp_refresh_preserves_semantic_work_and_rollba
   end)
 end
 
-function test_project_graph_revision_hydration_rejects_replaced_or_unfinished_work(
+function test_project_graph_manifest_revision_rejects_replaced_or_unfinished_work(
     _context: test.Context)
   test_runtime.run(function ()
     local store = stores.open(":memory:")
@@ -895,25 +895,30 @@ function test_project_graph_revision_hydration_rejects_replaced_or_unfinished_wo
     local revision = stores.scalar_integer(access.connection,
       "SELECT revision FROM main.graph_modules WHERE name='main'")
     local generation = cache:generation()
-    local rejected = not cache:hydrate_project_ast_at_revision("main", revision + 1, TestAst.new("wrong"))
+    local rejected = not cache:accepts_project_manifest("main", revision + 1)
     local first? = cache:project_ast("main")
     test.assert(rejected and first ~= nil and first.label == "first" and
-      cache:hydrate_project_ast_at_revision("main", revision, TestAst.new("restored")) and
+      cache:accepts_project_manifest("main", revision) and
       cache:generation() == generation,
-      "revision hydration changed SQL state or admitted the wrong revision")
+      "manifest acceptance changed SQL state or admitted the wrong revision")
+    cache:release_project_snapshots()
+    test.assert(cache:project_ast("main") == nil and
+      cache:accepts_project_manifest("main", revision) and
+      cache:generation() == generation and #cache:dirty_modules() == 0,
+      "releasing published bodies discarded clean module metadata")
     cache:invalidate_project("main")
-    test.assert(not cache:hydrate_project_ast_at_revision("main", revision, TestAst.new("dirty")),
-      "revision hydration admitted invalidated work")
+    test.assert(not cache:accepts_project_manifest("main", revision),
+      "manifest restoration admitted invalidated work")
     cache:remove_module("main")
     cache:observe_project("main", {stamp("main.titan", 1)})
     commit(cache, "main", manifest("public", "source"), {}, "replacement")
-    local stale = not cache:hydrate_project_ast_at_revision("main", revision, TestAst.new("old"))
+    local stale = not cache:accepts_project_manifest("main", revision)
     local replacement? = cache:project_ast("main")
     test.assert(stale and replacement ~= nil and replacement.label == "replacement",
-      "delayed hydration replaced a recreated module with an earlier payload")
+      "delayed restoration accepted a recreated module's earlier payload")
     cache:upsert_external_source("external", {stamp("external.titan", 1)},
       manifest("external", "external"), {})
-    test.assert(not cache:hydrate_project_ast_at_revision("external", 0, TestAst.new("external")),
-      "revision hydration admitted an external compiler graph")
+    test.assert(not cache:accepts_project_manifest("external", 0),
+      "manifest restoration admitted external module state")
   end)
 end

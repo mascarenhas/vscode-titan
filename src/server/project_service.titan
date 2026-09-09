@@ -852,13 +852,13 @@ local function Service:revalidate_external_files()
           case external.origin
           when source then
             self.graph:upsert_external_source(
-              name, current, external.manifest, external.imports)
+              name, current, comparison_manifest(external.manifest), external.imports)
           when dynamic_binary then
             self.graph:upsert_external_binary(
-              name, current, external.manifest, external.imports)
+              name, current, comparison_manifest(external.manifest), external.imports)
           when static_binary then
             self.graph:upsert_external_binary(
-              name, current, external.manifest, external.imports)
+              name, current, comparison_manifest(external.manifest), external.imports)
           end
           self.metadata:write_external(ExternalModule.new(
             name, external.origin, external.manifest, current,
@@ -1050,13 +1050,21 @@ local function analyzed_input_digest(
          #headers .. ":" .. headers
 end
 
+-- Graph owns only equality comparisons. Reloadable declared interfaces stay
+-- with compiler entries and external metadata, independently of these hashes.
+local function comparison_manifest(manifest: project_graph.Manifest):
+    project_graph.Manifest
+  return project_graph.Manifest.new(content_identity.digest(manifest.public_digest),
+    content_identity.digest(manifest.source_digest))
+end
+
 local function graph_manifest(snapshot: compiler_bridge.ModuleSnapshot):
     project_graph.Manifest?
   if snapshot.manifest == nil then return nil end
   local source? = snapshot.manifest.source_serialized
   if source == nil then return nil end
   return project_graph.Manifest.new(
-    snapshot.manifest.serialized, source)
+    content_identity.digest(snapshot.manifest.serialized), content_identity.digest(source))
 end
 
 local function Service:prepare_work_avoiding(
@@ -1467,15 +1475,15 @@ local function Service:replace_external(
   case external.origin
   when source then
     self.graph:publish_external_source(
-      external.module_name, external.stamps, external.manifest,
+      external.module_name, external.stamps, comparison_manifest(external.manifest),
       external.imports, satisfied_projects)
   when dynamic_binary then
     self.graph:publish_external_binary(
-      external.module_name, external.stamps, external.manifest,
+      external.module_name, external.stamps, comparison_manifest(external.manifest),
       external.imports, satisfied_projects)
   when static_binary then
     self.graph:publish_external_binary(
-      external.module_name, external.stamps, external.manifest,
+      external.module_name, external.stamps, comparison_manifest(external.manifest),
       external.imports, satisfied_projects)
   end
   self.metadata:write_external(external)
@@ -2302,21 +2310,16 @@ function Service:publication_committed()
   if self.publication_hooks ~= nil and self.publication_hooks.committed ~= nil then
     self.publication_hooks.committed()
   end
+  -- The caller still owns the publication Store lease. No AST is needed by a
+  -- completed SQL view, even when the module remains clean for future imports.
+  self.graph:release_project_snapshots()
 end
 
-function Service:hydrate_project_snapshot(module_name: string,
-    snapshot: compiler_bridge.ModuleSnapshot): boolean
+function Service:accepts_project_manifest(module_name: string,
+    expected_revision: integer): boolean
   local access = self.store:acquire()
   defer access:release()
-  return self.graph:hydrate_project_ast(module_name, snapshot)
-end
-
-function Service:hydrate_project_snapshot_at_revision(module_name: string,
-    expected_revision: integer, snapshot: compiler_bridge.ModuleSnapshot): boolean
-  local access = self.store:acquire()
-  defer access:release()
-  return self.graph:hydrate_project_ast_at_revision(
-    module_name, expected_revision, snapshot)
+  return self.graph:accepts_project_manifest(module_name, expected_revision)
 end
 
 function Service:invalidate_cached_project(module_name: string)

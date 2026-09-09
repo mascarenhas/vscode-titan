@@ -10,6 +10,59 @@ SQLite implementation plan. The runner queries hover, definition, references,
 and folding after each completed generation and checks that the comment edits
 and restarts preserve the returned feature data.
 
+Current reports use format 2 and name background declaration restoration
+`manifestRestoration`. The historical results below use the earlier full-graph
+hydration path. See the [storage breakdown](sqlite-backend-storage.md) for the
+preserved single-FFI baseline and the compact declaration/cache contract.
+
+## Compact declarations: 9 September 2026
+
+The final format-2 runner completed cold startup, an unchanged restart, a saved
+comment in `titan.sqlite3`, and startup after its repository header comment and
+timestamp changed. It used compiler `61a2996f` and the final executable with
+SHA-256 `c77211228bd6da537c4d854add5abccefacc4a3122fdd5cc55b1e209d7d63eda`.
+This is a separate multi-process workload from the paired observer-assisted
+[cold storage comparison](sqlite-backend-storage.md#measured-compact-implementation-9-september-2026).
+Do not substitute its database or timing values into that paired comparison.
+
+| Phase | Wall time | Server CPU | Server peak RSS | Database at readiness |
+| --- | ---: | ---: | ---: | ---: |
+| Cold launch to READY | 260.462 s | 233.270 s | 2,902,572 KiB | 365,719,552 B |
+| Unchanged launch to SQL READY | 10.693 s | 10.530 s | 161,628 KiB | 365,719,552 B |
+| Saved source edit to READY | 24.061 s | 23.900 s | 708,236 KiB | 365,801,472 B |
+| Changed-header launch to READY | 31.707 s | 31.500 s | 802,328 KiB | 369,532,928 B |
+
+Peak RSS is the process lifetime high-water mark at that phase; the saved edit
+shares the restart process. On restart, background declaration restoration
+finished **4.009 seconds after SQL readiness**, or 14.702 seconds after launch.
+Its completion sample was 468,752 KiB peak RSS. All four saved-file features
+remained queryable during restoration: 131 requests had p95 latencies of
+76.101 ms (hover), 71.341 ms (definition), 62.766 ms (references) and
+99.421 ms (folding). These restoration timings include that query traffic.
+
+Every reuse assertion passed. The unchanged restart performed zero source
+parses/checks, header preprocessing/parsing, FFI conversion/replay or project
+payload encoding. The saved comment parsed, checked and encoded only
+`titan.sqlite3`; it performed no header preprocessing/parsing or FFI conversion
+and reused one persisted FFI conversion. The changed header parsed/checked that
+same module and performed one header preprocessing operation and one FFI
+conversion. Hover, definition, references and folding results remained
+equivalent after each phase, and no diagnostics were produced.
+
+The private probe cache held 346 format-2 records totaling 10,662 bytes,
+excluded from all database totals. Cold lookup recorded 346 misses; each later
+process recorded 32 hits and zero misses (the restart process includes its
+saved edit). All paths stayed under the controlled prefix. Read-only inspection
+after shutdown returned SQLite integrity `ok`, 90,218 pages, zero freelist pages
+and no unpublished occurrence staging rows. No database sidecars remained.
+
+Evidence is under `/tmp/module-manifest-validation/warm-edit-header-final/`:
+`summary.json`, `setup.json`, the three session reports/logs,
+`sqlite-inspection.json`, and retained database/probe files. The source, header
+and previous workspace cache were restored successfully. The earlier
+`warm-edit-header` directory remains an explicitly failed format-1 harness
+attempt; its source/header/cache restoration also passed.
+
 ## Reproduce
 
 Build and verify the intended server first. Keep both workspaces idle for the
@@ -85,7 +138,7 @@ directory. All three server processes share that directory. The current runner
 uses the compiler's supported `TITAN_PREFIX` cache-root override only in its
 child processes, while `TITAN_ROCKS_ROOT` still selects the actual installation.
 The source-only probe cache retains its ordinary raw-source SHA-256 keys and
-format-1 acceptance/rejection records. Existing installation caches are neither
+format-2 acceptance/rejection and typed enum-selection records. Existing installation caches are neither
 deleted nor used for the controlled comparison. The historical runs below,
 before the source-only simplification, used the former cache-identity namespace
 control instead. The OS page cache is not flushed, so these are not machine
@@ -94,7 +147,7 @@ cold-boot measurements.
 `setup.json` records the inherited and effective cache settings and verifies the
 private prefix starts empty. The runner rejects `TITAN_PROBE_CACHE_DISABLE=1`,
 requires a positive cold cache miss, and checks every observed persistent lookup
-against the private format-1 path. Reported hits include cached acceptance and
+against the private format-2 path. Reported hits include cached acceptance and
 rejection; in-memory result reuse does not emit a persistent-lookup event. Probe
 files remain under the output directory and have separate file/byte totals.
 
@@ -125,10 +178,10 @@ The report keeps these measurements separate:
 - Each feature records individual request latencies and their minimum, median,
   p95 and maximum, together with the actual result and a SHA-256 comparison value.
   Unchanged feature requests must not start an indexing cycle.
-- `graphHydration` records when background hydration finishes relative to SQL
+- `manifestRestoration` records when background restoration finishes relative to SQL
   readiness, its logged phase, and resource samples after completion. The client
-  continuously cycles through all four feature queries while hydration is active;
-  these latency samples are separate from `featuresAfterHydration`. Hydration wall
+  continuously cycles through all four feature queries while restoration is active;
+  these latency samples are separate from `featuresAfterRestoration`. Restoration wall
   and process CPU therefore include concurrent query traffic. Fast cold/header
   paths can finish restoration before readiness, leaving no overlapping samples.
 - Cache sizes include the database and any `-wal`, `-shm`, and `-journal`
@@ -137,17 +190,17 @@ The report keeps these measurements separate:
 
 `initialWork` in all three processes and `savedEdit.work` retain source parse/check profile counts and
 CPU, source-module names, header preprocessing/parsing counts, downstream FFI
-conversion calls and replay hits, cache statistics, hydration and encoding
+conversion calls and replay hits, cache statistics, restoration and encoding
 events, and the `cache.startup.phase` CPU/wall records. The existing detailed
 compiler profile aggregation is included as well. `cacheBehavior` states the
-observed restart/edit outcomes explicitly. `graphHydration.work` records the
-hydration lifecycle and its final counters. Current runs also enforce these work
+observed restart/edit outcomes explicitly. `manifestRestoration.work` records the
+restoration lifecycle and its final counters. Current runs also enforce these work
 checks before reporting success:
 
 - An unchanged restart performs no source analysis/profile visits, header
   preprocessing/parsing, downstream FFI conversion/replay, conversion lookups,
   cache misses, or project-payload encoding.
-- Warm SQL readiness precedes project hydration. Source, external-input, header
+- Warm SQL readiness precedes project restoration. Source, external-input, header
   and compiler-inventory counters prove zero content reads/hashes for unchanged
   observations. Initial validation and background completion are timed separately.
 - The saved comment parses/checks only the named module, performs no header

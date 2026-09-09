@@ -3,6 +3,7 @@ local bridge = import "server.compiler_bridge"
 local graph = import "server.project_graph"
 local metadata = import "server.project_metadata"
 local stores = import "server.workspace_store"
+local header_store = import "server.header_store"
 local test_runtime = import "server.test_runtime"
 
 function test_project_metadata_roundtrips_ordered_batches_and_nullable_binary_fields(
@@ -122,6 +123,8 @@ function test_project_metadata_refreshes_observations_without_rewriting_semantic
     saved:write_diagnostics("main", {bridge.Diagnostic.new(bridge.DiagnosticKind.type_error(),
       "retained diagnostic", nil, nil)})
     saved:write_header("vendor", {header})
+    saved:write_header("other", {header})
+    header_store.replace(access.connection, 2, "vendor", {header})
     saved:write_external(metadata.ExternalModule.new("vendor", origin,
       graph.Manifest.new("public", "source"), {stamp}, "analyzed", {}, {}, {header}))
     saved:write_fingerprint(metadata.ExternalFingerprint.new("vendor", false, true, origin, {stamp}, nil))
@@ -153,5 +156,8 @@ function test_project_metadata_refreshes_observations_without_rewriting_semantic
       external.c_header_dependencies[1].observation ~= nil and
       external.c_header_dependencies[1].observation.modified_seconds == 3,
       "observation refresh lost source bytes, semantics, diagnostics, or a header owner")
+    test.assert(saved:header("other").dependencies[1].observation.modified_seconds == 1 and
+      header_store.read(access.connection, 2, "vendor")[1].observation.modified_seconds == 1,
+      "module refresh changed an unrelated module or artifact sharing the old observation")
   end)
 end

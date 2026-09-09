@@ -113,7 +113,7 @@ For a controlled persistent-cache fill/warm comparison, set `TITAN_PREFIX` to
 a fresh absolute directory and reuse it for the consecutive server processes.
 Keep `TITAN_ROCKS_ROOT` pointed at the actual compiler installation, normally
 this repository's `.titan` directory. The private prefix holds ordinary
-source-only probe records under `var/cache/titan-probes/1`; it does not change
+source-only probe records under `var/cache/titan-probes/2`; it does not change
 their raw-source keys or delete ordinary developer cache entries. The workspace
 cache benchmark below manages this isolation automatically.
 
@@ -243,9 +243,11 @@ references within their module; they have no project definition or rename
 target. `ffi` is reserved as a binding name and remains an ordinary member name
 after `.` or `:`.
 
-Persisted compiler artifacts use `c-header-v2` and `ffi-conversion-v2` for the
-combined environment. The pinned compiler's source inventory invalidates
-incompatible old publications; the SQLite schema version does not change.
+Persisted compiler artifacts use `c-header-v3` and `ffi-conversion-v3` for
+extracted C definitions. Project entries retain declared member/type manifests,
+including trusted source visibility and generic schemes. SQLite schema 4 shares
+ordered header provenance across cache owners and stores fixed-size graph
+comparison hashes. Incompatible old publications are rebuilt.
 
 The two bundled trees contain ordinary Lua source and native Lua modules; they
 are not embedded into the executable. They contain no `lib/titan` provider tree,
@@ -381,8 +383,10 @@ above.
 
 The server stores its saved index and dependency metadata in
 `.titan-ls/index.sqlite3` inside the resolved workspace root. It also stores
-compiler-owned checked-project and completed C-header graphs there, allowing a
-compatible restart to reuse work. The directory excludes itself from Git and
+compiler-owned project declaration manifests and extracted C definitions there,
+allowing a compatible restart to reuse work. Function and method bodies are
+transient: fresh checking extracts semantic facts into SQL, publication retains
+unchanged module facts, and then the server releases the checked bodies. The directory excludes itself from Git and
 is always omitted from source discovery and watchers. If it cannot be created
 or opened, the server logs that persistence is unavailable and uses the same
 SQLite backend in memory.
@@ -395,8 +399,8 @@ updates only the observation. Replacements, symlink changes and new earlier
 search candidates still invalidate affected inputs. Deliberate byte changes that
 preserve all trusted metadata are outside this policy.
 
-Validated SQL answers become available before compiler graphs finish hydrating.
-Hydration runs in an owned background task with frequent yields; saved edits and
+Validated SQL answers become available before declaration manifests finish
+restoring. Restoration runs in an owned background task with frequent yields; saved edits and
 compiler-verified rename coordinate with that task. Incompatible or damaged
 cache data rebuilds through the ordinary indexing path.
 Changing only `exclude` changes watcher policy without invalidating compatible
@@ -405,6 +409,8 @@ semantics. The cache is disposable: close the server before removing
 
 See [workspace SQLite measurements](docs/sqlite-backend-benchmarks.md) for
 restart and saved-edit timings, memory and disk usage, and reproduction commands.
+The [storage breakdown](docs/sqlite-backend-storage.md) profiles the completed
+single-FFI baseline and records the compact-cache changes.
 
 ## Package and install the VSIX
 

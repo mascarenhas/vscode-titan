@@ -47,13 +47,39 @@ local record SavedFile
   const coordinates: source_text.CoordinateIndex
 end
 
+-- The work revision is allocated by ProjectGraph. State uses its codes:
+-- 0 dirty, 1 checking, 2 clean, 3 failed. It is independent of the generation
+-- of the complete published query view.
+record ModulePublication
+  const module_name: string
+  const revision: integer
+  const state: integer
+end
+
+record PublicationPlan
+  const modules: {ModulePublication}
+  const replaced_modules: {string}
+  const removed_modules: {string}
+  const rebuild_all: boolean
+  local const expected_generation: integer
+  local const by_name: {string: ModulePublication}
+  local const replacements: {string: boolean}
+end
+
+local record MaterializedSummary
+  const module_name: string
+  const summary_id: integer
+  const markdown: string
+end
+
 -- Prepared data belongs only to one publication attempt. Query facades retain
 -- neither source/AST maps nor occurrence buckets after that attempt finishes.
 record Prepared
   const projects: {bridge.ProjectModule}
   const occurrences: {Occurrence}
+  const plan: PublicationPlan?
   local const files: {string: SavedFile}
-  local const summaries: {string: string}
+  local const summaries: {string: MaterializedSummary}
 end
 
 record Index
@@ -191,10 +217,12 @@ local function index_coordinates(contents: string,
 end
 
 local function project_files(projects: {bridge.ProjectModule},
-                             yield_state: YieldState):
+                             yield_state: YieldState,
+                             selected: {string: boolean}?):
     ({string: SavedFile}, {string: boolean},
      {string: source_text.CoordinateIndex})
   local files: {string: SavedFile} = {}
+  local filenames: {string: boolean} = {}
   local modules: {string: boolean} = {}
   local coordinates: {string: source_text.CoordinateIndex} = {}
   for project_index = 1, #projects do
@@ -208,14 +236,17 @@ local function project_files(projects: {bridge.ProjectModule},
     for file_index = 1, #project.files do
       account_work(yield_state)
       local file = project.files[file_index]
-      if files[file.filename] ~= nil then
+      if filenames[file.filename] then
         fail<value>(project.module_name, file.filename,
           "saved source file belongs to more than one project module")
       end
-      local indexed = index_coordinates(file.contents, yield_state)
-      files[file.filename] = SavedFile.new(
-        project.module_name, file.contents, indexed)
-      coordinates[file.filename] = indexed
+      filenames[file.filename] = true
+      if selected == nil or selected[project.module_name] then
+        local indexed = index_coordinates(file.contents, yield_state)
+        files[file.filename] = SavedFile.new(
+          project.module_name, file.contents, indexed)
+        coordinates[file.filename] = indexed
+      end
     end
   end
   return files, modules, coordinates
@@ -266,7 +297,7 @@ local function project_snapshot(snapshot: bridge.ModuleSnapshot): boolean
 end
 
 local function append_snapshot_summaries(
-    target: {string: string}, snapshot: bridge.ModuleSnapshot,
+    target: {string: MaterializedSummary}, snapshot: bridge.ModuleSnapshot,
     projects: {string: boolean}, yield_state: YieldState)
   if not project_snapshot(snapshot) then return end
   if not projects[snapshot.module_name] then
@@ -287,7 +318,8 @@ local function append_snapshot_summaries(
       fail<value>(snapshot.module_name, nil,
         "duplicate snapshot-local hover summary id")
     end
-    target[key] = render_hover_summary(summary, yield_state)
+    target[key] = MaterializedSummary.new(snapshot.module_name, summary.id,
+      render_hover_summary(summary, yield_state))
   end
 end
 
@@ -351,20 +383,70 @@ local function append_snapshot_occurrences(
   end
 end
 
-function prepare(projects: {bridge.ProjectModule},
-                 snapshots: {bridge.ModuleSnapshot},
-                 yield_now: Yield?): Prepared
+local function prepare_internal(projects: {bridge.ProjectModule},
+                                snapshots: {bridge.ModuleSnapshot},
+                                plan: PublicationPlan?,
+                                yield_now: Yield?): Prepared
   local state = YieldState.new(yield_now, 0)
-  local files, project_names = project_files(projects, state)
+  local selected: {string: boolean}? = nil
+  if plan ~= nil then selected = plan.replacements end
+  local files, project_names = project_files(projects, state, selected)
+  if plan ~= nil then
+    if #projects ~= #plan.modules then
+      fail<value>(nil, nil, "publication plan does not match saved project membership")
+    end
+    for index = 1, #projects do
+      local name = projects[index].module_name
+      if plan.by_name[name] == nil then
+        fail<value>(name, nil, "saved project module has no publication revision")
+      end
+    end
+  end
   local occurrences: {Occurrence} = {}
-  local summaries: {string: string} = {}
+  local summaries: {string: MaterializedSummary} = {}
+  local observed: {string: boolean} = {}
   for index = 1, #snapshots do
     account_work(state)
+    local snapshot = snapshots[index]
+    if plan ~= nil and project_snapshot(snapshot) then
+      local module? = plan.by_name[snapshot.module_name]
+      if module == nil or not plan.replacements[snapshot.module_name] or
+          module.state ~= 2 then
+        fail<value>(snapshot.module_name, nil,
+          "compiler snapshot does not belong to a replaced clean module")
+      end
+      if observed[snapshot.module_name] then
+        fail<value>(snapshot.module_name, nil,
+          "duplicate compiler snapshot for a publication module")
+      end
+      observed[snapshot.module_name] = true
+    end
     append_snapshot_summaries(summaries, snapshots[index], project_names, state)
     append_snapshot_occurrences(
       occurrences, snapshots[index], files, project_names, state)
   end
-  return Prepared.new(projects, occurrences, files, summaries)
+  if plan ~= nil then
+    for index = 1, #plan.replaced_modules do
+      local name = plan.replaced_modules[index]
+      if plan.by_name[name].state == 2 and not observed[name] then
+        fail<value>(name, nil,
+          "replaced clean module has no current compiler snapshot")
+      end
+    end
+  end
+  return Prepared.new(projects, occurrences, plan, files, summaries)
+end
+
+function prepare(projects: {bridge.ProjectModule},
+                 snapshots: {bridge.ModuleSnapshot},
+                 yield_now: Yield?): Prepared
+  return prepare_internal(projects, snapshots, nil, yield_now)
+end
+
+function prepare_update(projects: {bridge.ProjectModule},
+                        snapshots: {bridge.ModuleSnapshot},
+                        plan: PublicationPlan, yield_now: Yield?): Prepared
+  return prepare_internal(projects, snapshots, plan, yield_now)
 end
 
 function Prepared:coordinate_index(filename: string):
@@ -424,13 +506,16 @@ local SOURCE_ORDER = " ORDER BY filename,byte_start,byte_finish,declaration_id,r
 
 function initialize_schema(connection: sqlite3.Connection)
   execute(connection, "CREATE TABLE IF NOT EXISTS main.semantic_projects(" ..
-    "module_name BLOB PRIMARY KEY,module_order INTEGER NOT NULL)")
+    "module_name BLOB PRIMARY KEY,module_order INTEGER NOT NULL," ..
+    "revision INTEGER NOT NULL,state INTEGER NOT NULL CHECK(state BETWEEN 0 AND 3))")
   execute(connection, "CREATE TABLE IF NOT EXISTS main.semantic_files(" ..
     "filename BLOB PRIMARY KEY,module_name BLOB NOT NULL,contents BLOB NOT NULL," ..
     "module_order INTEGER NOT NULL,file_order INTEGER NOT NULL," ..
     "FOREIGN KEY(module_name) REFERENCES semantic_projects(module_name))")
   execute(connection, "CREATE TABLE IF NOT EXISTS main.semantic_summaries(" ..
-    "identity BLOB PRIMARY KEY,markdown BLOB NOT NULL)")
+    "module_name BLOB NOT NULL,summary_id INTEGER NOT NULL CHECK(summary_id>0)," ..
+    "markdown BLOB NOT NULL,PRIMARY KEY(module_name,summary_id)," ..
+    "FOREIGN KEY(module_name) REFERENCES semantic_projects(module_name)) WITHOUT ROWID")
   execute(connection, "CREATE TABLE IF NOT EXISTS main.semantic_occurrences(" ..
     "declaration_id BLOB NOT NULL,module_name BLOB NOT NULL," ..
     "filename BLOB NOT NULL,name BLOB NOT NULL,role INTEGER NOT NULL," ..
@@ -443,10 +528,81 @@ function initialize_schema(connection: sqlite3.Connection)
     "SELECT " .. OCCURRENCE_COLUMNS .. " FROM main.semantic_occurrences WHERE 0")
   execute(connection, "CREATE INDEX IF NOT EXISTS main.semantic_occurrences_file " ..
     "ON semantic_occurrences(filename,start_line,start_character)")
+  execute(connection, "CREATE INDEX IF NOT EXISTS main.semantic_occurrences_module " ..
+    "ON semantic_occurrences(module_name)")
+  execute(connection, "CREATE INDEX IF NOT EXISTS main.semantic_files_module " ..
+    "ON semantic_files(module_name,file_order)")
   execute(connection, "CREATE INDEX IF NOT EXISTS main.semantic_occurrences_symbol " ..
     "ON semantic_occurrences(declaration_id,filename,byte_start)")
   execute(connection, "CREATE UNIQUE INDEX IF NOT EXISTS main.semantic_declarations " ..
     "ON semantic_occurrences(declaration_id) WHERE role IN (0,1)")
+end
+
+-- This read-only plan is made under the caller's Store lease and graph revision
+-- fence. A different module order alone does not invalidate any source facts.
+function publication_plan(connection: sqlite3.Connection,
+                          modules: {ModulePublication}): PublicationPlan
+  local generation = workspace_store.scalar_integer(connection,
+    "SELECT published_generation FROM main.store_state WHERE singleton=1")
+  local current: {ModulePublication} = {}
+  local by_name: {string: ModulePublication} = {}
+  for index = 1, #modules do
+    local module = modules[index]
+    if module.module_name == "" or module.revision < 0 or
+        module.state < 0 or module.state > 3 then
+      fail<value>(module.module_name, nil, "invalid module publication revision or state")
+    end
+    if by_name[module.module_name] ~= nil then
+      fail<value>(module.module_name, nil, "duplicate module publication revision")
+    end
+    current[index] = module
+    by_name[module.module_name] = module
+  end
+  local previous: {string: ModulePublication} = {}
+  local removed: {string} = {}
+  -- Inspect the complete core index before initialize_schema recreates missing
+  -- tables. A surviving revision row cannot certify lost facts or saved files,
+  -- including the source membership of an unchanged failed module.
+  local complete = workspace_store.scalar_integer(connection,
+    "SELECT COUNT(*) FROM main.sqlite_master WHERE type='table' AND name IN (" ..
+    "'semantic_projects','semantic_files','semantic_summaries','semantic_occurrences')") == 4
+  if workspace_store.scalar_integer(connection,
+      "SELECT COUNT(*) FROM main.sqlite_master " ..
+      "WHERE type='table' AND name='semantic_projects'") > 0 then
+    local statement = connection:prepare(
+      "SELECT module_name,revision,state FROM main.semantic_projects ORDER BY module_name")
+    defer statement:close()
+    local cursor = statement:query()
+    defer cursor:close()
+    for row in cursor:fetch do
+      local name = bytes(row, 1)
+      previous[name] = ModulePublication.new(
+        name, row:get(2) as integer, row:get(3) as integer)
+      if by_name[name] == nil then removed[#removed + 1] = name end
+    end
+  end
+  local replaced: {string} = {}
+  local replacements: {string: boolean} = {}
+  for index = 1, #current do
+    local module = current[index]
+    local old? = previous[module.module_name]
+    if not complete or old == nil or old.revision ~= module.revision or old.state ~= module.state then
+      replaced[#replaced + 1] = module.module_name
+      replacements[module.module_name] = true
+    end
+  end
+  return PublicationPlan.new(current, replaced, removed, not complete, generation,
+    by_name, replacements)
+end
+
+function PublicationPlan:replaces(module_name: string): boolean
+  return self.replacements[module_name] == true
+end
+
+function Prepared:check_publication(connection: sqlite3.Connection)
+  if self.plan ~= nil then
+    check_generation(connection, self.plan.expected_generation)
+  end
 end
 
 local function visibility_rank(visibility: bridge.DeclarationVisibility): integer
@@ -535,19 +691,79 @@ local function validate_published(connection: sqlite3.Connection)
         "symbol '" .. bytes(row, 3) .. "' has more than one exact declaration")
     end
   end
+  do
+    -- Replacement declarations must also be unique against the modules whose
+    -- facts survived this publication. Occurrences are owned by their containing
+    -- module, so references to a replaced provider intentionally remain here.
+    local statement = connection:prepare(
+      "SELECT fresh.module_name,fresh.filename,fresh.declaration_id " ..
+      "FROM main.semantic_occurrence_inputs AS fresh " ..
+      "JOIN main.semantic_occurrences AS retained " ..
+      "ON retained.declaration_id=fresh.declaration_id " ..
+      "WHERE fresh.role IN (0,1) AND retained.role IN (0,1) LIMIT 1")
+    defer statement:close()
+    local cursor = statement:query()
+    defer cursor:close()
+    local row? = cursor:fetch()
+    if row ~= nil then
+      fail<value>(bytes(row, 1), bytes(row, 2),
+        "symbol '" .. bytes(row, 3) .. "' has more than one exact declaration")
+    end
+  end
+end
+
+local function prune_module(connection: sqlite3.Connection, name: string)
+  workspace_store.execute(connection,
+    "DELETE FROM main.semantic_occurrences WHERE module_name=?", blob(name))
+  workspace_store.execute(connection,
+    "DELETE FROM main.semantic_summaries WHERE module_name=?", blob(name))
+  workspace_store.execute(connection,
+    "DELETE FROM main.semantic_files WHERE module_name=?", blob(name))
 end
 
 function Prepared:publish(connection: sqlite3.Connection)
-  execute(connection, "DELETE FROM main.semantic_occurrences")
+  self:check_publication(connection)
   execute(connection, "DELETE FROM main.semantic_occurrence_inputs")
-  execute(connection, "DELETE FROM main.semantic_files")
-  execute(connection, "DELETE FROM main.semantic_projects")
-  execute(connection, "DELETE FROM main.semantic_summaries")
+  if self.plan == nil or self.plan.rebuild_all then
+    execute(connection, "DELETE FROM main.semantic_occurrences")
+    execute(connection, "DELETE FROM main.semantic_summaries")
+    execute(connection, "DELETE FROM main.semantic_files")
+    execute(connection, "DELETE FROM main.semantic_projects")
+  else
+    for index = 1, #self.plan.replaced_modules do
+      prune_module(connection, self.plan.replaced_modules[index])
+    end
+    for index = 1, #self.plan.removed_modules do
+      local name = self.plan.removed_modules[index]
+      prune_module(connection, name)
+      workspace_store.execute(connection,
+        "DELETE FROM main.semantic_projects WHERE module_name=?", blob(name))
+    end
+  end
   do
-    local insert = connection:prepare("INSERT INTO main.semantic_projects VALUES (?,?)")
+    local insert = connection:prepare(
+      "INSERT INTO main.semantic_projects(module_name,module_order,revision,state) " ..
+      "VALUES (?,?,?,?) ON CONFLICT(module_name) DO UPDATE SET " ..
+      "module_order=excluded.module_order,revision=excluded.revision,state=excluded.state " ..
+      "WHERE semantic_projects.module_order<>excluded.module_order " ..
+      "OR semantic_projects.revision<>excluded.revision OR semantic_projects.state<>excluded.state")
     defer insert:close()
     for module_index = 1, #self.projects do
-      insert:execute(blob(self.projects[module_index].module_name), module_index)
+      local name = self.projects[module_index].module_name
+      -- Full standalone builds have no compiler work-revision authority.
+      -- Their facts are queryable but are never certified as retained clean
+      -- work by a later incremental publication plan.
+      local revision, state = 0, 0
+      if self.plan ~= nil then
+        local module = self.plan.by_name[name]
+        revision, state = module.revision, module.state
+      end
+      insert:execute(blob(name), module_index, revision, state)
+      if self.plan ~= nil and not self.plan:replaces(name) then
+        workspace_store.execute(connection,
+          "UPDATE main.semantic_files SET module_order=? " ..
+          "WHERE module_name=? AND module_order<>?", module_index, blob(name), module_index)
+      end
     end
   end
   -- Build fixed-size file batches without retaining a second file registry.
@@ -556,22 +772,24 @@ function Prepared:publish(connection: sqlite3.Connection)
   local file_count = 0
   for module_index = 1, #self.projects do
     local project = self.projects[module_index]
-    for file_index = 1, #project.files do
-      local file = project.files[file_index]
-      if file_count > 0 then file_sql = file_sql .. "," end
-      file_sql = file_sql .. "(" .. binding(file_bindings, blob(file.filename)) .. "," ..
-        binding(file_bindings, blob(project.module_name)) .. "," ..
-        binding(file_bindings, blob(file.contents)) .. "," ..
-        binding(file_bindings, module_index) .. "," ..
-        binding(file_bindings, file_index) .. ")"
-      file_count = file_count + 1
-      if file_count == 40 then
-        local statement = connection:prepare(file_sql)
-        defer statement:close()
-        statement:execute(...file_bindings)
-        file_bindings = {}
-        file_sql = "INSERT INTO main.semantic_files VALUES "
-        file_count = 0
+    if self.plan == nil or self.plan:replaces(project.module_name) then
+      for file_index = 1, #project.files do
+        local file = project.files[file_index]
+        if file_count > 0 then file_sql = file_sql .. "," end
+        file_sql = file_sql .. "(" .. binding(file_bindings, blob(file.filename)) .. "," ..
+          binding(file_bindings, blob(project.module_name)) .. "," ..
+          binding(file_bindings, blob(file.contents)) .. "," ..
+          binding(file_bindings, module_index) .. "," ..
+          binding(file_bindings, file_index) .. ")"
+        file_count = file_count + 1
+        if file_count == 40 then
+          local statement = connection:prepare(file_sql)
+          defer statement:close()
+          statement:execute(...file_bindings)
+          file_bindings = {}
+          file_sql = "INSERT INTO main.semantic_files VALUES "
+          file_count = 0
+        end
       end
     end
   end
@@ -583,12 +801,13 @@ function Prepared:publish(connection: sqlite3.Connection)
   local summary_bindings: {value} = {}
   local summary_sql = "INSERT INTO main.semantic_summaries VALUES "
   local summary_count = 0
-  for key, markdown in iteration.pairs<string, string>(self.summaries) do
+  for _, summary in iteration.pairs<string, MaterializedSummary>(self.summaries) do
     if summary_count > 0 then summary_sql = summary_sql .. "," end
-    summary_sql = summary_sql .. "(" .. binding(summary_bindings, blob(key)) .. "," ..
-      binding(summary_bindings, blob(markdown)) .. ")"
+    summary_sql = summary_sql .. "(" .. binding(summary_bindings, blob(summary.module_name)) .. "," ..
+      binding(summary_bindings, summary.summary_id) .. "," ..
+      binding(summary_bindings, blob(summary.markdown)) .. ")"
     summary_count = summary_count + 1
-    if summary_count == 100 then
+    if summary_count == 60 then
       local statement = connection:prepare(summary_sql)
       defer statement:close()
       statement:execute(...summary_bindings)
@@ -759,9 +978,9 @@ function Index:hover_summary(occurrence: Occurrence): string?
   defer access:release()
   check_generation(access.connection, self.published_generation)
   local statement = access.connection:prepare(
-    "SELECT markdown FROM main.semantic_summaries WHERE identity=?")
+    "SELECT markdown FROM main.semantic_summaries WHERE module_name=? AND summary_id=?")
   defer statement:close()
-  local cursor = statement:query(blob(summary_key(occurrence.module_name, summary_id)))
+  local cursor = statement:query(blob(occurrence.module_name), summary_id)
   defer cursor:close()
   local row? = cursor:fetch()
   if row == nil then return nil end

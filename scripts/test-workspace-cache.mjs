@@ -54,8 +54,8 @@ async function withServer(label, body, environment = {}) {
   const exit = exitOf(child);
   const stderr = collect(child.stderr);
   let logTail = "";
-  let hydrationLogError;
-  const hydration = new Promise((resolve,reject) => {
+  let restorationLogError;
+  const restoration = new Promise((resolve,reject) => {
     child.stderr.on("data", (chunk) => {
       try {
         logTail += chunk.toString("utf8");
@@ -64,26 +64,26 @@ async function withServer(label, body, environment = {}) {
         for (const line of lines) {
           if (!line.startsWith("titan-language-server ")) continue;
           const record = JSON.parse(line.slice("titan-language-server ".length));
-          if (record.event === "cache.startup.phase" && record.phase === "project_hydration") {
+          if (record.event === "cache.startup.phase" && record.phase === "project_restoration") {
             resolve(record);
           }
         }
       } catch (cause) {
-        hydrationLogError = cause;
+        restorationLogError = cause;
         reject(cause);
       }
     });
   });
-  hydration.catch(() => undefined);
+  restoration.catch(() => undefined);
   const responses = new FrameReader(child.stdout);
   let closed = false;
   let nextId = 10;
   const session = {
     child, responses,
     async restored() {
-      if (hydrationLogError) throw hydrationLogError;
-      const result = await withTimeout(hydration, "background graph hydration", 30_000);
-      if (hydrationLogError) throw hydrationLogError;
+      if (restorationLogError) throw restorationLogError;
+      const result = await withTimeout(restoration, "background manifest restoration", 30_000);
+      if (restorationLogError) throw restorationLogError;
       return result;
     },
     async query(method, params) {
@@ -195,10 +195,10 @@ function assertWarmInitial(records) {
     assert.equal(records.some((record) => record.event === event), false,
       `unchanged restart performed ${event}`);
   }
-  assert.equal(records.some((record) => record.event === "cache.projects.hydrate"), false,
-    "warm SQL readiness waited for project graph hydration");
-  assert.equal(records.some((record) => record.event === "cache.projects.hydration_start"), false,
-    "project hydration started before the warm SQL view was ready");
+  assert.equal(records.some((record) => record.event === "cache.projects.restore"), false,
+    "warm SQL readiness waited for project manifest restoration");
+  assert.equal(records.some((record) => record.event === "cache.projects.restoration_start"), false,
+    "project restoration started before the warm SQL view was ready");
   const inventory = records.find((record) => record.event === "cache.inventory.validation");
   assert.ok(inventory, "compiler inventory validation omitted its counters");
   assert.equal(inventory.reads, 0, "warm compiler inventory reread unchanged content");
@@ -280,8 +280,8 @@ try {
   const warmPhases = initialRecords(warm.records);
   const warmInitialCache = assertWarmInitial(warmPhases.initial);
   assert.ok(warmPhases.later.some((record) =>
-    record.event === "cache.projects.hydrate" && record.restored === 2),
-  "background hydration did not restore unchanged dependencies before the first edit");
+    record.event === "cache.projects.restore" && record.restored === 2),
+  "background restoration did not restore unchanged dependencies before the first edit");
   assert.deepEqual(checkedModules(warmPhases.later), ["consumer"],
     "first body edit reparsed or rechecked an unchanged dependency");
   const firstEditEncodes = warmPhases.later.filter((record) =>
@@ -295,7 +295,7 @@ try {
   assert.ok(cacheStats(warmPhases.later).conversion_hits > 0);
   for (const field of ["header_file_reads","header_file_hashes"]) {
     assert.equal(cacheStats(warm.records)[field],0,
-      `hydration or importer-only editing performed ${field}`);
+      `restoration or importer-only editing performed ${field}`);
   }
 
   await writeFile(headerFile, fixtureHeader("typedef long fixture_int;\n"));
@@ -544,8 +544,8 @@ try {
     cold_checked: checkedModules(cold.records),
     cold_indexing_cpu_ms: initialRecords(cold.records).initial.at(-1).cpu_ms,
     warm_indexing_cpu_ms: warmPhases.initial.at(-1).cpu_ms,
-    warm_hydration: warmPhases.later.filter((record) =>
-      record.event === "cache.projects.hydrate"),
+    warm_restoration: warmPhases.later.filter((record) =>
+      record.event === "cache.projects.restore"),
     warm_startup_phases: warmPhases.initial.filter((record) =>
       record.event === "cache.startup.phase"),
     warm_source_profiles: 0,
@@ -565,7 +565,7 @@ try {
       "configuration publication identity", "compiler content identity",
       "unchanged-mtime source/header/compiler trust", "changed-mtime source/header/compiler invalidation",
       "ordered inherited C environment restart and header invalidation",
-      "SQL readiness before background hydration", "include-search shadowing", "corrupt project payload",
+      "SQL readiness before background restoration", "include-search shadowing", "corrupt project payload",
       "invalid SQLite payload storage types",
       "corrupt rebuild", "incompatible rebuild", "memory fallback"]
   };

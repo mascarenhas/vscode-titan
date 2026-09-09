@@ -5,6 +5,7 @@ local strings = import "string"
 local bridge = import "server.compiler_bridge"
 local indexer = import "server.semantic_index.titan"
 local source_text = import "server.source_text"
+local stores = import "server.workspace_store"
 
 local function location(filename: string, line: integer,
                         column: integer): bridge.SourceLocation
@@ -633,5 +634,271 @@ function test_semantic_index_preserves_empty_modules_and_blob_source_batches(
       "arbitrary source bytes changed across the last source batch")
     test.assert(index:hover_summary_count() == 105,
       "summary publication lost rows across its binding batch limit")
+  end)
+end
+
+local function publication_plan(store: stores.Store,
+                                modules: {indexer.ModulePublication}): indexer.PublicationPlan
+  local access = store:acquire()
+  defer access:release()
+  return indexer.publication_plan(access.connection, modules)
+end
+
+local function publish_prepared(store: stores.Store,
+                                prepared: indexer.Prepared): indexer.Index
+  local generation = 0
+  do
+    local access = store:acquire()
+    defer access:release()
+    local connection = access.connection
+    generation = stores.scalar_integer(connection,
+      "SELECT published_generation FROM main.store_state WHERE singleton=1") + 1
+    connection:set_autocommit(false)
+    defer do
+      if not connection:get_autocommit() then connection:rollback() end
+    end
+    indexer.initialize_schema(connection)
+    prepared:publish(connection)
+    stores.execute(connection,
+      "UPDATE main.store_state SET published_generation=? WHERE singleton=1", generation)
+    connection:commit()
+  end
+  return indexer.open(store, generation)
+end
+
+local function publish_modules(store: stores.Store, projects: {bridge.ProjectModule},
+                               snapshots: {bridge.ModuleSnapshot},
+                               modules: {indexer.ModulePublication}): indexer.Index
+  local plan = publication_plan(store, modules)
+  return publish_prepared(store, indexer.prepare_update(projects, snapshots, plan))
+end
+
+function test_semantic_index_retains_module_facts_without_snapshots(
+    _context: test.Context)
+  runtime.run(function ()
+    local store = stores.open(":memory:")
+    defer store:close()
+    local a_file = "/workspace/a.titan"
+    local b_file = "/workspace/b.titan"
+    local identity = "export:a:value:answer"
+    local a = project("a", a_file, "answer = 42\n")
+    local b = project("b", b_file, "answer\n" .. strings.rep("-- unchanged saved source\n", 4096))
+    local a_snapshot = project_snapshot("a", a_file, {
+      occurrence(a_file, 1, 1, 7, "answer", identity,
+        bridge.OccurrenceRole.definition(), false, 1),
+    }, {record_hover_summary(1, "a.Old", "old: integer"),
+        record_hover_summary(2, "a.Unused", "unused: integer")})
+    local b_snapshot = project_snapshot("b", b_file, {
+      occurrence(b_file, 1, 1, 7, "answer", identity,
+        bridge.OccurrenceRole.reference(), false, 1),
+    }, {record_hover_summary(1, "b.Retained", "retained: integer")})
+    publish_modules(store, {a, b}, {a_snapshot, b_snapshot}, {
+      indexer.ModulePublication.new("a", 1, 2),
+      indexer.ModulePublication.new("b", 2, 2),
+    })
+    do
+      local access = store:acquire()
+      defer access:release()
+      -- These guards prove retained rows survive publication; checking equal
+      -- query answers alone would also pass after deleting and recreating them.
+      stores.execute(access.connection,
+        "CREATE TEMP TRIGGER retain_occurrences BEFORE DELETE ON main.semantic_occurrences " ..
+        "WHEN OLD.module_name=CAST('b' AS BLOB) BEGIN SELECT RAISE(ABORT,'retained occurrences'); END")
+      stores.execute(access.connection,
+        "CREATE TEMP TRIGGER retain_summaries BEFORE DELETE ON main.semantic_summaries " ..
+        "WHEN OLD.module_name=CAST('b' AS BLOB) BEGIN SELECT RAISE(ABORT,'retained summaries'); END")
+      stores.execute(access.connection,
+        "CREATE TEMP TRIGGER retain_files BEFORE DELETE ON main.semantic_files " ..
+        "WHEN OLD.module_name=CAST('b' AS BLOB) BEGIN SELECT RAISE(ABORT,'retained files'); END")
+      stores.execute(access.connection,
+        "CREATE TEMP TRIGGER retain_contents BEFORE UPDATE OF contents ON main.semantic_files " ..
+        "WHEN OLD.module_name=CAST('b' AS BLOB) BEGIN SELECT RAISE(ABORT,'retained contents'); END")
+    end
+    a = project("a", a_file, "-- saved comment\nanswer = 42\n")
+    a_snapshot = project_snapshot("a", a_file, {
+      occurrence(a_file, 2, 1, 7, "answer", identity,
+        bridge.OccurrenceRole.definition(), false, 1),
+    }, {record_hover_summary(1, "a.New", "new: integer")})
+    local plan = publication_plan(store, {
+      indexer.ModulePublication.new("a", 3, 2),
+      indexer.ModulePublication.new("b", 2, 2),
+    })
+    test.assert(#plan.replaced_modules == 1 and plan:replaces("a") and
+      not plan:replaces("b"), "comment edit replaced an unchanged module")
+    local yields = 0
+    local prepared = indexer.prepare_update({b, a}, {a_snapshot}, plan,
+      function () yields = yields + 1 end)
+    test.assert(prepared:coordinate_index(b_file) == nil and yields == 0,
+      "retained module source was decoded during changed-module preparation")
+    local view = publish_prepared(store, prepared)
+    local use? = view:occurrence_at(b_file, source_text.Position.new(0, 1))
+    test.assert(use ~= nil and #view:occurrences(use.symbol_id, true) == 2,
+      "provider replacement deleted its retained importer's reference")
+    local definition? = view:definition(use.symbol_id)
+    test.assert(definition ~= nil and definition.filename == a_file and
+      definition.span.start.line == 1,
+      "retained reference did not resolve to the moved provider declaration")
+    test.assert(strings.find(view:hover_summary(use), "b.Retained", 1, true) ~= nil and
+      strings.find(view:hover_summary(definition), "a.New", 1, true) ~= nil and
+      view:hover_summary_count() == 2,
+      "module-local summary ids collided or an obsolete summary survived")
+    local saved = view:project_modules()
+    test.assert(#saved == 2 and saved[1].module_name == "b" and
+      saved[1].files[1].contents == b.files[1].contents and saved[2].module_name == "a",
+      "retention lost complete saved source membership or its new module order")
+    local unchanged = publication_plan(store, {
+      indexer.ModulePublication.new("a", 3, 2),
+      indexer.ModulePublication.new("b", 2, 2),
+    })
+    test.assert(#unchanged.replaced_modules == 0 and #unchanged.removed_modules == 0,
+      "published module revisions did not survive their transaction")
+  end)
+end
+
+function test_semantic_index_rebuilds_failed_sources_after_missing_file_table(
+    _context: test.Context)
+  runtime.run(function ()
+    local store = stores.open(":memory:")
+    defer store:close()
+    local clean_file = "/workspace/clean.titan"
+    local failed_file = "/workspace/failed/failed.titan"
+    local clean = project("clean", clean_file, "item\n")
+    local failed = bridge.ProjectModule.new("failed", {
+      bridge.SourceFile.new(failed_file, "local broken = missing\n"),
+      bridge.SourceFile.new("/workspace/failed/extra.titan", "-- saved bytes\0\255\n"),
+    })
+    local checked = project_snapshot("clean", clean_file, {
+      occurrence(clean_file, 1, 1, 5, "item", "export:clean:value:item",
+        bridge.OccurrenceRole.definition(), false),
+    })
+    local modules = {
+      indexer.ModulePublication.new("clean", 1, 2),
+      indexer.ModulePublication.new("failed", 2, 3),
+    }
+    publish_modules(store, {clean, failed}, {checked}, modules)
+    test.assert(#publication_plan(store, modules).replaced_modules == 0,
+      "complete clean/failed publication was not reusable")
+    do
+      local access = store:acquire()
+      defer access:release()
+      stores.execute(access.connection, "DROP TABLE main.semantic_files")
+    end
+    local plan = publication_plan(store, modules)
+    test.assert(#plan.replaced_modules == 2 and plan:replaces("clean") and
+      plan:replaces("failed"),
+      "surviving revisions hid missing clean or failed saved-file rows")
+    expect_index_error(function ()
+      indexer.prepare_update({clean, failed}, {}, plan)
+    end, "no current compiler snapshot")
+    local prepared = indexer.prepare_update({clean, failed}, {checked}, plan)
+    local rebuilt = publish_prepared(store, prepared)
+    local saved = rebuilt:project_modules()
+    test.assert(#saved == 2 and saved[1].module_name == "clean" and
+      #saved[1].files == 1 and saved[1].files[1].contents == clean.files[1].contents and
+      saved[2].module_name == "failed" and #saved[2].files == 2 and
+      saved[2].files[1].filename == failed_file and
+      saved[2].files[1].contents == failed.files[1].contents and
+      saved[2].files[2].filename == failed.files[2].filename and
+      saved[2].files[2].contents == failed.files[2].contents,
+      "rebuilt publication lost failed source bytes or constituent order")
+    test.assert(#rebuilt:file_occurrences(clean_file) == 1 and
+      #rebuilt:file_occurrences(failed_file) == 0 and
+      #publication_plan(store, modules).replaced_modules == 0,
+      "recovery changed semantic state or failed to certify rebuilt source rows")
+  end)
+end
+
+function test_semantic_index_prunes_failed_dirty_deleted_and_recreated_modules(
+    _context: test.Context)
+  runtime.run(function ()
+    local store = stores.open(":memory:")
+    defer store:close()
+    local filename = "/workspace/state.titan"
+    local saved = project("state", filename, "item\n")
+    local checked = project_snapshot("state", filename, {
+      occurrence(filename, 1, 1, 5, "item", "export:state:value:item",
+        bridge.OccurrenceRole.definition(), false, 1),
+    }, {record_hover_summary(1, "state.Item", "item: integer")})
+    publish_modules(store, {saved}, {checked}, {indexer.ModulePublication.new("state", 1, 2)})
+    local failed_plan = publication_plan(store, {indexer.ModulePublication.new("state", 1, 3)})
+    test.assert(failed_plan:replaces("state"), "same-revision failure retained clean facts")
+    local failed = publish_prepared(store, indexer.prepare_update({saved}, {}, failed_plan))
+    test.assert(#failed:file_occurrences(filename) == 0 and failed:hover_summary_count() == 0 and
+      #failed:project_modules() == 1,
+      "failed module retained facts or lost its saved sources for rename preflight")
+    local stable_failed = publication_plan(store, {indexer.ModulePublication.new("state", 1, 3)})
+    test.assert(#stable_failed.replaced_modules == 0,
+      "unchanged failed revision was treated as fresh work")
+    expect_index_error(function ()
+      indexer.prepare_update({saved}, {},
+        publication_plan(store, {indexer.ModulePublication.new("state", 2, 2)}))
+    end, "no current compiler snapshot")
+    local recovered = publish_modules(store, {saved}, {checked},
+      {indexer.ModulePublication.new("state", 2, 2)})
+    test.assert(#recovered:file_occurrences(filename) == 1,
+      "recovered module did not publish its fresh facts")
+    local dirty = publish_modules(store, {saved}, {}, {indexer.ModulePublication.new("state", 3, 0)})
+    test.assert(#dirty:file_occurrences(filename) == 0 and #dirty:project_modules() == 1,
+      "dirty module exposed an older completed declaration")
+    local removed_plan = publication_plan(store, {})
+    test.assert(#removed_plan.removed_modules == 1 and removed_plan.removed_modules[1] == "state",
+      "removed module was omitted from the publication plan")
+    local removed = publish_prepared(store, indexer.prepare_update({}, {}, removed_plan))
+    test.assert(#removed:project_modules() == 0 and removed:hover_summary_count() == 0,
+      "deleted module retained source membership or summaries")
+    local recreated = publish_modules(store, {saved}, {checked},
+      {indexer.ModulePublication.new("state", 4, 2)})
+    test.assert(#recreated:file_occurrences(filename) == 1,
+      "recreated module reused its removed predecessor's publication")
+  end)
+end
+
+function test_semantic_index_rejects_conflicts_with_retained_declarations_and_rolls_back(
+    _context: test.Context)
+  runtime.run(function ()
+    local store = stores.open(":memory:")
+    defer store:close()
+    local a_file, b_file = "/workspace/a.titan", "/workspace/b.titan"
+    local a, b = project("a", a_file, "item\n"), project("b", b_file, "item\n")
+    local a_snapshot = project_snapshot("a", a_file, {
+      occurrence(a_file, 1, 1, 5, "item", "export:a:value:item",
+        bridge.OccurrenceRole.definition(), false),
+    })
+    local b_snapshot = project_snapshot("b", b_file, {
+      occurrence(b_file, 1, 1, 5, "item", "export:b:value:item",
+        bridge.OccurrenceRole.definition(), false),
+    })
+    local original = publish_modules(store, {a, b}, {a_snapshot, b_snapshot}, {
+      indexer.ModulePublication.new("a", 1, 2), indexer.ModulePublication.new("b", 2, 2),
+    })
+    local conflicting = project_snapshot("a", a_file, {
+      occurrence(a_file, 1, 1, 5, "item", "export:b:value:item",
+        bridge.OccurrenceRole.definition(), false),
+    })
+    local plan = publication_plan(store, {
+      indexer.ModulePublication.new("a", 3, 2), indexer.ModulePublication.new("b", 2, 2),
+    })
+    expect_index_error(function ()
+      publish_prepared(store, indexer.prepare_update({a, b}, {conflicting}, plan))
+    end, "more than one exact declaration")
+    test.assert(original:definition(indexer.SymbolId.new("export:a:value:item")) ~= nil and
+      original:definition(indexer.SymbolId.new("export:b:value:item")) ~= nil,
+      "failed replacement did not roll back both retained and replaced definitions")
+    local rolled_back = publication_plan(store, {
+      indexer.ModulePublication.new("a", 1, 2), indexer.ModulePublication.new("b", 2, 2),
+    })
+    test.assert(#rolled_back.replaced_modules == 0,
+      "failed replacement advanced a module's publication revision")
+    local overlapping = project_snapshot("a", a_file, {
+      occurrence(a_file, 1, 1, 5, "item", "export:a:value:item",
+        bridge.OccurrenceRole.definition(), false),
+      occurrence(a_file, 1, 2, 4, "te", "ast:a:inner",
+        bridge.OccurrenceRole.reference(), true),
+    })
+    expect_index_error(function ()
+      publish_prepared(store, indexer.prepare_update({a, b}, {overlapping}, plan))
+    end, "overlap")
+    test.assert(#original:file_occurrences(a_file) == 1 and #original:file_occurrences(b_file) == 1,
+      "span validation did not preserve the preceding completed view")
   end)
 end

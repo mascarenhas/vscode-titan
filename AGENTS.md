@@ -40,8 +40,10 @@ project workflow.
   watching external source trees are out of scope for version 1.
 - Convert compiler-owned Lua tables into typed Titan records/unions at a narrow
   boundary. Do not spread untyped `value` maps through the server.
-- Cache complete annotated ASTs only for project modules. External source and
-  binary modules retain manifests/mtimes only.
+- Retain declared top-level member/type manifests and exact provenance for
+  project modules. Bodies are transient during checking and SQL extraction;
+  release them after accepted publication. Reuse unchanged modules' SQL facts.
+  External source and binary modules retain manifests/provenance only.
 
 ## Toolchain and verification
 
