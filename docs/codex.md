@@ -115,7 +115,7 @@ returns a `WorkspaceEdit` with `applied: false`. It never changes source files.
   metadata, checked-project and C-header graph codecs, FFI conversion reuse,
   incremental-analysis hooks, timestamp observations and C-header dependency
   restat contract, resolver-scoped I/O strategy with checked-module yield sequencing,
-  bounded graph decoding and registry validation, and the
+  bounded graph decoding and cooperative registry assembly, and the
   validated metadata-only embedded-interface resolver used here. The provider's
   validated build target profile supports portable C types and their numeric
   conversions without requiring a C compiler or Titan SDK for reflection

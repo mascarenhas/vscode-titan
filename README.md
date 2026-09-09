@@ -217,8 +217,9 @@ search path. Compatibility still requires both the matching Titan ABI and
 compiler's typed semantic metadata, incremental-analysis hooks, C-header
 dependency restat contract, checked-project graph codecs, completed C-header
 and FFI conversion cache transport with separately refreshed timestamp observations,
+the module-local builtin `ffi` namespace and source-imported C header contexts,
 resolver-scoped I/O strategy with named completed-module yield checkpoints,
-bounded graph decoding and registry validation, and the validated metadata-only embedded
+bounded graph decoding and cooperative registry assembly, and the validated metadata-only embedded
 interface provider used before disk-backed compiled providers. The provider's
 validated build target profile describes portable C types in those interfaces
 and their numeric conversions, allowing reflection imports and ordinary
@@ -229,6 +230,22 @@ alone is not the language-server API contract.
 Titan is not publicly released; its language-server API version remains `1`
 until the first public release. Prerelease compiler and server changes are
 developed together against the exact pinned compiler revision.
+
+C imports use `foreign import "header.h"` and contribute, in declaration order,
+to the module's builtin `ffi` namespace. Explicit `.titan` source imports also
+contribute their C environment through the compiler's generated `.ffi.h`
+headers. The separate `.titan.h` header declares source-defined foreign
+functions; source-private visibility follows the usual explicit source-import
+rules. The server retains the complete physical C-header dependency closure
+for invalidation, including inherited headers, and keeps external source ASTs
+out of its project cache. Written `ffi` roots and C value members support hover and
+references within their module; they have no project definition or rename
+target. `ffi` is reserved as a binding name and remains an ordinary member name
+after `.` or `:`.
+
+Persisted compiler artifacts use `c-header-v2` and `ffi-conversion-v2` for the
+combined environment. The pinned compiler's source inventory invalidates
+incompatible old publications; the SQLite schema version does not change.
 
 The two bundled trees contain ordinary Lua source and native Lua modules; they
 are not embedded into the executable. They contain no `lib/titan` provider tree,

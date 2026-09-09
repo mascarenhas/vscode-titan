@@ -22,6 +22,7 @@ const folderRoot = path.join(sourceRoot, "mathlib");
 const consumerFile = path.join(sourceRoot, "consumer.titan");
 const providerFile = path.join(folderRoot, "mathlib.titan");
 const headerFile = path.join(root, "include", "fixture.h");
+const inheritedHeaderFile = path.join(root, "include", "inherited.h");
 const configFile = path.join(root, "titan-config.lua");
 const unmappedFile = path.join(root, "outside.titan");
 const databaseFile = path.join(root, ".titan-ls", "index.sqlite3");
@@ -33,14 +34,20 @@ const config = [
   ""
 ].join("\n");
 const consumer = (value) => [
-  'local provider = import "mathlib"',
-  'local c = foreign import "fixture.h"',
+  'local provider = import "mathlib.titan"',
+  'foreign import "fixture.h"',
   "function answer(): integer",
-  "  local number: c.fixture_int = provider.forty()",
-  `  return number + provider.extra() + ${value}`,
+  "  local number: ffi.fixture_int = provider.forty()",
+  `  return number + provider.extra() + ffi.FIXTURE_CODE + ${value}`,
   "end",
   ""
 ].join("\n");
+const providerUseColumn = consumer(0).split("\n")[3].indexOf("forty") + 1;
+assert(providerUseColumn > 0);
+const fixtureHeader = (declaration) => declaration +
+  "enum fixture_code { FIXTURE_CODE = INHERITED_CODE + 1 };\n";
+const inheritedHeader = (value) =>
+  `enum inherited_code { INHERITED_CODE = ${value} };\n`;
 
 async function withServer(label, body, environment = {}) {
   const child = launch(root, "trace", environment);
@@ -118,7 +125,7 @@ async function withServer(label, body, environment = {}) {
 async function featureSnapshot(session) {
   const position = {
     textDocument: {uri: uri(consumerFile)},
-    position: {line: 3, character: 42}
+    position: {line: 3, character: providerUseColumn}
   };
   const definition = await session.query("textDocument/definition", position);
   const publications = session.responses.diagnosticPublications;
@@ -150,7 +157,7 @@ async function featureSnapshot(session) {
 
 async function failedConsumerSnapshot(session) {
   assert.equal(await session.query("textDocument/hover", {
-    textDocument: {uri: uri(consumerFile)}, position: {line: 3, character: 42}
+    textDocument: {uri: uri(consumerFile)}, position: {line: 3, character: providerUseColumn}
   }), null, "invalid configuration retained old consumer semantics");
   const failed = session.responses.diagnosticPublications.filter((item) =>
     item.uri === uri(consumerFile)).at(-1);
@@ -245,15 +252,18 @@ try {
   await mkdir(path.dirname(headerFile));
   await writeFile(configFile, config);
   await writeFile(unmappedFile, "function outside(): integer\n  return 0\nend\n");
-  await writeFile(providerFile, "function forty(): integer\n  return 40\nend\n");
+  await writeFile(providerFile, "function forty(): integer\n  return 40\nend\n" +
+    'foreign import "inherited.h"\n');
   await writeFile(path.join(folderRoot, "extra.titan"),
     "function extra(): integer\n  return 1\nend\n");
   await writeFile(consumerFile, consumer(1));
-  await writeFile(headerFile, "typedef int  fixture_int;\n");
+  await writeFile(headerFile, fixtureHeader("typedef int  fixture_int;\n"));
+  await writeFile(inheritedHeaderFile, inheritedHeader(7));
   // An integral timestamp survives Node's Date conversion exactly. The later
   // edit deliberately preserves both this timestamp and the file's size.
   const headerTimestamp = new Date("2020-01-02T03:04:05Z");
   await utimes(headerFile, headerTimestamp, headerTimestamp);
+  await utimes(inheritedHeaderFile, headerTimestamp, headerTimestamp);
   const headerBefore = await stat(headerFile);
 
   const cold = await withServer("cold", featureSnapshot);
@@ -288,7 +298,7 @@ try {
       `hydration or importer-only editing performed ${field}`);
   }
 
-  await writeFile(headerFile, "typedef long fixture_int;\n");
+  await writeFile(headerFile, fixtureHeader("typedef long fixture_int;\n"));
   await utimes(headerFile, headerTimestamp, headerTimestamp);
   const headerAfter = await stat(headerFile);
   assert.equal(headerAfter.size, headerBefore.size);
@@ -308,6 +318,21 @@ try {
     "changed-mtime header edit reused a stale preprocessor graph");
   assert.ok(cacheStats(changedHeader.records).conversion_misses > 0,
     "header type edit reused a stale FFI conversion");
+
+  await writeFile(inheritedHeaderFile, inheritedHeader(9));
+  await utimes(inheritedHeaderFile, headerTimestamp,
+    new Date(headerTimestamp.getTime() + 1000));
+  const changedInheritedHeader = await withServer("changed-inherited-header", featureSnapshot);
+  assert.deepEqual(changedInheritedHeader.result, cold.result);
+  assert.deepEqual(checkedModules(changedInheritedHeader.records), ["consumer", "mathlib"],
+    "inherited C environment edit did not recheck its provider and consumer");
+  assert.ok(cacheStats(changedInheritedHeader.records).header_misses > 0);
+  assert.ok(cacheStats(changedInheritedHeader.records).conversion_misses > 0);
+  const warmInheritedHeader = await withServer("warm-inherited-header", featureSnapshot);
+  assert.deepEqual(warmInheritedHeader.result, cold.result);
+  assertWarmInitial(initialRecords(warmInheritedHeader.records).initial);
+  assert.deepEqual(checkedModules(warmInheritedHeader.records), [],
+    "unchanged inherited C environment was rechecked after restart");
 
   const membershipFile = path.join(folderRoot, "membership.titan");
   await withServer("membership-and-recovery", async (session) => {
@@ -334,14 +359,14 @@ try {
   // A completed publication must carry the configuration that produced it.
   // Restore the original configuration while the process is stopped so startup
   // cannot rely on a watcher having observed the transition back from B to A.
-  await writeFile(headerFile, [
+  await writeFile(headerFile, fixtureHeader([
     "#ifdef FIXTURE_POINTER",
     "typedef const char *fixture_int;",
     "#else",
     "typedef long fixture_int;",
     "#endif",
     ""
-  ].join("\n"));
+  ].join("\n")));
   const changedConfig = await withServer("changed-config", async (session) => {
     await featureSnapshot(session);
     await writeSavedGeneration(session.responses, configFile,
@@ -539,6 +564,7 @@ try {
     verified: ["feature replay", "folder membership", "failure recovery",
       "configuration publication identity", "compiler content identity",
       "unchanged-mtime source/header/compiler trust", "changed-mtime source/header/compiler invalidation",
+      "ordered inherited C environment restart and header invalidation",
       "SQL readiness before background hydration", "include-search shadowing", "corrupt project payload",
       "invalid SQLite payload storage types",
       "corrupt rebuild", "incompatible rebuild", "memory fallback"]

@@ -2351,11 +2351,16 @@ local function node_name(node: {string: value}, tag: string): string?
   if tag == "Ast.ArgsMethod" or tag == "Ast.ArgsNamedMethod" then
     return optional_string(node["method"], DRIVER_MODULE, tag .. ".method")
   end
-  if tag == "Ast.TopLevelImport" or tag == "Ast.TopLevelForeignImport" then
+  if tag == "Ast.TopLevelImport" then
     return optional_string(
       node["localname"], DRIVER_MODULE, tag .. ".localname")
   end
   return nil
+end
+
+local function foreign_namespace_member(node: {string: value},
+                                         tag: string): boolean
+  return tag == "Type.ModuleMember" and node["_foreign_namespace"] == true
 end
 
 local function node_is_local(node: {string: value}): boolean
@@ -2366,13 +2371,13 @@ local function node_is_local(node: {string: value}): boolean
     -- so preserve that compiler visibility rule explicitly.
     return true
   end
-  if tag == "Ast.TopLevelImport" or
-      tag == "Ast.TopLevelForeignImport" then
-    -- Import namespaces are always introduced by Titan's `local` import
-    -- syntax. The compiler does not need an `islocal` marker for checking, so
-    -- normalize that source fact explicitly at the language-server boundary.
+  if tag == "Ast.TopLevelImport" then
+    -- Titan module aliases are local bindings even without an AST marker.
+    -- Nameless foreign directives introduce no binding of their own.
     return true
   end
+  if tag == "Checker.ForeignNamespace" or
+      foreign_namespace_member(node, tag) then return true end
   if optional_boolean(node["islocal"], DRIVER_MODULE, "AST islocal") then
     return true
   end
@@ -2444,6 +2449,22 @@ local function declaration_identity(module_name: string, candidate: value): stri
   local raw = required_map(candidate, DRIVER_MODULE, "symbol declaration")
   local tag = required_string(
     raw["_tag"], DRIVER_MODULE, "symbol declaration._tag")
+  if tag == "Checker.ForeignNamespace" then
+    local namespace_type = required_map(
+      raw["_type"], DRIVER_MODULE, "foreign namespace._type")
+    if raw["name"] ~= "ffi" or raw["_builtin"] ~= true or
+        namespace_type["_tag"] ~= "Type.CModule" or
+        namespace_type["name"] ~= "ffi" then
+      return fail<string>(DRIVER_MODULE, "invalid builtin foreign namespace")
+    end
+    -- This compiler-owned namespace has written references but no source
+    -- declaration. Each module has its own combined C environment.
+    return "builtin:" .. module_name .. ":ffi"
+  end
+  if foreign_namespace_member(raw, tag) then
+    return "foreign:" .. module_name .. ":value:" .. required_string(
+      raw["name"], DRIVER_MODULE, "foreign namespace member.name")
+  end
   if tag == "Ast.Decl" then
     local canonical: value = raw["_decl"]
     if canonical ~= nil and canonical ~= false and canonical ~= candidate then
@@ -2453,7 +2474,8 @@ local function declaration_identity(module_name: string, candidate: value): stri
   if strings.sub(tag, 1, 4) == "Ast." then
     local name: string? = optional_string(
       raw["name"], DRIVER_MODULE, "symbol declaration.name")
-    if tag == "Ast.TopLevelImport" or tag == "Ast.TopLevelForeignImport" then
+    if tag == "Ast.TopLevelForeignImport" then return nil end
+    if tag == "Ast.TopLevelImport" then
       name = optional_string(
         raw["localname"], DRIVER_MODULE, "symbol declaration.localname")
     elseif tag == "Ast.TopLevelVar" then
@@ -2496,6 +2518,10 @@ local function declaration_identity(module_name: string, candidate: value): stri
     if index < 1 then
       return fail<string>(DRIVER_MODULE,
         "Checker.Parameter.index must be positive")
+    end
+    if raw["_foreign_namespace"] == true then
+      return "foreign:" .. module_name .. ":parameter:" ..
+        callable_name .. ":" .. index .. ":" .. name
     end
     return "parameter:" .. owner_kind .. ":" .. owner_name .. ":" ..
       callable_name .. ":" .. index .. ":" .. name
@@ -2821,11 +2847,19 @@ local function Walker:add_bound_occurrence(name: string, declaration: value,
   local declaration_id = declaration_identity(
     self.module_name, declaration)
   local localness = declaration_local(declaration)
+  local inferred: TypeInfo? = nil
+  if declaration ~= nil and declaration ~= false then
+    local raw = required_map(declaration, DRIVER_MODULE, "bound declaration")
+    if raw["_tag"] == "Checker.ForeignNamespace" then
+      inferred = optional_type(
+        self.compiler, raw, "_type", "bound foreign namespace")
+    end
+  end
   self.symbols[#self.symbols + 1] = SymbolOccurrence.new(
     name, declaration_id, role, location,
     exact_name_span(location, name), localness,
     declaration_visibility(declaration, localness),
-    nil, nil,
+    inferred, nil,
     self:summary_id(
       declaration, declaration, "bound hover summary declaration"))
 end
@@ -2947,9 +2981,7 @@ local function Walker:visit_node(candidate: value, parent_id: integer?,
         or tag == "Ast.Decl" or tag == "Ast.UnionVariant"
         or tag == "Ast.TypeParam"
         or tag == "Ast.InterfaceMethod" then
-      role = (tag == "Ast.TopLevelImport" or
-              tag == "Ast.TopLevelForeignImport")
-        and "import_alias" or "definition"
+      role = tag == "Ast.TopLevelImport" and "import_alias" or "definition"
     elseif tag == "Ast.TypeName" or tag == "Ast.TypeQualName" then
       role = "type_reference"
     end
