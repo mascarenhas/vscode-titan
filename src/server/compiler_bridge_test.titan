@@ -1562,7 +1562,7 @@ local function joins_source_imported_local_function_definition_identity()
   local provider = bridge.ProjectModule.new(
     "bridge_source_definition_provider", {bridge.SourceFile.new(
       provider_file,
-      "local ffi = foreign import \"titan/ffi.h\"\n" ..
+      "foreign import \"titan/ffi.h\"\n" ..
       "local secret_value: integer = 1\n" ..
       "local function secret(): integer return 41 end\n" ..
       "foreign function native_add(left: int,\n" ..
@@ -1839,8 +1839,8 @@ typedef int vscode_titan_lsp_project_only_int;
   local module = bridge.ProjectModule.new("bridge_ffi_include", {
     bridge.SourceFile.new(
       "/workspace/bridge_ffi_include.titan",
-      "local c = foreign import \"" .. header_name .. "\"\n" ..
-      "local type ProjectInteger = c.vscode_titan_lsp_project_only_int\n" ..
+      "foreign import \"" .. header_name .. "\"\n" ..
+      "local type ProjectInteger = ffi.vscode_titan_lsp_project_only_int\n" ..
       "function answer(): integer return 42 end\n")
   })
   local configured = bridge.load()
@@ -2295,10 +2295,10 @@ local function excludes_foreign_and_external_declarations_from_features()
   end
 
   local filename = "/workspace/semantic_boundaries.titan"
-  local source = [[local c = foreign import "string.h"
+  local source = [[foreign import "string.h"
 local external = import "semantic_acceptance_external"
 function ffi_use(): integer
-  return c.strlen("Titan")
+  return ffi.strlen("Titan")
 end
 function external_use(): integer
   return external.external_value()
@@ -2325,16 +2325,16 @@ end
   defer model:close()
 
   local foreign_definition? = model:definition(
-    filename, source_text.Position.new(3, 12))
+    filename, source_text.Position.new(3, 14))
   local foreign_references = model:references(
-    filename, source_text.Position.new(3, 12), true)
+    filename, source_text.Position.new(3, 14), true)
   local foreign_rename?, foreign_rename_error? = model:rename(
-    filename, source_text.Position.new(3, 12), "renamed_native")
+    filename, source_text.Position.new(3, 14), "renamed_native")
   test.assert(foreign_definition == nil and
               #foreign_references == 1 and
               foreign_references[1].range.start.line == 3 and
-              foreign_references[1].range.start.character == 11 and
-              foreign_references[1].range.finish.character == 17 and
+              foreign_references[1].range.start.character == 13 and
+              foreign_references[1].range.finish.character == 19 and
               foreign_rename == nil and foreign_rename_error ~= nil and
               strings.find(foreign_rename_error.message,
                            "outside project") ~= nil,
@@ -2368,7 +2368,7 @@ local function preserves_imported_callable_hover_signatures()
   fs.unlink(external_root)
   fs.mkdir(external_root)
   local external_file = external_root .. "/hover_external.titan"
-  fs.write_file(external_file, [[local ffi = foreign import "titan/ffi.h"
+  fs.write_file(external_file, [[foreign import "titan/ffi.h"
 record Counter
   amount: integer
 end
@@ -3216,10 +3216,10 @@ local function preserves_direct_c_callable_hover_signatures()
   end
 
   local filename = "/workspace/hover_c_consumer.titan"
-  local source = [[local native = foreign import "hover_callable.h"
+  local source = [[foreign import "hover_callable.h"
 function run(): integer
-  local named: integer = native.hover_named_sum(1, 2)
-  local unnamed: integer = native.hover_unnamed_sum(3, 4)
+  local named: integer = ffi.hover_named_sum(1, 2)
+  local unnamed: integer = ffi.hover_unnamed_sum(3, 4)
   return named + unnamed
 end
 ]]
@@ -3241,15 +3241,15 @@ end
 
   local named? = model:hover(filename, source_text.Position.new(2, 40))
   test.assert(named ~= nil and named:markdown() ==
-                "- Signature: `native.hover_named_sum(" ..
+                "- Signature: `ffi.hover_named_sum(" ..
                 "left: int, right: int): int`\n" ..
-                "- Visibility: exported\n",
-              "direct C function lost its written alias or parameter names")
+                "- Visibility: module\n",
+              "direct C function lost its FFI namespace or parameter names")
 
   local unnamed? = model:hover(filename, source_text.Position.new(3, 42))
   test.assert(unnamed ~= nil and unnamed:markdown() ==
-                "- Signature: `native.hover_unnamed_sum(int, int): int`\n" ..
-                "- Visibility: exported\n",
+                "- Signature: `ffi.hover_unnamed_sum(int, int): int`\n" ..
+                "- Visibility: module\n",
               "unnamed C prototype invented parameter labels")
 end
 
@@ -3631,7 +3631,7 @@ local function overlays_current_header_observations_on_project_payloads()
   local name = "project_observed_header"
   local projects = {bridge.ProjectModule.new(name,{
     bridge.SourceFile.new(root .. "/project_observed_header.titan",
-      "local c = foreign import \"" .. header .. "\"\n" ..
+      "foreign import \"" .. header .. "\"\n" ..
       "function answer(): integer return 42 end\n")})}
   local compiler = bridge.load()
   local analysis = compiler:analyze(name,projects)
@@ -3675,4 +3675,318 @@ end
 function test_compiler_bridge_overlays_current_header_observations_on_project_payloads(
     _context: test.Context)
   run_bridge(overlays_current_header_observations_on_project_payloads)
+end
+
+local function assert_clean_ffi_analysis(analysis: bridge.Analysis,
+                                         subject: string)
+  local messages = strings.writer()
+  for index = 1, #analysis.diagnostics do
+    messages:write(analysis.diagnostics[index].message .. "\n")
+  end
+  test.assert(#analysis.diagnostics == 0, subject .. ": " .. messages:drain())
+end
+
+local function preserves_combined_ffi_namespace_semantics()
+  preload_real_compiler()
+  local root = fs.tmpname()
+  fs.unlink(root)
+  fs.mkdir(root)
+  local first_header = root .. "/ordered_base.h"
+  local second_header = root .. "/ordered_api.h"
+  fs.write_file(first_header,
+    "#ifndef BRIDGE_ORDERED_BASE_H\n#define BRIDGE_ORDERED_BASE_H\n" ..
+    "typedef int ordered_word;\n#define ORDERED_BIAS 4\n#endif\n")
+  fs.write_file(second_header,
+    "enum ordered_code { ORDERED_CODE = ORDERED_BIAS + 3 };\n" ..
+    "int ordered_call(ordered_word amount);\n")
+  defer do
+    fs.unlink(second_header)
+    fs.unlink(first_header)
+    fs.rmdir(root)
+  end
+  local source = "foreign import \"" .. first_header .. "\"\n" ..
+    "foreign import \"" .. second_header .. "\"\n" ..
+    "local function use(input: ffi.ordered_word): integer\n" ..
+    "  local left: integer = ffi.ordered_call { amount = input }\n" ..
+    "  return left + ffi.ordered_call(input) + ffi.ORDERED_CODE\n" ..
+    "end\n"
+  local first_file = root .. "/ordered_first.titan"
+  local second_file = root .. "/ordered_second.titan"
+  local projects = {
+    bridge.ProjectModule.new("ordered_first", {
+      bridge.SourceFile.new(first_file, source),
+    }),
+    bridge.ProjectModule.new("ordered_second", {
+      bridge.SourceFile.new(second_file, source),
+    }),
+  }
+  local compiler = bridge.load()
+  local analysis = compiler:analyze("ordered_first", projects)
+  assert_clean_ffi_analysis(analysis, "combined header namespace failed")
+  local first: bridge.ModuleSnapshot = analysis:find_module("ordered_first")
+  local second: bridge.ModuleSnapshot = analysis:find_module("ordered_second")
+  test.assert(#first.imports == 0 and #second.imports == 0,
+              "foreign directives became Titan dependency aliases")
+  test.assert(symbol_identity(first, "ffi") ~= nil and
+              symbol_identity(first, "ffi") ~= symbol_identity(second, "ffi") and
+              symbol_identity(first, "ordered_call") ~= nil and
+              symbol_identity(first, "ordered_call") ~=
+                symbol_identity(second, "ordered_call") and
+              symbol_identity(first, "amount") ~= nil and
+              symbol_identity(first, "amount") ~= symbol_identity(second, "amount"),
+              "different modules shared a builtin, C member, or parameter identity")
+  local directives = 0
+  for index = 1, #first.nodes do
+    local node = first.nodes[index]
+    if node.tag == "Ast.TopLevelForeignImport" then
+      directives = directives + 1
+      test.assert(node.name == nil,
+                  "a foreign directive invented a local binding")
+    end
+  end
+  test.assert(directives == 2, "ordered foreign directives disappeared")
+  local model = features.build(projects, analysis.modules)
+  defer model:close()
+  local root_position = marked_name_position(
+    source, "ffi.ordered_call {", "ffi")
+  local type_root = marked_name_position(
+    source, "input: ffi.ordered_word", "ffi")
+  local root_hover? = model:hover(first_file, root_position)
+  local type_hover? = model:hover(first_file, type_root)
+  test.assert(root_hover ~= nil and type_hover ~= nil and
+              strings.find(root_hover:markdown(), "C module ffi") ~= nil and
+              type_hover:markdown() == root_hover:markdown(),
+              "value and type roots lost builtin namespace hover")
+  local references = model:references(first_file, root_position, true)
+  test.assert(#references == 4,
+              "builtin references lost a type root or invented a definition")
+  local first_uri: string = source_text.path_to_file_uri(first_file)
+  for index = 1, #references do
+    test.assert(references[index].uri == first_uri,
+                "builtin references crossed module environments")
+  end
+  local renamed?, rename_error? = model:rename(
+    first_file, root_position, "native")
+  test.assert(model:definition(first_file, root_position) == nil and
+              renamed == nil and rename_error ~= nil,
+              "builtin FFI namespace became a navigation or rename target")
+  local call_position = marked_name_position(
+    source, "ffi.ordered_call {", "ordered_call")
+  local call_hover? = model:hover(first_file, call_position)
+  test.assert(call_hover ~= nil and call_hover.callable_signature ~= nil and
+              strings.find(call_hover.callable_signature.display,
+                "ffi.ordered_call(amount:") ~= nil and
+              #model:references(first_file, call_position, true) == 2 and
+              model:definition(first_file, call_position) == nil,
+              "combined C calls lost named hover or module-scoped references")
+  local enum_position = marked_name_position(source, "ffi.ORDERED_CODE", "ORDERED_CODE")
+  test.assert(model:hover(first_file, enum_position) ~= nil,
+              "combined-header enum lost its saved semantic occurrence")
+  local parameter_position = marked_name_position(source, "amount = input", "amount")
+  test.assert(#model:references(first_file, parameter_position, true) == 1 and
+              model:definition(first_file, parameter_position) == nil,
+              "C parameter references crossed module environments or navigated into C")
+end
+
+function test_compiler_bridge_preserves_combined_ffi_namespace_semantics(
+    _context: test.Context)
+  run_bridge(preserves_combined_ffi_namespace_semantics)
+end
+
+local function assert_inherited_header_inputs(snapshot: bridge.ModuleSnapshot,
+                                              first: string, second: string)
+  local saw_first, saw_second = false, false
+  for index = 1, #snapshot.c_header_dependencies do
+    local input = snapshot.c_header_dependencies[index]
+    case input.kind
+    when file then
+      if input.path == first then saw_first = true end
+      if input.path == second then saw_second = true end
+    else
+    end
+  end
+  test.assert(saw_first and saw_second,
+              "source-imported C environment lost its physical header closure")
+end
+
+local function preserves_inherited_ffi_payloads(external_provider: boolean)
+  preload_real_compiler()
+  local root = fs.tmpname()
+  fs.unlink(root)
+  fs.mkdir(root)
+  local first_header = root .. "/inherited_base.h"
+  local second_header = root .. "/inherited_api.h"
+  local provider_file = root .. "/ffi_provider.titan"
+  local consumer_file = root .. "/ffi_consumer.titan"
+  fs.write_file(first_header,
+    "#ifndef BRIDGE_INHERITED_BASE_H\n#define BRIDGE_INHERITED_BASE_H\n" ..
+    "typedef int inherited_word;\n#define INHERITED_BIAS 4\n#endif\n")
+  fs.write_file(second_header,
+    "#ifndef BRIDGE_INHERITED_API_H\n#define BRIDGE_INHERITED_API_H\n" ..
+    "enum inherited_code { INHERITED_CODE = INHERITED_BIAS + 3 };\n" ..
+    "int inherited_call(inherited_word amount);\n#endif\n")
+  local provider_source = "foreign import \"" .. first_header .. "\"\n" ..
+    "foreign import \"" .. second_header .. "\"\n" ..
+    "foreign function native_add(input: ffi.inherited_word): ffi.inherited_word\n" ..
+    "  return input + 1\n" ..
+    "end\n"
+  fs.write_file(provider_file, provider_source)
+  defer do
+    fs.unlink(provider_file)
+    fs.unlink(second_header)
+    fs.unlink(first_header)
+    fs.rmdir(root)
+  end
+  local consumer_source: (integer) -> string = function (extra: integer): string
+    return "local provider = import \"ffi_provider.titan\"\n" ..
+      "local function answer(input: ffi.inherited_word): integer\n" ..
+      "  local native: integer = provider.native_add(input)\n" ..
+      "  return native + ffi.inherited_call(input) + ffi.INHERITED_CODE + " .. extra .. "\n" ..
+      "end\n"
+  end
+  local consumer = bridge.ProjectModule.new("ffi_consumer", {
+    bridge.SourceFile.new(consumer_file, consumer_source(0)),
+  })
+  local projects: {bridge.ProjectModule} = {consumer}
+  local selected = {"ffi_consumer"}
+  if not external_provider then
+    projects[#projects + 1] = bridge.ProjectModule.new("ffi_provider", {
+      bridge.SourceFile.new(provider_file, provider_source),
+    })
+    selected[#selected + 1] = "ffi_provider"
+  end
+  local compiler = bridge.load()
+  compiler:configure_paths(root, nil, nil)
+  local initial = compiler:analyze("ffi_consumer", projects)
+  assert_clean_ffi_analysis(initial, "inherited FFI source context failed")
+  local consumer_snapshot: bridge.ModuleSnapshot = initial:find_module("ffi_consumer")
+  local provider_snapshot: bridge.ModuleSnapshot = initial:find_module("ffi_provider")
+  assert_inherited_header_inputs(consumer_snapshot, first_header, second_header)
+  assert_inherited_header_inputs(provider_snapshot, first_header, second_header)
+  if external_provider then
+    test.assert(#provider_snapshot.nodes == 0 and #provider_snapshot.symbols == 0 and
+                not compiler:has_project_ast("ffi_provider"),
+                "inherited FFI metadata retained an external provider AST")
+  end
+  local model = features.build(projects, initial.modules)
+  defer model:close()
+  local native_position = marked_name_position(
+    consumer_source(0), "provider.native_add", "native_add")
+  local inherited_position = marked_name_position(
+    consumer_source(0), "ffi.inherited_call", "inherited_call")
+  local native_hover? = model:hover(consumer_file, native_position)
+  local inherited_hover? = model:hover(consumer_file, inherited_position)
+  test.assert(native_hover ~= nil and native_hover.callable_signature ~= nil and
+              strings.find(native_hover.callable_signature.display,
+                "ffi_provider.native_add(input:") ~= nil and
+              inherited_hover ~= nil and inherited_hover.callable_signature ~= nil and
+              strings.find(inherited_hover.callable_signature.display,
+                "ffi.inherited_call(amount:") ~= nil,
+              "source-private and inherited C callables lost their distinct hover owners")
+  local payloads = compiler:export_projects(projects, selected)
+  test.assert(#payloads == #selected,
+              "inherited C descriptors prevented project graph export")
+  local restarted = bridge.load()
+  restarted:configure_paths(root, nil, nil)
+  local restored = restarted:hydrate_projects(projects, payloads)
+  test.assert(#restored == #selected,
+              "inherited C descriptors prevented project graph hydration")
+  for index = 1, #restored do
+    assert_inherited_header_inputs(restored[index], first_header, second_header)
+  end
+  local replayed = features.build(projects, restored)
+  defer replayed:close()
+  local replayed_native? = replayed:hover(consumer_file, native_position)
+  local replayed_inherited? = replayed:hover(consumer_file, inherited_position)
+  test.assert(replayed_native ~= nil and replayed_inherited ~= nil and
+              replayed_native:markdown() == native_hover:markdown() and
+              replayed_inherited:markdown() == inherited_hover:markdown(),
+              "hydrating inherited C metadata changed saved callable semantics")
+  test.assert(restarted:has_project_ast("ffi_provider") == not external_provider,
+              "graph hydration changed the project/external AST ownership boundary")
+  projects[1] = bridge.ProjectModule.new("ffi_consumer", {
+    bridge.SourceFile.new(consumer_file, consumer_source(1)),
+  })
+  local changed = restarted:analyze_incremental(projects, {"ffi_consumer"}, {})
+  assert_clean_ffi_analysis(changed, "editing a hydrated inherited FFI consumer failed")
+  local edited: bridge.ModuleSnapshot = changed:find_module("ffi_consumer")
+  assert_inherited_header_inputs(edited, first_header, second_header)
+  if not external_provider then
+    test.assert(changed:find_module("ffi_provider") == nil,
+                "consumer body edit rechecked its unchanged project C environment")
+  else
+    local external: bridge.ModuleSnapshot = changed:find_module("ffi_provider")
+    test.assert(#external.nodes == 0 and #external.symbols == 0 and
+                not restarted:has_project_ast("ffi_provider"),
+                "consumer body edit retained its external provider AST")
+  end
+end
+
+function test_compiler_bridge_hydrates_inherited_project_ffi_context(_context: test.Context)
+  run_bridge(function () preserves_inherited_ffi_payloads(false) end)
+end
+
+function test_compiler_bridge_hydrates_inherited_external_ffi_metadata(_context: test.Context)
+  run_bridge(function () preserves_inherited_ffi_payloads(true) end)
+end
+
+local function assert_contextual_ffi_rename(model: features.Features,
+                                            filename: string, source: string,
+                                            marker: string, name: string,
+                                            allowed: boolean)
+  local candidate?, candidate_error? = model:rename(
+    filename, marked_name_position(source, marker, name), "ffi")
+  test.assert(candidate ~= nil and candidate_error == nil,
+              "contextual ffi rename was rejected before compiler preflight")
+  local analysis = bridge.load():analyze(
+    "ffi_rename_consumer", candidate:edited_project_modules())
+  local verified?, verification_error? = candidate:preflight(analysis)
+  if allowed then
+    assert_clean_ffi_analysis(analysis, "member rename to ffi failed")
+    test.assert(verified ~= nil and verification_error == nil,
+                "member rename to ffi failed its binding preflight")
+  else
+    test.assert(#analysis.diagnostics > 0 and verified == nil and
+                verification_error ~= nil,
+                "binding rename to reserved ffi passed compiler preflight")
+  end
+end
+
+local function distinguishes_ffi_member_and_binding_renames()
+  preload_real_compiler()
+  local filename = "/workspace/ffi_rename_consumer.titan"
+  local source = [[local provider = import "ffi_rename_provider"
+record Item
+  amount: integer
+end
+function Item:read(): integer return self.amount end
+function answer(): integer
+  local selected = Item.new { amount = 1 }
+  return selected:read() + provider.answer()
+end
+]]
+  local projects = {
+    bridge.ProjectModule.new("ffi_rename_provider", {
+      bridge.SourceFile.new("/workspace/ffi_rename_provider.titan",
+        "function answer(): integer return 41 end\n"),
+    }),
+    bridge.ProjectModule.new("ffi_rename_consumer", {
+      bridge.SourceFile.new(filename, source),
+    }),
+  }
+  local analysis = bridge.load():analyze("ffi_rename_consumer", projects)
+  assert_clean_ffi_analysis(analysis, "contextual ffi rename fixture failed")
+  local model = features.build(projects, analysis.modules)
+  defer model:close()
+  assert_contextual_ffi_rename(model, filename, source, "amount: integer", "amount", true)
+  assert_contextual_ffi_rename(model, filename, source, "Item:read", "read", true)
+  assert_contextual_ffi_rename(model, filename, source, "local selected", "selected", false)
+  assert_contextual_ffi_rename(model, filename, source, "local provider", "provider", false)
+  assert_contextual_ffi_rename(model, filename, source, "function answer", "answer", false)
+  assert_contextual_ffi_rename(model, filename, source, "record Item", "Item", false)
+end
+
+function test_compiler_bridge_distinguishes_ffi_member_and_binding_renames(
+    _context: test.Context)
+  run_bridge(distinguishes_ffi_member_and_binding_renames)
 end

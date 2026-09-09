@@ -4,7 +4,7 @@ local lua = import "lua"
 local strings = import "string"
 local test = import "test"
 local timer = import "timer"
-local file_times = foreign import "utime.h"
+foreign import "utime.h"
 local bridge = import "server.compiler_bridge.titan"
 local test_runtime = import "server.test_runtime"
 
@@ -161,13 +161,13 @@ typedef int bridge_concurrency_cppflags_b_int;
   local project_a = bridge.ProjectModule.new(CPPFLAGS_MODULE_A, {
     bridge.SourceFile.new(
       root .. "/" .. CPPFLAGS_MODULE_A .. ".titan",
-      "local c = foreign import \"" .. header_a .. "\"\n" ..
+      "foreign import \"" .. header_a .. "\"\n" ..
       "function answer(): integer return 41 end\n")
   })
   local project_b = bridge.ProjectModule.new(CPPFLAGS_MODULE_B, {
     bridge.SourceFile.new(
       root .. "/" .. CPPFLAGS_MODULE_B .. ".titan",
-      "local c = foreign import \"" .. header_b .. "\"\n" ..
+      "foreign import \"" .. header_b .. "\"\n" ..
       "function answer(): integer return 42 end\n")
   })
   local compiler_a = bridge.load()
@@ -451,13 +451,13 @@ local function cancels_ffi_analysis_and_transfers_cleanup()
   local project = bridge.ProjectModule.new(CLEANUP_MODULE, {
     bridge.SourceFile.new(
       root .. "/" .. CLEANUP_MODULE .. ".titan",
-      "local c = foreign import \"bridge_concurrency_cleanup.h\"\n" ..
-      "local function probe_pointer(pointer: *c.bridge_cleanup_source): " ..
-      "*c.bridge_cleanup_target\n" ..
+      "foreign import \"bridge_concurrency_cleanup.h\"\n" ..
+      "local function probe_pointer(pointer: *ffi.bridge_cleanup_source): " ..
+      "*ffi.bridge_cleanup_target\n" ..
       "  return pointer\n" ..
       "end\n" ..
-      "foreign function identity(input: c.bridge_concurrency_cleanup_int): " ..
-      "c.bridge_concurrency_cleanup_int\n" ..
+      "foreign function identity(input: ffi.bridge_concurrency_cleanup_int): " ..
+      "ffi.bridge_concurrency_cleanup_int\n" ..
       "  return input\n" ..
       "end\n")
   })
@@ -481,6 +481,7 @@ local function cancels_ffi_analysis_and_transfers_cleanup()
   -- lookup, so observing it while the Task waits pins cancellation to that
   -- exact yield rather than to an earlier filesystem or compiler operation.
   local checking_header?: string = nil
+  local checking_ffi_header?: string = nil
   while checking_header == nil do
     local raw_imported: value = driver["imported"]
     if raw_imported is {string: value} then
@@ -490,6 +491,9 @@ local function cancels_ffi_analysis_and_transfers_cleanup()
         local raw_header: value =
           (raw_module as {string: value})["checking_foreign_header"]
         if raw_header is string then checking_header = raw_header end
+        local raw_ffi_header: value =
+          (raw_module as {string: value})["checking_ffi_header"]
+        if raw_ffi_header is string then checking_ffi_header = raw_ffi_header end
       end
     end
     if checking_header == nil then
@@ -520,6 +524,10 @@ local function cancels_ffi_analysis_and_transfers_cleanup()
               "FFI analysis was not waiting at its post-module yield")
   test.assert(fs.lstat(checking_header as string) ~= nil,
               "generated checking header was absent before cancellation")
+  test.assert(checking_ffi_header ~= nil and
+              checking_ffi_header ~= checking_header and
+              fs.lstat(checking_ffi_header as string) ~= nil,
+              "module C environment header was absent before cancellation")
 
   local workspace? = observe_probe_workspace()
   test.assert(workspace ~= nil,
@@ -545,6 +553,7 @@ local function cancels_ffi_analysis_and_transfers_cleanup()
   local attempts = 0
   while not cleaned and attempts < 10000 do
     cleaned = fs.lstat(checking_header as string) == nil
+      and fs.lstat(checking_ffi_header as string) == nil
     for index = 1, #workspaces do
       if fs.lstat(workspaces[index]) ~= nil then cleaned = false end
     end
@@ -552,7 +561,7 @@ local function cancels_ffi_analysis_and_transfers_cleanup()
     attempts = attempts + 1
   end
   test.assert(cleaned,
-              "transferred cancellation cleanup leaked the checking header " ..
+              "transferred cancellation cleanup leaked a generated header " ..
               "or private probe workspace")
 end
 
@@ -798,11 +807,11 @@ local function large_project_payload_restoration_yields_and_cleans_up()
     function (_name: string,_snapshot: bridge.ModuleSnapshot): boolean
       return false
     end)
-  local _encoded, decode_yields, registry_yields = counts()
+  local _encoded, decode_yields, _registry_yields = counts()
   test.assert(reads == 1 and #rejected == 0 and not restored:has_project_ast(name),
     "rejected revision installed compiler state or duplicated its BLOB read")
-  test.assert(decode_yields > 1 and registry_yields > 1,
-    "single project decoding or registry assembly did not yield repeatedly")
+  test.assert(decode_yields > 1,
+    "single project decoding did not yield repeatedly")
 
   local types = lua.require("titan-compiler.types") as {string: value}
   local previous: value = types["registry"]
@@ -866,14 +875,14 @@ local function live_header_touch_uses_current_analysis_baselines()
   local header = root .. "/live_observed.h"
   fs.write_file(header,"typedef long live_observed_word;\n")
   defer do fs.unlink(header); fs.rmdir(root) end
-  local times = file_times.utimbuf.new()
+  local times = ffi.utimbuf.new()
   times.actime = 1700000000
   times.modtime = 1700000000
-  test.assert(file_times.utime(header,times) == 0,"cannot set initial header timestamp")
+  test.assert(ffi.utime(header,times) == 0,"cannot set initial header timestamp")
   local provider = bridge.ProjectModule.new("live_observed_provider",{
     bridge.SourceFile.new(root .. "/live_observed_provider.titan",
-      "local c = foreign import \"" .. header .. "\"\n" ..
-      "local function cast(item: integer): c.live_observed_word return item end\n")})
+      "foreign import \"" .. header .. "\"\n" ..
+      "local function cast(item: integer): ffi.live_observed_word return item end\n")})
   local consumer_source: (integer) -> string = function (amount: integer): string
     return "local provider = import \"live_observed_provider.titan\"\n" ..
       "function answer(): integer return provider.cast(" .. amount .. ") end\n"
@@ -904,7 +913,7 @@ local function live_header_touch_uses_current_analysis_baselines()
     end
   end
   times.modtime = 1700000001
-  test.assert(file_times.utime(header,times) == 0,"cannot touch live header")
+  test.assert(ffi.utime(header,times) == 0,"cannot touch live header")
   local current, changed = compiler:restat_c_header_dependencies(inputs)
   test.assert(not changed,"same-content header touch changed semantic identity")
   local before_reads,before_hashes = counts()

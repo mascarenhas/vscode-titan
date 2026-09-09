@@ -1215,9 +1215,9 @@ async function testSourceImportCppflagsAndUnchangedRequests() {
     ""
   ];
   const guardedLines = [
-    'local c = foreign import "vscode_titan_protocol_guard.h"',
+    'foreign import "vscode_titan_protocol_guard.h"',
     "function guarded_answer(item: integer): integer",
-    "  local converted: c.vscode_titan_protocol_int = item",
+    "  local converted: ffi.vscode_titan_protocol_int = item",
     "  return converted",
     "end",
     ""

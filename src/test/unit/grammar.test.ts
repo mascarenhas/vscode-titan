@@ -127,6 +127,28 @@ describe("Titan TextMate grammar", () => {
     assertScope(line, "finally", "invalid.illegal.reserved.titan");
   });
 
+  test("recognizes the builtin FFI namespace and nameless foreign imports", () => {
+    const [directive, value, type, member, comment, string] = tokenizeLines([
+      'foreign import "native.h"',
+      "return ffi.native_value()",
+      "local pointer: *ffi.NativeType = nil",
+      "return object.ffi",
+      "-- ffi remains comment text",
+      'local text = "ffi"'
+    ]);
+
+    assertScope(directive, "foreign", "storage.modifier.titan");
+    assertScope(directive, "import", "keyword.control.import.titan");
+    assertScope(directive, "native.h", "string.quoted.double.titan");
+    assertScope(value, "ffi", "variable.language.ffi.titan");
+    assertScope(type, "ffi", "variable.language.ffi.titan");
+    assertScope(value, "native_value", "variable.other.member.titan");
+    assertScope(type, "NativeType", "variable.other.member.titan");
+    assertScope(member, "ffi", "variable.other.member.titan");
+    assertScope(comment, "ffi", "comment.line.double-dash.titan");
+    assertScope(string, "ffi", "string.quoted.double.titan");
+  });
+
   test("keeps equals-delimited long comments and strings open across lines", () => {
     const comment = tokenizeLines([
       "--[=[ comment begins",
