@@ -332,9 +332,9 @@ end
 
 type ProgressListener = (AnalysisProgress) -> ()
 
--- Only unchanged external source modules use this serialized boundary. Clean
--- project modules retain their complete compiler-owned entries privately in
--- Compiler, while binary interfaces keep their physical provider resolution.
+-- External source modules keep equality manifests and resolver metadata.
+-- Project modules separately retain restorable declared interfaces in Compiler;
+-- bodies exist only during fresh checking and semantic extraction.
 record CachedSourceInterface
   module_name: string
   serialized: string
@@ -355,7 +355,7 @@ type CacheLookup = (string, string) -> (string?, {CHeaderDependency}?)
 type CachePublisher = (string, string, string, {CHeaderDependency}) -> ()
 type CacheInputRefresher = (string, string, {CHeaderDependency}) -> boolean
 type ProjectPayloadReader = (string) -> (string?, {CHeaderDependency}?)
-type ProjectSnapshotInstaller = (string, ModuleSnapshot) -> boolean
+type ProjectManifestInstaller = (string) -> boolean
 
 function Analysis:find_module(module_name: string): ModuleSnapshot?
   for index = 1, #self.modules do
@@ -380,7 +380,6 @@ record Compiler
   local embedded_provider_file: string
   local embedded_provider_identity: compiler_io.LstatIdentity
   local io: compiler_io.CompilerIO
-  local project_asts: {string: value}
   local project_entries: {string: value}
   local source_path: string?
   local binary_path: string?
@@ -918,6 +917,7 @@ local function load_with(require_function: RequireFunction,
   checked_function(driver, DRIVER_MODULE, "split_shell_words", type_of)
   checked_function(driver, DRIVER_MODULE, "encode_project_entry", type_of)
   checked_function(driver, DRIVER_MODULE, "decode_project_entry", type_of)
+  checked_function(driver, DRIVER_MODULE, "compact_project_entry", type_of)
   checked_function(driver, DRIVER_MODULE, "project_entries_registry", type_of)
   checked_function(driver, DRIVER_MODULE, "language_server_cache_identity", type_of)
   checked_function(driver, DRIVER_MODULE, "compiler_cache_stats", type_of)
@@ -930,7 +930,7 @@ local function load_with(require_function: RequireFunction,
   return Compiler.new(
     parser, checker, types, driver, type_of, embedded_interface_provider,
     embedded_provider_file, embedded_identity, compiler_io.create(),
-    {}, {}, nil, nil, {}, {}, nil)
+    {}, nil, nil, {}, {}, nil)
 end
 
 function load(): Compiler
@@ -956,12 +956,11 @@ function Compiler:compiler_abi(): string
   return COMPILER_ABI
 end
 
-function Compiler:has_project_ast(module_name: string): boolean
-  return self.project_asts[module_name] ~= nil
+function Compiler:has_project_entry(module_name: string): boolean
+  return self.project_entries[module_name] ~= nil
 end
 
-function Compiler:drop_project_ast(module_name: string)
-  self.project_asts[module_name] = nil
+function Compiler:drop_project_entry(module_name: string)
   self.project_entries[module_name] = nil
 end
 
@@ -3377,8 +3376,7 @@ local function snapshot_module(compiler: Compiler, module_name: string,
                                projects: {string: ProjectModule},
                                cached: {string: CachedSourceInterface},
                                valid_manifest: boolean,
-                               work: NormalizationWork,
-                               defer_ast_install: boolean?): NormalizedModule
+                               work: NormalizationWork): NormalizedModule
   local entry = required_map(
     candidate, DRIVER_MODULE, "driver.imported['" .. module_name .. "']")
   local normalized_origin = provenance(entry, module_name, projects)
@@ -3433,9 +3431,6 @@ local function snapshot_module(compiler: Compiler, module_name: string,
     end
     nodes, symbols, imports, hover_summaries = walk_ast(
       compiler, module_name, raw_ast, work)
-    if valid_manifest and not defer_ast_install then
-      compiler.project_asts[module_name] = raw_ast
-    end
   elseif cached[module_name] ~= nil then
     local cached_source = cached[module_name]
     for index = 1, #cached_source.imports do
@@ -3912,6 +3907,7 @@ local function Compiler:run_attempt_inner(
   local normalization_work = NormalizationWork.new(0)
   local options: {string: value} = { ["io"] = self.io }
   options["c_header_analysis"] = c_header_analysis
+  options["analysis_only"] = true
   if header_inputs ~= nil then options["header_inputs"] = header_inputs end
   local profiling = logging.enabled("trace")
   if profiling then
@@ -4117,7 +4113,20 @@ local function Compiler:run_attempt_inner(
           ["cpu_ms"] = logging.elapsed_ms(normalization_started),
         })
       end
-      if is_project and valid then entries[name] = imported[name] end
+      if is_project and valid then
+        local compact = checked_function(self.driver, DRIVER_MODULE,
+          "compact_project_entry", self.type_of) as
+          (value, value) -> (value, value)
+        local retained, failure = compact(imported[name], {
+          ["yield"] = function () async.yield() end,
+        } as {string: value})
+        if retained == nil or retained == false then
+          return fail<AttemptResult>(DRIVER_MODULE,
+            "cannot retain declared interface for '" .. name .. "': " ..
+            strings.tostring(failure))
+        end
+        entries[name] = retained
+      end
     end
   end
   if checked_set[root_module] and imported[root_module] == nil then
@@ -4284,7 +4293,6 @@ function Compiler:analyze_incremental(
   for name in iteration.pairs<string, value>(self.project_entries) do
     if projects[name] == nil or requested[name] then
       self.project_entries[name] = nil
-      self.project_asts[name] = nil
     end
   end
 
@@ -4502,12 +4510,12 @@ function Compiler:export_projects(projects: {ProjectModule}, selected_names: {st
   return result
 end
 
--- Decode literal compiler-owned data before attaching anything to the live
--- compiler. The temporary complete registry preserves source-private/generic
--- summary views; it never escapes the existing global compiler permit.
-function Compiler:hydrate_project_cache(projects: {ProjectModule},
+-- Decode declared interfaces and validate their canonical owners before
+-- attaching anything to the live compiler. Completed SQL facts already own
+-- body-derived semantics; restoration never reconstructs or walks an AST.
+function Compiler:restore_project_cache(projects: {ProjectModule},
     names: {string}, read: ProjectPayloadReader,
-    install: ProjectSnapshotInstaller): {string}
+    install: ProjectManifestInstaller): {string}
   local started = logging.clock()
   local permit = compiler_scheduler.acquire()
   defer permit:release()
@@ -4548,43 +4556,37 @@ function Compiler:hydrate_project_cache(projects: {ProjectModule},
     })
     return {}
   end
-  local previous: value = self.types["registry"]
-  defer self.types["registry"] = previous
-  self.types["registry"] = required_map(registry,DRIVER_MODULE,"hydrated project registry")
+  required_map(registry,DRIVER_MODULE,"restored project registry")
   local result: {string} = {}
-  local work = NormalizationWork.new(0)
   for index = 1, #projects do
     local name = projects[index].module_name
     local entry: value = entries[name]
     if entry ~= nil then
       do
-        local normalized = snapshot_module(self,name,entry,project_map,{},true,work,true)
-        if install(name,normalized.snapshot) then
-          self.project_asts[name] = required_map(entry,DRIVER_MODULE,
-            "hydrated project entry")["ast"]
+        if install(name) then
           self.project_entries[name] = entry
           result[#result + 1] = name
         else
-          self:drop_project_ast(name)
+          self:drop_project_entry(name)
         end
       catch
         if error is async.CancellationReason then raise end
-        self:drop_project_ast(name)
-        logging.emit("debug","cache.project.normalization_miss",{
+        self:drop_project_entry(name)
+        logging.emit("debug","cache.project.installation_miss",{
           ["module"] = name,["message"] = strings.tostring(error),
         })
       end
     end
   end
-  logging.emit("debug","cache.projects.hydrate",{
+  logging.emit("debug","cache.projects.restore",{
     ["requested"] = #names,["restored"] = #result,["cpu_ms"] = logging.elapsed_ms(started),
   })
   return result
 end
 
 
-function Compiler:hydrate_projects(projects: {ProjectModule},
-                                    payloads: {ProjectPayload}): {ModuleSnapshot}
+function Compiler:restore_projects(projects: {ProjectModule},
+                                    payloads: {ProjectPayload}): {string}
   local names: {string} = {}
   local saved: {string: string} = {}
   local observed: {string: {CHeaderDependency}} = {}
@@ -4594,16 +4596,11 @@ function Compiler:hydrate_projects(projects: {ProjectModule},
     saved[item.module_name] = item.payload
     if item.header_inputs ~= nil then observed[item.module_name] = item.header_inputs end
   end
-  local snapshots: {ModuleSnapshot} = {}
-  self:hydrate_project_cache(projects,names,
+  return self:restore_project_cache(projects,names,
     function (name: string): (string?,{CHeaderDependency}?)
       return saved[name],observed[name]
     end,
-    function (_name: string,snapshot: ModuleSnapshot): boolean
-      snapshots[#snapshots + 1] = snapshot
-      return true
-    end)
-  return snapshots
+    function (_name: string): boolean return true end)
 end
 
 local function containing_directory(path: string): string
@@ -4636,7 +4633,7 @@ local function hash_compiler_tree(directory: string, output: strings.StringWrite
   end
 end
 
--- The native world can consult completed header graphs, so the workspace
+-- The native world can consult extracted C definitions, so the workspace
 -- transport must be configured before this second compatibility check.
 function Compiler:native_cache_identity(): string
   local permit = compiler_scheduler.acquire()
@@ -4658,12 +4655,12 @@ end
 
 -- Resolve the inventory before any C probing. This namespace is sufficient to
 -- open the transport: each header/conversion key also carries its native world.
--- Project hydration additionally requires native_cache_identity above.
+-- Project restoration additionally requires native_cache_identity above.
 function Compiler:cache_identity(observed_fingerprint: ((string) -> string)?): string
   local permit = compiler_scheduler.acquire()
   defer permit:release()
   local output = strings.writer()
-  output:write("titan-ls-sqlite-schema-3-api-" .. COMPILER_LANGUAGE_SERVER_API)
+  output:write("titan-ls-sqlite-schema-4-api-" .. COMPILER_LANGUAGE_SERVER_API)
   local fingerprint: (string) -> string = function (path: string): string
     return content_identity.file(path,fs.read_file(path))
   end

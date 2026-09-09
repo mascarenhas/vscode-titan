@@ -2915,7 +2915,7 @@ function test_project_service_rolls_back_earlier_modules_when_later_result_is_mi
   end)
 end
 
-function test_project_service_hydrates_only_projects_revalidated_after_store_reopen(
+function test_project_service_restores_only_projects_revalidated_after_store_reopen(
     _context: test.Context)
   test_runtime.run(function ()
     with_fixture(function (fixture: Fixture)
@@ -2946,6 +2946,14 @@ function test_project_service_hydrates_only_projects_revalidated_after_store_reo
         "persistent fixture did not produce a checked project handle")
       local revision = work_revision(initial, "main")
       local generation = initial:latest().generation
+      do
+        local access = initial:workspace_store():acquire()
+        defer access:release()
+        test.assert(stores.scalar_integer(access.connection,
+          "SELECT length(public_digest)+length(source_digest) " ..
+          "FROM main.graph_modules WHERE name='main'") == 64,
+          "graph persisted complete comparison manifests instead of fixed-size digests")
+      end
       local before_touch = initial:counters()
       set_modified_time(fixture:path("src/main.titan"), 1700000001)
       set_modified_time(header, 1700000001)
@@ -2968,14 +2976,14 @@ function test_project_service_hydrates_only_projects_revalidated_after_store_reo
       test.assert(reopened:project_ast("main") == nil and
         #reopened:latest().dirty_modules == 0 and
         reopened:counters().file_reads == 0 and reopened:counters().file_hashes == 0 and
-        not reopened:hydrate_project_snapshot_at_revision("main", revision + 1, snapshot) and
-        reopened:hydrate_project_snapshot_at_revision("main", revision, snapshot),
-        "reopen fabricated a compiler handle or rejected validated clean hydration")
+        not reopened:accepts_project_manifest("main", revision + 1) and
+        reopened:accepts_project_manifest("main", revision),
+        "reopen fabricated a compiler body or rejected a validated clean manifest")
       local warm?, warm_error? = reopened:run_pending()
       test.assert(warm ~= nil and warm_error == nil and not warm.analyzed and
         reopened:counters().analysis_runs == 0 and reopened:counters().file_reads == 0 and
         reopened:counters().file_hashes == 0,
-        "unchanged hydrated project was submitted to the compiler again")
+        "unchanged restored project was submitted to the compiler again")
       reopened:close()
 
       fixture:write("include/value.h", "#define VALUE 2\n")
@@ -2987,8 +2995,8 @@ function test_project_service_hydrates_only_projects_revalidated_after_store_reo
       test.assert(changed ~= nil and change_error == nil, "changed-header persistent fixture did not reopen")
       if changed == nil then changed_store:close() raise "changed-header Service is missing" end
       test.assert(contains(changed:latest().dirty_modules, "main") and
-        not changed:hydrate_project_snapshot("main", snapshot),
-        "persisted header inputs were not revalidated before project hydration")
+        not changed:accepts_project_manifest("main", revision),
+        "persisted header inputs were not revalidated before manifest restoration")
     end)
   end)
 end
@@ -3012,7 +3020,10 @@ function test_project_service_rolls_back_header_baseline_with_its_invalidated_re
       local access = store:acquire()
       defer access:release()
       local old = stores.rows(access.connection,
-        "SELECT identity FROM main.header_inputs WHERE scope=0 AND module=?",
+        "SELECT d.identity FROM main.header_inputs AS i " ..
+        "JOIN main.header_owners AS o ON o.id=i.owner_id " ..
+        "JOIN main.header_dependencies AS d ON d.id=i.dependency_id " ..
+        "WHERE o.scope=0 AND o.key=? ORDER BY i.ordinal",
         sqlite3.Blob.new("main"))
       local original_identity = stores.bytes(old[1], 1)
       stores.execute(access.connection,
@@ -3027,7 +3038,10 @@ function test_project_service_rolls_back_header_baseline_with_its_invalidated_re
       local read = store:acquire()
       defer read:release()
       local restored = stores.rows(read.connection,
-        "SELECT identity FROM main.header_inputs WHERE scope=0 AND module=?",
+        "SELECT d.identity FROM main.header_inputs AS i " ..
+        "JOIN main.header_owners AS o ON o.id=i.owner_id " ..
+        "JOIN main.header_dependencies AS d ON d.id=i.dependency_id " ..
+        "WHERE o.scope=0 AND o.key=? ORDER BY i.ordinal",
         sqlite3.Blob.new("main"))
       test.assert(stores.bytes(restored[1], 1) == original_identity and
         stores.scalar_integer(read.connection,
@@ -3126,7 +3140,8 @@ extra_ffi_cppflags = "-DVARIANT=2"
         stores.scalar_integer(rolled_back.connection,
           "SELECT count(*) FROM main.graph_modules WHERE state=2") == 2 and
         stores.scalar_integer(rolled_back.connection,
-          "SELECT count(*) FROM main.header_inputs WHERE scope=0") == 2,
+          "SELECT count(*) FROM main.header_inputs AS i " ..
+          "JOIN main.header_owners AS o ON o.id=i.owner_id WHERE o.scope=0") == 2,
         "failed configuration transaction changed graph or header baselines")
       stores.execute(rolled_back.connection, "DROP TRIGGER main.reject_graph_configuration")
       rolled_back:release()
@@ -3153,7 +3168,7 @@ extra_ffi_cppflags = "-DVARIANT=2"
       local pending = recovered:latest().dirty_modules
       test.assert(#pending == 2 and contains(pending, "clean") and
         contains(pending, "failed") and snapshot_b ~= nil and
-        not recovered:hydrate_project_snapshot("clean", snapshot_b),
+        not recovered:accepts_project_manifest("clean", work_revision(recovered, "clean")),
         "restart trusted clean or failed graph work from configuration B")
       local after_reopen = recovered:workspace_store():acquire()
       defer after_reopen:release()

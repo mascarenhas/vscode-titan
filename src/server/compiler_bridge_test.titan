@@ -2,7 +2,7 @@ local fs = import "fs"
 local test = import "test"
 local lua = import "lua"
 local strings = import "string"
-local bridge = import "server.compiler_bridge"
+local bridge = import "server.compiler_bridge.titan"
 local embedded_interfaces = import "server.embedded_interfaces"
 local features = import "server.semantic_features"
 local logging = import "server.logging"
@@ -82,6 +82,16 @@ return function(mode, contextual_provider_file)
   driver.encode_project_entry = function() return nil, "fixture has no graph codec" end
   driver.decode_project_entry = function() return nil, "fixture has no graph codec" end
   driver.project_entries_registry = function() return {} end
+  if mode ~= "same-api-missing-compact-project-entry" then
+    driver.compact_project_entry = function(entry, options)
+      assert(type(options.yield) == "function")
+      local compact = {}
+      for key, value in pairs(entry) do
+        if key ~= "ast" then compact[key] = value end
+      end
+      return compact
+    end
+  end
   driver.language_server_cache_identity = function() return "fixture-cache-identity" end
   driver.compiler_cache_stats = function()
     return { headers = { lookups = 0, hits = 0, misses = 0,
@@ -688,6 +698,8 @@ function test_compiler_bridge_rejects_missing_incompatible_and_malformed_modules
                       "'new_c_header_analysis' must be a function, found nil")
   expect_bridge_error("same-api-missing-split-shell-words",
                       "'split_shell_words' must be a function, found nil")
+  expect_bridge_error("same-api-missing-compact-project-entry",
+                      "'compact_project_entry' must be a function, found nil")
   expect_bridge_error("malformed-parser", "'parse' must be a function")
 end
 
@@ -867,8 +879,8 @@ function test_compiler_bridge_accepts_missing_manifest_after_dependency_error(
                 "dependency error did not produce failed project snapshots")
     test.assert(root.manifest == nil and dependency.manifest == nil,
                 "failed dependency closure acquired a valid manifest")
-    test.assert(not compiler:has_project_ast("fixture") and
-                not compiler:has_project_ast("fixture.dependency"),
+    test.assert(not compiler:has_project_entry("fixture") and
+                not compiler:has_project_entry("fixture.dependency"),
                 "failed dependency closure entered the incremental cache")
   end)
 end
@@ -1253,9 +1265,9 @@ function test_compiler_bridge_normalizes_annotated_ast_and_provenance(
       "fixture", {bridge.SourceFile.new(
         "/workspace/fixture.titan", "saved fixture")})})
     test.assert(#analysis.diagnostics == 0, "valid fixture had diagnostics")
-    test.assert(compiler:has_project_ast("fixture"),
-                "project annotated AST was not retained behind the bridge")
-    test.assert(not compiler:has_project_ast("fixture.external"),
+    test.assert(compiler:has_project_entry("fixture"),
+                "project declarations were not retained behind the bridge")
+    test.assert(not compiler:has_project_entry("fixture.external"),
                 "external annotated AST leaked into retained project state")
 
     local project? = analysis:find_module("fixture")
@@ -1365,6 +1377,42 @@ end
   preload()
 end
 
+local function assert_declared_project_entry(compiler: bridge.Compiler,
+                                             module_name: string)
+  -- The compiler owns the opaque Lua entry. Keep the recursive representation
+  -- assertion at that boundary instead of teaching the typed server its shape.
+  local inspect = lua.load([==[
+return function(entry, name)
+  assert(type(entry) == "table", name .. " has no retained declarations")
+  assert(entry.ast == nil, name .. " retained its checked source AST")
+  local pending, seen = {entry}, {}
+  while #pending > 0 do
+    local node = table.remove(pending)
+    if type(node) == "table" and not seen[node] then
+      seen[node] = true
+      local tag = rawget(node, "_tag")
+      if type(tag) == "string" then
+        assert(not tag:match("^Ast%."),
+               name .. " retained a source syntax node: " .. tag)
+      end
+      for key, item in pairs(node) do
+        if type(key) == "table" then pending[#pending + 1] = key end
+        if type(item) == "table" then pending[#pending + 1] = item end
+      end
+    end
+  end
+end
+]==], "=compiler_bridge_declared_entry", nil)() as (value, string) -> ()
+  inspect(compiler.project_entries[module_name], module_name)
+end
+
+local function retained_header_inputs(compiler: bridge.Compiler,
+                                      module_name: string): {bridge.CHeaderDependency}
+  local entry = compiler.project_entries[module_name] as {string: value}
+  return bridge.normalize_c_header_dependencies(
+    entry["c_header_dependencies"], "restored project header observations")
+end
+
 local function executes_installed_compiler_on_valid_and_invalid_source()
   preload_real_compiler()
   local compiler = bridge.load()
@@ -1403,13 +1451,16 @@ function test_compiler_bridge_executes_installed_compiler_on_valid_and_invalid_s
   test_runtime.run(executes_installed_compiler_on_valid_and_invalid_source)
 end
 
-local function runs_incremental_full_ast_cache()
+local function runs_incremental_declared_interface_cache()
   preload_real_compiler()
   local compiler = bridge.load()
   local provider = bridge.ProjectModule.new("bridge_cache_provider", {
     bridge.SourceFile.new(
       "/workspace/bridge_cache_provider.titan",
-      "local function secret(): integer return 41 end\n")
+      "local function secret(): integer\n" ..
+      "  local body_only_answer = 41\n" ..
+      "  return body_only_answer\n" ..
+      "end\n")
   })
   local consumer = bridge.ProjectModule.new("bridge_cache_consumer", {
     bridge.SourceFile.new(
@@ -1424,6 +1475,8 @@ local function runs_incremental_full_ast_cache()
               initial:find_module("bridge_cache_provider") ~= nil and
               initial:find_module("bridge_cache_consumer") ~= nil,
               "initial source-required project closure did not compile")
+  assert_declared_project_entry(compiler, "bridge_cache_provider")
+  assert_declared_project_entry(compiler, "bridge_cache_consumer")
 
   local edited_consumer = bridge.ProjectModule.new(
     "bridge_cache_consumer", {bridge.SourceFile.new(
@@ -1433,17 +1486,19 @@ local function runs_incremental_full_ast_cache()
   local incremental = compiler:analyze_incremental(
     {provider, edited_consumer}, {"bridge_cache_consumer"}, {})
   test.assert(#incremental.diagnostics == 0,
-              "dirty consumer failed against retained full project AST")
+              "dirty consumer failed against its retained source-visible declarations")
   test.assert(incremental:find_module("bridge_cache_consumer") ~= nil and
               incremental:find_module("bridge_cache_provider") == nil,
               "unchanged source-required provider was reparsed or rechecked")
-  test.assert(compiler:has_project_ast("bridge_cache_provider"),
-              "clean project AST disappeared from the private bridge cache")
+  test.assert(compiler:has_project_entry("bridge_cache_provider"),
+              "clean project declarations disappeared from the private bridge cache")
+  assert_declared_project_entry(compiler, "bridge_cache_provider")
+  assert_declared_project_entry(compiler, "bridge_cache_consumer")
 end
 
-function test_compiler_bridge_reuses_unchanged_full_ast_incrementally(
+function test_compiler_bridge_reuses_unchanged_declared_interface_incrementally(
     _context: test.Context)
-  test_runtime.run(runs_incremental_full_ast_cache)
+  test_runtime.run(runs_incremental_declared_interface_cache)
 end
 
 local function preserves_mixed_sparse_project_payloads()
@@ -1454,13 +1509,16 @@ local function preserves_mixed_sparse_project_payloads()
   local provider_file = "/workspace/sparse_provider.titan"
   local consumer_file = "/workspace/sparse_consumer.titan"
   local provider = bridge.ProjectModule.new(provider_name,{bridge.SourceFile.new(provider_file,
-    "record Box<A> item: A end\n" ..
-    "local function secret<A>(item: A): A return item end\n")})
+    "record Box<A> item: A local hidden: A end\n" ..
+    "local function secret<A>(item: A): A\n" ..
+    "  local body_only_result = item\n" ..
+    "  return body_only_result\n" ..
+    "end\n")})
   local consumer_source: (integer) -> string = function (extra: integer): string
     return "local provider = import \"sparse_provider.titan\"\n" ..
       "function answer(): integer\n" ..
-      "  local box = provider.Box<integer>.new(42)\n" ..
-      "  return provider.secret<integer>(box.item) + " .. extra .. "\n" ..
+      "  local box = provider.Box<integer>.new(42, 7)\n" ..
+      "  return provider.secret<integer>(box.item) + box.hidden + " .. extra .. "\n" ..
       "end\n"
   end
   local consumer = bridge.ProjectModule.new(consumer_name,{
@@ -1468,6 +1526,9 @@ local function preserves_mixed_sparse_project_payloads()
   local projects = {provider,consumer}
   local initial = compiler:analyze(consumer_name,projects)
   test.assert(#initial.diagnostics == 0,"initial generic source-private payload fixture failed")
+  local original_provider: bridge.ModuleSnapshot = initial:find_module(provider_name)
+  assert_declared_project_entry(compiler, provider_name)
+  assert_declared_project_entry(compiler, consumer_name)
   local original = features.build(projects,initial.modules)
   defer original:close()
   local secret_position = source_text.Position.new(3,20)
@@ -1486,8 +1547,8 @@ local function preserves_mixed_sparse_project_payloads()
   local changed = compiler:analyze_incremental(current,{consumer_name},{})
   test.assert(#changed.diagnostics == 0 and changed:find_module(provider_name) == nil,
     "body-only consumer edit reparsed/rechecked its unchanged provider")
-  -- Consumer annotations can reach the provider AST. Selecting one encoder
-  -- must still pass every current project file to the compiler-owned codec.
+  -- A sparse export selects only changed declarations while retaining the
+  -- complete project file allowlist for their source locations.
   local sparse = compiler:export_projects(current,{consumer_name})
   test.assert(#sparse == 1 and sparse[1].module_name == consumer_name,
     "sparse export encoded an unchanged provider or narrowed the project file allowlist")
@@ -1496,25 +1557,58 @@ local function preserves_mixed_sparse_project_payloads()
   test.assert(#compiler:export_projects({edited},{provider_name}) == 0,
     "sparse selection exported an entry outside the current project set")
   local restarted = bridge.load()
-  local restored = restarted:hydrate_projects(current,{complete[1],sparse[1]})
-  test.assert(#restored == 2,"mixed unchanged/new payloads did not hydrate together")
-  local replayed = features.build(current,restored)
+  local restored = restarted:restore_projects(current,{complete[1],sparse[1]})
+  test.assert(#restored == 2 and restored[1] == provider_name and
+    restored[2] == consumer_name,"mixed unchanged/new manifests did not restore together")
+  assert_declared_project_entry(restarted, provider_name)
+  assert_declared_project_entry(restarted, consumer_name)
+  local next_consumer = bridge.ProjectModule.new(consumer_name,{
+    bridge.SourceFile.new(consumer_file,consumer_source(2))})
+  local next_projects = {provider,next_consumer}
+  local next_change = restarted:analyze_incremental(next_projects,{consumer_name},{})
+  test.assert(#next_change.diagnostics == 0 and next_change:find_module(provider_name) == nil,
+    "restored provider was not reusable on the next source-private generic edit")
+  local fresh: bridge.ModuleSnapshot = next_change:find_module(consumer_name)
+  local secret_identity? = symbol_identity(fresh,"secret")
+  local field_identity? = symbol_identity(fresh,"hidden")
+  test.assert(secret_identity ~= nil and field_identity ~= nil and
+    secret_identity == symbol_identity(original_provider,"secret") and
+    field_identity == symbol_identity(original_provider,"hidden"),
+    "checking against restored declarations changed private function or field identities")
+  -- Only fresh checking produces consumer facts. The original provider facts
+  -- stand in for its unchanged published rows, whose reuse has separate tests.
+  local replayed = features.build(next_projects,{original_provider,fresh})
   defer replayed:close()
   local secret? = replayed:hover(consumer_file,secret_position)
   local owner? = replayed:hover(consumer_file,owner_position)
   test.assert(secret ~= nil and owner ~= nil and
     secret:markdown() == (initial_secret as features.Hover):markdown() and
     owner:markdown() == (initial_owner as features.Hover):markdown(),
-    "mixed payload hydration changed source-private or generic owner metadata")
+    "checking against restored manifests changed source-private or generic owner metadata")
   local definition? = replayed:definition(consumer_file,secret_position)
   test.assert(definition ~= nil and definition.uri == "file://" .. provider_file and
     definition.range.start.line == 1 and definition.range.start.character == 15,
-    "mixed payload hydration lost the unchanged provider's declaration identity")
-  local next_consumer = bridge.ProjectModule.new(consumer_name,{
-    bridge.SourceFile.new(consumer_file,consumer_source(2))})
-  local next_change = restarted:analyze_incremental({provider,next_consumer},{consumer_name},{})
-  test.assert(#next_change.diagnostics == 0 and next_change:find_module(provider_name) == nil,
-    "rehydrated provider was not reusable on the next source-private edit")
+    "checking against restored declarations lost the provider's definition target")
+  assert_declared_project_entry(restarted, provider_name)
+  assert_declared_project_entry(restarted, consumer_name)
+
+  local public_consumer = bridge.ProjectModule.new(consumer_name,{
+    bridge.SourceFile.new(consumer_file,
+      "local provider = import \"sparse_provider\"\n" ..
+      "function answer(box: provider.Box<integer>): integer\n" ..
+      "  return box.hidden\nend\n")})
+  local public_result = restarted:analyze_incremental(
+    {provider,public_consumer},{consumer_name},{})
+  local hidden_field_rejected = false
+  for index = 1, #public_result.diagnostics do
+    if strings.find(public_result.diagnostics[index].message,
+        "field 'hidden' not found") ~= nil then
+      hidden_field_rejected = true
+    end
+  end
+  test.assert(#public_result.diagnostics > 0 and
+    hidden_field_rejected and public_result:find_module(provider_name) == nil,
+    "restored source-visible fields leaked into an ordinary public import")
 end
 
 function test_compiler_bridge_preserves_mixed_sparse_project_payloads(_context: test.Context)
@@ -1805,7 +1899,7 @@ local function reparses_source_required_external_for_cached_project()
               refreshed_external.manifest.source_serialized ==
                 external_manifest.source_serialized,
               "external source was not transiently reparsed and discarded")
-  test.assert(not compiler:has_project_ast("bridge_cached_external"),
+  test.assert(not compiler:has_project_entry("bridge_cached_external"),
               "external annotated AST leaked into the project cache")
 end
 
@@ -3138,7 +3232,7 @@ end
   local external? = initial:find_module("bridge_metadata")
   test.assert(external ~= nil and external.manifest ~= nil and
               #external.nodes == 0 and #external.symbols == 0 and
-              not initial_compiler:has_project_ast("bridge_metadata"),
+              not initial_compiler:has_project_entry("bridge_metadata"),
               "external metadata seed retained project semantic state")
   local manifest: bridge.Manifest = external.manifest
   test.assert(manifest.source_serialized ~= nil and
@@ -3165,8 +3259,8 @@ end
                 diagnostic_messages:drain())
   local project? = reloaded:find_module("bridge_metadata_consumer")
   test.assert(project ~= nil and #project.nodes > 0 and
-              reloaded_compiler:has_project_ast("bridge_metadata_consumer"),
-              "manifest consumer lost its annotated project AST")
+              reloaded_compiler:has_project_entry("bridge_metadata_consumer"),
+              "manifest consumer lost its fresh snapshot or retained declarations")
   local expected_types: {string: string} = {
     ["mutable_view"] = "const? { integer }",
     ["immutable_view"] = "const? { integer }",
@@ -3192,7 +3286,7 @@ end
               #cached_snapshot.symbols == 0 and cached_snapshot.manifest ~= nil and
               cached_snapshot.manifest.serialized == manifest.serialized and
               cached_snapshot.manifest.source_serialized == manifest.source_serialized and
-              not reloaded_compiler:has_project_ast("bridge_metadata"),
+              not reloaded_compiler:has_project_entry("bridge_metadata"),
               "rehydrated external metadata retained an AST or changed its manifest")
 end
 
@@ -3652,15 +3746,18 @@ local function overlays_current_header_observations_on_project_payloads()
   end
   test.assert(expected ~= nil,"header fixture omitted its physical observation")
   local payloads = compiler:export_projects(projects,{name})
-  test.assert(#payloads == 1,"header fixture did not encode its project graph")
+  test.assert(#payloads == 1,"header fixture did not encode its project declarations")
   local bytes = payloads[1].payload
   local observed = bridge.ProjectPayload.new(name,bytes,current)
-  local restored = bridge.load():hydrate_projects(projects,{observed})
-  test.assert(#restored == 1 and observed.payload == bytes,
-    "observation overlay changed or rejected the saved graph bytes")
+  local restarted = bridge.load()
+  local restored = restarted:restore_projects(projects,{observed})
+  test.assert(#restored == 1 and restored[1] == name and observed.payload == bytes,
+    "observation overlay changed or rejected the saved manifest bytes")
+  assert_declared_project_entry(restarted, name)
+  local inputs = retained_header_inputs(restarted, name)
   local matched = false
-  for index = 1, #restored[1].c_header_dependencies do
-    local input = restored[1].c_header_dependencies[index]
+  for index = 1, #inputs do
+    local input = inputs[index]
     local observation? = input.observation
     if input.path == header and observation ~= nil then
       matched = observation.modified_seconds ==
@@ -3669,7 +3766,7 @@ local function overlays_current_header_observations_on_project_payloads()
           (expected as bridge.HeaderObservation).modified_nanoseconds
     end
   end
-  test.assert(matched,"typed decode boundary discarded current SQL header observations")
+  test.assert(matched,"manifest restoration discarded current SQL header observations")
 end
 
 function test_compiler_bridge_overlays_current_header_observations_on_project_payloads(
@@ -3793,11 +3890,11 @@ function test_compiler_bridge_preserves_combined_ffi_namespace_semantics(
   run_bridge(preserves_combined_ffi_namespace_semantics)
 end
 
-local function assert_inherited_header_inputs(snapshot: bridge.ModuleSnapshot,
+local function assert_inherited_header_inputs(inputs: {bridge.CHeaderDependency},
                                               first: string, second: string)
   local saw_first, saw_second = false, false
-  for index = 1, #snapshot.c_header_dependencies do
-    local input = snapshot.c_header_dependencies[index]
+  for index = 1, #inputs do
+    local input = inputs[index]
     case input.kind
     when file then
       if input.path == first then saw_first = true end
@@ -3861,11 +3958,11 @@ local function preserves_inherited_ffi_payloads(external_provider: boolean)
   assert_clean_ffi_analysis(initial, "inherited FFI source context failed")
   local consumer_snapshot: bridge.ModuleSnapshot = initial:find_module("ffi_consumer")
   local provider_snapshot: bridge.ModuleSnapshot = initial:find_module("ffi_provider")
-  assert_inherited_header_inputs(consumer_snapshot, first_header, second_header)
-  assert_inherited_header_inputs(provider_snapshot, first_header, second_header)
+  assert_inherited_header_inputs(consumer_snapshot.c_header_dependencies, first_header, second_header)
+  assert_inherited_header_inputs(provider_snapshot.c_header_dependencies, first_header, second_header)
   if external_provider then
     test.assert(#provider_snapshot.nodes == 0 and #provider_snapshot.symbols == 0 and
-                not compiler:has_project_ast("ffi_provider"),
+                not compiler:has_project_entry("ffi_provider"),
                 "inherited FFI metadata retained an external provider AST")
   end
   local model = features.build(projects, initial.modules)
@@ -3885,48 +3982,52 @@ local function preserves_inherited_ffi_payloads(external_provider: boolean)
               "source-private and inherited C callables lost their distinct hover owners")
   local payloads = compiler:export_projects(projects, selected)
   test.assert(#payloads == #selected,
-              "inherited C descriptors prevented project graph export")
+              "inherited C declarations prevented project manifest export")
   local restarted = bridge.load()
   restarted:configure_paths(root, nil, nil)
-  local restored = restarted:hydrate_projects(projects, payloads)
+  local restored = restarted:restore_projects(projects, payloads)
   test.assert(#restored == #selected,
-              "inherited C descriptors prevented project graph hydration")
+              "inherited C declarations prevented project manifest restoration")
   for index = 1, #restored do
-    assert_inherited_header_inputs(restored[index], first_header, second_header)
+    assert_declared_project_entry(compiler, restored[index])
+    assert_declared_project_entry(restarted, restored[index])
+    assert_inherited_header_inputs(retained_header_inputs(restarted, restored[index]),
+      first_header, second_header)
   end
-  local replayed = features.build(projects, restored)
+  test.assert(restarted:has_project_entry("ffi_provider") == not external_provider,
+              "manifest restoration changed the project/external ownership boundary")
+  projects[1] = bridge.ProjectModule.new("ffi_consumer", {
+    bridge.SourceFile.new(consumer_file, consumer_source(1)),
+  })
+  local changed = restarted:analyze_incremental(projects, {"ffi_consumer"}, {})
+  assert_clean_ffi_analysis(changed, "editing a restored inherited FFI consumer failed")
+  local edited: bridge.ModuleSnapshot = changed:find_module("ffi_consumer")
+  assert_inherited_header_inputs(edited.c_header_dependencies, first_header, second_header)
+  local replayed = features.build(projects, {provider_snapshot, edited})
   defer replayed:close()
   local replayed_native? = replayed:hover(consumer_file, native_position)
   local replayed_inherited? = replayed:hover(consumer_file, inherited_position)
   test.assert(replayed_native ~= nil and replayed_inherited ~= nil and
               replayed_native:markdown() == native_hover:markdown() and
               replayed_inherited:markdown() == inherited_hover:markdown(),
-              "hydrating inherited C metadata changed saved callable semantics")
-  test.assert(restarted:has_project_ast("ffi_provider") == not external_provider,
-              "graph hydration changed the project/external AST ownership boundary")
-  projects[1] = bridge.ProjectModule.new("ffi_consumer", {
-    bridge.SourceFile.new(consumer_file, consumer_source(1)),
-  })
-  local changed = restarted:analyze_incremental(projects, {"ffi_consumer"}, {})
-  assert_clean_ffi_analysis(changed, "editing a hydrated inherited FFI consumer failed")
-  local edited: bridge.ModuleSnapshot = changed:find_module("ffi_consumer")
-  assert_inherited_header_inputs(edited, first_header, second_header)
+              "checking restored inherited C declarations changed callable semantics")
+  assert_declared_project_entry(restarted, "ffi_consumer")
   if not external_provider then
     test.assert(changed:find_module("ffi_provider") == nil,
                 "consumer body edit rechecked its unchanged project C environment")
   else
     local external: bridge.ModuleSnapshot = changed:find_module("ffi_provider")
     test.assert(#external.nodes == 0 and #external.symbols == 0 and
-                not restarted:has_project_ast("ffi_provider"),
+                not restarted:has_project_entry("ffi_provider"),
                 "consumer body edit retained its external provider AST")
   end
 end
 
-function test_compiler_bridge_hydrates_inherited_project_ffi_context(_context: test.Context)
+function test_compiler_bridge_restores_inherited_project_ffi_context(_context: test.Context)
   run_bridge(function () preserves_inherited_ffi_payloads(false) end)
 end
 
-function test_compiler_bridge_hydrates_inherited_external_ffi_metadata(_context: test.Context)
+function test_compiler_bridge_restores_inherited_external_ffi_metadata(_context: test.Context)
   run_bridge(function () preserves_inherited_ffi_payloads(true) end)
 end
 

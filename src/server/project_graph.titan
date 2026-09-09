@@ -570,23 +570,17 @@ function Graph:set_project_snapshot(module_name: string, ast: A?): boolean
   return true
 end
 
--- The caller has validated and decoded this persisted project payload. A
--- restored compiler handle does not perform work or change published metadata.
-function Graph:hydrate_project_ast(module_name: string, ast: A): boolean
-  if sql.scalar_integer(self.connection,
-    "SELECT count(*) FROM main.graph_modules WHERE name=? AND provenance=0 AND state=2",
-    module_name) == 0 then return false end
-  self.asts[module_name] = ast
-  return true
+-- SQL owns completed lexical facts. The accepted publication retires every
+-- transient body snapshot without changing module revisions or clean state.
+function Graph:release_project_snapshots()
+  self.asts = {}
 end
 
-function Graph:hydrate_project_ast_at_revision(module_name: string,
-    expected_revision: integer, ast: A): boolean
+function Graph:accepts_project_manifest(module_name: string,
+    expected_revision: integer): boolean
   local entry? = self:module(module_name)
-  if entry == nil or entry.provenance ~= 0 or entry.state ~= 2 or
-     entry.revision ~= expected_revision then return false end
-  self.asts[module_name] = ast
-  return true
+  return entry ~= nil and entry.provenance == 0 and entry.state == 2 and
+    entry.revision == expected_revision
 end
 
 -- Observation refresh is deliberately separate from semantic work. A touch

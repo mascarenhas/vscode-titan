@@ -2,6 +2,7 @@ local sqlite3 = import "sqlite3"
 local sql = import "server.workspace_store"
 local compiler_bridge = import "server.compiler_bridge"
 local project_graph = import "server.project_graph"
+local header_store = import "server.header_store"
 
 record SourceFileSnapshot
   const filename: string
@@ -124,6 +125,7 @@ end
 
 function create(connection: sqlite3.Connection,
                 graph: project_graph.Graph<compiler_bridge.ModuleSnapshot>): Metadata
+  header_store.create(connection)
   local statements = {
     "CREATE TABLE IF NOT EXISTS main.project_records(name BLOB PRIMARY KEY) WITHOUT ROWID",
     "CREATE TABLE IF NOT EXISTS main.project_sources(module BLOB NOT NULL REFERENCES project_records(name) ON DELETE CASCADE, ordinal INTEGER NOT NULL, path BLOB NOT NULL, contents BLOB NOT NULL, seconds INTEGER NOT NULL, nanos INTEGER NOT NULL, size INTEGER NOT NULL, identity BLOB, physical_identity BLOB, PRIMARY KEY(module,ordinal)) WITHOUT ROWID",
@@ -134,8 +136,6 @@ function create(connection: sqlite3.Connection,
     "CREATE TABLE IF NOT EXISTS main.external_files(scope INTEGER NOT NULL, module BLOB NOT NULL, ordinal INTEGER NOT NULL, path BLOB NOT NULL, seconds INTEGER NOT NULL, nanos INTEGER NOT NULL, size INTEGER NOT NULL, identity BLOB, physical_identity BLOB, PRIMARY KEY(scope,module,ordinal)) WITHOUT ROWID",
     "CREATE TABLE IF NOT EXISTS main.external_sources(scope INTEGER NOT NULL, module BLOB NOT NULL, ordinal INTEGER NOT NULL, path BLOB NOT NULL, PRIMARY KEY(scope,module,ordinal)) WITHOUT ROWID",
     "CREATE TABLE IF NOT EXISTS main.external_import_details(module BLOB NOT NULL, ordinal INTEGER NOT NULL, alias BLOB NOT NULL, imported BLOB NOT NULL, source_required INTEGER NOT NULL, path BLOB NOT NULL, line INTEGER NOT NULL, column_number INTEGER NOT NULL, PRIMARY KEY(module,ordinal)) WITHOUT ROWID",
-    "CREATE TABLE IF NOT EXISTS main.header_owners(scope INTEGER NOT NULL, module BLOB NOT NULL, PRIMARY KEY(scope,module)) WITHOUT ROWID",
-    "CREATE TABLE IF NOT EXISTS main.header_inputs(scope INTEGER NOT NULL, module BLOB NOT NULL, ordinal INTEGER NOT NULL, kind INTEGER NOT NULL, path BLOB NOT NULL, identity BLOB NOT NULL, observed_seconds INTEGER, observed_nanos INTEGER, physical_identity BLOB, PRIMARY KEY(scope,module,ordinal), FOREIGN KEY(scope,module) REFERENCES header_owners(scope,module) ON DELETE CASCADE) WITHOUT ROWID",
   }
   for index = 1, #statements do sql.execute(connection, statements[index]) end
   return Metadata.new(connection, graph)
@@ -161,7 +161,7 @@ function Metadata:fingerprint_names(): {string}
 end
 
 function Metadata:header_names(): {string}
-  return self:names("SELECT module FROM main.header_owners WHERE scope=0 ORDER BY module")
+  return self:names("SELECT key FROM main.header_owners WHERE scope=0 ORDER BY key")
 end
 
 function Metadata:has_project(name: string): boolean
@@ -373,80 +373,27 @@ function Metadata:refresh_fingerprint_observations(name: string,
 end
 
 local function Metadata:headers(scope: integer, name: string): HeaderFingerprint?
-  if sql.scalar_integer(self.connection,
-    "SELECT EXISTS(SELECT 1 FROM main.header_owners WHERE scope=? AND module=?)",
-    scope, sqlite3.Blob.new(name)) == 0 then return nil end
-  local rows = sql.rows(self.connection,
-    "SELECT kind,path,identity,observed_seconds,observed_nanos,physical_identity FROM main.header_inputs WHERE scope=? AND module=? ORDER BY ordinal",
-    scope, sqlite3.Blob.new(name))
-  local result: {compiler_bridge.CHeaderDependency} = {}
-  for index = 1, #rows do
-    local row = rows[index]
-    local code: integer = row:get(1)
-    local kind = compiler_bridge.CHeaderDependencyKind.file()
-    if code == 1 then kind = compiler_bridge.CHeaderDependencyKind.search() end
-    local seconds: integer? = row:get(4)
-    local nanos: integer? = row:get(5)
-    local physical? = sql.optional_bytes(row, 6)
-    local observation: compiler_bridge.HeaderObservation?
-    if seconds ~= nil and nanos ~= nil and physical ~= nil then
-      observation = compiler_bridge.HeaderObservation.new(seconds, nanos, physical)
-    elseif seconds ~= nil or nanos ~= nil or physical ~= nil then
-      raise "incomplete saved header observation"
+  local inputs? = header_store.read(self.connection, scope, name)
+  if inputs == nil then
+    if sql.scalar_integer(self.connection,
+        "SELECT EXISTS(SELECT 1 FROM main.header_owners WHERE scope=? AND key=?)",
+        scope, sqlite3.Blob.new(name)) ~= 0 then
+      raise "invalid saved header owner"
     end
-    result[index] = compiler_bridge.CHeaderDependency.new(kind,
-      sql.bytes(row, 2), sql.bytes(row, 3), observation)
+    return nil
   end
-  return HeaderFingerprint.new(name, result)
+  return HeaderFingerprint.new(name, inputs)
 end
 
 local function Metadata:write_headers(scope: integer, name: string,
     dependencies: {compiler_bridge.CHeaderDependency})
-  sql.execute(self.connection,
-    "DELETE FROM main.header_owners WHERE scope=? AND module=?",scope,sqlite3.Blob.new(name))
-  sql.execute(self.connection,"INSERT INTO main.header_owners VALUES(?,?)",scope,sqlite3.Blob.new(name))
-  local insert = batch(self.connection, "header_inputs", 9)
-  for index = 1, #dependencies do
-    local input = dependencies[index]
-    local kind = 0
-    case input.kind when search then kind = 1 when file then end
-    local seconds: integer?
-    local nanos: integer?
-    local physical: string?
-    if input.observation ~= nil then
-      seconds = input.observation.modified_seconds
-      nanos = input.observation.modified_nanoseconds
-      physical = input.observation.physical_identity
-    end
-    insert:append({scope, sqlite3.Blob.new(name), index, kind,
-      sqlite3.Blob.new(input.path), sqlite3.Blob.new(input.identity),
-      seconds, nanos, optional_blob(physical)})
-  end
-  insert:flush()
+  header_store.replace(self.connection, scope, name, dependencies)
 end
 
 function Metadata:refresh_header_observations(name: string,
     dependencies: {compiler_bridge.CHeaderDependency})
-  for index = 1, #dependencies do
-    local input = dependencies[index]
-    local kind = 0
-    case input.kind when search then kind = 1 when file then end
-    local observation? = input.observation
-    if observation == nil then
-      sql.execute(self.connection,
-        "UPDATE main.header_inputs SET observed_seconds=NULL,observed_nanos=NULL," ..
-        "physical_identity=NULL WHERE module=? AND kind=? AND path=? AND identity=?",
-        sqlite3.Blob.new(name), kind, sqlite3.Blob.new(input.path),
-        sqlite3.Blob.new(input.identity))
-    else
-      sql.execute(self.connection,
-        "UPDATE main.header_inputs SET observed_seconds=?,observed_nanos=?," ..
-        "physical_identity=? WHERE module=? AND kind=? AND path=? AND identity=?",
-        observation.modified_seconds, observation.modified_nanoseconds,
-        sqlite3.Blob.new(observation.physical_identity), sqlite3.Blob.new(name), kind,
-        sqlite3.Blob.new(input.path), sqlite3.Blob.new(input.identity))
-    end
-  end
+  header_store.refresh(self.connection, 0, name, dependencies)
+  header_store.refresh(self.connection, 1, name, dependencies)
 end
 
 function Metadata:header(name: string): HeaderFingerprint?
@@ -458,11 +405,11 @@ function Metadata:write_header(name: string, dependencies: {compiler_bridge.CHea
 end
 
 function Metadata:remove_header(name: string)
-  sql.execute(self.connection,"DELETE FROM main.header_owners WHERE scope=0 AND module=?",sqlite3.Blob.new(name))
+  header_store.remove(self.connection, 0, name)
 end
 
 function Metadata:clear_headers()
-  sql.execute(self.connection,"DELETE FROM main.header_owners WHERE scope=0")
+  header_store.clear_scope(self.connection, 0)
 end
 
 function Metadata:fingerprint(name: string): ExternalFingerprint?
@@ -548,7 +495,7 @@ end
 function Metadata:remove_external(name: string)
   sql.execute(self.connection,"DELETE FROM main.external_records WHERE name=?",sqlite3.Blob.new(name))
   sql.execute(self.connection,"DELETE FROM main.external_import_details WHERE module=?",sqlite3.Blob.new(name))
-  sql.execute(self.connection,"DELETE FROM main.header_owners WHERE scope=1 AND module=?",sqlite3.Blob.new(name))
+  header_store.remove(self.connection, 1, name)
   self:write_origin(1, name, nil)
   self:write_stamps(1, name, {})
 end
@@ -559,5 +506,5 @@ function Metadata:clear_externals()
   sql.execute(self.connection,"DELETE FROM main.external_observations")
   sql.execute(self.connection,"DELETE FROM main.external_files")
   sql.execute(self.connection,"DELETE FROM main.external_sources")
-  sql.execute(self.connection,"DELETE FROM main.header_owners WHERE scope=1")
+  header_store.clear_scope(self.connection, 1)
 end

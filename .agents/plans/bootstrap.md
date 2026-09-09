@@ -154,7 +154,9 @@ joins its explicit retry.
 - File content change invalidates its owning module.
 - Creating or deleting a constituent of a folder module invalidates that whole
   module and updates membership.
-- Project modules retain their full annotated AST and manifest.
+- Project modules retain declared top-level member/type manifests. Checking and
+  semantic extraction use transient bodies; accepted SQL publication releases
+  them and later publications reuse unchanged modules' saved facts.
 - Every project module is explicitly `dirty`, `checking`, `clean`, or `failed`.
   A diagnostic or explicit nil-manifest compiler result is current and
   `failed`, not pending work: it contributes saved coordinates and diagnostics

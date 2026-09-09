@@ -6,8 +6,9 @@ local sql = import "server.workspace_store"
 local identity = import "server.content_identity"
 local bridge = import "server.compiler_bridge"
 local logging = import "server.logging"
+local headers = import "server.header_store"
 
-local SCHEMA_VERSION = 3
+local SCHEMA_VERSION = 4
 
 type ProjectPayload = bridge.ProjectPayload
 
@@ -50,8 +51,8 @@ record Cache
 end
 
 local function artifact_table(kind: string): string?
-  if kind == "c-header-v2" then return "main.header_graphs" end
-  if kind == "ffi-conversion-v2" then return "main.ffi_conversion_snapshots" end
+  if kind == "c-header-v3" then return "main.header_graphs" end
+  if kind == "ffi-conversion-v3" then return "main.ffi_conversion_snapshots" end
   return nil
 end
 
@@ -91,15 +92,15 @@ local function open_compatible(path: string, compatibility: string?): Cache?
     local checked = sql.rows(connection,"PRAGMA main.quick_check")
     if #checked ~= 1 or checked[1]:get(1) ~= "ok" then return nil end
   end
+  headers.create(connection)
   local schema = {
     "CREATE TABLE IF NOT EXISTS main.project_snapshots(module BLOB PRIMARY KEY,payload BLOB NOT NULL,revision INTEGER NOT NULL) WITHOUT ROWID",
     "CREATE TABLE IF NOT EXISTS main.header_graphs(key BLOB PRIMARY KEY,payload BLOB NOT NULL) WITHOUT ROWID",
     "CREATE TABLE IF NOT EXISTS main.ffi_conversion_snapshots(key BLOB PRIMARY KEY,payload BLOB NOT NULL) WITHOUT ROWID",
-    "CREATE TABLE IF NOT EXISTS main.cached_header_inputs(artifact_kind TEXT NOT NULL,graph_key BLOB NOT NULL,ordinal INTEGER NOT NULL,kind INTEGER NOT NULL,path BLOB NOT NULL,identity BLOB NOT NULL,observed_seconds INTEGER,observed_nanos INTEGER,physical_identity BLOB,PRIMARY KEY(artifact_kind,graph_key,ordinal)) WITHOUT ROWID",
     "CREATE TABLE IF NOT EXISTS main.compiler_inputs(path BLOB PRIMARY KEY,observation BLOB NOT NULL,fingerprint BLOB NOT NULL) WITHOUT ROWID",
   }
   for index = 1, #schema do sql.execute(connection, schema[index]) end
-  sql.execute(connection, "PRAGMA main.user_version=3")
+  sql.execute(connection, "PRAGMA main.user_version=" .. SCHEMA_VERSION)
   if sql.scalar_integer(connection, "PRAGMA main.user_version") ~= SCHEMA_VERSION then
     raise "workspace cache schema version was not installed"
   end
@@ -335,41 +336,10 @@ function Cache:rebuild(replacement_compatibility: string?): Cache
   return replacement
 end
 
-local function header_inputs_from_rows(rows: {sqlite3.Row}): {bridge.CHeaderDependency}?
-  local inputs: {bridge.CHeaderDependency} = {}
-  for index = 1, #rows do
-    local row = rows[index]
-    local saved_kind: value = row:get(1)
-    local path: value = row:get(2)
-    local digest: value = row:get(3)
-    if not (saved_kind is integer) or not (path is sqlite3.Blob) or
-       not (digest is sqlite3.Blob) then return nil end
-    local input_kind = bridge.CHeaderDependencyKind.file()
-    if saved_kind == 1 then
-      input_kind = bridge.CHeaderDependencyKind.search()
-    elseif saved_kind ~= 0 then return nil end
-    local observation?: bridge.HeaderObservation
-    local seconds: value = row:get(4)
-    local nanos: value = row:get(5)
-    local physical: value = row:get(6)
-    if seconds ~= nil or nanos ~= nil or physical ~= nil then
-      if not (seconds is integer) or not (nanos is integer) or
-         not (physical is sqlite3.Blob) then return nil end
-      observation = bridge.HeaderObservation.new(seconds,nanos,
-        (physical as sqlite3.Blob).bytes)
-    end
-    inputs[index] = bridge.CHeaderDependency.new(input_kind,
-      (path as sqlite3.Blob).bytes,(digest as sqlite3.Blob).bytes,observation)
-  end
-  return inputs
-end
-
-local function saved_header_inputs(connection: sqlite3.Connection,
-    kind: string,key: string): {bridge.CHeaderDependency}?
-  return header_inputs_from_rows(sql.rows(connection,
-    "SELECT kind,path,identity,observed_seconds,observed_nanos,physical_identity " ..
-    "FROM main.cached_header_inputs WHERE artifact_kind=? AND graph_key=? ORDER BY ordinal",
-    kind,sqlite3.Blob.new(key)))
+local function artifact_scope(kind: string): integer
+  if kind == "c-header-v3" then return 2 end
+  if kind == "ffi-conversion-v3" then return 3 end
+  raise "unknown header artifact namespace"
 end
 
 function Cache:lookup(kind: string, key: string): (string?,{bridge.CHeaderDependency}?)
@@ -391,7 +361,8 @@ function Cache:lookup(kind: string, key: string): (string?,{bridge.CHeaderDepend
   if #rows == 0 then return nil,nil end
   local payload: value = rows[1]:get(1)
   if not (payload is sqlite3.Blob) then return nil,nil end
-  if refreshed == nil then refreshed = saved_header_inputs(access.connection,kind,key) end
+  if refreshed == nil then refreshed = headers.read(access.connection,artifact_scope(kind),key) end
+  if refreshed == nil then return nil,nil end
   return (payload as sqlite3.Blob).bytes,refreshed
 end
 
@@ -446,6 +417,29 @@ function Cache:project_candidates(): {ProjectCandidate}
   return result
 end
 
+-- A declared compiler manifest cannot rebuild lexical SQL facts. Interrupted
+-- work or an incomplete semantic publication must recheck its source before
+-- an updater can replace those facts; no body hydration fallback exists.
+function Cache:unpublished_projects(): {string}
+  local access = self.store:acquire()
+  defer access:release()
+  local connection = access.connection
+  local complete = sql.scalar_integer(connection,
+    "SELECT count(*) FROM main.sqlite_master WHERE type='table' AND name IN (" ..
+    "'semantic_projects','semantic_files','semantic_summaries','semantic_occurrences'," ..
+    "'semantic_hovers','semantic_folds')") == 6
+  local query = "SELECT g.name FROM main.graph_modules AS g " ..
+    "WHERE g.provenance=0 AND g.state=2"
+  if complete then
+    query = query .. " AND NOT EXISTS(SELECT 1 FROM main.semantic_projects AS p " ..
+      "WHERE p.module_name=CAST(g.name AS BLOB) AND p.revision=g.revision AND p.state=2)"
+  end
+  local rows = sql.rows(connection, query .. " ORDER BY g.name COLLATE BINARY")
+  local result: {string} = {}
+  for index = 1, #rows do result[index] = rows[index]:get(1) as string end
+  return result
+end
+
 function Cache:project_payload(candidate: ProjectCandidate): ProjectPayload?
   local access = self.store:acquire()
   defer access:release()
@@ -470,10 +464,14 @@ function Cache:project_payload(candidate: ProjectCandidate): ProjectPayload?
     })
     return nil
   end
-  local inputs? = header_inputs_from_rows(sql.rows(access.connection,
-    "SELECT kind,path,identity,observed_seconds,observed_nanos,physical_identity " ..
-    "FROM main.header_inputs WHERE scope=0 AND module=? ORDER BY ordinal",
-    sqlite3.Blob.new(candidate.module_name)))
+  local inputs? = headers.read(access.connection,0,candidate.module_name)
+  if inputs == nil then
+    logging.emit("debug","cache.project.miss",{
+      ["module"] = candidate.module_name,
+      ["message"] = "persisted project header owner is missing or invalid",
+    })
+    return nil
+  end
   return ProjectPayload.new(candidate.module_name,(payload as sqlite3.Blob).bytes,inputs)
 end
 
@@ -570,42 +568,6 @@ function Cache:stage_context(root: string,compatibility: string,native_context: 
   self.publication_native_context = native_context
 end
 
-local function publish_header_inputs(connection: sqlite3.Connection, item: Artifact)
-  sql.execute(connection,"DELETE FROM main.cached_header_inputs WHERE artifact_kind=? AND graph_key=?",
-    item.kind,sqlite3.Blob.new(item.key))
-  -- Twenty nine-column rows stay below Titan's 200-value call bound.
-  for first = 1, #item.inputs, 20 do
-    local last = first + 19
-    if last > #item.inputs then last = #item.inputs end
-    local query = strings.writer()
-    query:write("INSERT INTO main.cached_header_inputs VALUES")
-    local parameters: {value} = {}
-    for index = first, last do
-      if index > first then query:write(",") end
-      local input = item.inputs[index]
-      if input.observation ~= nil then
-        query:write("(?,?,?,?,?,?,?,?,?)")
-      else
-        query:write("(?,?,?,?,?,?,NULL,NULL,NULL)")
-      end
-      local kind = 0
-      case input.kind when search then kind = 1 when file then end
-      parameters[#parameters + 1] = item.kind
-      parameters[#parameters + 1] = sqlite3.Blob.new(item.key)
-      parameters[#parameters + 1] = index
-      parameters[#parameters + 1] = kind
-      parameters[#parameters + 1] = sqlite3.Blob.new(input.path)
-      parameters[#parameters + 1] = sqlite3.Blob.new(input.identity)
-      if input.observation ~= nil then
-        parameters[#parameters + 1] = input.observation.modified_seconds
-        parameters[#parameters + 1] = input.observation.modified_nanoseconds
-        parameters[#parameters + 1] = sqlite3.Blob.new(input.observation.physical_identity)
-      end
-    end
-    sql.execute(connection,query:drain(),...parameters)
-  end
-end
-
 function Cache:publish(connection: sqlite3.Connection)
   if self.publication_key == nil then raise "cache publication was not prepared" end
   -- Pruning belongs to the same completed publication as replacement facts.
@@ -634,8 +596,9 @@ function Cache:publish(connection: sqlite3.Connection)
         " VALUES(?,?) ON CONFLICT(key) DO UPDATE SET payload=excluded.payload",
         sqlite3.Blob.new(item.key),sqlite3.Blob.new(item.payload))
     end
-    publish_header_inputs(connection,item)
+    headers.replace(connection,artifact_scope(item.kind),item.key,item.inputs)
   end
+  headers.prune(connection)
   write_metadata(connection,"published_revisions",self.publication_key)
   if self.publication_compatibility ~= nil then
     write_metadata(connection,"compatibility",self.publication_compatibility)

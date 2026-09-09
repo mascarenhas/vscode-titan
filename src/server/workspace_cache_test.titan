@@ -10,6 +10,7 @@ local test_runtime = import "server.test_runtime"
 local features = import "server.semantic_features"
 local published_diagnostics = import "server.published_diagnostics"
 local graph = import "server.project_graph"
+local headers = import "server.header_store"
 foreign import "utime.h"
 
 local function new_root(): string
@@ -38,9 +39,7 @@ local function initialize_revision(cache: caches.Cache)
     "name TEXT PRIMARY KEY,provenance INTEGER,state INTEGER,revision INTEGER)")
   sql.execute(access.connection,"INSERT INTO main.graph_modules VALUES('main',0,2,1) " ..
     "ON CONFLICT(name) DO NOTHING")
-  sql.execute(access.connection,"CREATE TABLE IF NOT EXISTS main.header_inputs(" ..
-    "scope INTEGER,module BLOB,ordinal INTEGER,kind INTEGER,path BLOB,identity BLOB," ..
-    "observed_seconds INTEGER,observed_nanos INTEGER,physical_identity BLOB)")
+  headers.replace(access.connection,0,"main",{})
 end
 
 function test_workspace_cache_rejects_project_payload_ahead_of_its_publication(
@@ -69,19 +68,36 @@ end
 function test_workspace_cache_missing_semantic_table_rebuilds_materialized_view(
     _context: test.Context)
   test_runtime.run(function ()
-    local cache = caches.memory("missing-table")
-    defer cache.store:close()
-    initialize_revision(cache)
-    cache:prepare()
-    cache:set_projects({bridge.ProjectPayload.new("main","checked-graph")})
-    publish(cache)
-    do
-      local access = cache.store:acquire()
-      defer access:release()
-      sql.execute(access.connection,"DROP TABLE main.semantic_hovers")
+    local missing_tables = {"semantic_hovers", "semantic_files"}
+    for index = 1, #missing_tables do
+      local cache = caches.memory("missing-table")
+      defer cache.store:close()
+      initialize_revision(cache)
+      do
+        local access = cache.store:acquire()
+        defer access:release()
+        sql.execute(access.connection,
+          "INSERT INTO main.graph_modules VALUES('failed',0,3,2)")
+        sql.execute(access.connection,
+          "INSERT INTO main.semantic_projects VALUES(CAST('main' AS BLOB),1,1,2)," ..
+          "(CAST('failed' AS BLOB),2,2,3)")
+      end
+      cache:prepare()
+      cache:set_projects({bridge.ProjectPayload.new("main","checked-graph")})
+      publish(cache)
+      test.assert(#cache:unpublished_projects() == 0,
+        "complete publication selected an unchanged module for rechecking")
+      do
+        local access = cache.store:acquire()
+        defer access:release()
+        sql.execute(access.connection,"DROP TABLE main." .. missing_tables[index])
+      end
+      test.assert(#cache:project_payloads() == 1 and not cache:prepare(),
+        "missing materialized table was treated as a reusable complete view")
+      local recheck = cache:unpublished_projects()
+      test.assert(#recheck == 1 and recheck[1] == "main",
+        "incomplete publication did not require a fresh clean snapshot or rechecked a failed module")
     end
-    test.assert(#cache:project_payloads() == 1 and not cache:prepare(),
-      "missing materialized table was treated as a reusable complete view")
   end)
 end
 
@@ -121,16 +137,16 @@ function test_workspace_cache_publishes_binary_payloads_and_preserves_warm_proje
     initialize_revision(cache)
     test.assert(not cache:prepare(),"empty cache exposed a completed view")
     cache:set_projects({bridge.ProjectPayload.new("main","project\0\255")})
-    cache:stage("c-header-v2","header\0key","graph\0\255",{})
-    cache:stage("ffi-conversion-v2","conversion","converted\0",{})
-    cache:stage("c-header-v1","header\0key","obsolete-header",{})
-    cache:stage("ffi-conversion-v1","conversion","obsolete-conversion",{})
+    cache:stage("c-header-v3","header\0key","graph\0\255",{})
+    cache:stage("ffi-conversion-v3","conversion","converted\0",{})
+    cache:stage("c-header-v2","header\0key","obsolete-header",{})
+    cache:stage("ffi-conversion-v2","conversion","obsolete-conversion",{})
     publish(cache)
-    test.assert(cache:lookup("c-header-v2","header\0key") == "graph\0\255" and
-      cache:lookup("ffi-conversion-v2","conversion") == "converted\0",
+    test.assert(cache:lookup("c-header-v3","header\0key") == "graph\0\255" and
+      cache:lookup("ffi-conversion-v3","conversion") == "converted\0",
       "compiler payload lost binary contents")
-    test.assert(cache:lookup("c-header-v1","header\0key") == nil and
-      cache:lookup("ffi-conversion-v1","conversion") == nil,
+    test.assert(cache:lookup("c-header-v2","header\0key") == nil and
+      cache:lookup("ffi-conversion-v2","conversion") == nil,
       "obsolete compiler artifacts aliased the combined namespace cache")
     test.assert(cache:prepare(),"unchanged work revision was not reusable")
     publish(cache)
@@ -201,7 +217,7 @@ function test_workspace_cache_native_context_change_rebuilds_before_hydration(
     cache:prepare()
     cache:set_projects({bridge.ProjectPayload.new("main","old-world-graph")})
     publish(cache)
-    cache:stage("c-header-v2","new-world-header","freshly-validated",{})
+    cache:stage("c-header-v3","new-world-header","freshly-validated",{})
     test.assert(not cache:accept_native_context("second-world"),
       "changed native context was allowed to hydrate old project rows")
     cache = cache:rebuild()
@@ -210,7 +226,7 @@ function test_workspace_cache_native_context_change_rebuilds_before_hydration(
     test.assert(cache:accept_native_context("second-world") and
       #cache:project_payloads() == 0 and not cache:prepare(),
       "native context rebuild retained an incompatible completed view")
-    test.assert(cache:lookup("c-header-v2","new-world-header") == "freshly-validated",
+    test.assert(cache:lookup("c-header-v3","new-world-header") == "freshly-validated",
       "native context rebuild lost freshly validated staged header work")
   end)
 end
@@ -285,8 +301,8 @@ function test_workspace_cache_malformed_sqlite_payloads_are_misses(_context: tes
     initialize_revision(cache)
     cache:prepare()
     cache:set_projects({bridge.ProjectPayload.new("main","checked-graph")})
-    cache:stage("c-header-v2","header","header-graph",{})
-    cache:stage("ffi-conversion-v2","conversion","converted-graph",{})
+    cache:stage("c-header-v3","header","header-graph",{})
+    cache:stage("ffi-conversion-v3","conversion","converted-graph",{})
     publish(cache)
     do
       local access = cache.store:acquire()
@@ -296,8 +312,8 @@ function test_workspace_cache_malformed_sqlite_payloads_are_misses(_context: tes
       sql.execute(access.connection,"UPDATE main.ffi_conversion_snapshots SET payload='invalid-text'")
     end
     test.assert(#cache:project_payloads() == 0 and
-      cache:lookup("c-header-v2","header") == nil and
-      cache:lookup("ffi-conversion-v2","conversion") == nil,
+      cache:lookup("c-header-v3","header") == nil and
+      cache:lookup("ffi-conversion-v3","conversion") == nil,
       "invalid SQLite payload types escaped the disposable cache boundary")
   end)
 end
@@ -499,7 +515,7 @@ function test_workspace_cache_rebuilds_the_previous_schema_before_graph_use(
     do
       local access = cache.store:acquire()
       defer access:release()
-      sql.execute(access.connection,"PRAGMA main.user_version=2")
+      sql.execute(access.connection,"PRAGMA main.user_version=3")
     end
     cache.store:close()
     local reopened = caches.open(root,"same-context")
@@ -508,7 +524,7 @@ function test_workspace_cache_rebuilds_the_previous_schema_before_graph_use(
     test.assert(#reopened:project_payloads() == 0,"previous graph schema survived a cache reopen")
     local access = reopened.store:acquire()
     defer access:release()
-    test.assert(sql.scalar_integer(access.connection,"PRAGMA main.user_version") == 3,
+    test.assert(sql.scalar_integer(access.connection,"PRAGMA main.user_version") == 4,
       "rebuild did not install the new graph schema version")
   end)
 end
@@ -630,9 +646,10 @@ function test_workspace_cache_reads_only_matching_background_candidates(
     do
       local access = cache.store:acquire()
       defer access:release()
-      sql.execute(access.connection,"INSERT INTO main.header_inputs VALUES(0,?,1,0,?,?,5,6,?)",
-        sqlite3.Blob.new("main"),sqlite3.Blob.new("header.h"),sqlite3.Blob.new("hash"),
-        sqlite3.Blob.new("physical"))
+      headers.replace(access.connection,0,"main",{
+        bridge.CHeaderDependency.new(bridge.CHeaderDependencyKind.file(),"header.h","hash",
+          bridge.HeaderObservation.new(5,6,"physical")),
+      })
     end
     local refreshed = cache:project_payload(candidates[1])
     test.assert(refreshed.payload == "second" and
@@ -666,8 +683,8 @@ function test_workspace_cache_refreshes_header_observations_without_rewriting_gr
       bridge.CHeaderDependency.new(bridge.CHeaderDependencyKind.search(),"missing.h","missing",nil),
     }
     cache:prepare()
-    cache:stage("c-header-v2","shared-key","header-graph",inputs)
-    cache:stage("ffi-conversion-v2","shared-key","conversion-graph",inputs)
+    cache:stage("c-header-v3","shared-key","header-graph",inputs)
+    cache:stage("ffi-conversion-v3","shared-key","conversion-graph",inputs)
     publish(cache)
     do
       local access = cache.store:acquire()
@@ -679,18 +696,24 @@ function test_workspace_cache_refreshes_header_observations_without_rewriting_gr
     end
     inputs[1] = bridge.CHeaderDependency.new(bridge.CHeaderDependencyKind.file(),"header.h","hash",
       bridge.HeaderObservation.new(3,4,"physical"))
-    test.assert(cache:refresh_inputs("c-header-v2","shared-key",inputs) and
-      cache:refresh_inputs("ffi-conversion-v2","shared-key",inputs),
+    test.assert(cache:refresh_inputs("c-header-v3","shared-key",inputs),
       "existing artifacts rejected observation-only refresh")
-    local payload?,refreshed? = cache:lookup("c-header-v2","shared-key")
+    local retained?,retained_inputs? = cache:lookup("ffi-conversion-v3","shared-key")
+    test.assert(retained == "conversion-graph" and retained_inputs[1].observation.modified_seconds == 1,
+      "staged refresh changed another artifact namespace")
+    test.assert(cache:refresh_inputs("ffi-conversion-v3","shared-key",inputs),
+      "conversion artifact rejected its own observation refresh")
+    local payload?,refreshed? = cache:lookup("c-header-v3","shared-key")
     test.assert(payload == "header-graph" and refreshed[1].observation.modified_seconds == 3,
       "staged observation lookup lost the immutable graph")
     do
       local access = cache.store:acquire()
       defer access:release()
       test.assert(sql.scalar_integer(access.connection,
-        "SELECT observed_seconds FROM main.cached_header_inputs " ..
-        "WHERE artifact_kind='c-header-v2' AND ordinal=1") == 1,
+        "SELECT d.observed_seconds FROM main.header_inputs i " ..
+        "JOIN main.header_owners o ON o.id=i.owner_id " ..
+        "JOIN main.header_dependencies d ON d.id=i.dependency_id " ..
+        "WHERE o.scope=2 AND i.ordinal=1") == 1,
         "compiler observation refresh wrote outside saved publication")
     end
     cache:prepare()
@@ -698,13 +721,113 @@ function test_workspace_cache_refreshes_header_observations_without_rewriting_gr
     cache.store:close()
     cache = caches.open(root,"observations")
     defer cache.store:close()
-    local header?,header_inputs? = cache:lookup("c-header-v2","shared-key")
-    local conversion?,conversion_inputs? = cache:lookup("ffi-conversion-v2","shared-key")
+    local header?,header_inputs? = cache:lookup("c-header-v3","shared-key")
+    local conversion?,conversion_inputs? = cache:lookup("ffi-conversion-v3","shared-key")
     test.assert(header == "header-graph" and conversion == "conversion-graph" and
       #header_inputs == 2 and #conversion_inputs == 2 and
       header_inputs[1].observation.modified_seconds == 3 and
       conversion_inputs[1].observation.modified_nanoseconds == 4 and
       header_inputs[2].observation == nil,
       "restart lost refreshed header/FFI observations or artifact namespaces")
+  end)
+end
+
+function test_workspace_cache_rolls_back_shared_headers_and_retries_pending_publication(
+    _context: test.Context)
+  test_runtime.run(function ()
+    local cache = caches.memory("header-rollback")
+    defer cache.store:close()
+    initialize_revision(cache)
+    local original = {
+      bridge.CHeaderDependency.new(bridge.CHeaderDependencyKind.file(), "file.h", "digest",
+        bridge.HeaderObservation.new(1, 2, "physical")),
+    }
+    cache:prepare()
+    cache:stage("c-header-v3", "shared", "header-graph", original)
+    cache:stage("ffi-conversion-v3", "shared", "conversion-graph", original)
+    publish(cache)
+    cache:prepare()
+    local next = {
+      bridge.CHeaderDependency.new(bridge.CHeaderDependencyKind.file(), "file.h", "digest",
+        bridge.HeaderObservation.new(3, 4, "physical")),
+    }
+    test.assert(cache:refresh_inputs("c-header-v3", "shared", next),
+      "saved artifact rejected observation refresh")
+    do
+      local access = cache.store:acquire()
+      defer access:release()
+      local connection = access.connection
+      sql.execute(connection,
+        "CREATE TRIGGER main.reject_header_publication BEFORE UPDATE ON cache_meta " ..
+        "WHEN NEW.key=CAST('published_revisions' AS BLOB) " ..
+        "BEGIN SELECT RAISE(ABORT,'injected header publication failure'); END")
+      connection:set_autocommit(false)
+      local rejected = false
+      do cache:publish(connection)
+      catch rejected = error is sqlite3.Error and (error as sqlite3.Error).code == 19 end
+      connection:rollback()
+      test.assert(rejected and headers.read(connection, 2, "shared")[1].observation.modified_seconds == 1 and
+        headers.read(connection, 3, "shared")[1].observation.modified_seconds == 1 and
+        sql.scalar_integer(connection, "SELECT count(*) FROM main.header_dependencies") == 1,
+        "rejected publication retained new values or changed shared owner links")
+      sql.execute(connection, "DROP TRIGGER main.reject_header_publication")
+    end
+    publish(cache)
+    local payload?, inputs? = cache:lookup("c-header-v3", "shared")
+    local retained?, retained_inputs? = cache:lookup("ffi-conversion-v3", "shared")
+    test.assert(payload == "header-graph" and inputs[1].observation.modified_seconds == 3 and
+      retained == "conversion-graph" and retained_inputs[1].observation.modified_seconds == 1,
+      "retry lost staged headers or refreshed a different artifact")
+    test.assert(cache:refresh_inputs("ffi-conversion-v3", "shared", next),
+      "remaining artifact rejected refresh")
+    cache:prepare()
+    publish(cache)
+    local access = cache.store:acquire()
+    defer access:release()
+    test.assert(sql.scalar_integer(access.connection, "SELECT count(*) FROM main.header_dependencies") == 1 and
+      sql.scalar_integer(access.connection, "SELECT count(*) FROM main.header_inputs") == 2,
+      "accepted publication retained an orphaned observation or lost ordered membership")
+  end)
+end
+
+function test_workspace_cache_requires_present_valid_header_owners_for_reuse(
+    _context: test.Context)
+  test_runtime.run(function ()
+    local cache = caches.memory("header-owners")
+    defer cache.store:close()
+    initialize_revision(cache)
+    cache:prepare()
+    cache:set_projects({bridge.ProjectPayload.new("main", "project")})
+    cache:stage("c-header-v3", "same", "header", {})
+    cache:stage("ffi-conversion-v3", "same", "conversion", {})
+    publish(cache)
+    local candidate = cache:project_candidates()[1]
+    local payload?, inputs? = cache:lookup("c-header-v3", "same")
+    test.assert(payload == "header" and inputs ~= nil and #inputs == 0 and
+      cache:project_payload(candidate) ~= nil,
+      "valid empty header owners were treated as absent provenance")
+    do
+      local access = cache.store:acquire()
+      defer access:release()
+      headers.remove(access.connection, 2, "same")
+      headers.remove(access.connection, 0, "main")
+    end
+    test.assert(cache:lookup("c-header-v3", "same") == nil and
+      cache:project_payload(candidate) == nil and
+      cache:lookup("ffi-conversion-v3", "same") == "conversion",
+      "a missing header owner reused uncertified payloads or another namespace")
+    do
+      local access = cache.store:acquire()
+      defer access:release()
+      local current = {
+        bridge.CHeaderDependency.new(bridge.CHeaderDependencyKind.file(), "file.h", "digest", nil),
+      }
+      headers.replace(access.connection, 2, "same", current)
+      headers.replace(access.connection, 0, "main", current)
+      sql.execute(access.connection, "UPDATE main.header_inputs SET ordinal=2")
+    end
+    test.assert(cache:lookup("c-header-v3", "same") == nil and
+      cache:project_payload(candidate) == nil,
+      "a malformed ordered header closure reused its payload")
   end)
 end

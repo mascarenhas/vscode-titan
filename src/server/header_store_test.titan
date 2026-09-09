@@ -1,0 +1,180 @@
+local fs = import "fs"
+local sqlite3 = import "sqlite3"
+local test = import "test"
+local bridge = import "server.compiler_bridge"
+local headers = import "server.header_store"
+local sql = import "server.workspace_store"
+local runtime = import "server.test_runtime"
+
+local function dependency(observation: bridge.HeaderObservation?): bridge.CHeaderDependency
+  return bridge.CHeaderDependency.new(bridge.CHeaderDependencyKind.file(),
+    "header\0\255.h", "digest\0\255", observation)
+end
+
+function test_header_store_shares_complete_values_and_preserves_ordered_namespaces(
+    _context: test.Context)
+  runtime.run(function ()
+    local store = sql.open(":memory:")
+    defer store:close()
+    local access = store:acquire()
+    defer access:release()
+    local connection = access.connection
+    headers.create(connection)
+    local values = {
+      dependency(nil),
+      dependency(bridge.HeaderObservation.new(0, 0, "")),
+      dependency(bridge.HeaderObservation.new(0, 0, "\0\255")),
+      bridge.CHeaderDependency.new(bridge.CHeaderDependencyKind.search(),
+        "header\0\255.h", "digest\0\255", nil),
+    }
+    local ordered: {bridge.CHeaderDependency} = {}
+    for index = 1, 45 do ordered[index] = values[(index - 1) % 4 + 1] end
+    for scope = 0, 3 do headers.replace(connection, scope, "same\0key", ordered) end
+    headers.replace(connection, 0, "empty", {})
+    test.assert(sql.scalar_integer(connection, "SELECT count(*) FROM main.header_dependencies") == 4 and
+      sql.scalar_integer(connection, "SELECT count(*) FROM main.header_owners") == 5 and
+      sql.scalar_integer(connection, "SELECT count(*) FROM main.header_inputs") == 180,
+      "ordered duplicates or owner namespaces repeated shared values")
+    test.assert(headers.read(connection, 0, "missing") == nil and
+      #headers.read(connection, 0, "empty") == 0,
+      "an empty owner was confused with a missing owner")
+    for scope = 0, 3 do
+      local saved? = headers.read(connection, scope, "same\0key")
+      test.assert(saved ~= nil and #saved == 45, "an ordered owner failed to roundtrip")
+      if saved == nil then raise "saved owner missing" end
+      for index = 1, #saved do
+        local expected = ordered[index]
+        local actual = saved[index]
+        test.assert(actual.path == expected.path and actual.identity == expected.identity and
+          (actual.observation == nil) == (expected.observation == nil),
+          "binary fields or absent observations changed across a packet boundary")
+        if actual.observation ~= nil then
+          test.assert(actual.observation.modified_seconds == expected.observation.modified_seconds and
+            actual.observation.modified_nanoseconds == expected.observation.modified_nanoseconds and
+            actual.observation.physical_identity == expected.observation.physical_identity,
+            "NULL observation aliased zero timestamps or a binary physical identity")
+        end
+        case actual.kind
+        when file then test.assert(index % 4 ~= 0, "file input moved in the ordered closure")
+        when search then test.assert(index % 4 == 0, "search input moved in the ordered closure")
+        end
+      end
+    end
+  end)
+end
+
+function test_header_store_refreshes_selected_owner_without_mutating_shared_values(
+    _context: test.Context)
+  runtime.run(function ()
+    local store = sql.open(":memory:")
+    defer store:close()
+    local access = store:acquire()
+    defer access:release()
+    local connection = access.connection
+    headers.create(connection)
+    local old = dependency(bridge.HeaderObservation.new(1, 2, "physical"))
+    local unmatched = bridge.CHeaderDependency.new(bridge.CHeaderDependencyKind.search(),
+      "missing.h", "missing", nil)
+    for scope = 0, 3 do headers.replace(connection, scope, "same", {old, unmatched, old}) end
+    headers.replace(connection, 0, "other", {old})
+    local next = dependency(bridge.HeaderObservation.new(3, 4, "physical"))
+    headers.refresh(connection, 0, "same", {next,
+      bridge.CHeaderDependency.new(bridge.CHeaderDependencyKind.file(), "new.h", "new", nil)})
+    local refreshed = headers.read(connection, 0, "same")
+    test.assert(#refreshed == 3 and refreshed[1].observation.modified_seconds == 3 and
+      refreshed[3].observation.modified_seconds == 3 and refreshed[2].path == "missing.h" and
+      refreshed[2].observation == nil,
+      "refresh lost duplicates, unmatched inputs, or introduced new dependency triples")
+    for scope = 1, 3 do
+      test.assert(headers.read(connection, scope, "same")[1].observation.modified_seconds == 1,
+        "refresh mutated another namespace's shared observation")
+    end
+    test.assert(headers.read(connection, 0, "other")[1].observation.modified_seconds == 1 and
+      sql.scalar_integer(connection, "SELECT count(*) FROM main.header_dependencies") == 3,
+      "refresh changed another module or inserted an unmatched value")
+    headers.refresh(connection, 0, "absent", {next})
+    test.assert(headers.read(connection, 0, "absent") == nil,
+      "refresh created an owner with no accepted baseline")
+    headers.refresh(connection, 0, "same", {dependency(nil)})
+    test.assert(headers.read(connection, 0, "same")[1].observation == nil and
+      headers.read(connection, 2, "same")[1].observation ~= nil,
+      "clearing one observation changed a shared artifact")
+  end)
+end
+
+function test_header_store_rolls_back_links_values_and_pruning_before_restart(
+    _context: test.Context)
+  runtime.run(function ()
+    local path = fs.tmpname()
+    defer fs.unlink(path)
+    local store = sql.open(path)
+    local access = store:acquire()
+    local connection = access.connection
+    headers.create(connection)
+    connection:set_autocommit(false)
+    headers.replace(connection, 0, "module", {dependency(nil)})
+    headers.replace(connection, 2, "artifact", {dependency(nil), dependency(nil)})
+    headers.replace(connection, 0, "empty", {})
+    connection:commit()
+    connection:set_autocommit(false)
+    headers.replace(connection, 0, "module", {dependency(bridge.HeaderObservation.new(5, 6, "new"))})
+    headers.remove(connection, 2, "artifact")
+    headers.prune(connection)
+    test.assert(sql.scalar_integer(connection, "SELECT count(*) FROM main.header_dependencies") == 1 and
+      headers.read(connection, 0, "module")[1].observation.modified_seconds == 5,
+      "staged pruning did not replace the now-unreferenced value")
+    connection:rollback()
+    test.assert(headers.read(connection, 0, "module")[1].observation == nil and
+      #headers.read(connection, 2, "artifact") == 2 and
+      sql.scalar_integer(connection, "SELECT count(*) FROM main.header_dependencies") == 1,
+      "rollback retained a speculative value or lost pruned links")
+    access:release()
+    store:close()
+    local reopened = sql.open(path)
+    defer reopened:close()
+    local read = reopened:acquire()
+    defer read:release()
+    headers.create(read.connection)
+    test.assert(#headers.read(read.connection, 2, "artifact") == 2 and
+      #headers.read(read.connection, 0, "empty") == 0 and
+      headers.read(read.connection, 0, "module")[1].observation == nil,
+      "restart lost the accepted empty owner or ordered shared inputs")
+    headers.clear_scope(read.connection, 0)
+    headers.prune(read.connection)
+    test.assert(headers.read(read.connection, 0, "module") == nil and
+      headers.read(read.connection, 0, "empty") == nil and
+      #headers.read(read.connection, 2, "artifact") == 2 and
+      sql.scalar_integer(read.connection, "SELECT count(*) FROM main.header_dependencies") == 1,
+      "owner cascade or pruning removed another namespace's values")
+    headers.remove(read.connection, 2, "artifact")
+    headers.prune(read.connection)
+    test.assert(sql.scalar_integer(read.connection, "SELECT count(*) FROM main.header_inputs") == 0 and
+      sql.scalar_integer(read.connection, "SELECT count(*) FROM main.header_dependencies") == 0,
+      "retired observations remained after their last owner disappeared")
+  end)
+end
+
+function test_header_store_rejects_incomplete_observations_and_missing_references(
+    _context: test.Context)
+  runtime.run(function ()
+    local store = sql.open(":memory:")
+    defer store:close()
+    local access = store:acquire()
+    defer access:release()
+    headers.create(access.connection)
+    local invalid = {
+      "INSERT INTO header_dependencies(kind,path,identity,observed_seconds) VALUES(0,x'01',x'02',1)",
+      "INSERT INTO header_dependencies(kind,path,identity,physical_identity) VALUES(0,x'01',x'02',x'')",
+      "INSERT INTO header_dependencies(kind,path,identity,observed_seconds,observed_nanos,physical_identity) VALUES(0,x'01',x'02',1,2,'text')",
+      "INSERT INTO header_inputs VALUES(999,1,999)",
+    }
+    for index = 1, #invalid do
+      local rejected = false
+      do sql.execute(access.connection, invalid[index])
+      catch rejected = error is sqlite3.Error and (error as sqlite3.Error).code == 19 end
+      test.assert(rejected, "malformed shared header row bypassed its constraints")
+    end
+    test.assert(sql.scalar_integer(access.connection, "SELECT count(*) FROM main.header_dependencies") == 0,
+      "a malformed observation survived rejected publication")
+  end)
+end

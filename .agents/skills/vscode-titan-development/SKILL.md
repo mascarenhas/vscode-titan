@@ -57,10 +57,11 @@ errors. Do not solve discovery by embedding the compiler into the executable.
 ## Project and cache rules
 
 Match `titanc --tree` module discovery, including folder modules. Keep one
-shared graph with complete annotated ASTs for project modules and only
-manifest and exact filesystem provenance metadata for external source and
-binary modules. Compiler-observed C-header dependency closures are metadata,
-not retained external ASTs.
+shared graph with declared top-level member/type manifests and exact filesystem
+provenance. Project bodies exist only during fresh checking and semantic
+extraction; release them after accepted SQL publication and retain unchanged
+modules' SQL facts. External source and binary modules retain manifests and
+provenance only. Compiler-observed C-header dependency closures are metadata.
 
 Project watchers cover `.titan` creation, changes, and deletion. They never
 watch external trees. Revalidate an encountered external import from its exact

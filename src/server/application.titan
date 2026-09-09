@@ -533,10 +533,13 @@ local function watcher_scope(snapshot: project_service.Snapshot):
     snapshot.project_directories, configuration)
 end
 
-local function project_inputs(snapshot: project_service.Snapshot):
+local function project_inputs(snapshot: project_service.Snapshot,
+                              replaced_modules: {string}):
     ({bridge.ProjectModule}, {bridge.ModuleSnapshot})
   local projects: {bridge.ProjectModule} = {}
   local snapshots: {bridge.ModuleSnapshot} = {}
+  local replaced: {string: boolean} = {}
+  for index = 1, #replaced_modules do replaced[replaced_modules[index]] = true end
   for module_index = 1, #snapshot.project_modules do
     local module = snapshot.project_modules[module_index]
     local files: {bridge.SourceFile} = {}
@@ -553,13 +556,18 @@ local function project_inputs(snapshot: project_service.Snapshot):
       module.module_name, files)
     case module.analysis_state
     when clean then
-      if module.compiler_snapshot == nil or #module.diagnostics > 0 then
-        raise Error.new(
-          "clean Titan project module '" .. module.module_name ..
-          "' has no valid compiler snapshot for the current saved " ..
-          "generation")
+      if #module.diagnostics > 0 then
+        raise Error.new("clean Titan project module '" .. module.module_name ..
+          "' has compiler diagnostics")
       end
-      snapshots[#snapshots + 1] = module.compiler_snapshot
+      if replaced[module.module_name] then
+        if module.compiler_snapshot == nil then
+          raise Error.new(
+            "clean Titan project module '" .. module.module_name ..
+            "' has no fresh compiler snapshot for semantic replacement")
+        end
+        snapshots[#snapshots + 1] = module.compiler_snapshot
+      end
     when failed then
       -- The diagnostics are current for this exact saved revision, but a
       -- failed module deliberately contributes no compiler snapshot.
@@ -761,6 +769,7 @@ local function Application:publish_view(service: project_service.Service,
     snapshot: project_service.Snapshot, reuse: View?): View
   local store = service:workspace_store()
   local revision = ""
+  local plan?: semantic_index.PublicationPlan = nil
   do
     local access = store:acquire()
     defer access:release()
@@ -769,6 +778,16 @@ local function Application:publish_view(service: project_service.Service,
       raise Error.new("saved Titan project changed before semantic preparation; retry")
     end
     revision = publication_revision(access.connection)
+    local rows = stores.rows(access.connection,
+      "SELECT name,revision,state FROM main.graph_modules " ..
+      "WHERE provenance=0 ORDER BY name")
+    local modules: {semantic_index.ModulePublication} = {}
+    for index = 1, #rows do
+      local row = rows[index]
+      modules[index] = semantic_index.ModulePublication.new(
+        row:get(1) as string, row:get(2) as integer, row:get(3) as integer)
+    end
+    plan = semantic_index.publication_plan(access.connection, modules)
   end
   self:reconcile_watcher(snapshot)
   -- Source extraction and cache serialization can yield without monopolizing
@@ -777,9 +796,10 @@ local function Application:publish_view(service: project_service.Service,
   local prepared: semantic_features.PreparedView? = nil
   if reuse == nil and not warm_reuse then
     self.view_builds = self.view_builds + 1
-    local projects, snapshots = project_inputs(snapshot)
-    prepared = semantic_features.prepare(
-      projects, snapshots, function () async.yield() end)
+    local captured = plan as semantic_index.PublicationPlan
+    local projects, snapshots = project_inputs(snapshot, captured.replaced_modules)
+    prepared = semantic_features.prepare_update(
+      projects, snapshots, captured, function () async.yield() end)
   end
   local diagnostic_rows = diagnostics.from_snapshot_with_yield(snapshot)
   local access = store:acquire()
@@ -788,8 +808,6 @@ local function Application:publish_view(service: project_service.Service,
   if publication_revision(connection) ~= revision then
     raise Error.new("saved Titan project changed during semantic preparation; retry")
   end
-  semantic_features.initialize_schema(connection)
-  published_diagnostics.initialize_schema(connection)
   local generation = stores.scalar_integer(connection,
     "SELECT published_generation FROM main.store_state WHERE singleton=1")
   if reuse ~= nil then
@@ -799,6 +817,11 @@ local function Application:publish_view(service: project_service.Service,
   end
   connection:set_autocommit(false)
   do
+    -- Schema recreation belongs to the same accepted publication as its rows.
+    -- A rollback must preserve missing tables so the retry still rebuilds all
+    -- facts instead of trusting empty recreated tables at old revisions.
+    semantic_features.initialize_schema(connection)
+    published_diagnostics.initialize_schema(connection)
     if prepared ~= nil then prepared:publish(connection) end
     published_diagnostics.publish(connection, diagnostic_rows)
     service:publish_prepared(connection)

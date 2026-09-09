@@ -474,15 +474,21 @@ local function cancels_ffi_analysis_and_transfers_cleanup()
       started = true
       return compiler:analyze(CLEANUP_MODULE, {project})
     end)
+  defer do
+    if not analysis_task:status():has_finished() then
+      analysis_task:cancel(async.CancellationReason.simple("FFI cleanup test stopped"))
+    end
+    async.join(analysis_task)
+  end
   while not started do async.yield() end
 
-  -- The driver publishes this field immediately before its post-module
-  -- strategy yield. The absolute source filename avoids any intervening path
-  -- lookup, so observing it while the Task waits pins cancellation to that
-  -- exact yield rather than to an earlier filesystem or compiler operation.
-  local checking_header?: string = nil
+  -- Analysis retains the generated C include environment and probe workspace,
+  -- but does not generate a foreign function body header. The driver publishes
+  -- the include filename immediately before its post-module strategy yield.
+  -- The absolute source filename avoids an intervening path lookup, so this
+  -- observation pins cancellation to the completed module's exact checkpoint.
   local checking_ffi_header?: string = nil
-  while checking_header == nil do
+  while checking_ffi_header == nil do
     local raw_imported: value = driver["imported"]
     if raw_imported is {string: value} then
       local raw_module: value =
@@ -490,13 +496,14 @@ local function cancels_ffi_analysis_and_transfers_cleanup()
       if raw_module is {string: value} then
         local raw_header: value =
           (raw_module as {string: value})["checking_foreign_header"]
-        if raw_header is string then checking_header = raw_header end
+        test.assert(raw_header == nil,
+          "analysis generated a foreign function body header")
         local raw_ffi_header: value =
           (raw_module as {string: value})["checking_ffi_header"]
         if raw_ffi_header is string then checking_ffi_header = raw_ffi_header end
       end
     end
-    if checking_header == nil then
+    if checking_ffi_header == nil then
       if analysis_task:status():has_finished() then
         case async.join<bridge.Analysis, value>(analysis_task)
         when succeeded: analysis then
@@ -518,14 +525,9 @@ local function cancels_ffi_analysis_and_transfers_cleanup()
       async.yield()
     end
   end
-  test.assert(checking_header ~= nil,
-              "compiler did not publish a generated checking header")
   test.assert(analysis_task:status():as_string() == "waiting",
               "FFI analysis was not waiting at its post-module yield")
-  test.assert(fs.lstat(checking_header as string) ~= nil,
-              "generated checking header was absent before cancellation")
   test.assert(checking_ffi_header ~= nil and
-              checking_ffi_header ~= checking_header and
               fs.lstat(checking_ffi_header as string) ~= nil,
               "module C environment header was absent before cancellation")
 
@@ -552,8 +554,7 @@ local function cancels_ffi_analysis_and_transfers_cleanup()
   local cleaned = false
   local attempts = 0
   while not cleaned and attempts < 10000 do
-    cleaned = fs.lstat(checking_header as string) == nil
-      and fs.lstat(checking_ffi_header as string) == nil
+    cleaned = fs.lstat(checking_ffi_header as string) == nil
     for index = 1, #workspaces do
       if fs.lstat(workspaces[index]) ~= nil then cleaned = false end
     end
@@ -748,82 +749,89 @@ function test_compiler_bridge_yields_during_large_diagnostic_normalization(
   test_runtime.run(large_diagnostic_normalization_yields)
 end
 
-local type PayloadHookCounts = () -> (integer,integer,integer)
-local type InstallPayloadHooks = ({string: value}) -> (() -> (),PayloadHookCounts)
+local type PayloadHookCounts = () -> (integer,integer,integer,integer)
+local type PayloadCheckpointBarrier = (string?) -> ()
+local type InstallPayloadHooks = ({string: value}) ->
+  (() -> (),PayloadHookCounts,PayloadCheckpointBarrier)
 
 local function observe_payload_hooks(driver: {string: value}):
-    (() -> (),PayloadHookCounts)
+    (() -> (),PayloadHookCounts,PayloadCheckpointBarrier)
   local install = lua.load([==[
 return function(driver)
-  local names = {"encode_project_entry", "decode_project_entry", "project_entries_registry"}
-  local original, counts = {}, {0, 0, 0}
+  local names = {"encode_project_entry", "decode_project_entry",
+                 "project_entries_registry", "compact_project_entry"}
+  local original, counts = {}, {0, 0, 0, 0}
+  local blocked
   for index, name in ipairs(names) do
     original[index] = driver[name]
     driver[name] = function(input, options)
       assert(type(options.yield) == "function", name .. " omitted cooperative work hook")
       local yield = options.yield
-      options.yield = function()
+      local observed = {}
+      for key, item in pairs(options) do observed[key] = item end
+      observed.yield = function()
         counts[index] = counts[index] + 1
-        yield()
+        if blocked == name then
+          -- Hold the actual compiler checkpoint until the observer cancels.
+          -- A compact registry may offer only its final cooperative turn;
+          -- polling cannot assume that the observer runs before it resumes.
+          repeat yield() until blocked ~= name
+        else
+          yield()
+        end
       end
-      return original[index](input, options)
+      return original[index](input, observed)
     end
   end
   return function()
     for index, name in ipairs(names) do driver[name] = original[index] end
-  end, function() return counts[1], counts[2], counts[3] end
+  end, function() return counts[1], counts[2], counts[3], counts[4] end,
+  function(phase)
+    local phases = {decode = names[2], registry = names[3]}
+    assert(phase == nil or phases[phase], "unknown payload checkpoint phase")
+    blocked = phase and phases[phase]
+  end
 end
 ]==],"=project_payload_hook_observer",nil)() as InstallPayloadHooks
   return install(driver)
 end
 
-local function large_project_payload_restoration_yields_and_cleans_up()
-  local source = strings.writer()
-  for index = 1, 384 do
-    source:write("function item_" .. index .. "(item: integer): integer\n" ..
-      "  local answer = item + " .. index .. "\n  return answer\nend\n")
-  end
-  local name = "large_restoration"
-  local projects = {bridge.ProjectModule.new(name,{
-    bridge.SourceFile.new("/workspace/large_restoration.titan",source:drain())})}
-  local compiler = bridge.load()
-  local analysis = compiler:analyze(name,projects)
-  test.assert(#analysis.diagnostics == 0,"large restoration fixture failed analysis")
+local function cancel_project_restore_at_checkpoint(
+    projects: {bridge.ProjectModule}, payloads: {bridge.ProjectPayload},
+    counts: PayloadHookCounts, barrier: PayloadCheckpointBarrier, phase: string)
   local driver = lua.require(DRIVER_MODULE) as {string: value}
-  local restore_hooks, counts = observe_payload_hooks(driver)
-  defer restore_hooks()
-  local payloads = compiler:export_projects(projects,{name})
-  test.assert(#payloads == 1,"large single project payload was not exported")
-  local encode_yields, _decode_yields, _registry_yields = counts()
-  test.assert(encode_yields > 1,"single project encoding did not yield repeatedly")
-  local restored = bridge.load()
-  local reads = 0
-  local rejected = restored:hydrate_project_cache(projects,{name},
-    function (requested: string): (string?,{bridge.CHeaderDependency}?)
-      test.assert(requested == name,"restoration read an unselected payload")
-      reads = reads + 1
-      return payloads[1].payload,nil
-    end,
-    function (_name: string,_snapshot: bridge.ModuleSnapshot): boolean
-      return false
-    end)
-  local _encoded, decode_yields, _registry_yields = counts()
-  test.assert(reads == 1 and #rejected == 0 and not restored:has_project_ast(name),
-    "rejected revision installed compiler state or duplicated its BLOB read")
-  test.assert(decode_yields > 1,
-    "single project decoding did not yield repeatedly")
-
   local types = lua.require("titan-compiler.types") as {string: value}
-  local previous: value = types["registry"]
-  local cancelled = bridge.load()
-  local task = async.run<{bridge.ModuleSnapshot},value>(function (): {bridge.ModuleSnapshot}
-    return cancelled:hydrate_projects(projects,payloads)
+  local previous_registry: value = types["registry"]
+  local previous_imported: value = driver["imported"]
+  local previous_source_path: value = driver["TITAN_SOURCE_PATH"]
+  local previous_binary_path: value = driver["TITAN_BIN_PATH"]
+  local previous_cppflags: value = driver["EXTRA_CPPFLAGS"]
+  local _encode, previous_decode, previous_assembly, _compact = counts()
+  barrier(phase)
+  defer barrier(nil)
+  local compiler = bridge.load()
+  local task = async.run<{string},value>(function (): {string}
+    return compiler:restore_projects(projects,payloads)
   end)
-  local saw_registry = false
+  defer do
+    if not task:status():has_finished() then
+      task:cancel(async.CancellationReason.simple("payload cancellation test cleanup"))
+    end
+    async.join(task)
+  end
+  local observed = false
   while not task:status():has_finished() do
-    if types["registry"] ~= previous then
-      saw_registry = true
-      task:cancel(async.CancellationReason.simple("cancel payload normalization"))
+    test.assert(types["registry"] == previous_registry and
+      driver["imported"] == previous_imported and
+      driver["TITAN_SOURCE_PATH"] == previous_source_path and
+      driver["TITAN_BIN_PATH"] == previous_binary_path and
+      driver["EXTRA_CPPFLAGS"] == previous_cppflags,
+      "manifest restoration replaced compiler globals while yielding")
+    local _encoded, decoding, assembly, _compacted = counts()
+    if (phase == "decode" and decoding > previous_decode) or
+       (phase == "registry" and assembly > previous_assembly) then
+      observed = true
+      task:cancel(async.CancellationReason.simple("cancel payload " .. phase))
       break
     end
     async.yield()
@@ -834,13 +842,67 @@ local function large_project_payload_restoration_yields_and_cleans_up()
   when failed: failure then raise failure.error
   else
   end
-  test.assert(saw_registry and cancellation,
-    "large payload normalization offered no cancellable scheduler turn")
-  test.assert(types["registry"] == previous and not cancelled:has_project_ast(name),
-    "cancelled normalization leaked the temporary registry or a partial project AST")
-  local recovered = bridge.load():hydrate_projects(projects,payloads)
-  test.assert(#recovered == 1,
-    "cancellation did not release the compiler permit for a later restoration")
+  local _encoded, final_decode, final_assembly, _compacted = counts()
+  test.assert(observed and cancellation,
+    "large payload " .. phase .. " offered no cancellable scheduler turn" ..
+    "; observed=" .. strings.tostring(observed) ..
+    "; terminal=" .. task:status():as_string() ..
+    "; decode=" .. (final_decode - previous_decode) ..
+    "; registry=" .. (final_assembly - previous_assembly))
+  barrier(nil)
+  test.assert(types["registry"] == previous_registry and
+    driver["imported"] == previous_imported and
+    driver["TITAN_SOURCE_PATH"] == previous_source_path and
+    driver["TITAN_BIN_PATH"] == previous_binary_path and
+    driver["EXTRA_CPPFLAGS"] == previous_cppflags and
+    not compiler:has_project_entry(projects[1].module_name),
+    "cancelled " .. phase .. " changed compiler globals or installed partial declarations")
+  local recovered = bridge.load():restore_projects(projects,payloads)
+  test.assert(#recovered == 1 and recovered[1] == projects[1].module_name,
+    "cancelled " .. phase .. " did not release the compiler permit for a later restoration")
+end
+
+local function large_project_payload_restoration_yields_and_cleans_up()
+  local source = strings.writer()
+  for index = 1, 384 do
+    source:write("record Item_" .. index .. "\n" ..
+      "  amount: integer\n  other: integer\nend\n" ..
+      "function item_" .. index .. "(item: Item_" .. index .. "): integer\n" ..
+      "  local answer = item.amount + " .. index .. "\n  return answer\nend\n")
+  end
+  local name = "large_restoration"
+  local projects = {bridge.ProjectModule.new(name,{
+    bridge.SourceFile.new("/workspace/large_restoration.titan",source:drain())})}
+  local compiler = bridge.load()
+  local driver = lua.require(DRIVER_MODULE) as {string: value}
+  local restore_hooks, counts, barrier = observe_payload_hooks(driver)
+  defer restore_hooks()
+  local analysis = compiler:analyze(name,projects)
+  test.assert(#analysis.diagnostics == 0,"large restoration fixture failed analysis")
+  local payloads = compiler:export_projects(projects,{name})
+  test.assert(#payloads == 1,"large single project payload was not exported")
+  local encode_yields, _decode_yields, _registry_yields, compact_yields = counts()
+  test.assert(encode_yields > 1,"single project encoding did not yield repeatedly")
+  test.assert(compact_yields > 1,"declared-interface compaction did not yield repeatedly")
+  local restored = bridge.load()
+  local reads = 0
+  local rejected = restored:restore_project_cache(projects,{name},
+    function (requested: string): (string?,{bridge.CHeaderDependency}?)
+      test.assert(requested == name,"restoration read an unselected payload")
+      reads = reads + 1
+      return payloads[1].payload,nil
+    end,
+    function (_name: string): boolean
+      return false
+    end)
+  local _encoded, decode_yields, _registry_yields, _compacted = counts()
+  test.assert(reads == 1 and #rejected == 0 and not restored:has_project_entry(name),
+    "rejected revision installed compiler state or duplicated its BLOB read")
+  test.assert(decode_yields > 1,
+    "single project decoding did not yield repeatedly")
+
+  cancel_project_restore_at_checkpoint(projects,payloads,counts,barrier,"decode")
+  cancel_project_restore_at_checkpoint(projects,payloads,counts,barrier,"registry")
 end
 
 function test_compiler_bridge_large_payload_restoration_yields_and_cleans_up(

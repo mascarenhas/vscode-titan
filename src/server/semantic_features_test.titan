@@ -177,6 +177,228 @@ function test_semantic_features_reuses_indexed_file_coordinates(
   end)
 end
 
+local function update_plan(store: stores.Store,
+                           modules: {indexer.ModulePublication}): indexer.PublicationPlan
+  local access = store:acquire()
+  defer access:release()
+  return indexer.publication_plan(access.connection, modules)
+end
+
+local function publish_update(store: stores.Store,
+                              projects: {bridge.ProjectModule},
+                              snapshots: {bridge.ModuleSnapshot},
+                              modules: {indexer.ModulePublication}): features.Features
+  local plan = update_plan(store, modules)
+  local prepared = features.prepare_update(projects, snapshots, plan)
+  local generation = 0
+  do
+    local access = store:acquire()
+    defer access:release()
+    local connection = access.connection
+    generation = stores.scalar_integer(connection,
+      "SELECT published_generation FROM main.store_state WHERE singleton=1") + 1
+    connection:set_autocommit(false)
+    defer do
+      if not connection:get_autocommit() then connection:rollback() end
+    end
+    features.initialize_schema(connection)
+    prepared:publish(connection)
+    stores.execute(connection,
+      "UPDATE main.store_state SET published_generation=? WHERE singleton=1", generation)
+    connection:commit()
+  end
+  return features.open(store, generation)
+end
+
+local function module_facts(module_name: string, filenames: {string},
+                            names: {string}, type_info: bridge.TypeInfo): bridge.ModuleSnapshot
+  local nodes: {bridge.Node} = {}
+  local symbols: {bridge.SymbolOccurrence} = {}
+  for index = 1, #filenames do
+    local filename, name = filenames[index], names[index]
+    nodes[#nodes + 1] = node(index * 2 - 1, "Ast.Decl", bridge.NodeKind.declaration(),
+      filename, 1, 1, name, false, type_info, nil, nil, nil, nil)
+    nodes[#nodes + 1] = node(index * 2, "Ast.TopLevelFunc", bridge.NodeKind.declaration(),
+      filename, 1, 1, nil, false, nil, nil, nil, nil,
+      compiler_span(filename, 1, 1, 3, 1))
+    symbols[index] = occurrence(filename, 1, 1, #name + 1, name,
+      "export:" .. module_name .. ":value:" .. name,
+      bridge.OccurrenceRole.definition(), false, type_info)
+  end
+  return snapshot(module_name, filenames[1], filenames, nodes, symbols)
+end
+
+function test_semantic_features_retains_unchanged_facts_and_prunes_old_file_owners(
+    _context: test.Context)
+  runtime.run(function ()
+    local store = stores.open(":memory:")
+    defer store:close()
+    local main_file, old_file = "/workspace/folder/main.titan", "/workspace/folder/old.titan"
+    local keep_file = "/workspace/keep.titan"
+    local main = bridge.SourceFile.new(main_file, "first\nbody\nend\n")
+    local old = bridge.SourceFile.new(old_file, "second\nbody\nend\n")
+    local keep = bridge.SourceFile.new(keep_file, "third\nbody\nend\n")
+    local a = project("folder", {main, old})
+    local b = project("keep", {keep})
+    local integer_type = bridge.TypeInfo.new("Type.Integer", "integer")
+    local string_type = bridge.TypeInfo.new("Type.String", "string")
+    publish_update(store, {a, b}, {
+      module_facts("folder", {main_file, old_file}, {"first", "second"}, integer_type),
+      module_facts("keep", {keep_file}, {"third"}, integer_type),
+    }, {indexer.ModulePublication.new("folder", 1, 2), indexer.ModulePublication.new("keep", 2, 2)})
+    do
+      local access = store:acquire()
+      defer access:release()
+      stores.execute(access.connection,
+        "CREATE TEMP TRIGGER retain_hovers BEFORE DELETE ON main.semantic_hovers " ..
+        "WHEN OLD.filename=CAST('/workspace/keep.titan' AS BLOB) " ..
+        "BEGIN SELECT RAISE(ABORT,'retained hover'); END")
+      stores.execute(access.connection,
+        "CREATE TEMP TRIGGER retain_folds BEFORE DELETE ON main.semantic_folds " ..
+        "WHEN OLD.filename=CAST('/workspace/keep.titan' AS BLOB) " ..
+        "BEGIN SELECT RAISE(ABORT,'retained fold'); END")
+    end
+    a = project("folder", {main})
+    local view = publish_update(store, {a, b}, {
+      module_facts("folder", {main_file}, {"first"}, string_type),
+    }, {indexer.ModulePublication.new("folder", 3, 2), indexer.ModulePublication.new("keep", 2, 2)})
+    local at = source_text.Position.new(0, 1)
+    local retained? = view:hover(keep_file, at)
+    local replaced? = view:hover(main_file, at)
+    test.assert(retained ~= nil and retained.inferred_type ~= nil and
+      retained.inferred_type.display == "integer" and #view:folding_ranges(keep_file) == 1,
+      "unchanged module lost its materialized hover or fold without an AST")
+    test.assert(replaced ~= nil and replaced.inferred_type ~= nil and
+      replaced.inferred_type.display == "string" and #view:folding_ranges(main_file) == 1,
+      "changed module did not replace its materialized type facts")
+    test.assert(view:hover(old_file, at) == nil and #view:folding_ranges(old_file) == 0,
+      "removed constituent retained facts after its old file ownership disappeared")
+    local candidate?, rename_error? = view:rename(keep_file, at, "renamed")
+    test.assert(candidate ~= nil and rename_error == nil,
+      "retained SQL facts could not create a rename candidate")
+    local edited = candidate:edited_project_modules()
+    test.assert(#edited == 2 and find_contents(edited, main_file) == main.contents and
+      find_contents(edited, old_file) == nil and
+      find_contents(edited, keep_file) == "renamed\nbody\nend\n",
+      "rename preflight lost complete current saved membership after retention")
+    local removed = publish_update(store, {b}, {}, {indexer.ModulePublication.new("keep", 2, 2)})
+    test.assert(removed:hover(main_file, at) == nil and #removed:folding_ranges(main_file) == 0 and
+      removed:hover(keep_file, at) ~= nil and #removed:folding_ranges(keep_file) == 1,
+      "module deletion pruned the wrong owner's materialized facts")
+  end)
+end
+
+function test_semantic_features_rebuilds_all_facts_after_missing_file_ownership(
+    _context: test.Context)
+  runtime.run(function ()
+    local store = stores.open(":memory:")
+    defer store:close()
+    local clean_file = "/workspace/clean.titan"
+    local failed_file = "/workspace/failed.titan"
+    local removed_file = "/workspace/removed.titan"
+    local clean = project("clean", {bridge.SourceFile.new(clean_file, "first\nbody\nend\n")})
+    local failed = project("failed", {bridge.SourceFile.new(failed_file, "local broken = missing\n")})
+    local removed = project("removed", {bridge.SourceFile.new(removed_file, "old\nbody\nend\n")})
+    local integer_type = bridge.TypeInfo.new("Type.Integer", "integer")
+    publish_update(store, {clean, failed, removed}, {
+      module_facts("clean", {clean_file}, {"first"}, integer_type),
+      module_facts("removed", {removed_file}, {"old"}, integer_type),
+    }, {
+      indexer.ModulePublication.new("clean", 1, 2),
+      indexer.ModulePublication.new("failed", 2, 3),
+      indexer.ModulePublication.new("removed", 3, 2),
+    })
+    do
+      local access = store:acquire()
+      defer access:release()
+      stores.execute(access.connection, "DROP TABLE main.semantic_files")
+    end
+    clean = project("clean", {bridge.SourceFile.new(clean_file, "first\n")})
+    local view = publish_update(store, {clean, failed}, {
+      snapshot("clean", clean_file, {clean_file}, {
+        node(1, "Ast.Decl", bridge.NodeKind.declaration(), clean_file, 1, 1,
+          "first", false, integer_type, nil, nil, nil, nil),
+      }, {
+        occurrence(clean_file, 1, 1, 6, "first", "export:clean:value:first",
+          bridge.OccurrenceRole.definition(), false, integer_type),
+      }),
+    }, {
+      indexer.ModulePublication.new("clean", 4, 2),
+      indexer.ModulePublication.new("failed", 2, 3),
+    })
+    local at = source_text.Position.new(0, 1)
+    test.assert(view:hover(clean_file, at) ~= nil and
+      view:hover(removed_file, at) == nil and
+      #view:folding_ranges(clean_file) == 0 and
+      #view:folding_ranges(removed_file) == 0,
+      "lost file ownership retained old folds or a removed module's hover")
+    local candidate?, rename_error? = view:rename(clean_file, at, "renamed")
+    test.assert(candidate ~= nil and rename_error == nil,
+      "rebuilt clean facts did not support rename preparation")
+    local edited = candidate:edited_project_modules()
+    test.assert(#edited == 2 and find_contents(edited, clean_file) == "renamed\n" and
+      find_contents(edited, failed_file) == failed.files[1].contents and
+      find_contents(edited, removed_file) == nil,
+      "recovery omitted the unchanged failed source from complete rename preflight")
+    local access = store:acquire()
+    defer access:release()
+    test.assert(stores.scalar_integer(access.connection,
+      "SELECT COUNT(*) FROM main.semantic_hovers") == 1 and
+      stores.scalar_integer(access.connection, "SELECT COUNT(*) FROM main.semantic_folds") == 0,
+      "recovery left orphaned feature rows without their old file ownership")
+  end)
+end
+
+function test_semantic_features_rejects_stale_update_before_pruning(
+    _context: test.Context)
+  runtime.run(function ()
+    local store = stores.open(":memory:")
+    defer store:close()
+    local a_file, b_file = "/workspace/a.titan", "/workspace/b.titan"
+    local a = project("a", {bridge.SourceFile.new(a_file, "first\nbody\nend\n")})
+    local b = project("b", {bridge.SourceFile.new(b_file, "second\nbody\nend\n")})
+    local integer_type = bridge.TypeInfo.new("Type.Integer", "integer")
+    local string_type = bridge.TypeInfo.new("Type.String", "string")
+    publish_update(store, {a, b}, {
+      module_facts("a", {a_file}, {"first"}, integer_type),
+      module_facts("b", {b_file}, {"second"}, integer_type),
+    }, {indexer.ModulePublication.new("a", 1, 2), indexer.ModulePublication.new("b", 2, 2)})
+    local stale_plan = update_plan(store, {
+      indexer.ModulePublication.new("a", 3, 2), indexer.ModulePublication.new("b", 2, 2),
+    })
+    local obsolete = features.prepare_update({a, b}, {
+      module_facts("a", {a_file}, {"first"}, string_type),
+    }, stale_plan)
+    local current = publish_update(store, {a, b}, {
+      module_facts("b", {b_file}, {"second"}, string_type),
+    }, {indexer.ModulePublication.new("a", 1, 2), indexer.ModulePublication.new("b", 4, 2)})
+    do
+      local access = store:acquire()
+      defer access:release()
+      local connection = access.connection
+      connection:set_autocommit(false)
+      defer connection:rollback()
+      local rejected = false
+      do
+        obsolete:publish(connection)
+      catch
+        rejected = error is indexer.StaleView
+      end
+      test.assert(rejected, "obsolete module plan overwrote a newer completed view")
+      -- Inspect before rollback: a fence inside index publication alone would
+      -- run after feature pruning and leave this transaction partially changed.
+      test.assert(stores.scalar_integer(connection, "SELECT COUNT(*) FROM main.semantic_hovers") == 2 and
+        stores.scalar_integer(connection, "SELECT COUNT(*) FROM main.semantic_folds") == 2 and
+        stores.scalar_integer(connection, "SELECT COUNT(*) FROM main.semantic_occurrences") == 2,
+        "stale publication mutated facts before checking its completed generation")
+    end
+    local at = source_text.Position.new(0, 1)
+    test.assert(current:hover(a_file, at).inferred_type.display == "integer" and
+      current:hover(b_file, at).inferred_type.display == "string",
+      "obsolete update changed the preceding accepted module facts")
+  end)
+end
+
 function test_semantic_features_definition_and_all_project_references(
     _context: test.Context)
   runtime.run(function ()
