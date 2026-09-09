@@ -131,12 +131,14 @@ Validation:
   now measures real declared-owner work. Focused compiler project-cache tests
   passed 14/14; final server `git diff --check` passed.
 
-The delivery compiler pin is `d40f7c607455e53b4b88472ed94b87a21b9423fa`.
-This advances the initial pin for test portability fixes, delivery notes and
-the requested two-runner compiler CI split; compiler production files are
-identical. The preceding server Linux runs passed all required checks and
-uploaded their VSIX artifacts. The updated pin receives a fresh Linux run before
-delivery.
+The delivery compiler pin is the merged master commit
+`5787bd4fb09f210462c45f341998c854611df610`. The maintainer confirmed that
+Titan #156 passed macOS CI and merged it. This tree is identical to the reviewed
+compiler head `0741487ff082e9378235db75d78d86e771c5702e`; its production
+compiler is unchanged from the locally verified earlier pin. The server's
+existing native/JavaScript/extension-host and packaging evidence therefore
+applies to the same compiler implementation. The pin update receives the
+ordinary automatic server CI run.
 
 A final isolated native cold capture against the compiler implementation at
 `30daba07` and the verified server reached READY in 309.319 seconds
