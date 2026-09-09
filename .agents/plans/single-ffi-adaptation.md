@@ -98,7 +98,7 @@ server branch on the existing documentation/profiling PRs.
 - [x] Migrate source, bridge, grammar, and fixtures; add integration coverage.
 - [x] Build the private current compiler/provider and run focused checks.
 - [x] Complete full verification and independent review.
-- [ ] Pin the final compiler commit, commit exact paths, and open the server PR.
+- [x] Pin the compiler commit, commit exact paths, and open the server PR.
 - [ ] Record green Linux CI and update the board; leave PRs open for review.
 
 Validation:
@@ -131,8 +131,14 @@ Validation:
   now measures real declared-owner work. Focused compiler project-cache tests
   passed 14/14; final server `git diff --check` passed.
 
-The delivery compiler pin is `30daba07f7c50480a25e46424c5837b8833be17e`. A final isolated native cold capture
-against this compiler and the verified server reached READY in 309.319 seconds
+The delivery compiler pin is `99afa19062f4f456ee7c0e259d35cd6687fe30c9`.
+This advances the initial pin only for an inventory-test portability fix and
+delivery notes; compiler production files are identical. The first server Linux
+CI run passed all required checks and uploaded its VSIX at server `193ce03c`.
+The updated pin receives a fresh Linux run before delivery.
+
+A final isolated native cold capture against the compiler implementation at
+`30daba07` and the verified server reached READY in 309.319 seconds
 with all 63 modules committed in one analysis, zero stale/failed analyses,
 135 saved source files and zero diagnostics. Saved-file hover, definition,
 references and folding passed; source/config/cache bytes and metadata were
