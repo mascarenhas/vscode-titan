@@ -2,7 +2,7 @@ SHELL := /bin/bash
 .SHELLFLAGS := -eu -o pipefail -c
 
 TITAN_REPO ?= ../titan
-TITAN_PREFIX := $(abspath .titan)
+TITAN_PREFIX ?= $(abspath .titan)
 TITANC := $(TITAN_PREFIX)/bin/titanc
 TITAN_LUA := $(TITAN_PREFIX)/bin/lua
 LUAROCKS := $(TITAN_PREFIX)/bin/luarocks
