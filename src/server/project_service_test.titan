@@ -1,4 +1,5 @@
 local fs = import "fs"
+local lua = import "lua"
 local async = import "async"
 local sqlite3 = import "sqlite3"
 foreign import "utime.h"
@@ -1245,6 +1246,80 @@ end
 function test_project_service_uses_real_compiler_source_interfaces_for_selective_rechecking(
     _context: test.Context)
   test_runtime.run(rechecks_real_compiler_source_dependants_selectively)
+end
+
+local function publishes_and_recovers_source_serialization_diagnostics()
+  with_fixture(function (fixture: Fixture)
+    fixture:mkdir("src")
+    configure_source_root(fixture)
+    fixture:write("src/main.titan",
+      "function answer(): integer return 41 end\n")
+    local service?, failure? = project_service.load_default(fixture.root)
+    if service ~= nil then fixture.services[#fixture.services + 1] = service end
+    test.assert(service ~= nil and failure == nil,
+                "serialization fixture did not load with valid source")
+    test.assert(service:project_ast("main") ~= nil,
+                "serialization fixture had no initial semantic snapshot")
+
+    -- Fault injection stays at the external compiler's documented Lua result
+    -- boundary. The real checker, bridge and SQL publication run unchanged.
+    local driver = lua.require("titan-compiler.driver") as {string: value}
+    local serialize = driver["serialize_source_interface"] as
+      (value) -> (value, value)
+    defer driver["serialize_source_interface"] = serialize
+    driver["serialize_source_interface"] = function (entry: value): (value, value)
+      local raw = entry as {string: value}
+      local module_type = raw["type"] as {string: value}
+      if module_type["name"] == "main" then
+        return nil, "forced source-interface failure"
+      end
+      return serialize(entry)
+    end
+
+    fixture:write("src/main.titan",
+      "function answer(): integer return 42 end\n")
+    local failed?, failed_error? = service:refresh()
+    test.assert(failed ~= nil and failed_error == nil and
+                #failed.failed_modules == 1 and failed.failed_modules[1] == "main",
+                "serialization error failed the analyzer instead of its source module")
+    local invalid? = find_project(service:latest(), "main")
+    test.assert(invalid ~= nil and #invalid.diagnostics == 1 and
+                invalid.compiler_snapshot ~= nil and
+                invalid.compiler_snapshot.manifest == nil and
+                service:project_ast("main") == nil,
+                "serialization failure kept stale semantics or lost its diagnostic")
+    local diagnostic = invalid.diagnostics[1]
+    test.assert(diagnostic.location ~= nil and
+                diagnostic.location.filename == fixture:path("src/main.titan") and
+                diagnostic.location.line == 1 and diagnostic.location.column == 1 and
+                diagnostic.owner_module == "main" and
+                strings.find(diagnostic.message,
+                  "could not serialize source interface for module 'main'") ~= nil and
+                strings.find(diagnostic.message, "forced source-interface failure") ~= nil,
+                "serialization diagnostic lost its source attribution or error detail")
+    case diagnostic.kind
+    when compiler then
+    else test.assert(false, "serialization failure used the wrong diagnostic kind")
+    end
+
+    driver["serialize_source_interface"] = serialize
+    fixture:write("src/main.titan",
+      "function answer(): integer return 43 end\n")
+    local recovered?, recovery_error? = service:refresh()
+    local repaired? = find_project(service:latest(), "main")
+    test.assert(recovered ~= nil and recovery_error == nil and
+                #recovered.failed_modules == 0 and #recovered.committed_modules == 1 and
+                repaired ~= nil and #repaired.diagnostics == 0 and
+                repaired.compiler_snapshot ~= nil and
+                repaired.compiler_snapshot.manifest ~= nil and
+                service:project_ast("main") ~= nil,
+                "a later saved edit did not clear serialization diagnostics and restore semantics")
+  end)
+end
+
+function test_project_service_publishes_and_recovers_source_serialization_diagnostics(
+    _context: test.Context)
+  test_runtime.run(publishes_and_recovers_source_serialization_diagnostics)
 end
 
 local function analyzes_source_qualified_modules_from_narrow_watch_root()

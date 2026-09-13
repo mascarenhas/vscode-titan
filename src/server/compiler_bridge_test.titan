@@ -457,6 +457,7 @@ return function(mode, contextual_provider_file)
       }
       if mode == "dependency-diagnostic" then
         driver.imported[name].source_manifest = nil
+        driver.imported[name].deps = {["fixture.dependency"] = true}
         driver.imported["fixture.dependency"] = {
           kind = "source",
           ast = ast,
@@ -1449,6 +1450,80 @@ end
 function test_compiler_bridge_executes_installed_compiler_on_valid_and_invalid_source(
     _context: test.Context)
   test_runtime.run(executes_installed_compiler_on_valid_and_invalid_source)
+end
+
+local function recovers_after_dependency_checking_errors()
+  preload_real_compiler()
+  local compiler = bridge.load()
+  local consumer = bridge.ProjectModule.new("manifest_consumer", {
+    bridge.SourceFile.new("/workspace/manifest_consumer.titan", [[
+local dependency = import "manifest_middle.titan"
+local healthy = import "manifest_healthy"
+function answer(): integer return dependency.answer() + healthy.answer() end
+]]),
+  })
+  local middle = bridge.ProjectModule.new("manifest_middle", {
+    bridge.SourceFile.new("/workspace/manifest_middle.titan", [[
+local dependency = import "manifest_dependency"
+function answer(): integer return dependency.answer() end
+]]),
+  })
+  local healthy = bridge.ProjectModule.new("manifest_healthy", {
+    bridge.SourceFile.new("/workspace/manifest_healthy.titan",
+      "function answer(): integer return 1 end\n"),
+  })
+  local filename = "/workspace/manifest_dependency.titan"
+  local dependency = bridge.ProjectModule.new("manifest_dependency", {
+    bridge.SourceFile.new(filename,
+      "function answer(): integer return 'invalid' end\n"),
+  })
+  local failed = compiler:analyze("manifest_consumer", {
+    consumer, middle, dependency, healthy,
+  })
+  local failed_consumer? = failed:find_module("manifest_consumer")
+  local failed_middle? = failed:find_module("manifest_middle")
+  local failed_dependency? = failed:find_module("manifest_dependency")
+  local healthy_snapshot? = failed:find_module("manifest_healthy")
+  test.assert(#failed.diagnostics > 0 and failed_consumer ~= nil and
+              failed_middle ~= nil and failed_dependency ~= nil,
+              "dependency checking error prevented project normalization")
+  test.assert(failed_consumer.manifest == nil and
+              failed_middle.manifest == nil and
+              failed_dependency.manifest == nil and
+              not compiler:has_project_entry("manifest_consumer") and
+              not compiler:has_project_entry("manifest_middle") and
+              not compiler:has_project_entry("manifest_dependency"),
+              "failed dependency closure retained reusable interfaces")
+  test.assert(healthy_snapshot ~= nil and healthy_snapshot.manifest ~= nil,
+              "dependency error discarded a healthy sibling interface")
+  assert_declared_project_entry(compiler, "manifest_healthy")
+  local diagnostic = failed.diagnostics[1]
+  test.assert(diagnostic.location ~= nil and
+              diagnostic.location.filename == filename and
+              strings.find(diagnostic.message, "could not serialize") == nil,
+              "ordinary checking error was replaced by a serialization failure")
+
+  dependency = bridge.ProjectModule.new("manifest_dependency", {
+    bridge.SourceFile.new(filename,
+      "function answer(): integer return 42 end\n"),
+  })
+  local recovered = compiler:analyze("manifest_consumer", {
+    consumer, middle, dependency, healthy,
+  })
+  local recovered_consumer? = recovered:find_module("manifest_consumer")
+  local recovered_dependency? = recovered:find_module("manifest_dependency")
+  test.assert(#recovered.diagnostics == 0 and
+              recovered_consumer ~= nil and recovered_consumer.manifest ~= nil and
+              recovered_dependency ~= nil and recovered_dependency.manifest ~= nil,
+              "repairing the dependency did not recover valid manifests")
+  assert_declared_project_entry(compiler, "manifest_consumer")
+  assert_declared_project_entry(compiler, "manifest_middle")
+  assert_declared_project_entry(compiler, "manifest_dependency")
+end
+
+function test_compiler_bridge_recovers_after_dependency_checking_errors(
+    _context: test.Context)
+  test_runtime.run(recovers_after_dependency_checking_errors)
 end
 
 local function runs_incremental_declared_interface_cache()

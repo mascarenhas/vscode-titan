@@ -44,7 +44,18 @@ for required in \
   extension/dist/titan/share/lua/5.5/titan-compiler/driver.lua \
   extension/dist/titan/share/lua/5.5/titan-compiler/version.lua \
   extension/dist/titan/lib/lua/5.5/lfs.so \
-  extension/dist/titan/lib/lua/5.5/lpeglabel.so; do
+  extension/dist/titan/lib/lua/5.5/lpeglabel.so \
+  extension/dist/titan/include/titan.h \
+  extension/dist/titan/include/titan/ffi.h \
+  extension/dist/titan/include/minicoro.h \
+  extension/dist/titan/include/llhttp.h \
+  extension/dist/titan/include/sqlite3.h \
+  extension/dist/titan/include/openssl/ssl.h \
+  extension/dist/titan/include/openssl/e_ostime.h \
+  extension/dist/titan/include/uv.h \
+  extension/dist/titan/include/lua.h \
+  extension/dist/titan/src/lua-5.5.1/lobject.h \
+  extension/dist/titan/src/lua-5.5.1/luaconf.h; do
   if ! grep -Fxq "$required" <<<"$contents"; then
     echo "VSIX is missing $required" >&2
     exit 1
@@ -92,18 +103,18 @@ fi
 unexpected_titan_payload=$(
   grep -E '^extension/dist/titan(/|$)' <<<"$contents" |
     grep -Ev \
-      '^extension/dist/titan/?$|^extension/dist/titan/(share|lib)/?$|^extension/dist/titan/(share|lib)/lua/?$|^extension/dist/titan/(share|lib)/lua/5[.]5(/.*)?$' \
+      '^extension/dist/titan/?$|^extension/dist/titan/(share|lib|src)/?$|^extension/dist/titan/(share|lib)/lua/?$|^extension/dist/titan/(share|lib)/lua/5[.]5(/.*)?$|^extension/dist/titan/include(/.*)?$|^extension/dist/titan/src/lua-5[.]5[.]1(/.*)?$' \
     || true
 )
 if [[ -n "$unexpected_titan_payload" ]]; then
-  echo "VSIX contains content outside the two reviewed Lua module trees:" >&2
+  echo "VSIX contains content outside the reviewed compiler module and SDK trees:" >&2
   printf '%s\n' "$unexpected_titan_payload" >&2
   exit 1
 fi
 
-if grep -Eq '^extension/dist/titan/(include|src|lib/titan|share/titan)(/|$)' \
+if grep -Eq '^extension/dist/titan/(lib/titan|share/titan)(/|$)' \
     <<<"$contents"; then
-  echo "VSIX contains Titan provider, SDK, source, or non-Lua share content" >&2
+  echo "VSIX contains Titan provider or non-Lua share content" >&2
   exit 1
 fi
 
@@ -118,7 +129,7 @@ if [[ ! -x "$extract_root/extension/bin/titan-language-server" ]]; then
   exit 1
 fi
 
-compare_module_tree() {
+compare_packaged_tree() {
   local relative_tree=$1
   local source_tree="$titan_prefix/$relative_tree"
   local packaged_tree="$extract_root/extension/dist/titan/$relative_tree"
@@ -126,16 +137,16 @@ compare_module_tree() {
   local packaged_inventory="$extract_root/packaged-inventory"
 
   if [[ ! -d "$source_tree" ]]; then
-    echo "source Lua module tree is missing: $source_tree" >&2
+    echo "source compiler module or SDK tree is missing: $source_tree" >&2
     exit 1
   fi
   if [[ ! -d "$packaged_tree" ]]; then
-    echo "packaged Lua module tree is missing: $packaged_tree" >&2
+    echo "packaged compiler module or SDK tree is missing: $packaged_tree" >&2
     exit 1
   fi
   if find "$packaged_tree" ! -type d ! -type f -print -quit |
       grep -q .; then
-    echo "packaged Lua module tree contains a non-regular entry: $relative_tree" >&2
+    echo "packaged tree contains a non-regular entry: $relative_tree" >&2
     exit 1
   fi
 
@@ -148,7 +159,7 @@ compare_module_tree() {
     find . -type f -print | LC_ALL=C sort
   ) >"$packaged_inventory"
   if ! diff -u "$source_inventory" "$packaged_inventory"; then
-    echo "packaged Lua module inventory differs from $source_tree" >&2
+    echo "packaged inventory differs from $source_tree" >&2
     exit 1
   fi
 
@@ -156,14 +167,16 @@ compare_module_tree() {
     if ! cmp -s \
         "$source_tree/$relative_file" \
         "$packaged_tree/$relative_file"; then
-      echo "packaged Lua module differs from source: $relative_tree/$relative_file" >&2
+      echo "packaged file differs from source: $relative_tree/$relative_file" >&2
       exit 1
     fi
   done <"$source_inventory"
 }
 
-compare_module_tree share/lua/5.5
-compare_module_tree lib/lua/5.5
+compare_packaged_tree share/lua/5.5
+compare_packaged_tree lib/lua/5.5
+compare_packaged_tree include
+compare_packaged_tree src
 
 inspect_native_module() {
   local module=$1
@@ -230,6 +243,7 @@ inspect_native_module \
   "$extract_root/extension/dist/titan/lib/lua/5.5/lpeglabel.so"
 
 node_executable=$(command -v node)
+sdk_compiler=${CC:-cc}
 protocol_root="$extract_root/unrelated-working-directory"
 cache_root="$extract_root/compiler-cache"
 hostile_titan_root="$extract_root/ambient-titan-must-not-be-used"
@@ -243,6 +257,7 @@ mkdir -p \
   # Embedded interfaces must remain usable without a C toolchain or ambient
   # Titan SDK headers, including when their metadata contains portable C types.
   unset CPATH C_INCLUDE_PATH CPLUS_INCLUDE_PATH
+  unset TITAN_EXTRA_CPPFLAGS TITAN_EXTRA_CFLAGS
   export CC="$extract_root/c-compiler-must-not-be-used"
   export CCACHE_DISABLE=1
   export LUA_PATH=/ambient/must-not-be-used/?.lua
@@ -257,6 +272,17 @@ mkdir -p \
   "$node_executable" "$repository_root/scripts/test-server-protocol.mjs" \
     "$extract_root/extension/bin/titan-language-server" \
     --self-contained-smoke
+
+  # C imports need a C compiler, with all Titan/Lua headers supplied by the
+  # extracted package and no checkout-specific include configuration.
+  # TITAN_ROCKS_ROOT is an explicit SDK override; allow the packaged native
+  # module path to identify the installation for this check.
+  unset TITAN_ROCKS_ROOT
+  export CC="$sdk_compiler"
+  export TITAN_PROBE_CACHE_DISABLE=1
+  "$node_executable" "$repository_root/scripts/test-server-protocol.mjs" \
+    "$extract_root/extension/bin/titan-language-server" \
+    --sdk-smoke
 )
 
 manifest=$(unzip -p "$vsix" extension.vsixmanifest)
