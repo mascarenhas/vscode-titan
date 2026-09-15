@@ -3,6 +3,7 @@ import { cp, lstat, mkdir, readFile, readdir, rm } from "node:fs/promises";
 import * as path from "node:path";
 
 const LUA_VERSION = "5.5";
+const LUA_SOURCE_VERSION = "5.5.1";
 const EXPECTED_COMPILER_VERSION = {
   LUA_VERSION,
   TITAN_ABI_VERSION: "2",
@@ -32,6 +33,21 @@ const REQUIRED_SHARE_FILES = [
   "titan-compiler/types.lua",
   "titan-compiler/version.lua"
 ];
+const EXPECTED_INCLUDE_ROOT = [
+  "lauxlib.h:file",
+  "llhttp.h:file",
+  "luaconf.h:file",
+  "lua.h:file",
+  "lua.hpp:file",
+  "lualib.h:file",
+  "minicoro.h:file",
+  "openssl:directory",
+  "sqlite3.h:file",
+  "titan:directory",
+  "titan.h:file",
+  "uv:directory",
+  "uv.h:file"
+];
 
 const repositoryRoot = process.cwd();
 const titanPrefix = path.resolve(
@@ -51,6 +67,18 @@ const trees = [
     source: path.join(titanPrefix, "lib", "lua", LUA_VERSION),
     destination: path.join(outputPrefix, "lib", "lua", LUA_VERSION),
     expectedRoot: EXPECTED_NATIVE_ROOT
+  },
+  {
+    description: "Titan SDK include tree",
+    source: path.join(titanPrefix, "include"),
+    destination: path.join(outputPrefix, "include"),
+    expectedRoot: EXPECTED_INCLUDE_ROOT
+  },
+  {
+    description: "Lua native source tree",
+    source: path.join(titanPrefix, "src"),
+    destination: path.join(outputPrefix, "src"),
+    expectedRoot: [`lua-${LUA_SOURCE_VERSION}:directory`]
   }
 ];
 
@@ -222,7 +250,7 @@ for (const tree of trees) {
 }
 
 console.log(
-  `staged ${fileCount} Lua ${LUA_VERSION} module files (${byteCount} bytes) in ${
+  `staged ${fileCount} compiler module and SDK files (${byteCount} bytes) in ${
     path.relative(repositoryRoot, outputPrefix)
   }`
 );

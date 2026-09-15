@@ -3859,10 +3859,44 @@ end
 local function failed_projects(root_module: string,
                                diagnostics: {Diagnostic},
                                projects: {string: ProjectModule},
+                               imported: {string: value},
                                loader_failed: boolean,
                                work: NormalizationWork): {string: boolean}
   local failed: {string: boolean} = {}
+  if #diagnostics == 0 and not loader_failed then return failed end
   local owners = project_filename_owners(projects, work)
+  local importers: {string: {string}} = {}
+  -- A declaration manifest can serialize even when a function body failed.
+  -- Use source provenance and the compiler's direct dependency edges to carry
+  -- failure through source importers without rejecting healthy siblings.
+  for name, candidate in iteration.pairs<string, value>(imported) do
+    work:account()
+    local entry = required_map(
+      candidate, DRIVER_MODULE, "driver.imported['" .. name .. "']")
+    if entry["kind"] == "source" then
+      local files = required_string_list(entry["source_files"], DRIVER_MODULE,
+        "compiler source files for '" .. name .. "'")
+      for index = 1, #files do
+        work:account()
+        if owners[files[index]] == nil then owners[files[index]] = name end
+      end
+      local dependencies: value = entry["deps"]
+      if dependencies is {string: value} then
+        for dependency, enabled in iteration.pairs<string, value>(
+            dependencies as {string: value}) do
+          work:account()
+          if enabled then
+            local dependants? = importers[dependency]
+            if dependants == nil then
+              dependants = {}
+              importers[dependency] = dependants
+            end
+            dependants[#dependants + 1] = name
+          end
+        end
+      end
+    end
+  end
   if loader_failed then failed[root_module] = true end
   for index = 1, #diagnostics do
     work:account()
@@ -3873,6 +3907,25 @@ local function failed_projects(root_module: string,
     end
     if owner == nil then owner = root_module end
     failed[owner as string] = true
+  end
+  local pending: {string} = {}
+  for name in iteration.pairs<string, boolean>(failed) do
+    pending[#pending + 1] = name
+  end
+  local current = 1
+  while current <= #pending do
+    local dependants? = importers[pending[current]]
+    if dependants ~= nil then
+      for index = 1, #dependants do
+        work:account()
+        local name = dependants[index]
+        if not failed[name] then
+          failed[name] = true
+          pending[#pending + 1] = name
+        end
+      end
+    end
+    current = current + 1
   end
   return failed
 end
@@ -4063,7 +4116,7 @@ local function Compiler:run_attempt_inner(
   end
 
   local failed = failed_projects(
-    root_module, diagnostics, projects, not ok, normalization_work)
+    root_module, diagnostics, projects, imported, not ok, normalization_work)
   local checked_set: {string: boolean} = {}
   for index = 1, #checked do checked_set[checked[index]] = true end
   -- A loader that fails before publishing a module cannot add the root to the
@@ -4081,22 +4134,6 @@ local function Compiler:run_attempt_inner(
     if not is_project or checked_set[name] then
       local valid = #diagnostics == 0
       if is_project then valid = failed[name] ~= true end
-      if is_project and valid and #diagnostics > 0 then
-        local entry = required_map(
-          imported[name], DRIVER_MODULE,
-          "driver.imported['" .. name .. "']")
-        -- A diagnostic in a source dependency makes every source module that
-        -- depends on it invalid. The compiler consequently omits those
-        -- modules' source manifests even when no diagnostic points into their
-        -- own files. Preserve malformed-manifest contract checks, but treat
-        -- this documented omission as the compiler's transitive-failure
-        -- signal instead of trying to serialize an invalid module.
-        if entry["source_manifest"] == nil or
-            entry["source_manifest"] == false then
-          valid = false
-          failed[name] = true
-        end
-      end
       local normalization_started = 0.0
       if profiling then normalization_started = logging.clock() end
       local normalized = snapshot_module(

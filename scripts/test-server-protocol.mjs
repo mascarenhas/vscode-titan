@@ -928,12 +928,29 @@ async function testUnmappedSourceWarnings() {
   }
 }
 
-async function testSelfContainedCompilerModules() {
+async function testSelfContainedCompilerModules({ sdkHeaders = false } = {}) {
   const root = await makePhysicalTemporaryRoot(
     "vscode-titan-self-contained-"
   );
   const filename = path.join(root, "standard_module.titan");
   const lines = [
+    ...(sdkHeaders ? [
+      'foreign import "titan.h"',
+      'foreign import "lobject.h"',
+      'foreign import "uv.h"',
+      'foreign import "minicoro.h"',
+      'foreign import "llhttp.h"',
+      'foreign import "sqlite3.h"',
+      'foreign import "openssl/ssl.h"',
+      "local function sdk_layouts(): integer",
+      "  return ffi.TValue.sizeof + ffi.uv_loop_t.sizeof + " +
+        "ffi.mco_desc.sizeof + ffi.llhttp_t.sizeof",
+      "end",
+      "local function sdk_versions(): integer",
+      "  return ffi.sqlite3_libversion_number() + ffi.OpenSSL_version_num()",
+      "end",
+      ""
+    ] : []),
     'local strings = import "string"',
     'local http = import "http"',
     'local reflect = import "reflect"',
@@ -973,7 +990,10 @@ async function testSelfContainedCompilerModules() {
   ];
   await writeFile(
     path.join(root, "titan-config.lua"),
-    'include = { "." }\nsource_module_roots = { "." }\n',
+    'include = { "." }\nsource_module_roots = { "." }\n' +
+      (sdkHeaders
+        ? 'extra_ffi_cppflags = "-D_GNU_SOURCE -DOPENSSL_API_COMPAT=30000"\n'
+        : ""),
     "utf8"
   );
   await writeFile(filename, lines.join("\n"), "utf8");
@@ -1727,11 +1747,11 @@ if (isMain) {
   if (!server) {
     console.error(
       "usage: node scripts/test-server-protocol.mjs PATH-TO-SERVER " +
-        "[--self-contained-smoke]"
+        "[--self-contained-smoke|--sdk-smoke]"
     );
     process.exit(2);
   }
-  if (!["full", "--self-contained-smoke"].includes(mode)) {
+  if (!["full", "--self-contained-smoke", "--sdk-smoke"].includes(mode)) {
     console.error(`unsupported protocol-test mode: ${mode}`);
     process.exit(2);
   }
@@ -1740,6 +1760,9 @@ if (isMain) {
   if (mode === "--self-contained-smoke") {
     await testSelfContainedCompilerModules();
     console.log("self-contained compiler-module protocol smoke passed");
+  } else if (mode === "--sdk-smoke") {
+    await testSelfContainedCompilerModules({ sdkHeaders: true });
+    console.log("packaged SDK header protocol smoke passed");
   } else {
     await testCoalescedIndexingResetStatus();
     await testLifecycle();

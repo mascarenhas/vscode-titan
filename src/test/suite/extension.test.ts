@@ -1188,6 +1188,10 @@ function assertInitialization(
   assert.equal(event.luaCPath, luaCPath);
   assert.ok(event.compilerCachePrefix);
   assert.ok(path.isAbsolute(event.compilerCachePrefix));
+  assert.ok(
+    event.compilerCachePrefix.split(path.sep).includes("workspaceStorage"),
+    "probe records should use workspace storage"
+  );
   assert.equal(event.serverLogLevel, "info");
   assert.equal(event.trace, "off");
   assert.equal(event.rootPath, folder.uri.fsPath);
