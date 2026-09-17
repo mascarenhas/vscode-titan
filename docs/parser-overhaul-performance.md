@@ -1,5 +1,9 @@
 # Parser-overhaul analysis regression measurements
 
+These measurements describe the parser-overhaul checkpoint before the later
+compiler-pin and incremental-build update in [native-build.md](native-build.md).
+They have not been relabeled as measurements of the newer compiler.
+
 The matched comparison uses Titan `3a06055f4d84e4ca3eb9f8a31fd32aa65d6e6bce` for both server images. The pre-refactor image already includes the syntax/AST migration and the corrected `c-header-v5` / `ffi-conversion-v6` persistence contract. Both images analyze the **same final source snapshots**: 65 saved files in vscode-titan and 135 files, including folder-module contributors, in Titan.
 
 | Corpus | Server | Cold READY | Unchanged restart READY | Restart full restoration |

@@ -15,7 +15,9 @@ Read the sibling `../titan/.agents/skills/titan-programmer/SKILL.md` before any
 Titan source work. Add `titan-tester`, `titan-async`, `titan-ffi`, or
 `titan-pegs` when their boundaries apply. Use this repository's `.titan/bin`
 toolchain and its installed Lua paths; do not silently compile with an ambient
-Titan installation.
+Titan installation. Packaging checks an exact production SDK inventory. Keep
+upstream compiler test tools such as Busted and coverage modules in a separate
+test prefix; they are not part of the extension's compiler payload.
 
 Before changing code, identify the board issue that owns the work and its
 acceptance criteria. If the unit is still broad, split it into board-sized
@@ -141,6 +143,34 @@ No fallback cache may supply a different compiler. Native tests compile once and
 parallel shards on the two-CPU runner. Maintain the module inventory in
 `scripts/run-server-tests.mjs` when adding a test owner, inspect positive test
 selection and both shard outcomes, and use `make verify` for the complete gate.
+
+## Incremental native builds
+
+Read [native-build.md](../../../docs/native-build.md) before changing the Make
+object graph. Make owns dependency and configuration invalidation; the compiler's
+`--incremental` check only validates source timestamps. Keep generated outputs in
+persistent build stages, and discover imports with the compiler parser so Titan
+fixture strings do not become build dependencies. Folder contributors form one
+logical module and object.
+
+Use `make -j2 server server-test-build` for parallel object compilation. Each
+object recipe uses `-c --incremental -j1`; final links reuse those objects.
+`server-objects` and `server-test-objects` stop before linking. Keep production
+and test graphs separate with consistent flags and source/provider selection in
+every phase. Production uses `--static`; tests follow the compiler stdlib test
+policy and build shared `titan.test` support before test owners. Never reuse a
+production object in the test graph. Native payloads, exported Lua symbols and
+bootstrap flags belong at the final link.
+
+Verify unchanged builds preserve all generated companions and executables, and
+that module, import, folder inventory, C header, compiler/SDK and flag changes
+invalidate the expected closure. Preserve two execution shards independently of
+object compilation. Run incremental build regressions and the complete gate
+before delivery. The shipping compiler defaults to O3 and Linux fat LTO; a
+cheaper fixture build must set consistent C and link overrides and must not
+replace validation of the shipping configuration. Use one Make process per
+`BUILD_ROOT`; independent concurrent builds need separate roots and, when
+linking servers, separate `SERVER` destinations.
 
 The SQLite directory is also the native server's default C probe-cache prefix.
 Use the shared workspace-cache directory helper and set this default before

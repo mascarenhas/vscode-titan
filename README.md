@@ -51,7 +51,7 @@ require that development toolchain.
 ```sh
 make toolchain
 make npm-ci
-make
+make -j2
 make test
 ```
 
@@ -68,10 +68,16 @@ If `.titan/` already exists after the sibling Titan checkout changes, run
 `make toolchain-refresh` before rebuilding so the isolated compiler modules and
 static providers match that checkout.
 
+Native modules now have separate object targets and final executable links.
+`make -j2 server server-test-build` schedules incremental object compilation;
+`make server-objects` and `make server-test-objects` stop before linking.
+See [incremental native builds](docs/native-build.md) for dependency ownership,
+configuration invalidation, separate production/test objects and LTO settings.
+
 The complete local gate builds the server and extension, runs Titan and
 JavaScript tests plus the Extension Host smoke test, queries the native server
-through the Codex adapter, packages the VSIX, checks its contents, validates the
-Codex plugin metadata, and inspects native linkage:
+through the Codex adapter, checks incremental native rebuilds, packages the VSIX,
+checks its contents, validates the Codex plugin metadata, and inspects native linkage:
 
 ```sh
 make verify
@@ -86,22 +92,26 @@ xvfb-run -a make verify
 GitHub CI runs the same gates as separate toolchain, build, test, packaging, and
 inspection steps on Ubuntu 24.04 `ubicloud-standard-2` runners. The completed
 `.titan` installation and the two LuaRocks licensing inputs required by packaging
-are cached by the exact pinned Titan commit and installation identity. A cache hit reuses the compiler and SDK; a miss builds them once before
-server compilation. Native server tests compile once and run in two parallel
-execution shards on the runner's two CPUs. Because both repositories are
+are cached by the exact pinned Titan commit and installation identity. A cache hit
+reuses the compiler and SDK; a miss builds them once before
+server compilation. Make schedules module object recipes across two CPUs, then
+links one native test executable that runs in two parallel execution shards.
+Because both repositories are
 private, the vscode-titan repository must define an Actions secret named
 `SSH_PRIVATE_KEY`; its public half must be registered as a read-only deploy key
 in `mascarenhas/titan`.
 
 Use `make help` for focused targets. In particular, `make server-test` runs the
 native Titan suite serially; `make server-test-sharded` runs the same suite in two
-parallel shards. `make server-test-build` only compiles the aggregate, and
+parallel shards. `make server-test-build` incrementally builds and links the
+aggregate, and
 `make server-test-run` executes the current aggregate without rebuilding it.
 `make test` and `make verify` use the two-shard runner. Each test module belongs
 to exactly one shard in `scripts/run-server-tests.mjs`; its inventory check
 requires newly imported test modules to be assigned. Per-shard logs and timings
 are written under `.build/test-shards`. `make extension-test` runs the extension
-unit tests. A successful compilation by itself is not a successful test run.
+unit tests. `make incremental-build-test` exercises Make's rebuild decisions with
+small native fixtures. A successful compilation by itself is not a successful test run.
 
 To measure the production server against this repository's saved Titan source,
 including startup and cold-index wall/CPU time, peak RSS, request responsiveness,

@@ -1,8 +1,10 @@
 SHELL := /bin/bash
 .SHELLFLAGS := -eu -o pipefail -c
+.DELETE_ON_ERROR:
 
 TITAN_REPO ?= ../titan
 TITAN_PREFIX ?= $(abspath .titan)
+override TITAN_PREFIX := $(abspath $(TITAN_PREFIX))
 TITANC := $(TITAN_PREFIX)/bin/titanc
 TITAN_LUA := $(TITAN_PREFIX)/bin/lua
 LUAROCKS := $(TITAN_PREFIX)/bin/luarocks
@@ -11,8 +13,10 @@ TITAN_STANDARD_PROVIDER := $(TITAN_PREFIX)/lib/titan/0.6/titan.a
 DEVELOPMENT_LUA_PATH := $(TITAN_PREFIX)/share/lua/5.5/?.lua;$(TITAN_PREFIX)/share/lua/5.5/?/init.lua
 DEVELOPMENT_LUA_CPATH := $(TITAN_PREFIX)/lib/lua/5.5/?.so
 
-SOURCE_ROOT := $(abspath src)
-BUILD_ROOT := $(abspath .build)
+SOURCE_ROOT ?= $(abspath src)
+BUILD_ROOT ?= $(abspath .build)
+override SOURCE_ROOT := $(abspath $(SOURCE_ROOT))
+override BUILD_ROOT := $(abspath $(BUILD_ROOT))
 SERVER_BUILD_DIR := $(BUILD_ROOT)/server
 TEST_BUILD_DIR := $(BUILD_ROOT)/tests
 SERVER_SOURCE_STAGE := $(BUILD_ROOT)/server-src
@@ -22,9 +26,8 @@ VSIX_DIR := $(BUILD_ROOT)/vsix
 NATIVE_BUILD_DIR := $(BUILD_ROOT)/native
 SERVER_BUILD_OUTPUT := $(SERVER_BUILD_DIR)/titan_language_server
 SERVER := $(abspath bin/titan-language-server)
+override SERVER := $(abspath $(SERVER))
 SERVER_TEST := $(TEST_BUILD_DIR)/server/tests
-SERVER_SOURCES := $(shell find src -type f \( -name '*.titan' -o -name '*.h' \) -print 2>/dev/null)
-SERVER_SOURCE_DIRS := src $(shell find src/server -type d -print 2>/dev/null)
 COMPILER_IO_CLOCK_SOURCE := src/server/compiler_io_clock.c
 COMPILER_IO_CLOCK_HEADER := src/server/compiler_io_clock.h
 COMPILER_IO_CLOCK_OBJECT := $(NATIVE_BUILD_DIR)/compiler_io_clock.o
@@ -35,6 +38,8 @@ EMBEDDED_INTERFACES_OBJECT := $(NATIVE_BUILD_DIR)/embedded_interfaces_native.o
 HOST_OS := $(shell uname -s)
 HOST_ARCH := $(shell uname -m)
 CC ?= cc
+AR ?= ar
+RANLIB ?= ranlib
 CCACHE_DISABLE ?= 1
 INSTALL_PREFIX ?= /usr/local
 
@@ -74,9 +79,60 @@ VSIX := $(VSIX_DIR)/titan-$(VSIX_TARGET).vsix
 .DEFAULT_GOAL := all
 
 .PHONY: all help toolchain toolchain-refresh npm-ci server server-test \
-	server-test-build server-test-run server-test-sharded shard-runner-test \
+	server-objects server-test-objects server-test-build server-test-run server-test-sharded shard-runner-test incremental-build-test \
 	server-protocol-test codex-native-test extension extension-test extension-host-test test package inspect-server \
-	plugin-validate verify inspect-vsix install-server install-server-test install-vsix clean clean-node
+	plugin-validate verify inspect-vsix FORCE install-server install-server-test install-vsix clean clean-node
+
+# The compiler intentionally checks only source/object timestamps. Make owns
+# imported objects, native headers, SDK/compiler inputs and effective settings.
+# The graph generator finishes both source stages before parallel recipes start.
+shell_quote = '$(subst ','"'"',$(1))'
+NATIVE_BUILD_GENERATOR := scripts/generate-native-build.lua
+NATIVE_BUILD_GRAPH := $(BUILD_ROOT)/native-modules.mk
+NATIVE_CONFIG_STAMP := $(BUILD_ROOT)/native.config
+NATIVE_BUILD_INPUTS = Makefile $(NATIVE_BUILD_GENERATOR) $(TITANC) $(TITAN_LUA) \
+	$(NATIVE_SDK_INPUTS) $(BUILD_ROOT)/native-inputs/sdk
+TEST_SUPPORT_STEM := $(TEST_BUILD_DIR)/titan/test__test_support
+TEST_SUPPORT_OUTPUTS := $(addprefix $(TEST_SUPPORT_STEM),.o .c .ffi.h)
+TEST_SUPPORT_SOURCE := $(TITAN_PREFIX)/share/titan/0.6/src/titan/test.titan
+SERVER_LINK_OUTPUTS := $(SERVER_BUILD_OUTPUT) \
+	$(SERVER_BUILD_DIR)/titan_language_server__entrypoint.c \
+	$(SERVER_BUILD_DIR)/titan_language_server__entrypoint.o
+TEST_LINK_OUTPUTS := $(SERVER_TEST) $(addprefix $(SERVER_TEST)__test_runner,.c .o .ffi.h) \
+	$(addprefix $(SERVER_TEST)__test_entrypoint,.c .o)
+
+# --tree selects each staged source root; compiled fallback is the explicit SDK.
+# The test DAG uses the stdlib's dynamic-provider preference. Source-backed
+# titan.test otherwise changes a static dependency's binding at the final link.
+NATIVE_COMPILER_ENV = env -u LUA_PATH -u LUA_CPATH -u LUA_PATH_5_5 -u LUA_CPATH_5_5 -u TITAN_SOURCE_PATH \
+	CC=$(call shell_quote,$(CC)) AR=$(call shell_quote,$(AR)) RANLIB=$(call shell_quote,$(RANLIB)) \
+	CCACHE_DISABLE=$(call shell_quote,$(CCACHE_DISABLE)) \
+	TITAN_ROCKS_ROOT=$(call shell_quote,$(TITAN_PREFIX)) \
+	TITAN_PATH_0_6=$(call shell_quote,$(TITAN_PREFIX)/lib/titan/0.6) \
+	TITAN_PATH=$(call shell_quote,$(TITAN_PREFIX)/lib/titan/0.6) \
+	TITAN_EXTRA_CPPFLAGS=$(call shell_quote,$(TITAN_EXTRA_CPPFLAGS)) \
+	TITAN_EXTRA_CFLAGS=$(call shell_quote,$(TITAN_EXTRA_CFLAGS)) \
+	TITAN_EXTRA_LDFLAGS=$(call shell_quote,$(TITAN_EXTRA_LDFLAGS)) \
+	TITAN_NO_LINE_DIRECTIVES=$(call shell_quote,$(TITAN_NO_LINE_DIRECTIVES))
+NATIVE_LINK_ENV = $(NATIVE_COMPILER_ENV) \
+	TITAN_EXTRA_LDFLAGS=$(call shell_quote,$(strip $(TITAN_EXTRA_LDFLAGS) $(EXPORT_LUA_LDFLAGS) $(COMPILER_IO_CLOCK_OBJECT) $(EMBEDDED_INTERFACES_OBJECT) $(TITAN_STANDARD_PROVIDER)))
+
+FORCE:
+
+# Keep housekeeping and JavaScript-only goals usable without a native SDK.
+NON_NATIVE_GOALS := help clean clean-node toolchain toolchain-refresh npm-ci extension extension-test shard-runner-test incremental-build-test plugin-validate inspect-vsix server-test-run
+ifneq ($(filter-out $(NON_NATIVE_GOALS),$(if $(MAKECMDGOALS),$(MAKECMDGOALS),all)),)
+$(NATIVE_BUILD_GRAPH): FORCE $(NATIVE_BUILD_GENERATOR) | $(TITANC)
+	@$(NATIVE_COMPILER_ENV) \
+		LUA_PATH=$(call shell_quote,$(DEVELOPMENT_LUA_PATH)) \
+		LUA_CPATH=$(call shell_quote,$(DEVELOPMENT_LUA_CPATH)) \
+		TITANC=$(call shell_quote,$(TITANC)) TITAN_LUA=$(call shell_quote,$(TITAN_LUA)) \
+		VSCODE_TITAN_EXPORT_FLAGS=$(call shell_quote,$(EXPORT_LUA_LDFLAGS)) \
+		$(call shell_quote,$(TITAN_LUA)) $(call shell_quote,$(NATIVE_BUILD_GENERATOR)) \
+		$(call shell_quote,$(abspath $(SOURCE_ROOT))) $(call shell_quote,$(abspath $(BUILD_ROOT))) \
+		$(call shell_quote,$(TITAN_PREFIX))
+include $(NATIVE_BUILD_GRAPH)
+endif
 
 all: server extension
 
@@ -85,10 +141,13 @@ help:
 	@echo "  toolchain            build the ignored project-local .titan installation"
 	@echo "  toolchain-refresh    reinstall the sibling Titan checkout into .titan"
 	@echo "  server               build bin/titan-language-server as one native executable"
+	@echo "  server-objects       compile production modules without linking"
+	@echo "  server-test-objects  compile test/support modules without linking"
 	@echo "  server-test          compile and run the native Titan protocol tests"
 	@echo "  server-test-build    compile the native test aggregate once"
 	@echo "  server-test-run      run the current native aggregate without rebuilding"
 	@echo "  server-test-sharded  compile once and run two native execution shards"
+	@echo "  incremental-build-test exercise native invalidation and no-op builds"
 	@echo "  server-protocol-test exercise the native executable over framed stdio"
 	@echo "  codex-native-test    query the native executable through the Codex adapter"
 	@echo "  extension-test       compile and run the JavaScript unit tests"
@@ -126,7 +185,8 @@ node_modules/.package-lock.json: package.json package-lock.json
 
 server: $(SERVER)
 
-$(COMPILER_IO_CLOCK_OBJECT): $(COMPILER_IO_CLOCK_SOURCE) $(COMPILER_IO_CLOCK_HEADER)
+$(COMPILER_IO_CLOCK_OBJECT): $(COMPILER_IO_CLOCK_SOURCE) $(COMPILER_IO_CLOCK_HEADER) \
+	$(NATIVE_BUILD_INPUTS) $(NATIVE_CONFIG_STAMP)
 	@mkdir -p "$(dir $(COMPILER_IO_CLOCK_OBJECT))"
 	CCACHE_DISABLE="$(CCACHE_DISABLE)" $(CC) -std=c99 -O2 \
 		-Wall -Wextra -Werror \
@@ -140,7 +200,7 @@ $(TITAN_STANDARD_PROVIDER): | $(TITANC)
 	}
 
 $(EMBEDDED_INTERFACES_SOURCE): $(EMBEDDED_INTERFACES_GENERATOR) \
-	$(TITAN_STANDARD_PROVIDER)
+	$(TITAN_STANDARD_PROVIDER) $(NATIVE_BUILD_INPUTS) $(NATIVE_CONFIG_STAMP)
 	@mkdir -p "$(dir $(EMBEDDED_INTERFACES_SOURCE))"
 	CCACHE_DISABLE="$(CCACHE_DISABLE)" CC="$(CC)" \
 		TITAN_ROCKS_ROOT="$(TITAN_PREFIX)" \
@@ -150,40 +210,64 @@ $(EMBEDDED_INTERFACES_SOURCE): $(EMBEDDED_INTERFACES_GENERATOR) \
 		"$(TITAN_STANDARD_PROVIDER)" "$@"
 
 $(EMBEDDED_INTERFACES_OBJECT): $(EMBEDDED_INTERFACES_SOURCE) \
-	$(EMBEDDED_INTERFACES_HEADER) $(TITAN_STANDARD_PROVIDER)
+	$(EMBEDDED_INTERFACES_HEADER) $(TITAN_STANDARD_PROVIDER) \
+	$(NATIVE_BUILD_INPUTS) $(NATIVE_CONFIG_STAMP)
 	@mkdir -p "$(dir $(EMBEDDED_INTERFACES_OBJECT))"
 	CCACHE_DISABLE="$(CCACHE_DISABLE)" $(CC) -std=c99 -O2 \
 		-Wall -Wextra -Werror \
-		-I "$(TITAN_PREFIX)/include" -I "$(SOURCE_ROOT)/server" \
+		-I "$(TITAN_PREFIX)/include" -I "$(abspath src/server)" \
 		-c "$(EMBEDDED_INTERFACES_SOURCE)" \
 		-o "$(EMBEDDED_INTERFACES_OBJECT)"
 
-$(SERVER): $(SERVER_SOURCES) $(SERVER_SOURCE_DIRS) Makefile \
-	$(COMPILER_IO_CLOCK_OBJECT) $(EMBEDDED_INTERFACES_OBJECT) | $(TITANC)
-	rm -rf -- "$(SERVER_SOURCE_STAGE)"
-	@mkdir -p "$(SERVER_BUILD_DIR)" "$(SERVER_SOURCE_STAGE)" "$(dir $(SERVER))"
-	cp -a "$(SOURCE_ROOT)/." "$(SERVER_SOURCE_STAGE)/"
-	cd "$(SERVER_BUILD_DIR)" && \
-		CCACHE_DISABLE="$(CCACHE_DISABLE)" \
-		TITAN_EXTRA_LDFLAGS="$(strip $(TITAN_EXTRA_LDFLAGS) $(EXPORT_LUA_LDFLAGS) $(COMPILER_IO_CLOCK_OBJECT) $(EMBEDDED_INTERFACES_OBJECT) $(TITAN_STANDARD_PROVIDER))" \
-		"$(TITANC)" --static --tree "$(SERVER_SOURCE_STAGE)" titan_language_server
-	install -m 0755 "$(SERVER_BUILD_OUTPUT)" "$(SERVER)"
+server-objects: $(SERVER_MODULE_OBJECTS)
+
+$(SERVER_BUILD_OUTPUT): FORCE $(SERVER_MODULE_OBJECTS) $(COMPILER_IO_CLOCK_OBJECT) \
+	$(EMBEDDED_INTERFACES_OBJECT) $(NATIVE_BUILD_INPUTS) $(NATIVE_CONFIG_STAMP)
+	@set -e; stale=0; newer=$(call shell_quote,$(filter-out FORCE,$?)); \
+	test -z "$$newer" || stale=1; \
+	for output in $(foreach output,$(SERVER_LINK_OUTPUTS),$(call shell_quote,$(output))); do test -s "$$output" || stale=1; done; \
+	test -x $(call shell_quote,$(SERVER_BUILD_OUTPUT)) || stale=1; \
+	if test "$$stale" = 1; then \
+	  cd $(call shell_quote,$(SERVER_BUILD_DIR)); \
+	  $(NATIVE_LINK_ENV) $(call shell_quote,$(TITANC)) --static --source-first --incremental -j1 \
+	    --tree $(call shell_quote,$(SERVER_SOURCE_STAGE)) titan_language_server; \
+	fi
+
+$(SERVER): $(SERVER_BUILD_OUTPUT)
+	@mkdir -p $(call shell_quote,$(dir $(SERVER)))
+	install -m 0755 $(call shell_quote,$(SERVER_BUILD_OUTPUT)) $(call shell_quote,$(SERVER))
 
 server-test: server-test-build
 	$(MAKE) server-test-run
 
+$(TEST_SUPPORT_STEM).o: FORCE $(TEST_SUPPORT_SOURCE) $(NATIVE_BUILD_INPUTS) $(NATIVE_CONFIG_STAMP)
+	@set -e; stale=0; newer=$(call shell_quote,$(filter-out FORCE,$?)); \
+	test -z "$$newer" || stale=1; \
+	for output in $(foreach output,$(TEST_SUPPORT_OUTPUTS),$(call shell_quote,$(output))); do test -f "$$output" || stale=1; done; \
+	if test "$$stale" = 1; then \
+	  rm -f $(call shell_quote,$@); \
+	  cd $(call shell_quote,$(TEST_BUILD_DIR)); \
+	  $(NATIVE_COMPILER_ENV) $(call shell_quote,$(TITANC)) --test --source-first --incremental -j1 -c \
+	    --tree $(call shell_quote,$(TEST_SOURCE_STAGE)) titan.test; \
+	fi
+
+$(filter-out $(TEST_SUPPORT_STEM).o,$(TEST_SUPPORT_OUTPUTS)): $(TEST_SUPPORT_STEM).o
+	@test -f $(call shell_quote,$@)
+
+server-test-objects: $(TEST_MODULE_OBJECTS) $(TEST_SUPPORT_OUTPUTS)
 server-test-build: $(SERVER_TEST)
 
-$(SERVER_TEST): $(SERVER_SOURCES) $(SERVER_SOURCE_DIRS) Makefile \
-	$(COMPILER_IO_CLOCK_OBJECT) $(EMBEDDED_INTERFACES_OBJECT) $(TITANC)
-	rm -rf -- "$(TEST_SOURCE_STAGE)"
-	@mkdir -p "$(TEST_BUILD_DIR)" "$(TEST_SOURCE_STAGE)"
-	cp -a "$(SOURCE_ROOT)/." "$(TEST_SOURCE_STAGE)/"
-	cd "$(TEST_BUILD_DIR)" && \
-		CCACHE_DISABLE="$(CCACHE_DISABLE)" \
-		TITAN_EXTRA_LDFLAGS="$(strip $(TITAN_EXTRA_LDFLAGS) $(EXPORT_LUA_LDFLAGS) $(COMPILER_IO_CLOCK_OBJECT) $(EMBEDDED_INTERFACES_OBJECT) $(TITAN_STANDARD_PROVIDER))" \
-		"$(TITANC)" --static --test --no-uv-bootstrap \
-			--tree "$(TEST_SOURCE_STAGE)" server.tests
+$(SERVER_TEST): FORCE $(TEST_MODULE_OBJECTS) $(TEST_SUPPORT_OUTPUTS) $(COMPILER_IO_CLOCK_OBJECT) \
+	$(EMBEDDED_INTERFACES_OBJECT) $(NATIVE_BUILD_INPUTS) $(NATIVE_CONFIG_STAMP)
+	@set -e; stale=0; newer=$(call shell_quote,$(filter-out FORCE,$?)); \
+	test -z "$$newer" || stale=1; \
+	for output in $(foreach output,$(TEST_LINK_OUTPUTS),$(call shell_quote,$(output))); do test -s "$$output" || stale=1; done; \
+	test -x $(call shell_quote,$(SERVER_TEST)) || stale=1; \
+	if test "$$stale" = 1; then \
+	  cd $(call shell_quote,$(TEST_BUILD_DIR)); \
+	  $(NATIVE_LINK_ENV) $(call shell_quote,$(TITANC)) --test --source-first --incremental -j1 --no-uv-bootstrap \
+	    --tree $(call shell_quote,$(TEST_SOURCE_STAGE)) server.tests; \
+	fi
 
 server-test-run:
 	CCACHE_DISABLE="$(CCACHE_DISABLE)" "$(SERVER_TEST)"
@@ -193,6 +277,9 @@ server-test-sharded: server-test-build
 
 shard-runner-test:
 	node --test scripts/run-server-tests.test.mjs
+
+incremental-build-test:
+	node scripts/test-incremental-build.mjs --prefix $(call shell_quote,$(TITAN_PREFIX))
 
 server-protocol-test: $(SERVER)
 	TITAN_LS_LUA_PATH='$(DEVELOPMENT_LUA_PATH)' \
@@ -216,7 +303,7 @@ extension-test: npm-ci
 extension-host-test: $(SERVER) npm-ci
 	npm run test:vscode
 
-test: server-test-sharded server-protocol-test codex-native-test extension-test shard-runner-test
+test: server-test-sharded server-protocol-test codex-native-test extension-test shard-runner-test incremental-build-test
 
 package: $(SERVER) npm-ci
 	@mkdir -p "$(VSIX_DIR)"
