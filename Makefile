@@ -74,8 +74,9 @@ VSIX := $(VSIX_DIR)/titan-$(VSIX_TARGET).vsix
 .DEFAULT_GOAL := all
 
 .PHONY: all help toolchain toolchain-refresh npm-ci server server-test \
+	server-test-build server-test-run server-test-sharded shard-runner-test \
 	server-protocol-test codex-native-test extension extension-test extension-host-test test package inspect-server \
-	plugin-validate verify install-server install-server-test install-vsix clean clean-node
+	plugin-validate verify inspect-vsix install-server install-server-test install-vsix clean clean-node
 
 all: server extension
 
@@ -85,6 +86,9 @@ help:
 	@echo "  toolchain-refresh    reinstall the sibling Titan checkout into .titan"
 	@echo "  server               build bin/titan-language-server as one native executable"
 	@echo "  server-test          compile and run the native Titan protocol tests"
+	@echo "  server-test-build    compile the native test aggregate once"
+	@echo "  server-test-run      run the current native aggregate without rebuilding"
+	@echo "  server-test-sharded  compile once and run two native execution shards"
 	@echo "  server-protocol-test exercise the native executable over framed stdio"
 	@echo "  codex-native-test    query the native executable through the Codex adapter"
 	@echo "  extension-test       compile and run the JavaScript unit tests"
@@ -165,8 +169,13 @@ $(SERVER): $(SERVER_SOURCES) $(SERVER_SOURCE_DIRS) Makefile \
 		"$(TITANC)" --static --tree "$(SERVER_SOURCE_STAGE)" titan_language_server
 	install -m 0755 "$(SERVER_BUILD_OUTPUT)" "$(SERVER)"
 
-server-test: $(SERVER_SOURCES) $(COMPILER_IO_CLOCK_OBJECT) \
-	$(EMBEDDED_INTERFACES_OBJECT) | $(TITANC)
+server-test: server-test-build
+	$(MAKE) server-test-run
+
+server-test-build: $(SERVER_TEST)
+
+$(SERVER_TEST): $(SERVER_SOURCES) $(SERVER_SOURCE_DIRS) Makefile \
+	$(COMPILER_IO_CLOCK_OBJECT) $(EMBEDDED_INTERFACES_OBJECT) $(TITANC)
 	rm -rf -- "$(TEST_SOURCE_STAGE)"
 	@mkdir -p "$(TEST_BUILD_DIR)" "$(TEST_SOURCE_STAGE)"
 	cp -a "$(SOURCE_ROOT)/." "$(TEST_SOURCE_STAGE)/"
@@ -175,7 +184,15 @@ server-test: $(SERVER_SOURCES) $(COMPILER_IO_CLOCK_OBJECT) \
 		TITAN_EXTRA_LDFLAGS="$(strip $(TITAN_EXTRA_LDFLAGS) $(EXPORT_LUA_LDFLAGS) $(COMPILER_IO_CLOCK_OBJECT) $(EMBEDDED_INTERFACES_OBJECT) $(TITAN_STANDARD_PROVIDER))" \
 		"$(TITANC)" --static --test --no-uv-bootstrap \
 			--tree "$(TEST_SOURCE_STAGE)" server.tests
+
+server-test-run:
 	CCACHE_DISABLE="$(CCACHE_DISABLE)" "$(SERVER_TEST)"
+
+server-test-sharded: server-test-build
+	CCACHE_DISABLE="$(CCACHE_DISABLE)" node scripts/run-server-tests.mjs "$(SERVER_TEST)"
+
+shard-runner-test:
+	node --test scripts/run-server-tests.test.mjs
 
 server-protocol-test: $(SERVER)
 	TITAN_LS_LUA_PATH='$(DEVELOPMENT_LUA_PATH)' \
@@ -199,7 +216,7 @@ extension-test: npm-ci
 extension-host-test: $(SERVER) npm-ci
 	npm run test:vscode
 
-test: server-test server-protocol-test codex-native-test extension-test
+test: server-test-sharded server-protocol-test codex-native-test extension-test shard-runner-test
 
 package: $(SERVER) npm-ci
 	@mkdir -p "$(VSIX_DIR)"
@@ -216,6 +233,9 @@ plugin-validate:
 	node scripts/validate-plugin.mjs
 
 verify: test extension-host-test package inspect-server plugin-validate install-server-test
+	$(MAKE) inspect-vsix
+
+inspect-vsix:
 	TITAN_PREFIX="$(TITAN_PREFIX)" \
 		./scripts/inspect-vsix.sh "$(VSIX)" "$(VSIX_TARGET)"
 

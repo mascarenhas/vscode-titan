@@ -8,7 +8,7 @@ local system = import "os"
 local strings = import "string"
 foreign import "compiler_io_clock.h"
 
-type CheckpointListener = (string?) -> ()
+type CheckpointListener = function (string?): ()
 
 local record CompilerProgress
   attempt: integer
@@ -279,7 +279,7 @@ catch
   return false
 end
 
-local function read_bounded_chunks(reader: (integer) -> string?,
+local function read_bounded_chunks(reader: function (integer): string?,
                                    max_bytes: integer): string
   local output = strings.writer()
   local remaining = max_bytes + 1
@@ -342,7 +342,7 @@ catch
     -- from being submitted by this Task. Transfer cleanup to an uncancelled
     -- child which remains runtime-rooted after the caller unwinds.
     do
-      async.run<nil, value>(function (): nil
+      async.run<|nil, value|>(function (): nil
         do fs.unlink(temporary) catch end
         return nil
       end)
@@ -383,16 +383,16 @@ function CompilerIO:write_file(path: string,
   -- Keep creation and removal of the name reservation in a child Task. If the
   -- calling compiler Task is cancelled while joining it, the child still owns
   -- enough state to finish the unlink instead of losing a completed tmpname.
-  local release = async.run<ReleasedReservation, value>(
+  local release = async.run<|ReleasedReservation, value|>(
     function (): ReleasedReservation return release_reservation(self) end)
   local reservation?: string = nil
-  case async.join<ReleasedReservation, value>(release)
-  when succeeded: result then
+  case async.join<|ReleasedReservation, value|>(release)
+  when succeeded(result) then
     if not result.path then return nil, result.message end
     reservation = result.path
-  when failed: failure then
+  when failed(failure) then
     return nil, failure_message(failure.error)
-  when cancelled then
+  when cancelled() then
     return nil, "temporary-name reservation task was cancelled"
   else
     return nil, "temporary-name reservation task did not finish"
@@ -432,7 +432,7 @@ catch
     -- Complete rollback in an uncancelled child because this Task can no
     -- longer submit another cancellation-sensitive filesystem operation.
     do
-      async.run<nil, value>(function (): nil
+      async.run<|nil, value|>(function (): nil
         do fs.rmdir(path) catch end
         return nil
       end)
@@ -465,7 +465,7 @@ catch
     -- authoritative cancellation. Retry in an uncancelled child so both that
     -- case and cancellation before submission leave the owned path absent.
     do
-      async.run<nil, value>(function (): nil
+      async.run<|nil, value|>(function (): nil
         do fs.unlink(path) catch end
         return nil
       end)
@@ -507,7 +507,7 @@ end
 
 function CompilerIO:tmpname(): (string?, string?)
   local handoff = TmpnameHandoff.new(nil, nil, false, false, false)
-  async.run<nil, value>(function (): nil
+  async.run<|nil, value|>(function (): nil
     do
       local path = fs.tmpname()
       handoff.path = path
@@ -694,10 +694,10 @@ local function capture_process(process: system.Process,
   -- function can suspend. If the caller is cancelled while closing stdin or
   -- joining, the reader still drains/closes its pipe and the waiter still
   -- reaps the process after kill_owned_process terminates it.
-  local reader = async.run<string, value>(function (): string
+  local reader = async.run<|string, value|>(function (): string
     return read_all(output)
   end)
-  local waiter = async.run<system.ExitStatus, value>(
+  local waiter = async.run<|system.ExitStatus, value|>(
     function (): system.ExitStatus return process:wait() end)
 
   do
@@ -706,12 +706,12 @@ local function capture_process(process: system.Process,
 
     local captured? : string = nil
     case read_status
-    when succeeded: bytes then captured = bytes
-    when failed: failure then
+    when succeeded(bytes) then captured = bytes
+    when failed(failure) then
       return capture_failure(
         command, "could not capture command output: " ..
         failure_message(failure.error), true)
-    when cancelled then
+    when cancelled() then
       return capture_failure(
         command, "captured command reader was cancelled", true)
     else
@@ -721,13 +721,13 @@ local function capture_process(process: system.Process,
 
     local status?: system.ExitStatus = nil
     case wait_status
-    when succeeded: exit_status then status = exit_status
-    when failed: failure then
+    when succeeded(exit_status) then status = exit_status
+    when failed(failure) then
       return capture_failure(
         command, (captured as string) ..
         "\nfailed waiting for command: " .. failure_message(failure.error),
         true)
-    when cancelled then
+    when cancelled() then
       return capture_failure(
         command, "captured command wait was cancelled", true)
     else

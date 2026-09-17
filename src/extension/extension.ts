@@ -238,18 +238,13 @@ class TitanClientManager {
       const physicalWorkspaceRoot = await resolvePhysicalWorkspaceRoot(
         folder.uri.fsPath
       );
-      const compilerCacheStorage =
-        this.context.storageUri ?? this.context.globalStorageUri;
-      await vscode.workspace.fs.createDirectory(compilerCacheStorage);
-
       const serverOptions: ServerOptions = createServerLaunchOptions(
         command,
         serverConfiguration.arguments,
         physicalWorkspaceRoot,
         process.env,
         compilerDiscovery,
-        serverConfiguration.logLevel,
-        compilerCacheStorage.fsPath
+        serverConfiguration.logLevel
       );
       const documentSelector = createWorkspaceDocumentSelector(folder);
       const clientOptions: LanguageClientOptions = {

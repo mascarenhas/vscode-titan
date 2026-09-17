@@ -3,17 +3,17 @@ local dispatcher = import "server.dispatcher"
 local logging = import "server.logging"
 local response_queue = import "server.response_queue"
 
-type SemanticHandler = (dispatcher.SemanticRequest) ->
+type SemanticHandler = function (dispatcher.SemanticRequest):
   dispatcher.SemanticOutcome
-type InitializedHandler = () -> ()
-type ShutdownHandler = () -> ()
+type InitializedHandler = function (): ()
+type ShutdownHandler = function (): ()
 
-local type RemoveListener = () -> ()
+local type RemoveListener = function (): ()
 
 local record ActiveRequest
   id: dispatcher.RequestId
   method: string
-  task: async.Task<dispatcher.SemanticOutcome, value>
+  task: async.Task<|dispatcher.SemanticOutcome, value|>
   remove_listener: RemoveListener?
   responded: boolean
   started: float
@@ -85,7 +85,7 @@ end
 
 local function Coordinator:complete(
     active: ActiveRequest,
-    status: async.TaskStatus<dispatcher.SemanticOutcome, value>)
+    status: async.TaskStatus<|dispatcher.SemanticOutcome, value|>)
   if active.responded then return end
   active.responded = true
 
@@ -97,20 +97,20 @@ local function Coordinator:complete(
   local status_name = "unknown"
 
   case status
-  when succeeded: outcome then
+  when succeeded(outcome) then
     status_name = "succeeded"
     case outcome
-    when result: result then
+    when result(result) then
       self:publish(dispatcher.result_response(active.id, result))
-    when failure: failure then
+    when failure(failure) then
       self:publish(dispatcher.failure_response(
         active.id, failure.code, failure.message))
     end
-  when failed then
+  when failed() then
     status_name = "failed"
     self:publish(dispatcher.failure_response(
       active.id, INTERNAL_ERROR, "Internal error"))
-  when cancelled then
+  when cancelled() then
     status_name = "cancelled"
     self:publish(dispatcher.failure_response(
       active.id, REQUEST_CANCELLED, "Request cancelled"))
@@ -134,7 +134,7 @@ local function Coordinator:start(request: dispatcher.SemanticRequest)
     return
   end
 
-  local task = async.run<dispatcher.SemanticOutcome, value>(
+  local task = async.run<|dispatcher.SemanticOutcome, value|>(
     function (): dispatcher.SemanticOutcome
       return self.handler(request)
     end)
@@ -147,7 +147,7 @@ local function Coordinator:start(request: dispatcher.SemanticRequest)
     ["active_requests"] = #self.active,
   })
   active.remove_listener = task:add_terminal_listener(
-    function (status: async.TaskStatus<dispatcher.SemanticOutcome, value>)
+    function (status: async.TaskStatus<|dispatcher.SemanticOutcome, value|>)
       self:complete(active, status)
     end)
 end
@@ -196,7 +196,7 @@ end
 function Coordinator:handle(source: string): integer?
   local phase_before = self.router:phase_name()
   case self.router:route(source)
-  when immediate: result then
+  when immediate(result) then
     self:publish(result)
     local phase_after = self.router:phase_name()
     if phase_after ~= phase_before then
@@ -206,25 +206,25 @@ function Coordinator:handle(source: string): integer?
       })
     end
     return result.exit_code
-  when initialized then
+  when initialized() then
     local handler? = self.initialized_handler
     if handler ~= nil then handler() end
     logging.emit("info", "lifecycle.initialized", nil)
     return nil
-  when semantic: request then
+  when semantic(request) then
     self:start(request)
     return nil
-  when cancel: id then
+  when cancel(id) then
     self:cancel(id)
     return nil
-  when shutdown: result then
+  when shutdown(result) then
     self:cancel_all("language server shutdown")
     local handler? = self.shutdown_handler
     if handler ~= nil then handler() end
     self:publish(result)
     logging.emit("info", "lifecycle.shutdown", nil)
     return nil
-  when exit: code then
+  when exit(code) then
     logging.emit("info", "lifecycle.exit", {
       ["code"] = code,
     })

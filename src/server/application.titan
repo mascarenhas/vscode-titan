@@ -31,8 +31,8 @@ local record View
 end
 
 local union RefreshOutcome
-  ready: View
-  failure: Error
+  ready(View)
+  failure(Error)
 end
 
 -- Watch backends publish canonical paths, while project configuration retains
@@ -50,9 +50,9 @@ local record WatchFilter
 end
 
 local union WatchDisposition
-  irrelevant
-  relevant
-  possible_directory: string
+  irrelevant()
+  relevant()
+  possible_directory(string)
 end
 
 -- A raw create hint does not carry a file kind. Own possible new-directory
@@ -62,17 +62,17 @@ local record DirectoryProbes
   pending: {string: boolean}
   order: {string}
   next_index: integer
-  task: async.Task<nil, value>?
+  task: async.Task<|nil, value|>?
 end
 
 local function new_directory_probes(): DirectoryProbes
   return DirectoryProbes.new({}, {}, 1, nil)
 end
 
-type RenameAnalyzer = (
-  project_service.Snapshot, {bridge.ProjectModule}) -> bridge.Analysis
-type ProjectLoader = (
-  string, bridge.ProgressListener?, project_service.SnapshotListener?) ->
+type RenameAnalyzer = function (
+  project_service.Snapshot, {bridge.ProjectModule}): bridge.Analysis
+type ProjectLoader = function (
+  string, bridge.ProgressListener?, project_service.SnapshotListener?):
   (project_service.Service?, project_service.Error?, project_loader.Restoration?)
 
 local record RefreshChain
@@ -89,7 +89,7 @@ record Application
   local service: project_service.Service?
   local watcher: project_watcher.ProjectWatcher?
   local watch_filter: WatchFilter?
-  local refresh_task: async.Task<RefreshOutcome, value>?
+  local refresh_task: async.Task<|RefreshOutcome, value|>?
   local completed_view: View?
   local refresh_failure: Error?
   local failed_epoch: integer?
@@ -494,7 +494,7 @@ local function watch_change_disposition(filter: WatchFilter,
           return WatchDisposition.relevant()
         end
         case change
-        when created then
+        when created() then
           return WatchDisposition.possible_directory(path)
         else
         end
@@ -508,7 +508,7 @@ local function watch_change_relevant(filter: WatchFilter,
                                      change: project_watcher.PathChange):
     boolean
   case watch_change_disposition(filter, change)
-  when irrelevant then return false
+  when irrelevant() then return false
   else return true
   end
 end
@@ -542,20 +542,13 @@ local function project_inputs(snapshot: project_service.Snapshot,
   for index = 1, #replaced_modules do replaced[replaced_modules[index]] = true end
   for module_index = 1, #snapshot.project_modules do
     local module = snapshot.project_modules[module_index]
-    local files: {bridge.SourceFile} = {}
-    for file_index = 1, #module.source_files do
-      local file = module.source_files[file_index]
-      files[file_index] = bridge.SourceFile.new(
-        file.filename, file.contents)
-    end
     -- Retain every saved module in Features even when it has no semantic
     -- snapshot. Besides providing source coordinates, this makes rename
     -- preflight compile the complete saved project and therefore reject an
     -- edit if an invalid module could contain an unindexed reference.
-    projects[#projects + 1] = bridge.ProjectModule.new(
-      module.module_name, files)
+    projects[module_index] = module:compiler_input()
     case module.analysis_state
-    when clean then
+    when clean() then
       if #module.diagnostics > 0 then
         raise Error.new("clean Titan project module '" .. module.module_name ..
           "' has compiler diagnostics")
@@ -568,10 +561,10 @@ local function project_inputs(snapshot: project_service.Snapshot,
         end
         snapshots[#snapshots + 1] = module.compiler_snapshot
       end
-    when failed then
+    when failed() then
       -- The diagnostics are current for this exact saved revision, but a
       -- failed module deliberately contributes no compiler snapshot.
-    when dirty then
+    when dirty() then
       -- Saved or dependency inputs changed; indexing is still outstanding.
     end
   end
@@ -635,7 +628,7 @@ local function Application:probe_possible_directory(path: string)
   probes.pending[path] = true
   probes.order[#probes.order + 1] = path
   if probes.task ~= nil then return end
-  probes.task = async.run<nil, value>(
+  probes.task = async.run<|nil, value|>(
     function (): nil return self:run_directory_probes() end)
 end
 
@@ -648,12 +641,12 @@ local function Application:watch_callback(
   if not relevant and filter ~= nil then
     for index = 1, #batch.changes do
       case watch_change_disposition(filter, batch.changes[index])
-      when relevant then
+      when relevant() then
         relevant = true
         break
-      when possible_directory: path then
+      when possible_directory(path) then
         possible_directories[#possible_directories + 1] = path
-      when irrelevant then
+      when irrelevant() then
       end
     end
   elseif not relevant and #batch.changes > 0 then
@@ -880,7 +873,7 @@ local function Application:refresh_once(): RefreshOutcome
       restoration:finish(service)
       self.restoration = nil
     end
-    local report?, refresh_error? = service:refresh_with_snapshot_listener(
+    local report?, refresh_error? = service:refresh(
       function (snapshot: project_service.Snapshot)
         self:reconcile_watcher(snapshot)
       end)
@@ -1011,7 +1004,7 @@ local function Application:complete_refresh_chain(
 end
 
 local function Application:start_refresh(force: boolean, reason: string):
-    async.Task<RefreshOutcome, value>?
+    async.Task<|RefreshOutcome, value|>?
   if self.closed or self.refresh_task ~= nil then return self.refresh_task end
   if not force then
     if self.completed_view ~= nil and
@@ -1035,7 +1028,7 @@ local function Application:start_refresh(force: boolean, reason: string):
     self:emit_indexing_status(indexing_status.State.indexing(), nil, nil, nil)
   end
   local chain = self.refresh_chain as RefreshChain
-  local task = async.run<RefreshOutcome, value>(function (): RefreshOutcome
+  local task = async.run<|RefreshOutcome, value|>(function (): RefreshOutcome
     do
       local started = logging.clock()
       self.refresh_passes = self.refresh_passes + 1
@@ -1053,12 +1046,12 @@ local function Application:start_refresh(force: boolean, reason: string):
       local outcome_message: string? = nil
       local diagnostic_publications: {diagnostics.Publication}? = nil
       case completed
-      when failure: failure then
+      when failure(failure) then
         outcome_name = "failed"
         outcome_message = failure.message
         self.refresh_failure = failure
         self.failed_epoch = target_epoch
-      when ready: view then
+      when ready(view) then
         outcome_name = "ready"
         -- Publish every successful pass even when a later hint arrived. Retain
         -- and serve that immutable generation while the single coalesced
@@ -1076,11 +1069,11 @@ local function Application:start_refresh(force: boolean, reason: string):
       end
 
       case completed
-      when failure then
+      when failure() then
         -- A failed refresh cannot validate diagnostics from the preceding saved
         -- epoch. Clear them while the watcher waits for a repair.
         self.diagnostic_publisher:clear()
-      when ready then
+      when ready() then
         -- Building UTF-16 coordinates can yield. Publish only if no newer save
         -- arrived during that work; the coalesced follow-up owns the replacement.
         if diagnostic_publications ~= nil and
@@ -1109,10 +1102,10 @@ local function Application:start_refresh(force: boolean, reason: string):
         self:complete_refresh_chain(
           outcome_name, target_epoch, outcome_message)
         case completed
-        when failure: failure then
+        when failure(failure) then
           self:emit_indexing_status(
             indexing_status.State.failed(), failure.message)
-        when ready: view then
+        when ready(view) then
           self:emit_indexing_status(indexing_status.State.ready(), nil)
           local restoration? = self.restoration
           if restoration ~= nil and not self.closed then
@@ -1212,17 +1205,17 @@ local function Application:stop_watching_for_testing()
   if watcher ~= nil then watcher:stop() end
 end
 
-local function joined_view(task: async.Task<RefreshOutcome, value>):
+local function joined_view(task: async.Task<|RefreshOutcome, value|>):
     (View?, Error?)
-  case async.join<RefreshOutcome, value>(task)
-  when succeeded: outcome then
+  case async.join<|RefreshOutcome, value|>(task)
+  when succeeded(outcome) then
     case outcome
-    when ready: view then return view, nil
-    when failure: item then return nil, item
+    when ready(view) then return view, nil
+    when failure(item) then return nil, item
     end
-  when failed: item then
+  when failed(item) then
     return nil, runtime_error(item.error)
-  when cancelled then
+  when cancelled() then
     return nil, Error.new("project refresh was cancelled")
   else
     return nil, Error.new("project refresh did not finish")
@@ -1384,11 +1377,12 @@ local function default_rename_analyzer(
     snapshot: project_service.Snapshot,
     projects: {bridge.ProjectModule}): bridge.Analysis
   local compiler = bridge.load()
-  compiler:configure_paths(
-    snapshot.config:source_path(),
-    snapshot.config.binary_modules_root,
-    snapshot.config.extra_ffi_include_dirs,
-    snapshot.config.extra_ffi_cppflags)
+  compiler:configure(bridge.CompilerConfiguration.new {
+    source_roots = snapshot.config.source_module_roots,
+    binary_root = snapshot.config.binary_modules_root,
+    include_roots = snapshot.config.extra_ffi_include_dirs,
+    cppflags = snapshot.config.extra_ffi_cppflags,
+  })
   return compiler:analyze(snapshot.project_modules[1].module_name, projects)
 end
 
@@ -1459,54 +1453,29 @@ local function Application:handle_rename(
     lsp.workspace_edit_value(verified:document_edits()))
 end
 
-function create(project_root: string): Application
+function create(project_root: string, loader: ProjectLoader?,
+    rename_analyzer: RenameAnalyzer?): Application
   return Application.new(
-    project_root, project_loader.load, nil, nil, nil, nil, nil, nil,
+    project_root, loader or project_loader.load, nil, nil, nil, nil, nil, nil,
     nil, 1, 0, nil, nil, false, 0, 0, 0, nil, false,
-    new_directory_probes(), default_rename_analyzer, diagnostics.create())
+    new_directory_probes(), rename_analyzer or default_rename_analyzer,
+    diagnostics.create())
 end
 
--- Dependency-injected constructor used by the project/application integration
--- tests. Keeping the real Service here exercises the same refresh state
--- machine without loading process-global compiler modules in the fixture.
-function create_with_service(project_root: string,
-                             service: project_service.Service): Application
-  local application = Application.new(
-    project_root, project_loader.load, service, nil, nil, nil, nil,
-    nil, nil, 0, 0, nil, nil, false, 0, 0, 0, nil, false,
-    new_directory_probes(), default_rename_analyzer, diagnostics.create())
-  application.completed_view = application:install_view(service:latest())
+-- Source-imported tests own preloaded Services. All construction still passes
+-- through create, so new Application state has one initialization authority.
+local function create_unindexed_with_service(
+    project_root: string, service: project_service.Service): Application
+  local application = create(project_root)
+  application.service = service
   return application
 end
 
--- Source-imported tests exercise the real refresh state machine while leaving
--- the already loaded Service without a published semantic View.
-local function create_unindexed_with_service(
-    project_root: string, service: project_service.Service): Application
-  return Application.new(
-    project_root, project_loader.load, service, nil, nil, nil, nil,
-    nil, nil, 1, 0, nil, nil, false, 0, 0, 0, nil, false,
-    new_directory_probes(), default_rename_analyzer, diagnostics.create())
-end
-
--- Source-imported application tests use an analyzer-backed loader to exercise
--- the complete cold-start watcher boundary without loading process-global
--- compiler Lua modules.
-local function create_with_project_loader(
-    project_root: string, project_loader: ProjectLoader): Application
-  return Application.new(
-    project_root, project_loader, nil, nil, nil, nil, nil, nil, nil, 1, 0,
-    nil, nil, false, 0, 0, 0, nil, false, new_directory_probes(),
-    default_rename_analyzer, diagnostics.create())
-end
-
-function create_with_service_and_rename_analyzer(
-    project_root: string, service: project_service.Service,
-    rename_analyzer: RenameAnalyzer): Application
-  local application = Application.new(
-    project_root, project_loader.load, service, nil, nil, nil, nil,
-    nil, nil, 0, 0, nil, nil, false, 0, 0, 0, nil, false,
-    new_directory_probes(), rename_analyzer, diagnostics.create())
+local function create_with_service(project_root: string,
+    service: project_service.Service, rename_analyzer: RenameAnalyzer?): Application
+  local application = create(project_root, nil, rename_analyzer)
+  application.service = service
+  application.change_epoch = 0
   application.completed_view = application:install_view(service:latest())
   return application
 end

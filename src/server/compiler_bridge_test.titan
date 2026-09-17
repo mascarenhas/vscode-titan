@@ -10,8 +10,8 @@ local source_text = import "server.source_text"
 local test_runtime = import "server.test_runtime"
 local content_identity = import "server.content_identity"
 
-local type EmptyFunction = () -> ()
-local type FixtureInstaller = (string, string?) -> value
+local type EmptyFunction = function (): ()
+local type FixtureInstaller = function (string, string?): value
 
 local function run_bridge(body: EmptyFunction)
   do
@@ -178,6 +178,7 @@ return function(mode, contextual_provider_file)
     assert(driver.TITAN_SOURCE_PATH ==
              "/configured/first;/configured/second")
     assert(driver.TITAN_BIN_PATH == "/configured/binary")
+    assert(options.context.options.extra_ffi_include_dirs[1] == "/configured/include")
     assert(known_sources.app == true)
     assert(requests["vendor.source"] == true)
     assert(requests["vendor.dynamic"] == false)
@@ -907,7 +908,7 @@ function test_compiler_bridge_keeps_source_manifests_off_binary_snapshots(
                     #"fixture binary provider",
                   "binary snapshot lost its compiler-observed provider")
       case binary.provenance
-      when dynamic_binary: provenance then
+      when dynamic_binary(provenance) then
         test.assert(provenance.provider_file == provider,
                     "binary manifest fixture lost its provider provenance")
       else
@@ -944,7 +945,7 @@ function test_compiler_bridge_observes_embedded_provider_identity(
                     nil,
                   "embedded provider was not stamped as an observed binary")
       case embedded.provenance
-      when static_binary: provenance then
+      when static_binary(provenance) then
         test.assert(provenance.provider_file == provider,
                     "embedded provider lost its executable provenance")
       else
@@ -975,7 +976,7 @@ function test_compiler_bridge_does_not_treat_an_ordinary_executable_path_as_embe
                     nil,
                   "ordinary executable-path provider bypassed lstat evidence")
       case ordinary.provenance
-      when dynamic_binary: provenance then
+      when dynamic_binary(provenance) then
         test.assert(provenance.provider_file == provider,
                     "ordinary executable-path provider lost its provenance")
       else
@@ -1022,7 +1023,7 @@ function test_compiler_bridge_rejects_mixed_binary_providers_across_attempts(
                     nil,
                   "mixed binary providers acquired a publishable identity")
       case binary.provenance
-      when dynamic_binary: provenance then
+      when dynamic_binary(provenance) then
         test.assert(provenance.provider_file == second_provider,
                     "provider-switch fixture did not retain its final result")
       else
@@ -1063,7 +1064,7 @@ local function preserves_binary_observation_when_final_snapshot_is_source()
                   nil,
                 "source-final result lost its earlier binary observation")
     case provider.provenance
-    when external_source: source then
+    when external_source(source) then
       test.assert(source.main_file == second_provider,
                   "source-final fixture lost its final provider")
     else
@@ -1083,8 +1084,15 @@ function test_compiler_bridge_normalizes_external_resolution_fingerprints(
     _context: test.Context)
   with_fixture("external-resolution", function ()
     local compiler = bridge.load()
-    compiler:configure_paths(
-      "/configured/first;/configured/second", "/configured/binary", {})
+    local roots = {"/configured/first", "/configured/second"}
+    local includes = {"/configured/include"}
+    compiler:configure(bridge.CompilerConfiguration.new {
+      source_roots = roots,
+      binary_root = "/configured/binary",
+      include_roots = includes,
+    })
+    roots[1] = "/mutated/source"
+    includes[1] = "/mutated/include"
     local resolutions = compiler:resolve_external_modules({"app"}, {
       bridge.ExternalResolutionRequest.new("vendor.source", true),
       bridge.ExternalResolutionRequest.new("vendor.dynamic", false),
@@ -1099,7 +1107,7 @@ function test_compiler_bridge_normalizes_external_resolution_fingerprints(
                 resolutions[1].provenance ~= nil,
                 "external source resolution lost typed identity")
     case resolutions[1].provenance as bridge.Provenance
-    when external_source: source then
+    when external_source(source) then
       test.assert(source.main_file == "/external/vendor/vendor.titan" and
                   #source.source_files == 2 and
                   source.source_files[2] ==
@@ -1108,13 +1116,13 @@ function test_compiler_bridge_normalizes_external_resolution_fingerprints(
     else test.assert(false, "external source used a binary provenance")
     end
     case resolutions[2].provenance as bridge.Provenance
-    when dynamic_binary: binary then
+    when dynamic_binary(binary) then
       test.assert(binary.provider_file == "/binary/vendor.so",
                   "dynamic provider path was not normalized")
     else test.assert(false, "dynamic provider used the wrong provenance")
     end
     case resolutions[3].provenance as bridge.Provenance
-    when static_binary: binary then
+    when static_binary(binary) then
       test.assert(binary.provider_file == "/binary/vendor.a",
                   "static provider path was not normalized")
     else test.assert(false, "static provider used the wrong provenance")
@@ -1124,6 +1132,31 @@ function test_compiler_bridge_normalizes_external_resolution_fingerprints(
                 resolutions[5].provenance == nil and
                 resolutions[5].error == "invalid provider metadata",
                 "missing/error resolution escaped the typed contract")
+  end)
+end
+
+function test_compiler_bridge_reuses_unchanged_preprocessing_configuration(
+    _context: test.Context)
+  with_fixture("external-resolution", function ()
+    local compiler = bridge.load()
+    local split = compiler.driver["split_shell_words"] as
+      function (string): (value, value)
+    local parses = 0
+    compiler.driver["split_shell_words"] = function (input: string): (value, value)
+      parses = parses + 1
+      return split(input)
+    end
+    compiler:configure(bridge.CompilerConfiguration.new {
+      source_roots = {"/first"}, cppflags = "-DPROJECT=1",
+    })
+    compiler:configure(bridge.CompilerConfiguration.new {
+      source_roots = {"/first"}, cppflags = "-DPROJECT=1",
+    })
+    compiler:configure(bridge.CompilerConfiguration.new {
+      source_roots = {"/second"}, cppflags = "-DPROJECT=1",
+    })
+    test.assert(parses == 1,
+                "unchanged project flags were reparsed during reconfiguration")
   end)
 end
 
@@ -1152,7 +1185,7 @@ function test_compiler_bridge_normalizes_contextual_owner_provenance(
                     #"fixture static provider",
                   "contextual owner graph identity was changed")
       case resolution.provenance
-      when static_binary: binary then
+      when static_binary(binary) then
         test.assert(binary.provider_file == provider,
                     "contextual owner provider path was lost")
       else
@@ -1199,11 +1232,11 @@ function test_compiler_bridge_normalizes_and_restats_c_header_dependencies(
                 "per-module C header metadata was not normalized")
     local snapshot: bridge.ModuleSnapshot = module
     case snapshot.c_header_dependencies[1].kind
-    when file then
+    when file() then
     else test.assert(false, "direct C header used search-input kind")
     end
     case snapshot.c_header_dependencies[2].kind
-    when search then
+    when search() then
     else test.assert(false, "include candidate used file-input kind")
     end
     local current, changed = compiler:restat_c_header_dependencies(
@@ -1291,7 +1324,7 @@ function test_compiler_bridge_normalizes_annotated_ast_and_provenance(
                   "Source(\"fixture.external\")",
                 "external source-visible manifest was not normalized")
     case external.provenance
-    when external_source: source then
+    when external_source(source) then
       test.assert(#source.source_files == 2 and
                   source.source_files[2] == "/external/part.titan",
                   "external folder source provenance lost member paths")
@@ -1326,13 +1359,13 @@ function test_compiler_bridge_normalizes_annotated_ast_and_provenance(
       local symbol = project.symbols[index]
       if symbol.name == "count" then
         case symbol.role
-        when definition then definition_id = symbol.declaration_id
-        when reference then reference_id = symbol.declaration_id
+        when definition() then definition_id = symbol.declaration_id
+        when reference() then reference_id = symbol.declaration_id
         else
         end
       elseif symbol.name == "dependency" then
         case symbol.role
-        when import_alias then
+        when import_alias() then
           saw_local_import = symbol.is_local and symbol.type_info ~= nil and
             symbol.type_info.display == "module fixture.external"
         else
@@ -1356,7 +1389,7 @@ function test_compiler_bridge_normalizes_invalid_source_diagnostic(
                 "invalid fixture did not produce one diagnostic")
     local diagnostic = analysis.diagnostics[1]
     case diagnostic.kind
-    when syntax then
+    when syntax() then
     else test.assert(false, "syntax diagnostic used the wrong kind")
     end
     test.assert(diagnostic.location ~= nil and
@@ -1403,7 +1436,7 @@ return function(entry, name)
     end
   end
 end
-]==], "=compiler_bridge_declared_entry", nil)() as (value, string) -> ()
+]==], "=compiler_bridge_declared_entry", nil)() as function (value, string): ()
   inspect(compiler.project_entries[module_name], module_name)
 end
 
@@ -1584,16 +1617,16 @@ local function preserves_mixed_sparse_project_payloads()
   local provider_file = "/workspace/sparse_provider.titan"
   local consumer_file = "/workspace/sparse_consumer.titan"
   local provider = bridge.ProjectModule.new(provider_name,{bridge.SourceFile.new(provider_file,
-    "record Box<A> item: A local hidden: A end\n" ..
-    "local function secret<A>(item: A): A\n" ..
+    "record Box<|A|> item: A local hidden: A end\n" ..
+    "local function secret<|A|>(item: A): A\n" ..
     "  local body_only_result = item\n" ..
     "  return body_only_result\n" ..
     "end\n")})
-  local consumer_source: (integer) -> string = function (extra: integer): string
+  local consumer_source: function (integer): string = function (extra: integer): string
     return "local provider = import \"sparse_provider.titan\"\n" ..
       "function answer(): integer\n" ..
-      "  local box = provider.Box<integer>.new(42, 7)\n" ..
-      "  return provider.secret<integer>(box.item) + box.hidden + " .. extra .. "\n" ..
+      "  local box = provider.Box<|integer|>.new(42, 7)\n" ..
+      "  return provider.secret<|integer|>(box.item) + box.hidden + " .. extra .. "\n" ..
       "end\n"
   end
   local consumer = bridge.ProjectModule.new(consumer_name,{
@@ -1670,7 +1703,7 @@ local function preserves_mixed_sparse_project_payloads()
   local public_consumer = bridge.ProjectModule.new(consumer_name,{
     bridge.SourceFile.new(consumer_file,
       "local provider = import \"sparse_provider\"\n" ..
-      "function answer(box: provider.Box<integer>): integer\n" ..
+      "function answer(box: provider.Box<|integer|>): integer\n" ..
       "  return box.hidden\nend\n")})
   local public_result = restarted:analyze_incremental(
     {provider,public_consumer},{consumer_name},{})
@@ -1695,7 +1728,7 @@ function test_compiler_bridge_native_sha_matches_the_compiler_binary_digest(_con
     preload_real_compiler()
     local compiler_digest = lua.load(
       "return require('titan-compiler.sha256').binary",
-      "=compiler_bridge_sha256_equivalence",nil)() as (string) -> string
+      "=compiler_bridge_sha256_equivalence",nil)() as function (string): string
     local sources = {"", "a\0b\255", "\0\255boundary0123456789abcdefghijklmnopqrstuvwxyz" ..
       "0123456789abcdefghijklmnopqrstuvwxyz0123456789abcdefghijklmnopqrstuvwxyz"}
     for index = 1, #sources do
@@ -1930,7 +1963,7 @@ local function reparses_source_required_external_for_cached_project()
   end
 
   local compiler = bridge.load()
-  compiler:configure_paths(external_root, nil, nil)
+  compiler:configure(bridge.CompilerConfiguration.new { source_roots = {external_root} })
   local provider = bridge.ProjectModule.new("bridge_cached_provider", {
     bridge.SourceFile.new(
       "/workspace/bridge_cached_provider.titan",
@@ -2009,15 +2042,13 @@ typedef int vscode_titan_lsp_project_only_int;
     bridge.SourceFile.new(
       "/workspace/bridge_ffi_include.titan",
       "foreign import \"" .. header_name .. "\"\n" ..
-      "local type ProjectInteger = ffi.vscode_titan_lsp_project_only_int\n" ..
+      "foreign type ProjectInteger = vscode_titan_lsp_project_only_int\n" ..
       "function answer(): integer return 42 end\n")
   })
   local configured = bridge.load()
-  configured:configure_paths(
-    nil, nil, {include_root},
-    "-DVSCODE_TITAN_LSP_PROJECT_FLAG=17 " ..
+  configured:configure(bridge.CompilerConfiguration.new { include_roots = {include_root}, cppflags = "-DVSCODE_TITAN_LSP_PROJECT_FLAG=17 " ..
     "-UVSCODE_TITAN_LSP_PROJECT_FLAG " ..
-    "'-DVSCODE_TITAN_LSP_PROJECT_FLAG=42'")
+    "'-DVSCODE_TITAN_LSP_PROJECT_FLAG=42'" })
   local accepted = configured:analyze("bridge_ffi_include", {module})
   local messages = strings.writer()
   for index = 1, #accepted.diagnostics do
@@ -2033,7 +2064,7 @@ typedef int vscode_titan_lsp_project_only_int;
   for index = 1, #accepted_module.c_header_dependencies do
     local dependency = accepted_module.c_header_dependencies[index]
     case dependency.kind
-    when file then
+    when file() then
       if dependency.path == header then observed = dependency end
     else
     end
@@ -2049,37 +2080,34 @@ typedef int vscode_titan_lsp_project_only_int;
               "project-only FFI header unexpectedly resolved globally")
 
   local include_only = bridge.load()
-  include_only:configure_paths(nil, nil, {include_root})
+  include_only:configure(bridge.CompilerConfiguration.new { include_roots = {include_root} })
   local missing_flag = include_only:analyze("bridge_ffi_include", {module})
   test.assert(#missing_flag.diagnostics > 0,
               "project FFI header ignored its required preprocessing flag")
 
   -- Reconfigure one Compiler A -> B -> A. Each analysis must use its current
   -- preprocessing profile; identical completed native probes may be reused.
-  configured:configure_paths(nil, nil, {include_root})
+  configured:configure(bridge.CompilerConfiguration.new { include_roots = {include_root} })
   local reconfigured_without_flag =
     configured:analyze("bridge_ffi_include", {module})
   test.assert(#reconfigured_without_flag.diagnostics > 0,
               "same compiler reused preprocessing flags after reconfiguration")
-  configured:configure_paths(
-    nil, nil, {include_root},
-    "-DVSCODE_TITAN_LSP_PROJECT_FLAG=17 " ..
+  configured:configure(bridge.CompilerConfiguration.new { include_roots = {include_root}, cppflags = "-DVSCODE_TITAN_LSP_PROJECT_FLAG=17 " ..
     "-UVSCODE_TITAN_LSP_PROJECT_FLAG " ..
-    "'-DVSCODE_TITAN_LSP_PROJECT_FLAG=42'")
+    "'-DVSCODE_TITAN_LSP_PROJECT_FLAG=42'" })
   local accepted_again = configured:analyze("bridge_ffi_include", {module})
   test.assert(#accepted_again.diagnostics == 0,
               "same compiler did not restore an earlier preprocessing profile")
 
   local rejected_flags = false
   do
-    configured:configure_paths(
-      nil, nil, {include_root .. "/missing"}, "'unterminated")
+    configured:configure(bridge.CompilerConfiguration.new { include_roots = {include_root .. "/missing"}, cppflags = "'unterminated" })
   catch
     rejected_flags = true
     test.assert(error is bridge.BridgeError and
                 strings.find(
                   (error as bridge.BridgeError).message,
-                  "invalid extra_ffi_cppflags") ~= nil,
+                  "invalid compiler cppflags") ~= nil,
                 "malformed project flags raised an untyped bridge error")
   end
   test.assert(rejected_flags,
@@ -2089,7 +2117,7 @@ typedef int vscode_titan_lsp_project_only_int;
               "malformed reconfiguration replaced the last accepted paths")
 
   local after = bridge.load()
-  after:configure_paths(nil, nil, {include_root})
+  after:configure(bridge.CompilerConfiguration.new { include_roots = {include_root} })
   local isolated = after:analyze("bridge_ffi_include", {module})
   test.assert(#isolated.diagnostics > 0,
               "project preprocessing flags leaked across compiler permits")
@@ -2229,21 +2257,21 @@ end
 local function normalizes_generic_nominal_member_metadata()
   preload_real_compiler()
   local compiler = bridge.load()
-  local source = [[record Box<T>
+  local source = [[record Box<|T|>
   item: T
 end
 union Maybe
-  Some: Box<integer>
-  None
+  Some(Box<|integer|>)
+  None()
 end
 function Box:get(): T return self.item end
-function inspect<T>(box: Box<T>, maybe: Maybe): T
+function inspect<|T|>(box: Box<|T|>, maybe: Maybe): T
   local field = box.item
   local bound = box:get
   local got = box:get()
-  local made: Box<T> = { item = field }
+  local made: Box<|T|> = { item = field }
   case maybe
-  when Some: some then
+  when Some(some) then
   else
   end
   return field
@@ -2300,17 +2328,17 @@ end
 local function excludes_lowered_generic_case_payloads_from_exact_spans()
   preload_real_compiler()
   local filename = "/workspace/generic_case_payload.titan"
-  local source = [[union Maybe<T>
-  present: T
-  absent
+  local source = [[union Maybe<|T|>
+  present(T)
+  absent()
 end
-function make<T>(item: T): Maybe<T>
-  return Maybe<T>.present(item)
+function make<|T|>(item: T): Maybe<|T|>
+  return Maybe<|T|>.present(item)
 end
 function number(): integer
   local candidate = make(42)
   case candidate
-  when present: item then
+  when present(item) then
     return item
   else
     return 0
@@ -2477,7 +2505,7 @@ end
     bridge.SourceFile.new(filename, source),
   })}
   local compiler = bridge.load()
-  compiler:configure_paths(external_root, nil, nil)
+  compiler:configure(bridge.CompilerConfiguration.new { source_roots = {external_root} })
   local analysis = compiler:analyze("semantic_boundaries", projects)
   local diagnostic_messages = strings.writer()
   for index = 1, #analysis.diagnostics do
@@ -2573,7 +2601,7 @@ end
     bridge.SourceFile.new(filename, source),
   })}
   local compiler = bridge.load()
-  compiler:configure_paths(external_root, nil, nil)
+  compiler:configure(bridge.CompilerConfiguration.new { source_roots = {external_root} })
   local analysis = compiler:analyze("hover_consumer", projects)
   local diagnostic_messages = strings.writer()
   for index = 1, #analysis.diagnostics do
@@ -2625,7 +2653,7 @@ end
   test.assert(foreign_hover ~= nil and
               foreign_hover.callable_signature ~= nil and
               foreign_hover.callable_signature.display ==
-                "hover_external.native_add(left: int, right: int): int",
+                "hover_external.native_add(left: foreign int, right: foreign int): foreign int",
               "source-imported foreign function lost its exact signature")
 end
 
@@ -2637,16 +2665,16 @@ end
 local function preserves_generic_callable_hover_signatures()
   preload_real_compiler()
   local filename = "/workspace/generic_callable_hover.titan"
-  local source = [[record Box<T>
+  local source = [[record Box<|T|>
   item: T
 end
 function Box:get(): T
   return self.item
 end
-function identity<T>(item: T): T
+function identity<|T|>(item: T): T
   return item
 end
-function use(box: Box<integer>): integer
+function use(box: Box<|integer|>): integer
   return box:get()
 end
 ]]
@@ -2683,7 +2711,7 @@ end
   local declaration? = model:hover(
     filename, source_text.Position.new(6, 10))
   test.assert(declaration ~= nil and declaration:markdown() ==
-                "- Signature: `generic_callable_hover.identity<T>(" ..
+                "- Signature: `generic_callable_hover.identity<|T|>(" ..
                   "item: T): T`\n" ..
                 "- Visibility: exported\n",
               "generic function declaration hover lost its surface signature")
@@ -2714,7 +2742,7 @@ local function preserves_contextual_aggregate_and_module_hover_summaries()
   local provider_filename = "/workspace/summary_provider.titan"
   local provider_source = [[local const secret: integer = 7
 answer = 42
-record Box<T>
+record Box<|T|>
   item: T
 end
 type BoxAlias = Box
@@ -2727,7 +2755,7 @@ function exposed(): integer return answer end
   local consumer_filename = "/workspace/summary_consumer.titan"
   local consumer_source = [[local public = import "summary_provider"
 local source = import "summary_provider.titan"
-function compare(left: public.Box<integer>, right: source.Box<integer>): public.Box<integer>
+function compare(left: public.Box<|integer|>, right: source.Box<|integer|>): public.Box<|integer|>
   return left
 end
 ]]
@@ -2765,8 +2793,8 @@ end
     if symbol.location.filename == consumer_filename then
       if symbol.name == "Box" and symbol.location.line == 3 then
         if symbol.location.column == 31 then public_box = symbol.summary_id
-        elseif symbol.location.column == 59 then source_box = symbol.summary_id
-        elseif symbol.location.column == 81 then
+        elseif symbol.location.column == 61 then source_box = symbol.summary_id
+        elseif symbol.location.column == 85 then
           repeated_box = symbol.summary_id
         end
       elseif symbol.name == "public" then
@@ -2778,7 +2806,7 @@ end
       elseif symbol.name == "source" then
         if symbol.location.line == 2 and symbol.location.column == 7 then
           source_module = symbol.summary_id
-        elseif symbol.location.line == 3 and symbol.location.column == 52 then
+        elseif symbol.location.line == 3 and symbol.location.column == 54 then
           repeated_source_module = symbol.summary_id
         end
       end
@@ -2799,15 +2827,15 @@ end
     provider_filename, source_text.Position.new(2, 8))
   local defining_markdown = defining ~= nil and defining:markdown() or "<nil>"
   test.assert(defining ~= nil and defining:markdown() ==
-                "**record** `summary_provider.Box<T>`\n\n" ..
+                "**record** `summary_provider.Box<|T|>`\n\n" ..
                 "Fields\n\n" ..
                 "- `item: T`\n\n" ..
                 "Functions\n\n" ..
-                "- `summary_provider.Box<T>.new(" ..
-                  "item: T): summary_provider.Box<T>`\n\n" ..
+                "- `summary_provider.Box<|T|>.new(" ..
+                  "item: T): summary_provider.Box<|T|>`\n\n" ..
                 "Methods\n\n" ..
-                "- `summary_provider.Box<T>:get(): T`\n" ..
-                "- `local summary_provider.Box<T>:hidden(): T`\n\n" ..
+                "- `summary_provider.Box<|T|>:get(): T`\n" ..
+                "- `local summary_provider.Box<|T|>:hidden(): T`\n\n" ..
                 "- Visibility: exported\n",
               "defining aggregate hover lost its full generic view:\n" ..
               defining_markdown)
@@ -2816,32 +2844,32 @@ end
     consumer_filename, source_text.Position.new(2, 31))
   local ordinary_markdown = ordinary ~= nil and ordinary:markdown() or "<nil>"
   local expected_public =
-    "**record** `summary_provider.Box<integer>`\n\n" ..
+    "**record** `summary_provider.Box<|integer|>`\n\n" ..
     "Fields\n\n" ..
     "- `item: integer`\n\n" ..
     "Functions\n\n" ..
-    "- `summary_provider.Box<integer>.new(" ..
-      "item: integer): summary_provider.Box<integer>`\n\n" ..
+    "- `summary_provider.Box<|integer|>.new(" ..
+      "item: integer): summary_provider.Box<|integer|>`\n\n" ..
     "Methods\n\n" ..
-    "- `summary_provider.Box<integer>:get(): integer`\n\n" ..
+    "- `summary_provider.Box<|integer|>:get(): integer`\n\n" ..
     "- Visibility: exported\n"
   test.assert(ordinary ~= nil and ordinary:markdown() == expected_public,
               "ordinary import exposed local or unspecialized members:\n" ..
               ordinary_markdown)
 
   local source? = model:hover(
-    consumer_filename, source_text.Position.new(2, 59))
+    consumer_filename, source_text.Position.new(2, 61))
   local source_markdown = source ~= nil and source:markdown() or "<nil>"
   test.assert(source ~= nil and source:markdown() ==
-                "**record** `summary_provider.Box<integer>`\n\n" ..
+                "**record** `summary_provider.Box<|integer|>`\n\n" ..
                 "Fields\n\n" ..
                 "- `item: integer`\n\n" ..
                 "Functions\n\n" ..
-                "- `summary_provider.Box<integer>.new(" ..
-                  "item: integer): summary_provider.Box<integer>`\n\n" ..
+                "- `summary_provider.Box<|integer|>.new(" ..
+                  "item: integer): summary_provider.Box<|integer|>`\n\n" ..
                 "Methods\n\n" ..
-                "- `summary_provider.Box<integer>:get(): integer`\n" ..
-                "- `local summary_provider.Box<integer>:hidden(): integer`\n\n" ..
+                "- `summary_provider.Box<|integer|>:get(): integer`\n" ..
+                "- `local summary_provider.Box<|integer|>:hidden(): integer`\n\n" ..
                 "- Visibility: exported\n",
               "direct-source import lost its local specialized members:\n" ..
               source_markdown)
@@ -2853,10 +2881,10 @@ end
   local expected_public_module =
     "**module** `summary_provider`\n\n" ..
     "Members\n\n" ..
-    "- `record Box<T>`\n" ..
+    "- `record Box<|T|>`\n" ..
     "- `answer: integer`\n" ..
     "- `summary_provider.exposed(): integer`\n" ..
-    "- `type BoxAlias<T> = summary_provider.Box<T>`\n\n" ..
+    "- `type BoxAlias<|T|> = summary_provider.Box<|T|>`\n\n" ..
     "- Visibility: module\n"
   test.assert(public_module ~= nil and
               public_module:markdown() == expected_public_module and
@@ -2872,19 +2900,19 @@ end
   test.assert(source_module ~= nil and source_module:markdown() ==
                 "**module** `summary_provider`\n\n" ..
                 "Members\n\n" ..
-                "- `record Box<T>`\n" ..
+                "- `record Box<|T|>`\n" ..
                 "- `answer: integer`\n" ..
                 "- `summary_provider.exposed(): integer`\n" ..
                 "- `local const secret: integer`\n" ..
-                "- `type BoxAlias<T> = summary_provider.Box<T>`\n" ..
+                "- `type BoxAlias<|T|> = summary_provider.Box<|T|>`\n" ..
                 "- `local type Hidden = integer`\n" ..
-                "- `local type HiddenBox<T> = summary_provider.Box<T>`\n\n" ..
+                "- `local type HiddenBox<|T|> = summary_provider.Box<|T|>`\n\n" ..
                 "- Visibility: module\n",
               "direct-source module hover lost its source-only members:\n" ..
               source_module_markdown)
 
   local repeated? = model:hover(
-    consumer_filename, source_text.Position.new(2, 81))
+    consumer_filename, source_text.Position.new(2, 85))
   test.assert(repeated ~= nil and repeated:markdown() == expected_public,
               "repeated generic view did not reuse normalized summary text")
 end
@@ -2975,7 +3003,7 @@ local function keeps_function_valued_module_variables_as_bare_types()
   preload_real_compiler()
   local provider_filename =
     "/workspace/function_variable_provider.titan"
-  local provider_source = [[callback: (integer) -> integer =
+  local provider_source = [[callback: function (integer): integer =
   function(item) return item + 1 end
 function declared(item: integer): integer
   return item * 2
@@ -3016,7 +3044,7 @@ end
   test.assert(module_hover ~= nil and markdown ==
                 "**module** `function_variable_provider`\n\n" ..
                 "Members\n\n" ..
-                "- `callback: (integer) -> integer`\n" ..
+                "- `callback: function (integer): integer`\n" ..
                 "- `function_variable_provider.declared(" ..
                   "item: integer): integer`\n\n" ..
                 "- Visibility: module\n",
@@ -3045,8 +3073,8 @@ function Parcel:increase(delta: integer): integer
   return self.amount + delta
 end
 union Choice
-  numbered: integer
-  empty
+  numbered(integer)
+  empty()
 end
 function Choice.from_ordinal(ordinal: integer): Choice
   return Choice.numbered(ordinal)
@@ -3074,7 +3102,7 @@ end
       "function seed(): integer return cached.combine(1, 2) end\n"),
   })
   local initial_compiler = bridge.load()
-  initial_compiler:configure_paths(external_root, nil, nil)
+  initial_compiler:configure(bridge.CompilerConfiguration.new { source_roots = {external_root} })
   local initial = initial_compiler:analyze("hover_manifest_seed", {seed})
   local initial_external? = initial:find_module("hover_manifest")
   test.assert(#initial.diagnostics == 0 and initial_external ~= nil and
@@ -3112,7 +3140,7 @@ end
     bridge.SourceFile.new(filename, source),
   })
   local reloaded_compiler = bridge.load()
-  reloaded_compiler:configure_paths(external_root, nil, nil)
+  reloaded_compiler:configure(bridge.CompilerConfiguration.new { source_roots = {external_root} })
   local reloaded = reloaded_compiler:analyze_incremental(
     {consumer}, {"hover_manifest_consumer"}, {cached_external})
   local diagnostic_messages = strings.writer()
@@ -3184,8 +3212,8 @@ end
   test.assert(choice_hover ~= nil and choice_hover:markdown() ==
                 "**union** `hover_manifest.Choice`\n\n" ..
                 "Variants\n\n" ..
-                "- `empty`\n" ..
-                "- `numbered(payload: integer)`\n\n" ..
+                "- `empty()`\n" ..
+                "- `numbered(integer)`\n\n" ..
                 "Functions\n\n" ..
                 "- `hover_manifest.Choice.from_ordinal(" ..
                   "ordinal: integer): hover_manifest.Choice`\n\n" ..
@@ -3269,8 +3297,8 @@ end
 function optional(items: (const? { integer })?): (const? { integer })?
   return items
 end
-function relay(callback: foreign (*lua_State, const *char) -> int):
-    foreign (*lua_State, const *char) -> int
+function relay(callback: foreign function (*lua_State, const *char): int):
+    foreign function (*lua_State, const *char): int
   return callback
 end
 ]])
@@ -3281,7 +3309,7 @@ end
 
   local filename = "/workspace/bridge_metadata_consumer.titan"
   local source = [[local cached = import "bridge_metadata"
-function use(callback: foreign (*lua_State, const *char) -> int,
+function use(callback: foreign function (*lua_State, const *char): int,
              mutable: { integer }, immutable: const { integer }): integer
   local mutable_view = cached.view(mutable)
   local immutable_view = cached.view(immutable)
@@ -3295,7 +3323,7 @@ end
     bridge.SourceFile.new(filename, source),
   })
   local initial_compiler = bridge.load()
-  initial_compiler:configure_paths(external_root, nil, nil)
+  initial_compiler:configure(bridge.CompilerConfiguration.new { source_roots = {external_root} })
   local initial = initial_compiler:analyze("bridge_metadata_consumer", {consumer})
   local diagnostic_messages = strings.writer()
   for index = 1, #initial.diagnostics do
@@ -3323,7 +3351,7 @@ end
   -- Make source fallback fail so this analysis proves manifest rehydration.
   fs.write_file(external_file, "function broken(: integer) end\n")
   local reloaded_compiler = bridge.load()
-  reloaded_compiler:configure_paths(external_root, nil, nil)
+  reloaded_compiler:configure(bridge.CompilerConfiguration.new { source_roots = {external_root} })
   local reloaded = reloaded_compiler:analyze_incremental(
     {consumer}, {"bridge_metadata_consumer"}, {cached_external})
   for index = 1, #reloaded.diagnostics do
@@ -3340,7 +3368,7 @@ end
     ["mutable_view"] = "const? { integer }",
     ["immutable_view"] = "const? { integer }",
     ["optional_view"] = "const? { integer }?",
-    ["relayed"] = "*(foreign  (*lua_State, const *char) -> int)",
+    ["relayed"] = "foreign function (*lua_State, const *char): int",
   }
   local checked_types = 0
   for index = 1, #project.symbols do
@@ -3396,7 +3424,7 @@ end
     bridge.SourceFile.new(filename, source),
   })
   local compiler = bridge.load()
-  compiler:configure_paths(nil, nil, {include_root})
+  compiler:configure(bridge.CompilerConfiguration.new { include_roots = {include_root} })
   local analysis = compiler:analyze("hover_c_consumer", {project})
   local diagnostic_messages = strings.writer()
   for index = 1, #analysis.diagnostics do
@@ -3411,13 +3439,13 @@ end
   local named? = model:hover(filename, source_text.Position.new(2, 40))
   test.assert(named ~= nil and named:markdown() ==
                 "- Signature: `ffi.hover_named_sum(" ..
-                "left: int, right: int): int`\n" ..
+                "left: foreign int, right: foreign int): foreign int`\n" ..
                 "- Visibility: module\n",
               "direct C function lost its FFI namespace or parameter names")
 
   local unnamed? = model:hover(filename, source_text.Position.new(3, 42))
   test.assert(unnamed ~= nil and unnamed:markdown() ==
-                "- Signature: `ffi.hover_unnamed_sum(int, int): int`\n" ..
+                "- Signature: `ffi.hover_unnamed_sum(foreign int, foreign int): foreign int`\n" ..
                 "- Visibility: module\n",
               "unnamed C prototype invented parameter labels")
 end
@@ -3749,8 +3777,8 @@ local function joins_nominal_type_and_constructor_namespaces()
   amount: integer
 end
 union Choice
-  some: integer
-  none
+  some(integer)
+  none()
 end
 type BoxAlias = Box
 type ChoiceAlias = Choice
@@ -3878,7 +3906,7 @@ local function preserves_combined_ffi_namespace_semantics()
   end
   local source = "foreign import \"" .. first_header .. "\"\n" ..
     "foreign import \"" .. second_header .. "\"\n" ..
-    "local function use(input: ffi.ordered_word): integer\n" ..
+    "local function use(input: foreign ordered_word): integer\n" ..
     "  local left: integer = ffi.ordered_call { amount = input }\n" ..
     "  return left + ffi.ordered_call(input) + ffi.ORDERED_CODE\n" ..
     "end\n"
@@ -3921,17 +3949,13 @@ local function preserves_combined_ffi_namespace_semantics()
   defer model:close()
   local root_position = marked_name_position(
     source, "ffi.ordered_call {", "ffi")
-  local type_root = marked_name_position(
-    source, "input: ffi.ordered_word", "ffi")
   local root_hover? = model:hover(first_file, root_position)
-  local type_hover? = model:hover(first_file, type_root)
-  test.assert(root_hover ~= nil and type_hover ~= nil and
-              strings.find(root_hover:markdown(), "C module ffi") ~= nil and
-              type_hover:markdown() == root_hover:markdown(),
-              "value and type roots lost builtin namespace hover")
+  test.assert(root_hover ~= nil and
+              strings.find(root_hover:markdown(), "C module ffi") ~= nil,
+              "value root lost builtin namespace hover")
   local references = model:references(first_file, root_position, true)
-  test.assert(#references == 4,
-              "builtin references lost a type root or invented a definition")
+  test.assert(#references == 3,
+              "builtin references included an unqualified foreign type or definition")
   local first_uri: string = source_text.path_to_file_uri(first_file)
   for index = 1, #references do
     test.assert(references[index].uri == first_uri,
@@ -3965,13 +3989,91 @@ function test_compiler_bridge_preserves_combined_ffi_namespace_semantics(
   run_bridge(preserves_combined_ffi_namespace_semantics)
 end
 
+local function preserves_foreign_type_and_current_module_metadata()
+  preload_real_compiler()
+  local filename = "/workspace/foreign_type_metadata.titan"
+  local source = [[foreign type Word = int
+record Word
+  amount: integer
+end
+local function inspect(input: foreign Word): integer
+  local storage: owned Word[] = foreign Word.new_array(2)
+  storage[0] = input
+  local copied: foreign Word = storage[0]
+  return copied + foreign Word.sizeof
+end
+function make(Word: integer): Word
+  local made: M.Word = M.Word.new(Word)
+  return made
+end
+]]
+  local projects = {bridge.ProjectModule.new("foreign_type_metadata", {
+    bridge.SourceFile.new(filename, source),
+  })}
+  local analysis = bridge.load():analyze("foreign_type_metadata", projects)
+  assert_clean_ffi_analysis(analysis, "foreign type and current-module fixture")
+  local snapshot: bridge.ModuleSnapshot = analysis:find_module("foreign_type_metadata")
+  local seen: {string: boolean} = {}
+  local foreign_identity: string? = nil
+  local record_identity: string? = nil
+  local owner_type = false
+  for index = 1, #snapshot.nodes do
+    local node = snapshot.nodes[index]
+    seen[node.tag] = true
+    if node.tag == "Ast.TopLevelForeignTypeAlias" then
+      test.assert(node.name == "Word" and node.is_local,
+                  "foreign alias lost its name or source-local visibility")
+    end
+  end
+  for index = 1, #snapshot.symbols do
+    local symbol = snapshot.symbols[index]
+    if symbol.name == "Word" then
+      if symbol.location.line == 1 then
+        foreign_identity = symbol.declaration_id
+        test.assert(symbol.exact_span == nil,
+                    "foreign type declaration became a navigation anchor")
+      elseif symbol.location.line == 2 then
+        record_identity = symbol.declaration_id
+      elseif symbol.location.line == 5 or symbol.location.line == 6 then
+        test.assert(symbol.declaration_id == foreign_identity,
+                    "foreign type mention lost its alias identity")
+      elseif symbol.location.line == 12 and symbol.location.column < 34 then
+        test.assert(symbol.declaration_id == record_identity,
+                    "M.Word resolved to a shadowing value or the foreign alias")
+      end
+    elseif symbol.name == "storage" and symbol.type_info ~= nil then
+      owner_type = symbol.type_info.tag == "Type.COwned" and
+        symbol.type_info.display == "owned Word[]"
+    end
+  end
+  test.assert(seen["Ast.TypeForeignName"] and seen["Ast.TypeOwned"] and
+              seen["Ast.ExpForeignType"] and
+              seen["Ast.TopLevelForeignTypeAlias"] and owner_type,
+              "new foreign type nodes or their owned type metadata were dropped")
+  test.assert(foreign_identity ~= nil and record_identity ~= nil and
+              foreign_identity ~= record_identity,
+              "foreign and Titan type declarations shared one identity")
+  local model = features.build(projects, analysis.modules)
+  defer model:close()
+  local foreign_position = marked_name_position(source, "input: foreign Word", "Word")
+  local nominal_position = marked_name_position(source, "M.Word.new", "Word")
+  test.assert(model:definition(filename, foreign_position) == nil and
+              model:definition(filename, nominal_position) ~= nil,
+              "foreign and current-module references lost their navigation boundaries")
+end
+
+function test_compiler_bridge_preserves_foreign_type_and_current_module_metadata(
+    _context: test.Context)
+  run_bridge(preserves_foreign_type_and_current_module_metadata)
+end
+
 local function assert_inherited_header_inputs(inputs: {bridge.CHeaderDependency},
                                               first: string, second: string)
   local saw_first, saw_second = false, false
   for index = 1, #inputs do
     local input = inputs[index]
     case input.kind
-    when file then
+    when file() then
       if input.path == first then saw_first = true end
       if input.path == second then saw_second = true end
     else
@@ -3999,7 +4101,7 @@ local function preserves_inherited_ffi_payloads(external_provider: boolean)
     "int inherited_call(inherited_word amount);\n#endif\n")
   local provider_source = "foreign import \"" .. first_header .. "\"\n" ..
     "foreign import \"" .. second_header .. "\"\n" ..
-    "foreign function native_add(input: ffi.inherited_word): ffi.inherited_word\n" ..
+    "foreign function native_add(input: inherited_word): inherited_word\n" ..
     "  return input + 1\n" ..
     "end\n"
   fs.write_file(provider_file, provider_source)
@@ -4009,9 +4111,9 @@ local function preserves_inherited_ffi_payloads(external_provider: boolean)
     fs.unlink(first_header)
     fs.rmdir(root)
   end
-  local consumer_source: (integer) -> string = function (extra: integer): string
+  local consumer_source: function (integer): string = function (extra: integer): string
     return "local provider = import \"ffi_provider.titan\"\n" ..
-      "local function answer(input: ffi.inherited_word): integer\n" ..
+      "local function answer(input: foreign inherited_word): integer\n" ..
       "  local native: integer = provider.native_add(input)\n" ..
       "  return native + ffi.inherited_call(input) + ffi.INHERITED_CODE + " .. extra .. "\n" ..
       "end\n"
@@ -4028,7 +4130,7 @@ local function preserves_inherited_ffi_payloads(external_provider: boolean)
     selected[#selected + 1] = "ffi_provider"
   end
   local compiler = bridge.load()
-  compiler:configure_paths(root, nil, nil)
+  compiler:configure(bridge.CompilerConfiguration.new { source_roots = {root} })
   local initial = compiler:analyze("ffi_consumer", projects)
   assert_clean_ffi_analysis(initial, "inherited FFI source context failed")
   local consumer_snapshot: bridge.ModuleSnapshot = initial:find_module("ffi_consumer")
@@ -4059,7 +4161,7 @@ local function preserves_inherited_ffi_payloads(external_provider: boolean)
   test.assert(#payloads == #selected,
               "inherited C declarations prevented project manifest export")
   local restarted = bridge.load()
-  restarted:configure_paths(root, nil, nil)
+  restarted:configure(bridge.CompilerConfiguration.new { source_roots = {root} })
   local restored = restarted:restore_projects(projects, payloads)
   test.assert(#restored == #selected,
               "inherited C declarations prevented project manifest restoration")
@@ -4108,8 +4210,7 @@ end
 
 local function assert_contextual_ffi_rename(model: features.Features,
                                             filename: string, source: string,
-                                            marker: string, name: string,
-                                            allowed: boolean)
+                                            marker: string, name: string)
   local candidate?, candidate_error? = model:rename(
     filename, marked_name_position(source, marker, name), "ffi")
   test.assert(candidate ~= nil and candidate_error == nil,
@@ -4117,18 +4218,12 @@ local function assert_contextual_ffi_rename(model: features.Features,
   local analysis = bridge.load():analyze(
     "ffi_rename_consumer", candidate:edited_project_modules())
   local verified?, verification_error? = candidate:preflight(analysis)
-  if allowed then
-    assert_clean_ffi_analysis(analysis, "member rename to ffi failed")
-    test.assert(verified ~= nil and verification_error == nil,
-                "member rename to ffi failed its binding preflight")
-  else
-    test.assert(#analysis.diagnostics > 0 and verified == nil and
-                verification_error ~= nil,
-                "binding rename to reserved ffi passed compiler preflight")
-  end
+  assert_clean_ffi_analysis(analysis, "rename to shadowable ffi failed")
+  test.assert(verified ~= nil and verification_error == nil,
+              "rename to ffi changed the selected binding")
 end
 
-local function distinguishes_ffi_member_and_binding_renames()
+local function allows_ffi_member_and_shadowing_binding_renames()
   preload_real_compiler()
   local filename = "/workspace/ffi_rename_consumer.titan"
   local source = [[local provider = import "ffi_rename_provider"
@@ -4154,15 +4249,15 @@ end
   assert_clean_ffi_analysis(analysis, "contextual ffi rename fixture failed")
   local model = features.build(projects, analysis.modules)
   defer model:close()
-  assert_contextual_ffi_rename(model, filename, source, "amount: integer", "amount", true)
-  assert_contextual_ffi_rename(model, filename, source, "Item:read", "read", true)
-  assert_contextual_ffi_rename(model, filename, source, "local selected", "selected", false)
-  assert_contextual_ffi_rename(model, filename, source, "local provider", "provider", false)
-  assert_contextual_ffi_rename(model, filename, source, "function answer", "answer", false)
-  assert_contextual_ffi_rename(model, filename, source, "record Item", "Item", false)
+  assert_contextual_ffi_rename(model, filename, source, "amount: integer", "amount")
+  assert_contextual_ffi_rename(model, filename, source, "Item:read", "read")
+  assert_contextual_ffi_rename(model, filename, source, "local selected", "selected")
+  assert_contextual_ffi_rename(model, filename, source, "local provider", "provider")
+  assert_contextual_ffi_rename(model, filename, source, "function answer", "answer")
+  assert_contextual_ffi_rename(model, filename, source, "record Item", "Item")
 end
 
-function test_compiler_bridge_distinguishes_ffi_member_and_binding_renames(
+function test_compiler_bridge_allows_ffi_member_and_shadowing_binding_renames(
     _context: test.Context)
-  run_bridge(distinguishes_ffi_member_and_binding_renames)
+  run_bridge(allows_ffi_member_and_shadowing_binding_renames)
 end

@@ -83,15 +83,25 @@ On a headless Linux machine, run the Extension Host under a virtual display:
 xvfb-run -a make verify
 ```
 
-GitHub CI runs that gate directly on the same Ubuntu 24.04
-`ubicloud-standard-2` runners used by Titan. Because both repositories are
+GitHub CI runs the same gates as separate toolchain, build, test, packaging, and
+inspection steps on Ubuntu 24.04 `ubicloud-standard-2` runners. The completed
+`.titan` installation is cached by the exact pinned Titan commit and installation
+identity. A cache hit reuses the compiler and SDK; a miss builds them once before
+server compilation. Native server tests compile once and run in two parallel
+execution shards on the runner's two CPUs. Because both repositories are
 private, the vscode-titan repository must define an Actions secret named
 `SSH_PRIVATE_KEY`; its public half must be registered as a read-only deploy key
 in `mascarenhas/titan`.
 
 Use `make help` for focused targets. In particular, `make server-test` runs the
-native Titan suite and `make extension-test` runs the extension unit tests. A
-successful compilation by itself is not a successful test run.
+native Titan suite serially; `make server-test-sharded` runs the same suite in two
+parallel shards. `make server-test-build` only compiles the aggregate, and
+`make server-test-run` executes the current aggregate without rebuilding it.
+`make test` and `make verify` use the two-shard runner. Each test module belongs
+to exactly one shard in `scripts/run-server-tests.mjs`; its inventory check
+requires newly imported test modules to be assigned. Per-shard logs and timings
+are written under `.build/test-shards`. `make extension-test` runs the extension
+unit tests. A successful compilation by itself is not a successful test run.
 
 To measure the production server against this repository's saved Titan source,
 including startup and cold-index wall/CPU time, peak RSS, request responsiveness,
@@ -251,10 +261,12 @@ rules. The server retains the complete physical C-header dependency closure
 for invalidation, including inherited headers, and keeps external source ASTs
 out of its project cache. Written `ffi` roots and C value members support hover and
 references within their module; they have no project definition or rename
-target. `ffi` is reserved as a binding name and remains an ordinary member name
-after `.` or `:`.
+target. The readonly builtin `ffi` can be shadowed by an ordinary binding.
+Foreign types use a separate unqualified namespace: write `foreign int`,
+`foreign *Name`, or an always-local `foreign type Name = ...` declaration.
+They are not selected through the value binding `ffi`.
 
-Persisted compiler artifacts use `c-header-v3` and `ffi-conversion-v3` for
+Persisted compiler artifacts use `c-header-v5` and `ffi-conversion-v6` for
 extracted C definitions. Project entries retain declared member/type manifests,
 including trusted source visibility and generic schemes. SQLite schema 4 shares
 ordered header provenance across cache owners and stores fixed-size graph
@@ -270,10 +282,16 @@ for `titan.async`, `titan.coroutine`, `titan.fs`, `titan.gc`, `titan.http`,
 `titan.os`, `titan.peg`, `titan.reflect`, `titan.sqlite3`, `titan.ssl`,
 `titan.string`, `titan.test`, `titan.timer`, `titan.url`, and `titan.uv`.
 
-The extension sets the compiler probe-cache prefix to VS Code's workspace
-storage directory. Accepted and rejected probes are shared within that VS Code
-workspace and remain separate from unrelated workspaces. Standalone launches
-can select their cache prefix explicitly through `TITAN_PREFIX`.
+The server defaults the compiler probe-cache prefix to the directory containing
+its SQLite database: `<workspace>/.titan-ls`. Accepted and rejected probes live
+under `.titan-ls/var/cache/titan-probes/2`, alongside `index.sqlite3`. The
+extension uses this same server default. A nonempty inherited `TITAN_PREFIX`
+explicitly overrides the probe prefix for either extension or standalone
+launches; it does not relocate the workspace database. With the default
+prefix, removing `.titan-ls` clears both caches; removing only `index.sqlite3`
+retains probe results. An overridden probe directory must be cleared separately.
+Probe keys remain based on raw C source; clear their directory when a changed
+native environment makes a cached result stale.
 
 In Remote SSH, WSL, or container workspaces, the workspace extension and native
 server run on that remote host. The client maps the workspace's remote URI
@@ -331,6 +349,9 @@ prefixed output channel; `verbose` traces can include source text and other
 workspace data. Restore the setting to `off` after collecting a trace.
 
 ### Project configuration
+
+See [server configuration and data flow](docs/server-data-flow.md) for input
+provenance, compiler scope ownership, and the production loader/cache boundary.
 
 An optional `titan-config.lua` at the workspace root assigns configuration
 values as globals. Relative paths are resolved from that root:

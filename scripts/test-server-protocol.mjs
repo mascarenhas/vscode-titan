@@ -374,7 +374,8 @@ async function waitForIndexing(
       if (minimumEpoch !== undefined && status.epoch < minimumEpoch) {
         break;
       }
-      assert.equal(status.state, expectedState);
+      assert.equal(status.state, expectedState,
+        `unexpected indexing status: ${JSON.stringify(status)}`);
       responses.lastIndexingProgress = progress;
       terminal = status;
       acceptedCycles += 1;
@@ -943,8 +944,8 @@ async function testSelfContainedCompilerModules({ sdkHeaders = false } = {}) {
       'foreign import "sqlite3.h"',
       'foreign import "openssl/ssl.h"',
       "local function sdk_layouts(): integer",
-      "  return ffi.TValue.sizeof + ffi.uv_loop_t.sizeof + " +
-        "ffi.mco_desc.sizeof + ffi.llhttp_t.sizeof",
+      "  return foreign TValue.sizeof + foreign uv_loop_t.sizeof + " +
+        "foreign mco_desc.sizeof + foreign llhttp_t.sizeof",
       "end",
       "local function sdk_versions(): integer",
       "  return ffi.sqlite3_libversion_number() + ffi.OpenSSL_version_num()",
@@ -1237,7 +1238,7 @@ async function testSourceImportCppflagsAndUnchangedRequests() {
   const guardedLines = [
     'foreign import "vscode_titan_protocol_guard.h"',
     "function guarded_answer(item: integer): integer",
-    "  local converted: ffi.vscode_titan_protocol_int = item",
+    "  local converted: foreign vscode_titan_protocol_int = item",
     "  return converted",
     "end",
     ""

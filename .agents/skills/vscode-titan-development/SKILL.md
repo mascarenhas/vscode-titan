@@ -100,3 +100,48 @@ its existing compiler behavior for `titanc`, run its own focused and broad
 tests, and defer its PR until the extension/server work is wrapped. Leave the
 compiler PR open for maintainer review; opening it does not authorize merging
 it.
+
+## Compiler syntax updates and architecture review
+
+Use the exact requested compiler commit in CI and the isolated development
+installation. During prerelease development the compiler/server API stays at
+`1`; update both consumers and fixtures against the pinned metadata contract.
+Treat source syntax, saved-source fixture strings, hover text, semantic spans,
+TextMate scopes and editor bracket/indent rules as separate migration surfaces.
+Do not rewrite SQL, embedded Lua or other string payloads as Titan syntax.
+Compare production string payloads after automated migrations and validate the
+result with the compiler parser and semantic/protocol tests.
+
+Read the compiler's current AST/type definitions before adapting the typed
+bridge. Foreign type names live in a distinct C namespace and do not acquire
+ordinary Titan definition-navigation targets. Retain lexical traversal order
+and exclude compiler DAG backreferences when walking the saved AST.
+
+Architecture reviews should examine the entire server. Configuration flow is
+one example: trace environment inputs and project configuration to the compiler
+owner, its resolver contexts and cache identity. Prefer one accepted normalized
+snapshot and one production composition path. Remove repeated discovery,
+parallel loader implementations, copying adapters and per-node allocations
+where ownership permits. Preserve the deliberate rescan after watcher
+registration, short SQL publication transactions, cancellation cleanup and
+snapshot isolation. Prefer record-owned conversions over new forwarding layers.
+
+For performance changes, retain a fixed executable and isolated saved-source
+snapshots for both Titan and vscode-titan. Use the workspace-cache benchmark's
+`--startup-only` mode for cold and unchanged-process-restart comparisons. Record
+cache state, diagnostic success, warm work avoided, full background restoration,
+compiler/source revisions and host-load limits; an early READY notification is
+not full restoration. Keep failed runs as failed evidence.
+
+CI builds and caches the complete compiler installation by its exact commit,
+platform/build policy and absolute installation prefix. No fallback cache may
+supply a different compiler. Native tests compile once and execute in two
+parallel shards on the two-CPU runner. Maintain the module inventory in
+`scripts/run-server-tests.mjs` when adding a test owner, inspect positive test
+selection and both shard outcomes, and use `make verify` for the complete gate.
+
+The SQLite directory is also the native server's default C probe-cache prefix.
+Use the shared workspace-cache directory helper and set this default before
+compiler modules first load; preserve a nonempty inherited `TITAN_PREFIX`.
+The extension must not replace that policy with VS Code workspace storage.
+Probe-prefix selection must not change compiler Lua, provider or SDK discovery.

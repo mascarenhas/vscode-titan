@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { cp, mkdir, readFile, rm, stat, utimes, writeFile } from "node:fs/promises";
+import { cp, mkdir, readFile, readdir, rm, stat, utimes, writeFile } from "node:fs/promises";
 import * as path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { pathToFileURL } from "node:url";
@@ -37,7 +37,7 @@ const consumer = (value) => [
   'local provider = import "mathlib.titan"',
   'foreign import "fixture.h"',
   "function answer(): integer",
-  "  local number: ffi.fixture_int = provider.forty()",
+  "  local number: foreign fixture_int = provider.forty()",
   `  return number + provider.extra() + ffi.FIXTURE_CODE + ${value}`,
   "end",
   ""
@@ -50,7 +50,7 @@ const inheritedHeader = (value) =>
   `enum inherited_code { INHERITED_CODE = ${value} };\n`;
 
 async function withServer(label, body, environment = {}) {
-  const child = launch(root, "trace", environment);
+  const child = launch(root, "trace", { TITAN_PREFIX: undefined, ...environment });
   const exit = exitOf(child);
   const stderr = collect(child.stderr);
   let logTail = "";
@@ -120,6 +120,18 @@ async function withServer(label, body, environment = {}) {
       await withTimeout(exit, "failed cache-test server exit", 5_000);
     }
   }
+}
+
+async function assertProbeRecords(prefix) {
+  const cacheRoot = path.join(prefix, "var", "cache", "titan-probes");
+  const namespaces = await readdir(cacheRoot, { withFileTypes: true });
+  let records = 0;
+  for (const namespace of namespaces) {
+    if (!namespace.isDirectory()) continue;
+    const files = await readdir(path.join(cacheRoot, namespace.name));
+    records += files.filter((filename) => filename.endsWith(".result")).length;
+  }
+  assert.ok(records > 0, `no C-probe records were written below ${prefix}`);
 }
 
 async function featureSnapshot(session) {
@@ -271,6 +283,10 @@ try {
   assert.ok(cacheStats(cold.records).header_misses > 0);
   assert.ok(cacheStats(cold.records).conversion_misses > 0);
   assert.ok((await stat(databaseFile)).size > 0);
+  const defaultProbePrefix = path.dirname(databaseFile);
+  assert.equal(cold.records.find((record) => record.event === "server.start")
+    ?.probe_cache_prefix, defaultProbePrefix);
+  await assertProbeRecords(defaultProbePrefix);
 
   const warm = await withServer("warm-and-edit", async (session) => {
     assert.deepEqual(await featureSnapshot(session), cold.result);
@@ -311,13 +327,18 @@ try {
   assert.deepEqual(checkedModules(trustedHeader.records), [],
     "unchanged header timestamp caused a content check");
   await utimes(headerFile, headerTimestamp, new Date(headerTimestamp.getTime() + 1000));
-  const changedHeader = await withServer("changed-header", featureSnapshot);
+  const explicitProbePrefix = path.join(root, ".titan-ls", "explicit-probe-prefix");
+  const changedHeader = await withServer("changed-header", featureSnapshot,
+    { TITAN_PREFIX: explicitProbePrefix });
   assert.deepEqual(changedHeader.result, cold.result);
   assert.ok(checkedModules(changedHeader.records).includes("consumer"));
   assert.ok(cacheStats(changedHeader.records).header_misses > 0,
     "changed-mtime header edit reused a stale preprocessor graph");
   assert.ok(cacheStats(changedHeader.records).conversion_misses > 0,
     "header type edit reused a stale FFI conversion");
+  assert.equal(changedHeader.records.find((record) => record.event === "server.start")
+    ?.probe_cache_prefix, explicitProbePrefix);
+  await assertProbeRecords(explicitProbePrefix);
 
   await writeFile(inheritedHeaderFile, inheritedHeader(9));
   await utimes(inheritedHeaderFile, headerTimestamp,

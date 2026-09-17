@@ -20,19 +20,9 @@ local function project_inputs(snapshot: service.Snapshot): {bridge.ProjectModule
   local projects: {bridge.ProjectModule} = {}
   for index = 1, #snapshot.project_modules do
     local module = snapshot.project_modules[index]
-    local files: {bridge.SourceFile} = {}
-    for file_index = 1, #module.source_files do
-      local file = module.source_files[file_index]
-      files[file_index] = bridge.SourceFile.new(file.filename,file.contents)
-    end
-    projects[index] = bridge.ProjectModule.new(module.module_name,files)
+    projects[index] = module:compiler_input()
   end
   return projects
-end
-
-local function configure(compiler: bridge.Compiler, settings: config.ProjectConfig)
-  compiler:configure_paths(settings:source_path(),settings.binary_modules_root,
-    settings.extra_ffi_include_dirs,settings.extra_ffi_cppflags)
 end
 
 local function analysis_header_inputs(request: service.AnalysisRequest):
@@ -45,8 +35,8 @@ local function analysis_header_inputs(request: service.AnalysisRequest):
       local input = dependencies[dependency_index]
       local kind = "file"
       case input.kind
-      when file then
-      when search then kind = "search"
+      when file() then
+      when search() then kind = "search"
       end
       local key = kind .. "\0" .. input.path .. "\0" .. input.identity
       if not seen[key] then
@@ -62,18 +52,18 @@ end
 -- The Application owns this Task. Joining it never gives a query ownership of
 -- cancellation; shutdown explicitly cancels and drains it before Store.close.
 record Restoration
-  local const work: () -> {string}
-  local task: async.Task<{string}, value>?
+  local const work: function (): {string}
+  local task: async.Task<|{string}, value|>?
   local consumed: boolean
 end
 
-function restoration(work: () -> {string}): Restoration
+function restoration(work: function (): {string}): Restoration
   return Restoration.new(work,nil,false)
 end
 
-function Restoration:start(on_miss: (() -> ())?)
+function Restoration:start(on_miss: (function (): ())?)
   if self.task ~= nil then return end
-  self.task = async.run<{string},value>(function (): {string}
+  self.task = async.run<|{string},value|>(function (): {string}
     -- READY and the completed SQL View are visible before decoding starts.
     async.yield()
     local missing = self.work()
@@ -85,10 +75,10 @@ end
 function Restoration:finish(loaded: service.Service)
   self:start()
   local missing: {string} = {}
-  case async.join<{string},value>(self.task as async.Task<{string},value>)
-  when succeeded: result then missing = result
-  when failed: failure then raise failure.error
-  when cancelled then
+  case async.join<|{string},value|>(self.task)
+  when succeeded(result) then missing = result
+  when failed(failure) then raise failure.error
+  when cancelled() then
     raise async.CancellationReason.simple("project restoration was cancelled")
   else raise "project restoration did not finish"
   end
@@ -171,7 +161,12 @@ local function load_or_raise(project_root: string,
   if settings == nil then
     return nil,service.Error.new(config_error.path,config_error.message),nil
   end
-  configure(compiler,settings)
+  compiler:configure(bridge.CompilerConfiguration.new {
+    source_roots = settings.source_module_roots,
+    binary_root = settings.binary_modules_root,
+    include_roots = settings.extra_ffi_include_dirs,
+    cppflags = settings.extra_ffi_cppflags,
+  })
   local cache = caches.open_for_inventory(settings.project_root)
   local loaded?: service.Service
   local restoring: Restoration? = nil
@@ -212,14 +207,24 @@ local function load_or_raise(project_root: string,
   local analyzer: service.Analyzer = function (
       request: service.AnalysisRequest): bridge.Analysis
     if restoring ~= nil and loaded ~= nil then restoring:finish(loaded) end
-    configure(compiler,request.config)
+    compiler:configure(bridge.CompilerConfiguration.new {
+      source_roots = request.config.source_module_roots,
+      binary_root = request.config.binary_modules_root,
+      include_roots = request.config.extra_ffi_include_dirs,
+      cppflags = request.config.extra_ffi_cppflags,
+    })
     return compiler:analyze_incremental(request.project_modules,request.dirty_modules,
       request.cached_sources,progress_listener,analysis_header_inputs(request))
   end
   local resolver: service.ExternalResolver = function (
       current: config.ProjectConfig,projects: {string},
       requests: {bridge.ExternalResolutionRequest}): {bridge.ExternalResolution}
-    configure(compiler,current)
+    compiler:configure(bridge.CompilerConfiguration.new {
+      source_roots = current.source_module_roots,
+      binary_root = current.binary_modules_root,
+      include_roots = current.extra_ffi_include_dirs,
+      cppflags = current.extra_ffi_cppflags,
+    })
     return compiler:resolve_external_modules(projects,requests)
   end
   local restater: service.HeaderRestater = function (
@@ -230,8 +235,14 @@ local function load_or_raise(project_root: string,
   local failure?: service.Error
   cpu = logging.clock()
   wall = ffi.vscode_titan_monotonic_ms()
-  loaded,failure = service.create_with_store(project_root,installed_root,
-    analyzer,resolver,restater,cache.store)
+  loaded,failure = service.create {
+    settings = settings,
+    installed_binary_modules_root = installed_root,
+    analyzer = analyzer,
+    external_resolver = resolver,
+    header_restater = restater,
+    store = cache.store,
+  }
   if loaded == nil then return nil,failure,nil end
   phase("input_validation",cpu,wall)
   local unpublished = cache:unpublished_projects()
@@ -241,7 +252,12 @@ local function load_or_raise(project_root: string,
     function (snapshot: service.Snapshot): boolean
       local next_configuration = snapshot.config:semantic_identity()
       if next_configuration ~= current_configuration then
-        configure(compiler,snapshot.config)
+        compiler:configure(bridge.CompilerConfiguration.new {
+          source_roots = snapshot.config.source_module_roots,
+          binary_root = snapshot.config.binary_modules_root,
+          include_roots = snapshot.config.extra_ffi_include_dirs,
+          cppflags = snapshot.config.extra_ffi_cppflags,
+        })
         native_context = compiler:native_cache_identity()
         current_configuration = next_configuration
       end

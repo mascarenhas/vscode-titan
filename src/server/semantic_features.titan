@@ -32,7 +32,7 @@ local record SavedFile
   const coordinates: source_text.CoordinateIndex
 end
 
-type Yield = () -> ()
+type Yield = function (): ()
 
 local record ExtractionState
   const yield_now: Yield?
@@ -103,11 +103,11 @@ record PreparedView
   local const folds: {MaterializedFold}
 end
 
-local function fail<T>(message: string): T
+local function fail<|T|>(message: string): T
   raise Error.new(message)
 end
 
-local function rejected<T>(message: string): (T?, Error?)
+local function rejected<|T|>(message: string): (T?, Error?)
   return nil, Error.new(message)
 end
 
@@ -161,20 +161,20 @@ local function saved_files(projects: {bridge.ProjectModule},
   for module_index = 1, #projects do
     local module = projects[module_index]
     if modules[module.module_name] then
-      return fail<{string: SavedFile}>(
+      return fail<|{string: SavedFile}|>(
         "duplicate saved project module '" .. module.module_name .. "'")
     end
     modules[module.module_name] = true
     for file_index = 1, #module.files do
       local file = module.files[file_index]
       if result[file.filename] ~= nil then
-        return fail<{string: SavedFile}>(
+        return fail<|{string: SavedFile}|>(
           "saved source file belongs to more than one project module: " ..
           file.filename)
       end
       local coordinates? = index:coordinate_index(file.filename)
       if coordinates == nil then
-        return fail<{string: SavedFile}>(
+        return fail<|{string: SavedFile}|>(
           "semantic index omitted saved source coordinates: " ..
           file.filename)
       end
@@ -190,7 +190,7 @@ local function location_for(occurrence: indexer.Occurrence): Location
   if uri == nil then
     local detail = "invalid project source path"
     if uri_error ~= nil then detail = uri_error.message end
-    return fail<Location>(
+    return fail<|Location|>(
       "cannot encode location for '" .. occurrence.filename .. "': " ..
       detail)
   end
@@ -281,9 +281,9 @@ end
 
 local function semantic_container(kind: bridge.NodeKind): boolean
   case kind
-  when expression then return true
-  when variable then return true
-  when type_syntax then return true
+  when expression() then return true
+  when variable() then return true
+  when type_syntax() then return true
   else return false
   end
 end
@@ -316,7 +316,7 @@ local function snapshot_for_module(snapshots: {bridge.ModuleSnapshot},
     local snapshot = snapshots[index]
     if snapshot.module_name == module_name then
       case snapshot.provenance
-      when project_source then return snapshot
+      when project_source() then return snapshot
       else return nil
       end
     end
@@ -414,9 +414,9 @@ function Hover:markdown(): string
   end
   output:write("- Visibility: ")
   case self.visibility
-  when block then output:write("block\n")
-  when module then output:write("module\n")
-  when exported then output:write("exported\n")
+  when block() then output:write("block\n")
+  when module() then output:write("module\n")
+  when exported() then output:write("exported\n")
   end
   return output:drain()
 end
@@ -444,13 +444,13 @@ local function lsp_span_for_compiler_span(saved: SavedFile,
                                            span: bridge.SourceSpan):
     source_text.Span
   if span.start.filename ~= span.finish.filename then
-    return fail<source_text.Span>(
+    return fail<|source_text.Span|>(
       "compiler structural span crosses source files")
   end
   local start? = compiler_offset(saved.coordinates, span.start)
   local finish? = compiler_offset(saved.coordinates, span.finish)
   if start == nil or finish == nil or finish < start then
-    return fail<source_text.Span>(
+    return fail<|source_text.Span|>(
       "compiler structural span is outside the saved source")
   end
   local converted?, conversion_error? = saved.coordinates:span_for_offsets(
@@ -458,7 +458,7 @@ local function lsp_span_for_compiler_span(saved: SavedFile,
   if converted == nil then
     local detail = "invalid UTF-8 boundary"
     if conversion_error ~= nil then detail = conversion_error.message end
-    return fail<source_text.Span>(
+    return fail<|source_text.Span|>(
       "cannot convert compiler structural span: " .. detail)
   end
   return converted
@@ -898,7 +898,7 @@ local function replace_anchor_offsets(anchors: {PendingRenameAnchor},
     if span == nil then
       local detail = "invalid post-rename UTF-8 boundary"
       if failure ~= nil then detail = failure.message end
-      return fail<{RenameAnchor}>(detail)
+      return fail<|{RenameAnchor}|>(detail)
     end
     result[index] = RenameAnchor.new(anchor.filename, anchor.before, span)
   end
@@ -924,20 +924,20 @@ end
 function Features:rename(filename: string, position: source_text.Position,
                          new_name: string): (RenameCandidate?, Error?)
   if not lsp.valid_identifier(new_name) then
-    return rejected<RenameCandidate>(
+    return rejected<|RenameCandidate|>(
       "rename target must be a non-keyword Titan identifier")
   end
   local selected? = self.index:occurrence_at(filename, position)
   if selected == nil then return nil, nil end
   local definition? = self.index:definition(selected.symbol_id)
   if definition == nil then
-    return rejected<RenameCandidate>(
+    return rejected<|RenameCandidate|>(
       "cannot rename a symbol declared outside project source")
   end
 
   local occurrences = self.index:occurrences(selected.symbol_id, true)
   if #occurrences == 0 then
-    return rejected<RenameCandidate>(
+    return rejected<|RenameCandidate|>(
       "cannot rename a symbol with no project occurrences")
   end
   local projects = self.index:project_modules()
@@ -957,7 +957,7 @@ function Features:rename(filename: string, position: source_text.Position,
     if #current > 0 then
       local saved? = files[filenames[file_index]]
       if saved == nil then
-        return rejected<RenameCandidate>(
+        return rejected<|RenameCandidate|>(
           "rename occurrence has no saved project source")
       end
       local contents, raw_anchors, edits = edited_file(
@@ -969,7 +969,7 @@ function Features:rename(filename: string, position: source_text.Position,
       if uri == nil then
         local detail = "invalid project source path"
         if uri_error ~= nil then detail = uri_error.message end
-        return rejected<RenameCandidate>(detail)
+        return rejected<|RenameCandidate|>(detail)
       end
       documents[#documents + 1] = lsp.DocumentEdits.new(uri, edits)
     end
@@ -1029,7 +1029,7 @@ end
 function RenameCandidate:preflight(analysis: bridge.Analysis):
     (VerifiedRename?, Error?)
   if #analysis.diagnostics > 0 then
-    return rejected<VerifiedRename>(
+    return rejected<|VerifiedRename|>(
       "compiler rejected the candidate rename")
   end
 
@@ -1038,9 +1038,9 @@ function RenameCandidate:preflight(analysis: bridge.Analysis):
   for index = 1, #analysis.modules do
     local snapshot = analysis.modules[index]
     case snapshot.provenance
-    when project_source then
+    when project_source() then
       if seen_projects[snapshot.module_name] then
-        return rejected<VerifiedRename>(
+        return rejected<|VerifiedRename|>(
           "compiler returned a duplicate project snapshot")
       end
       seen_projects[snapshot.module_name] = true
@@ -1051,7 +1051,7 @@ function RenameCandidate:preflight(analysis: bridge.Analysis):
   end
   for index = 1, #self.edited_projects do
     if not seen_projects[self.edited_projects[index].module_name] then
-      return rejected<VerifiedRename>(
+      return rejected<|VerifiedRename|>(
         "compiler omitted a renamed project module")
     end
   end
@@ -1065,36 +1065,36 @@ function RenameCandidate:preflight(analysis: bridge.Analysis):
       anchor.filename, anchor.after.start)
     if occurrence == nil or occurrence.name ~= self.new_name or
        not same_source_span(occurrence.span, anchor.after) then
-      return rejected<VerifiedRename>(
+      return rejected<|VerifiedRename|>(
         "compiler did not preserve a renamed occurrence")
     end
     if resolved == nil then
       resolved = occurrence.symbol_id
     elseif resolved.declaration_id ~= occurrence.symbol_id.declaration_id then
-      return rejected<VerifiedRename>(
+      return rejected<|VerifiedRename|>(
         "candidate rename would capture or split symbol references")
     end
   end
   if resolved == nil then
-    return rejected<VerifiedRename>(
+    return rejected<|VerifiedRename|>(
       "candidate rename has no compiler-verified occurrences")
   end
 
   local definition? = checked:definition(resolved)
   if definition == nil or definition.name ~= self.new_name or
      not contains_anchor(self.anchors, definition) then
-    return rejected<VerifiedRename>(
+    return rejected<|VerifiedRename|>(
       "candidate rename did not produce one project declaration")
   end
   local occurrences = checked:occurrences(resolved, true)
   if #occurrences ~= #self.anchors then
-    return rejected<VerifiedRename>(
+    return rejected<|VerifiedRename|>(
       "candidate rename changed the resolved occurrence set")
   end
   for index = 1, #occurrences do
     if occurrences[index].name ~= self.new_name or
        not contains_anchor(self.anchors, occurrences[index]) then
-      return rejected<VerifiedRename>(
+      return rejected<|VerifiedRename|>(
         "candidate rename resolved an unexpected occurrence")
     end
   end

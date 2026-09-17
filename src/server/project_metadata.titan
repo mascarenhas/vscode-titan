@@ -20,9 +20,9 @@ record ExternalBinary
 end
 
 union ExternalOrigin
-  source: ExternalSource
-  dynamic_binary: ExternalBinary
-  static_binary: ExternalBinary
+  source(ExternalSource)
+  dynamic_binary(ExternalBinary)
+  static_binary(ExternalBinary)
 end
 
 -- This record intentionally cannot carry compiler nodes, symbols, or a raw
@@ -70,7 +70,7 @@ end
 -- typed results; no file, provenance, diagnostics, or name index lives in RAM.
 record Metadata
   const connection: sqlite3.Connection
-  local const graph: project_graph.Graph<compiler_bridge.ModuleSnapshot>
+  local const graph: project_graph.Graph<|compiler_bridge.ModuleSnapshot|>
 end
 
 local function optional_blob(candidate: string?): value
@@ -124,7 +124,7 @@ local function Batch:append(row: {value})
 end
 
 function create(connection: sqlite3.Connection,
-                graph: project_graph.Graph<compiler_bridge.ModuleSnapshot>): Metadata
+                graph: project_graph.Graph<|compiler_bridge.ModuleSnapshot|>): Metadata
   header_store.create(connection)
   local statements = {
     "CREATE TABLE IF NOT EXISTS main.project_records(name BLOB PRIMARY KEY) WITHOUT ROWID",
@@ -184,9 +184,9 @@ end
 
 local function diagnostic_code(kind: compiler_bridge.DiagnosticKind): integer
   case kind
-  when syntax then return 0
-  when type_error then return 1
-  when compiler then return 2
+  when syntax() then return 0
+  when type_error() then return 1
+  when compiler() then return 2
   end
 end
 
@@ -282,9 +282,9 @@ end
 local function origin_values(origin: ExternalOrigin?): (integer?, string?)
   if origin == nil then return nil, nil end
   case origin
-  when source: source then return 0, source.main_file
-  when dynamic_binary: binary then return 1, binary.provider_file
-  when static_binary: binary then return 2, binary.provider_file
+  when source(source) then return 0, source.main_file
+  when dynamic_binary(binary) then return 1, binary.provider_file
+  when static_binary(binary) then return 2, binary.provider_file
   end
 end
 
@@ -311,7 +311,7 @@ local function Metadata:write_origin(scope: integer, name: string,
     scope, sqlite3.Blob.new(name))
   if origin == nil then return end
   case origin
-  when source: source then
+  when source(source) then
     local insert = batch(self.connection, "external_sources", 4)
     for index = 1, #source.source_files do
       insert:append({scope, sqlite3.Blob.new(name), index,

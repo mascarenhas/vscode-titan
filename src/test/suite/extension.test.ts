@@ -1137,8 +1137,7 @@ suite("Titan extension", () => {
     const defaultedInitialization = defaulted[5];
     assert.equal(defaultedInitialization.luaPath, bundledLuaPath);
     assert.equal(defaultedInitialization.luaCPath, bundledLuaCPath);
-    assert.ok(defaultedInitialization.compilerCachePrefix);
-    assert.ok(path.isAbsolute(defaultedInitialization.compilerCachePrefix));
+    assert.equal(defaultedInitialization.compilerCachePrefix, process.env.TITAN_PREFIX);
 
     await vscode.workspace.getConfiguration("titan.languageServer").update(
       "path",
@@ -1186,12 +1185,8 @@ function assertInitialization(
   assert.deepEqual(event.arguments, ["--fixture-token", token]);
   assert.equal(event.luaPath, luaPath);
   assert.equal(event.luaCPath, luaCPath);
-  assert.ok(event.compilerCachePrefix);
-  assert.ok(path.isAbsolute(event.compilerCachePrefix));
-  assert.ok(
-    event.compilerCachePrefix.split(path.sep).includes("workspaceStorage"),
-    "probe records should use workspace storage"
-  );
+  assert.equal(event.compilerCachePrefix, process.env.TITAN_PREFIX,
+    "the native server owns the default probe-cache location");
   assert.equal(event.serverLogLevel, "info");
   assert.equal(event.trace, "off");
   assert.equal(event.rootPath, folder.uri.fsPath);

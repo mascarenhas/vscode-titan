@@ -192,7 +192,8 @@ describe("Titan language configuration", () => {
     assert.deepEqual(configuration.brackets, [
       ["{", "}"],
       ["[", "]"],
-      ["(", ")"]
+      ["(", ")"],
+      ["<|", "|>"]
     ]);
     assert.ok(
       configuration.autoClosingPairs.some(
@@ -231,6 +232,11 @@ describe("Titan language configuration", () => {
       assert.match(deferredBlock, increasesIndent);
     }
     assert.doesNotMatch("defer cleanup()", increasesIndent);
+    assert.doesNotMatch("function: integer = 1", increasesIndent);
+    assert.doesNotMatch("record = 2", increasesIndent);
+    assert.doesNotMatch("end: integer = 3", decreasesIndent);
+    assert.match("function Box<|T|>:unwrap(): T", increasesIndent);
+    assert.match("when some(item) then", increasesIndent);
     assert.match("else -- fallback", increasesIndent);
     assert.match("else -- fallback", decreasesIndent);
   });

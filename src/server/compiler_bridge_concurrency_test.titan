@@ -6,6 +6,7 @@ local test = import "test"
 local timer = import "timer"
 foreign import "utime.h"
 local bridge = import "server.compiler_bridge.titan"
+local compiler_scheduler = import "server.compiler_scheduler"
 local test_runtime = import "server.test_runtime"
 
 local DRIVER_MODULE = "titan-compiler.driver"
@@ -28,7 +29,7 @@ local function assert_external_provider(analysis: bridge.Analysis,
   test.assert(found ~= nil, subject .. " omitted the external module")
   local snapshot: bridge.ModuleSnapshot = found
   case snapshot.provenance
-  when external_source: source then
+  when external_source(source) then
     test.assert(source.main_file == expected_file,
                 subject .. " selected another Compiler's source provider")
     test.assert(#source.source_files == 1 and
@@ -46,37 +47,37 @@ local function source_file_of(result: {bridge.ExternalResolution},
     raise "unexpected external resolution for " .. module_name
   end
   case result[1].provenance as bridge.Provenance
-  when external_source: source then return source.main_file
+  when external_source(source) then return source.main_file
   else raise "external resolution did not select source"
   end
 end
 
-local function join_nil(task: async.Task<nil, value>, subject: string)
-  case async.join<nil, value>(task)
-  when succeeded then
-  when failed: failure then
+local function join_nil(task: async.Task<|nil, value|>, subject: string)
+  case async.join<|nil, value|>(task)
+  when succeeded() then
+  when failed(failure) then
     raise subject .. " failed: " .. strings.tostring(failure.error)
-  when cancelled then raise subject .. " was cancelled"
+  when cancelled() then raise subject .. " was cancelled"
   else raise subject .. " did not finish"
   end
 end
 
-local function join_analysis(task: async.Task<bridge.Analysis, value>,
+local function join_analysis(task: async.Task<|bridge.Analysis, value|>,
                              subject: string): bridge.Analysis
-  case async.join<bridge.Analysis, value>(task)
-  when succeeded: analysis then return analysis
-  when failed: failure then
+  case async.join<|bridge.Analysis, value|>(task)
+  when succeeded(analysis) then return analysis
+  when failed(failure) then
     raise subject .. " failed: " .. strings.tostring(failure.error)
-  when cancelled then raise subject .. " was cancelled"
+  when cancelled() then raise subject .. " was cancelled"
   else raise subject .. " did not finish"
   end
 end
 
-local type RestoreDriverResolver = () -> ()
-local type ObserveDriverHandoff = () -> (integer, boolean)
-local type ObserveDriverRestoration = () -> boolean
+local type RestoreDriverResolver = function (): ()
+local type ObserveDriverHandoff = function (): (integer, boolean)
+local type ObserveDriverRestoration = function (): boolean
 local type InstallDriverHandoffObserver =
-  ({string: value}) ->
+  function ({string: value}):
     (RestoreDriverResolver, ObserveDriverHandoff,
      ObserveDriverRestoration)
 
@@ -89,16 +90,21 @@ return function(driver)
   local original_resolver = driver.resolve_external_modules
   local original_cppflags = driver.EXTRA_CPPFLAGS
   local calls = 0
-  local restored_at_handoff = false
+  local configured_at_handoff = false
   driver.resolve_external_modules = function(...)
     calls = calls + 1
-    restored_at_handoff = driver.EXTRA_CPPFLAGS == original_cppflags
+    local required, forbidden = false, false
+    for _, flag in ipairs(driver.EXTRA_CPPFLAGS or {}) do
+      if flag == "-DBRIDGE_CONCURRENCY_CPPFLAGS_B=1" then required = true end
+      if flag == "-DBRIDGE_CONCURRENCY_CPPFLAGS_A=1" then forbidden = true end
+    end
+    configured_at_handoff = required and not forbidden
     return original_resolver(...)
   end
   return function()
     driver.resolve_external_modules = original_resolver
   end, function()
-    return calls, restored_at_handoff
+    return calls, configured_at_handoff
   end, function()
     return driver.EXTRA_CPPFLAGS == original_cppflags
   end
@@ -171,9 +177,9 @@ typedef int bridge_concurrency_cppflags_b_int;
       "function answer(): integer return 42 end\n")
   })
   local compiler_a = bridge.load()
-  compiler_a:configure_paths(nil, nil, nil, CPPFLAGS_A)
+  compiler_a:configure(bridge.CompilerConfiguration.new { cppflags = CPPFLAGS_A })
   local compiler_b = bridge.load()
-  compiler_b:configure_paths(nil, nil, nil, CPPFLAGS_B)
+  compiler_b:configure(bridge.CompilerConfiguration.new { cppflags = CPPFLAGS_B })
   local driver = lua.require(DRIVER_MODULE) as {string: value}
   local restore_resolver, observe_handoff, observe_restoration =
     install_driver_handoff_observer(driver)
@@ -188,9 +194,9 @@ typedef int bridge_concurrency_cppflags_b_int;
   local b_checkpoint = false
   local b_checkpoint_flags = false
   local b_restored_after_analysis = false
-  local b_task: async.Task<bridge.Analysis, value>? = nil
+  local b_task: async.Task<|bridge.Analysis, value|>? = nil
 
-  local a_task = async.run<bridge.Analysis, value>(
+  local a_task = async.run<|bridge.Analysis, value|>(
     function (): bridge.Analysis
       defer a_finished = true
       return compiler_a:analyze_incremental(
@@ -201,15 +207,15 @@ typedef int bridge_concurrency_cppflags_b_int;
             a_checkpoint = true
             a_checkpoint_flags = cppflags_include_without(
               driver, CPPFLAGS_A, CPPFLAGS_B)
-            b_task = async.run<bridge.Analysis, value>(
+            b_task = async.run<|bridge.Analysis, value|>(
               function (): bridge.Analysis
                 b_started_before_a_finished = not a_finished
                 b_started_with_a_flags = cppflags_include_without(
                   driver, CPPFLAGS_A, CPPFLAGS_B)
                 local empty = compiler_b:resolve_external_modules({}, {})
-                local handoff_calls, restored = observe_handoff()
+                local handoff_calls, configured = observe_handoff()
                 b_handoff_restored = #empty == 0 and
-                  handoff_calls == 1 and restored
+                  handoff_calls == 1 and configured and observe_restoration()
                 local analysis = compiler_b:analyze_incremental(
                   {project_b}, {CPPFLAGS_MODULE_B}, {},
                   function (b_progress: bridge.AnalysisProgress)
@@ -234,7 +240,7 @@ typedef int bridge_concurrency_cppflags_b_int;
   test.assert(b_task ~= nil,
               "Compiler A did not yield at its published-module checkpoint")
   local analysis_b = join_analysis(
-    b_task as async.Task<bridge.Analysis, value>,
+    b_task as async.Task<|bridge.Analysis, value|>,
     "Compiler B cppflags analysis")
   test.assert(#analysis_b.diagnostics == 0 and
               analysis_b:find_module(CPPFLAGS_MODULE_B) ~= nil,
@@ -244,7 +250,7 @@ typedef int bridge_concurrency_cppflags_b_int;
               "Compiler B did not queue while yielding Compiler A owned " ..
               "its preprocessing flags")
   test.assert(b_handoff_restored,
-              "driver.EXTRA_CPPFLAGS was not restored before permit handoff")
+              "resolver used another compiler's flags or failed to restore the driver")
   test.assert(b_checkpoint and b_checkpoint_flags,
               "Compiler B inherited Compiler A preprocessing flags")
   test.assert(b_restored_after_analysis and observe_restoration(),
@@ -254,6 +260,78 @@ end
 function test_compiler_bridge_isolates_cppflags_across_yielding_analysis(
     _context: test.Context)
   test_runtime.run(isolates_cppflags_across_yielding_analysis)
+end
+
+function test_compiler_bridge_load_waits_for_inherited_driver_configuration(
+    _context: test.Context)
+  test_runtime.run(function ()
+    local inherited_root = temporary_root()
+    defer fs.rmdir(inherited_root)
+    local source = inherited_root .. "/load_default.titan"
+    fs.write_file(source, "function answer(): integer return 42 end\n")
+    defer fs.unlink(source)
+    local initial = bridge.load()
+    local driver = initial.driver
+    local previous_source: value = driver["TITAN_SOURCE_PATH"]
+    local previous_binary: value = driver["TITAN_BIN_PATH"]
+    local previous_flags: value = driver["EXTRA_CPPFLAGS"]
+    defer do
+      driver["TITAN_SOURCE_PATH"] = previous_source
+      driver["TITAN_BIN_PATH"] = previous_binary
+      driver["EXTRA_CPPFLAGS"] = previous_flags
+    end
+    driver["TITAN_SOURCE_PATH"] = inherited_root
+    driver["TITAN_BIN_PATH"] = ""
+    local inherited_flags: {integer: value} = {[1] = "-DLOAD_BASELINE=1"}
+    driver["EXTRA_CPPFLAGS"] = inherited_flags
+    local first = bridge.load()
+    first:configure(bridge.CompilerConfiguration.new {
+      source_roots = {"/other-workspace"}, cppflags = "-DOTHER_WORKSPACE=1",
+    })
+    local loading: async.Task<|bridge.Compiler, value|>?
+    defer do
+      if loading ~= nil then
+        if not loading:status():has_finished() then loading:cancel() end
+        async.join(loading)
+      end
+    end
+    do
+      local permit = compiler_scheduler.acquire()
+      defer permit:release()
+      local previous = first:install_configuration()
+      defer previous:apply()
+      loading = async.run<|bridge.Compiler, value|>(function (): bridge.Compiler
+        return bridge.load()
+      end)
+      while loading:status():as_string() == "ready" do timer.yield() end
+      test.assert(loading:status():as_string() == "waiting",
+                  "compiler load captured another workspace's active configuration")
+    end
+    local second: bridge.Compiler?
+    case async.join(loading)
+    when succeeded(compiler) then second = compiler
+    when failed(failure) then raise failure.error
+    else raise "compiler load did not finish"
+    end
+    local resolution = second:resolve_external_modules({}, {
+      bridge.ExternalResolutionRequest.new("load_default", true),
+    })
+    test.assert(#resolution == 1 and resolution[1].provenance ~= nil,
+                "new compiler inherited another workspace's source roots")
+    case resolution[1].provenance
+    when external_source(found) then
+      test.assert(found.main_file == source,
+                  "new compiler resolved against the temporary workspace roots")
+    else raise "new compiler did not resolve its inherited source provider"
+    end
+    local permit = compiler_scheduler.acquire()
+    defer permit:release()
+    local previous = second:install_configuration()
+    defer previous:apply()
+    local flags = driver["EXTRA_CPPFLAGS"] as {integer: string}
+    test.assert(#flags == 1 and flags[1] == "-DLOAD_BASELINE=1",
+                "new compiler inherited another workspace's preprocessing flags")
+  end)
 end
 
 local function serializes_real_compilers_across_cancellation()
@@ -279,13 +357,13 @@ local function serializes_real_compilers_across_cancellation()
   })
 
   local compiler_a = bridge.load()
-  compiler_a:configure_paths(root_a, "", {})
+  compiler_a:configure(bridge.CompilerConfiguration.new { source_roots = {root_a}, binary_root = "", include_roots = {} })
   local compiler_b = bridge.load()
-  compiler_b:configure_paths(root_b, "", {})
+  compiler_b:configure(bridge.CompilerConfiguration.new { source_roots = {root_b}, binary_root = "", include_roots = {} })
   local driver = lua.require(DRIVER_MODULE) as {string: value}
 
   local a_started = false
-  local a_task = async.run<bridge.Analysis, value>(function (): bridge.Analysis
+  local a_task = async.run<|bridge.Analysis, value|>(function (): bridge.Analysis
     a_started = true
     return compiler_a:analyze(PROJECT_A, {project_a})
   end)
@@ -308,18 +386,18 @@ local function serializes_real_compilers_across_cancellation()
     end
     if active_provider == nil then
       if a_task:status():has_finished() then
-        case async.join<bridge.Analysis, value>(a_task)
-        when succeeded: analysis then
+        case async.join<|bridge.Analysis, value|>(a_task)
+        when succeeded(analysis) then
           local messages = strings.writer()
           for index = 1, #analysis.diagnostics do
             messages:write("\n" .. analysis.diagnostics[index].message)
           end
           raise "Compiler A finished before publishing its external provider" ..
                 messages:drain()
-        when failed: failure then
+        when failed(failure) then
           raise "Compiler A failed before publishing its external provider: " ..
                 strings.tostring(failure.error)
-        when cancelled then
+        when cancelled() then
           raise "Compiler A was cancelled before the test requested it"
         else
           raise "finished Compiler A analysis had a nonterminal status"
@@ -343,7 +421,7 @@ local function serializes_real_compilers_across_cancellation()
   local b_saw_provider = ""
   local a_status_after_b_resolution = "not-resolved"
   local b_provider?: string = nil
-  local b_task = async.run<nil, value>(function (): nil
+  local b_task = async.run<|nil, value|>(function (): nil
     b_started = true
     b_saw_a_status = a_task:status():as_string()
     b_saw_source_path = driver["TITAN_SOURCE_PATH"]
@@ -380,7 +458,7 @@ local function serializes_real_compilers_across_cancellation()
   test.assert(b_provider == provider_b,
               "Compiler B resolved another Compiler's source provider")
 
-  local a_terminal = async.join<bridge.Analysis, value>(a_task)
+  local a_terminal = async.join<|bridge.Analysis, value|>(a_task)
   test.assert(a_terminal:as_string() == "cancelled",
               "Compiler A did not finish with cancellation")
 
@@ -395,10 +473,10 @@ end
 
 local CLEANUP_MODULE = "bridge_concurrency_ffi_cleanup"
 
-local type RestoreProbeProvider = () -> ()
-local type ObserveProbeWorkspace = () -> string?
+local type RestoreProbeProvider = function (): ()
+local type ObserveProbeWorkspace = function (): string?
 local type InstallProbeWorkspaceObserver =
-  ({string: value}) -> (RestoreProbeProvider, ObserveProbeWorkspace)
+  function ({string: value}): (RestoreProbeProvider, ObserveProbeWorkspace)
 
 local function tmp_entries(): {string: boolean}
   local result: {string: boolean} = {}
@@ -452,12 +530,12 @@ local function cancels_ffi_analysis_and_transfers_cleanup()
     bridge.SourceFile.new(
       root .. "/" .. CLEANUP_MODULE .. ".titan",
       "foreign import \"bridge_concurrency_cleanup.h\"\n" ..
-      "local function probe_pointer(pointer: *ffi.bridge_cleanup_source): " ..
-      "*ffi.bridge_cleanup_target\n" ..
+      "local function probe_pointer(pointer: foreign *bridge_cleanup_source): " ..
+      "foreign *bridge_cleanup_target\n" ..
       "  return pointer\n" ..
       "end\n" ..
-      "foreign function identity(input: ffi.bridge_concurrency_cleanup_int): " ..
-      "ffi.bridge_concurrency_cleanup_int\n" ..
+      "foreign function identity(input: bridge_concurrency_cleanup_int): " ..
+      "bridge_concurrency_cleanup_int\n" ..
       "  return input\n" ..
       "end\n")
   })
@@ -469,7 +547,7 @@ local function cancels_ffi_analysis_and_transfers_cleanup()
   defer restore_probe_provider()
 
   local started = false
-  local analysis_task = async.run<bridge.Analysis, value>(
+  local analysis_task = async.run<|bridge.Analysis, value|>(
     function (): bridge.Analysis
       started = true
       return compiler:analyze(CLEANUP_MODULE, {project})
@@ -505,18 +583,18 @@ local function cancels_ffi_analysis_and_transfers_cleanup()
     end
     if checking_ffi_header == nil then
       if analysis_task:status():has_finished() then
-        case async.join<bridge.Analysis, value>(analysis_task)
-        when succeeded: analysis then
+        case async.join<|bridge.Analysis, value|>(analysis_task)
+        when succeeded(analysis) then
           local messages = strings.writer()
           for index = 1, #analysis.diagnostics do
             messages:write("\n" .. analysis.diagnostics[index].message)
           end
           raise "FFI analysis finished before its post-module yield" ..
                 messages:drain()
-        when failed: failure then
+        when failed(failure) then
           raise "FFI analysis failed before its post-module yield: " ..
                 strings.tostring(failure.error)
-        when cancelled then
+        when cancelled() then
           raise "FFI analysis was cancelled before the test requested it"
         else
           raise "finished FFI analysis had a nonterminal status"
@@ -544,7 +622,7 @@ local function cancels_ffi_analysis_and_transfers_cleanup()
 
   analysis_task:cancel(async.CancellationReason.simple(
     "cancel FFI analysis at its post-module yield"))
-  local terminal = async.join<bridge.Analysis, value>(analysis_task)
+  local terminal = async.join<|bridge.Analysis, value|>(analysis_task)
   test.assert(terminal:as_string() == "cancelled",
               "FFI analysis did not finish with cancellation")
 
@@ -596,7 +674,7 @@ local function lua_proxy_resumes_titan_async_method()
   fs.write_file(path, "read through Titan async fs")
 
   local strategy = LuaProxyIoStrategy.new(path, 0, false)
-  local observer = async.run<nil, value>(function (): nil
+  local observer = async.run<|nil, value|>(function (): nil
     test.assert(strategy.phase == 1,
                 "Lua did not remain inside the yielding Titan method")
     strategy.observed_while_yielded = true
@@ -612,7 +690,7 @@ return function(strategy)
   return contents
 end
 ]==], "=compiler_bridge_io_strategy_proxy", nil)() as
-    (LuaProxyIoStrategy) -> string
+    function (LuaProxyIoStrategy): string
 
   local contents = invoke(strategy)
   test.assert(contents == "read through Titan async fs",
@@ -638,7 +716,7 @@ local function large_hover_summary_normalization_yields()
   local started = false
   local finished = false
   local normalized: {string} = {}
-  local normalization = async.run<nil, value>(function (): nil
+  local normalization = async.run<|nil, value|>(function (): nil
     started = true
     defer finished = true
     normalized = bridge.summary_lines(
@@ -647,7 +725,7 @@ local function large_hover_summary_normalization_yields()
   end)
 
   local observer_turns = 0
-  local observer = async.run<nil, value>(function (): nil
+  local observer = async.run<|nil, value|>(function (): nil
     while not started do async.yield() end
     while not finished do
       observer_turns = observer_turns + 1
@@ -697,7 +775,7 @@ local function large_diagnostic_normalization_yields()
   local diagnostics: {bridge.Diagnostic} = {}
   local failed: {string: boolean} = {}
   local names: {string} = {}
-  local normalization = async.run<nil, value>(function (): nil
+  local normalization = async.run<|nil, value|>(function (): nil
     started = true
     defer finished = true
     local work = bridge.NormalizationWork.new(0)
@@ -715,7 +793,7 @@ local function large_diagnostic_normalization_yields()
 
   local observer_turns = 0
   local phase_turns: {integer} = {0, 0, 0, 0}
-  local observer = async.run<nil, value>(function (): nil
+  local observer = async.run<|nil, value|>(function (): nil
     while not started do async.yield() end
     while not finished do
       observer_turns = observer_turns + 1
@@ -749,13 +827,13 @@ function test_compiler_bridge_yields_during_large_diagnostic_normalization(
   test_runtime.run(large_diagnostic_normalization_yields)
 end
 
-local type PayloadHookCounts = () -> (integer,integer,integer,integer)
-local type PayloadCheckpointBarrier = (string?) -> ()
-local type InstallPayloadHooks = ({string: value}) ->
-  (() -> (),PayloadHookCounts,PayloadCheckpointBarrier)
+local type PayloadHookCounts = function (): (integer,integer,integer,integer)
+local type PayloadCheckpointBarrier = function (string?): ()
+local type InstallPayloadHooks = function ({string: value}):
+  (function (): (),PayloadHookCounts,PayloadCheckpointBarrier)
 
 local function observe_payload_hooks(driver: {string: value}):
-    (() -> (),PayloadHookCounts,PayloadCheckpointBarrier)
+    (function (): (),PayloadHookCounts,PayloadCheckpointBarrier)
   local install = lua.load([==[
 return function(driver)
   local names = {"encode_project_entry", "decode_project_entry",
@@ -810,7 +888,7 @@ local function cancel_project_restore_at_checkpoint(
   barrier(phase)
   defer barrier(nil)
   local compiler = bridge.load()
-  local task = async.run<{string},value>(function (): {string}
+  local task = async.run<|{string},value|>(function (): {string}
     return compiler:restore_projects(projects,payloads)
   end)
   defer do
@@ -838,8 +916,8 @@ local function cancel_project_restore_at_checkpoint(
   end
   local cancellation = false
   case async.join(task)
-  when cancelled then cancellation = true
-  when failed: failure then raise failure.error
+  when cancelled() then cancellation = true
+  when failed(failure) then raise failure.error
   else
   end
   local _encoded, final_decode, final_assembly, _compacted = counts()
@@ -910,10 +988,10 @@ function test_compiler_bridge_large_payload_restoration_yields_and_cleans_up(
   test_runtime.run(large_project_payload_restoration_yields_and_cleans_up)
 end
 
-local type HeaderReadCounts = () -> (integer,integer)
-local type InstallHeaderReadObserver = ({string: value}) -> (() -> (),HeaderReadCounts)
+local type HeaderReadCounts = function (): (integer,integer)
+local type InstallHeaderReadObserver = function ({string: value}): (function (): (),HeaderReadCounts)
 
-local function observe_header_reads(driver: {string: value}): (() -> (),HeaderReadCounts)
+local function observe_header_reads(driver: {string: value}): (function (): (),HeaderReadCounts)
   local install = lua.load([==[
 return function(driver)
   local original = driver.new_resolver_context
@@ -937,15 +1015,15 @@ local function live_header_touch_uses_current_analysis_baselines()
   local header = root .. "/live_observed.h"
   fs.write_file(header,"typedef long live_observed_word;\n")
   defer do fs.unlink(header); fs.rmdir(root) end
-  local times = ffi.utimbuf.new()
+  local times = foreign utimbuf.new()
   times.actime = 1700000000
   times.modtime = 1700000000
   test.assert(ffi.utime(header,times) == 0,"cannot set initial header timestamp")
   local provider = bridge.ProjectModule.new("live_observed_provider",{
     bridge.SourceFile.new(root .. "/live_observed_provider.titan",
       "foreign import \"" .. header .. "\"\n" ..
-      "local function cast(item: integer): ffi.live_observed_word return item end\n")})
-  local consumer_source: (integer) -> string = function (amount: integer): string
+      "local function cast(item: integer): foreign live_observed_word return item end\n")})
+  local consumer_source: function (integer): string = function (amount: integer): string
     return "local provider = import \"live_observed_provider.titan\"\n" ..
       "function answer(): integer return provider.cast(" .. amount .. ") end\n"
   end
@@ -967,8 +1045,8 @@ local function live_header_touch_uses_current_analysis_baselines()
       local input = dependencies[index]
       local kind = "file"
       case input.kind
-      when file then
-      when search then kind = "search"
+      when file() then
+      when search() then kind = "search"
       end
       local key = kind .. "\0" .. input.path
       if not seen[key] then seen[key] = true; inputs[#inputs + 1] = input end

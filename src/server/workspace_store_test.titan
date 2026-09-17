@@ -6,11 +6,11 @@ local test = import "test"
 local stores = import "server.workspace_store"
 local test_runtime = import "server.test_runtime"
 
-local function joins(task: async.Task<nil, value>, subject: string)
-  case async.join<nil, value>(task)
-  when succeeded then
-  when cancelled then
-  when failed: failure then raise subject .. ": " .. strings.tostring(failure.error)
+local function joins(task: async.Task<|nil, value|>, subject: string)
+  case async.join<|nil, value|>(task)
+  when succeeded() then
+  when cancelled() then
+  when failed(failure) then raise subject .. ": " .. strings.tostring(failure.error)
   else raise subject .. " did not finish"
   end
 end
@@ -22,14 +22,14 @@ function test_workspace_store_serializes_operations_and_cancelled_reservations(
     defer store:close()
     local first = store:acquire()
     local trace = ""
-    local cancelled = async.run<nil, value>(function (): nil
+    local cancelled = async.run<|nil, value|>(function (): nil
       local access = store:acquire()
       defer access:release()
       trace = trace .. "cancelled>"
       return nil
     end)
     async.yield()
-    local second = async.run<nil, value>(function (): nil
+    local second = async.run<|nil, value|>(function (): nil
       local access = store:acquire()
       defer access:release()
       stores.scalar_integer(access.connection, "SELECT published_generation " ..
@@ -46,14 +46,14 @@ function test_workspace_store_serializes_operations_and_cancelled_reservations(
     test.assert(trace == "second>", "cancelled waiter kept connection ownership")
 
     local held = store:acquire()
-    local granted = async.run<nil, value>(function (): nil
+    local granted = async.run<|nil, value|>(function (): nil
       local access = store:acquire()
       defer access:release()
       trace = trace .. "granted>"
       return nil
     end)
     async.yield()
-    local successor = async.run<nil, value>(function (): nil
+    local successor = async.run<|nil, value|>(function (): nil
       local access = store:acquire()
       defer access:release()
       trace = trace .. "successor>"
@@ -77,7 +77,7 @@ function test_workspace_store_close_waits_for_the_writer_transaction(
     stores.execute(writer.connection,
       "UPDATE main.store_state SET published_generation=7 WHERE singleton=1")
     local closed = false
-    local closer = async.run<nil, value>(function (): nil
+    local closer = async.run<|nil, value|>(function (): nil
       store:close()
       closed = true
       return nil

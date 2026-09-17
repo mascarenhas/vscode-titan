@@ -34,16 +34,18 @@ function usage() {
   --timeout-ms N      Deadline per startup/edit (default: 1800000)
   --queries N         Samples per feature and phase (default: 5)
   --python PATH       Python 3 for exact timestamp restore and read-only SQL
+  --startup-only      Measure cold and unchanged restart without comment edits
   --keep-database     Retain the measured database in the evidence directory
   --help              Show this help
 
 Runs cold startup, unchanged restart, one saved source comment edit, and
-startup after a header comment edit with a changed mtime. Measures SQL readiness,
+startup after a header comment edit with a changed mtime. With --startup-only,
+run just the cold and unchanged restart processes. Measures SQL readiness,
 background restoration completion, and query latency throughout restoration.
 Temporarily moves aside an existing .titan-ls and restores it afterward.
 Restores the target's original bytes and nanosecond atime/mtime in finally.
 Each run retains a fresh format-2 probe cache under OUTPUT/probe-prefix, shared
-by its three server processes and excluded from workspace database byte totals.
+by all measured processes and excluded from workspace database byte totals.
 TITAN_PROBE_CACHE_DISABLE=1 is rejected; compiler discovery keeps its real prefix.
 Do not run concurrently with another server or source edits in that workspace.
 Trace logging is always enabled; OS page caches are not flushed.`;
@@ -56,7 +58,7 @@ function parseArguments(arguments_) {
     marker: "return same_lstat_identity(left as LstatIdentity, right as LstatIdentity)",
     symbol: "same_lstat_identity", header: "src/server/compiler_io_clock.h",
     timeoutMs: 1_800_000, queries: 5, python: "python3",
-    keepDatabase: false
+    keepDatabase: false, startupOnly: false
   };
   const fields = new Map([
     ["--server", "server"], ["--root", "root"], ["--file", "file"], ["--header", "header"],
@@ -67,6 +69,7 @@ function parseArguments(arguments_) {
   for (let index = 0; index < arguments_.length; index += 1) {
     const flag = arguments_[index];
     if (flag === "--help") return { help: true };
+    if (flag === "--startup-only") { options.startupOnly = true; continue; }
     if (flag === "--keep-database") { options.keepDatabase = true; continue; }
     const field = fields.get(flag);
     assert.ok(field, `unknown argument: ${flag}`);
@@ -776,7 +779,7 @@ async function benchmark(options) {
       cpuModel: os.cpus()[0]?.model, logicalCpus: os.cpus().length, totalMemoryBytes: os.totalmem(),
       node: process.version, clockTicksPerSecond: target.ticks },
     checkout: checkoutState(options.root),
-    setup: { logLevel: "trace", probeCache, queriesPerFeature: options.queries,
+    setup: { logLevel: "trace", startupOnly: options.startupOnly, probeCache, queriesPerFeature: options.queries,
       timeoutMs: options.timeoutMs, osPageCacheFlushed: false, source: inputEvidence(target),
       header: inputEvidence(target.header),
       inheritedProbeCacheDisable: process.env.TITAN_PROBE_CACHE_DISABLE ?? null,
@@ -803,56 +806,63 @@ async function benchmark(options) {
     if (target.cacheMetadata) { await rename(target.cache, backup); movedCache = true; }
     ownsCache = true;
     report.cold = await runSession(options, target, "cold", probeCache, false);
-    report.restart = await runSession(options, target, "restart-and-edit", probeCache, true);
-    report.reuseAssertions = { unchangedRestart: false, sparseImporter: false, changedHeader: false };
+    report.restart = await runSession(options, target,
+      options.startupOnly ? "restart" : "restart-and-edit", probeCache, !options.startupOnly);
+    report.reuseAssertions = { unchangedRestart: false,
+      ...(options.startupOnly ? {} : { sparseImporter: false, changedHeader: false }) };
     assertWarmReuse(report.restart.initialWork);
     for (const field of ["header_file_reads","header_file_hashes"]) {
       assert.equal(report.restart.manifestRestoration.work.cacheStats?.[field],0,
         `background restoration performed ${field}`);
-      assert.equal(report.restart.savedEdit.work.cacheStats?.[field],0,
+      if (!options.startupOnly) assert.equal(report.restart.savedEdit.work.cacheStats?.[field],0,
         `restoration or importer-only editing performed ${field}`);
     }
     report.reuseAssertions.unchangedRestart = true;
-    assertImporterReuse(report.restart.savedEdit.work, options.moduleName);
-    report.reuseAssertions.sparseImporter = true;
-    interrupted(options);
-    assert.ok((await readFile(target.header.filename)).equals(target.header.original),
-      "header changed independently before its comment edit; refusing to overwrite it");
-    const headerMutationStarted = performance.now();
-    interrupted(options);
-    await writeFile(target.header.filename, target.header.edited);
-    const changedHeaderTime = BigInt(Date.now()) * 1_000_000n > target.header.metadata.mtimeNs
-      ? BigInt(Date.now()) * 1_000_000n : target.header.metadata.mtimeNs + 1_000_000_000n;
-    python(options,"import os, sys; os.utime(sys.argv[1], ns=(int(sys.argv[2]),int(sys.argv[3])))",
-      [target.header.filename,String(target.header.metadata.atimeNs),String(changedHeaderTime)]);
-    const headerMutationWallMs = round(performance.now() - headerMutationStarted);
-    report.headerChange = await runSession(options, target, "changed-header", probeCache, false);
-    report.headerChange.mutation = { wallMs: headerMutationWallMs, mtimePreserved: false,
-      originalBytes: target.header.original.length, changedBytes: target.header.edited.length,
-      scenario: "header-only bytes changed while the server was closed; preceding saved source edit retained" };
-    assertHeaderInvalidation(report.headerChange.initialWork, options.moduleName);
-    report.reuseAssertions.changedHeader = true;
     const restartWork = report.restart.initialWork;
-    const editWork = report.restart.savedEdit.work;
     report.cacheBehavior = {
       restartAvoidedSourceAnalysis: restartWork.analysisCalls === 0 && restartWork.sourceProfileCalls === 0,
-      restartReencodedProjects: restartWork.encodedProjects.reduce((sum, record) => sum + record.modules, 0),
-      savedEditProfileVisitedModules: editWork.sourceModules,
-      savedEditParsedModules: editWork.parsedSourceModules,
-      savedEditCheckedModules: editWork.checkedSourceModules,
-      savedEditAvoidedHeaderPreprocessAndParse: editWork.preprocessingCalls === 0 && editWork.headerParseCalls === 0,
-      savedEditFfiReplayHits: editWork.ffiReplayHits,
-      savedEditFfiConversionCalls: editWork.ffiConversionCalls,
-      headerChangeProfileVisitedModules: report.headerChange.initialWork.sourceModules,
-      headerChangeParsedModules: report.headerChange.initialWork.parsedSourceModules,
-      headerChangeCheckedModules: report.headerChange.initialWork.checkedSourceModules,
-      headerChangePreprocessingCalls: report.headerChange.initialWork.preprocessingCalls,
-      headerChangeFfiConversionCalls: report.headerChange.initialWork.ffiConversionCalls
+      restartReencodedProjects: restartWork.encodedProjects.reduce((sum, record) => sum + record.modules, 0)
     };
+    if (!options.startupOnly) {
+      assertImporterReuse(report.restart.savedEdit.work, options.moduleName);
+      report.reuseAssertions.sparseImporter = true;
+      interrupted(options);
+      assert.ok((await readFile(target.header.filename)).equals(target.header.original),
+        "header changed independently before its comment edit; refusing to overwrite it");
+      const headerMutationStarted = performance.now();
+      interrupted(options);
+      await writeFile(target.header.filename, target.header.edited);
+      const changedHeaderTime = BigInt(Date.now()) * 1_000_000n > target.header.metadata.mtimeNs
+        ? BigInt(Date.now()) * 1_000_000n : target.header.metadata.mtimeNs + 1_000_000_000n;
+      python(options,"import os, sys; os.utime(sys.argv[1], ns=(int(sys.argv[2]),int(sys.argv[3])))",
+        [target.header.filename,String(target.header.metadata.atimeNs),String(changedHeaderTime)]);
+      const headerMutationWallMs = round(performance.now() - headerMutationStarted);
+      report.headerChange = await runSession(options, target, "changed-header", probeCache, false);
+      report.headerChange.mutation = { wallMs: headerMutationWallMs, mtimePreserved: false,
+        originalBytes: target.header.original.length, changedBytes: target.header.edited.length,
+        scenario: "header-only bytes changed while the server was closed; preceding saved source edit retained" };
+      assertHeaderInvalidation(report.headerChange.initialWork, options.moduleName);
+      report.reuseAssertions.changedHeader = true;
+      const editWork = report.restart.savedEdit.work;
+      report.cacheBehavior = {
+        ...report.cacheBehavior,
+        savedEditProfileVisitedModules: editWork.sourceModules,
+        savedEditParsedModules: editWork.parsedSourceModules,
+        savedEditCheckedModules: editWork.checkedSourceModules,
+        savedEditAvoidedHeaderPreprocessAndParse: editWork.preprocessingCalls === 0 && editWork.headerParseCalls === 0,
+        savedEditFfiReplayHits: editWork.ffiReplayHits,
+        savedEditFfiConversionCalls: editWork.ffiConversionCalls,
+        headerChangeProfileVisitedModules: report.headerChange.initialWork.sourceModules,
+        headerChangeParsedModules: report.headerChange.initialWork.parsedSourceModules,
+        headerChangeCheckedModules: report.headerChange.initialWork.checkedSourceModules,
+        headerChangePreprocessingCalls: report.headerChange.initialWork.preprocessingCalls,
+        headerChangeFfiConversionCalls: report.headerChange.initialWork.ffiConversionCalls
+      };
+    }
     for (const operation of Object.keys(report.cold.features)) {
       assert.equal(report.restart.features[operation].resultSha256,
         report.cold.features[operation].resultSha256, `restart changed ${operation} result`);
-      assert.equal(report.headerChange.features[operation].resultSha256,
+      if (!options.startupOnly) assert.equal(report.headerChange.features[operation].resultSha256,
         report.cold.features[operation].resultSha256, `header comment edit changed ${operation} result`);
     }
     interrupted(options);
@@ -935,8 +945,8 @@ async function main() {
     process.stdout.write(JSON.stringify({ evidence: options.output, completed: report.completed,
       coldWallMs: report.cold.initialIndex.launchToReadyWallMs,
       restartWallMs: report.restart.initialIndex.launchToReadyWallMs,
-      savedEditWallMs: report.restart.savedEdit.wallMs,
-      changedHeaderWallMs: report.headerChange.initialIndex.launchToReadyWallMs }) + "\n");
+      savedEditWallMs: report.restart.savedEdit?.wallMs,
+      changedHeaderWallMs: report.headerChange?.initialIndex.launchToReadyWallMs }) + "\n");
   } catch (cause) {
     process.stderr.write(JSON.stringify({ error: cause.message }) + "\n");
     process.exitCode = 1;

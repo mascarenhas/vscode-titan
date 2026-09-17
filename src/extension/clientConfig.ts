@@ -9,7 +9,6 @@ export const LANGUAGE_SERVER_LUA_PATH_ENVIRONMENT_VARIABLE =
   "TITAN_LS_LUA_PATH";
 export const LANGUAGE_SERVER_LUA_CPATH_ENVIRONMENT_VARIABLE =
   "TITAN_LS_LUA_CPATH";
-export const COMPILER_CACHE_PREFIX_ENVIRONMENT_VARIABLE = "TITAN_PREFIX";
 export const SERVER_LOG_LEVEL_ENVIRONMENT_VARIABLE =
   "TITAN_LANGUAGE_SERVER_LOG_LEVEL";
 
@@ -193,8 +192,7 @@ export function createServerLaunchOptions(
     luaPath: "./?.lua",
     luaCPath: "./?.so"
   },
-  logLevel: ServerLogLevel = DEFAULT_SERVER_LOG_LEVEL,
-  compilerCachePrefix = ""
+  logLevel: ServerLogLevel = DEFAULT_SERVER_LOG_LEVEL
 ): ServerLaunchOptions {
   const childEnvironment = { ...environment };
   childEnvironment[SERVER_LOG_LEVEL_ENVIRONMENT_VARIABLE] = logLevel;
@@ -202,11 +200,6 @@ export function createServerLaunchOptions(
     compilerDiscovery.luaPath;
   childEnvironment[LANGUAGE_SERVER_LUA_CPATH_ENVIRONMENT_VARIABLE] =
     compilerDiscovery.luaCPath;
-  if (compilerCachePrefix.length > 0) {
-    childEnvironment[COMPILER_CACHE_PREFIX_ENVIRONMENT_VARIABLE] =
-      compilerCachePrefix;
-  }
-
   return {
     command,
     args: [...args],

@@ -5,8 +5,8 @@ local strings = import "string"
 local source_text = import "server.source_text"
 
 union ModuleKind
-  flat
-  folder
+  flat()
+  folder()
 end
 
 record Module
@@ -18,14 +18,14 @@ end
 
 function Module:is_folder(): boolean
   case self.kind
-  when folder then return true
+  when folder() then return true
   else return false
   end
 end
 
 union IssueKind
-  invalid_module
-  unmapped_source
+  invalid_module()
+  unmapped_source()
 end
 
 record Issue
@@ -120,8 +120,8 @@ local record PhysicalSource
 end
 
 local union SourceResolution
-  found: PhysicalSource
-  blocked: string
+  found(PhysicalSource)
+  blocked(string)
 end
 
 local record SourceSelection
@@ -131,7 +131,7 @@ local record SourceSelection
   depth: integer
 end
 
-local function fail<T>(path: string, message: string): T
+local function fail<|T|>(path: string, message: string): T
   raise Error.new(path, message)
 end
 
@@ -474,12 +474,12 @@ local function absolute_root(path: string): string
   if strings.sub(candidate, 1, 1) == "/" then
     local normalized?, failure? =
       source_text.normalize_absolute_path(candidate)
-    if normalized == nil then return fail<string>(path, failure.message) end
+    if normalized == nil then return fail<|string|>(path, failure.message) end
     return normalized
   end
   local normalized?, failure? =
     source_text.resolve_path(fs.pwd(), candidate)
-  if normalized == nil then return fail<string>(path, failure.message) end
+  if normalized == nil then return fail<|string|>(path, failure.message) end
   return normalized
 end
 
@@ -487,16 +487,16 @@ local function validated_include_root(root: string): IncludeRoot
   do
     local metadata? = fs.stat(root)
     if metadata == nil then
-      return fail<IncludeRoot>(root, "include root does not exist")
+      return fail<|IncludeRoot|>(root, "include root does not exist")
     end
     if metadata.kind ~= "directory" then
-      return fail<IncludeRoot>(root, "include root is not a directory")
+      return fail<|IncludeRoot|>(root, "include root is not a directory")
     end
     return IncludeRoot.new(root, canonical_path(root))
   catch
     if error is async.CancellationReason then raise end
     if error is Error then raise end
-    return fail<IncludeRoot>(root, strings.tostring(error))
+    return fail<|IncludeRoot|>(root, strings.tostring(error))
   end
 end
 
@@ -578,10 +578,10 @@ local function scan_root_or_raise(root: IncludeRoot, excluded: {string},
                                   source_roots: {SourceRoot}): Scan
   local root_metadata? = fs.stat(root.lexical)
   if root_metadata == nil then
-    return fail<Scan>(root.lexical, "include root does not exist")
+    return fail<|Scan|>(root.lexical, "include root does not exist")
   end
   if root_metadata.kind ~= "directory" then
-    return fail<Scan>(root.lexical, "include root is not a directory")
+    return fail<|Scan|>(root.lexical, "include root is not a directory")
   end
   local entries: {FileEntry} = {}
   local directories: {string} = {}
@@ -598,7 +598,7 @@ local function scan_root(root: IncludeRoot, excluded: {string},
   catch
     if error is async.CancellationReason then raise end
     if error is Error then raise end
-    return fail<Scan>(root.lexical, strings.tostring(error))
+    return fail<|Scan|>(root.lexical, strings.tostring(error))
   end
 end
 
@@ -764,7 +764,7 @@ end
 
 local function physical_is_folder(source: PhysicalSource): boolean
   case source.kind
-  when folder then return true
+  when folder() then return true
   else return false
   end
 end
@@ -917,13 +917,13 @@ local function discover_or_raise(include: {string}, exclude: {string},
         IssueKind.invalid_module())
     else
       case resolved
-      when blocked: blocking_source then
+      when blocked(blocking_source) then
         issues[#issues + 1] = Issue.new(
           candidate.module.main_file,
           "logical Titan module '" .. name ..
           "' is blocked by folder source '" .. blocking_source .. "'",
           IssueKind.invalid_module())
-      when found: source then
+      when found(source) then
         if same_physical_source(candidate.module, source) then
           modules[#modules + 1] = candidate.module
           for file, owner in iteration.pairs(candidate.owner_by_file) do

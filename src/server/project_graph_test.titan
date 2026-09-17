@@ -28,14 +28,14 @@ local function source_required(module_name: string): graph.ImportEdge
     module_name, graph.ImportVisibility.source_required())
 end
 
-local function commit(cache: graph.Graph<TestAst>, module_name: string,
+local function commit(cache: graph.Graph<|TestAst|>, module_name: string,
                       output: graph.Manifest, imports: {graph.ImportEdge},
                       label: string): {string}
   local token? = cache:begin_project_check(module_name)
   test.assert(token ~= nil, "expected a dirty project module to be checkable")
   case cache:commit_project(token, output, imports, TestAst.new(label))
-  when accepted: accepted then return accepted.invalidated
-  when stale then
+  when accepted(accepted) then return accepted.invalidated
+  when stale() then
     test.assert(false, "fresh project result was rejected as stale")
     return {}
   end
@@ -58,7 +58,7 @@ function test_project_graph_retains_asts_only_for_project_modules(
     defer store:close()
     local access = store:acquire()
     defer access:release()
-    local cache = graph.create<TestAst>(access.connection)
+    local cache = graph.create<|TestAst|>(access.connection)
     cache:observe_project("app.main", {stamp("app/main.titan", 1)})
     commit(cache, "app.main", manifest("main-public", "main-source"), {},
            "annotated-main")
@@ -78,15 +78,15 @@ function test_project_graph_retains_asts_only_for_project_modules(
                 "external metadata exposed an AST cache")
 
     case cache:provenance("app.main")
-    when project then
+    when project() then
     else test.assert(false, "project provenance was not retained")
     end
     case cache:provenance("vendor.source")
-    when external_source then
+    when external_source() then
     else test.assert(false, "external source provenance was not retained")
     end
     case cache:provenance("vendor.binary")
-    when external_binary then
+    when external_binary() then
     else test.assert(false, "external binary provenance was not retained")
     end
     assert_names(cache:module_names(),
@@ -102,7 +102,7 @@ function test_project_graph_folder_membership_and_stamps_dirty_input(
     defer store:close()
     local access = store:acquire()
     defer access:release()
-    local cache = graph.create<TestAst>(access.connection)
+    local cache = graph.create<|TestAst|>(access.connection)
     cache:observe_project("pkg.folder", {
       stamp("pkg/folder/z.titan", 1),
       stamp("pkg/folder/folder.titan", 1),
@@ -141,7 +141,7 @@ function test_project_graph_rejects_stale_generations(
     defer store:close()
     local access = store:acquire()
     defer access:release()
-    local cache = graph.create<TestAst>(access.connection)
+    local cache = graph.create<|TestAst|>(access.connection)
     cache:observe_project("app.one", {stamp("app/one.titan", 1)})
     local stale? = cache:begin_project_check("app.one")
     test.assert(stale ~= nil, "initial project check did not start")
@@ -149,7 +149,7 @@ function test_project_graph_rejects_stale_generations(
     cache:observe_project("app.two", {stamp("app/two.titan", 1)})
     case cache:commit_project(
         stale, manifest("one", "one"), {}, TestAst.new("stale"))
-    when stale then
+    when stale() then
     else test.assert(false, "older project generation was published")
     end
     test.assert(cache:is_dirty("app.one") and
@@ -170,7 +170,7 @@ function test_project_graph_rejects_results_invalidated_within_generation(
     defer store:close()
     local access = store:acquire()
     defer access:release()
-    local cache = graph.create<TestAst>(access.connection)
+    local cache = graph.create<|TestAst|>(access.connection)
     cache:observe_project("app.dep", {stamp("app/dep.titan", 1)})
     cache:observe_project("app.client", {stamp("app/client.titan", 1)})
     commit(cache, "app.dep", manifest("dep-1", "dep-1"), {}, "dep-1")
@@ -185,17 +185,17 @@ function test_project_graph_rejects_results_invalidated_within_generation(
                 "same-generation checks did not start")
     case cache:commit_project(
         dependency, manifest("dep-2", "dep-2"), {}, TestAst.new("dep-2"))
-    when accepted: accepted then
+    when accepted(accepted) then
       assert_names(accepted.invalidated, {"app.client"},
                    "in-flight importer invalidation")
-    when stale then
+    when stale() then
       test.assert(false, "dependency result unexpectedly became stale")
     end
 
     case cache:commit_project(
         client, manifest("client", "client"), {ordinary("app.dep")},
         TestAst.new("obsolete-client"))
-    when stale then
+    when stale() then
     else
       test.assert(false,
                   "dependency-invalidated result was published in its generation")
@@ -212,7 +212,7 @@ function test_project_graph_keeps_an_exact_failed_revision_out_of_pending_work(
     defer store:close()
     local access = store:acquire()
     defer access:release()
-    local cache = graph.create<TestAst>(access.connection)
+    local cache = graph.create<|TestAst|>(access.connection)
     cache:observe_project("app.main", {stamp("app/main.titan", 1)})
     local token? = cache:begin_project_check("app.main")
     test.assert(token ~= nil, "initial failed-project check did not start")
@@ -257,7 +257,7 @@ function test_project_graph_retries_failed_dependency_consumers_and_recovers(
     defer store:close()
     local access = store:acquire()
     defer access:release()
-    local cache = graph.create<TestAst>(access.connection)
+    local cache = graph.create<|TestAst|>(access.connection)
     cache:upsert_external_source(
       "vendor.dep", {stamp("vendor/dep.titan", 1)},
       manifest("dep-p1", "dep-s1"), {})
@@ -318,7 +318,7 @@ function test_project_graph_retries_only_failed_importers_when_dependency_recove
     defer store:close()
     local access = store:acquire()
     defer access:release()
-    local cache = graph.create<TestAst>(access.connection)
+    local cache = graph.create<|TestAst|>(access.connection)
     cache:observe_project("app.dep", {stamp("app/dep.titan", 1)})
     cache:observe_project("app.failed", {stamp("app/failed.titan", 1)})
     cache:observe_project("app.clean", {stamp("app/clean.titan", 1)})
@@ -361,7 +361,7 @@ function test_project_graph_rejects_a_stale_failed_result(
     defer store:close()
     local access = store:acquire()
     defer access:release()
-    local cache = graph.create<TestAst>(access.connection)
+    local cache = graph.create<|TestAst|>(access.connection)
     cache:observe_project("app.main", {stamp("app/main.titan", 1)})
     local stale? = cache:begin_project_check("app.main")
     test.assert(stale ~= nil, "stale diagnostic check did not start")
@@ -388,7 +388,7 @@ function test_project_graph_tracks_direct_and_reverse_import_modes(
     defer store:close()
     local access = store:acquire()
     defer access:release()
-    local cache = graph.create<TestAst>(access.connection)
+    local cache = graph.create<|TestAst|>(access.connection)
     cache:observe_project("app.client", {stamp("app/client.titan", 1)})
     cache:observe_project("app.friend", {stamp("app/friend.titan", 1)})
     cache:upsert_external_source(
@@ -402,7 +402,7 @@ function test_project_graph_tracks_direct_and_reverse_import_modes(
     test.assert(#direct == 1 and direct[1].module_name == "dep",
                 "duplicate direct imports were not normalized")
     case direct[1].visibility
-    when ordinary then
+    when ordinary() then
     else test.assert(false, "ordinary import mode was lost")
     end
 
@@ -411,7 +411,7 @@ function test_project_graph_tracks_direct_and_reverse_import_modes(
                 reverse[2].importer == "app.friend",
                 "reverse imports were missing or nondeterministic")
     case reverse[2].visibility
-    when source_required then
+    when source_required() then
     else test.assert(false, "source-required reverse edge was lost")
     end
   end)
@@ -424,7 +424,7 @@ function test_project_graph_stops_at_unchanged_relevant_manifests(
     defer store:close()
     local access = store:acquire()
     defer access:release()
-    local cache = graph.create<TestAst>(access.connection)
+    local cache = graph.create<|TestAst|>(access.connection)
     cache:observe_project("app.client", {stamp("app/client.titan", 1)})
     cache:observe_project("app.friend", {stamp("app/friend.titan", 1)})
     cache:observe_project("app.top", {stamp("app/top.titan", 1)})
@@ -469,7 +469,7 @@ function test_project_graph_handles_cycles_without_eager_recursion(
     defer store:close()
     local access = store:acquire()
     defer access:release()
-    local cache = graph.create<TestAst>(access.connection)
+    local cache = graph.create<|TestAst|>(access.connection)
     cache:observe_project("cycle.a", {stamp("cycle/a.titan", 1)})
     cache:observe_project("cycle.b", {stamp("cycle/b.titan", 1)})
     commit(cache, "cycle.a", manifest("a1", "a1"),
@@ -503,7 +503,7 @@ function test_project_graph_add_replace_and_remove_invalidate_importers(
     defer store:close()
     local access = store:acquire()
     defer access:release()
-    local cache = graph.create<TestAst>(access.connection)
+    local cache = graph.create<|TestAst|>(access.connection)
     cache:observe_project("app.client", {stamp("app/client.titan", 1)})
     commit(cache, "app.client", manifest("client", "client"),
            {ordinary("dep")}, "client")
@@ -541,7 +541,7 @@ function test_project_graph_crosses_external_reverse_dependencies(
     defer store:close()
     local access = store:acquire()
     defer access:release()
-    local cache = graph.create<TestAst>(access.connection)
+    local cache = graph.create<|TestAst|>(access.connection)
     cache:upsert_external_source(
       "vendor.inner", {stamp("vendor/inner.titan", 1)},
       manifest("inner-p1", "inner-s1"), {})
@@ -569,7 +569,7 @@ function test_project_graph_dirties_a_converging_external_importer_once(
     defer store:close()
     local access = store:acquire()
     defer access:release()
-    local cache = graph.create<TestAst>(access.connection)
+    local cache = graph.create<|TestAst|>(access.connection)
     cache:upsert_external_source(
       "vendor.inner", {stamp("vendor/inner.titan", 1)},
       manifest("inner-p1", "inner-s1"), {})
@@ -601,7 +601,7 @@ function test_project_graph_honors_visibility_before_external_reverse_walk(
     defer store:close()
     local access = store:acquire()
     defer access:release()
-    local cache = graph.create<TestAst>(access.connection)
+    local cache = graph.create<|TestAst|>(access.connection)
     cache:upsert_external_source(
       "vendor.inner", {stamp("vendor/inner.titan", 1)},
       manifest("inner-p1", "inner-s1"), {})
@@ -637,7 +637,7 @@ function test_project_graph_reachability_and_derived_publication_are_generation_
     defer store:close()
     local access = store:acquire()
     defer access:release()
-    local cache = graph.create<TestAst>(access.connection)
+    local cache = graph.create<|TestAst|>(access.connection)
     cache:upsert_external_binary(
       "vendor.inner", {stamp("vendor/inner.a", 1)},
       manifest("inner-p1", "inner-p1"), {})
@@ -672,8 +672,8 @@ function test_project_graph_reachability_and_derived_publication_are_generation_
     case cache:commit_project(
         token, manifest("main-p2", "main-s2"),
         {ordinary("vendor.outer")}, TestAst.new("main-2"))
-    when accepted then
-    when stale then
+    when accepted() then
+    when stale() then
       test.assert(false,
                   "same-analysis external publication invalidated its project token")
     end
@@ -687,7 +687,7 @@ function test_project_graph_sql_rollback_restores_metadata_and_live_ast_handles(
     defer store:close()
     local access = store:acquire()
     defer access:release()
-    local cache = graph.create<TestAst>(access.connection)
+    local cache = graph.create<|TestAst|>(access.connection)
     cache:observe_project("app.main", {stamp("app/main.titan", 1)})
     commit(cache, "app.main", manifest("one", "one"), {ordinary("missing")}, "first")
     local checkpoint = cache:checkpoint_asts()
@@ -715,7 +715,7 @@ function test_project_graph_saved_identity_changes_even_with_identical_stamps(
     defer store:close()
     local access = store:acquire()
     defer access:release()
-    local cache = graph.create<TestAst>(access.connection)
+    local cache = graph.create<|TestAst|>(access.connection)
     cache:observe_project("same", {graph.FileStamp.new("same.titan", 1, 2, 3, "old\0\255")})
     commit(cache, "same", manifest("one", "one"), {}, "old")
     test.assert(not cache:observe_project("same", {
@@ -736,7 +736,7 @@ function test_project_graph_sql_reverse_and_pending_work_use_indexes(
     defer store:close()
     local access = store:acquire()
     defer access:release()
-    graph.create<TestAst>(access.connection)
+    graph.create<|TestAst|>(access.connection)
     local reverse = stores.rows(access.connection,
       "EXPLAIN QUERY PLAN SELECT importer FROM main.graph_imports WHERE imported=?", "provider")
     local pending = stores.rows(access.connection,
@@ -757,7 +757,7 @@ function test_project_graph_reopens_metadata_and_restores_only_clean_project_han
     defer fs.unlink(path)
     local store = stores.open(path)
     local access = store:acquire()
-    local cache = graph.create<TestAst>(access.connection)
+    local cache = graph.create<|TestAst|>(access.connection)
     access.connection:set_autocommit(false)
     local stamps: {graph.FileStamp} = {}
     local imports: {graph.ImportEdge} = {}
@@ -785,7 +785,7 @@ function test_project_graph_reopens_metadata_and_restores_only_clean_project_han
     defer reopened:close()
     local read = reopened:acquire()
     defer read:release()
-    local hydrated = graph.create<TestAst>(read.connection)
+    local hydrated = graph.create<|TestAst|>(read.connection)
     hydrated:restart_interrupted_checks()
     test.assert(hydrated:generation() == generation and hydrated:is_dirty("interrupted"),
       "reopen did not preserve work generation or retry interrupted work")
@@ -814,7 +814,7 @@ function test_project_graph_recreated_module_revisions_survive_an_empty_store_re
     defer fs.unlink(path)
     local store = stores.open(path)
     local access = store:acquire()
-    local cache = graph.create<TestAst>(access.connection)
+    local cache = graph.create<|TestAst|>(access.connection)
     cache:observe_project("main", {stamp("main.titan", 1)})
     for attempt = 1, 5 do cache:invalidate_project("main") end
     local previous? = cache:begin_project_check("main")
@@ -833,7 +833,7 @@ function test_project_graph_recreated_module_revisions_survive_an_empty_store_re
     defer reopened:close()
     local read = reopened:acquire()
     defer read:release()
-    local restored = graph.create<TestAst>(read.connection)
+    local restored = graph.create<|TestAst|>(read.connection)
     restored:observe_project("main", {stamp("main.titan", 3)})
     local next? = restored:begin_project_check("main")
     test.assert(next ~= nil and next.revision > recreated.revision,
@@ -848,7 +848,7 @@ function test_project_graph_timestamp_refresh_preserves_semantic_work_and_rollba
     defer store:close()
     local access = store:acquire()
     defer access:release()
-    local cache = graph.create<TestAst>(access.connection)
+    local cache = graph.create<|TestAst|>(access.connection)
     local original = graph.FileStamp.new("main.titan", 1, 2, 3, "content", "physical")
     cache:observe_project("main", {original})
     commit(cache, "main", manifest("public", "source"), {}, "original")
@@ -873,8 +873,8 @@ function test_project_graph_timestamp_refresh_preserves_semantic_work_and_rollba
     test.assert(not cache:observe_project("main", {touched}).changed,
       "timestamp refresh invalidated an active check")
     case cache:commit_project(token, manifest("public", "source"), {}, TestAst.new("checked"))
-    when accepted then
-    when stale then test.assert(false, "timestamp refresh rejected a valid checking token")
+    when accepted() then
+    when stale() then test.assert(false, "timestamp refresh rejected a valid checking token")
     end
     test.assert(cache:observe_project("main", {
       graph.FileStamp.new("main.titan", 3, 4, 3, "content", "replacement")}).changed,
@@ -889,7 +889,7 @@ function test_project_graph_manifest_revision_rejects_replaced_or_unfinished_wor
     defer store:close()
     local access = store:acquire()
     defer access:release()
-    local cache = graph.create<TestAst>(access.connection)
+    local cache = graph.create<|TestAst|>(access.connection)
     cache:observe_project("main", {stamp("main.titan", 1)})
     commit(cache, "main", manifest("public", "source"), {}, "first")
     local revision = stores.scalar_integer(access.connection,

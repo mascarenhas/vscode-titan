@@ -1,3 +1,4 @@
+local test_service = import "server.test_service"
 local async = import "async"
 local fs = import "fs"
 local json = import "json"
@@ -78,7 +79,7 @@ end
 local function project_is_clean(
     module: project_service.ProjectModule): boolean
   case module.analysis_state
-  when clean then return true
+  when clean() then return true
   else return false
   end
 end
@@ -86,7 +87,7 @@ end
 local function project_is_failed(
     module: project_service.ProjectModule): boolean
   case module.analysis_state
-  when failed then return true
+  when failed() then return true
   else return false
   end
 end
@@ -303,11 +304,11 @@ end
 local function result_array_length(
     outcome: dispatcher.SemanticOutcome, subject: string): integer
   case outcome
-  when result: item then
+  when result(item) then
     local array? = wire.as_array(item)
     if array == nil then raise subject .. " did not return a JSON array" end
     return #array
-  when failure: failure then
+  when failure(failure) then
     test.assert(false, subject .. ": " .. failure.message)
   end
   return -1
@@ -316,8 +317,8 @@ end
 local function assert_result(outcome: dispatcher.SemanticOutcome,
                              subject: string)
   case outcome
-  when result then
-  when failure: failure then
+  when result() then
+  when failure(failure) then
     test.assert(false, subject .. ": " .. failure.message)
   end
 end
@@ -325,22 +326,22 @@ end
 local function assert_failure(outcome: dispatcher.SemanticOutcome,
                               subject: string)
   case outcome
-  when result then test.assert(false, subject .. " unexpectedly succeeded")
-  when failure then
+  when result() then test.assert(false, subject .. " unexpectedly succeeded")
+  when failure() then
   end
 end
 
 local function assert_null_result(outcome: dispatcher.SemanticOutcome,
                                   subject: string)
   case outcome
-  when result: item then
+  when result(item) then
     test.assert(wire.is_null(item), subject .. " did not return null")
-  when failure: failure then
+  when failure(failure) then
     test.assert(false, subject .. ": " .. failure.message)
   end
 end
 
-local function wait_until(predicate: () -> boolean, message: string)
+local function wait_until(predicate: function (): boolean, message: string)
   -- Worker-pool filesystem operations need a wall-clock allowance. Counting
   -- immediate scheduler turns made this expire in well under a second under
   -- load, without indicating a product liveness failure.
@@ -359,13 +360,13 @@ local function contains_string(items: {string}, expected: string): boolean
 end
 
 local function join_outcome(
-    task: async.Task<dispatcher.SemanticOutcome, value>,
+    task: async.Task<|dispatcher.SemanticOutcome, value|>,
     subject: string): dispatcher.SemanticOutcome
-  case async.join<dispatcher.SemanticOutcome, value>(task)
-  when succeeded: outcome then return outcome
-  when failed: failure then
+  case async.join<|dispatcher.SemanticOutcome, value|>(task)
+  when succeeded(outcome) then return outcome
+  when failed(failure) then
     raise subject .. ": " .. strings.tostring(failure.error)
-  when cancelled then raise subject .. " was cancelled"
+  when cancelled() then raise subject .. " was cancelled"
   else raise subject .. " did not finish"
   end
   return dispatcher.SemanticOutcome.failure(
@@ -374,7 +375,7 @@ end
 
 local function with_application_state(
     indexed: boolean,
-    body: (string, YieldingAnalyzer, application.Application) -> ())
+    body: function (string, YieldingAnalyzer, application.Application): ())
   local root = fs.tmpname()
   fs.unlink(root)
   fs.mkdir(root)
@@ -392,8 +393,11 @@ local function with_application_state(
   end
 
   local analyzer = YieldingAnalyzer.new(0, false, false, false, false)
-  local service?, service_error? = project_service.load_with_analyzer(
-    root, "/sdk/lib/titan/0.6", analyzer:analyze)
+  local service?, service_error? = test_service.load {
+    project_root = root,
+    installed_binary_modules_root = "/sdk/lib/titan/0.6",
+    analyzer = analyzer:analyze,
+  }
   test.assert(service_error == nil and service ~= nil,
               "application fixture project did not load")
   if service == nil then raise "application fixture Service is missing" end
@@ -412,17 +416,17 @@ local function with_application_state(
 end
 
 local function with_application(
-    body: (string, YieldingAnalyzer, application.Application) -> ())
+    body: function (string, YieldingAnalyzer, application.Application): ())
   with_application_state(true, body)
 end
 
 local function with_unindexed_application(
-    body: (string, YieldingAnalyzer, application.Application) -> ())
+    body: function (string, YieldingAnalyzer, application.Application): ())
   with_application_state(false, body)
 end
 
 local function with_cold_application(
-    body: (string, YieldingAnalyzer, application.Application) -> ())
+    body: function (string, YieldingAnalyzer, application.Application): ())
   local root = fs.tmpname()
   fs.unlink(root)
   fs.mkdir(root)
@@ -440,15 +444,18 @@ local function with_cold_application(
   end
 
   local analyzer = YieldingAnalyzer.new(0, false, false, false, false)
-  local app = application.create_with_project_loader(
+  local app = application.create(
     root,
     function (project_root: string,
               _progress_listener: bridge.ProgressListener?,
               snapshot_listener: project_service.SnapshotListener?):
         (project_service.Service?, project_service.Error?, project_loader.Restoration?)
-      local loaded?,failure? = project_service.load_with_analyzer(
-        project_root, "/sdk/lib/titan/0.6", analyzer:analyze, nil,
-        snapshot_listener)
+      local loaded?,failure? = test_service.load {
+        project_root = project_root,
+        installed_binary_modules_root = "/sdk/lib/titan/0.6",
+        analyzer = analyzer:analyze,
+        snapshot_listener = snapshot_listener,
+      }
       return loaded,failure,nil
     end)
   defer do
@@ -596,15 +603,18 @@ local function recovers_configuration_load_failure_from_later_save()
   end
 
   local analyzer = YieldingAnalyzer.new(0, false, false, false, false)
-  local app = application.create_with_project_loader(
+  local app = application.create(
     root,
     function (project_root: string,
               _progress_listener: bridge.ProgressListener?,
               snapshot_listener: project_service.SnapshotListener?):
         (project_service.Service?, project_service.Error?, project_loader.Restoration?)
-      local loaded?,failure? = project_service.load_with_analyzer(
-        project_root, "/sdk/lib/titan/0.6", analyzer:analyze, nil,
-        snapshot_listener)
+      local loaded?,failure? = test_service.load {
+        project_root = project_root,
+        installed_binary_modules_root = "/sdk/lib/titan/0.6",
+        analyzer = analyzer:analyze,
+        snapshot_listener = snapshot_listener,
+      }
       return loaded,failure,nil
     end)
   defer app:close()
@@ -683,8 +693,11 @@ local function reconciles_expanded_scope_before_existing_analysis()
   end
 
   local analyzer = YieldingAnalyzer.new(0, false, false, false, false)
-  local service?, service_error? = project_service.load_with_analyzer(
-    root, "/sdk/lib/titan/0.6", analyzer:analyze)
+  local service?, service_error? = test_service.load {
+    project_root = root,
+    installed_binary_modules_root = "/sdk/lib/titan/0.6",
+    analyzer = analyzer:analyze,
+  }
   test.assert(service_error == nil and service ~= nil,
               "scope-expansion fixture project did not load")
   if service == nil then raise "scope-expansion fixture Service is missing" end
@@ -1093,8 +1106,11 @@ local function refreshes_unmapped_warnings_only_during_ordinary_discovery()
   fs.write_file(config,
     "include = { '.' }\nsource_module_roots = { 'src' }\n")
   local analyzer = YieldingAnalyzer.new(0, false, false, false, false)
-  local service?, service_error? = project_service.load_with_analyzer(
-    root, "/sdk/lib/titan/0.6", analyzer:analyze)
+  local service?, service_error? = test_service.load {
+    project_root = root,
+    installed_binary_modules_root = "/sdk/lib/titan/0.6",
+    analyzer = analyzer:analyze,
+  }
   test.assert(service_error == nil and service ~= nil,
               "unmapped warning fixture project did not load")
   local app = application.create_with_service(root, service)
@@ -1300,8 +1316,11 @@ local function failed_revision_waits_for_a_saved_change_and_recovers()
   end
 
   local analyzer = RecoveringAnalyzer.new(true, 0)
-  local service?, service_error? = project_service.load_with_analyzer(
-    root, "/sdk/lib/titan/0.6", analyzer:analyze)
+  local service?, service_error? = test_service.load {
+    project_root = root,
+    installed_binary_modules_root = "/sdk/lib/titan/0.6",
+    analyzer = analyzer:analyze,
+  }
   test.assert(service_error == nil and service ~= nil,
               "partial recovery fixture project did not load")
   if service == nil then raise "partial recovery Service is missing" end
@@ -1498,8 +1517,12 @@ local function rebuilds_view_when_external_recheck_fails_clean_module()
     end
 
   local service?, service_error? =
-    project_service.load_with_analyzer_and_resolver(
-      root, "/sdk/lib/titan/0.6", analyzer, resolver)
+    test_service.load {
+      project_root = root,
+      installed_binary_modules_root = "/sdk/lib/titan/0.6",
+      analyzer = analyzer,
+      external_resolver = resolver,
+    }
   test.assert(service_error == nil and service ~= nil,
               "provider-failure Application fixture did not load")
   if service == nil then raise "provider-failure Service is missing" end
@@ -1686,8 +1709,11 @@ local function classifies_canonical_symlink_watcher_paths()
   end
 
   local analyzer = YieldingAnalyzer.new(0, false, false, false, false)
-  local service?, service_error? = project_service.load_with_analyzer(
-    linked_root, "/sdk/lib/titan/0.6", analyzer:analyze)
+  local service?, service_error? = test_service.load {
+    project_root = linked_root,
+    installed_binary_modules_root = "/sdk/lib/titan/0.6",
+    analyzer = analyzer:analyze,
+  }
   test.assert(service_error == nil and service ~= nil,
               "symlinked project fixture did not load")
   if service == nil then raise "symlinked project Service is missing" end
@@ -1767,8 +1793,11 @@ local function watches_canonical_targets_of_lexically_mapped_include_symlinks()
               "could not create lexical source-ancestry symlink fixture")
 
   local analyzer = YieldingAnalyzer.new(0, false, false, false, false)
-  local service?, service_error? = project_service.load_with_analyzer(
-    project, "/sdk/lib/titan/0.6", analyzer:analyze)
+  local service?, service_error? = test_service.load {
+    project_root = project,
+    installed_binary_modules_root = "/sdk/lib/titan/0.6",
+    analyzer = analyzer:analyze,
+  }
   test.assert(service_error == nil and service ~= nil,
               "lexically mapped symlink fixture project did not load")
   local app = application.create_with_service(project, service)
@@ -1948,7 +1977,7 @@ local function remains_responsive_during_yielding_recheck()
                 "responsive request waited for the yielding recheck")
 
     -- Rename must not use the fallback because its edits target saved bytes.
-    local rename = async.run<dispatcher.SemanticOutcome, value>(function ():
+    local rename = async.run<|dispatcher.SemanticOutcome, value|>(function ():
         dispatcher.SemanticOutcome
       return app:handle(request_for(
         filename, 3, "textDocument/rename"))
@@ -2014,7 +2043,7 @@ local function preserves_shared_refresh_after_owner_cancellation()
 
     -- A fresh rename request joins the independently rooted refresh. Cancelling
     -- that request must detach its join without cancelling shared indexing.
-    local owner = async.run<dispatcher.SemanticOutcome, value>(function ():
+    local owner = async.run<|dispatcher.SemanticOutcome, value|>(function ():
         dispatcher.SemanticOutcome
       return app:handle(request_for(
         filename, 5, "textDocument/rename"))
@@ -2028,9 +2057,9 @@ local function preserves_shared_refresh_after_owner_cancellation()
       "cancel refresh-owning request in application test"))
     local owner_cancelled = false
     case async.join(owner)
-    when cancelled then owner_cancelled = true
-    when succeeded then
-    when failed then
+    when cancelled() then owner_cancelled = true
+    when succeeded() then
+    when failed() then
     else
     end
     test.assert(owner_cancelled,
@@ -2249,7 +2278,7 @@ function test_application_continues_indexing_after_status_encoding_failure(
   test_runtime.run(continues_indexing_after_status_encoding_failure)
 end
 
-local function run_indexing_case(name: string, body: () -> ())
+local function run_indexing_case(name: string, body: function (): ())
   do body() catch
     if error is async.OperationError then
       local failure = error as async.OperationError
@@ -2324,22 +2353,25 @@ local function rejects_save_during_successful_rename_preflight()
   end
 
   local analyzer = YieldingAnalyzer.new(0, false, false, false, false)
-  local service?, service_error? = project_service.load_with_analyzer(
-    root, "/sdk/lib/titan/0.6", analyzer:analyze)
+  local service?, service_error? = test_service.load {
+    project_root = root,
+    installed_binary_modules_root = "/sdk/lib/titan/0.6",
+    analyzer = analyzer:analyze,
+  }
   test.assert(service_error == nil and service ~= nil,
               "rename-race fixture project did not load")
   if service == nil then raise "rename-race fixture Service is missing" end
 
   local saving = SavingRenameAnalyzer.new(filename, 0)
-  local app = application.create_with_service_and_rename_analyzer(
+  local app = application.create_with_service(
     root, service, saving:analyze)
   defer app:close()
 
   local outcome = app:handle(rename_request_for(filename, 20, 7))
   case outcome
-  when result then
+  when result() then
     test.assert(false, "rename returned edits for an obsolete saved generation")
-  when failure: failure then
+  when failure(failure) then
     test.assert(
       failure.code == -32803 and
       strings.find(failure.message,
@@ -2364,7 +2396,7 @@ local function rejects_query_captured_before_sql_publication()
     local before = app.completed_view as application.View
     local access = store:acquire()
     defer access:release()
-    local queued = async.run<dispatcher.SemanticOutcome, value>(function ():
+    local queued = async.run<|dispatcher.SemanticOutcome, value|>(function ():
         dispatcher.SemanticOutcome
       return app:handle(request_for(filename, 501, "textDocument/foldingRange"))
     end)
@@ -2379,7 +2411,7 @@ local function rejects_query_captured_before_sql_publication()
     access:release()
     local rejected = false
     case join_outcome(queued, "query queued behind publication")
-    when failure: failure then
+    when failure(failure) then
       rejected = failure.code == -32803 and
         strings.find(failure.message, "retry", 1, true) ~= nil
     else
@@ -2467,7 +2499,7 @@ local function close_drains_updater_and_readers()
     app:note_saved_change()
     wait_until(function (): boolean return analyzer.started end,
       "close-drain analyzer did not start")
-    local closer = async.run<nil, value>(function (): nil
+    local closer = async.run<|nil, value|>(function (): nil
       app:close()
       return nil
     end)
@@ -2486,9 +2518,9 @@ local function close_drains_updater_and_readers()
     test.assert(not closer:status():has_finished(),
       "close released SQLite while an accepted reader still owned it")
     reader:release()
-    case async.join<nil, value>(closer)
-    when succeeded then
-    when failed: failed then raise failed.error
+    case async.join<|nil, value|>(closer)
+    when succeeded() then
+    when failed(failed) then raise failed.error
     else raise "close did not drain the accepted updater"
     end
     test.assert(analyzer.finished, "close cancelled the accepted compiler recheck")
@@ -2511,7 +2543,7 @@ local record RestorationGate
 end
 
 local function with_restoring_application(missing: boolean,
-    body: (string, YieldingAnalyzer, RestorationGate, application.Application) -> ())
+    body: function (string, YieldingAnalyzer, RestorationGate, application.Application): ())
   local root = fs.tmpname()
   fs.unlink(root)
   fs.mkdir(root)
@@ -2526,12 +2558,16 @@ local function with_restoring_application(missing: boolean,
   end
   local analyzer = YieldingAnalyzer.new(0,false,false,false,false)
   local gate = RestorationGate.new(true,false,false,false,missing)
-  local app = application.create_with_project_loader(root,
+  local app = application.create(root,
     function (project_root: string,_progress: bridge.ProgressListener?,
         listener: project_service.SnapshotListener?):
         (project_service.Service?,project_service.Error?,project_loader.Restoration?)
-      local loaded?,failure? = project_service.load_with_analyzer(
-        project_root,"/sdk/lib/titan/0.6",analyzer:analyze,nil,listener)
+      local loaded?,failure? = test_service.load {
+        project_root = project_root,
+        installed_binary_modules_root = "/sdk/lib/titan/0.6",
+        analyzer = analyzer:analyze,
+        snapshot_listener = listener,
+      }
       if loaded == nil then return nil,failure,nil end
       local restoring = project_loader.restoration(function (): {string}
         gate.started = true
@@ -2582,7 +2618,7 @@ local function serves_published_features_during_restoration()
     assert_result(app:handle(references),"references during restoration")
     test.assert(analyzer.runs == runs and not gate.finished,
       "read-only features waited for restoration or started analysis")
-    local rename = async.run<dispatcher.SemanticOutcome,value>(function ():
+    local rename = async.run<|dispatcher.SemanticOutcome,value|>(function ():
         dispatcher.SemanticOutcome
       return app:handle(request_for(filename,505,"textDocument/rename"))
     end)

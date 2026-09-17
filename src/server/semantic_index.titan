@@ -32,7 +32,7 @@ record Error
   const message: string
 end
 
-type Yield = () -> ()
+type Yield = function (): ()
 
 local YIELD_CADENCE = 1024
 
@@ -93,7 +93,7 @@ record StaleView
   const actual_generation: integer
 end
 
-local function fail<T>(module_name: string?, filename: string?,
+local function fail<|T|>(module_name: string?, filename: string?,
                         message: string): T
   raise Error.new(module_name, filename, message)
 end
@@ -114,11 +114,11 @@ end
 
 local function role_rank(role: bridge.OccurrenceRole): integer
   case role
-  when definition then return 0
-  when import_alias then return 1
-  when write then return 2
-  when reference then return 3
-  when type_reference then return 4
+  when definition() then return 0
+  when import_alias() then return 1
+  when write() then return 2
+  when reference() then return 3
+  when type_reference() then return 4
   end
 end
 
@@ -129,22 +129,22 @@ local function location_offset(coordinates: source_text.CoordinateIndex,
                                location: bridge.SourceLocation,
                                module_name: string): integer
   if location.line < 1 then
-    return fail<integer>(module_name, location.filename,
+    return fail<|integer|>(module_name, location.filename,
       "compiler span has a non-positive line")
   end
   if location.column < 1 then
-    return fail<integer>(module_name, location.filename,
+    return fail<|integer|>(module_name, location.filename,
       "compiler span has a non-positive column")
   end
   local start_offset? = coordinates:lf_line_start(location.line)
   if start_offset == nil then
-    return fail<integer>(module_name, location.filename,
+    return fail<|integer|>(module_name, location.filename,
       "compiler span line is outside the saved source")
   end
   local target_offset? = coordinates:offset_for_lf_byte_position(
     location.line, location.column)
   if target_offset == nil then
-    return fail<integer>(module_name, location.filename,
+    return fail<|integer|>(module_name, location.filename,
       "compiler span column is outside its saved source line")
   end
   return target_offset
@@ -229,7 +229,7 @@ local function project_files(projects: {bridge.ProjectModule},
     account_work(yield_state)
     local project = projects[project_index]
     if modules[project.module_name] then
-      fail<value>(project.module_name, nil,
+      fail<|value|>(project.module_name, nil,
         "duplicate saved project module")
     end
     modules[project.module_name] = true
@@ -237,7 +237,7 @@ local function project_files(projects: {bridge.ProjectModule},
       account_work(yield_state)
       local file = project.files[file_index]
       if filenames[file.filename] then
-        fail<value>(project.module_name, file.filename,
+        fail<|value|>(project.module_name, file.filename,
           "saved source file belongs to more than one project module")
       end
       filenames[file.filename] = true
@@ -258,10 +258,10 @@ end
 
 local function summary_kind_label(kind: bridge.HoverSummaryKind): string
   case kind
-  when module_summary then return "module"
-  when record_summary then return "record"
-  when union_summary then return "union"
-  when interface_summary then return "interface"
+  when module_summary() then return "module"
+  when record_summary() then return "record"
+  when union_summary() then return "union"
+  when interface_summary() then return "interface"
   end
 end
 
@@ -291,7 +291,7 @@ end
 
 local function project_snapshot(snapshot: bridge.ModuleSnapshot): boolean
   case snapshot.provenance
-  when project_source then return true
+  when project_source() then return true
   else return false
   end
 end
@@ -301,7 +301,7 @@ local function append_snapshot_summaries(
     projects: {string: boolean}, yield_state: YieldState)
   if not project_snapshot(snapshot) then return end
   if not projects[snapshot.module_name] then
-    fail<value>(snapshot.module_name, nil,
+    fail<|value|>(snapshot.module_name, nil,
       "project compiler snapshot has no matching saved project module")
   end
   local summaries? = snapshot.hover_summaries
@@ -310,12 +310,12 @@ local function append_snapshot_summaries(
     account_work(yield_state)
     local summary = summaries[index]
     if summary.id ~= index then
-      fail<value>(snapshot.module_name, nil,
+      fail<|value|>(snapshot.module_name, nil,
         "hover summary id does not match its snapshot-local registry slot")
     end
     local key = summary_key(snapshot.module_name, summary.id)
     if target[key] ~= nil then
-      fail<value>(snapshot.module_name, nil,
+      fail<|value|>(snapshot.module_name, nil,
         "duplicate snapshot-local hover summary id")
     end
     target[key] = MaterializedSummary.new(snapshot.module_name, summary.id,
@@ -328,12 +328,12 @@ local function validated_summary_id(snapshot: bridge.ModuleSnapshot,
   local id? = symbol.summary_id
   if id == nil then return nil end
   if id <= 0 then
-    return fail<integer>(snapshot.module_name, symbol.location.filename,
+    return fail<|integer|>(snapshot.module_name, symbol.location.filename,
       "compiler occurrence has a non-positive hover summary id")
   end
   local summaries? = snapshot.hover_summaries
   if summaries == nil or id > #summaries or summaries[id].id ~= id then
-    return fail<integer>(snapshot.module_name, symbol.location.filename,
+    return fail<|integer|>(snapshot.module_name, symbol.location.filename,
       "compiler occurrence references an unknown hover summary id")
   end
   return id
@@ -344,13 +344,13 @@ local function append_snapshot_occurrences(
     files: {string: SavedFile}, projects: {string: boolean},
     yield_state: YieldState)
   case snapshot.provenance
-  when project_source then
+  when project_source() then
   else
     -- External source and binary snapshots never contribute source locations.
     return
   end
   if not projects[snapshot.module_name] then
-    fail<value>(snapshot.module_name, nil,
+    fail<|value|>(snapshot.module_name, nil,
       "project compiler snapshot has no matching saved project module")
   end
 
@@ -365,11 +365,11 @@ local function append_snapshot_occurrences(
     if saved ~= nil and saved.module_name == snapshot.module_name and
        symbol.declaration_id ~= nil and symbol.exact_span ~= nil then
       if symbol.declaration_id == "" then
-        fail<value>(snapshot.module_name, symbol.location.filename,
+        fail<|value|>(snapshot.module_name, symbol.location.filename,
           "compiler occurrence has an empty declaration identity")
       end
       if symbol.name == "" then
-        fail<value>(snapshot.module_name, symbol.location.filename,
+        fail<|value|>(snapshot.module_name, symbol.location.filename,
           "compiler occurrence has an empty identifier")
       end
       local span, bytes = validate_span(snapshot.module_name, saved, symbol)
@@ -393,12 +393,12 @@ local function prepare_internal(projects: {bridge.ProjectModule},
   local files, project_names = project_files(projects, state, selected)
   if plan ~= nil then
     if #projects ~= #plan.modules then
-      fail<value>(nil, nil, "publication plan does not match saved project membership")
+      fail<|value|>(nil, nil, "publication plan does not match saved project membership")
     end
     for index = 1, #projects do
       local name = projects[index].module_name
       if plan.by_name[name] == nil then
-        fail<value>(name, nil, "saved project module has no publication revision")
+        fail<|value|>(name, nil, "saved project module has no publication revision")
       end
     end
   end
@@ -412,11 +412,11 @@ local function prepare_internal(projects: {bridge.ProjectModule},
       local module? = plan.by_name[snapshot.module_name]
       if module == nil or not plan.replacements[snapshot.module_name] or
           module.state ~= 2 then
-        fail<value>(snapshot.module_name, nil,
+        fail<|value|>(snapshot.module_name, nil,
           "compiler snapshot does not belong to a replaced clean module")
       end
       if observed[snapshot.module_name] then
-        fail<value>(snapshot.module_name, nil,
+        fail<|value|>(snapshot.module_name, nil,
           "duplicate compiler snapshot for a publication module")
       end
       observed[snapshot.module_name] = true
@@ -429,7 +429,7 @@ local function prepare_internal(projects: {bridge.ProjectModule},
     for index = 1, #plan.replaced_modules do
       local name = plan.replaced_modules[index]
       if plan.by_name[name].state == 2 and not observed[name] then
-        fail<value>(name, nil,
+        fail<|value|>(name, nil,
           "replaced clean module has no current compiler snapshot")
       end
     end
@@ -550,10 +550,10 @@ function publication_plan(connection: sqlite3.Connection,
     local module = modules[index]
     if module.module_name == "" or module.revision < 0 or
         module.state < 0 or module.state > 3 then
-      fail<value>(module.module_name, nil, "invalid module publication revision or state")
+      fail<|value|>(module.module_name, nil, "invalid module publication revision or state")
     end
     if by_name[module.module_name] ~= nil then
-      fail<value>(module.module_name, nil, "duplicate module publication revision")
+      fail<|value|>(module.module_name, nil, "duplicate module publication revision")
     end
     current[index] = module
     by_name[module.module_name] = module
@@ -607,9 +607,9 @@ end
 
 local function visibility_rank(visibility: bridge.DeclarationVisibility): integer
   case visibility
-  when block then return 0
-  when module then return 1
-  when exported then return 2
+  when block() then return 0
+  when module() then return 1
+  when exported() then return 2
   end
 end
 
@@ -674,7 +674,7 @@ local function validate_published(connection: sqlite3.Connection)
     defer cursor:close()
     local row? = cursor:fetch()
     if row ~= nil then
-      fail<value>(bytes(row, 1), bytes(row, 2),
+      fail<|value|>(bytes(row, 1), bytes(row, 2),
         "compiler symbol spans overlap in saved source")
     end
   end
@@ -687,7 +687,7 @@ local function validate_published(connection: sqlite3.Connection)
     defer cursor:close()
     local row? = cursor:fetch()
     if row ~= nil then
-      fail<value>(bytes(row, 1), bytes(row, 2),
+      fail<|value|>(bytes(row, 1), bytes(row, 2),
         "symbol '" .. bytes(row, 3) .. "' has more than one exact declaration")
     end
   end
@@ -706,7 +706,7 @@ local function validate_published(connection: sqlite3.Connection)
     defer cursor:close()
     local row? = cursor:fetch()
     if row ~= nil then
-      fail<value>(bytes(row, 1), bytes(row, 2),
+      fail<|value|>(bytes(row, 1), bytes(row, 2),
         "symbol '" .. bytes(row, 3) .. "' has more than one exact declaration")
     end
   end
@@ -801,7 +801,7 @@ function Prepared:publish(connection: sqlite3.Connection)
   local summary_bindings: {value} = {}
   local summary_sql = "INSERT INTO main.semantic_summaries VALUES "
   local summary_count = 0
-  for _, summary in iteration.pairs<string, MaterializedSummary>(self.summaries) do
+  for _, summary in iteration.pairs<|string, MaterializedSummary|>(self.summaries) do
     if summary_count > 0 then summary_sql = summary_sql .. "," end
     summary_sql = summary_sql .. "(" .. binding(summary_bindings, blob(summary.module_name)) .. "," ..
       binding(summary_bindings, summary.summary_id) .. "," ..

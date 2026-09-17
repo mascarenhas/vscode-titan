@@ -24,9 +24,9 @@ type SourceFileSnapshot = metadata.SourceFileSnapshot
 -- result is instead current for its exact revision: it carries authoritative
 -- diagnostics but no semantic AST until a relevant input invalidates it.
 union ProjectAnalysisState
-  clean
-  failed
-  dirty
+  clean()
+  failed()
+  dirty()
 end
 
 record ProjectModule
@@ -35,6 +35,15 @@ record ProjectModule
   const compiler_snapshot: compiler_bridge.ModuleSnapshot?
   const diagnostics: {compiler_bridge.Diagnostic}
   const analysis_state: ProjectAnalysisState
+end
+
+function ProjectModule:compiler_input(): compiler_bridge.ProjectModule
+  local files: {compiler_bridge.SourceFile} = {}
+  for index = 1, #self.source_files do
+    local file = self.source_files[index]
+    files[index] = compiler_bridge.SourceFile.new(file.filename, file.contents)
+  end
+  return compiler_bridge.ProjectModule.new(self.module_name, files)
 end
 
 type ExternalSource = metadata.ExternalSource
@@ -70,25 +79,25 @@ record AnalysisRequest
   const check_tokens: {project_graph.CheckToken}
 end
 
-type Analyzer = (AnalysisRequest) -> compiler_bridge.Analysis
-type ExternalResolver = (
+type Analyzer = function (AnalysisRequest): compiler_bridge.Analysis
+type ExternalResolver = function (
   project_config.ProjectConfig, {string},
-  {compiler_bridge.ExternalResolutionRequest}) ->
+  {compiler_bridge.ExternalResolutionRequest}):
   {compiler_bridge.ExternalResolution}
-type HeaderRestater = ({compiler_bridge.CHeaderDependency},
-                      compiler_bridge.HeaderValidation?) ->
+type HeaderRestater = function ({compiler_bridge.CHeaderDependency},
+                      compiler_bridge.HeaderValidation?):
                       ({compiler_bridge.CHeaderDependency}, boolean)
 -- Lifecycle owners use the saved snapshot after discovery to establish their
 -- watcher before compiler analysis begins. The cold loader immediately scans
 -- once more after its first callback, closing the initial
 -- scan-to-registration gap, and publishes that post-registration snapshot
 -- before analysis.
-type SnapshotListener = (Snapshot) -> ()
+type SnapshotListener = function (Snapshot): ()
 
 record PublicationHooks
-  const prepare: (Snapshot) -> boolean
-  const publish: (sqlite3.Connection) -> ()
-  const committed: (() -> ())?
+  const prepare: function (Snapshot): boolean
+  const publish: function (sqlite3.Connection): ()
+  const committed: (function (): ())?
 end
 
 record Counters
@@ -119,7 +128,7 @@ record Service
   local header_restater: HeaderRestater?
   local current_config: project_config.ProjectConfig
   local catalog: project_discovery.Discovery
-  local graph: project_graph.Graph<compiler_bridge.ModuleSnapshot>
+  local graph: project_graph.Graph<|compiler_bridge.ModuleSnapshot|>
   local const store: sql.Store
   local const metadata: metadata.Metadata
   local read_count: integer
@@ -129,19 +138,37 @@ record Service
   local analysis_count: integer
   local submitted_count: integer
   local analysis_active: boolean
-  local analysis_task: async.Task<value, value>?
+  local analysis_task: async.Task<|value, value|>?
   local publication_hooks: PublicationHooks?
 end
 
-local function fail<T>(path: string, message: string): T
+local function fail<|T|>(path: string, message: string): T
   raise Error.new(path, message)
+end
+
+local function service_error(project_root: string, cause: value): Error
+  if cause is Error then return cause end
+  if cause is compiler_bridge.BridgeError then
+    local failure: compiler_bridge.BridgeError = cause
+    return Error.new(failure.module_name, failure.message)
+  end
+  if cause is sqlite3.Error then
+    local failure: sqlite3.Error = cause
+    return Error.new(project_root, failure.operation .. ": " .. failure.message)
+  end
+  if cause is async.OperationError then
+    local failure: async.OperationError = cause
+    return Error.new(project_root, failure.operation .. ": " .. failure.message ..
+      " (" .. failure.name .. ")")
+  end
+  return Error.new(project_root, strings.tostring(cause))
 end
 
 -- Call after collecting filesystem/compiler observations and while holding
 -- the Store lease. An observation baseline and the work it invalidates must
 -- survive a process interruption together. Nested adapters borrow the caller's
 -- transaction; only the outer updater owns COMMIT/ROLLBACK.
-local function Service:update_metadata(body: () -> ())
+local function Service:update_metadata(body: function (): ())
   local connection = self.graph.connection
   if not connection:get_autocommit() then
     body()
@@ -189,8 +216,8 @@ end
 local function header_kind_name(
     kind: compiler_bridge.CHeaderDependencyKind): string
   case kind
-  when file then return "file"
-  when search then return "search"
+  when file() then return "file"
+  when search() then return "search"
   end
 end
 
@@ -202,8 +229,8 @@ local function copy_header_dependencies(
     local dependency = source[index]
     local kind = compiler_bridge.CHeaderDependencyKind.file()
     case dependency.kind
-    when search then kind = compiler_bridge.CHeaderDependencyKind.search()
-    when file then
+    when search() then kind = compiler_bridge.CHeaderDependencyKind.search()
+    when file() then
     end
     local observation: compiler_bridge.HeaderObservation?
     if dependency.observation ~= nil then
@@ -273,13 +300,13 @@ end
 
 local function copy_external_origin(source: ExternalOrigin): ExternalOrigin
   case source
-  when source: origin then
+  when source(origin) then
     return ExternalOrigin.source(ExternalSource.new(
       origin.main_file, copy_strings(origin.source_files)))
-  when dynamic_binary: origin then
+  when dynamic_binary(origin) then
     return ExternalOrigin.dynamic_binary(
       ExternalBinary.new(origin.provider_file))
-  when static_binary: origin then
+  when static_binary(origin) then
     return ExternalOrigin.static_binary(
       ExternalBinary.new(origin.provider_file))
   end
@@ -299,7 +326,7 @@ end
 local function origin_identity(origin: ExternalOrigin?): string
   if origin == nil then return "missing" end
   case origin as ExternalOrigin
-  when source: source then
+  when source(source) then
     local output = strings.writer()
     output:write("source:" .. #source.main_file .. ":" .. source.main_file)
     for index = 1, #source.source_files do
@@ -307,10 +334,10 @@ local function origin_identity(origin: ExternalOrigin?): string
       output:write(":" .. #path .. ":" .. path)
     end
     return output:drain()
-  when dynamic_binary: binary then
+  when dynamic_binary(binary) then
     return "dynamic:" .. #binary.provider_file .. ":" ..
            binary.provider_file
-  when static_binary: binary then
+  when static_binary(binary) then
     return "static:" .. #binary.provider_file .. ":" ..
            binary.provider_file
   end
@@ -323,7 +350,7 @@ local function copy_imports(
     local edge = source[index]
     local visibility = project_graph.ImportVisibility.ordinary()
     case edge.visibility
-    when source_required then
+    when source_required() then
       visibility = project_graph.ImportVisibility.source_required()
     else
     end
@@ -331,15 +358,6 @@ local function copy_imports(
       edge.module_name, visibility)
   end
   return result
-end
-
-local function copy_config(source: project_config.ProjectConfig):
-    project_config.ProjectConfig
-  return project_config.ProjectConfig.new(
-    source.project_root, source.config_file, copy_strings(source.include),
-    copy_strings(source.exclude), copy_strings(source.source_module_roots),
-    source.binary_modules_root,
-    copy_strings(source.extra_ffi_include_dirs), source.extra_ffi_cppflags)
 end
 
 local function same_observed_stamp(left: project_graph.FileStamp,
@@ -415,7 +433,7 @@ local function read_saved_file(path: string, previous: project_graph.FileStamp?,
     local before? = content_identity.observe(path)
     if before == nil then return nil, nil, reads, 0 end
     if before.kind ~= "file" then
-      return fail<string>(path, "path is not a regular file"), nil, reads, 0
+      return fail<|string|>(path, "path is not a regular file"), nil, reads, 0
     end
     if previous ~= nil and previous.path == path and previous.identity ~= nil and
        previous.physical_identity == before.physical_identity and
@@ -433,7 +451,7 @@ local function read_saved_file(path: string, previous: project_graph.FileStamp?,
         after.size, content_identity.digest(contents), after.physical_identity), reads, 1
     end
   end
-  return fail<string>(path,
+  return fail<|string|>(path,
     "saved input changed repeatedly while it was being read"), nil, reads, 0
 end
 
@@ -474,7 +492,7 @@ local function Service:read_stable_file(
   self.read_count = self.read_count + reads
   self.hash_count = self.hash_count + hashes
   if contents == nil or observed == nil then
-    return fail<SourceFileSnapshot>(filename, "saved source file disappeared")
+    return fail<|SourceFileSnapshot|>(filename, "saved source file disappeared")
   end
   if previous ~= nil then
     if same_observed_stamp(previous.stamp, observed) then return previous end
@@ -573,13 +591,13 @@ local function Service:restat_header_dependencies(
     ({compiler_bridge.CHeaderDependency}, boolean)
   if #dependencies == 0 then return {}, false end
   if self.header_restater == nil then
-    return fail<{compiler_bridge.CHeaderDependency}>(module_name,
+    return fail<|{compiler_bridge.CHeaderDependency}|>(module_name,
       "analyzer reported C header dependencies without a header restater"), false
   end
   local current, changed = (self.header_restater as HeaderRestater)(
     copy_header_dependencies(dependencies), validation)
   if #current ~= #dependencies then
-    return fail<{compiler_bridge.CHeaderDependency}>(module_name,
+    return fail<|{compiler_bridge.CHeaderDependency}|>(module_name,
       "header restater returned the wrong number of dependencies"), false
   end
   for index = 1, #dependencies do
@@ -587,10 +605,10 @@ local function Service:restat_header_dependencies(
     local after = current[index]
     if header_kind_name(before.kind) ~= header_kind_name(after.kind) or
        before.path ~= after.path then
-      return fail<{compiler_bridge.CHeaderDependency}>(module_name,
+      return fail<|{compiler_bridge.CHeaderDependency}|>(module_name,
         "header restater changed dependency kind/path at index " .. index), false
     elseif after.identity == "" then
-      return fail<{compiler_bridge.CHeaderDependency}>(module_name,
+      return fail<|{compiler_bridge.CHeaderDependency}|>(module_name,
         "header restater returned an empty identity at index " .. index), false
     end
   end
@@ -665,7 +683,7 @@ local function Service:source_required_for_external(name: string): boolean
   local reverse = self.graph:reverse_imports(name)
   for index = 1, #reverse do
     case reverse[index].visibility
-    when source_required then return true
+    when source_required() then return true
     else
     end
   end
@@ -679,20 +697,20 @@ local function Service:fingerprint_from_resolution(
   local paths: {string} = {}
   if resolution.provenance ~= nil then
     case resolution.provenance as compiler_bridge.Provenance
-    when external_source: source then
+    when external_source(source) then
       origin = ExternalOrigin.source(ExternalSource.new(
         source.main_file, copy_strings(source.source_files)))
       paths = copy_strings(source.source_files)
-    when dynamic_binary: binary then
+    when dynamic_binary(binary) then
       origin = ExternalOrigin.dynamic_binary(
         ExternalBinary.new(binary.provider_file))
       paths[1] = binary.provider_file
-    when static_binary: binary then
+    when static_binary(binary) then
       origin = ExternalOrigin.static_binary(
         ExternalBinary.new(binary.provider_file))
       paths[1] = binary.provider_file
-    when project_source then
-      return fail<ExternalFingerprint>(resolution.module_name,
+    when project_source() then
+      return fail<|ExternalFingerprint|>(resolution.module_name,
         "external resolver returned project-source provenance")
     end
   end
@@ -722,9 +740,9 @@ local function Service:restat_external_fingerprint(
   if previous.origin ~= nil then
     origin = copy_external_origin(previous.origin as ExternalOrigin)
     case origin as ExternalOrigin
-    when source: source then paths = copy_strings(source.source_files)
-    when dynamic_binary: binary then paths[1] = binary.provider_file
-    when static_binary: binary then paths[1] = binary.provider_file
+    when source(source) then paths = copy_strings(source.source_files)
+    when dynamic_binary(binary) then paths[1] = binary.provider_file
+    when static_binary(binary) then paths[1] = binary.provider_file
     end
   end
   local stamps: {project_graph.FileStamp} = {}
@@ -803,7 +821,7 @@ local function Service:revalidate_external_topology()
   if #requests == 0 then return end
   local resolver = self.external_resolver as ExternalResolver
   local resolutions = resolver(
-    copy_config(self.current_config), copy_strings(self.metadata:project_names()), requests)
+    self.current_config:copy(), copy_strings(self.metadata:project_names()), requests)
   if #resolutions ~= #requests then
     raise Error.new(self.project_root,
       "external resolver returned the wrong number of results")
@@ -850,13 +868,13 @@ local function Service:revalidate_external_files()
       elseif not same_stamps(current, external.stamps) then
         self:update_metadata(function ()
           case external.origin
-          when source then
+          when source() then
             self.graph:upsert_external_source(
               name, current, comparison_manifest(external.manifest), external.imports)
-          when dynamic_binary then
+          when dynamic_binary() then
             self.graph:upsert_external_binary(
               name, current, comparison_manifest(external.manifest), external.imports)
-          when static_binary then
+          when static_binary() then
             self.graph:upsert_external_binary(
               name, current, comparison_manifest(external.manifest), external.imports)
           end
@@ -881,7 +899,8 @@ local function Service:revalidate_external_files()
   end
 end
 
-local function Service:scan_or_raise(): Snapshot
+local function Service:accept_discovery(loaded: project_config.ProjectConfig,
+    found: project_discovery.Discovery): Snapshot
   local started = logging.clock()
   local reads_before = self.read_count
   local hashes_before = self.hash_count
@@ -891,17 +910,6 @@ local function Service:scan_or_raise(): Snapshot
     ["root"] = self.project_root,
     ["generation"] = self.graph:generation(),
   })
-  local loaded?, config_error? = project_config.load(
-    self.project_root, self.installed_binary_modules_root)
-  if loaded == nil then
-    return fail<Snapshot>(config_error.path, config_error.message)
-  end
-  local found?, discovery_error? = project_discovery.discover(
-    loaded.include, loaded.exclude, loaded.source_module_roots)
-  if found == nil then
-    return fail<Snapshot>(discovery_error.path, discovery_error.message)
-  end
-
   -- Compare with the configuration that produced the persisted graph, even
   -- when construction loaded a newer configuration before this first scan.
   -- Exclude remains watcher policy and is omitted from semantic_identity.
@@ -999,6 +1007,21 @@ local function Service:scan_or_raise(): Snapshot
   return snapshot
 end
 
+local function Service:scan_or_raise(): Snapshot
+  local loaded?, config_error? = project_config.load(
+    self.project_root, self.installed_binary_modules_root)
+  if loaded == nil then
+    return fail<|Snapshot|>(config_error.path, config_error.message)
+  end
+  local found?, discovery_error? = project_discovery.discover(
+    loaded.include, loaded.exclude, loaded.source_module_roots)
+  if found == nil then
+    return fail<|Snapshot|>(discovery_error.path, discovery_error.message)
+  end
+
+  return self:accept_discovery(loaded, found)
+end
+
 function Service:scan(): (Snapshot?, Error?)
   local access = self.store:acquire()
   defer access:release()
@@ -1006,8 +1029,7 @@ function Service:scan(): (Snapshot?, Error?)
     return self:scan_or_raise(), nil
   catch
     if error is async.CancellationReason then raise end
-    if error is Error then return nil, error as Error end
-    return nil, Error.new(self.project_root, strings.tostring(error))
+    return nil, service_error(self.project_root, error)
   end
 end
 
@@ -1120,7 +1142,7 @@ local function Service:prepare_work_avoiding(
     end
     if trusted then
       case external.origin
-      when source: source then
+      when source(source) then
         cached_sources[#cached_sources + 1] =
           compiler_bridge.CachedSourceInterface.new(
             external.module_name, external.manifest.public_digest,
@@ -1154,7 +1176,7 @@ local function Service:prepare_work_avoiding(
     end
   end
   local request = AnalysisRequest.new(
-    self.graph:generation(), copy_config(self.current_config),
+    self.graph:generation(), self.current_config:copy(),
     selected[1], modules, selected, cached_sources, fingerprints,
     header_fingerprints, tokens)
   logging.emit("debug", "analysis.workset", {
@@ -1276,8 +1298,8 @@ local function Service:publish_failed_project(
       if not self.metadata:has_project(name) and not self.metadata:has_external(name) then
         local requires_source = false
         case edge.visibility
-        when source_required then requires_source = true
-        when ordinary then
+        when source_required() then requires_source = true
+        when ordinary() then
         end
         local previous? = self.metadata:fingerprint(name)
         if previous == nil then
@@ -1317,12 +1339,12 @@ local function Service:external_candidate(
   local origin?: ExternalOrigin
   local analyzed_input_identity: string? = nil
   case snapshot.provenance
-  when external_source: source then
+  when external_source(source) then
     for index = 1, #source.source_files do
       local path = source.source_files[index]
       local stamp? = self:stamp_for(path, find_stamp(prior_stamps, path))
       if stamp == nil then
-        return fail<ExternalModule>(source.source_files[index],
+        return fail<|ExternalModule|>(source.source_files[index],
           "external source disappeared while compiler results were committed")
       end
       stamps[index] = stamp
@@ -1331,27 +1353,27 @@ local function Service:external_candidate(
       source.main_file, copy_strings(source.source_files)))
     analyzed_input_identity = analyzed_input_digest(
       stamp_digest(stamps), snapshot.c_header_dependencies)
-  when dynamic_binary: binary then
+  when dynamic_binary(binary) then
     local stamp? = self:stamp_for(binary.provider_file,
       find_stamp(prior_stamps, binary.provider_file))
     if stamp == nil then
-      return fail<ExternalModule>(binary.provider_file,
+      return fail<|ExternalModule|>(binary.provider_file,
         "external binary disappeared while compiler results were committed")
     end
     stamps[1] = stamp
     origin = ExternalOrigin.dynamic_binary(
       ExternalBinary.new(binary.provider_file))
-  when static_binary: binary then
+  when static_binary(binary) then
     local stamp? = self:stamp_for(binary.provider_file,
       find_stamp(prior_stamps, binary.provider_file))
     if stamp == nil then
-      return fail<ExternalModule>(binary.provider_file,
+      return fail<|ExternalModule|>(binary.provider_file,
         "external static provider disappeared while compiler results were committed")
     end
     stamps[1] = stamp
     origin = ExternalOrigin.static_binary(
       ExternalBinary.new(binary.provider_file))
-  when project_source then
+  when project_source() then
     return nil
   end
   local imports = graph_imports(snapshot)
@@ -1378,7 +1400,7 @@ local function project_snapshot_map(
   for index = 1, #analysis.modules do
     local snapshot = analysis.modules[index]
     case snapshot.provenance
-    when project_source then result[snapshot.module_name] = snapshot
+    when project_source() then result[snapshot.module_name] = snapshot
     else
     end
   end
@@ -1473,15 +1495,15 @@ end
 local function Service:replace_external(
     external: ExternalModule, satisfied_projects: {string})
   case external.origin
-  when source then
+  when source() then
     self.graph:publish_external_source(
       external.module_name, external.stamps, comparison_manifest(external.manifest),
       external.imports, satisfied_projects)
-  when dynamic_binary then
+  when dynamic_binary() then
     self.graph:publish_external_binary(
       external.module_name, external.stamps, comparison_manifest(external.manifest),
       external.imports, satisfied_projects)
-  when static_binary then
+  when static_binary() then
     self.graph:publish_external_binary(
       external.module_name, external.stamps, comparison_manifest(external.manifest),
       external.imports, satisfied_projects)
@@ -1525,7 +1547,7 @@ local function analysis_source_required(
     local edge = reverse[index]
     if not replaced_importers[edge.importer] then
       case edge.visibility
-      when source_required then return true
+      when source_required() then return true
       else
       end
     end
@@ -1622,8 +1644,8 @@ local function contextual_provider_is_current(
       found = true
       local provider_file?: string = nil
       case resolution.provenance
-      when dynamic_binary: binary then provider_file = binary.provider_file
-      when static_binary: binary then provider_file = binary.provider_file
+      when dynamic_binary(binary) then provider_file = binary.provider_file
+      when static_binary(binary) then provider_file = binary.provider_file
       else return false
       end
       local identity? = resolution.provider_identity
@@ -1767,16 +1789,16 @@ local function Service:commit_or_raise(
   for index = 1, #analysis.modules do
     local snapshot = analysis.modules[index]
     case snapshot.provenance
-    when project_source then
+    when project_source() then
     else
       case snapshot.provenance
-      when dynamic_binary: binary then
+      when dynamic_binary(binary) then
         snapshot_binary_keys[snapshot.module_name] =
           binary_provider_key(
             snapshot.module_name, "dynamic", binary.provider_file)
         snapshot_binaries[snapshot.module_name] = snapshot
         insert_name(snapshot_binary_names, snapshot.module_name)
-      when static_binary: binary then
+      when static_binary(binary) then
         snapshot_binary_keys[snapshot.module_name] =
           binary_provider_key(
             snapshot.module_name, "static", binary.provider_file)
@@ -1959,14 +1981,14 @@ local function Service:commit_or_raise(
         if manifest ~= nil then
           case self.graph:commit_project(
               token, manifest, graph_imports(snapshot), snapshot)
-          when accepted then
+          when accepted() then
             state.diagnostics = diagnostics
             state.compiler_snapshot = snapshot
             self.metadata:write_diagnostics(name, diagnostics)
             self:remember_header_fingerprint(
               name, snapshot.c_header_dependencies)
             committed[#committed + 1] = name
-          when stale then
+          when stale() then
           end
         else
           if self:publish_failed_project(
@@ -2012,12 +2034,7 @@ function Service:commit(request: AnalysisRequest,
     return self:commit_or_raise(request, analysis), nil
   catch
     if error is async.CancellationReason then raise end
-    if error is Error then return nil, error as Error end
-    if error is compiler_bridge.BridgeError then
-      local failure = error as compiler_bridge.BridgeError
-      return nil, Error.new(failure.module_name, failure.message)
-    end
-    return nil, Error.new(self.project_root, strings.tostring(error))
+    return nil, service_error(self.project_root, error)
   end
 end
 
@@ -2030,7 +2047,7 @@ local function Service:analyze_or_raise(
       self:latest().dirty_modules)
   end
   if self.analysis_active then
-    return fail<RefreshReport>(self.project_root,
+    return fail<|RefreshReport|>(self.project_root,
       "compiler analysis is already active for this project")
   end
   self.analysis_active = true
@@ -2071,12 +2088,7 @@ function Service:analyze(request: AnalysisRequest):
     return self:analyze_or_raise(request), nil
   catch
     if error is async.CancellationReason then raise end
-    if error is Error then return nil, error as Error end
-    if error is compiler_bridge.BridgeError then
-      local failure = error as compiler_bridge.BridgeError
-      return nil, Error.new(failure.module_name, failure.message)
-    end
-    return nil, Error.new(self.project_root, strings.tostring(error))
+    return nil, service_error(self.project_root, error)
   end
 end
 
@@ -2162,7 +2174,7 @@ local function Service:analyze_to_fixed_point(): (RefreshReport?, Error?)
   return report, nil
 end
 
-local function Service:refresh_internal(snapshot_listener: SnapshotListener?):
+function Service:refresh(snapshot_listener: SnapshotListener?):
     (RefreshReport?, Error?)
   local started = logging.clock()
   logging.emit("debug", "project.refresh.start", {
@@ -2199,19 +2211,6 @@ local function Service:refresh_internal(snapshot_listener: SnapshotListener?):
     ["cpu_ms"] = logging.elapsed_ms(started),
   })
   return report, nil
-end
-
--- Preserve the long-standing no-argument refresh API for callers which do not
--- own watcher scope. Application uses the notifying variant to reconcile the
--- just-discovered saved tree before compiler work can yield for an extended
--- period.
-function Service:refresh(): (RefreshReport?, Error?)
-  return self:refresh_internal(nil)
-end
-
-function Service:refresh_with_snapshot_listener(
-    snapshot_listener: SnapshotListener): (RefreshReport?, Error?)
-  return self:refresh_internal(snapshot_listener)
 end
 
 function Service:counters(): Counters
@@ -2278,7 +2277,7 @@ local function Service:latest_inner(): Snapshot
   local issues: {project_discovery.Issue} = {}
   for index = 1, #self.catalog.issues do issues[index] = self.catalog.issues[index] end
   return Snapshot.new(
-    self.graph:generation(), copy_config(self.current_config), issues,
+    self.graph:generation(), self.current_config:copy(), issues,
     self:project_directories(), projects, externals,
     self.graph:dirty_modules())
 end
@@ -2336,26 +2335,20 @@ function Service:close()
     end
     -- Cancellation is not a drain: the accepted updater must finish any native
     -- COMMIT/ROLLBACK before its connection can be closed.
-    async.join<value, value>(active)
+    async.join<|value, value|>(active)
   end
   self.store:close()
 end
 
-local function create_or_raise(project_root: string,
-                               installed_binary_modules_root: string,
-                               analyzer: Analyzer,
-                               external_resolver: ExternalResolver?,
-                               header_restater: HeaderRestater?,
-                               existing_store: sql.Store?): Service
-  local loaded?, config_error? = project_config.load(
-    project_root, installed_binary_modules_root)
-  if loaded == nil then
-    return fail<Service>(config_error.path, config_error.message)
-  end
+local function create_or_raise(settings: project_config.ProjectConfig,
+    installed_binary_modules_root: string, analyzer: Analyzer,
+    external_resolver: ExternalResolver?, header_restater: HeaderRestater?,
+    existing_store: sql.Store?): Service
+  local loaded = settings:copy()
   local found?, discovery_error? = project_discovery.discover(
     loaded.include, loaded.exclude, loaded.source_module_roots)
   if found == nil then
-    return fail<Service>(discovery_error.path, discovery_error.message)
+    return fail<|Service|>(discovery_error.path, discovery_error.message)
   end
   local store? = existing_store
   if store == nil then store = sql.open(":memory:") end
@@ -2365,224 +2358,53 @@ local function create_or_raise(project_root: string,
   end
   local access = store:acquire()
   defer access:release()
-  local graph = project_graph.create<compiler_bridge.ModuleSnapshot>(access.connection)
+  local graph = project_graph.create<|compiler_bridge.ModuleSnapshot|>(access.connection)
   graph:restart_interrupted_checks()
   local saved_metadata = metadata.create(access.connection, graph)
   local service = Service.new(
     loaded.project_root, installed_binary_modules_root, analyzer,
     external_resolver, header_restater, loaded, found,
     graph, store, saved_metadata, 0, 0, 0, 0, 0, 0, false, nil, nil)
-  service:scan_or_raise()
+  service:accept_discovery(loaded, found)
   initialized = true
   return service
 end
 
 -- On success Service owns the supplied Store until close. On failure its
--- caller retains that Store for cache recovery/fallback. No compiler analysis
--- runs here, leaving the loader an interval to hydrate validated graph payloads.
-function create_with_store(project_root: string,
+-- caller retains that Store; an omitted Store is created and owned here.
+-- Configuration is already normalized by the caller. Initial discovery uses it
+-- once; later scans reload the workspace file with the same installed default.
+function create(settings: project_config.ProjectConfig,
     installed_binary_modules_root: string, analyzer: Analyzer,
     external_resolver: ExternalResolver?, header_restater: HeaderRestater?,
-    store: sql.Store): (Service?, Error?)
+    store: sql.Store?): (Service?, Error?)
   do
-    return create_or_raise(project_root, installed_binary_modules_root,
+    return create_or_raise(settings, installed_binary_modules_root,
       analyzer, external_resolver, header_restater, store), nil
   catch
     if error is async.CancellationReason then raise end
-    if error is Error then return nil, error as Error end
-    return nil, Error.new(project_root, strings.tostring(error))
+    return nil, service_error(settings.project_root, error)
   end
-end
-
-function create_with_analyzer(project_root: string,
-                              installed_binary_modules_root: string,
-                              analyzer: Analyzer,
-                              header_restater: HeaderRestater?):
-    (Service?, Error?)
-  do
-    return create_or_raise(
-      project_root, installed_binary_modules_root, analyzer, nil,
-      header_restater), nil
-  catch
-    if error is async.CancellationReason then raise end
-    if error is Error then return nil, error as Error end
-    return nil, Error.new(project_root, strings.tostring(error))
-  end
-end
-
-function create_with_analyzer_and_resolver(
-    project_root: string, installed_binary_modules_root: string,
-    analyzer: Analyzer, external_resolver: ExternalResolver,
-    header_restater: HeaderRestater?):
-    (Service?, Error?)
-  do
-    return create_or_raise(project_root, installed_binary_modules_root,
-                           analyzer, external_resolver,
-                           header_restater), nil
-  catch
-    if error is async.CancellationReason then raise end
-    if error is Error then return nil, error as Error end
-    return nil, Error.new(project_root, strings.tostring(error))
-  end
-end
-
-local function load_with_services(
-    project_root: string, installed_binary_modules_root: string,
-    analyzer: Analyzer, external_resolver: ExternalResolver?,
-    header_restater: HeaderRestater?,
-    snapshot_listener: SnapshotListener?):
-    (Service?, Error?)
-  local service?: Service
-  local failure?: Error
-  if external_resolver == nil then
-    service, failure = create_with_analyzer(
-      project_root, installed_binary_modules_root, analyzer,
-      header_restater)
-  else
-    service, failure = create_with_analyzer_and_resolver(
-      project_root, installed_binary_modules_root, analyzer,
-      external_resolver as ExternalResolver, header_restater)
-  end
-  if service == nil then return nil, failure end
-
-  local complete = false
-  defer do
-    if not complete then service:close() end
-  end
-  local report?, refresh_error? = service:run_pending(snapshot_listener)
-  if report == nil then return nil, refresh_error end
-  complete = true
-  return service, nil
 end
 
 function Service:run_pending(snapshot_listener: SnapshotListener?):
     (RefreshReport?, Error?)
-  local service = self
   if snapshot_listener ~= nil then
     local listener: SnapshotListener = snapshot_listener
     do
       -- Register from the first complete discovery before compiler work can
       -- yield for an extended period. A second scan after registration catches
       -- a save in the finite interval between that discovery and the watcher.
-      listener(service:latest())
-      local rescanned?, scan_error? = service:scan()
+      listener(self:latest())
+      local rescanned?, scan_error? = self:scan()
       if rescanned == nil then return nil, scan_error end
       listener(rescanned)
     catch
       if error is async.CancellationReason then raise end
-      if error is Error then return nil, error as Error end
-      return nil, Error.new(self.project_root, strings.tostring(error))
+      return nil, service_error(self.project_root, error)
     end
   end
 
-  local report?, refresh_error? = service:analyze_to_fixed_point()
+  local report?, refresh_error? = self:analyze_to_fixed_point()
   return report, refresh_error
-end
-
-function load_with_analyzer(project_root: string,
-                            installed_binary_modules_root: string,
-                            analyzer: Analyzer,
-                            header_restater: HeaderRestater?,
-                            snapshot_listener: SnapshotListener?):
-    (Service?, Error?)
-  return load_with_services(
-    project_root, installed_binary_modules_root, analyzer, nil,
-    header_restater, snapshot_listener)
-end
-
-function load_with_analyzer_and_resolver(
-    project_root: string, installed_binary_modules_root: string,
-    analyzer: Analyzer, external_resolver: ExternalResolver,
-    header_restater: HeaderRestater?,
-    snapshot_listener: SnapshotListener?):
-    (Service?, Error?)
-  return load_with_services(
-    project_root, installed_binary_modules_root, analyzer,
-    external_resolver, header_restater, snapshot_listener)
-end
-
-local function load_compiler(project_root: string):
-    (compiler_bridge.Compiler?, Error?)
-  local compiler?: compiler_bridge.Compiler
-  do
-    compiler = compiler_bridge.load()
-  catch
-    if error is async.CancellationReason then raise end
-    if error is compiler_bridge.BridgeError then
-      local failure = error as compiler_bridge.BridgeError
-      return nil, Error.new(failure.module_name, failure.message)
-    end
-    return nil, Error.new(project_root, strings.tostring(error))
-  end
-  return compiler, nil
-end
-
-local function load_with_compiler(
-    project_root: string, installed_binary_modules_root: string,
-    compiler: compiler_bridge.Compiler,
-    progress_listener: compiler_bridge.ProgressListener?,
-    snapshot_listener: SnapshotListener?): (Service?, Error?)
-  local analyzer: Analyzer = function (
-      request: AnalysisRequest): compiler_bridge.Analysis
-    compiler:configure_paths(
-      request.config:source_path(),
-      request.config.binary_modules_root,
-      request.config.extra_ffi_include_dirs,
-      request.config.extra_ffi_cppflags)
-    return compiler:analyze_incremental(
-      request.project_modules, request.dirty_modules,
-      request.cached_sources, progress_listener)
-  end
-  local external_resolver: ExternalResolver = function (
-      config: project_config.ProjectConfig, project_modules: {string},
-      requests: {compiler_bridge.ExternalResolutionRequest}):
-      {compiler_bridge.ExternalResolution}
-    compiler:configure_paths(
-      config:source_path(), config.binary_modules_root,
-      config.extra_ffi_include_dirs, config.extra_ffi_cppflags)
-    return compiler:resolve_external_modules(project_modules, requests)
-  end
-  local header_restater: HeaderRestater = function (
-      dependencies: {compiler_bridge.CHeaderDependency},
-      validation: compiler_bridge.HeaderValidation?):
-      ({compiler_bridge.CHeaderDependency}, boolean)
-    return compiler:restat_c_header_dependencies(dependencies, validation)
-  end
-  return load_with_services(
-    project_root, installed_binary_modules_root, analyzer,
-    external_resolver, header_restater, snapshot_listener)
-end
-
-function load(project_root: string,
-              installed_binary_modules_root: string,
-              progress_listener: compiler_bridge.ProgressListener?,
-              snapshot_listener: SnapshotListener?):
-    (Service?, Error?)
-  local compiler?, failure? = load_compiler(project_root)
-  if compiler == nil then return nil, failure end
-  return load_with_compiler(
-    project_root, installed_binary_modules_root, compiler,
-    progress_listener, snapshot_listener)
-end
-
-function load_default(
-    project_root: string,
-    progress_listener: compiler_bridge.ProgressListener?,
-    snapshot_listener: SnapshotListener?): (Service?, Error?)
-  local compiler?, failure? = load_compiler(project_root)
-  if compiler == nil then return nil, failure end
-  local installed_root?: string
-  do
-    installed_root = compiler:installed_binary_modules_root()
-  catch
-    if error is async.CancellationReason then raise end
-    if error is compiler_bridge.BridgeError then
-      local bridge_error = error as compiler_bridge.BridgeError
-      return nil, Error.new(bridge_error.module_name, bridge_error.message)
-    end
-    return nil, Error.new(project_root, strings.tostring(error))
-  end
-  return load_with_compiler(
-    project_root, installed_root, compiler, progress_listener,
-    snapshot_listener)
 end
