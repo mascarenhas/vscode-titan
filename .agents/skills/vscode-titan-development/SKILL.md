@@ -134,8 +134,10 @@ compiler/source revisions and host-load limits; an early READY notification is
 not full restoration. Keep failed runs as failed evidence.
 
 CI builds and caches the complete compiler installation by its exact commit,
-platform/build policy and absolute installation prefix. No fallback cache may
-supply a different compiler. Native tests compile once and execute in two
+platform/build policy and absolute installation prefix. Include the unpacked
+LuaRocks COPYING and core/cfg.lua licensing inputs used by stage-notices.mjs; a
+fresh compiler checkout does not contain those generated dependency directories.
+No fallback cache may supply a different compiler. Native tests compile once and execute in two
 parallel shards on the two-CPU runner. Maintain the module inventory in
 `scripts/run-server-tests.mjs` when adding a test owner, inspect positive test
 selection and both shard outcomes, and use `make verify` for the complete gate.

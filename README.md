@@ -85,8 +85,8 @@ xvfb-run -a make verify
 
 GitHub CI runs the same gates as separate toolchain, build, test, packaging, and
 inspection steps on Ubuntu 24.04 `ubicloud-standard-2` runners. The completed
-`.titan` installation is cached by the exact pinned Titan commit and installation
-identity. A cache hit reuses the compiler and SDK; a miss builds them once before
+`.titan` installation and the two LuaRocks licensing inputs required by packaging
+are cached by the exact pinned Titan commit and installation identity. A cache hit reuses the compiler and SDK; a miss builds them once before
 server compilation. Native server tests compile once and run in two parallel
 execution shards on the runner's two CPUs. Because both repositories are
 private, the vscode-titan repository must define an Actions secret named
