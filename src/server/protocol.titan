@@ -10,8 +10,8 @@ record ProtocolError
   message: string
 end
 
-type NotificationSink = (string) -> ()
-type NotificationBinder = (NotificationSink) -> ()
+type NotificationSink = function (string): ()
+type NotificationBinder = function (NotificationSink): ()
 
 local record InputDelivery
   body: string
@@ -21,9 +21,9 @@ local record InputDelivery
 end
 
 local union InputEvent
-  message: InputDelivery
-  eof
-  failure: string
+  message(InputDelivery)
+  eof()
+  failure(string)
 end
 
 local record InputQueue
@@ -36,8 +36,8 @@ local record Session
   input: InputQueue
   output: response_queue.ResponseQueue
   coordinator: coordinator.Coordinator
-  reader: async.Task<nil, value>
-  writer: async.Task<nil, value>
+  reader: async.Task<|nil, value|>
+  writer: async.Task<|nil, value|>
   closed: boolean
 end
 
@@ -157,21 +157,21 @@ local function new_session(source: io.Reader, target: io.Writer,
   local output = response_queue.create()
   local server = coordinator.create(
     output, handler, initialized_handler, shutdown_handler)
-  local writer = async.run<nil, value>(function (): nil
+  local writer = async.run<|nil, value|>(function (): nil
     return write_messages(target, output)
   end)
-  local reader = async.run<nil, value>(function (): nil
+  local reader = async.run<|nil, value|>(function (): nil
     return read_messages(source, input)
   end)
   return Session.new(input, output, server, reader, writer, false)
 end
 
-local function rethrow_failed(status: async.TaskStatus<nil, value>,
+local function rethrow_failed(status: async.TaskStatus<|nil, value|>,
                               owner: string)
   case status
-  when succeeded then return
-  when failed: failure then raise failure.error
-  when cancelled then return
+  when succeeded() then return
+  when failed(failure) then raise failure.error
+  when cancelled() then return
   else raise owner .. " did not reach a terminal Task status"
   end
 end
@@ -215,7 +215,7 @@ function run(source: io.Reader, target: io.Writer,
 
   while true do
     case session.input:take()
-    when message: delivery then
+    when message(delivery) then
       local exit_code? = session.coordinator:handle(delivery.body)
       delivery:acknowledge()
       if exit_code ~= nil then return exit_code end
@@ -223,9 +223,9 @@ function run(source: io.Reader, target: io.Writer,
       -- and sole writer all advance without one buffered owner starving the
       -- others.
       async.yield()
-    when eof then
+    when eof() then
       raise ProtocolError.new("stdin closed before the exit notification")
-    when failure: message then
+    when failure(message) then
       raise ProtocolError.new(message)
     end
   end

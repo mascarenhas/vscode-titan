@@ -56,6 +56,13 @@ Git. Prefer `.titan/bin/titanc`, `.titan/bin/lua`, and
 `.titan/bin/luarocks` over ambient installations. Keep the package lockfile
 checked in and use `npm ci` for reproducible JavaScript installs.
 
+Native compilation uses persistent production and test object graphs. See
+`docs/native-build.md` for dependency ownership and `make -j2 server
+server-test-build` for the parallel build. Keep source/provider policy consistent
+within each graph, and run the incremental build regression gate when changing
+Make rules or the compiler pin. Independent concurrent builds need separate
+`BUILD_ROOT` values and, when linking servers, separate `SERVER` destinations.
+
 Tests live with their implementation:
 
 - Titan unit and protocol tests exercise the server, framing, cache,

@@ -131,7 +131,7 @@ describe("Titan TextMate grammar", () => {
     const [directive, value, type, member, comment, string] = tokenizeLines([
       'foreign import "native.h"',
       "return ffi.native_value()",
-      "local pointer: *ffi.NativeType = nil",
+      "local pointer: foreign *NativeType = nil",
       "return object.ffi",
       "-- ffi remains comment text",
       'local text = "ffi"'
@@ -141,12 +141,56 @@ describe("Titan TextMate grammar", () => {
     assertScope(directive, "import", "keyword.control.import.titan");
     assertScope(directive, "native.h", "string.quoted.double.titan");
     assertScope(value, "ffi", "variable.language.ffi.titan");
-    assertScope(type, "ffi", "variable.language.ffi.titan");
+    assertScope(type, "foreign", "storage.modifier.titan");
     assertScope(value, "native_value", "variable.other.member.titan");
-    assertScope(type, "NativeType", "variable.other.member.titan");
+    assertScope(type, "NativeType", "entity.name.type.titan");
     assertScope(member, "ffi", "variable.other.member.titan");
     assertScope(comment, "ffi", "comment.line.double-dash.titan");
     assertScope(string, "ffi", "string.quoted.double.titan");
+  });
+
+  test("recognizes generic delimiters, function types, and union arms", () => {
+    const [generic, callable, arm, removed] = tokenizeLines([
+      "local box = Box<|integer|>.new(1)",
+      "type Transform = function (integer): string",
+      "when some(item) then",
+      "type Removed = (integer) -> string"
+    ]);
+
+    assertScope(generic, "<|", "punctuation.definition.typeparameters.begin.titan");
+    assertScope(generic, "|>", "punctuation.definition.typeparameters.end.titan");
+    assertScope(generic, "new", "variable.other.member.titan");
+    assertScope(callable, "function", "storage.type.function.titan");
+    assertScope(arm, "when", "keyword.control.titan");
+    assertScope(arm, "some", "entity.name.tag.titan");
+    assertScope(removed, "->", "invalid.illegal.operator.titan");
+  });
+
+  test("recognizes foreign type operations and current-module builtins", () => {
+    const [allocation, callback, module, state] = tokenizeLines([
+      "local bytes = foreign unsigned char.new_array(32)",
+      "type Callback = function (foreign function (*void): void): ()",
+      "return M.type",
+      "return ffi.lua_gettop(L)"
+    ]);
+
+    assertScope(allocation, "unsigned char", "entity.name.type.titan");
+    assertScope(allocation, "new_array", "variable.other.member.titan");
+    assertScope(callback, "foreign", "storage.modifier.titan");
+    assertScope(module, "M", "variable.language.module.titan");
+    assertScope(module, "type", "variable.other.member.titan");
+    assertScope(state, "L", "variable.language.lua-state.titan");
+  });
+
+  test("allows contextual type and builtin words as local bindings", () => {
+    const [typeWord, builtin] = tokenizeLines([
+      "local string = 1",
+      "local const ffi: integer = 2"
+    ]);
+
+    assertScope(typeWord, "string", "variable.other.readwrite.titan");
+    assertScope(builtin, "ffi", "variable.other.readwrite.titan");
+    assertScope(builtin, "integer", "storage.type.primitive.titan");
   });
 
   test("keeps equals-delimited long comments and strings open across lines", () => {

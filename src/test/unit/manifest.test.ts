@@ -192,7 +192,8 @@ describe("Titan language configuration", () => {
     assert.deepEqual(configuration.brackets, [
       ["{", "}"],
       ["[", "]"],
-      ["(", ")"]
+      ["(", ")"],
+      ["<|", "|>"]
     ]);
     assert.ok(
       configuration.autoClosingPairs.some(
@@ -231,6 +232,30 @@ describe("Titan language configuration", () => {
       assert.match(deferredBlock, increasesIndent);
     }
     assert.doesNotMatch("defer cleanup()", increasesIndent);
+    assert.doesNotMatch("function: integer = 1", increasesIndent);
+    assert.doesNotMatch("record = 2", increasesIndent);
+    assert.doesNotMatch("end: integer = 3", decreasesIndent);
+    assert.match("function Box<|T|>:unwrap(): T", increasesIndent);
+    // Multiline callbacks can start without a declaration name.
+    for (const callback of [
+      "    function (): dispatcher.SemanticOutcome",
+      "        function (name: string): (string?,{bridge.CHeaderDependency}?)",
+      "function(value)",
+      "function()",
+      "  function ("
+    ]) {
+      assert.match(callback, increasesIndent);
+    }
+    for (const declaration of [
+      "type Callback = function (integer): integer",
+      "local callback: function (integer): integer",
+      "callback: function (): () = handler",
+      "function: function (integer): integer = handler",
+      "function = handler"
+    ]) {
+      assert.doesNotMatch(declaration, increasesIndent);
+    }
+    assert.match("when some(item) then", increasesIndent);
     assert.match("else -- fallback", increasesIndent);
     assert.match("else -- fallback", decreasesIndent);
   });

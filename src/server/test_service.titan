@@ -1,0 +1,32 @@
+local config = import "server.project_config"
+local service = import "server.project_service"
+local stores = import "server.workspace_store"
+
+-- Test setup supplies collaborators to the production Service constructor.
+-- Real-compiler integration fixtures use project_loader instead.
+function create(project_root: string, installed_binary_modules_root: string,
+    analyzer: service.Analyzer, external_resolver: service.ExternalResolver?,
+    header_restater: service.HeaderRestater?, store: stores.Store?):
+    (service.Service?, service.Error?)
+  local settings?, failure? = config.load(project_root, installed_binary_modules_root)
+  if settings == nil then
+    return nil, service.Error.new(failure.path, failure.message)
+  end
+  return service.create(settings, installed_binary_modules_root,
+    analyzer, external_resolver, header_restater, store)
+end
+
+function load(project_root: string, installed_binary_modules_root: string,
+    analyzer: service.Analyzer, external_resolver: service.ExternalResolver?,
+    header_restater: service.HeaderRestater?,
+    snapshot_listener: service.SnapshotListener?): (service.Service?, service.Error?)
+  local loaded?, failure? = create(project_root, installed_binary_modules_root,
+    analyzer, external_resolver, header_restater)
+  if loaded == nil then return nil, failure end
+  local complete = false
+  defer do if not complete then loaded:close() end end
+  local report?, refresh_error? = loaded:run_pending(snapshot_listener)
+  if report == nil then return nil, refresh_error end
+  complete = true
+  return loaded, nil
+end

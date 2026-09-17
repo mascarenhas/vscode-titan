@@ -22,9 +22,9 @@ end
 -- repeated modifications of extensionless non-source files while still
 -- treating a newly created valid path as a possible source directory.
 union PathChange
-  created: string
-  modified: string
-  deleted: string
+  created(string)
+  modified(string)
+  deleted(string)
 end
 
 -- A change is only a hint that saved disk state may have changed. Consumers
@@ -36,24 +36,24 @@ record RediscoveryBatch
   const watch_set_changed: boolean
 end
 
-type RediscoveryCallback = (RediscoveryBatch) -> ()
+type RediscoveryCallback = function (RediscoveryBatch): ()
 
 local union BackendEvent
-  created: string
-  modified: string
-  deleted: string
-  failed: WatchFailure
+  created(string)
+  modified(string)
+  deleted(string)
+  failed(WatchFailure)
 end
 
 -- The private backend is the deterministic test seam. Production constructs
 -- one wrapper around one fs.Watcher; no dynamic values cross this boundary.
 local record Backend
-  canonicalize_directory: (string) -> string
-  watch: (string) -> ()
-  stop: (string) -> ()
-  is_watching: (string) -> boolean
-  clear: () -> ()
-  poll: () -> {BackendEvent}
+  canonicalize_directory: function (string): string
+  watch: function (string): ()
+  stop: function (string): ()
+  is_watching: function (string): boolean
+  clear: function (): ()
+  poll: function (): {BackendEvent}
 end
 
 record ProjectWatcher
@@ -61,7 +61,7 @@ record ProjectWatcher
   local callback: RediscoveryCallback
   local active: {string: boolean}
   local active_order: {string}
-  local poll_task: async.Task<nil, value>?
+  local poll_task: async.Task<|nil, value|>?
   local poll_cancel_expected: boolean
   local operation_active: boolean
   local stopped: boolean
@@ -89,9 +89,9 @@ end
 
 function change_path(change: PathChange): string
   case change
-  when created: path then return path
-  when modified: path then return path
-  when deleted: path then return path
+  when created(path) then return path
+  when modified(path) then return path
+  when deleted(path) then return path
   end
   return ""
 end
@@ -110,7 +110,7 @@ local function append_change(changes: {PathChange},
     -- created extensionless directory could be mistaken for an irrelevant
     -- existing file. Without a create, retain the final modify/delete state.
     case changes[position]
-    when created then return
+    when created() then return
     else
     end
     changes[position] = change
@@ -169,13 +169,13 @@ local function ProjectWatcher:publish(events: {BackendEvent})
   local failures: {WatchFailure} = {}
   for index = 1, #events do
     case events[index]
-    when created: path then
+    when created(path) then
       append_change(changes, positions, PathChange.created(path))
-    when modified: path then
+    when modified(path) then
       append_change(changes, positions, PathChange.modified(path))
-    when deleted: path then
+    when deleted(path) then
       append_change(changes, positions, PathChange.deleted(path))
-    when failed: failure then
+    when failed(failure) then
       failures[#failures + 1] = failure
     end
   end
@@ -239,7 +239,7 @@ local function ProjectWatcher:start_polling()
   if self.stopped or #self.active_order == 0 or self.poll_task ~= nil then
     return
   end
-  self.poll_task = async.run<nil, value>(function (): nil
+  self.poll_task = async.run<|nil, value|>(function (): nil
     return self:poll_loop()
   end)
 end
@@ -380,13 +380,13 @@ local function fs_backend(): Backend
     local events: {BackendEvent} = {}
     for index = 1, #native do
       case native[index]
-      when created: path then
+      when created(path) then
         events[#events + 1] = BackendEvent.created(path)
-      when modified: path then
+      when modified(path) then
         events[#events + 1] = BackendEvent.modified(path)
-      when deleted: path then
+      when deleted(path) then
         events[#events + 1] = BackendEvent.deleted(path)
-      when error: failure then
+      when error(failure) then
         events[#events + 1] = BackendEvent.failed(WatchFailure.new(
           failure.code, failure.name, failure.message, failure.operation))
       end

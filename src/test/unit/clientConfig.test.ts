@@ -12,7 +12,6 @@ import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { afterEach, describe, test } from "node:test";
 import {
-  COMPILER_CACHE_PREFIX_ENVIRONMENT_VARIABLE,
   DEFAULT_SERVER_LOG_LEVEL,
   LANGUAGE_SERVER_LUA_CPATH_ENVIRONMENT_VARIABLE,
   LANGUAGE_SERVER_LUA_PATH_ENVIRONMENT_VARIABLE,
@@ -338,15 +337,14 @@ describe("server launch validation", () => {
         luaPath: "/opt/titan/compiler/?.lua",
         luaCPath: "/opt/titan/compiler/?.so"
       },
-      "debug",
-      "/extension-storage"
+      "debug"
     );
     assert.deepEqual(configured.options.env, {
       LUA_PATH: "inherited-lua-path",
       LUA_CPATH: "inherited-lua-cpath",
       TITAN_LS_LUA_PATH: "/opt/titan/compiler/?.lua",
       TITAN_LS_LUA_CPATH: "/opt/titan/compiler/?.so",
-      [COMPILER_CACHE_PREFIX_ENVIRONMENT_VARIABLE]: "/extension-storage",
+      TITAN_PREFIX: "inherited-cache-prefix",
       TITAN_LANGUAGE_SERVER_LOG_LEVEL: "debug",
       TITAN_TEST_ENV: "preserved"
     });

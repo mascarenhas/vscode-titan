@@ -11,11 +11,13 @@ local indexing_status = import "server.indexing_status"
 local logging = import "server.logging"
 local lua_paths = import "server.lua_paths"
 local protocol = import "server.protocol"
+local workspace_cache = import "server.workspace_cache"
 
 local function serve(root: string): integer
   logging.emit("info", "server.start", {
     ["root"] = root,
     ["log_level"] = logging.level(),
+    ["probe_cache_prefix"] = os.getenv("TITAN_PREFIX"),
   })
   local result = 1
   do
@@ -92,5 +94,13 @@ function main(args: {string}): integer
       ["fallback"] = "info",
     })
   end
-  return serve(fs.pwd())
+  local root = fs.pwd()
+  local probe_prefix? = os.getenv("TITAN_PREFIX")
+  if probe_prefix == nil or probe_prefix == "" then
+    -- Each native process owns its startup working directory as its workspace.
+    -- Set the compiler's cache-only prefix before its Lua driver first loads;
+    -- TITAN_PREFIX does not choose compiler source, providers, or SDK headers.
+    os.setenv("TITAN_PREFIX", workspace_cache.directory(root))
+  end
+  return serve(root)
 end

@@ -1,7 +1,7 @@
 # Workspace SQLite measurements
 
 `scripts/benchmark-workspace-cache.mjs` measures the native language server
-against saved files in an actual workspace. Each invocation records a cold
+against saved files in an actual workspace. By default, each invocation records a cold
 startup, an unchanged process restart, and one saved comment edit in that
 restarted process, followed by startup after a repository-owned header changes.
 These are the workloads required by the integrated-performance gate in
@@ -11,8 +11,9 @@ and folding after each completed generation and checks that the comment edits
 and restarts preserve the returned feature data.
 
 Current reports use format 2 and name background declaration restoration
-`manifestRestoration`. The historical results below use the earlier full-graph
-hydration path. See the [storage breakdown](sqlite-backend-storage.md) for the
+`manifestRestoration`. The older September 7/8 sections preserve measurements
+from earlier startup and full-graph hydration implementations; the September 9
+section measures compact declaration restoration. See the [storage breakdown](sqlite-backend-storage.md) for the
 preserved single-FFI baseline and the compact declaration/cache contract.
 
 ## Compact declarations: 9 September 2026
@@ -62,6 +63,21 @@ Evidence is under `/tmp/module-manifest-validation/warm-edit-header-final/`:
 and previous workspace cache were restored successfully. The earlier
 `warm-edit-header` directory remains an explicitly failed format-1 harness
 attempt; its source/header/cache restoration also passed.
+
+## Analysis startup regression mode
+
+See the [parser-overhaul regression report](parser-overhaul-performance.md) for
+matched cold/unchanged-restart measurements and separately reported database
+replay trials on both source trees.
+
+Pass `--startup-only` to measure just a cold cache and an unchanged restart. This
+mode skips source and header comment edits, while retaining diagnostic checks,
+feature-result comparisons, warm-cache reuse assertions, background restoration
+timings, SQL integrity checks, and the existing evidence/cleanup contract. Use
+isolated source snapshots when the original checkout must remain unchanged.
+The run still requires a source query target and header path for its input
+identity record. Cold means a fresh workspace database and private probe cache;
+OS page caches are not flushed.
 
 ## Reproduce
 
@@ -134,7 +150,8 @@ of work performed and avoided.
 ## What is measured
 
 Cold means an absent workspace database and a fresh private native-probe cache
-directory. All three server processes share that directory. The current runner
+directory. The three full-mode processes (or two with `--startup-only`) share
+that directory. The current runner
 uses the compiler's supported `TITAN_PREFIX` cache-root override only in its
 child processes, while `TITAN_ROCKS_ROOT` still selects the actual installation.
 The source-only probe cache retains its ordinary raw-source SHA-256 keys and
@@ -188,11 +205,12 @@ The report keeps these measurements separate:
   sidecars both at readiness and after shutdown. They exclude the separate
   compiler probe cache and unrelated installation files.
 
-`initialWork` in all three processes and `savedEdit.work` retain source parse/check profile counts and
+`initialWork` in each process retains source parse/check profile counts and
 CPU, source-module names, header preprocessing/parsing counts, downstream FFI
 conversion calls and replay hits, cache statistics, restoration and encoding
 events, and the `cache.startup.phase` CPU/wall records. The existing detailed
-compiler profile aggregation is included as well. `cacheBehavior` states the
+compiler profile aggregation is included as well. Full mode also records
+`savedEdit.work`. `cacheBehavior` states the
 observed restart/edit outcomes explicitly. `manifestRestoration.work` records the
 restoration lifecycle and its final counters. Current runs also enforce these work
 checks before reporting success:
@@ -203,13 +221,15 @@ checks before reporting success:
 - Warm SQL readiness precedes project restoration. Source, external-input, header
   and compiler-inventory counters prove zero content reads/hashes for unchanged
   observations. Initial validation and background completion are timed separately.
-- The saved comment parses/checks only the named module, performs no header
+- In full mode, the saved comment parses/checks only the named module, performs no header
   preprocessing/parsing or FFI conversion, records a persisted FFI replay hit,
   and encodes exactly one payload with that module's name.
-- The header comment rechecks its importing module and performs header
+- In full mode, the header comment rechecks its importing module and performs header
   preprocessing/parsing and FFI conversion again.
 
-The corresponding `reuseAssertions` flags must all be true. Raw logs and
+The corresponding `reuseAssertions` flags must all be true. Startup-only omits
+`savedEdit`, `headerChange`, and their reuse flags rather than marking unrun
+scenarios successful. Raw logs and
 partial session evidence are kept when an assertion fails.
 
 `sourceProfileCalls` and `sourceModules` count profile visits, which include

@@ -11,6 +11,11 @@ record Error
   message: string
 end
 
+local function configuration_path(root: string): string
+  if root == "/" then return "/titan-config.lua" end
+  return root .. "/titan-config.lua"
+end
+
 record ProjectConfig
   project_root: string
   config_file: string?
@@ -22,13 +27,23 @@ record ProjectConfig
   extra_ffi_cppflags: string?
 end
 
-function ProjectConfig:source_path(): string
-  local output = strings.writer()
-  for index = 1, #self.source_module_roots do
-    if index > 1 then output:write(";") end
-    output:write(self.source_module_roots[index])
-  end
-  return output:drain()
+local function copy_paths(source: {string}): {string}
+  local result: {string} = {}
+  for index = 1, #source do result[index] = source[index] end
+  return result
+end
+
+function ProjectConfig:copy(): ProjectConfig
+  return ProjectConfig.new {
+    project_root = self.project_root,
+    config_file = self.config_file,
+    include = copy_paths(self.include),
+    exclude = copy_paths(self.exclude),
+    source_module_roots = copy_paths(self.source_module_roots),
+    binary_modules_root = self.binary_modules_root,
+    extra_ffi_include_dirs = copy_paths(self.extra_ffi_include_dirs),
+    extra_ffi_cppflags = self.extra_ffi_cppflags,
+  }
 end
 
 -- Persist the same semantic fields used by live invalidation. Exclude only
@@ -47,7 +62,7 @@ function ProjectConfig:semantic_identity(): string
   return content_identity.digest(output:drain())
 end
 
-local function fail<T>(path: string, message: string): T
+local function fail<|T|>(path: string, message: string): T
   raise Error.new(path, message)
 end
 
@@ -57,23 +72,23 @@ local function absolute_project_root(path: string): string
   if strings.sub(candidate, 1, 1) ~= "/" then
     local resolved?, failure? = source_text.resolve_path(fs.pwd(), candidate)
     if resolved == nil then
-      return fail<string>(path, failure.message)
+      return fail<|string|>(path, failure.message)
     end
     return resolved
   end
   local normalized?, failure? = source_text.normalize_absolute_path(candidate)
-  if normalized == nil then return fail<string>(path, failure.message) end
+  if normalized == nil then return fail<|string|>(path, failure.message) end
   return normalized
 end
 
 local function resolve_config_path(config_file: string, base: string,
                                    candidate: string, field: string): string
   if candidate == "" then
-    return fail<string>(config_file, field .. " must not be empty")
+    return fail<|string|>(config_file, field .. " must not be empty")
   end
   local resolved?, failure? = source_text.resolve_path(base, candidate)
   if resolved == nil then
-    return fail<string>(config_file, field .. ": " .. failure.message)
+    return fail<|string|>(config_file, field .. ": " .. failure.message)
   end
   return resolved
 end
@@ -83,7 +98,7 @@ local function optional_path(config_file: string, base: string,
                              default_path: string): string
   if candidate == nil then return default_path end
   if not (candidate is string) then
-    return fail<string>(config_file, field .. " must be a string")
+    return fail<|string|>(config_file, field .. " must be a string")
   end
   return resolve_config_path(
     config_file, base, candidate as string, field)
@@ -93,7 +108,7 @@ local function optional_string(config_file: string, candidate: value,
                                field: string): string?
   if candidate == nil then return nil end
   if not (candidate is string) then
-    return fail<string>(config_file, field .. " must be a string")
+    return fail<|string|>(config_file, field .. " must be a string")
   end
   return candidate as string
 end
@@ -108,7 +123,7 @@ local function normalize_paths(config_file: string, base: string,
         config_file, base, defaults[index], field .. "[" .. index .. "]")
       if field == "source_module_roots" and
          strings.find(resolved, ";") ~= nil then
-        return fail<{string}>(
+        return fail<|{string}|>(
           config_file, field .. "[" .. index .. "] must not contain ';'")
       end
       result[index] = resolved
@@ -116,7 +131,7 @@ local function normalize_paths(config_file: string, base: string,
     return result
   end
   if not (candidate is {value: value}) then
-    return fail<{string}>(
+    return fail<|{string}|>(
       config_file, field .. " must be a Lua array table")
   end
 
@@ -126,18 +141,18 @@ local function normalize_paths(config_file: string, base: string,
   local maximum = 0
   for key, item in iteration.pairs(raw) do
     if not (key is integer) then
-      return fail<{string}>(
+      return fail<|{string}|>(
         config_file,
         field .. " must contain only integer array keys")
     end
     local index = key as integer
     if index < 1 then
-      return fail<{string}>(
+      return fail<|{string}|>(
         config_file,
         field .. " array keys must be positive")
     end
     if not (item is string) then
-      return fail<{string}>(
+      return fail<|{string}|>(
         config_file,
         field .. " entries must be strings")
     end
@@ -145,7 +160,7 @@ local function normalize_paths(config_file: string, base: string,
       config_file, base, item as string, field .. "[" .. index .. "]")
     if field == "source_module_roots" and
        strings.find(resolved, ";") ~= nil then
-      return fail<{string}>(
+      return fail<|{string}|>(
         config_file, field .. "[" .. index .. "] must not contain ';'")
     end
     normalized[index] = resolved
@@ -153,7 +168,7 @@ local function normalize_paths(config_file: string, base: string,
     if index > maximum then maximum = index end
   end
   if count ~= maximum then
-    return fail<{string}>(
+    return fail<|{string}|>(
       config_file, field .. " must be a dense Lua array")
   end
 
@@ -162,11 +177,14 @@ local function normalize_paths(config_file: string, base: string,
   return result
 end
 
-local function normalize_environment(config_file: string,
+local function normalize_environment(config_file: string?,
                                      project_root: string,
                                      default_binary_root: string,
                                      environment: {value: value}):
     ProjectConfig
+  -- Invalid defaults still belong to the expected configuration pathname,
+  -- while config_file remains nil when the optional file is absent.
+  local error_path = config_file or configuration_path(project_root)
   local raw_include: value = nil
   local raw_exclude: value = nil
   local raw_source_module_roots: value = nil
@@ -175,8 +193,8 @@ local function normalize_environment(config_file: string,
   local raw_cppflags: value = nil
   for key, item in iteration.pairs(environment) do
     if not (key is string) then
-      return fail<ProjectConfig>(
-        config_file, "titan-config.lua global names must be strings")
+      return fail<|ProjectConfig|>(
+        error_path, "titan-config.lua global names must be strings")
     end
     local name = key as string
     if name == "include" then
@@ -192,26 +210,26 @@ local function normalize_environment(config_file: string,
     elseif name == "extra_ffi_cppflags" then
       raw_cppflags = item
     else
-      return fail<ProjectConfig>(
-        config_file, "unknown titan-config.lua field '" .. name .. "'")
+      return fail<|ProjectConfig|>(
+        error_path, "unknown titan-config.lua field '" .. name .. "'")
     end
   end
 
   local include = normalize_paths(
-    config_file, project_root, raw_include, "include", {"./src"})
+    error_path, project_root, raw_include, "include", {"./src"})
   local exclude = normalize_paths(
-    config_file, project_root, raw_exclude, "exclude", {})
+    error_path, project_root, raw_exclude, "exclude", {})
   local source_module_roots = normalize_paths(
-    config_file, project_root, raw_source_module_roots,
+    error_path, project_root, raw_source_module_roots,
     "source_module_roots", {"./src"})
   local binary_root = optional_path(
-    config_file, project_root, raw_binary_root,
+    error_path, project_root, raw_binary_root,
     "binary_modules_root", default_binary_root)
   local include_dirs = normalize_paths(
-    config_file, project_root, raw_include_dirs,
+    error_path, project_root, raw_include_dirs,
     "extra_ffi_include_dirs", {})
   local cppflags: string? = optional_string(
-    config_file, raw_cppflags, "extra_ffi_cppflags")
+    error_path, raw_cppflags, "extra_ffi_cppflags")
   return ProjectConfig.new(
     project_root, config_file, include, exclude, source_module_roots,
     binary_root, include_dirs, cppflags)
@@ -224,21 +242,14 @@ local function load_or_raise(project_root: string,
   local default_binary_root = resolve_config_path(
     root, root, installed_binary_modules_root,
     "installed binary modules root")
-  local config_file = root .. "/titan-config.lua"
-  if root == "/" then config_file = "/titan-config.lua" end
+  local config_file = configuration_path(root)
 
   local metadata? = fs.stat(config_file)
   if metadata == nil then
-    local include = normalize_paths(
-      config_file, root, nil, "include", {"./src"})
-    local source_module_roots = normalize_paths(
-      config_file, root, nil, "source_module_roots", {"./src"})
-    return ProjectConfig.new(
-      root, nil, include, {}, source_module_roots,
-      default_binary_root, {}, nil)
+    return normalize_environment(nil, root, default_binary_root, {})
   end
   if metadata.kind ~= "file" then
-    return fail<ProjectConfig>(
+    return fail<|ProjectConfig|>(
       config_file, "titan-config.lua is not a regular file")
   end
 
@@ -256,12 +267,12 @@ local function load_or_raise(project_root: string,
     returned = chunk()
   catch
     if error is async.CancellationReason then raise end
-    return fail<ProjectConfig>(
+    return fail<|ProjectConfig|>(
       config_file,
       "cannot evaluate titan-config.lua: " .. strings.tostring(error))
   end
   if returned ~= nil then
-    return fail<ProjectConfig>(
+    return fail<|ProjectConfig|>(
       config_file,
       "titan-config.lua must use global assignments and return no value")
   end

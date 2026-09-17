@@ -11,8 +11,8 @@ end
 -- Keeping that restriction nominal prevents dynamic JSON values from leaking
 -- into request ownership and cancellation bookkeeping.
 union RequestId
-  integer_id: integer
-  string_id: string
+  integer_id(integer)
+  string_id(string)
 end
 
 record SemanticRequest
@@ -27,17 +27,17 @@ record SemanticError
 end
 
 union SemanticOutcome
-  result: value
-  failure: SemanticError
+  result(value)
+  failure(SemanticError)
 end
 
 union Route
-  immediate: DispatchResult
-  initialized
-  semantic: SemanticRequest
-  cancel: RequestId
-  shutdown: DispatchResult
-  exit: integer
+  immediate(DispatchResult)
+  initialized()
+  semantic(SemanticRequest)
+  cancel(RequestId)
+  shutdown(DispatchResult)
+  exit(integer)
 end
 
 record Dispatcher
@@ -61,14 +61,14 @@ end
 
 function RequestId:equals(other: RequestId): boolean
   case self
-  when integer_id: left then
+  when integer_id(left) then
     case other
-    when integer_id: right then return left == right
+    when integer_id(right) then return left == right
     else return false
     end
-  when string_id: left then
+  when string_id(left) then
     case other
-    when string_id: right then return left == right
+    when string_id(right) then return left == right
     else return false
     end
   end
@@ -77,8 +77,8 @@ end
 
 function RequestId:to_json(): value
   case self
-  when integer_id: item then return item
-  when string_id: item then return item
+  when integer_id(item) then return item
+  when string_id(item) then return item
   end
   return wire.null()
 end
@@ -214,19 +214,19 @@ local function Dispatcher:route_call(object: wire.Object): Route
   local decision = self.lifecycle_state:dispatch(
     actual_method, is_request, params)
   case decision
-  when result: result then
+  when result(result) then
     if not is_request then return immediate(no_response()) end
     local reply = result_response(id, result)
     if actual_method == "shutdown" then return Route.shutdown(reply) end
     return immediate(reply)
-  when failure: failure then
+  when failure(failure) then
     if not is_request then return immediate(no_response()) end
     return immediate(failure_response(id, failure.code, failure.message))
-  when notification then return immediate(no_response())
-  when initialized then return Route.initialized()
-  when exit: code then
+  when notification() then return immediate(no_response())
+  when initialized() then return Route.initialized()
+  when exit(code) then
     return Route.exit(code)
-  when unhandled then
+  when unhandled() then
     if actual_method == "$/cancelRequest" then
       if is_request then
         return immediate(failure_response(
@@ -272,13 +272,13 @@ end
 -- coordinator consumes route() and owns semantic request Tasks.
 function Dispatcher:dispatch(source: string): DispatchResult
   case self:route(source)
-  when immediate: result then return result
-  when initialized then return no_response()
-  when semantic: request then
+  when immediate(result) then return result
+  when initialized() then return no_response()
+  when semantic(request) then
     return failure_response(request.id, METHOD_NOT_FOUND, "Method not found")
-  when cancel then return no_response()
-  when shutdown: result then return result
-  when exit: code then return DispatchResult.new(nil, code)
+  when cancel() then return no_response()
+  when shutdown(result) then return result
+  when exit(code) then return DispatchResult.new(nil, code)
   end
   return no_response()
 end

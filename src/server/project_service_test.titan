@@ -1,3 +1,4 @@
+local test_service = import "server.test_service"
 local fs = import "fs"
 local lua = import "lua"
 local async = import "async"
@@ -11,11 +12,21 @@ local content_identity = import "server.content_identity"
 local project_config = import "server.project_config"
 local project_service = import "server.project_service"
 local project_graph = import "server.project_graph"
+local project_loader = import "server.project_loader"
+local workspace_cache = import "server.workspace_cache"
 local stores = import "server.workspace_store"
 local test_runtime = import "server.test_runtime"
 
+local function same_paths(left: {string}, right: {string}): boolean
+  if #left ~= #right then return false end
+  for index = 1, #left do
+    if left[index] ~= right[index] then return false end
+  end
+  return true
+end
+
 local function set_modified_time(path: string, seconds: integer)
-  local times = ffi.utimbuf.new()
+  local times = foreign utimbuf.new()
   times.actime = seconds
   times.modtime = seconds
   test.assert(ffi.utime(path, times) == 0,
@@ -40,15 +51,36 @@ local record Fixture
   known_files: {string: boolean}
   known_directories: {string: boolean}
   services: {project_service.Service}
+  restorations: {project_loader.Restoration}
 end
 
-local type FixtureBody = (Fixture) -> ()
+local type FixtureBody = function (Fixture): ()
 
 local function new_fixture(): Fixture
   local root = fs.tmpname()
   fs.unlink(root)
   fs.mkdir(root)
-  return Fixture.new(root, {}, {root}, {}, {[root] = true}, {})
+  return Fixture.new(root, {}, {root}, {}, {[root] = true}, {}, {})
+end
+
+local function Fixture:load_compiler(): (project_service.Service?, project_service.Error?)
+  local loaded?, failure?, restoration? = project_loader.load(self.root)
+  if restoration ~= nil then
+    self.restorations[#self.restorations + 1] = restoration
+  end
+  return loaded, failure
+end
+
+local function remove_cache(path: string)
+  local metadata? = fs.lstat(path)
+  if metadata == nil then return end
+  if metadata.kind == "directory" then
+    local names = fs.list(path)
+    for index = 1, #names do remove_cache(path .. "/" .. names[index]) end
+    fs.rmdir(path)
+  else
+    fs.unlink(path)
+  end
 end
 
 local function Fixture:path(relative: string): string
@@ -74,7 +106,9 @@ local function Fixture:write(relative: string, contents: string)
 end
 
 local function Fixture:cleanup()
+  for index = #self.restorations, 1, -1 do self.restorations[index]:close() end
   for index = #self.services, 1, -1 do self.services[index]:close() end
+  remove_cache(workspace_cache.directory(self.root))
   for index = #self.files, 1, -1 do
     if fs.lstat(self.files[index]) ~= nil then fs.unlink(self.files[index]) end
   end
@@ -203,8 +237,8 @@ end
 local function current_header_identity(
     kind: compiler_bridge.CHeaderDependencyKind, path: string): string
   case kind
-  when search then return search_header_identity(path)
-  when file then
+  when search() then return search_header_identity(path)
+  when file() then
     local metadata? = fs.stat(path)
     if metadata == nil or metadata.kind ~= "file" then
       return "file:unreadable:" .. search_header_identity(path)
@@ -241,8 +275,8 @@ local function restat_test_headers(
     local dependency = dependencies[index]
     local kind = compiler_bridge.CHeaderDependencyKind.file()
     case dependency.kind
-    when search then kind = compiler_bridge.CHeaderDependencyKind.search()
-    when file then
+    when search() then kind = compiler_bridge.CHeaderDependencyKind.search()
+    when file() then
     end
     local observed? = header_observation(dependency.path)
     local previous? = dependency.observation
@@ -270,10 +304,10 @@ local function has_missing_file_header(
   for index = 1, #dependencies do
     local dependency = dependencies[index]
     case dependency.kind
-    when file then
+    when file() then
       local metadata? = fs.stat(dependency.path)
       if metadata == nil or metadata.kind ~= "file" then return true end
-    when search then
+    when search() then
     end
   end
   return false
@@ -314,7 +348,7 @@ local record RecordingAnalyzer
   last_dirty: {string}
   last_cached_count: integer
   checked_modules: {string}
-  expected_source_root: string?
+  expected_source_roots: {string}?
   external_main: string?
   external_files: {string}
   external_dependency_main: string?
@@ -368,8 +402,8 @@ local function RecordingAnalyzer:analyze(
       request.dirty_modules[index]
   end
   self.last_cached_count = #request.cached_sources
-  if self.expected_source_root ~= nil then
-    test.assert(request.config:source_path() == self.expected_source_root,
+  if self.expected_source_roots ~= nil then
+    test.assert(same_paths(request.config.source_module_roots, self.expected_source_roots),
                 "analysis request lost the normalized source root")
   end
 
@@ -531,9 +565,12 @@ end
 
 local function require_service(
     fixture: Fixture, analyzer: RecordingAnalyzer): project_service.Service
-  local service?, failure? = project_service.load_with_analyzer(
-    fixture.root, "/sdk/lib/titan/0.6", analyzer:analyze,
-    restat_test_headers)
+  local service?, failure? = test_service.load {
+    project_root = fixture.root,
+    installed_binary_modules_root = "/sdk/lib/titan/0.6",
+    analyzer = analyzer:analyze,
+    header_restater = restat_test_headers,
+  }
   if service ~= nil then fixture.services[#fixture.services + 1] = service end
   local detail = ""
   if failure ~= nil then
@@ -549,9 +586,13 @@ local function require_resolved_service(
     fixture: Fixture, analyzer: RecordingAnalyzer,
     resolver: RecordingResolver): project_service.Service
   local service?, failure? =
-    project_service.load_with_analyzer_and_resolver(
-      fixture.root, "/sdk/lib/titan/0.6", analyzer:analyze,
-      resolver:resolve, restat_test_headers)
+    test_service.load {
+      project_root = fixture.root,
+      installed_binary_modules_root = "/sdk/lib/titan/0.6",
+      analyzer = analyzer:analyze,
+      external_resolver = resolver:resolve,
+      header_restater = restat_test_headers,
+    }
   if service ~= nil then fixture.services[#fixture.services + 1] = service end
   local detail = ""
   if failure ~= nil then
@@ -574,21 +615,21 @@ end
 
 local function project_is_clean(module: project_service.ProjectModule): boolean
   case module.analysis_state
-  when clean then return true
+  when clean() then return true
   else return false
   end
 end
 
 local function project_is_failed(module: project_service.ProjectModule): boolean
   case module.analysis_state
-  when failed then return true
+  when failed() then return true
   else return false
   end
 end
 
 local function project_is_dirty(module: project_service.ProjectModule): boolean
   case module.analysis_state
-  when dirty then return true
+  when dirty() then return true
   else return false
   end
 end
@@ -607,9 +648,9 @@ end
 local function assert_visibility(edge: project_graph.ImportEdge,
                                  required: boolean)
   case edge.visibility
-  when ordinary then
+  when ordinary() then
     test.assert(not required, "source-required edge became ordinary")
-  when source_required then
+  when source_required() then
     test.assert(required, "ordinary edge became source-required")
   end
 end
@@ -630,7 +671,7 @@ local function loads_multi_module_folder_and_external_metadata()
     fixture:write("binary-modules/vendor.so", "binary provider")
 
     local analyzer = new_analyzer()
-    analyzer.expected_source_root = fixture:path("src")
+    analyzer.expected_source_roots = {fixture:path("src")}
     analyzer.external_main = fixture:path("external/main.titan")
     analyzer.external_files = {
       fixture:path("external/main.titan"),
@@ -681,7 +722,7 @@ local function loads_multi_module_folder_and_external_metadata()
                 binary ~= nil and #binary.stamps == 1,
                 "external source files or binary provider stamps were lost")
     case source.origin
-    when source: origin then
+    when source(origin) then
       test.assert(#origin.source_files == 2 and
                   origin.source_files[2] == fixture:path("external/part.titan"),
                   "external source provenance lost a folder constituent")
@@ -743,13 +784,12 @@ binary_modules_root = "binary-modules"
     fixture:write("lookup/external.titan", "-- source-only external\n")
 
     local analyzer = new_analyzer()
-    analyzer.expected_source_root = fixture:path("first") .. ";" ..
-                                    fixture:path("second") .. ";" ..
-                                    fixture:path("lookup")
+    analyzer.expected_source_roots = {fixture:path("first"),
+      fixture:path("second"), fixture:path("lookup")}
     local service = require_service(fixture, analyzer)
     local snapshot = service:latest()
-    test.assert(snapshot.config:source_path() ==
-                  analyzer.expected_source_root and
+    test.assert(same_paths(snapshot.config.source_module_roots,
+                  analyzer.expected_source_roots) and
                 #snapshot.project_modules == 4 and
                 find_project(snapshot, "excluded_file") ~= nil and
                 find_project(snapshot, "ignored.hidden") ~= nil and
@@ -797,9 +837,8 @@ binary_modules_root = "binary-modules"
     fixture:write("lookup/external.titan", "-- source-only external\n")
 
     local analyzer = new_analyzer()
-    analyzer.expected_source_root = fixture.root .. ";" ..
-                                    fixture:path("spec/stdlib/titan") .. ";" ..
-                                    fixture:path("lookup")
+    analyzer.expected_source_roots = {fixture.root,
+      fixture:path("spec/stdlib/titan"), fixture:path("lookup")}
     local service = require_service(fixture, analyzer)
     local snapshot = service:latest()
     test.assert(#snapshot.project_modules == 3 and
@@ -894,9 +933,8 @@ source_module_roots = { "src", "lookup-two" }
                 after.analysis_runs == before.analysis_runs + 1 and
                 after.project_modules_submitted ==
                   before.project_modules_submitted + 1 and
-                service:latest().config:source_path() ==
-                  fixture:path("src") .. ";" ..
-                    fixture:path("lookup-two"),
+                same_paths(service:latest().config.source_module_roots,
+                  {fixture:path("src"), fixture:path("lookup-two")}),
                 "source-module-root change reused compiler configuration")
   end)
 end
@@ -954,14 +992,16 @@ local function rejects_omitted_attempted_project_result()
     configure_source_root(fixture)
     fixture:write("src/main.titan", "-- saved project\n")
     local runs = 0
-    local service?, create_error? = project_service.create_with_analyzer(
-      fixture.root, "/sdk/lib/titan/0.6",
-      function (request: project_service.AnalysisRequest):
+    local service?, create_error? = test_service.create {
+      project_root = fixture.root,
+      installed_binary_modules_root = "/sdk/lib/titan/0.6",
+      analyzer = function (request: project_service.AnalysisRequest):
           compiler_bridge.Analysis
         runs = runs + 1
         return compiler_bridge.Analysis.new(
           request.root_module, {}, {}, {}, {}, {})
-      end)
+      end,
+    }
     if service ~= nil then fixture.services[#fixture.services + 1] = service end
     test.assert(create_error == nil and service ~= nil,
                 "omitted-result fixture did not initialize")
@@ -991,8 +1031,11 @@ local function rejects_stale_generation_commit()
     configure_source_root(fixture)
     fixture:write("src/main.titan", "-- first\n")
     local analyzer = new_analyzer()
-    local service?, failure? = project_service.create_with_analyzer(
-      fixture.root, "/sdk/lib/titan/0.6", analyzer:analyze)
+    local service?, failure? = test_service.create {
+      project_root = fixture.root,
+      installed_binary_modules_root = "/sdk/lib/titan/0.6",
+      analyzer = analyzer:analyze,
+    }
     if service ~= nil then fixture.services[#fixture.services + 1] = service end
     test.assert(failure == nil and service ~= nil,
                 "stale-generation fixture did not initialize")
@@ -1142,7 +1185,7 @@ function run(): integer return dep.answer() end
 function run(): integer return dep.hidden(1) end
 ]])
 
-    local service?, failure? = project_service.load_default(fixture.root)
+    local service?, failure? = fixture:load_compiler()
     if service ~= nil then fixture.services[#fixture.services + 1] = service end
     test.assert(failure == nil and service ~= nil,
                 "real compiler project fixture did not load")
@@ -1254,7 +1297,7 @@ local function publishes_and_recovers_source_serialization_diagnostics()
     configure_source_root(fixture)
     fixture:write("src/main.titan",
       "function answer(): integer return 41 end\n")
-    local service?, failure? = project_service.load_default(fixture.root)
+    local service?, failure? = fixture:load_compiler()
     if service ~= nil then fixture.services[#fixture.services + 1] = service end
     test.assert(service ~= nil and failure == nil,
                 "serialization fixture did not load with valid source")
@@ -1265,7 +1308,7 @@ local function publishes_and_recovers_source_serialization_diagnostics()
     -- boundary. The real checker, bridge and SQL publication run unchanged.
     local driver = lua.require("titan-compiler.driver") as {string: value}
     local serialize = driver["serialize_source_interface"] as
-      (value) -> (value, value)
+      function (value): (value, value)
     defer driver["serialize_source_interface"] = serialize
     driver["serialize_source_interface"] = function (entry: value): (value, value)
       local raw = entry as {string: value}
@@ -1298,7 +1341,7 @@ local function publishes_and_recovers_source_serialization_diagnostics()
                 strings.find(diagnostic.message, "forced source-interface failure") ~= nil,
                 "serialization diagnostic lost its source attribution or error detail")
     case diagnostic.kind
-    when compiler then
+    when compiler() then
     else test.assert(false, "serialization failure used the wrong diagnostic kind")
     end
 
@@ -1342,7 +1385,7 @@ end
 function answer(): integer return uv.private_answer() end
 ]])
 
-    local service?, failure? = project_service.load_default(fixture.root)
+    local service?, failure? = fixture:load_compiler()
     if service ~= nil then fixture.services[#fixture.services + 1] = service end
     local detail = ""
     if failure ~= nil then detail = ": " .. failure.message end
@@ -1554,8 +1597,11 @@ extra_ffi_cppflags = "-DPROJECT_SERVICE_FFI=0"
               {}, {}, {}, {}, nil, nil),
           }, {}, {}, {})
       end
-    local service?, load_error? = project_service.load_with_analyzer(
-      fixture.root, "/sdk/lib/titan/0.6", analyzer)
+    local service?, load_error? = test_service.load {
+      project_root = fixture.root,
+      installed_binary_modules_root = "/sdk/lib/titan/0.6",
+      analyzer = analyzer,
+    }
     if service ~= nil then fixture.services[#fixture.services + 1] = service end
     test.assert(load_error == nil and service ~= nil,
                 "configuration recovery fixture did not load")
@@ -1641,7 +1687,7 @@ local function detects_external_provider_and_folder_topology_changes()
                 binary ~= nil,
                 "new external provider did not narrowly recheck its consumer")
     case binary.origin
-    when dynamic_binary: origin then
+    when dynamic_binary(origin) then
       test.assert(origin.provider_file == second,
                   "external provider switch retained the old identity")
     else test.assert(false, "dynamic provider changed provenance kind")
@@ -1809,9 +1855,13 @@ local function missing_provider_appearance_recovers_failed_revision()
       end
     local resolver = new_resolver()
     local service?, load_error? =
-      project_service.load_with_analyzer_and_resolver(
-        fixture.root, "/sdk/lib/titan/0.6", analyzer,
-        resolver:resolve, restat_test_headers)
+      test_service.load {
+        project_root = fixture.root,
+        installed_binary_modules_root = "/sdk/lib/titan/0.6",
+        analyzer = analyzer,
+        external_resolver = resolver:resolve,
+        header_restater = restat_test_headers,
+      }
     if service ~= nil then fixture.services[#fixture.services + 1] = service end
     test.assert(load_error == nil and service ~= nil,
                 "missing-provider fixture did not load a partial project")
@@ -1946,9 +1996,12 @@ local function validates_binary_observation_before_source_result()
           }, {})
       end
 
-    local service?, load_error? = project_service.load_with_analyzer(
-      fixture.root, "/sdk/lib/titan/0.6", analyzer,
-      restat_test_headers)
+    local service?, load_error? = test_service.load {
+      project_root = fixture.root,
+      installed_binary_modules_root = "/sdk/lib/titan/0.6",
+      analyzer = analyzer,
+      header_restater = restat_test_headers,
+    }
     if service ~= nil then fixture.services[#fixture.services + 1] = service end
     test.assert(load_error == nil and service ~= nil,
                 "mixed-provider project service did not load")
@@ -2322,9 +2375,12 @@ local function attributes_location_free_diagnostics_to_attempted_modules()
         return compiler_bridge.Analysis.new(
           request.root_module, diagnostics, modules, {}, {}, {})
       end
-    local service?, failure? = project_service.load_with_analyzer(
-      fixture.root, "/sdk/lib/titan/0.6", analyzer,
-      restat_test_headers)
+    local service?, failure? = test_service.load {
+      project_root = fixture.root,
+      installed_binary_modules_root = "/sdk/lib/titan/0.6",
+      analyzer = analyzer,
+      header_restater = restat_test_headers,
+    }
     if service ~= nil then fixture.services[#fixture.services + 1] = service end
     test.assert(failure == nil and service ~= nil,
                 "owned-diagnostic project did not load")
@@ -2696,9 +2752,12 @@ local function rejects_new_header_change_during_analysis()
     }
     analyzer.write_during_analysis = header
     analyzer.write_during_analysis_contents = "#define VALUE 2\n"
-    local service?, failure? = project_service.create_with_analyzer(
-      fixture.root, "/sdk/lib/titan/0.6", analyzer:analyze,
-      restat_test_headers)
+    local service?, failure? = test_service.create {
+      project_root = fixture.root,
+      installed_binary_modules_root = "/sdk/lib/titan/0.6",
+      analyzer = analyzer:analyze,
+      header_restater = restat_test_headers,
+    }
     if service ~= nil then fixture.services[#fixture.services + 1] = service end
     test.assert(failure == nil and service ~= nil,
                 "header race fixture did not initialize")
@@ -2724,7 +2783,7 @@ end
 local function loads_compiler_owned_default_binary_root()
   with_fixture(function (fixture: Fixture)
     fixture:mkdir("src")
-    local service?, failure? = project_service.load_default(fixture.root)
+    local service?, failure? = fixture:load_compiler()
     if service ~= nil then fixture.services[#fixture.services + 1] = service end
     test.assert(failure == nil and service ~= nil,
                 "default compiler-owned project service did not load")
@@ -2744,6 +2803,77 @@ end
 function test_project_service_load_default_uses_compiler_installation_root(
     _context: test.Context)
   test_runtime.run(loads_compiler_owned_default_binary_root)
+end
+
+function test_project_service_uses_accepted_configuration_until_the_next_scan(
+    _context: test.Context)
+  test_runtime.run(function ()
+    with_fixture(function (fixture: Fixture)
+      fixture:mkdir("first")
+      fixture:mkdir("second")
+      fixture:write("first/initial.titan", "-- initial saved source\n")
+      fixture:write("second/replacement.titan", "-- replacement saved source\n")
+      fixture:write("titan-config.lua",
+        'include = { "first" }\nsource_module_roots = { "first" }\n')
+      local accepted?, config_error? = project_config.load(
+        fixture.root, "/sdk/lib/titan/0.6")
+      test.assert(accepted ~= nil and config_error == nil,
+        "initial configuration did not load")
+      fixture:write("titan-config.lua",
+        'include = { "second" }\nsource_module_roots = { "second" }\n')
+      local analyzer = new_analyzer()
+      local service?, failure? = project_service.create {
+        settings = accepted,
+        installed_binary_modules_root = "/sdk/lib/titan/0.6",
+        analyzer = analyzer:analyze,
+      }
+      if service ~= nil then fixture.services[#fixture.services + 1] = service end
+      test.assert(service ~= nil and failure == nil,
+        "service rejected the accepted configuration")
+      accepted.include[1] = fixture:path("second")
+      local initial = service:latest()
+      test.assert(initial.config.include[1] == fixture:path("first") and
+        #initial.project_modules == 1 and
+        initial.project_modules[1].module_name == "initial",
+        "construction reloaded or aliased its accepted configuration")
+      local current?, scan_error? = service:scan()
+      test.assert(current ~= nil and scan_error == nil and
+        current.config.include[1] == fixture:path("second") and
+        #current.project_modules == 1 and
+        current.project_modules[1].module_name == "replacement",
+        "the next scan did not load the current saved configuration")
+    end)
+  end)
+end
+
+function test_project_service_preserves_sqlite_failure_details_and_caller_store(
+    _context: test.Context)
+  test_runtime.run(function ()
+    with_fixture(function (fixture: Fixture)
+      fixture:mkdir("src")
+      local store = stores.open(":memory:")
+      defer store:close()
+      local access = store:acquire()
+      defer access:release()
+      stores.execute(access.connection, "CREATE TABLE main.graph_modules(bad INTEGER)")
+      access:release()
+      local analyzer = new_analyzer()
+      local service?, failure? = test_service.create {
+        project_root = fixture.root,
+        installed_binary_modules_root = "/sdk/lib/titan/0.6",
+        analyzer = analyzer:analyze,
+        store = store,
+      }
+      test.assert(service == nil and failure ~= nil and
+        strings.find(failure.message, "no such column") ~= nil and
+        strings.find(failure.message, "metatable") == nil,
+        "constructor replaced SQLite's diagnostic with an opaque record label")
+      local retained = store:acquire()
+      defer retained:release()
+      test.assert(stores.scalar_integer(retained.connection, "SELECT 1") == 1,
+        "failed construction closed the caller's Store")
+    end)
+  end)
 end
 
 function test_project_service_trusts_unchanged_saved_source_observations(
@@ -2891,9 +3021,9 @@ function test_project_service_keeps_reads_available_during_analysis_and_drains_c
       fixture:mkdir("src")
       configure_source_root(fixture)
       fixture:write("src/main.titan", "-- body one\n")
-      local started, await_started, close_started = async.channel<boolean>(1)
+      local started, await_started, close_started = async.channel<|boolean|>(1)
       defer close_started()
-      local resume, await_resume, close_resume = async.channel<boolean>(1)
+      local resume, await_resume, close_resume = async.channel<|boolean|>(1)
       defer close_resume()
       local block = false
       local recorder = new_analyzer()
@@ -2905,8 +3035,11 @@ function test_project_service_keeps_reads_available_during_analysis_and_drains_c
         end
         return recorder:analyze(request)
       end
-      local service?, failure? = project_service.load_with_analyzer(
-        fixture.root, "/sdk/lib/titan/0.6", analyzer)
+      local service?, failure? = test_service.load {
+        project_root = fixture.root,
+        installed_binary_modules_root = "/sdk/lib/titan/0.6",
+        analyzer = analyzer,
+      }
       if service ~= nil then fixture.services[#fixture.services + 1] = service end
       test.assert(service ~= nil and failure == nil, "drain fixture did not load")
       if service == nil then raise "drain fixture Service is missing" end
@@ -2916,7 +3049,7 @@ function test_project_service_keeps_reads_available_during_analysis_and_drains_c
       local request? = service:prepare_work()
       test.assert(request ~= nil, "saved edit did not prepare analysis")
       block = true
-      local worker = async.run<nil, value>(function (): nil
+      local worker = async.run<|nil, value|>(function (): nil
         local report?, commit_error? = service:analyze(request)
         test.assert(report ~= nil and commit_error == nil and
           #report.committed_modules == 1, "accepted analysis failed while close waited")
@@ -2929,7 +3062,7 @@ function test_project_service_keeps_reads_available_during_analysis_and_drains_c
         during.project_modules[1].compiler_snapshot ~= nil,
         "last compiler snapshot disappeared while refresh was active")
       local closed = false
-      local closer = async.run<nil, value>(function (): nil
+      local closer = async.run<|nil, value|>(function (): nil
         service:close()
         closed = true
         return nil
@@ -2937,8 +3070,8 @@ function test_project_service_keeps_reads_available_during_analysis_and_drains_c
       async.yield()
       test.assert(not closed, "Service closed before accepted analysis drained")
       resume(true)
-      test.assert(async.join<nil, value>(worker):has_succeeded(), "analysis worker failed")
-      test.assert(async.join<nil, value>(closer):has_succeeded() and closed,
+      test.assert(async.join<|nil, value|>(worker):has_succeeded(), "analysis worker failed")
+      test.assert(async.join<|nil, value|>(closer):has_succeeded() and closed,
         "Service did not close after its accepted update finished")
     end)
   end)
@@ -2963,8 +3096,11 @@ function test_project_service_rolls_back_earlier_modules_when_later_result_is_mi
         end
         return result
       end
-      local service?, failure? = project_service.load_with_analyzer(
-        fixture.root, "/sdk/lib/titan/0.6", analyzer)
+      local service?, failure? = test_service.load {
+        project_root = fixture.root,
+        installed_binary_modules_root = "/sdk/lib/titan/0.6",
+        analyzer = analyzer,
+      }
       if service ~= nil then fixture.services[#fixture.services + 1] = service end
       test.assert(service ~= nil and failure == nil, "rollback fixture did not load")
       if service == nil then raise "rollback fixture Service is missing" end
@@ -3009,9 +3145,13 @@ function test_project_service_restores_only_projects_revalidated_after_store_reo
         header_input(compiler_bridge.CHeaderDependencyKind.file(), header),
       }
       local store = stores.open(path)
-      local initial?, initial_error? = project_service.create_with_store(
-        fixture.root, "/sdk/lib/titan/0.6", analyzer:analyze, nil,
-        restat_test_headers, store)
+      local initial?, initial_error? = test_service.create {
+        project_root = fixture.root,
+        installed_binary_modules_root = "/sdk/lib/titan/0.6",
+        analyzer = analyzer:analyze,
+        header_restater = restat_test_headers,
+        store = store,
+      }
       if initial ~= nil then fixture.services[#fixture.services + 1] = initial end
       test.assert(initial ~= nil and initial_error == nil, "persistent fixture did not initialize")
       if initial == nil then store:close() raise "persistent fixture Service is missing" end
@@ -3042,9 +3182,13 @@ function test_project_service_restores_only_projects_revalidated_after_store_reo
       initial:close()
 
       local reopened_store = stores.open(path)
-      local reopened?, reopen_error? = project_service.create_with_store(
-        fixture.root, "/sdk/lib/titan/0.6", analyzer:analyze, nil,
-        restat_test_headers, reopened_store)
+      local reopened?, reopen_error? = test_service.create {
+        project_root = fixture.root,
+        installed_binary_modules_root = "/sdk/lib/titan/0.6",
+        analyzer = analyzer:analyze,
+        header_restater = restat_test_headers,
+        store = reopened_store,
+      }
       if reopened ~= nil then fixture.services[#fixture.services + 1] = reopened end
       test.assert(reopened ~= nil and reopen_error == nil, "unchanged persistent fixture did not reopen")
       if reopened == nil then reopened_store:close() raise "reopened Service is missing" end
@@ -3063,9 +3207,13 @@ function test_project_service_restores_only_projects_revalidated_after_store_reo
 
       fixture:write("include/value.h", "#define VALUE 2\n")
       local changed_store = stores.open(path)
-      local changed?, change_error? = project_service.create_with_store(
-        fixture.root, "/sdk/lib/titan/0.6", analyzer:analyze, nil,
-        restat_test_headers, changed_store)
+      local changed?, change_error? = test_service.create {
+        project_root = fixture.root,
+        installed_binary_modules_root = "/sdk/lib/titan/0.6",
+        analyzer = analyzer:analyze,
+        header_restater = restat_test_headers,
+        store = changed_store,
+      }
       if changed ~= nil then fixture.services[#fixture.services + 1] = changed end
       test.assert(changed ~= nil and change_error == nil, "changed-header persistent fixture did not reopen")
       if changed == nil then changed_store:close() raise "changed-header Service is missing" end
@@ -3175,11 +3323,15 @@ extra_ffi_cppflags = "-DVARIANT=2"
         return compiler_bridge.Analysis.new(request.root_module, diagnostics,
           snapshots, {}, {}, {})
       end
-      local reopen: () -> project_service.Service = function (): project_service.Service
+      local reopen: function (): project_service.Service = function (): project_service.Service
         local store = stores.open(fixture:path("cache.sqlite3"))
-        local service?, failure? = project_service.create_with_store(
-          fixture.root, "/sdk/lib/titan/0.6", analyzer, nil,
-          restat_test_headers, store)
+        local service?, failure? = test_service.create {
+          project_root = fixture.root,
+          installed_binary_modules_root = "/sdk/lib/titan/0.6",
+          analyzer = analyzer,
+          header_restater = restat_test_headers,
+          store = store,
+        }
         if service == nil then
           store:close()
           raise "persistent configuration fixture failed: " .. failure.message

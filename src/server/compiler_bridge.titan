@@ -47,9 +47,9 @@ record SourceSpan
 end
 
 union DiagnosticKind
-  syntax
-  type_error
-  compiler
+  syntax()
+  type_error()
+  compiler()
 end
 
 record Diagnostic
@@ -78,10 +78,10 @@ end
 -- still available. The semantic index renders and caches these typed values;
 -- hover requests never walk the dynamic compiler graph.
 union HoverSummaryKind
-  module_summary
-  record_summary
-  union_summary
-  interface_summary
+  module_summary()
+  record_summary()
+  union_summary()
+  interface_summary()
 end
 
 record HoverSummarySection
@@ -104,21 +104,21 @@ record AdjustmentInfo
 end
 
 union Adjustment
-  identity: AdjustmentInfo
-  coercion: AdjustmentInfo
-  gradual: AdjustmentInfo
-  callable: AdjustmentInfo
-  written: AdjustmentInfo
-  other: AdjustmentInfo
+  identity(AdjustmentInfo)
+  coercion(AdjustmentInfo)
+  gradual(AdjustmentInfo)
+  callable(AdjustmentInfo)
+  written(AdjustmentInfo)
+  other(AdjustmentInfo)
 end
 
 union NodeKind
-  declaration
-  statement
-  expression
-  variable
-  type_syntax
-  other
+  declaration()
+  statement()
+  expression()
+  variable()
+  type_syntax()
+  other()
 end
 
 record Node
@@ -139,17 +139,17 @@ record Node
 end
 
 union OccurrenceRole
-  definition
-  reference
-  write
-  type_reference
-  import_alias
+  definition()
+  reference()
+  write()
+  type_reference()
+  import_alias()
 end
 
 union DeclarationVisibility
-  block
-  module
-  exported
+  block()
+  module()
+  exported()
 end
 
 record SymbolOccurrence
@@ -188,10 +188,10 @@ record BinaryProvenance
 end
 
 union Provenance
-  project_source: SourceProvenance
-  external_source: SourceProvenance
-  dynamic_binary: BinaryProvenance
-  static_binary: BinaryProvenance
+  project_source(SourceProvenance)
+  external_source(SourceProvenance)
+  dynamic_binary(BinaryProvenance)
+  static_binary(BinaryProvenance)
 end
 
 record ExternalResolutionRequest
@@ -234,8 +234,8 @@ record BinaryProviderObservation
 end
 
 union CHeaderDependencyKind
-  file
-  search
+  file()
+  search()
 end
 
 -- `file` identities hash the exact bytes cdriver parsed. `search` identities
@@ -330,7 +330,7 @@ local record CProbeExecutionTrace
   wall_ms: float?
 end
 
-type ProgressListener = (AnalysisProgress) -> ()
+type ProgressListener = function (AnalysisProgress): ()
 
 -- External source modules keep equality manifests and resolver metadata.
 -- Project modules separately retain restorable declared interfaces in Compiler;
@@ -351,11 +351,11 @@ record ProjectPayload
   const header_inputs: {CHeaderDependency}?
 end
 
-type CacheLookup = (string, string) -> (string?, {CHeaderDependency}?)
-type CachePublisher = (string, string, string, {CHeaderDependency}) -> ()
-type CacheInputRefresher = (string, string, {CHeaderDependency}) -> boolean
-type ProjectPayloadReader = (string) -> (string?, {CHeaderDependency}?)
-type ProjectManifestInstaller = (string) -> boolean
+type CacheLookup = function (string, string): (string?, {CHeaderDependency}?)
+type CachePublisher = function (string, string, string, {CHeaderDependency}): ()
+type CacheInputRefresher = function (string, string, {CHeaderDependency}): boolean
+type ProjectPayloadReader = function (string): (string?, {CHeaderDependency}?)
+type ProjectManifestInstaller = function (string): boolean
 
 function Analysis:find_module(module_name: string): ModuleSnapshot?
   for index = 1, #self.modules do
@@ -366,9 +366,19 @@ function Analysis:find_module(module_name: string): ModuleSnapshot?
   return nil
 end
 
-local type RequireFunction = (string) -> value
-local type TypeOfFunction = (value) -> string
-local type CompilerFunction = (...: value) -> (...: value)
+local type RequireFunction = function (string): value
+local type TypeOfFunction = function (value): string
+local type CompilerFunction = function (...: value): (...: value)
+
+-- Project configuration reaches the compiler through this named boundary.
+-- Nil source/binary roots retain the installed driver's defaults. Include
+-- roots extend the explicit SDK roots; project CPP flags follow inherited flags.
+record CompilerConfiguration
+  const source_roots: {string}?
+  const binary_root: string?
+  const include_roots: {string}?
+  const cppflags: string?
+end
 
 record Compiler
   local parser: {string: value}
@@ -381,14 +391,14 @@ record Compiler
   local embedded_provider_identity: compiler_io.LstatIdentity
   local io: compiler_io.CompilerIO
   local project_entries: {string: value}
-  local source_path: string?
-  local binary_path: string?
-  local extra_ffi_include_dirs: {string}
-  local extra_ffi_cppflags: {string}
+  local configuration: CompilerConfiguration
+  local baseline: DriverConfiguration
+  local effective: DriverConfiguration
+  local include_dirs: {integer: value}
   local cache_adapter: {string: value}?
 end
 
-local function fail<T>(module_name: string, message: string): T
+local function fail<|T|>(module_name: string, message: string): T
   raise BridgeError.new(module_name, message)
 end
 
@@ -401,7 +411,7 @@ end
 local function required_map(candidate: value, module_name: string,
                             subject: string): {string: value}
   if not (candidate is {string: value}) then
-    return fail<{string: value}>(
+    return fail<|{string: value}|>(
       module_name, subject .. " must be a Lua table")
   end
   return candidate as {string: value}
@@ -410,7 +420,7 @@ end
 local function required_string(candidate: value, module_name: string,
                                subject: string): string
   if not (candidate is string) then
-    return fail<string>(module_name, subject .. " must be a string")
+    return fail<|string|>(module_name, subject .. " must be a string")
   end
   return candidate as string
 end
@@ -426,7 +436,7 @@ local function required_integer(candidate: value, module_name: string,
   local result: integer = candidate
   return result
 catch
-  return fail<integer>(module_name,
+  return fail<|integer|>(module_name,
     subject .. " must carry an exact Lua integer")
 end
 
@@ -437,7 +447,7 @@ local function embedded_provider_identity(
     candidate["path"], DRIVER_MODULE,
     "embedded compiler provider identity.path")
   if path ~= provider_file then
-    return fail<compiler_io.LstatIdentity>(
+    return fail<|compiler_io.LstatIdentity|>(
       DRIVER_MODULE,
       "embedded compiler provider identity path '" .. path ..
       "' does not match provider_file '" .. provider_file .. "'")
@@ -446,7 +456,7 @@ local function embedded_provider_identity(
     candidate["kind"], DRIVER_MODULE,
     "embedded compiler provider identity.kind")
   if kind ~= "file" then
-    return fail<compiler_io.LstatIdentity>(
+    return fail<|compiler_io.LstatIdentity|>(
       DRIVER_MODULE,
       "embedded compiler provider identity kind must be 'file', found '" ..
       kind .. "'")
@@ -472,7 +482,7 @@ local function required_boolean(candidate: value, module_name: string,
   local result: boolean = candidate
   return result
 catch
-  return fail<boolean>(module_name, subject .. " must be a boolean")
+  return fail<|boolean|>(module_name, subject .. " must be a boolean")
 end
 
 local function bounded_trace_string(candidate: value, subject: string,
@@ -482,7 +492,7 @@ local function bounded_trace_string(candidate: value, subject: string,
      #result > C_PROBE_TRACE_STRING_BYTES then
     local expectation = "a nonempty"
     if allow_empty then expectation = "a" end
-    return fail<string>(DRIVER_MODULE,
+    return fail<|string|>(DRIVER_MODULE,
       subject .. " must be " .. expectation .. " string of at most " ..
       C_PROBE_TRACE_STRING_BYTES .. " bytes")
   end
@@ -494,7 +504,7 @@ local function probe_trace_outcome(candidate: value,
   local result = bounded_trace_string(candidate, subject, false)
   if result ~= "success" and result ~= "compiler_rejection" and
      result ~= "infrastructure_failure" then
-    return fail<string>(DRIVER_MODULE,
+    return fail<|string|>(DRIVER_MODULE,
       subject .. " has unsupported value '" .. result .. "'")
   end
   return result
@@ -509,7 +519,7 @@ local function probe_trace_publication(candidate: value,
      result ~= "unstable_diagnostic" and result ~= "too_large" and
      result ~= "diagnostic_not_persisted" and
      result ~= "mixed" then
-    return fail<string>(DRIVER_MODULE,
+    return fail<|string|>(DRIVER_MODULE,
       subject .. " has unsupported value '" .. result .. "'")
   end
   return result
@@ -520,13 +530,13 @@ local function probe_trace_wall_ms(candidate: value,
   if candidate == nil then return nil end
   local result = candidate as float
   if result < 0.0 or result ~= result or result >= math.huge then
-    return fail<float?>(DRIVER_MODULE,
+    return fail<|float?|>(DRIVER_MODULE,
       subject .. " must be a finite nonnegative number")
   end
   return result
 catch
   if error is BridgeError then raise end
-  return fail<float?>(DRIVER_MODULE,
+  return fail<|float?|>(DRIVER_MODULE,
     subject .. " must be a finite nonnegative number")
 end
 
@@ -537,19 +547,19 @@ local function normalize_c_probe_semantic_trace(
   local event = bounded_trace_string(
     raw["event"], subject .. ".event", false)
   if event ~= "semantic_result" then
-    return fail<CProbeSemanticTrace>(DRIVER_MODULE,
+    return fail<|CProbeSemanticTrace|>(DRIVER_MODULE,
       subject .. ".event must be 'semantic_result'")
   end
   local key = bounded_trace_string(raw["key"], subject .. ".key", false)
   if #key ~= 64 then
-    return fail<CProbeSemanticTrace>(DRIVER_MODULE,
+    return fail<|CProbeSemanticTrace|>(DRIVER_MODULE,
       subject .. ".key must be a 64-byte digest")
   end
   local tier = bounded_trace_string(
     raw["cache_tier"], subject .. ".cache_tier", false)
   if tier ~= "service" and tier ~= "analysis" and
      tier ~= "persistent" and tier ~= "compiler" then
-    return fail<CProbeSemanticTrace>(DRIVER_MODULE,
+    return fail<|CProbeSemanticTrace|>(DRIVER_MODULE,
       subject .. ".cache_tier has unsupported value '" .. tier .. "'")
   end
   return CProbeSemanticTrace.new(
@@ -576,18 +586,18 @@ local function normalize_c_probe_execution_trace(
   local event = bounded_trace_string(
     raw["event"], subject .. ".event", false)
   if event ~= "compiler_execution" then
-    return fail<CProbeExecutionTrace>(DRIVER_MODULE,
+    return fail<|CProbeExecutionTrace|>(DRIVER_MODULE,
       subject .. ".event must be 'compiler_execution'")
   end
   local key = bounded_trace_string(raw["key"], subject .. ".key", false)
   if #key ~= 64 then
-    return fail<CProbeExecutionTrace>(DRIVER_MODULE,
+    return fail<|CProbeExecutionTrace|>(DRIVER_MODULE,
       subject .. ".key must be a 64-byte digest")
   end
   local batch_kind = bounded_trace_string(
     raw["batch_kind"], subject .. ".batch_kind", false)
   if batch_kind ~= "single" and batch_kind ~= "batch" then
-    return fail<CProbeExecutionTrace>(DRIVER_MODULE,
+    return fail<|CProbeExecutionTrace|>(DRIVER_MODULE,
       subject .. ".batch_kind has unsupported value '" ..
       batch_kind .. "'")
   end
@@ -597,7 +607,7 @@ local function normalize_c_probe_execution_trace(
      lookup ~= "memory" and lookup ~= "hit" and lookup ~= "miss" and
      lookup ~= "invalid" and lookup ~= "io_error" and
      lookup ~= "mixed" then
-    return fail<CProbeExecutionTrace>(DRIVER_MODULE,
+    return fail<|CProbeExecutionTrace|>(DRIVER_MODULE,
       subject .. ".persistent_lookup has unsupported value '" ..
       lookup .. "'")
   end
@@ -662,7 +672,7 @@ end
 local function required_string_list(candidate: value, module_name: string,
                                     subject: string): {string}
   if not (candidate is {integer: value}) then
-    return fail<{string}>(module_name, subject .. " must be a Lua array")
+    return fail<|{string}|>(module_name, subject .. " must be a Lua array")
   end
   local raw = candidate as {integer: value}
   local result: {string} = {}
@@ -677,7 +687,7 @@ local function normalize_c_header_dependencies(
     candidate: value, subject: string): {CHeaderDependency}
   if candidate == nil or candidate == false then return {} end
   if not (candidate is {integer: value}) then
-    return fail<{CHeaderDependency}>(
+    return fail<|{CHeaderDependency}|>(
       DRIVER_MODULE, subject .. " must be a Lua array")
   end
   local raw = candidate as {integer: value}
@@ -693,7 +703,7 @@ local function normalize_c_header_dependencies(
     if raw_kind == "search" then
       kind = CHeaderDependencyKind.search()
     elseif raw_kind ~= "file" then
-      return fail<{CHeaderDependency}>(DRIVER_MODULE,
+      return fail<|{CHeaderDependency}|>(DRIVER_MODULE,
         subject .. "[" .. index .. "] has unknown kind '" ..
         raw_kind .. "'")
     end
@@ -704,15 +714,15 @@ local function normalize_c_header_dependencies(
       item["identity"], DRIVER_MODULE,
       subject .. "[" .. index .. "].identity")
     if strings.sub(path, 1, 1) ~= "/" then
-      return fail<{CHeaderDependency}>(DRIVER_MODULE,
+      return fail<|{CHeaderDependency}|>(DRIVER_MODULE,
         subject .. "[" .. index .. "].path must be absolute")
     elseif identity == "" then
-      return fail<{CHeaderDependency}>(DRIVER_MODULE,
+      return fail<|{CHeaderDependency}|>(DRIVER_MODULE,
         subject .. "[" .. index .. "].identity must be nonempty")
     end
     local key = raw_kind .. "\0" .. path
     if seen[key] then
-      return fail<{CHeaderDependency}>(DRIVER_MODULE,
+      return fail<|{CHeaderDependency}|>(DRIVER_MODULE,
         subject .. " repeats " .. raw_kind .. " input '" .. path .. "'")
     end
     seen[key] = true
@@ -728,7 +738,7 @@ local function normalize_c_header_dependencies(
       local physical = required_string(observed["physical_identity"],DRIVER_MODULE,
         subject .. " observation.physical_identity")
       if nanoseconds < 0 or nanoseconds >= 1000000000 or physical == "" then
-        return fail<{CHeaderDependency}>(DRIVER_MODULE,
+        return fail<|{CHeaderDependency}|>(DRIVER_MODULE,
           subject .. " has an invalid header observation")
       end
       observation = HeaderObservation.new(seconds,nanoseconds,physical)
@@ -745,8 +755,8 @@ local function raw_c_header_dependencies(
     local dependency = dependencies[index]
     local kind = "file"
     case dependency.kind
-    when search then kind = "search"
-    when file then
+    when search() then kind = "search"
+    when file() then
     end
     local item: {string: value} = {}
     item["kind"] = kind
@@ -772,7 +782,7 @@ local function optional_boolean(candidate: value, module_name: string,
   local result: boolean = candidate
   return result
 catch
-  return fail<boolean>(module_name, subject .. " must be a boolean")
+  return fail<|boolean|>(module_name, subject .. " must be a boolean")
 end
 
 local function checked_function(module: {string: value},
@@ -780,7 +790,7 @@ local function checked_function(module: {string: value},
                                 type_of: TypeOfFunction): value
   local candidate: value = module[member]
   if type_of(candidate) ~= "function" then
-    return fail<value>(module_name,
+    return fail<|value|>(module_name,
       "compiler API member '" .. member .. "' must be a function, found " ..
       describe(candidate, type_of) ..
       ". Install a Titan compiler implementing " ..
@@ -797,12 +807,12 @@ local function require_compiler_module(require_function: RequireFunction,
   do
     loaded = require_function(module_name)
   catch
-    return fail<{string: value}>(module_name,
+    return fail<|{string: value}|>(module_name,
       "cannot load compiler module through package.path/package.cpath: " ..
       strings.tostring(error))
   end
   if type_of(loaded) ~= "table" then
-    return fail<{string: value}>(module_name,
+    return fail<|{string: value}|>(module_name,
       "compiler module must return a table, found " ..
       describe(loaded, type_of))
   end
@@ -818,7 +828,7 @@ end
 local function emit_cache_stats(compiler: Compiler)
   if not logging.enabled("debug") then return end
   local query = checked_function(compiler.driver,DRIVER_MODULE,
-    "compiler_cache_stats",compiler.type_of) as (value) -> value
+    "compiler_cache_stats",compiler.type_of) as function (value): value
   local context: {string: value} = {["io"] = compiler.io}
   local options: {string: value} = {["context"] = context}
   local statistics = required_map(query(options),DRIVER_MODULE,"compiler cache statistics")
@@ -861,7 +871,7 @@ local function load_with(require_function: RequireFunction,
   local version = required_string(
     driver["TITAN_ABI_VERSION"], DRIVER_MODULE, "TITAN_ABI_VERSION")
   if version ~= COMPILER_ABI then
-    return fail<Compiler>(DRIVER_MODULE,
+    return fail<|Compiler|>(DRIVER_MODULE,
       "incompatible Titan compiler ABI " .. version ..
       "; this server requires " .. COMPILER_ABI)
   end
@@ -869,7 +879,7 @@ local function load_with(require_function: RequireFunction,
   local raw_language_server_api: value =
     driver[COMPILER_LANGUAGE_SERVER_API_MARKER]
   if raw_language_server_api == nil then
-    return fail<Compiler>(DRIVER_MODULE,
+    return fail<|Compiler|>(DRIVER_MODULE,
       "Titan compiler ABI " .. version .. " is missing " ..
       COMPILER_LANGUAGE_SERVER_API_MARKER ..
       "; matching Titan ABI alone is insufficient. Install the Titan " ..
@@ -880,7 +890,7 @@ local function load_with(require_function: RequireFunction,
   do
     language_server_api = raw_language_server_api
   catch
-    return fail<Compiler>(DRIVER_MODULE,
+    return fail<|Compiler|>(DRIVER_MODULE,
       "incompatible Titan language-server API " ..
       describe(raw_language_server_api, type_of) .. " for compiler ABI " ..
       version .. "; this server requires " ..
@@ -890,7 +900,7 @@ local function load_with(require_function: RequireFunction,
       "is insufficient")
   end
   if language_server_api ~= COMPILER_LANGUAGE_SERVER_API then
-    return fail<Compiler>(DRIVER_MODULE,
+    return fail<|Compiler|>(DRIVER_MODULE,
       "incompatible Titan language-server API " .. language_server_api ..
       " for compiler ABI " .. version .. "; this server requires " ..
       COMPILER_LANGUAGE_SERVER_API_MARKER .. " " ..
@@ -927,13 +937,18 @@ local function load_with(require_function: RequireFunction,
   local embedded_provider_file = required_string(
     embedded_interface_provider["provider_file"], DRIVER_MODULE,
     "embedded_interface_provider.provider_file")
+  local baseline = capture_driver_configuration(driver)
   return Compiler.new(
     parser, checker, types, driver, type_of, embedded_interface_provider,
     embedded_provider_file, embedded_identity, compiler_io.create(),
-    {}, nil, nil, {}, {}, nil)
+    {}, CompilerConfiguration.new(), baseline, baseline, {}, nil)
 end
 
 function load(): Compiler
+  -- A new Compiler must capture inherited defaults after any active
+  -- compiler operation restores its temporary driver configuration.
+  local permit = compiler_scheduler.acquire()
+  defer permit:release()
   local provider: {string: value} = {}
   local raw_identity: {string: value} = {}
   do
@@ -964,82 +979,129 @@ function Compiler:drop_project_entry(module_name: string)
   self.project_entries[module_name] = nil
 end
 
-function Compiler:configure_paths(source_path: string?, binary_path: string?,
-                                  extra_ffi_include_dirs: {string}?,
-                                  extra_ffi_cppflags: string?)
-  local next_include_dirs: {string} = {}
-  if extra_ffi_include_dirs ~= nil then
-    local source = extra_ffi_include_dirs as {string}
-    for index = 1, #source do
-      next_include_dirs[index] = source[index]
-    end
-  end
-
-  local next_cppflags: {string} = {}
-  if extra_ffi_cppflags ~= nil and extra_ffi_cppflags ~= "" then
-    local raw_split = checked_function(
-      self.driver, DRIVER_MODULE, "split_shell_words", self.type_of)
-    local split = raw_split as (string) -> (value, value)
-    local parsed, parse_error = split(extra_ffi_cppflags as string)
-    if parsed == nil or parsed == false then
-      return fail<value>(
-        DRIVER_MODULE, "invalid extra_ffi_cppflags: " ..
-          strings.tostring(parse_error))
-    end
-    next_cppflags = required_string_list(
-      parsed, DRIVER_MODULE, "split extra_ffi_cppflags result")
-  end
-
-  -- Commit only after every untyped compiler value has been validated. A
-  -- malformed reconfiguration leaves the last accepted project configuration
-  -- intact rather than combining new paths with old preprocessing flags.
-  self.source_path = source_path
-  self.binary_path = binary_path
-  self.extra_ffi_include_dirs = next_include_dirs
-  self.extra_ffi_cppflags = next_cppflags
+local function copy_optional_roots(roots: {string}?): {string}?
+  if roots == nil then return nil end
+  local copied: {string} = {}
+  for index = 1, #roots do copied[index] = roots[index] end
+  return copied
 end
 
--- The driver parses inherited TITAN_EXTRA_CPPFLAGS once. Project flags use
--- that same parser, then extend a private copy only while this Compiler owns
--- the shared Lua state. Restoring the exact table before releasing the permit
--- prevents one yielding workspace analysis from reconfiguring another.
-local function install_extra_cppflags(compiler: Compiler): value
-  local previous: value = compiler.driver["EXTRA_CPPFLAGS"]
-  local effective: {integer: value} = {}
-  if previous ~= nil and previous ~= false then
-    local inherited = required_string_list(
-      previous, DRIVER_MODULE, "driver.EXTRA_CPPFLAGS")
-    for index = 1, #inherited do
-      effective[#effective + 1] = inherited[index]
+local function same_roots(left: {string}?, right: {string}?): boolean
+  if left == nil or right == nil then return left == right end
+  if #left ~= #right then return false end
+  for index = 1, #left do
+    if left[index] ~= right[index] then return false end
+  end
+  return true
+end
+
+function Compiler:configure(configuration: CompilerConfiguration)
+  local current = self.configuration
+  if current.binary_root == configuration.binary_root and
+     current.cppflags == configuration.cppflags and
+     same_roots(current.source_roots, configuration.source_roots) and
+     same_roots(current.include_roots, configuration.include_roots) then return end
+
+  local cppflags? = configuration.cppflags
+  local effective_cppflags: value = self.effective.cppflags
+  if cppflags ~= current.cppflags then
+    local words: {string} = {}
+    if cppflags ~= nil and cppflags ~= "" then
+      local split = checked_function(self.driver, DRIVER_MODULE,
+        "split_shell_words", self.type_of) as function (string): (value, value)
+      local parsed, parse_error = split(cppflags)
+      if parsed == nil or parsed == false then
+        fail<|value|>(DRIVER_MODULE,
+          "invalid compiler cppflags: " .. strings.tostring(parse_error))
+      end
+      words = required_string_list(parsed, DRIVER_MODULE, "split compiler cppflags")
     end
-  elseif #compiler.extra_ffi_cppflags == 0 then
-    return previous
+    effective_cppflags = self.baseline.cppflags
+    if #words > 0 then
+      local effective: {integer: value} = {}
+      if effective_cppflags ~= nil and effective_cppflags ~= false then
+        local inherited = required_string_list(
+          effective_cppflags, DRIVER_MODULE, "inherited compiler CPP flags")
+        for index = 1, #inherited do effective[index] = inherited[index] end
+      end
+      for index = 1, #words do effective[#effective + 1] = words[index] end
+      effective_cppflags = effective
+    end
   end
-  for index = 1, #compiler.extra_ffi_cppflags do
-    effective[#effective + 1] = compiler.extra_ffi_cppflags[index]
+  local source_path: value = self.baseline.source_path
+  if configuration.source_roots ~= nil then
+    local path = strings.writer()
+    for index = 1, #configuration.source_roots do
+      if index > 1 then path:write(";") end
+      path:write(configuration.source_roots[index])
+    end
+    source_path = path:drain()
   end
-  compiler.driver["EXTRA_CPPFLAGS"] = effective
+  local binary_path: value = self.baseline.binary_path
+  if configuration.binary_root ~= nil then binary_path = configuration.binary_root end
+  local includes: {integer: value} = {}
+  if configuration.include_roots ~= nil then
+    for index = 1, #configuration.include_roots do
+      includes[index] = configuration.include_roots[index]
+    end
+  end
+  -- Build the accepted snapshot and its Lua driver representation once.
+  -- Commit only after every field validates; caller mutations stay isolated.
+  local accepted = CompilerConfiguration.new {
+    source_roots = copy_optional_roots(configuration.source_roots),
+    binary_root = configuration.binary_root,
+    include_roots = copy_optional_roots(configuration.include_roots),
+    cppflags = cppflags,
+  }
+  local effective = DriverConfiguration.new(
+    self.driver, source_path, binary_path, effective_cppflags)
+  self.configuration = accepted
+  self.effective = effective
+  self.include_dirs = includes
+end
+
+-- Exact Lua driver globals have one representation for inherited defaults,
+-- accepted configuration, and the previous values restored after a call.
+local record DriverConfiguration
+  const driver: {string: value}
+  const source_path: value
+  const binary_path: value
+  const cppflags: value
+end
+
+local function capture_driver_configuration(driver: {string: value}): DriverConfiguration
+  return DriverConfiguration.new(driver, driver["TITAN_SOURCE_PATH"],
+    driver["TITAN_BIN_PATH"], driver["EXTRA_CPPFLAGS"])
+end
+
+local function DriverConfiguration:apply()
+  self.driver["TITAN_SOURCE_PATH"] = self.source_path
+  self.driver["TITAN_BIN_PATH"] = self.binary_path
+  self.driver["EXTRA_CPPFLAGS"] = self.cppflags
+end
+
+-- The caller holds the scheduler permit until the previous globals are
+-- restored. No flag parsing or path construction happens inside this scope.
+local function Compiler:install_configuration(): DriverConfiguration
+  local previous = capture_driver_configuration(self.driver)
+  self.effective:apply()
   return previous
 end
 
-local function new_context(compiler: Compiler,
-                           supplied: {string: value}?): value
-  local raw_new_context = checked_function(
-    compiler.driver, DRIVER_MODULE, "new_resolver_context", compiler.type_of)
-  local create = raw_new_context as (value) -> value
+local function Compiler:new_context(supplied: {string: value}?): value
+  local create = checked_function(self.driver, DRIVER_MODULE,
+    "new_resolver_context", self.type_of) as function (value): value
   local options: {string: value} = {}
-  if supplied ~= nil then options = supplied as {string: value} end
-  options["io"] = compiler.io
-  options["embedded_interface_provider"] =
-    compiler.embedded_interface_provider
-  if compiler.cache_adapter ~= nil then
-    options["cache_adapter"] = compiler.cache_adapter
-  end
+  if supplied ~= nil then options = supplied end
+  options["io"] = self.io
+  options["embedded_interface_provider"] = self.embedded_interface_provider
+  if self.cache_adapter ~= nil then options["cache_adapter"] = self.cache_adapter end
+  options["extra_ffi_include_dirs"] = self.include_dirs
   local context: value = create(options)
-  if compiler.type_of(context) ~= "table" then
-    return fail<value>(DRIVER_MODULE,
+  if self.type_of(context) ~= "table" then
+    return fail<|value|>(DRIVER_MODULE,
       "driver.new_resolver_context returned " ..
-      describe(context, compiler.type_of) .. " instead of a table")
+      describe(context, self.type_of) .. " instead of a table")
   end
   return context
 end
@@ -1047,10 +1109,10 @@ end
 local function close_loader_now(compiler: Compiler, loader: value)
   local raw_close = checked_function(
     compiler.driver, DRIVER_MODULE, "close_loader", compiler.type_of)
-  local close = raw_close as (value) -> (value, value)
+  local close = raw_close as function (value): (value, value)
   local ok, close_error = close(loader)
   if not ok then
-    fail<value>(DRIVER_MODULE,
+    fail<|value|>(DRIVER_MODULE,
       "cannot close compiler resolver: " .. strings.tostring(close_error))
   end
 end
@@ -1058,10 +1120,10 @@ end
 local function close_context_now(compiler: Compiler, context: value)
   local raw_close = checked_function(
     compiler.driver, DRIVER_MODULE, "close_resolver_context", compiler.type_of)
-  local close = raw_close as (value) -> (value, value)
+  local close = raw_close as function (value): (value, value)
   local ok, close_error = close(context)
   if not ok then
-    fail<value>(DRIVER_MODULE,
+    fail<|value|>(DRIVER_MODULE,
       "cannot close compiler resolver context: " ..
       strings.tostring(close_error))
   end
@@ -1075,7 +1137,7 @@ local function close_loader(compiler: Compiler, loader: value)
       -- Cleanup I/O cannot be submitted by a Task with sticky cancellation.
       -- Retain the Lua object in a fresh Task and wait for the current owner to
       -- release the shared compiler permit before retrying the close.
-      async.run<nil, value>(function (): nil
+      async.run<|nil, value|>(function (): nil
         local permit = compiler_scheduler.acquire()
         defer permit:release()
         close_loader_now(compiler, loader)
@@ -1091,7 +1153,7 @@ local function close_context(compiler: Compiler, context: value)
     close_context_now(compiler, context)
   catch
     if error is async.CancellationReason then
-      async.run<nil, value>(function (): nil
+      async.run<|nil, value|>(function (): nil
         local permit = compiler_scheduler.acquire()
         defer permit:release()
         close_context_now(compiler, context)
@@ -1111,11 +1173,11 @@ function Compiler:restat_c_header_dependencies(
   if #dependencies == 0 then return {},false end
   local permit = compiler_scheduler.acquire()
   defer permit:release()
-  local context = new_context(self, nil)
+  local context = self:new_context(nil)
   defer close_context(self, context)
   local raw_restat = checked_function(
     self.driver, DRIVER_MODULE, "restat_c_header_dependencies", self.type_of)
-  local restat = raw_restat as (value, value) -> (value, value, value)
+  local restat = raw_restat as function (value, value): (value, value, value)
   if validation == nil then validation = header_validation() end
   local options: {string: value} = {
     ["context"] = context, ["header_validation"] = validation.memo,
@@ -1123,7 +1185,7 @@ function Compiler:restat_c_header_dependencies(
   local raw_result, raw_error, raw_changed = restat(
     raw_c_header_dependencies(dependencies), options)
   if raw_result == nil or raw_result == false then
-    return fail<{CHeaderDependency}>(DRIVER_MODULE,
+    return fail<|{CHeaderDependency}|>(DRIVER_MODULE,
       "cannot restat C header dependencies: " ..
       strings.tostring(raw_error)), false
   end
@@ -1146,25 +1208,17 @@ function Compiler:resolve_external_modules(
     requests: {ExternalResolutionRequest}): {ExternalResolution}
   local permit = compiler_scheduler.acquire()
   defer permit:release()
-  local context = new_context(self, nil)
+  local previous_configuration = self:install_configuration()
+  defer previous_configuration:apply()
+  local context = self:new_context(nil)
   defer close_context(self, context)
 
-  local previous_source_path: value = self.driver["TITAN_SOURCE_PATH"]
-  local previous_binary_path: value = self.driver["TITAN_BIN_PATH"]
-  defer self.driver["TITAN_SOURCE_PATH"] = previous_source_path
-  defer self.driver["TITAN_BIN_PATH"] = previous_binary_path
-  if self.source_path then
-    self.driver["TITAN_SOURCE_PATH"] = self.source_path as string
-  end
-  if self.binary_path then
-    self.driver["TITAN_BIN_PATH"] = self.binary_path as string
-  end
 
   local raw_projects: {string: value} = {}
   for index = 1, #project_modules do
     local name = project_modules[index]
     if raw_projects[name] ~= nil then
-      return fail<{ExternalResolution}>(
+      return fail<|{ExternalResolution}|>(
         DRIVER_MODULE, "duplicate project module '" .. name ..
         "' in external resolution request")
     end
@@ -1175,7 +1229,7 @@ function Compiler:resolve_external_modules(
   for index = 1, #requests do
     local request = requests[index]
     if requested[request.module_name] then
-      return fail<{ExternalResolution}>(
+      return fail<|{ExternalResolution}|>(
         DRIVER_MODULE, "duplicate external module '" ..
         request.module_name .. "' in resolution request")
     end
@@ -1185,14 +1239,14 @@ function Compiler:resolve_external_modules(
 
   local raw_resolver = checked_function(
     self.driver, DRIVER_MODULE, "resolve_external_modules", self.type_of)
-  local resolver = raw_resolver as (value, value, value) -> value
+  local resolver = raw_resolver as function (value, value, value): value
   local options: {string: value} = { ["context"] = context }
   local raw_results = required_map(
     resolver(raw_requests, raw_projects, options), DRIVER_MODULE,
     "driver.resolve_external_modules result")
-  for name in iteration.pairs<string, value>(raw_results) do
+  for name in iteration.pairs<|string, value|>(raw_results) do
     if not requested[name] then
-      return fail<{ExternalResolution}>(DRIVER_MODULE,
+      return fail<|{ExternalResolution}|>(DRIVER_MODULE,
         "driver.resolve_external_modules returned unexpected module '" ..
         name .. "'")
     end
@@ -1227,7 +1281,7 @@ function Compiler:resolve_external_modules(
       message = required_string(raw["message"], DRIVER_MODULE,
                                 subject .. ".message")
     elseif kind ~= "missing" then
-      return fail<{ExternalResolution}>(DRIVER_MODULE,
+      return fail<|{ExternalResolution}|>(DRIVER_MODULE,
         subject .. " has unknown kind '" .. kind .. "'")
     end
     result[index] = ExternalResolution.new(
@@ -1250,7 +1304,7 @@ local function raw_location(candidate: value, subject: string): SourceLocation
   local column = required_integer(
     loc["col"], DRIVER_MODULE, subject .. ".col")
   if line < 1 or column < 1 then
-    return fail<SourceLocation>(
+    return fail<|SourceLocation|>(
       DRIVER_MODULE, subject .. " must use positive line and column values")
   end
   return SourceLocation.new(filename, line, column)
@@ -1287,16 +1341,16 @@ local function structural_span(node: {string: value},
   local start? = optional_field_location(node, "_structure_loc", subject)
   if start == nil then start = optional_location(node, subject) end
   if start == nil then
-    return fail<SourceSpan>(DRIVER_MODULE,
+    return fail<|SourceSpan|>(DRIVER_MODULE,
       subject .. " has _end_loc without a structural start")
   end
   if start.filename ~= finish.filename then
-    return fail<SourceSpan>(DRIVER_MODULE,
+    return fail<|SourceSpan|>(DRIVER_MODULE,
       subject .. " structural span crosses source files")
   end
   if finish.line < start.line or
      (finish.line == start.line and finish.column < start.column) then
-    return fail<SourceSpan>(DRIVER_MODULE,
+    return fail<|SourceSpan|>(DRIVER_MODULE,
       subject .. " structural span finishes before it starts")
   end
   return SourceSpan.new(start, finish)
@@ -1314,7 +1368,7 @@ local function type_tag(candidate: value, subject: string): string
   local raw = required_map(candidate, TYPES_MODULE, subject)
   local tag = required_string(raw["_tag"], TYPES_MODULE, subject .. "._tag")
   if strings.sub(tag, 1, 5) ~= "Type." then
-    return fail<string>(TYPES_MODULE,
+    return fail<|string|>(TYPES_MODULE,
       subject .. " has invalid type tag '" .. tag .. "'")
   end
   return tag
@@ -1332,19 +1386,19 @@ local function render_type(compiler: Compiler, candidate: value,
       or tag == "Type.Field" then
     local nested: value = raw["type"]
     if nested == nil then
-      return fail<TypeInfo>(TYPES_MODULE,
+      return fail<|TypeInfo|>(TYPES_MODULE,
         subject .. " has no nested member type")
     end
     display = render_type(compiler, nested, subject .. ".type").display
   else
     local raw_renderer = checked_function(
       compiler.types, TYPES_MODULE, "tostring", compiler.type_of)
-    local renderer = raw_renderer as (value) -> value
+    local renderer = raw_renderer as function (value): value
     local rendered: value = nil
     do
       rendered = renderer(candidate)
     catch
-      return fail<TypeInfo>(TYPES_MODULE,
+      return fail<|TypeInfo|>(TYPES_MODULE,
         "cannot render " .. subject .. ": " .. strings.tostring(error))
     end
     display = required_string(
@@ -1363,7 +1417,7 @@ end
 local function required_value_list(candidate: value, subject: string):
     {integer: value}
   if not (candidate is {integer: value}) then
-    return fail<{integer: value}>(
+    return fail<|{integer: value}|>(
       TYPES_MODULE, subject .. " must be a Lua array")
   end
   return candidate as {integer: value}
@@ -1381,13 +1435,13 @@ local function write_type_parameters(
   if candidate == nil or candidate == false then return end
   local parameters = required_value_list(candidate, subject)
   if #parameters == 0 then return end
-  output:write("<")
+  output:write("<|")
   for index = 1, #parameters do
     if index > 1 then output:write(", ") end
     output:write(render_type(
       compiler, parameters[index], subject .. "[" .. index .. "]").display)
   end
-  output:write(">")
+  output:write("|>")
 end
 
 local function write_callable_results(
@@ -1446,7 +1500,7 @@ local function render_callable_type(
   local names? = optional_name_list(
     supplied_names, subject .. ".paramnames")
   if names ~= nil and #names ~= #parameters then
-    return fail<CallableSignature>(
+    return fail<|CallableSignature|>(
       TYPES_MODULE, subject .. ".paramnames must match params")
   end
 
@@ -1594,12 +1648,12 @@ end
 
 -- Summaries can contain every member of a large module or aggregate. Keep the
 -- normalization O(n log n), just like semantic occurrence normalization.
-local function sort_summary_lines(items: {PendingSummaryLine},
-                                  work: NormalizationWork)
+local function stable_sort<|T|>(items: {T},
+    less: function (T, T): boolean, work: NormalizationWork)
   local count = #items
   if count < 2 then return end
   local source = items
-  local target: {PendingSummaryLine} = {}
+  local target: {T} = {}
   local source_is_input = true
   local width = 1
   while width < count do
@@ -1614,7 +1668,7 @@ local function sort_summary_lines(items: {PendingSummaryLine},
       local output = first
       while left <= left_finish and right <= right_finish do
         work:account()
-        if summary_line_less(source[right], source[left]) then
+        if less(source[right], source[left]) then
           target[output] = source[right]
           right = right + 1
         else
@@ -1653,7 +1707,7 @@ end
 
 local function summary_lines(items: {PendingSummaryLine},
                              work: NormalizationWork): {string}
-  sort_summary_lines(items, work)
+  stable_sort(items, summary_line_less, work)
   local result: {string} = {}
   for index = 1, #items do
     work:account()
@@ -1673,7 +1727,7 @@ local function field_summary_line(compiler: Compiler, candidate: value,
                                   subject: string): PendingSummaryLine
   local raw = required_map(candidate, TYPES_MODULE, subject)
   if type_tag(candidate, subject) ~= "Type.Field" then
-    return fail<PendingSummaryLine>(TYPES_MODULE,
+    return fail<|PendingSummaryLine|>(TYPES_MODULE,
       subject .. " must be a Type.Field")
   end
   local name = required_string(raw["name"], TYPES_MODULE, subject .. ".name")
@@ -1693,20 +1747,20 @@ local function variant_summary_line(compiler: Compiler, candidate: value,
                                     subject: string): PendingSummaryLine
   local raw = required_map(candidate, TYPES_MODULE, subject)
   if type_tag(candidate, subject) ~= "Type.Variant" then
-    return fail<PendingSummaryLine>(TYPES_MODULE,
+    return fail<|PendingSummaryLine|>(TYPES_MODULE,
       subject .. " must be a Type.Variant")
   end
   local name = required_string(raw["name"], TYPES_MODULE, subject .. ".name")
   local output = strings.writer()
   output:write(visibility_prefix(raw))
   output:write(name)
+  output:write("(")
   local payload: value = raw["payload"]
   if payload ~= nil and payload ~= false then
-    output:write("(payload: ")
     output:write(render_type(
       compiler, payload, subject .. ".payload").display)
-    output:write(")")
   end
+  output:write(")")
   return PendingSummaryLine.new(0, name, output:drain())
 end
 
@@ -1719,7 +1773,7 @@ local function aggregate_callable_line(
     compiler, candidate, owner, ".", name, raw["paramnames"],
     subject, owner)
   if signature == nil then
-    return fail<PendingSummaryLine>(TYPES_MODULE,
+    return fail<|PendingSummaryLine|>(TYPES_MODULE,
       subject .. " must be a method or associated function")
   end
   return PendingSummaryLine.new(
@@ -1735,12 +1789,12 @@ local function specialized_owner(compiler: Compiler, candidate: value,
   if scope == nil or scope == false then return candidate end
   local raw_substitute = checked_function(
     compiler.types, TYPES_MODULE, "substitute", compiler.type_of)
-  local substitute = raw_substitute as (value, value, value) -> value
+  local substitute = raw_substitute as function (value, value, value): value
   local specialized: value = nil
   do
     specialized = substitute(candidate, scope, arguments)
   catch
-    return fail<value>(TYPES_MODULE,
+    return fail<|value|>(TYPES_MODULE,
       "cannot specialize " .. subject .. ": " .. strings.tostring(error))
   end
   return specialized
@@ -1874,14 +1928,14 @@ local function applied_owner_title(compiler: Compiler, owner: value,
   local output = strings.writer()
   output:write(required_string(
     raw["name"], TYPES_MODULE, subject .. ".name"))
-  output:write("<")
+  output:write("<|")
   for index = 1, #arguments do
     if index > 1 then output:write(", ") end
     output:write(render_type(
       compiler, arguments[index],
       subject .. ".arguments[" .. index .. "]").display)
   end
-  output:write(">")
+  output:write("|>")
   return output:drain()
 end
 
@@ -1929,7 +1983,7 @@ local function aggregate_summary(
     local functions: {PendingSummaryLine} = {}
     local raw_functions = required_map(
       raw["functions"], TYPES_MODULE, subject .. ".functions")
-    for name, candidate in iteration.pairs<string, value>(raw_functions) do
+    for name, candidate in iteration.pairs<|string, value|>(raw_functions) do
       work:account()
       local candidate_raw = required_map(
         candidate, TYPES_MODULE, subject .. ".functions['" .. name .. "']")
@@ -1970,7 +2024,7 @@ local function aggregate_summary(
       local functions: {PendingSummaryLine} = {}
       local raw_functions = required_map(
         raw["functions"], TYPES_MODULE, subject .. ".functions")
-      for name, candidate in iteration.pairs<string, value>(raw_functions) do
+      for name, candidate in iteration.pairs<|string, value|>(raw_functions) do
         work:account()
         local candidate_raw = required_map(
           candidate, TYPES_MODULE,
@@ -2010,7 +2064,7 @@ local function aggregate_summary(
   else
     local raw_methods = required_map(
       raw["methods"], TYPES_MODULE, subject .. ".methods")
-    for name, candidate in iteration.pairs<string, value>(raw_methods) do
+    for name, candidate in iteration.pairs<|string, value|>(raw_methods) do
       work:account()
       local candidate_raw = required_map(
         candidate, TYPES_MODULE,
@@ -2063,7 +2117,7 @@ local function append_module_member(
   local raw = required_map(candidate, TYPES_MODULE, subject)
   local tag = type_tag(candidate, subject)
   if tag ~= "Type.ModuleMember" and tag ~= "Type.ModuleVariable" then
-    return fail<value>(TYPES_MODULE,
+    return fail<|value|>(TYPES_MODULE,
       subject .. " must be a module member")
   end
   local name = required_string(raw["name"], TYPES_MODULE, subject .. ".name")
@@ -2089,7 +2143,7 @@ local function append_module_member(
       compiler, member_type, module_name, ".", name,
       raw["paramnames"], subject .. ".type", nil)
     if signature == nil then
-      return fail<value>(TYPES_MODULE,
+      return fail<|value|>(TYPES_MODULE,
         subject .. " callable has no signature")
     end
     display = visibility_prefix(raw) .. signature.display
@@ -2116,7 +2170,7 @@ local function append_module_type_members(
     work: NormalizationWork)
   if candidate == nil or candidate == false then return end
   local raw = required_map(candidate, TYPES_MODULE, subject)
-  for name, member in iteration.pairs<string, value>(raw) do
+  for name, member in iteration.pairs<|string, value|>(raw) do
     work:account()
     if not seen[name] then
       -- A source interface may decorate the public entry by name as well as
@@ -2149,7 +2203,7 @@ local function append_module_type_members(
           compiler, member, member_subject).display
         local equals? = strings.find(rendered, " = ")
         if equals == nil then
-          return fail<value>(TYPES_MODULE,
+          return fail<|value|>(TYPES_MODULE,
             member_subject .. " generic alias has no rendered target")
         end
         output:write(strings.sub(rendered, equals))
@@ -2332,11 +2386,13 @@ local function node_name(node: {string: value}, tag: string): string?
   if tag == "Ast.TopLevelMethod" or tag == "Ast.TopLevelStatic"
       or tag == "Ast.TopLevelFunc" or tag == "Ast.TopLevelForeignFunc"
       or tag == "Ast.TopLevelTypeAlias" or tag == "Ast.TopLevelRecord"
+      or tag == "Ast.TopLevelForeignTypeAlias"
       or tag == "Ast.TopLevelUnion" or tag == "Ast.TopLevelInterface"
       or tag == "Ast.Decl" or tag == "Ast.UnionVariant"
       or tag == "Ast.InterfaceMethod" or tag == "Ast.TypeParam"
       or tag == "Ast.VarName" or tag == "Ast.VarDot"
       or tag == "Ast.TypeName" or tag == "Ast.TypeQualName"
+      or tag == "Ast.TypeForeignName"
       or tag == "Ast.ExpMethodRef" or tag == "Ast.CaseArm" then
     return optional_string(node["name"], DRIVER_MODULE, tag .. ".name")
   end
@@ -2364,10 +2420,10 @@ end
 
 local function node_is_local(node: {string: value}): boolean
   local tag = required_string(node["_tag"], DRIVER_MODULE, "AST _tag")
-  if tag == "Ast.TopLevelForeignFunc" then
-    -- Titan publishes direct foreign functions only through a module's
-    -- source-visible member table. The AST has no redundant `islocal` marker,
-    -- so preserve that compiler visibility rule explicitly.
+  if tag == "Ast.TopLevelForeignFunc" or
+      tag == "Ast.TopLevelForeignTypeAlias" then
+    -- Foreign functions and aliases are always source-local. Their AST nodes
+    -- carry no redundant `islocal` marker.
     return true
   end
   if tag == "Ast.TopLevelImport" then
@@ -2405,6 +2461,7 @@ local function node_has_synthetic_children(node: {string: value},
 end
 
 local function declaration_namespace(raw: {string: value}, tag: string): string
+  if tag == "Ast.TopLevelForeignTypeAlias" then return "foreign_type" end
   if tag == "Ast.TopLevelTypeAlias" or tag == "Ast.TopLevelInterface"
       or tag == "Type.Interface" or tag == "Type.GenericAlias" then
     return "type"
@@ -2454,7 +2511,7 @@ local function declaration_identity(module_name: string, candidate: value): stri
     if raw["name"] ~= "ffi" or raw["_builtin"] ~= true or
         namespace_type["_tag"] ~= "Type.CModule" or
         namespace_type["name"] ~= "ffi" then
-      return fail<string>(DRIVER_MODULE, "invalid builtin foreign namespace")
+      return fail<|string|>(DRIVER_MODULE, "invalid builtin foreign namespace")
     end
     -- This compiler-owned namespace has written references but no source
     -- declaration. Each module has its own combined C environment.
@@ -2503,7 +2560,7 @@ local function declaration_identity(module_name: string, candidate: value): stri
       raw["owner_kind"], DRIVER_MODULE,
       "Checker.Parameter.owner_kind")
     if owner_kind ~= "module" and owner_kind ~= "member" then
-      return fail<string>(DRIVER_MODULE,
+      return fail<|string|>(DRIVER_MODULE,
         "Checker.Parameter.owner_kind must be 'module' or 'member'")
     end
     local owner_name = required_string(
@@ -2515,7 +2572,7 @@ local function declaration_identity(module_name: string, candidate: value): stri
     local index = required_integer(
       raw["index"], DRIVER_MODULE, "Checker.Parameter.index")
     if index < 1 then
-      return fail<string>(DRIVER_MODULE,
+      return fail<|string|>(DRIVER_MODULE,
         "Checker.Parameter.index must be positive")
     end
     if raw["_foreign_namespace"] == true then
@@ -2540,7 +2597,7 @@ local function declaration_identity(module_name: string, candidate: value): stri
       if strings.byte(name, index) == 46 then split = index end
     end
     if split == 0 or split == #name then
-      return fail<string>(TYPES_MODULE,
+      return fail<|string|>(TYPES_MODULE,
         "nominal declaration name '" .. name .. "' is not fully qualified")
     end
     owner = strings.sub(name, 1, split - 1)
@@ -2614,10 +2671,10 @@ end
 
 local function summary_kind_key(kind: HoverSummaryKind): string
   case kind
-  when module_summary then return "module"
-  when record_summary then return "record"
-  when union_summary then return "union"
-  when interface_summary then return "interface"
+  when module_summary() then return "module"
+  when record_summary() then return "record"
+  when union_summary() then return "union"
+  when interface_summary() then return "interface"
   end
 end
 
@@ -2692,7 +2749,7 @@ local function aggregate_owner_module(name: string,
     if strings.byte(name, index) == 46 then split = index end
   end
   if split == 0 or split == #name then
-    return fail<string>(TYPES_MODULE,
+    return fail<|string|>(TYPES_MODULE,
       subject .. " name '" .. name .. "' is not fully qualified")
   end
   return strings.sub(name, 1, split - 1)
@@ -2776,7 +2833,8 @@ local function exact_occurrence_span(node: {string: value}, tag: string,
   -- V1. Calls may still carry a stable identity for hover/references, but the
   -- foreign declaration itself must not become a navigable project target or
   -- a rename anchor.
-  if tag == "Ast.TopLevelForeignFunc" then return nil end
+  if tag == "Ast.TopLevelForeignFunc" or
+      tag == "Ast.TopLevelForeignTypeAlias" then return nil end
   local name_location? = optional_field_location(
     node, "_name_loc", tag)
   if name_location ~= nil then
@@ -2897,27 +2955,25 @@ local function Walker:visit_any(candidate: value, parent_id: integer?,
   end
 end
 
-local function child_fields(): const { string }
-  -- Keep only lexical AST children here. Ast.ExpSpreadIndex.spread is a DAG
-  -- backreference to the carrier already emitted earlier in the expression
-  -- list. Traversing it is redundant now and could mis-parent the carrier if
-  -- expression-list traversal order changes.
-  return {
-    "typeparams", "typeargs", "_surface_typeparams", "_surface_typeargs",
-    "_surface_named_args",
-    "constraint", "class", "params",
-    "argtypes", "rettypes", "varargtype", "flexrettype", "block",
-    "decl", "decls", "value", "type", "fields", "variants",
-    "name",
-    "members", "methods", "stats", "condition", "start", "finish",
-    "inc", "exps", "vars", "callexp", "exp", "first", "last",
-    "var", "arms",
-    "elseblock", "thens", "elsestat", "catchblock", "finallyblock",
-    "exp1", "exp2", "lhs", "rhs", "target", "args", "subtype",
-    "base", "keystype", "valuestype", "basetype", "payload",
-    "binding", "index", "owner", "variant", "method",
-  }
-end
+-- Keep only lexical AST children here. Ast.ExpSpreadIndex.spread is a DAG
+-- backreference to the carrier already emitted earlier in the expression
+-- list. Traversing it is redundant now and could mis-parent the carrier if
+-- expression-list traversal order changes.
+local const AST_CHILD_FIELDS: const {string} = {
+  "typeparams", "typeargs", "_surface_typeparams", "_surface_typeargs",
+  "_surface_named_args",
+  "constraint", "class", "params",
+  "argtypes", "rettypes", "varargtype", "flexrettype", "block",
+  "decl", "decls", "value", "type", "fields", "variants",
+  "name",
+  "members", "methods", "stats", "condition", "start", "finish",
+  "inc", "exps", "vars", "callexp", "exp", "first", "last",
+  "var", "arms",
+  "elseblock", "thens", "elsestat", "catchblock", "finallyblock",
+  "exp1", "exp2", "lhs", "rhs", "target", "args", "subtype",
+  "base", "keystype", "valuestype", "basetype", "payload",
+  "binding", "index", "owner", "variant", "method",
+}
 
 local function Walker:visit_node(candidate: value, parent_id: integer?,
                                  role_name: string, local_hint: boolean?,
@@ -2927,7 +2983,7 @@ local function Walker:visit_node(candidate: value, parent_id: integer?,
   local raw = required_map(candidate, DRIVER_MODULE, "AST node")
   local tag = required_string(raw["_tag"], DRIVER_MODULE, "AST node._tag")
   if strings.sub(tag, 1, 4) ~= "Ast." then
-    fail<value>(DRIVER_MODULE, "invalid AST tag '" .. tag .. "'")
+    fail<|value|>(DRIVER_MODULE, "invalid AST tag '" .. tag .. "'")
   end
   local location? = semantic_location(raw, tag)
   local source_span? = structural_span(raw, tag)
@@ -2948,12 +3004,12 @@ local function Walker:visit_node(candidate: value, parent_id: integer?,
       self.compiler, raw_adjustment, tag .. " adjustment")
     local detail: AdjustmentInfo? = nil
     case adjustment
-    when identity: item then detail = item
-    when coercion: item then detail = item
-    when gradual: item then detail = item
-    when callable: item then detail = item
-    when written: item then detail = item
-    when other: item then detail = item
+    when identity(item) then detail = item
+    when coercion(item) then detail = item
+    when gradual(item) then detail = item
+    when callable(item) then detail = item
+    when written(item) then detail = item
+    when other(item) then detail = item
     end
     if detail then
       original = detail.source
@@ -2981,7 +3037,8 @@ local function Walker:visit_node(candidate: value, parent_id: integer?,
         or tag == "Ast.TypeParam"
         or tag == "Ast.InterfaceMethod" then
       role = tag == "Ast.TopLevelImport" and "import_alias" or "definition"
-    elseif tag == "Ast.TypeName" or tag == "Ast.TypeQualName" then
+    elseif tag == "Ast.TypeName" or tag == "Ast.TypeQualName" or
+        tag == "Ast.TypeForeignName" then
       role = "type_reference"
     end
     self:add_occurrence(
@@ -3031,10 +3088,9 @@ local function Walker:visit_node(candidate: value, parent_id: integer?,
       raw["decl"], id, "definition", true, children_synthetic)
   end
 
-  local fields = child_fields()
-  for index = 1, #fields do
+  for index = 1, #AST_CHILD_FIELDS do
     self:visit_any(
-      raw[fields[index]], id, "reference", nil, children_synthetic)
+      raw[AST_CHILD_FIELDS[index]], id, "reference", nil, children_synthetic)
   end
 end
 
@@ -3131,11 +3187,11 @@ local function normalize_diagnostics(candidate: value,
                                      work: NormalizationWork,
                                      owner_module: string?): {Diagnostic}
   if candidate == nil or candidate == false then
-    return fail<{Diagnostic}>(
+    return fail<|{Diagnostic}|>(
       DRIVER_MODULE, "compiler error list must be a Lua table")
   end
   if not (candidate is {integer: value}) then
-    return fail<{Diagnostic}>(
+    return fail<|{Diagnostic}|>(
       DRIVER_MODULE, "compiler error list must be a Lua table")
   end
   local raw = candidate as {integer: value}
@@ -3159,18 +3215,18 @@ local function serialize_manifest(compiler: Compiler, module_name: string,
     raw_type["_tag"], TYPES_MODULE,
     "module interface for '" .. module_name .. "'._tag")
   if tag ~= "Type.Module" then
-    return fail<Manifest>(TYPES_MODULE,
+    return fail<|Manifest|>(TYPES_MODULE,
       "module interface for '" .. module_name ..
       "' must have tag Type.Module, found " .. tag)
   end
   local raw_serializer = checked_function(
     compiler.types, TYPES_MODULE, "serialize", compiler.type_of)
-  local serializer = raw_serializer as (value) -> value
+  local serializer = raw_serializer as function (value): value
   local serialized: value = nil
   do
     serialized = serializer(candidate)
   catch
-    return fail<Manifest>(TYPES_MODULE,
+    return fail<|Manifest|>(TYPES_MODULE,
       "cannot serialize public manifest for '" .. module_name .. "': " ..
       strings.tostring(error))
   end
@@ -3185,11 +3241,11 @@ local function project_index(modules: {ProjectModule}): {string: ProjectModule}
   for index = 1, #modules do
     local module = modules[index]
     if result[module.module_name] ~= nil then
-      return fail<{string: ProjectModule}>(
+      return fail<|{string: ProjectModule}|>(
         DRIVER_MODULE, "duplicate project module '" .. module.module_name .. "'")
     end
     if #module.files == 0 then
-      return fail<{string: ProjectModule}>(
+      return fail<|{string: ProjectModule}|>(
         DRIVER_MODULE, "project module '" .. module.module_name ..
         "' has no saved source files")
     end
@@ -3204,7 +3260,7 @@ local function raw_source_descriptor(module: ProjectModule): value
   for index = 1, #module.files do
     local source = module.files[index]
     if contents[source.filename] ~= nil then
-      return fail<value>(DRIVER_MODULE,
+      return fail<|value|>(DRIVER_MODULE,
         "project module '" .. module.module_name ..
         "' repeats source file '" .. source.filename .. "'")
     end
@@ -3367,7 +3423,7 @@ local function provenance(entry: {string: value}, module_name: string,
         "compiler provenance for '" .. module_name .. "'.filename"))),
       true)
   end
-  return fail<NormalizedProvenance>(DRIVER_MODULE,
+  return fail<|NormalizedProvenance|>(DRIVER_MODULE,
     "unsupported compiler provenance kind '" .. kind .. "'")
 end
 
@@ -3391,26 +3447,26 @@ local function snapshot_module(compiler: Compiler, module_name: string,
     else
       local source_serialized: string? = nil
       case origin
-      when project_source then
+      when project_source() then
         source_serialized = required_string(
           entry["source_manifest"], DRIVER_MODULE,
           "compiler source manifest for '" .. module_name .. "'")
         if source_serialized == "" then
-          return fail<NormalizedModule>(
+          return fail<|NormalizedModule|>(
             DRIVER_MODULE, "compiler source manifest for '" ..
             module_name .. "' must not be empty")
         end
-      when external_source then
+      when external_source() then
         source_serialized = required_string(
           entry["source_manifest"], DRIVER_MODULE,
           "compiler source manifest for '" .. module_name .. "'")
         if source_serialized == "" then
-          return fail<NormalizedModule>(
+          return fail<|NormalizedModule|>(
             DRIVER_MODULE, "compiler source manifest for '" ..
             module_name .. "' must not be empty")
         end
-      when dynamic_binary then
-      when static_binary then
+      when dynamic_binary() then
+      when static_binary() then
       end
       manifest = serialize_manifest(
         compiler, module_name, entry["type"], source_serialized)
@@ -3426,7 +3482,7 @@ local function snapshot_module(compiler: Compiler, module_name: string,
   local raw_ast: value = entry["ast"]
   if projects[module_name] ~= nil then
     if raw_ast == nil or raw_ast == false then
-      return fail<NormalizedModule>(DRIVER_MODULE,
+      return fail<|NormalizedModule|>(DRIVER_MODULE,
         "project source '" .. module_name .. "' has no annotated AST")
     end
     nodes, symbols, imports, hover_summaries = walk_ast(
@@ -3445,7 +3501,7 @@ local function snapshot_module(compiler: Compiler, module_name: string,
     local dependencies: {string} = {}
     local raw_dependencies: value = entry["deps"]
     if raw_dependencies is {string: value} then
-      for dependency, enabled in iteration.pairs<string, value>(
+      for dependency, enabled in iteration.pairs<|string, value|>(
           raw_dependencies as {string: value}) do
         work:account()
         if enabled then
@@ -3462,10 +3518,10 @@ local function snapshot_module(compiler: Compiler, module_name: string,
     end
     local filename = "<" .. module_name .. ">"
     case origin
-    when external_source: source then filename = source.main_file
-    when dynamic_binary: binary then filename = binary.provider_file
-    when static_binary: binary then filename = binary.provider_file
-    when project_source then
+    when external_source(source) then filename = source.main_file
+    when dynamic_binary(binary) then filename = binary.provider_file
+    when static_binary(binary) then filename = binary.provider_file
+    when project_source() then
     end
     for index = 1, #dependencies do
       work:account()
@@ -3495,7 +3551,7 @@ local function normalize_contextual_resolutions(
     raw_context["contextual_resolutions"], DRIVER_MODULE,
     "compiler resolver contextual_resolutions")
   local result: {NormalizedContextualResolution} = {}
-  for key, candidate in iteration.pairs<string, value>(raw_resolutions) do
+  for key, candidate in iteration.pairs<|string, value|>(raw_resolutions) do
     work:account()
     local raw = required_map(candidate, DRIVER_MODULE,
       "compiler contextual resolution '" .. key .. "'")
@@ -3519,7 +3575,7 @@ local function normalize_contextual_resolutions(
       origin = Provenance.static_binary(
         BinaryProvenance.new(provider_file))
     else
-      return fail<{NormalizedContextualResolution}>(DRIVER_MODULE,
+      return fail<|{NormalizedContextualResolution}|>(DRIVER_MODULE,
         "compiler contextual resolution '" .. key ..
         "' has unsupported provenance kind '" .. kind .. "'")
     end
@@ -3542,8 +3598,8 @@ local function normalize_contextual_resolutions(
       local previous_kind = "dynamic"
       local previous_file = ""
       case previous.provenance
-      when dynamic_binary: binary then previous_file = binary.provider_file
-      when static_binary: binary then
+      when dynamic_binary(binary) then previous_file = binary.provider_file
+      when static_binary(binary) then
         previous_kind = "static"
         previous_file = binary.provider_file
       else
@@ -3563,10 +3619,10 @@ end
 local function contextual_provider_file(
     resolution: ContextualResolution): string
   case resolution.provenance
-  when dynamic_binary: binary then return binary.provider_file
-  when static_binary: binary then return binary.provider_file
+  when dynamic_binary(binary) then return binary.provider_file
+  when static_binary(binary) then return binary.provider_file
   else
-    return fail<string>(DRIVER_MODULE,
+    return fail<|string|>(DRIVER_MODULE,
       "contextual owner has non-binary provider provenance")
   end
 end
@@ -3588,7 +3644,7 @@ local function selected_provider_identity(
     embedded_provider: boolean): compiler_io.LstatIdentity?
   if embedded_provider then
     if provider_file ~= compiler.embedded_provider_file then
-      return fail<compiler_io.LstatIdentity?>(
+      return fail<|compiler_io.LstatIdentity?|>(
         DRIVER_MODULE,
         "embedded compiler result names unexpected provider '" ..
         provider_file .. "'")
@@ -3625,8 +3681,8 @@ local function attach_module_provider_identities(
     local snapshot = modules[index]
     local provider_file?: string = nil
     case snapshot.provenance
-    when dynamic_binary: binary then provider_file = binary.provider_file
-    when static_binary: binary then provider_file = binary.provider_file
+    when dynamic_binary(binary) then provider_file = binary.provider_file
+    when static_binary(binary) then provider_file = binary.provider_file
     else
     end
     if provider_file ~= nil and
@@ -3649,11 +3705,11 @@ local function binary_provider_selection(
     snapshot: ModuleSnapshot,
     embedded_provider: boolean): BinaryProviderSelection?
   case snapshot.provenance
-  when dynamic_binary: binary then
+  when dynamic_binary(binary) then
     return BinaryProviderSelection.new(
       snapshot.module_name, "dynamic", binary.provider_file,
       embedded_provider)
-  when static_binary: binary then
+  when static_binary(binary) then
     return BinaryProviderSelection.new(
       snapshot.module_name, "static", binary.provider_file,
       embedded_provider)
@@ -3755,7 +3811,7 @@ function Compiler:installed_binary_modules_root(): string
   local permit = compiler_scheduler.acquire()
   defer permit:release()
 
-  local context = new_context(self, nil)
+  local context = self:new_context(nil)
   defer close_context(self, context)
 
   local paths = required_map(
@@ -3793,7 +3849,7 @@ local function project_filename_owners(projects: {string: ProjectModule},
                                        work: NormalizationWork):
     {string: string}
   local owners: {string: string} = {}
-  for name, project in iteration.pairs<string, ProjectModule>(projects) do
+  for name, project in iteration.pairs<|string, ProjectModule|>(projects) do
     for index = 1, #project.files do
       work:account()
       owners[project.files[index].filename] = name
@@ -3802,57 +3858,18 @@ local function project_filename_owners(projects: {string: ProjectModule},
   return owners
 end
 
-local function sort_strings(items: {string}, work: NormalizationWork)
-  local count = #items
-  if count < 2 then return end
-  local source = items
-  local target: {string} = {}
-  local source_is_input = true
-  local width = 1
-  while width < count do
-    local first = 1
-    while first <= count do
-      local left = first
-      local middle = first + width
-      local right = middle
-      local finish = first + width + width - 1
-      if middle > count + 1 then middle = count + 1 end
-      if finish > count then finish = count end
-      for output = first, finish do
-        work:account()
-        if left < middle and
-           (right > finish or source[left] <= source[right]) then
-          target[output] = source[left]
-          left = left + 1
-        else
-          target[output] = source[right]
-          right = right + 1
-        end
-      end
-      first = finish + 1
-    end
-    local swap = source
-    source = target
-    target = swap
-    source_is_input = not source_is_input
-    width = width * 2
-  end
-  if not source_is_input then
-    for index = 1, count do
-      work:account()
-      items[index] = source[index]
-    end
-  end
+local function string_less(left: string, right: string): boolean
+  return left < right
 end
 
 local function sorted_entry_names(entries: {string: value},
                                   work: NormalizationWork): {string}
   local result: {string} = {}
-  for name in iteration.pairs<string, value>(entries) do
+  for name in iteration.pairs<|string, value|>(entries) do
     work:account()
     result[#result + 1] = name
   end
-  sort_strings(result, work)
+  stable_sort(result, string_less, work)
   return result
 end
 
@@ -3869,7 +3886,7 @@ local function failed_projects(root_module: string,
   -- A declaration manifest can serialize even when a function body failed.
   -- Use source provenance and the compiler's direct dependency edges to carry
   -- failure through source importers without rejecting healthy siblings.
-  for name, candidate in iteration.pairs<string, value>(imported) do
+  for name, candidate in iteration.pairs<|string, value|>(imported) do
     work:account()
     local entry = required_map(
       candidate, DRIVER_MODULE, "driver.imported['" .. name .. "']")
@@ -3882,7 +3899,7 @@ local function failed_projects(root_module: string,
       end
       local dependencies: value = entry["deps"]
       if dependencies is {string: value} then
-        for dependency, enabled in iteration.pairs<string, value>(
+        for dependency, enabled in iteration.pairs<|string, value|>(
             dependencies as {string: value}) do
           work:account()
           if enabled then
@@ -3909,7 +3926,7 @@ local function failed_projects(root_module: string,
     failed[owner as string] = true
   end
   local pending: {string} = {}
-  for name in iteration.pairs<string, boolean>(failed) do
+  for name in iteration.pairs<|string, boolean|>(failed) do
     pending[#pending + 1] = name
   end
   local current = 1
@@ -3944,10 +3961,10 @@ end
 
 local function snapshot_profile_filename(snapshot: ModuleSnapshot): string
   case snapshot.provenance
-  when project_source: source then return source.main_file
-  when external_source: source then return source.main_file
-  when dynamic_binary: binary then return binary.provider_file
-  when static_binary: binary then return binary.provider_file
+  when project_source(source) then return source.main_file
+  when external_source(source) then return source.main_file
+  when dynamic_binary(binary) then return binary.provider_file
+  when static_binary(binary) then return binary.provider_file
   end
 end
 
@@ -3965,7 +3982,7 @@ local function Compiler:run_attempt_inner(
   local profiling = logging.enabled("trace")
   if profiling then
     local trace_header_phase:
-      (string, string, string, string, float, string?) -> () =
+      function (string, string, string, string, float, string?): () =
       function (header: string, resolved_header: string,
                 phase: string, outcome: string, cpu_ms: float,
                 trace_identity: string?)
@@ -3985,7 +4002,7 @@ local function Compiler:run_attempt_inner(
         })
       end
     local trace_source_module:
-      (string, string, string, float, float, float, float) -> () =
+      function (string, string, string, float, float, float, float): () =
       function (module_name: string, filename: string, outcome: string,
                 self_cpu_ms: float, total_cpu_ms: float,
                 parse_cpu_ms: float, check_cpu_ms: float)
@@ -4001,7 +4018,7 @@ local function Compiler:run_attempt_inner(
         })
       end
     local trace_probe_cache:
-      (string, string, boolean, string, string) -> () =
+      function (string, string, boolean, string, string): () =
       function (module_name: string, stage: string, hit: boolean,
                 key: string, path: string)
         logging.emit("trace", "compiler.c_probe.cache", {
@@ -4014,11 +4031,11 @@ local function Compiler:run_attempt_inner(
           ["path"] = path,
         })
       end
-    local trace_probe_semantic: (value) -> () =
+    local trace_probe_semantic: function (value): () =
       function (event: value)
         emit_c_probe_semantic_trace(root_module, event)
       end
-    local trace_probe_execution: (value) -> () =
+    local trace_probe_execution: function (value): () =
       function (event: value)
         emit_c_probe_execution_trace(root_module, event)
       end
@@ -4032,7 +4049,7 @@ local function Compiler:run_attempt_inner(
   local active_overrides: {string: value} = {}
   local retained_entries: {string: value} = {}
   local known_source_modules: {string: value} = {}
-  for name in iteration.pairs<string, ProjectModule>(projects) do
+  for name in iteration.pairs<|string, ProjectModule|>(projects) do
     known_source_modules[name] = true
     if pending[name] then
       active_overrides[name] = overrides[name]
@@ -4045,11 +4062,6 @@ local function Compiler:run_attempt_inner(
   options["known_source_modules"] = known_source_modules
   options["cached_source_entries"] = retained_entries
   options["cached_interfaces"] = raw_cached_interfaces
-  local raw_includes: {integer: value} = {}
-  for index = 1, #self.extra_ffi_include_dirs do
-    raw_includes[index] = self.extra_ffi_include_dirs[index]
-  end
-  options["extra_ffi_include_dirs"] = raw_includes
 
   local previous_imported: value = self.driver["imported"]
   local previous_registry: value = self.types["registry"]
@@ -4059,24 +4071,24 @@ local function Compiler:run_attempt_inner(
   self.driver["imported"] = imported
   self.types["registry"] = {} as {string: value}
 
-  local context = new_context(self, options)
+  local context = self:new_context(options)
   defer close_context(self, context)
   options["context"] = context
 
   local raw_defaultloader = checked_function(
     self.driver, DRIVER_MODULE, "defaultloader", self.type_of)
-  local defaultloader = raw_defaultloader as (value, value) -> value
+  local defaultloader = raw_defaultloader as function (value, value): value
   local static_dependencies: {string: value} = {}
   local loader: value = defaultloader(static_dependencies, options)
   if self.type_of(loader) ~= "function" then
-    return fail<AttemptResult>(DRIVER_MODULE,
+    return fail<|AttemptResult|>(DRIVER_MODULE,
       "driver.defaultloader returned " .. describe(loader, self.type_of) ..
       " instead of a function")
   end
   defer close_loader(self, loader)
 
   local diagnostics: {Diagnostic} = {}
-  local invoke = loader as (string) -> (value, value, value, value)
+  local invoke = loader as function (string): (value, value, value, value)
   local raw_ok, interface_or_error, raw_errors = invoke(root_module)
   local ok = required_boolean(
     raw_ok, DRIVER_MODULE, "compiler loader result")
@@ -4100,7 +4112,7 @@ local function Compiler:run_attempt_inner(
 
   local raw_finalize = checked_function(
     self.driver, DRIVER_MODULE, "finalize_resolver_context", self.type_of)
-  local finalize = raw_finalize as (value) -> (value, value)
+  local finalize = raw_finalize as function (value): (value, value)
   local finalized, raw_final_errors = finalize(context)
   if finalized == nil or finalized == false then
     append_diagnostics(
@@ -4153,12 +4165,12 @@ local function Compiler:run_attempt_inner(
       if is_project and valid then
         local compact = checked_function(self.driver, DRIVER_MODULE,
           "compact_project_entry", self.type_of) as
-          (value, value) -> (value, value)
+          function (value, value): (value, value)
         local retained, failure = compact(imported[name], {
           ["yield"] = function () async.yield() end,
         } as {string: value})
         if retained == nil or retained == false then
-          return fail<AttemptResult>(DRIVER_MODULE,
+          return fail<|AttemptResult|>(DRIVER_MODULE,
             "cannot retain declared interface for '" .. name .. "': " ..
             strings.tostring(failure))
         end
@@ -4270,7 +4282,7 @@ function Compiler:analyze_incremental(
   -- advance by their saved constituent-file counts exactly once.
   compiler_io.set_checkpoint_listener(self.io, nil)
   defer compiler_io.set_checkpoint_listener(self.io, nil)
-  local mark_completed: (string) -> () = function (_name: string) end
+  local mark_completed: function (string): () = function (_name: string) end
   if progress_listener ~= nil then
     local notify: ProgressListener = progress_listener
     local file_counts: {string: integer} = {}
@@ -4297,8 +4309,8 @@ function Compiler:analyze_incremental(
   end
   local permit = compiler_scheduler.acquire()
   defer permit:release()
-  local previous_cppflags = install_extra_cppflags(self)
-  defer self.driver["EXTRA_CPPFLAGS"] = previous_cppflags
+  local previous_configuration = self:install_configuration()
+  defer previous_configuration:apply()
   compiler_io.begin_lstat_observations(self.io)
   defer compiler_io.end_lstat_observations(self.io)
   validate_embedded_provider_baseline(self)
@@ -4306,28 +4318,18 @@ function Compiler:analyze_incremental(
   local raw_new_c_header_analysis = checked_function(
     self.driver, DRIVER_MODULE, "new_c_header_analysis", self.type_of)
   local create_c_header_analysis =
-    raw_new_c_header_analysis as () -> value
+    raw_new_c_header_analysis as function (): value
   local c_header_analysis = create_c_header_analysis()
   if self.type_of(c_header_analysis) ~= "table" then
-    return fail<Analysis>(
+    return fail<|Analysis|>(
       DRIVER_MODULE, "driver.new_c_header_analysis returned " ..
       describe(c_header_analysis, self.type_of) .. " instead of a table")
   end
 
-  local previous_source_path: value = self.driver["TITAN_SOURCE_PATH"]
-  local previous_binary_path: value = self.driver["TITAN_BIN_PATH"]
-  defer self.driver["TITAN_SOURCE_PATH"] = previous_source_path
-  defer self.driver["TITAN_BIN_PATH"] = previous_binary_path
-  if self.source_path then
-    self.driver["TITAN_SOURCE_PATH"] = self.source_path as string
-  end
-  if self.binary_path then
-    self.driver["TITAN_BIN_PATH"] = self.binary_path as string
-  end
 
   -- Purge deleted and invalidated project state before constructing any fresh
   -- resolver. A dirty module can never be seeded from an older generation.
-  for name in iteration.pairs<string, value>(self.project_entries) do
+  for name in iteration.pairs<|string, value|>(self.project_entries) do
     if projects[name] == nil or requested[name] then
       self.project_entries[name] = nil
     end
@@ -4386,7 +4388,7 @@ function Compiler:analyze_incremental(
           #normalized_contextual_resolutions + 1] =
           attempt.contextual_resolutions[resolution_index]
       end
-      for name, entry in iteration.pairs<string, value>(attempt.entries) do
+      for name, entry in iteration.pairs<|string, value|>(attempt.entries) do
         self.project_entries[name] = entry
       end
       for checked_index = 1, #attempt.checked do
@@ -4406,16 +4408,12 @@ function Compiler:analyze_incremental(
     if snapshot ~= nil then modules[#modules + 1] = snapshot end
   end
   local external_names: {string} = {}
-  for name in iteration.pairs<string, ModuleSnapshot>(snapshots) do
+  for name in iteration.pairs<|string, ModuleSnapshot|>(snapshots) do
     if projects[name] == nil then
-      local position = #external_names + 1
-      while position > 1 and external_names[position - 1] > name do
-        external_names[position] = external_names[position - 1]
-        position = position - 1
-      end
-      external_names[position] = name
+      external_names[#external_names + 1] = name
     end
   end
+  stable_sort(external_names, string_less, result_normalization_work)
   for index = 1, #external_names do
     modules[#modules + 1] = snapshots[external_names[index]]
   end
@@ -4429,11 +4427,11 @@ function Compiler:analyze_incremental(
     attach_binary_provider_observations(
       self, final_embedded_identity, binary_provider_selection_list)
   local provider_conflict_names: {string} = {}
-  for name, conflicted in iteration.pairs<string, boolean>(
+  for name, conflicted in iteration.pairs<|string, boolean|>(
       provider_conflicts) do
     if conflicted then provider_conflict_names[#provider_conflict_names + 1] = name end
   end
-  sort_strings(provider_conflict_names, result_normalization_work)
+  stable_sort(provider_conflict_names, string_less, result_normalization_work)
   local result = Analysis.new(
     ordered[1], diagnostics, modules, contextual_resolutions,
     binary_provider_observations, provider_conflict_names)
@@ -4465,13 +4463,13 @@ end
 function Compiler:configure_cache(lookup: CacheLookup,
                                   publish: CachePublisher,
                                   refresh_inputs: CacheInputRefresher?)
-  local get: (string, string) -> (string?, value) = function (
+  local get: function (string, string): (string?, value) = function (
       kind: string, key: string): (string?, value)
     local payload?, inputs? = lookup(kind, key)
     if inputs == nil then return payload,nil end
     return payload,raw_c_header_dependencies(inputs)
   end
-  local put: (string, string, string, value) -> boolean = function (
+  local put: function (string, string, string, value): boolean = function (
       kind: string, key: string, payload: string, raw_inputs: value): boolean
     local inputs: {CHeaderDependency} = {}
     if raw_inputs ~= nil then
@@ -4511,7 +4509,7 @@ function Compiler:export_projects(projects: {ProjectModule}, selected_names: {st
   local permit = compiler_scheduler.acquire()
   defer permit:release()
   local encode = checked_function(self.driver, DRIVER_MODULE,
-    "encode_project_entry", self.type_of) as (value, value) -> (value, value)
+    "encode_project_entry", self.type_of) as function (value, value): (value, value)
   local current_projects = project_index(projects)
   local files = cache_project_files(projects)
   local options: {string: value} = {
@@ -4557,9 +4555,9 @@ function Compiler:restore_project_cache(projects: {ProjectModule},
   local permit = compiler_scheduler.acquire()
   defer permit:release()
   local decode = checked_function(self.driver, DRIVER_MODULE,
-    "decode_project_entry",self.type_of) as (string, value) -> (value, value)
+    "decode_project_entry",self.type_of) as function (string, value): (value, value)
   local make_registry = checked_function(self.driver, DRIVER_MODULE,
-    "project_entries_registry",self.type_of) as (value, value) -> (value, value)
+    "project_entries_registry",self.type_of) as function (value, value): (value, value)
   local project_map = project_index(projects)
   local files = cache_project_files(projects)
   local entries: {string: value} = {}
@@ -4651,11 +4649,11 @@ local function containing_directory(path: string): string
 end
 
 local function hash_compiler_tree(directory: string, output: strings.StringWriter,
-    fingerprint: (string) -> string)
+    fingerprint: function (string): string)
   local entries = fs.list(directory)
   local names: {string} = {}
   for index = 1, #entries do names[index] = entries[index] end
-  sort_strings(names,NormalizationWork.new(0))
+  stable_sort(names, string_less, NormalizationWork.new(0))
   for index = 1, #names do
     local path = directory .. "/" .. names[index]
     local metadata? = fs.stat(path)
@@ -4675,16 +4673,16 @@ end
 function Compiler:native_cache_identity(): string
   local permit = compiler_scheduler.acquire()
   defer permit:release()
-  local previous_cppflags = install_extra_cppflags(self)
-  defer self.driver["EXTRA_CPPFLAGS"] = previous_cppflags
-  local context = new_context(self,nil)
+  local previous_configuration = self:install_configuration()
+  defer previous_configuration:apply()
+  local context = self:new_context(nil)
   defer close_context(self,context)
   local cache_identity = checked_function(self.driver,DRIVER_MODULE,
-    "language_server_cache_identity",self.type_of) as (value) -> (value,value)
+    "language_server_cache_identity",self.type_of) as function (value): (value,value)
   local options: {string: value} = {["context"] = context}
   local raw, failure = cache_identity(options)
   if not (raw is string) then
-    return fail<string>(DRIVER_MODULE,"cannot identify compiler cache context: " .. strings.tostring(failure))
+    return fail<|string|>(DRIVER_MODULE,"cannot identify compiler cache context: " .. strings.tostring(failure))
   end
   emit_cache_stats(self)
   return content_identity.digest(raw as string)
@@ -4693,12 +4691,12 @@ end
 -- Resolve the inventory before any C probing. This namespace is sufficient to
 -- open the transport: each header/conversion key also carries its native world.
 -- Project restoration additionally requires native_cache_identity above.
-function Compiler:cache_identity(observed_fingerprint: ((string) -> string)?): string
+function Compiler:cache_identity(observed_fingerprint: (function (string): string)?): string
   local permit = compiler_scheduler.acquire()
   defer permit:release()
   local output = strings.writer()
   output:write("titan-ls-sqlite-schema-4-api-" .. COMPILER_LANGUAGE_SERVER_API)
-  local fingerprint: (string) -> string = function (path: string): string
+  local fingerprint: function (string): string = function (path: string): string
     return content_identity.file(path,fs.read_file(path))
   end
   if observed_fingerprint ~= nil then fingerprint = observed_fingerprint end
@@ -4709,11 +4707,11 @@ return function(name, native)
   return package.searchpath(name, native and package.cpath or package.path)
 end
 ]],"=compiler_bridge.cache_module_path",nil)()
-  local resolve = raw_resolve as (string,boolean) -> (string?,string?)
+  local resolve = raw_resolve as function (string,boolean): (string?,string?)
   local compiler_path?, compiler_error? = resolve(DRIVER_MODULE,false)
   local parser_path?, parser_error? = resolve("c-parser.cdriver",false)
   if compiler_path == nil or parser_path == nil then
-    return fail<string>(DRIVER_MODULE,"cannot identify compiler sources: " ..
+    return fail<|string|>(DRIVER_MODULE,"cannot identify compiler sources: " ..
       strings.tostring(compiler_error) .. strings.tostring(parser_error))
   end
   hash_compiler_tree(containing_directory(compiler_path),output,fingerprint)
@@ -4722,7 +4720,7 @@ end
   for index = 1, #dependencies do
     local path?, path_error? = resolve(dependencies[index],index > 2)
     if path == nil then
-      return fail<string>(DRIVER_MODULE,"cannot identify compiler dependency: " .. strings.tostring(path_error))
+      return fail<|string|>(DRIVER_MODULE,"cannot identify compiler dependency: " .. strings.tostring(path_error))
     end
     output:write(#path .. ":" .. path)
     output:write(fingerprint(path))
