@@ -276,9 +276,9 @@ Foreign types use a separate unqualified namespace: write `foreign int`,
 `foreign *Name`, or an always-local `foreign type Name = ...` declaration.
 They are not selected through the value binding `ffi`.
 
-Persisted compiler artifacts use `c-header-v5` and `ffi-conversion-v6` for
+Persisted compiler artifacts use `c-header-v6` and `ffi-conversion-v7` for
 extracted C definitions. Project entries retain declared member/type manifests,
-including trusted source visibility and generic schemes. SQLite schema 4 shares
+including trusted source visibility and generic schemes. SQLite schema 5 shares
 ordered header provenance across cache owners and stores fixed-size graph
 comparison hashes. Incompatible old publications are rebuilt.
 
@@ -501,10 +501,13 @@ available as `./?.lua` and `./?.so`; see [the Codex setup guide](docs/codex.md).
 
 ## Version 1 behavior
 
-Semantic requests use files saved on disk. Unsaved editor buffers are not
-silently compiled. Completion, foreign-definition navigation, navigation into
-external source modules, and watching external source trees are outside the
-first-version scope.
+Definition, references, hover, rename, folding and diagnostics use saved files.
+Post-V1 completion analyzes current editor text for the active logical module
+against a committed saved dependency baseline. Type `.` or `:`, or use the usual
+editor completion command, including after `foreign` in a type annotation.
+See [completion behavior and ownership](docs/completion.md) for supported contexts
+and limits. Foreign-definition navigation, external-source navigation and
+watching external source trees remain outside the first-version scope.
 
 Hover presents a named declaration signature, including parameter names, for
 functions, methods, associated functions, and supported foreign callables.

@@ -1,8 +1,8 @@
 # Incremental native builds
 
 The server and native test executable use [Titan PR #164](https://github.com/mascarenhas/titan/pull/164)'s
-opt-in object mode plus [the stacked cached-binding fix](https://github.com/mascarenhas/titan/pull/165), pinned in CI at
-`5e8194d282f9f3e98eec676b17064b43e1305d3d`.
+opt-in object mode plus [the cached-binding fix](https://github.com/mascarenhas/titan/pull/165).
+The exact compiler revision is pinned in [the CI workflow](../.github/workflows/ci.yml).
 Make owns the dependency graph and rebuild decisions; Titan restores source
 metadata from current objects while compiling dependents and linking.
 
@@ -46,6 +46,16 @@ produces the runner. The test graph follows Titan's stdlib test policy without
 so other stdlib imports use the corresponding DSO bindings. Production objects
 and test objects are not interchangeable.
 
+Lua derives default module paths from its executable's installation tree. Native
+test executables live under `.build/tests`, outside the SDK's `bin` directory.
+Both execution targets follow Titan's own test harness: query the selected
+`$(TITAN_LUA)` with `-E` for `package.path` and `package.cpath`, then pass those
+values as `LUA_PATH_5_5` and `LUA_CPATH_5_5` to the aggregate or its shards. The
+launcher clears ambient `TITAN_PATH_0_6` and `TITAN_PATH` so an unrelated provider
+cannot override the selected SDK. No SDK pathname is embedded in the executable
+or fabricated from its build directory. Use the Make targets to run the tests;
+direct execution outside the SDK tree needs the same queried Lua paths.
+
 ## Rebuild behavior
 
 An unchanged build preserves generated-object, header and executable timestamps.
@@ -88,5 +98,16 @@ remains split into the existing two shards, independently of object scheduling.
 Makefile in a private source/build tree. It checks unchanged timestamps and zero
 compiler invocations, importing-closure rebuilds, folder/import changes, header
 and flag invalidation, changed test discovery, and missing generated companions.
+It also runs the native tests with absent and unrelated ambient Titan paths to
+check that execution uses the selected SDK.
 The fixture uses matching `-O0 -fno-lto` compile/link overrides to keep this gate
 short. `make verify` also builds and tests the full server with shipping defaults.
+
+`make completion-protocol-test` exercises full document synchronization and
+completion through the actual stdio server, including unsaved folder members,
+saved dependency isolation, UTF-16 edits, and saved navigation. It reports cold
+preparation and warm SQL selection timings separately, using an 800-field dirty
+module and a competing saved refresh. This focused gate is also a prerequisite
+of `server-protocol-test`, so CI and `make verify` include it. Pass matching
+`BUILD_ROOT`, `SERVER`, and compiler flags when testing a separate development
+build.

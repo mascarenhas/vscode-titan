@@ -452,7 +452,9 @@ async function testLifecycle() {
         renameProvider: true,
         hoverProvider: true,
         foldingRangeProvider: true,
-        positionEncoding: "utf-16"
+        positionEncoding: "utf-16",
+        textDocumentSync: { openClose: true, change: 1, save: { includeText: false } },
+        completionProvider: { resolveProvider: false, triggerCharacters: [".", ":"] }
       }
     });
 
@@ -590,7 +592,8 @@ async function testSavedProjectSemantics() {
   const responses = new FrameReader(child.stdout);
   try {
     const initialized = await request(child, responses, 1, "initialize", {});
-    assert.equal(initialized.result.capabilities.completionProvider, undefined);
+    assert.deepEqual(initialized.result.capabilities.completionProvider,
+      { resolveProvider: false, triggerCharacters: [".", ":"] });
     child.stdin.write(frame({
       jsonrpc: "2.0",
       method: "initialized",
@@ -598,9 +601,9 @@ async function testSavedProjectSemantics() {
     }));
     await waitForIndexing(responses);
 
-    // V1 semantics are deliberately saved-file-only. Even if a client sends
-    // text synchronization notifications that the server does not advertise,
-    // their divergent in-memory text must not become compiler input. Keep the
+    // Navigation semantics remain saved-file-only. Text synchronization is
+    // advertised for completion, but divergent buffers must not change saved
+    // definition, references, hover, rename, or folding results. Keep the
     // buffer valid so a buffer-backed implementation cannot pass by falling
     // back to the last valid disk AST.
     const unsavedSource = [
@@ -751,7 +754,7 @@ async function testSavedProjectSemantics() {
       child,
       responses,
       "unsupported",
-      "textDocument/completion",
+      "textDocument/signatureHelp",
       documentPosition
     );
     assert.equal(unsupported.error.code, -32601);

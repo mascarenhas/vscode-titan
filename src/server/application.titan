@@ -5,6 +5,9 @@ local strings = import "string"
 local bridge = import "server.compiler_bridge"
 local diagnostics = import "server.diagnostics"
 local dispatcher = import "server.dispatcher"
+local coordinator = import "server.coordinator"
+local document_buffers = import "server.document_buffers"
+local completion_service = import "server.completion_service"
 local indexing_status = import "server.indexing_status"
 local wire = import "server.wire"
 local logging = import "server.logging"
@@ -107,6 +110,8 @@ record Application
   local const rename_analyzer: RenameAnalyzer
   local const diagnostic_publisher: diagnostics.Publisher
   local restoration: project_loader.Restoration?
+  local const buffers: document_buffers.BufferStore
+  local completion: completion_service.Service?
 end
 
 -- Source-imported application tests use these counters to assert coalescing and
@@ -1459,7 +1464,44 @@ function create(project_root: string, loader: ProjectLoader?,
     project_root, loader or project_loader.load, nil, nil, nil, nil, nil, nil,
     nil, 1, 0, nil, nil, false, 0, 0, 0, nil, false,
     new_directory_probes(), rename_analyzer or default_rename_analyzer,
-    diagnostics.create())
+    diagnostics.create(), nil, document_buffers.create(), nil)
+end
+
+function Application:on_document(notification: lsp.DocumentNotification)
+  if self.closed then return end
+  local path = ""
+  case notification
+  when opened(item) then path = item.document.path
+  when changed(item) then path = item.document.path
+  when closed(item) then path = item.path
+  when saved(item) then path = item.path
+  end
+  if not path_within(self.project_root, path) or not titan_source_path(path) then
+    return
+  end
+  -- This bookkeeping is synchronous, including before saved indexing starts.
+  -- Only completion consumes these bytes; didSave never publishes them.
+  if self.buffers:apply(notification) then
+    local completion? = self.completion
+    if completion ~= nil then completion:changed() end
+  end
+end
+
+local function unavailable_completion(): dispatcher.SemanticOutcome
+  return dispatcher.SemanticOutcome.result(
+    lsp.completion_list_value(lsp.CompletionList.new(true, {})))
+end
+
+function Application:capture_completion(request: dispatcher.CompletionRequest):
+    coordinator.CompletionWork
+  if self.closed or self.service == nil then return unavailable_completion end
+  if self.completion == nil then
+    self.completion = completion_service.create(
+      self.service:workspace_store(), self.buffers)
+  end
+  -- A completion request does not wait for saved indexing or compiler manifest
+  -- restoration. Its service captures the current committed SQL baseline.
+  return self.completion:capture(request)
 end
 
 -- Source-imported tests own preloaded Services. All construction still passes
@@ -1505,6 +1547,9 @@ end
 function Application:close()
   if self.closed then return end
   self.closed = true
+  local completion? = self.completion
+  self.completion = nil
+  if completion ~= nil then completion:close() end
   self.diagnostic_publisher:stop()
   self.indexing_listener = nil
   -- Stop accepting hints immediately. A reconciliation may already be inside

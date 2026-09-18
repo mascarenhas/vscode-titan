@@ -42,6 +42,8 @@ for required in \
   extension/dist/titan/share/lua/5.5/inspect.lua \
   extension/dist/titan/share/lua/5.5/relabel.lua \
   extension/dist/titan/share/lua/5.5/titan-compiler/driver.lua \
+  extension/dist/titan/share/lua/5.5/titan-compiler/completion.lua \
+  extension/dist/titan/share/lua/5.5/titan-compiler/checker/completion.lua \
   extension/dist/titan/share/lua/5.5/titan-compiler/version.lua \
   extension/dist/titan/lib/lua/5.5/lfs.so \
   extension/dist/titan/lib/lua/5.5/lpeglabel.so \

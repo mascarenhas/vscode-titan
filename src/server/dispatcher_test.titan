@@ -38,6 +38,61 @@ local function running_dispatcher(): dispatcher.Dispatcher
   return server
 end
 
+function test_dispatcher_routes_typed_document_notifications(_context: test.Context)
+  local server = running_dispatcher()
+  case server:route([[{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///workspace/main.titan","languageId":"titan","version":1,"text":"unsaved"}}}]])
+  when document(notification) then
+    case notification
+    when opened(item) then test.assert(item.version == 1 and item.text == "unsaved")
+    else test.assert(false, "didOpen had the wrong typed notification")
+    end
+  else test.assert(false, "didOpen was discarded")
+  end
+  case server:route([[{"jsonrpc":"2.0","method":"textDocument/didSave","params":{"textDocument":{"uri":"file:///workspace/main.titan"}}}]])
+  when document(notification) then
+    case notification
+    when saved(item) then test.assert(item.path == "/workspace/main.titan")
+    else test.assert(false, "didSave had the wrong typed notification")
+    end
+  else test.assert(false, "versionless didSave was discarded")
+  end
+  case server:route([[{"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":"file:///workspace/main.titan","version":2},"contentChanges":[{"text":"next"}]}}]])
+  when document(notification) then
+    case notification
+    when changed(item) then test.assert(item.version == 2 and item.text == "next")
+    else test.assert(false, "didChange had the wrong typed notification")
+    end
+  else test.assert(false, "didChange was discarded")
+  end
+  case server:route([[{"jsonrpc":"2.0","method":"textDocument/didClose","params":{"textDocument":{"uri":"file:///workspace/main.titan"}}}]])
+  when document(notification) then
+    case notification
+    when closed(item) then test.assert(item.path == "/workspace/main.titan")
+    else test.assert(false, "didClose had the wrong typed notification")
+    end
+  else test.assert(false, "didClose was discarded")
+  end
+end
+
+function test_dispatcher_validates_completion_and_drops_malformed_sync(_context: test.Context)
+  local server = running_dispatcher()
+  case server:route([[{"jsonrpc":"2.0","id":4,"method":"textDocument/completion","params":{"textDocument":{"uri":"file:///workspace/main.titan"},"position":{"line":0,"character":3},"context":{"triggerKind":2,"triggerCharacter":"."}}}]])
+  when completion(request) then
+    test.assert(request.id:to_json() == 4 and
+      request.params.document.position.character == 3 and
+      request.params.trigger_character == ".")
+  else test.assert(false, "completion did not route with typed params")
+  end
+  case server:route([[{"jsonrpc":"2.0","id":5,"method":"textDocument/completion","params":{}}]])
+  when immediate(result) then test.assert(response_error_code(result) == -32602)
+  else test.assert(false, "invalid completion escaped protocol validation")
+  end
+  case server:route([[{"jsonrpc":"2.0","method":"textDocument/didChange","params":{}}]])
+  when immediate(result) then test.assert(result.response == nil)
+  else test.assert(false, "malformed notification escaped validation")
+  end
+end
+
 local function assert_internal_error(object: wire.Object,
                                      id: dispatcher.RequestId)
   local failure? = wire.as_object(object["error"])

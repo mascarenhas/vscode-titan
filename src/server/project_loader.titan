@@ -6,6 +6,10 @@ local config = import "server.project_config"
 local service = import "server.project_service"
 local caches = import "server.workspace_cache"
 local logging = import "server.logging"
+local completion_store = import "server.completion_store"
+local completion_types = import "server.completion_types"
+local sql = import "server.workspace_store"
+local header_store = import "server.header_store"
 foreign import "compiler_io_clock.h"
 
 local function phase(name: string,cpu: float,wall: float)
@@ -23,6 +27,159 @@ local function project_inputs(snapshot: service.Snapshot): {bridge.ProjectModule
     projects[index] = module:compiler_input()
   end
   return projects
+end
+
+local record CompletionRevision
+  const name: string
+  const revision: integer
+  const state: integer
+end
+
+-- The updater prepares compiler facts without holding the connection lease,
+-- then publishes these descriptors with semantic_files in its one transaction.
+local function prepare_completion_descriptors(snapshot: service.Snapshot,
+    loaded: service.Service, compiler: bridge.Compiler, reusable: boolean):
+    ({completion_store.SavedDescriptor}, {string})
+  local changed: {CompletionRevision} = {}
+  local retained: {string} = {}
+  do
+    local access = loaded:workspace_store():acquire()
+    defer access:release()
+    local exists = sql.scalar_integer(access.connection,
+      "SELECT count(*) FROM main.sqlite_master WHERE type='table' AND name IN " ..
+      "('completion_descriptors','completion_source_files','completion_imports','completion_header_inputs','completion_members','completion_configuration','completion_roots')") == 7
+    local query = "SELECT name,revision,state,provenance FROM main.graph_modules ORDER BY name"
+    local rows = sql.rows(access.connection, query)
+    for index = 1, #rows do
+      local row = rows[index]
+      local name: string = row:get(1)
+      local revision: integer = row:get(2)
+      local state: integer = row:get(3)
+      retained[index] = name
+      local unchanged = false
+      if exists and row:get(4) == 0 then
+        unchanged = sql.scalar_integer(access.connection,
+          "SELECT count(*) FROM main.completion_descriptors WHERE module_name=? AND revision=? AND state=?",
+          sqlite3.Blob.new(name), revision, state) ~= 0
+      end
+      if not unchanged then
+        changed[#changed + 1] = CompletionRevision.new(name, revision, state)
+      end
+    end
+    -- Embedded catalog entries are not graph_modules. A warm startup must
+    -- retain their committed descriptors before the compiler graph hydrates.
+    if exists and reusable then
+      local catalog = sql.rows(access.connection,
+        "SELECT module_name FROM main.completion_descriptors AS c " ..
+        "WHERE c.provenance IN ('dynamic','static') AND NOT EXISTS(" ..
+        "SELECT 1 FROM main.graph_modules AS g WHERE g.name=CAST(c.module_name AS TEXT))")
+      for index = 1, #catalog do retained[#retained + 1] = sql.bytes(catalog[index], 1) end
+    end
+  end
+  local names: {string} = {}
+  for index = 1, #changed do names[index] = changed[index].name end
+  local exported = compiler:export_completion_facts(names)
+  local candidates: {string: {completion_types.Candidate}} = {}
+  for index = 1, #exported do
+    candidates[exported[index].module_name] = exported[index].candidates
+  end
+  local descriptors: {completion_store.SavedDescriptor} = {}
+  for index = 1, #changed do
+    local revision = changed[index]
+    local files: {string} = {}
+    local imports: {bridge.Import} = {}
+    local headers: {bridge.CHeaderDependency} = {}
+    local main_file = ""
+    local provenance = "project"
+    local public_interface = ""
+    local source_interface: string? = nil
+    for project_index = 1, #snapshot.project_modules do
+      local project = snapshot.project_modules[project_index]
+      if project.module_name == revision.name then
+        for file_index = 1, #project.source_files do
+          files[file_index] = project.source_files[file_index].filename
+        end
+        if #files > 0 then main_file = files[1] end
+        if project.compiler_snapshot ~= nil then
+          imports = project.compiler_snapshot.imports
+          headers = project.compiler_snapshot.c_header_dependencies
+          if project.compiler_snapshot.manifest ~= nil then
+            public_interface = project.compiler_snapshot.manifest.serialized
+            source_interface = project.compiler_snapshot.manifest.source_serialized
+          end
+        else
+          -- Failed or unchanged body-free projects may have no live snapshot.
+          -- Header provenance belongs to the accepted graph revision, not RAM.
+          local access = loaded:workspace_store():acquire()
+          defer access:release()
+          local saved_headers? = header_store.read(access.connection, 0, revision.name)
+          if saved_headers ~= nil then headers = saved_headers end
+        end
+      end
+    end
+    for external_index = 1, #snapshot.external_modules do
+      local external = snapshot.external_modules[external_index]
+      if external.module_name == revision.name then
+        imports = external.compiler_imports
+        headers = external.c_header_dependencies
+        public_interface = external.manifest.public_digest
+        source_interface = external.manifest.source_digest
+        case external.origin
+        when source(source) then
+          provenance = "external"
+          main_file = source.main_file
+          files = source.source_files
+        when dynamic_binary(binary) then
+          provenance = "dynamic"
+          main_file = binary.provider_file
+        when static_binary(binary) then
+          provenance = "static"
+          main_file = binary.provider_file
+        end
+      end
+    end
+    local members: {completion_types.Candidate} = {}
+    local selected_members? = candidates[revision.name]
+    if selected_members ~= nil then members = selected_members end
+    local payload: string? = nil
+    local descriptor = completion_store.SavedDescriptor.new(
+      revision.name, revision.revision, revision.state, provenance, main_file, nil,
+      public_interface, source_interface, files, imports, headers, members)
+    local unchanged = false
+    if provenance ~= "project" then
+      local access = loaded:workspace_store():acquire()
+      defer access:release()
+      if sql.scalar_integer(access.connection,
+          "SELECT count(*) FROM main.sqlite_master WHERE type='table' AND name IN " ..
+          "('completion_descriptors','completion_source_files','completion_imports','completion_header_inputs','completion_members','completion_configuration','completion_roots')") == 7 then
+        unchanged = completion_store.descriptor_matches(access.connection, descriptor)
+      end
+    end
+    if not unchanged then
+      if provenance == "external" then
+        payload = compiler:external_completion_payload(revision.name,
+          public_interface, source_interface, main_file, files, headers)
+      end
+      descriptors[#descriptors + 1] = completion_store.SavedDescriptor.new(
+        revision.name, revision.revision, revision.state, provenance, main_file, payload,
+        public_interface, source_interface, files, imports, headers, members)
+    end
+  end
+  local binaries = compiler:completion_binary_catalog()
+  for index = 1, #binaries do
+    local binary = binaries[index]
+    local found = false
+    for retained_index = 1, #retained do
+      if retained[retained_index] == binary.module_name then found = true end
+    end
+    if not found then
+      retained[#retained + 1] = binary.module_name
+      descriptors[#descriptors + 1] = completion_store.SavedDescriptor.new(
+        binary.module_name, 0, 2, binary.kind, binary.filename, nil,
+        binary.serialized, nil, {}, {}, {}, {})
+    end
+  end
+  return descriptors, retained
 end
 
 local function analysis_header_inputs(request: service.AnalysisRequest):
@@ -248,6 +405,11 @@ local function load_or_raise(project_root: string,
   local unpublished = cache:unpublished_projects()
   for index = 1, #unpublished do loaded:invalidate_cached_project(unpublished[index]) end
   restoring = project_restoration(compiler,loaded,cache)
+  local completion_descriptors: {completion_store.SavedDescriptor} = {}
+  local completion_modules: {string} = {}
+  local completion_configuration = bridge.CompilerConfiguration.new()
+  local completion_include: {string} = {}
+  local completion_exclude: {string} = {}
   loaded:set_publication_hooks(service.PublicationHooks.new(
     function (snapshot: service.Snapshot): boolean
       local next_configuration = snapshot.config:semantic_identity()
@@ -270,10 +432,27 @@ local function load_or_raise(project_root: string,
           cache:set_projects(compiler:export_projects(project_inputs(snapshot),selected))
         end
       end
+      completion_descriptors, completion_modules =
+        prepare_completion_descriptors(snapshot, loaded, compiler, reusable)
+      completion_configuration = bridge.CompilerConfiguration.new {
+        source_roots = snapshot.config.source_module_roots,
+        binary_root = snapshot.config.binary_modules_root,
+        include_roots = snapshot.config.extra_ffi_include_dirs,
+        cppflags = snapshot.config.extra_ffi_cppflags,
+      }
+      completion_include = snapshot.config.include
+      completion_exclude = snapshot.config.exclude
       return reusable
     end,
-    function (connection: sqlite3.Connection) cache:publish(connection) end,
-    function () cache:publication_committed() end))
+    function (connection: sqlite3.Connection)
+      cache:publish(connection)
+      completion_store.publish_saved(connection, completion_descriptors,
+        completion_modules, completion_configuration, completion_include, completion_exclude)
+    end,
+    function ()
+      cache:publication_committed()
+      compiler:release_completion_exports()
+    end))
   local report?, refresh_error? = loaded:run_pending(snapshot_listener)
   if report == nil then return nil,refresh_error,nil end
   if not cache:can_reuse_publication() then

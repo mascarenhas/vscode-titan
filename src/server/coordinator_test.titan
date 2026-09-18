@@ -6,6 +6,8 @@ local dispatcher = import "server.dispatcher"
 local wire = import "server.wire"
 local response_queue = import "server.response_queue"
 local test_runtime = import "server.test_runtime"
+local lsp = import "server.lsp_types"
+local buffers = import "server.document_buffers"
 
 local function response_object(source: string): wire.Object
   local parsed = wire.decode(source)
@@ -153,6 +155,77 @@ end
 function test_coordinator_cancels_and_joins_one_request(
     _context: test.Context)
   test_runtime.run(cancels_and_joins_one_request)
+end
+
+local function captures_completion_before_later_notifications()
+  local output = response_queue.create()
+  local store = buffers.create()
+  local server = coordinator.create(output)
+  defer server:cancel_all("captured completion cleanup")
+  local captured_version = -1
+  local started = false
+  server:configure_completion(
+    function (notification: lsp.DocumentNotification)
+      store:apply(notification)
+    end,
+    function (request: dispatcher.CompletionRequest): coordinator.CompletionWork
+      local captured? = store:capture(request.params.document.path,
+        request.params.document.position)
+      captured_version = captured.document.version
+      return function (): dispatcher.SemanticOutcome
+        started = true
+        local result: wire.Object = {
+          ["text"] = captured.document.text,
+          ["current"] = store:current(captured),
+        }
+        return dispatcher.SemanticOutcome.result(result)
+      end
+    end)
+  initialize(server, output)
+  server:handle([[{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///workspace/main.titan","languageId":"titan","version":1,"text":"before"}}}]])
+  server:handle([[{"jsonrpc":"2.0","id":30,"method":"textDocument/completion","params":{"textDocument":{"uri":"file:///workspace/main.titan"},"position":{"line":0,"character":3}}}]])
+  test.assert(captured_version == 1 and not started,
+    "completion capture was deferred until request Task execution")
+  server:handle([[{"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":"file:///workspace/main.titan","version":2},"contentChanges":[{"text":"after"}]}}]])
+  while server:active_count() > 0 do timer.yield() end
+  local response = response_object(output:take())
+  local result? = wire.as_object(response["result"])
+  test.assert(wire.as_string(result["text"]) == "before" and
+    wire.as_boolean(result["current"]) == false,
+    "later editor text was paired with the earlier completion caret")
+  test.assert(output:pending() == 0)
+end
+
+function test_coordinator_captures_completion_before_later_notifications(
+    _context: test.Context)
+  test_runtime.run(captures_completion_before_later_notifications)
+end
+
+local function cancels_completion_before_work_starts()
+  local output = response_queue.create()
+  local server = coordinator.create(output)
+  defer server:cancel_all("ready completion cancellation cleanup")
+  local started = false
+  server:configure_completion(
+    function (_notification: lsp.DocumentNotification) end,
+    function (_request: dispatcher.CompletionRequest): coordinator.CompletionWork
+      return function (): dispatcher.SemanticOutcome
+        started = true
+        return dispatcher.SemanticOutcome.result(wire.null())
+      end
+    end)
+  initialize(server, output)
+  server:handle([[{"jsonrpc":"2.0","id":"cancel-completion","method":"textDocument/completion","params":{"textDocument":{"uri":"file:///workspace/main.titan"},"position":{"line":0,"character":0}}}]])
+  server:handle([[{"jsonrpc":"2.0","method":"$/cancelRequest","params":{"id":"cancel-completion"}}]])
+  test.assert(not started and server:active_count() == 0,
+    "cancelled ready completion entered preparation")
+  test.assert(error_code(output:take()) == -32800)
+  server:handle([[{"jsonrpc":"2.0","method":"$/cancelRequest","params":{"id":"cancel-completion"}}]])
+  test.assert(output:pending() == 0, "cancellation emitted duplicate responses")
+end
+
+function test_coordinator_cancels_completion_before_work_starts(_context: test.Context)
+  test_runtime.run(cancels_completion_before_work_starts)
 end
 
 local function shutdown_cancels_all_before_reply()

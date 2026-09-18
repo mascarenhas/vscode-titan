@@ -13,12 +13,12 @@ const repository = fileURLToPath(new URL("..", import.meta.url));
 export const serverTestShards = [
   [
     "compiler_bridge_test", "compiler_bridge_concurrency_test", "compiler_io_test",
-    "diagnostics_test", "dispatcher_test", "embedded_interfaces_test",
+    "completion_discovery_test", "diagnostics_test", "dispatcher_test", "document_buffers_test", "embedded_interfaces_test",
     "framing_test", "header_store_test", "indexing_status_test", "lifecycle_test",
     "logging_test", "lsp_types_test", "lua_paths_test", "protocol_test", "wire_test"
   ],
   [
-    "application_test", "compiler_scheduler_test", "coordinator_test",
+    "application_test", "compiler_scheduler_test", "completion_service_test", "completion_store_test", "coordinator_test",
     "project_config_test", "project_discovery_test", "project_graph_test",
     "project_metadata_test", "project_service_test", "project_watcher_test",
     "semantic_features_test", "semantic_index_test", "source_text_test",

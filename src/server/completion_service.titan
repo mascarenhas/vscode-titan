@@ -1,0 +1,492 @@
+local async = import "async"
+local timer = import "timer"
+local strings = import "string"
+local bridge = import "server.compiler_bridge"
+local buffers = import "server.document_buffers"
+local discovery = import "server.completion_discovery"
+local facts = import "server.completion_types"
+local storage = import "server.completion_store"
+local sql = import "server.workspace_store"
+local source_text = import "server.source_text"
+local lsp = import "server.lsp_types"
+local dispatcher = import "server.dispatcher"
+local coordinator = import "server.coordinator"
+local logging = import "server.logging"
+foreign import "compiler_io_clock.h"
+
+local record Request
+  const capture: buffers.Capture
+  const generation: integer
+  baseline: storage.Baseline?
+  module_name: string
+  const key: string
+  const sequence: integer
+end
+
+local record Prepared
+  const snapshot: facts.Snapshot
+  const range: source_text.Span
+  const volatile_headers: {bridge.CHeaderDependency}
+end
+
+local record Ready
+  const id: string
+  const key: string
+  const prefix: string
+  const range: source_text.Span
+  const volatile_headers: {bridge.CHeaderDependency}
+  const validated_through: integer
+  const filename: string
+  const session: integer
+  const anchor: string
+end
+
+record Service
+  local const store: storage.Store
+  local const buffers: buffers.BufferStore
+  local pending: Request?
+  local active: Request?
+  local preparation: async.Task<|Prepared?, value|>?
+  local worker: async.Task<|nil, value|>?
+  local ready: Ready?
+  local closed: boolean
+  local sync_needed: boolean
+  local baseline: storage.Baseline?
+  local requests: integer
+  local previous_ready: Ready?
+end
+
+local function empty(): dispatcher.SemanticOutcome
+  return dispatcher.SemanticOutcome.result(lsp.completion_list_value(
+    lsp.CompletionList.new(true, {})))
+end
+
+function create(store: sql.Store, documents: buffers.BufferStore): Service
+  return Service.new(storage.open(store), documents, nil, nil, nil, nil, nil, false, false, nil, 0, nil)
+end
+
+local function open_paths(capture: buffers.Capture): {string}
+  local paths: {string} = {}
+  for index = 1, #capture.inputs do paths[#paths + 1] = capture.inputs[index].path end
+  for index = 1, #capture.unavailable_paths do
+    paths[#paths + 1] = capture.unavailable_paths[index]
+  end
+  return paths
+end
+
+local function module_for(path: string, baseline: storage.Baseline,
+                           paths: const {string}): string?
+  local roots: {string} = {}
+  if baseline.configuration.source_roots ~= nil then roots = baseline.configuration.source_roots end
+  local name? = discovery.find(path, baseline.projects, roots,
+    baseline.include, baseline.exclude, paths)
+  if name == nil then return nil end
+  for index = 1, #baseline.modules do
+    local module = baseline.modules[index]
+    if module.module_name == name and module.provenance ~= "project" then return nil end
+  end
+  return name
+end
+
+local function sort_files(files: {bridge.SourceFile}, main_file: string)
+  for index = 2, #files do
+    local item = files[index]
+    local previous = index - 1
+    while previous >= 1 and files[previous].filename ~= main_file and
+        (item.filename == main_file or item.filename < files[previous].filename) do
+      files[previous + 1] = files[previous]
+      previous = previous - 1
+    end
+    files[previous + 1] = item
+  end
+end
+
+local function active_module(request: Request): (bridge.ProjectModule?, {facts.Input})
+  local files: {bridge.SourceFile} = {}
+  local inputs: {facts.Input} = {}
+  local indexes: {string: integer} = {}
+  local main_file = ""
+  local paths = open_paths(request.capture)
+  for index = 1, #request.baseline.projects do
+    local project = request.baseline.projects[index]
+    if project.module_name == request.module_name then
+      for file_index = 1, #project.files do
+        local file = project.files[file_index]
+        files[#files + 1] = bridge.SourceFile.new(file.filename, file.contents)
+        indexes[file.filename] = #files
+        inputs[#inputs + 1] = facts.Input.new(file.filename, 0, 0, file.contents)
+      end
+      if #files > 0 then main_file = files[1].filename end
+    end
+  end
+  for index = 1, #request.capture.unavailable_paths do
+    if module_for(request.capture.unavailable_paths[index], request.baseline, paths) ==
+        request.module_name then return nil, {} end
+  end
+  for index = 1, #request.capture.inputs do
+    local input = request.capture.inputs[index]
+    if module_for(input.path, request.baseline, paths) == request.module_name then
+      local ordinal? = indexes[input.path]
+      if ordinal == nil then ordinal = #files + 1 end
+      files[ordinal] = bridge.SourceFile.new(input.path, input.text)
+      inputs[ordinal] = facts.Input.new(input.path, input.session, input.version, input.text)
+      indexes[input.path] = ordinal
+    end
+  end
+  if #files == 0 then return nil, {} end
+  if main_file == "" then
+    -- A folder's final name identifies its main file. Discovery has already
+    -- verified that the virtual resolver selects this exact provider.
+    local leaf = request.module_name
+    for index = 1, #leaf do
+      if strings.sub(request.module_name, index, index) == "." then
+        leaf = strings.sub(request.module_name, index + 1)
+      end
+    end
+    for index = 1, #files do
+      local file = files[index].filename
+      if strings.sub(file, -(#leaf + 6)) == "/" .. leaf .. ".titan" then main_file = file end
+    end
+    if main_file == "" then main_file = request.capture.document.path end
+  end
+  sort_files(files, main_file)
+  return bridge.ProjectModule.new(request.module_name, files), inputs
+end
+
+local function import_candidates(baseline: storage.Baseline): {facts.Candidate}
+  local result: {facts.Candidate} = {}
+  for index = 1, #baseline.modules do
+    local item = baseline.modules[index]
+    result[#result + 1] = facts.Candidate.new(item.module_name, "module", item.module_name,
+      9, "Titan module", "", 0, 0, index, true, "public", "", "import")
+  end
+  return result
+end
+
+local function header_kind(kind: bridge.CHeaderDependencyKind): integer
+  case kind
+  when file() then return 0
+  when search() then return 1
+  end
+end
+
+local function Service:prepare(request: Request): Prepared?
+  local started = logging.clock()
+  local wall = ffi.vscode_titan_monotonic_ms()
+  defer do
+    logging.emit("debug", "completion.prepare", {
+      ["cpu_ms"] = logging.elapsed_ms(started),
+      ["wall_ms"] = ffi.vscode_titan_monotonic_ms() - wall,
+      ["module"] = request.module_name, ["saved_generation"] = request.generation,
+    })
+  end
+  if self.baseline == nil or self.baseline.generation ~= request.generation then
+    local baseline? = self.store:capture_baseline()
+    if baseline == nil or baseline.generation ~= request.generation then return nil end
+    self.baseline = baseline
+  end
+  request.baseline = self.baseline
+  local reusable? = self.ready
+  if reusable ~= nil and reusable.key == request.key and #reusable.volatile_headers > 0 then
+    local validator = bridge.load()
+    validator:configure(request.baseline.configuration)
+    local _, changed = validator:restat_c_header_dependencies(reusable.volatile_headers)
+    if not changed and self.buffers:current(request.capture) and
+        self.store:current_generation(request.generation) then
+      self.ready = Ready.new(reusable.id, reusable.key, reusable.prefix, reusable.range,
+        reusable.volatile_headers, self.requests, reusable.filename, reusable.session, reusable.anchor)
+      return nil
+    end
+    self.previous_ready = reusable
+    self.ready = nil
+  end
+  local module_name? = module_for(request.capture.document.path, request.baseline, open_paths(request.capture))
+  if module_name == nil then return nil end
+  request.module_name = module_name
+  local capture = request.capture
+  local coordinates = source_text.coordinate_index(capture.document.text)
+  local caret? = coordinates:offset_for_position(capture.position)
+  if caret == nil then return nil end
+  local hole? = bridge.prepare_completion(capture.document.path, capture.document.text, caret)
+  if hole == nil then return nil end
+  local range? = coordinates:span_for_offsets(hole.replace_start, hole.replace_finish)
+  if range == nil then return nil end
+  local active?, inputs = active_module(request)
+  if active == nil then return nil end
+  for index = 1, #active.files do
+    if active.files[index].filename == capture.document.path then
+      active.files[index] = bridge.SourceFile.new(capture.document.path, hole.contents)
+    end
+  end
+  local result = bridge.CompletionAnalysis.new("complete", hole.kind, {}, {})
+  local volatile_headers: {bridge.CHeaderDependency} = {}
+  if hole.kind == "import" then
+    result = bridge.CompletionAnalysis.new("complete", "import", import_candidates(request.baseline), {})
+  else
+    local compiler = bridge.load()
+    compiler:configure(request.baseline.configuration)
+    -- Writes are intentionally private and disposable. Persisted C entries
+    -- are read only from this saved generation; pending watcher caches never
+    -- enter an unsaved analysis and native probe persistence is disabled.
+    compiler:configure_cache(
+      function (kind: string, key: string): (string?, {bridge.CHeaderDependency}?)
+        return self.store:read_saved_cache(request.baseline.generation, kind, key)
+      end,
+      function (_kind: string, _key: string, _payload: string, _inputs: {bridge.CHeaderDependency}) end,
+      function (_kind: string, _key: string, _inputs: {bridge.CHeaderDependency}): boolean return false end)
+    local restoration: {bridge.ProjectModule} = {}
+    local payloads: {bridge.ProjectPayload} = {}
+    local projects: {bridge.ProjectModule} = {active}
+    local binaries: {bridge.CompletionBinary} = {}
+    local captured_headers: {bridge.CHeaderDependency} = {}
+    local dependencies? = bridge.completion_dependencies(active)
+    if dependencies == nil then return nil end
+    local needed: {string: boolean} = {}
+    for index = 1, #dependencies do needed[dependencies[index]] = true end
+    local expanded = true
+    while expanded do
+      expanded = false
+      for index = 1, #request.baseline.modules do
+        local module = request.baseline.modules[index]
+        if needed[module.module_name] then
+          for import_index = 1, #module.imports do
+            local dependency = module.imports[import_index].module_name
+            if not needed[dependency] then needed[dependency] = true; expanded = true end
+          end
+        end
+      end
+    end
+    local bytes = 0
+    for index = 1, #request.baseline.modules do
+      local module = request.baseline.modules[index]
+      if module.module_name ~= request.module_name then
+        if module.provenance == "project" or module.provenance == "external" then
+          if needed[module.module_name] then
+          local payload? = self.store:read_descriptor(request.baseline.generation, module.module_name)
+          if payload ~= nil then
+            if payload.header_inputs ~= nil then
+              for header_index = 1, #payload.header_inputs do
+                captured_headers[#captured_headers + 1] = payload.header_inputs[header_index]
+              end
+            end
+            bytes = bytes + #payload.payload
+            if bytes > 64 * 1024 * 1024 then return nil end
+            local files: {bridge.SourceFile} = {}
+            for file_index = 1, #module.source_files do
+              files[file_index] = bridge.SourceFile.new(module.source_files[file_index], "")
+            end
+            if #files > 0 then
+              restoration[#restoration + 1] = bridge.ProjectModule.new(module.module_name, files)
+              payloads[#payloads + 1] = payload
+            end
+          end
+          end
+        elseif module.public_interface ~= "" then
+          binaries[#binaries + 1] = bridge.CompletionBinary.new(module.module_name,
+            module.public_interface, module.provenance, module.main_file)
+        end
+      end
+    end
+    for index = 1, #request.baseline.projects do
+      local project = request.baseline.projects[index]
+      if project.module_name ~= request.module_name then projects[#projects + 1] = project end
+    end
+    compiler:restore_projects(restoration, payloads)
+    local headers? = self.store:read_header_inputs(request.baseline.generation, request.module_name)
+    if headers == nil then return nil end
+    for index = 1, #headers do captured_headers[#captured_headers + 1] = headers[index] end
+    local _, changed = compiler:restat_c_header_dependencies(captured_headers)
+    if changed then return nil end
+    result = compiler:analyze_completion(request.module_name, projects, {}, hole, headers, binaries)
+    if result.observed_headers ~= nil then
+      for index = 1, #result.observed_headers do
+        local observed = result.observed_headers[index]
+        local captured = false
+        for saved_index = 1, #captured_headers do
+          local saved = captured_headers[saved_index]
+          if header_kind(saved.kind) == header_kind(observed.kind) and saved.path == observed.path then
+            captured = true
+            if saved.identity ~= observed.identity then return nil end
+          end
+        end
+        -- Unsaved code may introduce a new explicit header. It is not part of
+        -- the saved watch inventory yet, so later requests must prepare again.
+        if not captured then volatile_headers[#volatile_headers + 1] = observed end
+      end
+      local _, changed_observed = compiler:restat_c_header_dependencies(result.observed_headers)
+      if changed_observed then return nil end
+    end
+    local _, changed_after = compiler:restat_c_header_dependencies(captured_headers)
+    if changed_after then return nil end
+  end
+  if not self.buffers:current(capture) then return nil end
+  return Prepared.new(facts.Snapshot.new(request.key, request.module_name,
+    request.baseline.generation, capture.epoch, request.key, capture.document.path,
+    capture.document.session, capture.document.version, caret,
+    hole.replace_start, hole.replace_finish, hole.prefix, result.quality,
+    inputs, result.scopes, result.candidates), range, volatile_headers)
+end
+
+local function Service:run(): nil
+  while (self.pending ~= nil or self.sync_needed) and not self.closed do
+    if self.sync_needed then
+      self.sync_needed = false
+      local epoch = self.buffers:epoch()
+      local inputs = self.buffers:inputs()
+      local documents: {facts.OpenDocument} = {}
+      for index = 1, #inputs do
+        local input = inputs[index]
+        documents[index] = facts.OpenDocument.new(input.uri, input.path, "",
+          input.session, input.version, input.text)
+      end
+      self.store:sync_documents(documents, epoch,
+        function (): boolean return not self.closed and self.buffers:epoch() == epoch end)
+    end
+    if self.pending ~= nil then
+    local request = self.pending as Request
+    self.pending = nil
+    self.active = request
+    do
+      local paths = open_paths(request.capture)
+      local documents: {facts.OpenDocument} = {}
+      for index = 1, #request.capture.inputs do
+        local input = request.capture.inputs[index]
+        documents[index] = facts.OpenDocument.new(input.uri, input.path,
+          "", input.session, input.version, input.text)
+      end
+      local current = function (): boolean
+        return not self.closed and self.buffers:current(request.capture)
+      end
+      if self.store:sync_documents(documents, request.capture.epoch, current) then
+        local task = async.run<|Prepared?, value|>(function (): Prepared? return self:prepare(request) end)
+        self.preparation = task
+        case async.join(task)
+        when succeeded(prepared) then
+          if prepared ~= nil and current() and self.store:publish(prepared.snapshot, current) then
+            self.ready = Ready.new(prepared.snapshot.id, request.key,
+              prepared.snapshot.prefix, prepared.range, prepared.volatile_headers, self.requests,
+              request.capture.document.path, request.capture.document.session,
+              strings.sub(request.capture.document.text, 1, prepared.snapshot.replace_start))
+            self.previous_ready = self.ready
+          end
+        when failed(failure) then
+          logging.emit("debug", "completion.prepare.failure", {["message"] = strings.tostring(failure.error)})
+        when cancelled() then
+          self.ready = nil
+        else
+          raise "completion join returned running task"
+        end
+        self.preparation = nil
+      end
+    catch
+      if error is async.CancellationReason then raise end
+      logging.emit("debug", "completion.failure", {["message"] = strings.tostring(error)})
+    end
+    self.active = nil
+    end
+  end
+  return nil
+end
+
+function Service:changed()
+  if self.ready ~= nil then self.previous_ready = self.ready end
+  self.ready = nil
+  self.pending = nil
+  local task? = self.preparation
+  if task ~= nil and not task:status():has_finished() then
+    task:cancel(async.CancellationReason.simple("completion inputs changed"))
+  end
+  self.sync_needed = true
+  if not self.closed and (self.worker == nil or self.worker:status():has_finished()) then
+    self.worker = async.run<|nil, value|>(function (): nil return self:run() end)
+  end
+end
+
+local function Ready:valid_for(request: Request): boolean
+  return self.key == request.key and
+    (#self.volatile_headers == 0 or self.validated_through >= request.sequence)
+end
+
+local function encode(selected: facts.Selection, range: source_text.Span): dispatcher.SemanticOutcome
+  local items: {lsp.CompletionItem} = {}
+  for index = 1, #selected.candidates do
+    local candidate = selected.candidates[index]
+    items[index] = lsp.CompletionItem.new(candidate.label, candidate.kind, candidate.detail,
+      strings.format("%04d", index), candidate.label, lsp.TextEdit.new(range, candidate.label))
+  end
+  return dispatcher.SemanticOutcome.result(lsp.completion_list_value(
+    lsp.CompletionList.new(selected.is_incomplete, items)))
+end
+
+local function Service:provisional(request: Request): dispatcher.SemanticOutcome?
+  local ready?: Ready = self.ready
+  if ready == nil then ready = self.previous_ready end
+  if ready == nil or ready.filename ~= request.capture.document.path or
+      ready.session ~= request.capture.document.session then return nil end
+  local span? = buffers.identifier_span(request.capture)
+  if span == nil or strings.sub(request.capture.document.text, 1, span.bytes.start) ~= ready.anchor then
+    return nil
+  end
+  local selected? = self.store:select_provisional(ready.id, ready.filename, ready.session,
+    span.prefix, 200, function (): boolean
+      return not self.closed and self.buffers:current(request.capture)
+    end)
+  if selected == nil then return nil end
+  logging.emit("debug", "completion.provisional", {["items"] = #selected.candidates})
+  return encode(selected, span.range)
+end
+
+local function Service:answer(request: Request): dispatcher.SemanticOutcome
+  if self.closed or not self.buffers:current(request.capture) then return empty() end
+  if self.ready == nil or not self.ready:valid_for(request) then
+    if self.active == nil or self.active.key ~= request.key then self.pending = request end
+    if self.worker == nil or self.worker:status():has_finished() then
+      self.worker = async.run<|nil, value|>(function (): nil return self:run() end)
+    end
+    local provisional? = self:provisional(request)
+    if provisional ~= nil then return provisional end
+    -- The request owns no compiler task or scheduler permit. A held hydration
+    -- permit therefore yields a bounded, truthful retryable response.
+    for attempt = 1, 15 do
+      if self.ready ~= nil and self.ready:valid_for(request) then break end
+      if not self.buffers:current(request.capture) then return empty() end
+      if self.worker:status():has_finished() then break end
+      timer.sleep(10)
+    end
+  end
+  local ready? = self.ready
+  if ready == nil or not ready:valid_for(request) then return empty() end
+  local started = logging.clock()
+  local wall = ffi.vscode_titan_monotonic_ms()
+  local selected? = self.store:select(ready.id, ready.key, ready.prefix, 200,
+    function (): boolean return not self.closed and self.buffers:current(request.capture) end)
+  logging.emit("debug", "completion.select", {
+    ["cpu_ms"] = logging.elapsed_ms(started),
+    ["wall_ms"] = ffi.vscode_titan_monotonic_ms() - wall,
+  })
+  if selected == nil then return empty() end
+  return encode(selected, ready.range)
+end
+
+-- Called by the coordinator before its deferred request Task is created.
+-- Both editor inputs and saved rows are captured here, never sampled later.
+function Service:capture(request: dispatcher.CompletionRequest): coordinator.CompletionWork
+  local capture? = self.buffers:capture(request.params.document.path,
+    request.params.document.position)
+  if capture == nil or self.closed then return empty end
+  local generation = self.store:saved_generation()
+  if generation <= 0 then return empty end
+  local key = generation .. ":" .. capture.epoch .. ":" .. capture.document.session ..
+    ":" .. capture.document.version .. ":" .. capture.position.line .. ":" .. capture.position.character
+  self.requests = self.requests + 1
+  local captured = Request.new(capture, generation, nil, "", key, self.requests)
+  return function (): dispatcher.SemanticOutcome return self:answer(captured) end
+end
+
+function Service:close()
+  if self.closed then return end
+  self.closed = true
+  self:changed()
+  if self.worker ~= nil then async.join(self.worker) end
+  self.store:close()
+end

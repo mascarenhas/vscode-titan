@@ -6,6 +6,10 @@ Scope authority: [Titan issue #91](https://github.com/mascarenhas/titan/issues/9
 
 Work board: [Titan VSCode Extension project #2](https://github.com/users/mascarenhas/projects/2)
 
+> Post-V1 amendment: issue #50 adds unsaved completion only. Its authority is
+> [unsaved-completion.md](unsaved-completion.md); historical V1 exclusions below
+> remain the original milestone, not a prohibition on this approved extension.
+
 ## Objective
 
 Deliver a VS Code extension with Titan syntax highlighting and a reusable,
@@ -72,10 +76,10 @@ The Makefile owns the cross-language build:
    Titan-provider preference, and the complete metadata-only standard-interface
    inventory;
 2. compile/bundle the extension and run its JavaScript tests;
-3. assemble a platform-specific VSIX containing the native executable plus
-   exactly the private `dist/titan/share/lua/5.5` and
-   `dist/titan/lib/lua/5.5` trees, with no `lib/titan` tree, Titan provider
-   archive, Titan headers, or additional native SDK payload;
+3. assemble a platform-specific VSIX containing the native executable, private
+   `dist/titan/share/lua/5.5` and `dist/titan/lib/lua/5.5` trees, and the reviewed
+   SDK inventory under `dist/titan/include` and `dist/titan/src`; exclude the
+   `lib/titan` provider tree and Titan provider archive;
 4. provide focused and complete test targets.
 
 Initialized statically selected Titan runtime modules register their openers in
@@ -333,10 +337,11 @@ has evidence before moving to Done.
 ## Review checklist
 
 - No compiler Lua modules claimed to be embedded in the executable.
-- VSIX compiler artifacts are confined to `dist/titan/share/lua/5.5` and
-  `dist/titan/lib/lua/5.5`.
-- No `lib/titan` tree, Titan provider/archive, Titan headers, or additional
-  native SDK payload in the VSIX.
+- VSIX compiler modules use `dist/titan/share/lua/5.5` and
+  `dist/titan/lib/lua/5.5`; reviewed SDK headers and Lua sources use
+  `dist/titan/include` and `dist/titan/src`. Keep their exact staging inventory
+  and package checks aligned.
+- No `lib/titan` provider tree or Titan provider/archive in the VSIX.
 - Initialized statically linked standard modules use `package.preload`; the
   complete 21-entry embedded inventory is validated metadata-only analysis
   input, not runtime code or a linkable provider.

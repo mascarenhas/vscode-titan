@@ -31,7 +31,7 @@ function test_lifecycle_completes_initialize_shutdown_exit(
                 wire.as_boolean(capabilities["foldingRangeProvider"]),
                 "initialize omitted a supported semantic capability")
     test.assert(capabilities["completionProvider"] == nil,
-                "initialize advertised out-of-scope completion")
+                "initialize advertised completion without a configured handler")
   else
     test.assert(false, "initialize did not produce a result")
   end
@@ -69,6 +69,31 @@ function test_lifecycle_completes_initialize_shutdown_exit(
   end
   test.assert(server:phase_name() == "exited",
               "exit did not enter the exited phase")
+end
+
+function test_lifecycle_advertises_configured_full_sync_completion(_context: test.Context)
+  local server = lifecycle.create()
+  server:enable_completion()
+  local empty: wire.Object = {}
+  case server:dispatch("initialize", true, empty)
+  when result(result) then
+    local object? = wire.as_object(result)
+    local capabilities? = wire.as_object(object["capabilities"])
+    local synchronization? = wire.as_object(capabilities["textDocumentSync"])
+    local save? = wire.as_object(synchronization["save"])
+    local completion? = wire.as_object(capabilities["completionProvider"])
+    local triggers? = wire.as_array(completion["triggerCharacters"])
+    test.assert(wire.as_boolean(synchronization["openClose"]) == true and
+      wire.as_integer(synchronization["change"]) == 1 and
+      wire.as_boolean(save["includeText"]) == false,
+      "configured completion did not advertise full document synchronization")
+    test.assert(wire.as_boolean(completion["resolveProvider"]) == false and
+      #triggers == 2 and wire.as_string(triggers[1]) == "." and
+      wire.as_string(triggers[2]) == ":",
+      "completion advertised an unsupported trigger or resolve endpoint")
+  else
+    test.assert(false, "initialize failed with completion configured")
+  end
 end
 
 function test_lifecycle_enforces_order_and_message_kinds(

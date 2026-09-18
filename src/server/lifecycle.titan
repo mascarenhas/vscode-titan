@@ -24,6 +24,7 @@ end
 
 record Lifecycle
   local phase: Phase
+  local completion_enabled: boolean
 end
 
 local INVALID_REQUEST = -32600
@@ -31,7 +32,11 @@ local INVALID_PARAMS = -32602
 local SERVER_NOT_INITIALIZED = -32002
 
 function create(): Lifecycle
-  return Lifecycle.new(Phase.before_initialize())
+  return Lifecycle.new(Phase.before_initialize(), false)
+end
+
+function Lifecycle:enable_completion()
+  self.completion_enabled = true
 end
 
 function Lifecycle:phase_name(): string
@@ -49,7 +54,7 @@ local function fail(code: integer, message: string): Decision
   return Decision.failure(Error.new(code, message))
 end
 
-local function initialize_result(): wire.Object
+local function initialize_result(completion_enabled: boolean): wire.Object
   local capabilities: wire.Object = {
     -- vscode-languageclient currently advertises only UTF-16 and rejects any
     -- other selection. State the negotiated/default encoding explicitly.
@@ -60,6 +65,18 @@ local function initialize_result(): wire.Object
     ["hoverProvider"] = true,
     ["foldingRangeProvider"] = true,
   }
+  if completion_enabled then
+    local save: wire.Object = {["includeText"] = false}
+    local sync: wire.Object = {
+      ["openClose"] = true, ["change"] = 1, ["save"] = save,
+    }
+    local triggers: wire.Array = {".", ":"}
+    local completion: wire.Object = {
+      ["resolveProvider"] = false, ["triggerCharacters"] = triggers,
+    }
+    capabilities["textDocumentSync"] = sync
+    capabilities["completionProvider"] = completion
+  end
   return {["capabilities"] = capabilities}
 end
 
@@ -99,7 +116,7 @@ local function Lifecycle:handle_initialize(
       return fail(INVALID_PARAMS, "initialize params must be an object")
     end
     self.phase = Phase.awaiting_initialized()
-    return Decision.result(initialize_result())
+    return Decision.result(initialize_result(self.completion_enabled))
   else
     return fail(INVALID_REQUEST, "initialize may only be sent once")
   end

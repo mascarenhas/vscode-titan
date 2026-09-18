@@ -34,10 +34,16 @@ project workflow.
   dependencies loaded through `package.cpath` can bind to that same Lua state.
 - Stdout is exclusively for LSP framing. Diagnostics and debug logs go to
   stderr.
-- Version 1 computes semantics from saved files on disk. Do not silently add
-  unsaved-buffer semantics.
-- Completion, FFI-definition navigation, external-source navigation, and
-  watching external source trees are out of scope for version 1.
+- Definition, references, hover, rename, folding and diagnostics use saved disk
+  files. Post-V1 completion alone uses captured editor buffers; follow
+  `docs/completion.md` and `.agents/plans/unsaved-completion.md`.
+- FFI-definition navigation, external-source navigation, and watching external
+  source trees remain out of scope.
+- Completion captures sessions, versions, contributors and the committed saved
+  generation before deferred work. Private preparation reads baseline descriptors
+  fenced by that generation without awaiting shared restoration; the compiler
+  permit still serializes Lua state. SQL selection reads only qualified scalar
+  facts. Only the watcher writes saved facts/caches; never promote TEMP data on save.
 - Convert compiler-owned Lua tables into typed Titan records/unions at a narrow
   boundary. Do not spread untyped `value` maps through the server.
 - Retain declared top-level member/type manifests and exact provenance for

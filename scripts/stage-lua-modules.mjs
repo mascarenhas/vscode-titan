@@ -28,6 +28,8 @@ const REQUIRED_SHARE_FILES = [
   "inspect.lua",
   "relabel.lua",
   "titan-compiler/checker.lua",
+  "titan-compiler/checker/completion.lua",
+  "titan-compiler/completion.lua",
   "titan-compiler/driver.lua",
   "titan-compiler/parser.lua",
   "titan-compiler/types.lua",
