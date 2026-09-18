@@ -81,25 +81,44 @@ reanalysis: previous prepared candidates may be served as incomplete results,
 with a current token/edit and matching document session/context. Fresh
 publication and selection retain exact input checks.
 
-The compiler prerequisite is committed as
-`5c0cefb48c513956f6463674d8d3346390033ae9`; CI pins that exact revision. Its full
-local gate passed: 144 retained runtime/packaging, 3,478 compiler and 456 native
-standard-library tests. A fresh production SDK was built from the same authored
-tree; copied-tree Lua/compiler/native-runtime loading passed.
+The compiler prerequisite, including the selected-provider catalog fix, is
+committed as `e72280900fa1b5e95a2be54e33a83986126cfe16`; CI pins that exact
+revision. Its full local gate passed: 144 retained runtime/packaging, 3,480
+compiler and 456 native standard-library tests. All 67 production SDK
+compiler/parser Lua files and the completion manual match the authored source;
+the production installation contains no test-only rocks.
 
-All `make verify` gates passed on the final shipping O3/Linux LTO build, run in
-test and packaging phases: 383 native tests, completion and saved protocol,
-cache restart, Codex adapter, 60 extension units, six launcher tests, incremental
+All `make verify` gates passed on the shipping O3/Linux LTO build, run in test
+and packaging phases: 388 native tests, completion and saved protocol, cache
+restart, Codex adapter, 60 extension units, six launcher tests, incremental
 build checks, all 12 Extension Host cases, native inspection, plugin validation,
 installation checks and both extracted-VSIX compiler/SDK smokes.
 
 Schema 5 keeps large descriptor payloads outside the foreign-key parent index;
 candidate inserts are batched. Independent review and regressions cover partial
 batch rollback, a 2 MiB descriptor, non-null keys and schema 4-to-5 recreation.
-The packaged SDK smoke passes with its original deadlines. Release timings and
-memory observations in `docs/completion-performance.md` were independently
-checked against raw samples and the final executable identity.
+The packaged SDK smoke passes with its original deadlines. Historical timing
+and memory observations in `docs/completion-performance.md` identify their exact
+measured source/compiler revisions and executable, before the catalog follow-up.
 
-All local acceptance criteria and independent reviews are complete. The branches
-are ready for final commit/push and review PRs, which must remain open. No macOS
-CI has been dispatched.
+The Titan PR review identified a missing inventory boundary: selected static
+archives must publish every carried module, including unimported siblings.
+The compiler fix preserves embedded/imported precedence and does not select
+merely inspected or source-displaced archives. A regression completes a newly
+imported sibling after its archive is removed from disk. Focused provider,
+completion and driver regressions passed 231 tests.
+
+The server retains complete provider captures across roots and fixed-point
+passes, checks their observed physical identities, and replaces refreshed
+inventories as a whole. Publication reconciles them with accepted provider/source
+ownership, retains unchanged providers across unrelated edits, and preserves
+embedded inventory across compatible warm restart. Fresh captures remain usable
+with unrelated source diagnostics. Independent review covered implementation,
+documentation and skills; all 65 focused bridge/catalog tests passed, including
+five new regression cases. No cache schema or API-version change was needed.
+
+All local acceptance criteria and independent reviews are complete. Delivery is
+through [vscode-titan PR #82](https://github.com/mascarenhas/vscode-titan/pull/82)
+and [Titan PR #168](https://github.com/mascarenhas/titan/pull/168), which remain
+open for maintainer review. No macOS CI has been dispatched; normal Linux CI
+runs automatically when the branches are pushed.

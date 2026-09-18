@@ -1,8 +1,9 @@
 # Completion delivery measurements
 
-Measured on 17 September 2026 with the release build from
-`codex/unsaved-completion`, the compiler revision pinned in
-[CI](../.github/workflows/ci.yml), and a freshly built SDK. The executable SHA-256
+Measured on 17 September 2026 with vscode-titan revision
+`75ca2451916ab0afd75ce2f83a9baed38bf42b28`, compiler revision
+`5c0cefb48c513956f6463674d8d3346390033ae9`, and a freshly built SDK. These
+measurements precede the selected-provider catalog follow-up. The executable SHA-256
 was `4310beb3f8ba1c69a10c92ab40a9c2082bcecd461047cdc840557e80483e187c`.
 The host was Linux x86-64, AMD Ryzen AI 9 HX 370 (24 logical CPUs), GCC 16.2.1
 and Node.js 24.13.0. Host load was not controlled; these are local observations,

@@ -44,6 +44,21 @@ Persisted C cache reads are fenced by the saved generation; transient work
 cannot publish persistent compiler caches. Resolution is closed over the
 captured source/provider inventory.
 
+Selected static archives contribute their complete module inventory, including
+siblings not imported by saved source. The server accumulates whole provider
+captures across independent roots and fixed-point analysis, validates their
+observed file identities, and releases pending captures after publication.
+Recapturing an archive replaces its inventory, so removed siblings disappear.
+Saved source names and provider deselection prevent stale binary entries from
+surviving; embedded inventories also survive a compatible warm restart.
+
+An unrelated saved refresh retains an untouched provider's committed catalog
+while a clean project still reaches it. If all its importers fail and no fresh
+provider capture is available, that old catalog is discarded because current
+file observations alone cannot validate its previous bytes. Fresh captures can
+still be used with unrelated source diagnostics, and already prepared provisional
+completion remains available under the ordinary context/session rules.
+
 Known header and include-search identities are checked before and after private
 analysis and compared with its actual observations. Newly introduced explicit
 headers are checked too; until saved indexing owns them, later requests schedule

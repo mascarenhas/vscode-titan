@@ -82,8 +82,16 @@ declarations. Completion is a separate unsaved pipeline: preserve source-private
 visibility, actual receiver/ffi lookup and the distinct foreign type namespace.
 Read the sibling `titan-completion` skill when changing its compiler boundary.
 Capture committed completion descriptors with semantic publication; never use
-mutable graph work rows as a saved baseline. Decode descriptors only during
-private preparation; selection reads indexed scalar facts under one connection
+mutable graph work rows as a saved baseline. Selected static archives contribute
+complete sibling inventories. Accumulate captures by physical provider across
+independent roots and fixed-point passes, replace recaptured groups completely,
+and release pending captures after publication or configuration changes. Validate
+pending provider identities from compiler observations; preserve untouched SQL
+catalogs only through accepted provider ownership, with source overlap rejecting
+the entire provider. Retain embedded inventories during compatible warm startup.
+Test unrelated refresh, provider replacement/removal, and warm restoration.
+Decode descriptors only during private preparation; selection reads indexed
+scalar facts under one connection
 lease. Add deterministic held/free compiler-permit tests and measure preparation
 separately from SQL selection. Include new compiler modules in staging and VSIX
 checks, and keep all other semantic features saved-file-only.

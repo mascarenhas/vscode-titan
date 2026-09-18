@@ -90,6 +90,19 @@ return function(mode, contextual_provider_file)
   driver.completion_binary_catalog = function(context)
     assert(type(context) == "table")
     assert(type(context.io) == "userdata")
+    if mode == "completion-catalog" then
+      local name = context.checked_source_modules[1]
+      if name == "fixture.first" or name == "fixture.second" then
+        local provider = contextual_provider_file ..
+          (name == "fixture.second" and ".second" or "")
+        assert(context.io:lstat(provider))
+        local suffix = context.catalog_replacement and ".fresh" or ".old"
+        return { [name .. suffix] = {
+          serialized = "interface:" .. name .. suffix,
+          kind = "static", filename = provider,
+        } }
+      end
+    end
     return {}
   end
   -- These tests supply deliberately minimal AST/type fixtures. Descriptor
@@ -533,6 +546,11 @@ return function(mode, contextual_provider_file)
         end
       end
       local context = assert(options.context)
+      if mode == "completion-catalog" then
+        local source = options.source_overrides[name]
+        context.catalog_replacement = source and
+          source.contents[source.main] == "replacement"
+      end
       context.checked_source_modules[
         #context.checked_source_modules + 1] = name
       if mode == "dependency-diagnostic" then
@@ -1050,6 +1068,54 @@ function test_compiler_bridge_rejects_mixed_binary_providers_across_attempts(
         test.assert(false, "provider-switch fixture used source provenance")
       end
     end, first_provider)
+  end)
+end
+
+function test_compiler_bridge_completion_catalog_owns_complete_pending_providers(_context: test.Context)
+  run_bridge(function ()
+    local provider = fs.tmpname()
+    local second = provider .. ".second"
+    defer do fs.unlink(second); fs.unlink(provider) end
+    fs.write_file(provider, "first provider")
+    fs.write_file(second, "second provider")
+    with_fixture("completion-catalog", function ()
+      local compiler = bridge.load()
+      local projects = {
+        bridge.ProjectModule.new("fixture.first", {bridge.SourceFile.new("/workspace/first.titan", "old")}),
+        bridge.ProjectModule.new("fixture.second", {bridge.SourceFile.new("/workspace/second.titan", "old")}),
+        bridge.ProjectModule.new("fixture.last", {bridge.SourceFile.new("/workspace/last.titan", "old")}),
+      }
+      compiler:analyze_incremental(projects, {"fixture.first", "fixture.second", "fixture.last"}, {})
+      test.assert(#compiler:completion_binary_catalog() == 2,
+        "independent root attempts replaced earlier provider siblings")
+      compiler:analyze_incremental(projects, {"fixture.last"}, {})
+      test.assert(#compiler:completion_binary_catalog() == 2,
+        "a later fixed-point iteration lost an unpublished provider")
+      projects[1] = bridge.ProjectModule.new("fixture.first", {
+        bridge.SourceFile.new("/workspace/first.titan", "replacement"),
+      })
+      compiler:analyze_incremental(projects, {"fixture.first"}, {})
+      local catalog = compiler:completion_binary_catalog()
+      test.assert(#catalog == 2)
+      local fresh = false
+      for index = 1, #catalog do
+        test.assert(catalog[index].module_name ~= "fixture.first.old",
+          "recaptured provider kept its removed sibling")
+        if catalog[index].module_name == "fixture.first.fresh" then fresh = true end
+      end
+      test.assert(fresh, "recaptured provider lost its replacement inventory")
+      fs.write_file(provider, "same pathname now contains a replaced archive")
+      catalog = compiler:completion_binary_catalog()
+      test.assert(#catalog == 1 and catalog[1].filename == second,
+        "stale pending provider bytes survived a same-path replacement")
+      compiler:release_completion_exports()
+      test.assert(#compiler:completion_binary_catalog() == 0,
+        "accepted publication retained pending compiler catalog memory")
+      compiler:analyze_incremental(projects, {"fixture.second"}, {})
+      compiler:configure(bridge.CompilerConfiguration.new { binary_root = "/different/providers" })
+      test.assert(#compiler:completion_binary_catalog() == 0,
+        "configuration change retained an old provider selection")
+    end, provider)
   end)
 end
 

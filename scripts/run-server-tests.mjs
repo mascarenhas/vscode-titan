@@ -19,7 +19,7 @@ export const serverTestShards = [
   ],
   [
     "application_test", "compiler_scheduler_test", "completion_service_test", "completion_store_test", "coordinator_test",
-    "project_config_test", "project_discovery_test", "project_graph_test",
+    "project_config_test", "project_discovery_test", "project_graph_test", "project_loader_test",
     "project_metadata_test", "project_service_test", "project_watcher_test",
     "semantic_features_test", "semantic_index_test", "source_text_test",
     "workspace_cache_test", "workspace_store_test"

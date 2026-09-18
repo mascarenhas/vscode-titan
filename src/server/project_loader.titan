@@ -35,6 +35,123 @@ local record CompletionRevision
   const state: integer
 end
 
+local function binary_provider_key(kind: string, filename: string): string
+  return kind .. "\0" .. filename
+end
+
+-- Catalog-only siblings belong to a complete physical provider. Saved graph
+-- names always win, and a recapture replaces all prior siblings of its owner.
+local function completion_catalog(connection: sqlite3.Connection,
+    snapshot: service.Snapshot, binaries: {bridge.CompletionBinary}, reusable: boolean):
+    ({completion_store.SavedDescriptor}, {string})
+  local graph_names: {string: integer} = {}
+  local graph_rows = sql.rows(connection, "SELECT name,provenance FROM main.graph_modules")
+  for index = 1, #graph_rows do graph_names[graph_rows[index]:get(1)] = graph_rows[index]:get(2) end
+  local clean: {string: boolean} = {}
+  local reachable = sql.rows(connection,
+    "WITH RECURSIVE reachable(name) AS (" ..
+    "SELECT imported FROM main.graph_imports AS e JOIN main.graph_modules AS m ON m.name=e.importer " ..
+    "WHERE m.provenance=0 AND m.state=2 UNION " ..
+    "SELECT imported FROM reachable AS r JOIN main.graph_modules AS m ON m.name=r.name " ..
+    "JOIN main.graph_imports AS e ON e.importer=r.name WHERE m.provenance<>0) SELECT name FROM reachable")
+  for index = 1, #reachable do clean[reachable[index]:get(1)] = true end
+  local selected: {string: boolean} = {}
+  local clean_providers: {string: boolean} = {}
+  for index = 1, #snapshot.external_modules do
+    local external = snapshot.external_modules[index]
+    local key?: string
+    case external.origin
+    when static_binary(binary) then key = binary_provider_key("static", binary.provider_file)
+    when dynamic_binary(binary) then key = binary_provider_key("dynamic", binary.provider_file)
+    when source() then
+    end
+    if key ~= nil then
+      selected[key] = true
+      if clean[external.module_name] then clean_providers[key] = true end
+    end
+  end
+  local previous: {sqlite3.Row} = {}
+  if sql.scalar_integer(connection,
+      "SELECT count(*) FROM main.sqlite_master WHERE name='completion_descriptors' AND type='table'") ~= 0 then
+    previous = sql.rows(connection,
+      "SELECT module_name,provenance,main_file FROM main.completion_descriptors " ..
+      "WHERE provenance IN ('static','dynamic','embedded') ORDER BY module_name")
+  end
+  local replaced: {string: boolean} = {}
+  local blocked: {string: boolean} = {}
+  for index = 1, #binaries do
+    local binary = binaries[index]
+    local key = binary_provider_key(binary.kind, binary.filename)
+    replaced[key] = true
+    local provenance? = graph_names[binary.module_name]
+    if provenance ~= nil and provenance ~= 2 then blocked[key] = true end
+  end
+  for index = 1, #previous do
+    local row = previous[index]
+    local key = binary_provider_key(row:get(2), sql.bytes(row, 3))
+    local provenance? = graph_names[sql.bytes(row, 1)]
+    if not replaced[key] and provenance ~= nil and provenance ~= 2 then
+      blocked[key] = true
+    end
+  end
+  local names: {string} = {}
+  local choices: {string: bridge.CompletionBinary} = {}
+  local fresh: {string: boolean} = {}
+  for index = 1, #previous do
+    local row = previous[index]
+    local name = sql.bytes(row, 1)
+    local kind: string = row:get(2)
+    local key = binary_provider_key(kind, sql.bytes(row, 3))
+    local keep = false
+    if kind == "embedded" then
+      keep = reusable
+    elseif selected[key] then
+      keep = reusable or clean_providers[key] == true
+    end
+    if graph_names[name] == nil and not blocked[key] and not replaced[key] and
+       keep then
+      names[#names + 1] = name
+      choices[name] = bridge.CompletionBinary.new(name, "", kind, sql.bytes(row, 3))
+    end
+  end
+  for index = 1, #binaries do
+    local binary = binaries[index]
+    local key = binary_provider_key(binary.kind, binary.filename)
+    if graph_names[binary.module_name] == nil and not blocked[key] and
+       (binary.kind == "embedded" or selected[key] == true) then
+      local previous? = choices[binary.module_name]
+      if previous == nil then
+        names[#names + 1] = binary.module_name
+        choices[binary.module_name] = binary
+        fresh[binary.module_name] = true
+      elseif binary.kind == "embedded" then
+        choices[binary.module_name] = binary
+        fresh[binary.module_name] = true
+      elseif previous.kind ~= "embedded" and
+             binary.filename > previous.filename then
+        -- Preserve the compiler's deterministic catalog ordering. Ordinary
+        -- graph selections remain authoritative; invalid archive overlap still
+        -- belongs to the compiler's resolver diagnostics.
+        choices[binary.module_name] = binary
+        fresh[binary.module_name] = true
+      end
+    end
+  end
+  local descriptors: {completion_store.SavedDescriptor} = {}
+  local retained: {string} = {}
+  for index = 1, #names do
+    local name = names[index]
+    local binary = choices[name]
+    retained[#retained + 1] = name
+    if fresh[name] then
+      descriptors[#descriptors + 1] = completion_store.SavedDescriptor.new(
+        name, 0, 2, binary.kind, binary.filename, nil,
+        binary.serialized, nil, {}, {}, {}, {})
+    end
+  end
+  return descriptors, retained
+end
+
 -- The updater prepares compiler facts without holding the connection lease,
 -- then publishes these descriptors with semantic_files in its one transaction.
 local function prepare_completion_descriptors(snapshot: service.Snapshot,
@@ -65,15 +182,6 @@ local function prepare_completion_descriptors(snapshot: service.Snapshot,
       if not unchanged then
         changed[#changed + 1] = CompletionRevision.new(name, revision, state)
       end
-    end
-    -- Embedded catalog entries are not graph_modules. A warm startup must
-    -- retain their committed descriptors before the compiler graph hydrates.
-    if exists and reusable then
-      local catalog = sql.rows(access.connection,
-        "SELECT module_name FROM main.completion_descriptors AS c " ..
-        "WHERE c.provenance IN ('dynamic','static') AND NOT EXISTS(" ..
-        "SELECT 1 FROM main.graph_modules AS g WHERE g.name=CAST(c.module_name AS TEXT))")
-      for index = 1, #catalog do retained[#retained + 1] = sql.bytes(catalog[index], 1) end
     end
   end
   local names: {string} = {}
@@ -166,19 +274,11 @@ local function prepare_completion_descriptors(snapshot: service.Snapshot,
     end
   end
   local binaries = compiler:completion_binary_catalog()
-  for index = 1, #binaries do
-    local binary = binaries[index]
-    local found = false
-    for retained_index = 1, #retained do
-      if retained[retained_index] == binary.module_name then found = true end
-    end
-    if not found then
-      retained[#retained + 1] = binary.module_name
-      descriptors[#descriptors + 1] = completion_store.SavedDescriptor.new(
-        binary.module_name, 0, 2, binary.kind, binary.filename, nil,
-        binary.serialized, nil, {}, {}, {}, {})
-    end
-  end
+  local access = loaded:workspace_store():acquire()
+  defer access:release()
+  local catalog, catalog_names = completion_catalog(access.connection, snapshot, binaries, reusable)
+  for index = 1, #catalog do descriptors[#descriptors + 1] = catalog[index] end
+  for index = 1, #catalog_names do retained[#retained + 1] = catalog_names[index] end
   return descriptors, retained
 end
 
