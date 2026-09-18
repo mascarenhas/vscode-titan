@@ -183,10 +183,11 @@ describe("Titan TextMate grammar", () => {
   });
 
   test("recognizes multiple union parts, constructors, and both case forms", () => {
-    const [declaration, parts, positional, named, prefix, selected, empty] =
+    const [declaration, parts, , positional, named, prefix, selected, empty] =
       tokenizeLines([
         "union Message",
         "  moved(x: integer, text: string, note: string?)",
+        "end",
         'local first = Message.moved(1, "one")',
         'local second = Message.moved { text = "two", x = 2 }',
         "when moved(string) then",
@@ -195,6 +196,9 @@ describe("Titan TextMate grammar", () => {
       ]);
 
     assertScope(declaration, "Message", "entity.name.type.titan");
+    assertScope(parts, "moved", "entity.name.tag.titan");
+    assertScope(parts, "x", "variable.parameter.titan");
+    assertScope(named, "text", "variable.other.member.titan");
     assertScope(parts, "integer", "storage.type.primitive.titan");
     assertScope(parts, ",", "punctuation.separator.titan");
     assertScope(parts, "?", "keyword.operator.titan");
@@ -213,6 +217,166 @@ describe("Titan TextMate grammar", () => {
     assertScope(selected, ";", "punctuation.separator.titan");
     assertScope(empty, "{", "punctuation.section.group.begin.titan");
     assertScope(empty, "}", "punctuation.section.group.end.titan");
+  });
+
+  test("scopes union variants and contextual part declarations without losing type scopes", () => {
+    const lines = tokenizeLines([
+      "local union Message<|T|>",
+      "  moved(x: integer, end: integer)",
+      "  local end(value: string, ffi: T)",
+      "  plain(string) local(integer) local local(integer)",
+      "  complex(callback: function (integer): (string, T),",
+      "    items: Box<|function (T): T|>, lookup: {string: {T}},",
+      "    -- end: integer remains a comment",
+      "    note: string?)",
+      "end",
+      "function after(): integer",
+      "  if true then return 1 end",
+      "end"
+    ]);
+
+    assertScope(lines[0], "Message", "entity.name.type.titan");
+    assertScope(lines[0], "<|", "punctuation.definition.typeparameters.begin.titan");
+    for (const [index, variant] of [[1, "moved"], [2, "end"], [3, "plain"], [4, "complex"]] as const) {
+      assertScope(lines[index], variant, "entity.name.tag.titan");
+    }
+    for (const [index, part] of [[1, "x"], [1, "end"], [2, "value"], [2, "ffi"],
+      [4, "callback"], [5, "items"], [5, "lookup"], [7, "note"]] as const) {
+      assertScope(lines[index], part, "variable.parameter.titan");
+      assert.ok(!lines[index].scopesAt(part).includes("keyword.control.titan"));
+    }
+    assertScope(lines[2], "local", "storage.modifier.titan");
+    assertScope(lines[3], "string", "storage.type.primitive.titan");
+    assertScope(lines[3], "local(integer)", "entity.name.tag.titan");
+    assertScope(lines[3], "local local", "storage.modifier.titan");
+    assertScope(lines[4], "function", "storage.type.function.titan");
+    assertScope(lines[4], "integer", "storage.type.primitive.titan");
+    assertScope(lines[5], "string", "storage.type.primitive.titan");
+    assert.ok(!lines[5].scopesAt("string").includes("variable.parameter.titan"));
+    assertScope(lines[6], "end", "comment.line.double-dash.titan");
+    assertScope(lines[7], "string", "storage.type.primitive.titan");
+    assertScope(lines[8], "end", "keyword.control.titan");
+    assertScope(lines[9], "after", "entity.name.function.titan");
+    assertScope(lines[10], "if", "keyword.control.titan");
+    assertScope(lines[10], "end", "keyword.control.titan");
+  });
+
+  test("scopes named constructor labels while preserving nested expressions and comments", () => {
+    const lines = tokenizeLines([
+      "local packet = Message<|integer|>.moved { end = 4,",
+      "  x = other.end,",
+      "  value = Other.part { end = nested(5, 6), value = {7, 8} },",
+      '  text = "end = 6", -- end = 7',
+      "  flag = value == other,",
+      "  callback = function (): integer",
+      "    local count = 0; count = 1; if true then return count end",
+      "  end",
+      "}",
+      "return Message.moved(1, 2)"
+    ]);
+
+    for (const [index, label] of [[0, "end"], [1, "x"], [2, "value"], [2, "end"],
+      [3, "text"], [4, "flag"], [5, "callback"]] as const) {
+      assertScope(lines[index], label, "variable.other.member.titan");
+      assert.ok(!lines[index].scopesAt(label).includes("keyword.control.titan"));
+    }
+    assertScope(lines[1], "end", "variable.other.member.titan");
+    assertScope(lines[3], "end = 6", "string.quoted.double.titan");
+    assertScope(lines[3], "end = 7", "comment.line.double-dash.titan");
+    assertScope(lines[4], "value", "storage.type.primitive.titan");
+    assert.ok(!lines[4].scopesAt("value").includes("variable.other.member.titan"));
+    assertScope(lines[4], "==", "keyword.operator.titan");
+    assertScope(lines[5], "function", "storage.type.function.titan");
+    assertScope(lines[6], "if", "keyword.control.titan");
+    assert.ok(!lines[6].scopesAt("count = 1").includes("variable.other.member.titan"));
+    assertScope(lines[7], "end", "keyword.control.titan");
+    assertScope(lines[9], "return", "keyword.control.titan");
+    assertScope(lines[9], "moved", "variable.other.member.titan");
+  });
+
+  test("preserves long strings, function types, and assignments in named values", () => {
+    const lines = tokenizeLines([
+      "type Callbacks = { function(integer): integer }",
+      "local data = Event.some { value = [[end, label = 2]], end = 3 }",
+      "local callback = Event.some { callback = function(op: function(integer): integer): integer",
+      "  local count = 0; count = 1",
+      "  return op(count)",
+      "end, end = 3 }",
+      "local after = 0",
+      "after = 2",
+      "if after == 2 then return object.end() end"
+    ]);
+    assertScope(lines[0], "integer", "storage.type.primitive.titan");
+    assertScope(lines[1], "end, label", "string.quoted.other.long.titan");
+    assertScope(lines[1], "end = 3", "variable.other.member.titan");
+    assertScope(lines[2], "integer", "storage.type.primitive.titan");
+    assert.ok(!lines[3].scopesAt("count = 1").includes("variable.other.member.titan"));
+    assertScope(lines[4], "return", "keyword.control.titan");
+    assertScope(lines[5], "end,", "keyword.control.titan");
+    assertScope(lines[5], "end =", "variable.other.member.titan");
+    assertScope(lines[6], "after", "variable.other.readwrite.titan");
+    assert.ok(!lines[7].scopesAt("after").includes("variable.other.member.titan"));
+    assertScope(lines[8], "if", "keyword.control.titan");
+    assertScope(lines[8], "end()", "variable.other.member.titan");
+  });
+
+  test("keeps function-type annotations out of constructor function bodies", () => {
+    for (const source of [
+      "Event.some { callback = function():integer local x: string? return 1 end, end = 3 }",
+      "Event.some { callback = (f as function(integer):integer), end = 3 }",
+      "Event.some { callback = Box<|function(integer):integer|>.new(add), end = 3 }",
+      "Event.some { callback = function():integer local x: integer, cb: function():integer = 1, add; return cb() end, end = 3 }",
+      "Event.some { callback = function(): integer local f: function(integer):integer = add; return f(1) end, end = 3 }",
+      "Event.some { callback = function(): function(integer):integer return add end, end = 3 }",
+      "Event.some { callback = function(): integer local f = add as function(integer):integer; return f(1) end, end = 3 }",
+      "Event.some { callback = function -- comment\n(op: function(integer):integer):integer return op(1) end, end = 3 }",
+      "Event.some { callback = function\n(op: function(integer):integer):integer return op(1) end, end = 3 }"
+    ]) {
+      const lines = tokenizeLines(source.split("\n"));
+      assertScope(lines[lines.length - 1], "end = 3", "variable.other.member.titan");
+    }
+    const [type, array, nested, value] = tokenizeLines([
+      "type Callbacks = { function(function(integer):integer):integer }",
+      "local callbacks = { function():integer local x = 1; x = 2; return x end }",
+      "local nested = Event.some { callback = function():integer local function helper():integer return 1 end return helper() end, end = 3 }",
+      "local message = Event.some { end = 3 }"
+    ]);
+    assertScope(type, "integer", "storage.type.primitive.titan");
+    assert.ok(!array.scopesAt("x = 2").includes("variable.other.member.titan"));
+    assertScope(nested, "helper", "entity.name.function.titan");
+    assertScope(nested, "end = 3", "variable.other.member.titan");
+    assertScope(value, "end = 3", "variable.other.member.titan");
+  });
+
+  test("keeps contextual method names distinct from nested control blocks", () => {
+    const [loop] = tokenizeLines([
+      "Event.some { callback = function():integer for i: integer = 1, 2 do end for k: integer, v: string in next, ctx do end return 1 end, end = 3 }"
+    ]);
+    assertScope(loop, "integer =", "storage.type.primitive.titan");
+    assertScope(loop, "integer,", "storage.type.primitive.titan");
+    assertScope(loop, "string", "storage.type.primitive.titan");
+    assertScope(loop, "end = 3", "variable.other.member.titan");
+    const [locals] = tokenizeLines([
+      "Event.some { callback = function():integer local x: integer, cb: function():integer = 1, add; return cb() end, end = 3 }"
+    ]);
+    assertScope(locals, "function():integer =", "storage.type.function.titan");
+    assertScope(locals, "end = 3", "variable.other.member.titan");
+    const [callbackLoop] = tokenizeLines([
+      "Event.some { callback = function():integer for index: integer, cb: function(): integer in callbacks do cb() end return 1 end, end = 3 }"
+    ]);
+    assertScope(callbackLoop, "function(): integer in", "storage.type.function.titan");
+    assertScope(callbackLoop, "end = 3", "variable.other.member.titan");
+    for (const receiver of ["obj", "obj.field", "(obj)", "items[1]"]) {
+      const [line] = tokenizeLines([
+        `Event.some { value = ${receiver}:for(), text = ${receiver}:do(), callback = function():integer ${receiver}:end(); return 1 end, end = 3 }`
+      ]);
+      assertScope(line, "for()", "variable.other.member.titan");
+      assertScope(line, "do()", "variable.other.member.titan");
+      assertScope(line, "end()", "variable.other.member.titan");
+      assertScope(line, "integer", "storage.type.primitive.titan");
+      assertScope(line, "return", "keyword.control.titan");
+      assertScope(line, "end = 3", "variable.other.member.titan");
+    }
   });
 
   test("keeps named case aliases distinct from keyword parts across lines", () => {

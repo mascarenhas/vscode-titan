@@ -42,6 +42,11 @@ create local bindings. A reserved-word part needs an alias in a named pattern.
 ## Editor behavior
 
 Highlighting recognizes declarations, constructors and both pattern forms.
+Variant names, declared part names and named constructor labels have distinct
+scopes, including contextual names such as `end`. Nested payload types retain
+their type coloring; constructor values retain expression coloring. TextMate
+tokenization is line based: an `end` variant separated from its opening `(` by
+a comment or newline can still be read as the union terminator.
 Saved-file analysis retains references to every part's type and every case
 binding. Variant hover signatures show all declared part names and types.
 Part declarations, named constructor labels and named pattern selectors share

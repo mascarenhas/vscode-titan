@@ -132,6 +132,9 @@ installation. During prerelease development the compiler/server API stays at
 `1`; update both consumers and fixtures against the pinned metadata contract.
 Treat source syntax, saved-source fixture strings, hover text, semantic spans,
 TextMate scopes and editor bracket/indent rules as separate migration surfaces.
+Assert scopes for each newly introduced identifier position, including contextual
+keyword names in declarations and constructor labels. Test nested types, values,
+comments and strings so delimiter state does not leak into subsequent code.
 Do not rewrite SQL, embedded Lua or other string payloads as Titan syntax.
 Compare production string payloads after automated migrations and validate the
 result with the compiler parser and semantic/protocol tests.
