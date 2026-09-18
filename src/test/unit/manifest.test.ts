@@ -256,6 +256,16 @@ describe("Titan language configuration", () => {
       assert.doesNotMatch(declaration, increasesIndent);
     }
     assert.match("when some(item) then", increasesIndent);
+    for (const arm of [
+      "when moved(first, second) then",
+      "when moved(first) then",
+      "when moved{body = text; x} then",
+      "when moved{} then -- ignore every part",
+      "when end{finish = end} then"
+    ]) {
+      assert.match(arm, increasesIndent);
+      assert.match(arm, decreasesIndent);
+    }
     assert.match("else -- fallback", increasesIndent);
     assert.match("else -- fallback", decreasesIndent);
   });

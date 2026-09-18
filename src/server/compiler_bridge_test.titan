@@ -946,8 +946,8 @@ function test_compiler_bridge_keeps_source_manifests_off_binary_snapshots(
                     #"fixture binary provider",
                   "binary snapshot lost its compiler-observed provider")
       case binary.provenance
-      when dynamic_binary(provenance) then
-        test.assert(provenance.provider_file == provider,
+      when dynamic_binary{provider_file} then
+        test.assert(provider_file == provider,
                     "binary manifest fixture lost its provider provenance")
       else
         test.assert(false, "binary manifest fixture used source provenance")
@@ -983,8 +983,8 @@ function test_compiler_bridge_observes_embedded_provider_identity(
                     nil,
                   "embedded provider was not stamped as an observed binary")
       case embedded.provenance
-      when static_binary(provenance) then
-        test.assert(provenance.provider_file == provider,
+      when static_binary{provider_file} then
+        test.assert(provider_file == provider,
                     "embedded provider lost its executable provenance")
       else
         test.assert(false,
@@ -1014,8 +1014,8 @@ function test_compiler_bridge_does_not_treat_an_ordinary_executable_path_as_embe
                     nil,
                   "ordinary executable-path provider bypassed lstat evidence")
       case ordinary.provenance
-      when dynamic_binary(provenance) then
-        test.assert(provenance.provider_file == provider,
+      when dynamic_binary{provider_file} then
+        test.assert(provider_file == provider,
                     "ordinary executable-path provider lost its provenance")
       else
         test.assert(false,
@@ -1061,8 +1061,8 @@ function test_compiler_bridge_rejects_mixed_binary_providers_across_attempts(
                     nil,
                   "mixed binary providers acquired a publishable identity")
       case binary.provenance
-      when dynamic_binary(provenance) then
-        test.assert(provenance.provider_file == second_provider,
+      when dynamic_binary{provider_file} then
+        test.assert(provider_file == second_provider,
                     "provider-switch fixture did not retain its final result")
       else
         test.assert(false, "provider-switch fixture used source provenance")
@@ -1150,8 +1150,8 @@ local function preserves_binary_observation_when_final_snapshot_is_source()
                   nil,
                 "source-final result lost its earlier binary observation")
     case provider.provenance
-    when external_source(source) then
-      test.assert(source.main_file == second_provider,
+    when external_source{main_file, source_files} then
+      test.assert(main_file == second_provider,
                   "source-final fixture lost its final provider")
     else
       test.assert(false, "source-final fixture retained binary provenance")
@@ -1193,23 +1193,23 @@ function test_compiler_bridge_normalizes_external_resolution_fingerprints(
                 resolutions[1].provenance ~= nil,
                 "external source resolution lost typed identity")
     case resolutions[1].provenance as bridge.Provenance
-    when external_source(source) then
-      test.assert(source.main_file == "/external/vendor/vendor.titan" and
-                  #source.source_files == 2 and
-                  source.source_files[2] ==
+    when external_source{main_file, source_files} then
+      test.assert(main_file == "/external/vendor/vendor.titan" and
+                  #source_files == 2 and
+                  source_files[2] ==
                     "/external/vendor/part.titan",
                   "folder resolution lost a constituent")
     else test.assert(false, "external source used a binary provenance")
     end
     case resolutions[2].provenance as bridge.Provenance
-    when dynamic_binary(binary) then
-      test.assert(binary.provider_file == "/binary/vendor.so",
+    when dynamic_binary{provider_file} then
+      test.assert(provider_file == "/binary/vendor.so",
                   "dynamic provider path was not normalized")
     else test.assert(false, "dynamic provider used the wrong provenance")
     end
     case resolutions[3].provenance as bridge.Provenance
-    when static_binary(binary) then
-      test.assert(binary.provider_file == "/binary/vendor.a",
+    when static_binary{provider_file} then
+      test.assert(provider_file == "/binary/vendor.a",
                   "static provider path was not normalized")
     else test.assert(false, "static provider used the wrong provenance")
     end
@@ -1271,8 +1271,8 @@ function test_compiler_bridge_normalizes_contextual_owner_provenance(
                     #"fixture static provider",
                   "contextual owner graph identity was changed")
       case resolution.provenance
-      when static_binary(binary) then
-        test.assert(binary.provider_file == provider,
+      when static_binary{provider_file} then
+        test.assert(provider_file == provider,
                     "contextual owner provider path was lost")
       else
         test.assert(false,
@@ -1410,9 +1410,9 @@ function test_compiler_bridge_normalizes_annotated_ast_and_provenance(
                   "Source(\"fixture.external\")",
                 "external source-visible manifest was not normalized")
     case external.provenance
-    when external_source(source) then
-      test.assert(#source.source_files == 2 and
-                  source.source_files[2] == "/external/part.titan",
+    when external_source{main_file, source_files} then
+      test.assert(#source_files == 2 and
+                  source_files[2] == "/external/part.titan",
                   "external folder source provenance lost member paths")
     else
       test.assert(false, "external source used the wrong provenance variant")
@@ -2411,7 +2411,7 @@ function test_compiler_bridge_normalizes_generic_nominal_and_member_metadata(
   run_bridge(normalizes_generic_nominal_member_metadata)
 end
 
-local function excludes_lowered_generic_case_payloads_from_exact_spans()
+local function preserves_checked_generic_case_bindings()
   preload_real_compiler()
   local filename = "/workspace/generic_case_payload.titan"
   local source = [[union Maybe<|T|>
@@ -2439,29 +2439,28 @@ end
               "generic case payload fixture did not compile")
   local module? = analysis:find_module("generic_case_payload")
   test.assert(module ~= nil, "generic case payload module was not normalized")
-  local saw_lowered_payload = false
   local source_item_spans = 0
   for index = 1, #module.symbols do
     local symbol = module.symbols[index]
-    if strings.find(symbol.name, "__generic_case_payload_", 1) == 1 then
-      saw_lowered_payload = true
-      test.assert(symbol.exact_span == nil,
-                  "lowered generic case payload gained a source span")
-    elseif symbol.name == "item" and symbol.exact_span ~= nil then
+    test.assert(strings.find(symbol.name, "__generic_case_payload_", 1) ~= 1,
+                "analysis-only checking introduced a runtime case carrier")
+    if symbol.name == "item" and symbol.exact_span ~= nil then
       source_item_spans = source_item_spans + 1
     end
   end
-  test.assert(saw_lowered_payload,
-              "fixture did not exercise generic case payload lowering")
   test.assert(source_item_spans >= 4,
               "source-written generic bindings lost their exact spans")
   local model = features.build(projects, analysis.modules)
-  model:close()
+  defer model:close()
+  local binding? = model:hover(filename, source_text.Position.new(10, 16))
+  test.assert(binding ~= nil and binding:markdown() ==
+    "- Type: `integer`\n- Visibility: block\n",
+    "checked generic case binding lost its applied type")
 end
 
-function test_compiler_bridge_excludes_lowered_generic_case_payloads_from_exact_spans(
+function test_compiler_bridge_preserves_checked_generic_case_bindings(
     _context: test.Context)
-  run_bridge(excludes_lowered_generic_case_payloads_from_exact_spans)
+  run_bridge(preserves_checked_generic_case_bindings)
 end
 
 local function drives_shadowing_and_record_definition_features_from_compiler()
@@ -3299,7 +3298,7 @@ end
                 "**union** `hover_manifest.Choice`\n\n" ..
                 "Variants\n\n" ..
                 "- `empty()`\n" ..
-                "- `numbered(integer)`\n\n" ..
+                "- `numbered(value: integer)`\n\n" ..
                 "Functions\n\n" ..
                 "- `hover_manifest.Choice.from_ordinal(" ..
                   "ordinal: integer): hover_manifest.Choice`\n\n" ..
@@ -3345,9 +3344,9 @@ end
   local variant? = model:hover(filename, source_text.Position.new(8, 34))
   test.assert(variant ~= nil and variant:markdown() ==
                 "- Signature: `hover_manifest.Choice.numbered(" ..
-                "integer): hover_manifest.Choice`\n" ..
+                "value: integer): hover_manifest.Choice`\n" ..
                 "- Visibility: exported\n",
-              "union variant constructor invented a parameter label")
+              "legacy union payload lost its canonical value parameter label")
 
   local union_method? = model:hover(filename, source_text.Position.new(9, 24))
   test.assert(union_method ~= nil and union_method:markdown() ==
@@ -4346,4 +4345,235 @@ end
 function test_compiler_bridge_allows_ffi_member_and_shadowing_binding_renames(
     _context: test.Context)
   run_bridge(allows_ffi_member_and_shadowing_binding_renames)
+end
+
+local function union_parts_fixture():
+    ({bridge.ProjectModule}, string, string, string, string)
+  local provider_file = "/workspace/union_parts_provider.titan"
+  local consumer_file = "/workspace/union_parts_consumer.titan"
+  local provider = [[union Packet<|T|>
+  moved(x: T, text: string, end: integer, note: string?)
+  other(x: T)
+  legacy(T)
+  empty()
+end
+]]
+  local consumer = [[local p = import "union_parts_provider"
+function create(): p.Packet<|integer|>
+  return p.Packet<|integer|>.moved {text = "ready", x = 1, end = 2}
+end
+function named<|T|>(candidate: p.Packet<|integer|>, fallback: T): integer
+  case candidate
+  when moved{word = text; x; finish = end} then
+    local observed = word
+    return x + finish
+  catch
+    return x
+  else
+    return 0
+  end
+end
+function positional(candidate: p.Packet<|integer|>): integer
+  case candidate
+  when moved(coordinate) then return coordinate
+  else return 0
+  end
+end
+function generic_create<|T|>(item: T): p.Packet<|T|>
+  return p.Packet<|T|>.other(item)
+end
+type IntPacket = p.Packet<|integer|>
+function alias_create(): IntPacket
+  return IntPacket.other(1)
+end
+]]
+  return {
+    bridge.ProjectModule.new("union_parts_provider", {
+      bridge.SourceFile.new(provider_file, provider),
+    }),
+    bridge.ProjectModule.new("union_parts_consumer", {
+      bridge.SourceFile.new(consumer_file, consumer),
+    }),
+  }, provider_file, consumer_file, provider, consumer
+end
+
+local function assert_union_part_definition(model: features.Features,
+                                            source_file: string,
+                                            source: string, marker: string,
+                                            name: string,
+                                            provider_file: string,
+                                            provider: string,
+                                            declaration_marker: string)
+  local definition? = model:definition(source_file,
+    marked_name_position(source, marker, name))
+  local expected = marked_name_position(provider, declaration_marker, name)
+  test.assert(definition ~= nil and definition.uri == "file://" .. provider_file and
+    definition.range.start.line == expected.line and
+    definition.range.start.character == expected.character,
+    "named union part did not resolve to its own variant declaration: " .. marker)
+end
+
+local function preserves_named_union_part_semantics()
+  preload_real_compiler()
+  local projects, provider_file, consumer_file, provider, consumer = union_parts_fixture()
+  local analysis = bridge.load():analyze("union_parts_consumer", projects)
+  assert_clean_ffi_analysis(analysis, "named union part fixture failed")
+  local model = features.build(projects, analysis.modules)
+  defer model:close()
+  assert_union_part_definition(model, consumer_file, consumer, "x = 1", "x",
+    provider_file, provider, "x: T")
+  assert_union_part_definition(model, consumer_file, consumer, "word = text", "text",
+    provider_file, provider, "text: string")
+  assert_union_part_definition(model, consumer_file, consumer, "finish = end", "end",
+    provider_file, provider, "end: integer")
+  local references = model:references(provider_file,
+    marked_name_position(provider, "x: T", "x"), true)
+  test.assert(#references == 3,
+    "part references lost constructor/shorthand or included the other variant's x")
+  local other = model:references(provider_file,
+    marked_name_position(provider, "other(x", "x"), true)
+  test.assert(#other == 1, "same-spelled union parts shared a declaration identity")
+  local local_references = model:references(consumer_file,
+    marked_name_position(consumer, "; x;", "x"), true)
+  test.assert(#local_references == 3,
+    "shorthand local binding lost its body/catch references or included part labels")
+  local catch_hover? = model:hover(consumer_file,
+    marked_name_position(consumer, "    return x\n", "x"))
+  test.assert(catch_hover ~= nil and strings.find(catch_hover:markdown(), "integer") ~= nil,
+    "generic case binder lost its specialized type inside catch")
+  local positional? = model:definition(consumer_file,
+    marked_name_position(consumer, "return coordinate", "coordinate"))
+  local positional_decl = marked_name_position(consumer, "moved(coordinate)", "coordinate")
+  test.assert(positional ~= nil and positional.range.start.line == positional_decl.line and
+    positional.range.start.character == positional_decl.character,
+    "positional prefix binder lost its source declaration")
+  local union_hover? = model:hover(consumer_file,
+    marked_name_position(consumer, "candidate: p.Packet", "Packet"))
+  test.assert(union_hover ~= nil and
+    strings.find(union_hover:markdown(), "moved(x: integer, text: string, end: integer, note: string?)") ~= nil and
+    strings.find(union_hover:markdown(), "legacy(value: integer)") ~= nil,
+    "union hover lost named parts, generic specialization, or the legacy value part")
+  local constructor? = model:hover(consumer_file,
+    marked_name_position(consumer, ".moved {", "moved"))
+  test.assert(constructor ~= nil and constructor.callable_signature ~= nil and
+    constructor.callable_signature.display ==
+      "union_parts_provider.Packet<|integer|>.moved(x: integer, text: string, " ..
+      "end: integer, note: string?): union_parts_provider.Packet<|integer|>",
+    "variant constructor hover lost its applied named signature: " ..
+      (constructor ~= nil and constructor:markdown() or "missing hover"))
+  local create? = model:hover(consumer_file,
+    marked_name_position(consumer, "function create", "create"))
+  test.assert(create ~= nil and create.callable_signature ~= nil and
+    create.callable_signature.display ==
+      "union_parts_consumer.create(): union_parts_provider.Packet<|integer|>",
+    "analysis-only checking erased the constructor caller's return type")
+  local generic_constructor? = model:hover(consumer_file,
+    marked_name_position(consumer, ".other(item)", "other"))
+  test.assert(generic_constructor ~= nil and generic_constructor.callable_signature ~= nil and
+    generic_constructor.callable_signature.display ==
+      "union_parts_provider.Packet<|T|>.other(x: T): union_parts_provider.Packet<|T|>",
+    "generic function constructor hover lost its checked type parameter")
+  local fixed_constructor? = model:hover(consumer_file,
+    marked_name_position(consumer, "IntPacket.other", "other"))
+  test.assert(fixed_constructor ~= nil and fixed_constructor.callable_signature ~= nil and
+    fixed_constructor.callable_signature.display ==
+      "union_parts_provider.Packet<|integer|>.other(x: integer): " ..
+      "union_parts_provider.Packet<|integer|>",
+    "fixed alias constructor hover lost its applied signature")
+  local generic_parameter = marked_name_position(consumer, "generic_create<|T|>", "T")
+  local parameter_uses = model:references(consumer_file, generic_parameter, true)
+  test.assert(#parameter_uses == 4,
+    "written constructor namespace type argument was not indexed exactly once")
+end
+
+function test_compiler_bridge_preserves_named_union_part_semantics(_context: test.Context)
+  run_bridge(preserves_named_union_part_semantics)
+end
+
+local function renames_named_union_part(rename_part: boolean, keyword_part: boolean)
+  preload_real_compiler()
+  local projects, provider_file, consumer_file, provider, consumer = union_parts_fixture()
+  local analysis = bridge.load():analyze("union_parts_consumer", projects)
+  assert_clean_ffi_analysis(analysis, "named union rename fixture failed")
+  local model = features.build(projects, analysis.modules)
+  defer model:close()
+  local filename = rename_part and provider_file or consumer_file
+  local source = rename_part and provider or consumer
+  local marker = rename_part and (keyword_part and "end: integer" or "x: T") or "; x;"
+  local name = keyword_part and "end" or "x"
+  local candidate?, failure? = model:rename(filename,
+    marked_name_position(source, marker, name), "axis")
+  test.assert(candidate ~= nil and failure == nil, "named union rename had no candidate")
+  local edited = candidate:edited_project_modules()
+  local edited_provider = edited[1].files[1].contents
+  local edited_consumer = edited[2].files[1].contents
+  if rename_part and keyword_part then
+    test.assert(strings.find(edited_provider, "axis: integer") ~= nil and
+      strings.find(edited_consumer, "finish = axis") ~= nil and
+      strings.find(edited_consumer, "axis = 2") ~= nil,
+      "keyword part rename lost its declaration, constructor key, or case selector")
+  elseif rename_part then
+    test.assert(strings.find(edited_provider, "moved(axis: T") ~= nil and
+      strings.find(edited_provider, "other(x: T)") ~= nil and
+      strings.find(edited_consumer, "text; x = axis;") ~= nil and
+      strings.find(edited_consumer, "axis = 1") ~= nil and
+      strings.find(edited_consumer, "return x + finish") ~= nil,
+      "part rename changed its local shorthand binder or another variant")
+  else
+    test.assert(edited_provider == provider and
+      strings.find(edited_consumer, "text; axis = x;") ~= nil and
+      strings.find(edited_consumer, "return axis + finish") ~= nil and
+      strings.find(edited_consumer, "    return axis\n") ~= nil and
+      strings.find(edited_consumer, "x = 1") ~= nil,
+      "local shorthand rename changed the selected part")
+  end
+  local checked = bridge.load():analyze("union_parts_consumer", edited)
+  assert_clean_ffi_analysis(checked, "named union rename did not compile")
+  local verified?, verify_failure? = candidate:preflight(checked)
+  test.assert(verified ~= nil and verify_failure == nil,
+    "named union rename failed identity preflight: " ..
+      (verify_failure ~= nil and verify_failure.message or "no verified result"))
+end
+
+function test_compiler_bridge_renames_named_union_parts(context: test.Context)
+  context:run("shorthand_local", function(_child: test.Context)
+    run_bridge(function() renames_named_union_part(false, false) end)
+  end)
+  context:run("shorthand_part", function(_child: test.Context)
+    run_bridge(function() renames_named_union_part(true, false) end)
+  end)
+  context:run("keyword_part", function(_child: test.Context)
+    run_bridge(function() renames_named_union_part(true, true) end)
+  end)
+end
+
+local function restores_named_union_part_descriptors()
+  preload_real_compiler()
+  local projects, provider_file, consumer_file, provider, consumer = union_parts_fixture()
+  local compiler = bridge.load()
+  local initial = compiler:analyze("union_parts_consumer", projects)
+  assert_clean_ffi_analysis(initial, "cached union part fixture failed")
+  local provider_snapshot = initial:find_module("union_parts_provider") as bridge.ModuleSnapshot
+  local payloads = compiler:export_projects(projects, {"union_parts_provider", "union_parts_consumer"})
+  local restored = bridge.load()
+  test.assert(#restored:restore_projects(projects, payloads) == 2,
+    "named union declaration descriptors did not restore")
+  local changed = restored:analyze_incremental(projects, {"union_parts_consumer"}, {})
+  assert_clean_ffi_analysis(changed, "restored union part descriptors were not usable")
+  test.assert(changed:find_module("union_parts_provider") == nil,
+    "unchanged union provider was rechecked after descriptor restoration")
+  local consumer_snapshot = changed:find_module("union_parts_consumer") as bridge.ModuleSnapshot
+  local model = features.build(projects, {provider_snapshot, consumer_snapshot})
+  defer model:close()
+  assert_union_part_definition(model, consumer_file, consumer, "x = 1", "x",
+    provider_file, provider, "x: T")
+  assert_union_part_definition(model, consumer_file, consumer, "word = text", "text",
+    provider_file, provider, "text: string")
+  test.assert(#model:references(provider_file,
+    marked_name_position(provider, "x: T", "x"), true) == 3,
+    "restored constructor/case metadata changed union part identities")
+end
+
+function test_compiler_bridge_restores_named_union_part_descriptors(_context: test.Context)
+  run_bridge(restores_named_union_part_descriptors)
 end

@@ -11,6 +11,13 @@ record SymbolId
   const declaration_id: string
 end
 
+-- One shorthand token has two semantic identities. Queries choose the local
+-- binding at the caret and project the part reference when listing that part.
+union SharedCaseName
+  binding(part_id: string)
+  part(binding_id: string)
+end
+
 record Occurrence
   const symbol_id: SymbolId
   const module_name: string
@@ -24,6 +31,7 @@ record Occurrence
   const type_info: bridge.TypeInfo?
   const callable_signature: bridge.CallableSignature?
   const summary_id: integer?
+  const shared_case_name: SharedCaseName?
 end
 
 record Error
@@ -373,12 +381,16 @@ local function append_snapshot_occurrences(
           "compiler occurrence has an empty identifier")
       end
       local span, bytes = validate_span(snapshot.module_name, saved, symbol)
+      local shared: SharedCaseName? = nil
+      if symbol.case_part_id ~= nil then
+        shared = SharedCaseName.binding(symbol.case_part_id)
+      end
       target[#target + 1] = Occurrence.new(
         SymbolId.new(symbol.declaration_id), snapshot.module_name,
         symbol.location.filename, symbol.name, symbol.role, span, bytes,
         symbol.is_local, symbol.visibility, symbol.type_info,
         symbol.callable_signature,
-        summary_id)
+        summary_id, shared)
     end
   end
 end
@@ -501,7 +513,7 @@ end
 
 local OCCURRENCE_COLUMNS = "declaration_id,module_name,filename,name,role," ..
   "start_line,start_character,finish_line,finish_character,byte_start," ..
-  "byte_finish,is_local,visibility,type_tag,type_display,callable,summary_id"
+  "byte_finish,is_local,visibility,type_tag,type_display,callable,summary_id,case_part_id"
 local SOURCE_ORDER = " ORDER BY filename,byte_start,byte_finish,declaration_id,role"
 
 function initialize_schema(connection: sqlite3.Connection)
@@ -523,7 +535,7 @@ function initialize_schema(connection: sqlite3.Connection)
     "finish_line INTEGER NOT NULL,finish_character INTEGER NOT NULL," ..
     "byte_start INTEGER NOT NULL,byte_finish INTEGER NOT NULL," ..
     "is_local INTEGER NOT NULL,visibility INTEGER NOT NULL," ..
-    "type_tag BLOB,type_display BLOB,callable BLOB,summary_id INTEGER)")
+    "type_tag BLOB,type_display BLOB,callable BLOB,summary_id INTEGER,case_part_id BLOB)")
   execute(connection, "CREATE TABLE IF NOT EXISTS main.semantic_occurrence_inputs AS " ..
     "SELECT " .. OCCURRENCE_COLUMNS .. " FROM main.semantic_occurrences WHERE 0")
   execute(connection, "CREATE INDEX IF NOT EXISTS main.semantic_occurrences_file " ..
@@ -534,6 +546,8 @@ function initialize_schema(connection: sqlite3.Connection)
     "ON semantic_files(module_name,file_order)")
   execute(connection, "CREATE INDEX IF NOT EXISTS main.semantic_occurrences_symbol " ..
     "ON semantic_occurrences(declaration_id,filename,byte_start)")
+  execute(connection, "CREATE INDEX IF NOT EXISTS main.semantic_occurrences_case_part " ..
+    "ON semantic_occurrences(case_part_id) WHERE case_part_id IS NOT NULL")
   execute(connection, "CREATE UNIQUE INDEX IF NOT EXISTS main.semantic_declarations " ..
     "ON semantic_occurrences(declaration_id) WHERE role IN (0,1)")
 end
@@ -622,7 +636,7 @@ function binding(parameters: {value}, item: value): string
 end
 
 -- Eleven rows stay below Titan's 200-position variadic-call limit even when
--- all seventeen columns are non-NULL. SQL orders and normalizes the rows.
+-- all eighteen columns are non-NULL. SQL orders and normalizes the rows.
 local function publish_occurrences(connection: sqlite3.Connection,
                                    items: {Occurrence})
   local offset = 1
@@ -634,6 +648,15 @@ local function publish_occurrences(connection: sqlite3.Connection,
     for index = offset, finish do
       if index > offset then sql = sql .. "," end
       local item = items[index]
+      local case_part_id: string? = nil
+      if item.shared_case_name ~= nil then
+        case item.shared_case_name
+        when binding(part_id) then case_part_id = part_id
+        else
+          fail<|value|>(item.module_name, item.filename,
+            "a projected case part cannot be published as a source occurrence")
+        end
+      end
       sql = sql .. "(" .. binding(parameters, blob(item.symbol_id.declaration_id)) .. "," ..
         binding(parameters, blob(item.module_name)) .. "," ..
         binding(parameters, blob(item.filename)) .. "," ..
@@ -650,7 +673,8 @@ local function publish_occurrences(connection: sqlite3.Connection,
         binding(parameters, type_tag(item.type_info)) .. "," ..
         binding(parameters, type_display(item.type_info)) .. "," ..
         binding(parameters, signature_blob(item.callable_signature)) .. "," ..
-        binding(parameters, item.summary_id) .. ")"
+        binding(parameters, item.summary_id) .. "," ..
+        binding(parameters, blob(case_part_id)) .. ")"
     end
     local statement = connection:prepare(sql)
     defer statement:close()
@@ -899,20 +923,33 @@ function row_signature(row: sqlite3.Row, column: integer): bridge.CallableSignat
   return bridge.CallableSignature.new(display)
 end
 
-local function row_occurrence(row: sqlite3.Row): Occurrence
-  return Occurrence.new(SymbolId.new(bytes(row, 1)), bytes(row, 2),
-    bytes(row, 3), bytes(row, 4), row_role(row, 5),
+local function row_occurrence(row: sqlite3.Row, selected_id: string?): Occurrence
+  local declaration_id = bytes(row, 1)
+  local role = row_role(row, 5)
+  local shared: SharedCaseName? = nil
+  local case_part_id? = optional_bytes(row, 18)
+  if case_part_id ~= nil then
+    if selected_id == case_part_id then
+      shared = SharedCaseName.part(declaration_id)
+      declaration_id = case_part_id
+      role = bridge.OccurrenceRole.reference()
+    else
+      shared = SharedCaseName.binding(case_part_id)
+    end
+  end
+  return Occurrence.new(SymbolId.new(declaration_id), bytes(row, 2),
+    bytes(row, 3), bytes(row, 4), role,
     source_text.Span.new(
       source_text.Position.new(row:get(6) as integer, row:get(7) as integer),
       source_text.Position.new(row:get(8) as integer, row:get(9) as integer)),
     source_text.ByteSpan.new(row:get(10) as integer, row:get(11) as integer),
     (row:get(12) as integer) ~= 0, row_visibility(row, 13),
-    row_type(row, 14), row_signature(row, 16), row:get(17) as integer?)
+    row_type(row, 14), row_signature(row, 16), row:get(17) as integer?, shared)
 end
 
-local function collect(cursor: sqlite3.Cursor): {Occurrence}
+local function collect(cursor: sqlite3.Cursor, selected_id: string?): {Occurrence}
   local result: {Occurrence} = {}
-  for row in cursor:fetch do result[#result + 1] = row_occurrence(row) end
+  for row in cursor:fetch do result[#result + 1] = row_occurrence(row, selected_id) end
   return result
 end
 
@@ -1044,12 +1081,13 @@ function Index:occurrences(symbol_id: SymbolId, include_declaration: boolean): {
   local access = self.store:acquire()
   defer access:release()
   check_generation(access.connection, self.published_generation)
-  local predicate = " WHERE declaration_id=?"
+  local predicate = " WHERE (declaration_id=?"
   if not include_declaration then predicate = predicate .. " AND role NOT IN (0,1)" end
+  predicate = predicate .. ") OR case_part_id=?"
   local statement = access.connection:prepare("SELECT " .. OCCURRENCE_COLUMNS ..
     " FROM main.semantic_occurrences" .. predicate .. SOURCE_ORDER)
   defer statement:close()
-  local cursor = statement:query(blob(symbol_id.declaration_id))
+  local cursor = statement:query(blob(symbol_id.declaration_id), blob(symbol_id.declaration_id))
   defer cursor:close()
-  return collect(cursor)
+  return collect(cursor, symbol_id.declaration_id)
 end

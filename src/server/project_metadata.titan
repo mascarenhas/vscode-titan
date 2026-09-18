@@ -10,19 +10,10 @@ record SourceFileSnapshot
   const stamp: project_graph.FileStamp
 end
 
-record ExternalSource
-  const main_file: string
-  const source_files: {string}
-end
-
-record ExternalBinary
-  const provider_file: string
-end
-
 union ExternalOrigin
-  source(ExternalSource)
-  dynamic_binary(ExternalBinary)
-  static_binary(ExternalBinary)
+  source(main_file: string, source_files: {string})
+  dynamic_binary(provider_file: string)
+  static_binary(provider_file: string)
 end
 
 -- This record intentionally cannot carry compiler nodes, symbols, or a raw
@@ -282,9 +273,9 @@ end
 local function origin_values(origin: ExternalOrigin?): (integer?, string?)
   if origin == nil then return nil, nil end
   case origin
-  when source(source) then return 0, source.main_file
-  when dynamic_binary(binary) then return 1, binary.provider_file
-  when static_binary(binary) then return 2, binary.provider_file
+  when source{main_file} then return 0, main_file
+  when dynamic_binary{provider_file} then return 1, provider_file
+  when static_binary{provider_file} then return 2, provider_file
   end
 end
 
@@ -292,16 +283,16 @@ local function Metadata:origin(scope: integer, name: string,
     kind: integer?, main_path: string?): ExternalOrigin?
   if kind == nil then return nil end
   if kind == 1 then
-    return ExternalOrigin.dynamic_binary(ExternalBinary.new(main_path))
+    return ExternalOrigin.dynamic_binary(main_path)
   elseif kind == 2 then
-    return ExternalOrigin.static_binary(ExternalBinary.new(main_path))
+    return ExternalOrigin.static_binary(main_path)
   end
   local rows = sql.rows(self.connection,
     "SELECT path FROM main.external_sources WHERE scope=? AND module=? ORDER BY ordinal",
     scope, sqlite3.Blob.new(name))
   local files: {string} = {}
   for index = 1, #rows do files[index] = sql.bytes(rows[index], 1) end
-  return ExternalOrigin.source(ExternalSource.new(main_path, files))
+  return ExternalOrigin.source(main_path, files)
 end
 
 local function Metadata:write_origin(scope: integer, name: string,
@@ -311,11 +302,11 @@ local function Metadata:write_origin(scope: integer, name: string,
     scope, sqlite3.Blob.new(name))
   if origin == nil then return end
   case origin
-  when source(source) then
+  when source{source_files} then
     local insert = batch(self.connection, "external_sources", 4)
-    for index = 1, #source.source_files do
+    for index = 1, #source_files do
       insert:append({scope, sqlite3.Blob.new(name), index,
-        sqlite3.Blob.new(source.source_files[index])})
+        sqlite3.Blob.new(source_files[index])})
     end
     insert:flush()
   else

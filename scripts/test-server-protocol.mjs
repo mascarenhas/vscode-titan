@@ -554,6 +554,155 @@ async function writeSavedGeneration(
   );
 }
 
+async function testUnionPayloadSemantics() {
+  const root = await makePhysicalTemporaryRoot("vscode-titan-union-parts-");
+  const filename = path.join(root, "messages.titan");
+  const uri = pathToFileURL(filename).href;
+  const sourceLines = [
+    "union Message",
+    "  moved(x: integer, text: string, end: integer, note: string?)",
+    "  empty()",
+    "end",
+    "function positional(): Message",
+    '  return Message.moved(1, "one", 3)',
+    "end",
+    "function named(): Message",
+    '  return Message.moved { text = "two", end = 4, x = 2 }',
+    "end",
+    "function first(message: Message): integer",
+    "  case message",
+    "  when moved(coordinate) then",
+    "    return coordinate",
+    "  else",
+    "    return 0",
+    "  end",
+    "end",
+    "function describe(message: Message): string",
+    "  case message",
+    "  when moved{body = text; x; finish = end} then",
+    "    return body .. x .. finish",
+    "  catch",
+    "    return body",
+    "  when empty() then",
+    '    return "empty"',
+    "  end",
+    "end",
+    "union GenericMessage<|T|>",
+    "  packet(item: T, label: string)",
+    "end",
+    "function genericNamed(): GenericMessage<|integer|>",
+    '  return GenericMessage<|integer|>.packet {label = "named", item = 1}',
+    "end",
+    "function genericPositional(): GenericMessage<|integer|>",
+    '  return GenericMessage<|integer|>.packet(2, "positional")',
+    "end",
+    ""
+  ];
+  await writeFile(path.join(root, "titan-config.lua"),
+    'include = { "." }\nsource_module_roots = { "." }\n');
+  await writeFile(filename, sourceLines.join("\n"));
+  const child = launch(root);
+  const exit = exitOf(child);
+  const stderr = collect(child.stderr);
+  const responses = new FrameReader(child.stdout);
+  let id = 1;
+  const position = (line, name) => ({
+    line, character: sourceLines[line].indexOf(name) + Math.min(1, name.length - 1)
+  });
+  const at = (line, name) => ({ textDocument: { uri }, position: position(line, name) });
+  const query = (method, params) => semanticRequest(
+    child, responses, id++, `textDocument/${method}`, params
+  );
+  try {
+    await request(child, responses, id++, "initialize", {});
+    child.stdin.write(frame({ jsonrpc: "2.0", method: "initialized", params: {} }));
+    await waitForIndexing(responses);
+
+    const summary = await query("hover", at(0, "Message"));
+    assert.equal(summary.error, undefined, JSON.stringify(summary));
+    assert.match(summary.result.contents.value, /moved\(x: integer, text: string, end: integer, note: string\?\)/);
+    for (const line of [5, 8]) {
+      const constructor = await query("hover", at(line, "moved"));
+      assert.equal(constructor.error, undefined, JSON.stringify(constructor));
+      assert.match(constructor.result.contents.value, /x: integer/);
+      assert.match(constructor.result.contents.value, /text: string/);
+      assert.match(constructor.result.contents.value, /note: string\?/);
+    }
+    for (const line of [32, 35]) {
+      const constructor = await query("hover", at(line, "packet"));
+      assert.equal(constructor.error, undefined, JSON.stringify(constructor));
+      assert.match(constructor.result?.contents.value ?? "",
+        /packet\(item: integer, label: string\)/,
+        "saved generic constructor hover must preserve the checked specialization");
+    }
+    const prefix = await query("definition", at(13, "coordinate"));
+    assert.deepEqual(prefix.result, {
+      uri, range: {
+        start: { line: 12, character: sourceLines[12].indexOf("coordinate") },
+        end: { line: 12, character: sourceLines[12].indexOf("coordinate") + 10 }
+      }
+    });
+    const prefixHover = await query("hover", at(13, "coordinate"));
+    assert.match(prefixHover.result.contents.value, /integer/);
+
+    const selectedPart = await query("definition", at(20, "text"));
+    assert.deepEqual(selectedPart.result, {
+      uri, range: {
+        start: { line: 1, character: sourceLines[1].indexOf("text") },
+        end: { line: 1, character: sourceLines[1].indexOf("text") + 4 }
+      }
+    });
+    const partRename = await query("rename", { ...at(1, "x"), newName: "axis" });
+    assert.equal(partRename.error, undefined, JSON.stringify(partRename));
+    const partEdits = partRename.result.changes[uri];
+    assert.equal(partEdits.length, 3);
+    assert.ok(partEdits.some((edit) => edit.range.start.line === 1 && edit.newText === "axis"));
+    assert.ok(partEdits.some((edit) => edit.range.start.line === 8 && edit.newText === "axis"));
+    assert.ok(partEdits.some((edit) => edit.range.start.line === 20 && edit.newText === "x = axis"),
+      "renaming a selected part must preserve a shorthand binder's local name");
+
+    const aliasReferences = await query("references", {
+      ...at(21, "body"), context: { includeDeclaration: true }
+    });
+    assert.deepEqual(aliasReferences.result.map((location) => location.range.start.line).sort((a, b) => a - b),
+      [20, 21, 23], "named alias must remain visible in its arm and catch");
+    const catchHover = await query("hover", at(23, "body"));
+    assert.match(catchHover.result.contents.value, /string/);
+    const aliasRename = await query("rename", { ...at(21, "body"), newName: "description" });
+    assert.equal(aliasRename.error, undefined, JSON.stringify(aliasRename));
+    assert.equal(aliasRename.result.changes[uri].length, 3);
+    assert.ok(aliasRename.result.changes[uri].every((edit) => edit.newText === "description"));
+
+    const shorthandRename = await query("rename", { ...at(21, "x"), newName: "axis" });
+    assert.equal(shorthandRename.error, undefined, JSON.stringify(shorthandRename));
+    const edits = shorthandRename.result.changes[uri];
+    assert.equal(edits.length, 2);
+    assert.ok(edits.some((edit) => edit.range.start.line === 20 && edit.newText === "axis = x"),
+      "renaming a shorthand binder must preserve its selected part");
+    assert.ok(edits.some((edit) => edit.range.start.line === 21 && edit.newText === "axis"));
+    for (const edit of [...edits].sort((a, b) =>
+      b.range.start.line - a.range.start.line || b.range.start.character - a.range.start.character)) {
+      assert.equal(edit.range.start.line, edit.range.end.line);
+      const line = sourceLines[edit.range.start.line];
+      sourceLines[edit.range.start.line] = line.slice(0, edit.range.start.character) +
+        edit.newText + line.slice(edit.range.end.character);
+    }
+    await writeSavedGeneration(responses, filename, sourceLines.join("\n"));
+    const renamedHover = await query("hover", at(21, "axis"));
+    assert.match(renamedHover.result?.contents.value ?? "", /integer/,
+      "the renamed named-case source must still typecheck and publish semantics");
+
+    await request(child, responses, id++, "shutdown", null);
+    child.stdin.end(frame({ jsonrpc: "2.0", method: "exit" }));
+    assert.deepEqual(await awaitExit(exit), { code: 0, signal: null });
+  } catch (cause) {
+    throw new Error(`${cause.message}; stderr: ${stderr().toString("utf8").trim()}`, { cause });
+  } finally {
+    if (child.exitCode === null && child.signalCode === null) child.kill();
+    await rm(root, { recursive: true, force: true });
+  }
+}
+
 async function testSavedProjectSemantics() {
   const root = await makePhysicalTemporaryRoot("vscode-titan-project-");
   const filename = path.join(root, "sample.titan");
@@ -971,9 +1120,13 @@ async function testSelfContainedCompilerModules({ sdkHeaders = false } = {}) {
       "const { reflect.FieldType }",
     "  return descriptor.fields",
     "end",
-    "function call_reflected(callback: reflect.LuaCFunctionValue): integer",
-    "  local result: integer = callback.entry(L)",
-    "  return result",
+    "function call_reflected(callback: reflect.Value): integer",
+    "  case callback",
+    "  when is_lua_c_function{callback_entry = entry} then",
+    "    local result: integer = callback_entry(L)",
+    "    return result",
+    "  end",
+    "  return 0",
     "end",
     "function encode_json(subject: value, option: json.EncodeOption): string",
     "  return json.encode(subject, option, json.EncodeOption.max_depth(8))",
@@ -1055,6 +1208,12 @@ async function testSelfContainedCompilerModules({ sdkHeaders = false } = {}) {
         types: [/titan\.reflect\.RecordType/, /const/, /titan\.reflect\.FieldType/]
       },
       {
+        module: "reflect-callback",
+        name: "callback_entry",
+        prefix: "    local result: integer = callback_entry(",
+        types: [/lua_State/, /int/]
+      },
+      {
         module: "json",
         name: "encode_json",
         types: [/titan\.json\.EncodeOption/, /string/]
@@ -1090,6 +1249,33 @@ async function testSelfContainedCompilerModules({ sdkHeaders = false } = {}) {
         assert.match(hover.result.contents.value, type);
       }
     }
+    const callbackBindingLine = lines.findIndex((line) =>
+      line.includes("is_lua_c_function{callback_entry = entry}"));
+    const callbackCallLine = lines.findIndex((line) =>
+      line.includes("callback_entry(L)"));
+    assert.ok(callbackBindingLine >= 0 && callbackCallLine >= 0);
+    const callbackBindingColumn = lines[callbackBindingLine].indexOf("callback_entry");
+    const callbackDefinition = await semanticRequest(
+      child,
+      responses,
+      "self-contained-reflect-callback-definition",
+      "textDocument/definition",
+      {
+        textDocument: { uri },
+        position: {
+          line: callbackCallLine,
+          character: lines[callbackCallLine].indexOf("callback_entry") + 1
+        }
+      }
+    );
+    assert.equal(callbackDefinition.error, undefined, JSON.stringify(callbackDefinition.error));
+    assert.deepEqual(callbackDefinition.result, {
+      uri,
+      range: {
+        start: { line: callbackBindingLine, character: callbackBindingColumn },
+        end: { line: callbackBindingLine, character: callbackBindingColumn + "callback_entry".length }
+      }
+    }, "packaged reflected callback must navigate to its named case binding");
     assert.ok(
       responses.diagnosticPublications.every(
         (publication) => publication.diagnostics.length === 0
@@ -1771,6 +1957,7 @@ if (isMain) {
     await testCoalescedIndexingResetStatus();
     await testLifecycle();
     await testSavedProjectSemantics();
+    await testUnionPayloadSemantics();
     await testUnmappedSourceWarnings();
     await testConfigCannotWriteProtocolStdout();
     await testSourceImportCppflagsAndUnchangedRequests();

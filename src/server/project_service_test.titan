@@ -137,7 +137,7 @@ local function project_provenance(
   local files: {string} = {}
   for index = 1, #module.files do files[index] = module.files[index].filename end
   return compiler_bridge.Provenance.project_source(
-    compiler_bridge.SourceProvenance.new(files[1], files))
+    files[1], files)
 end
 
 local function location(module: compiler_bridge.ProjectModule):
@@ -460,8 +460,7 @@ local function RecordingAnalyzer:analyze(
       snapshots[#snapshots + 1] = compiler_bridge.ModuleSnapshot.new(
         "vendor.source",
         compiler_bridge.Provenance.external_source(
-          compiler_bridge.SourceProvenance.new(
-            self.external_main, self.external_files)),
+            self.external_main, self.external_files),
         compiler_bridge.Manifest.new(
           "vendor.source", "vendor-public",
           external_source_manifest(
@@ -474,8 +473,7 @@ local function RecordingAnalyzer:analyze(
     snapshots[#snapshots + 1] = compiler_bridge.ModuleSnapshot.new(
       "vendor.inner",
       compiler_bridge.Provenance.external_source(
-        compiler_bridge.SourceProvenance.new(
-          self.external_dependency_main, self.external_dependency_files)),
+          self.external_dependency_main, self.external_dependency_files),
       compiler_bridge.Manifest.new(
         "vendor.inner", "inner-public",
         external_source_manifest("vendor.inner", "inner-public", {})),
@@ -498,7 +496,7 @@ local function RecordingAnalyzer:analyze(
     snapshots[#snapshots + 1] = compiler_bridge.ModuleSnapshot.new(
       "vendor.binary",
       compiler_bridge.Provenance.dynamic_binary(
-        compiler_bridge.BinaryProvenance.new(self.binary_file)),
+        self.binary_file),
       binary_manifest,
       {external_node(self.binary_file)}, {}, {}, {}, nil,
       provider_identity)
@@ -512,7 +510,7 @@ local function RecordingAnalyzer:analyze(
     contextual[1] = compiler_bridge.ContextualResolution.new(
       "vendor.owner", "vendor.binary",
       compiler_bridge.Provenance.dynamic_binary(
-        compiler_bridge.BinaryProvenance.new(owner_file)),
+        owner_file),
       true, observed_provider_identity(owner_file))
   end
   if self.write_during_analysis ~= nil then
@@ -722,9 +720,9 @@ local function loads_multi_module_folder_and_external_metadata()
                 binary ~= nil and #binary.stamps == 1,
                 "external source files or binary provider stamps were lost")
     case source.origin
-    when source(origin) then
-      test.assert(#origin.source_files == 2 and
-                  origin.source_files[2] == fixture:path("external/part.titan"),
+    when source{source_main_file = main_file; source_paths = source_files} then
+      test.assert(#source_paths == 2 and
+                  source_paths[2] == fixture:path("external/part.titan"),
                   "external source provenance lost a folder constituent")
     else test.assert(false, "external source used a binary origin")
     end
@@ -1526,8 +1524,7 @@ local function rekeys_externals_after_any_config_change()
     local resolver = new_resolver()
     resolver.provenance["vendor.source"] =
       compiler_bridge.Provenance.external_source(
-        compiler_bridge.SourceProvenance.new(
-          external_main, {external_main}))
+          external_main, {external_main})
     local service = require_resolved_service(fixture, analyzer, resolver)
     local before = service:counters()
 
@@ -1660,11 +1657,10 @@ local function detects_external_provider_and_folder_topology_changes()
     local resolver = new_resolver()
     resolver.provenance["vendor.source"] =
       compiler_bridge.Provenance.external_source(
-        compiler_bridge.SourceProvenance.new(
-          external_main, {external_main}))
+          external_main, {external_main})
     resolver.provenance["vendor.binary"] =
       compiler_bridge.Provenance.dynamic_binary(
-        compiler_bridge.BinaryProvenance.new(first))
+        first)
     local service = require_resolved_service(fixture, analyzer, resolver)
     local before = service:counters()
 
@@ -1673,7 +1669,7 @@ local function detects_external_provider_and_folder_topology_changes()
     analyzer.binary_file = second
     resolver.provenance["vendor.binary"] =
       compiler_bridge.Provenance.dynamic_binary(
-        compiler_bridge.BinaryProvenance.new(second))
+        second)
     local switched?, switch_error? = service:refresh()
     local after_switch = service:counters()
     local binary? = service:external_module("vendor.binary")
@@ -1687,8 +1683,8 @@ local function detects_external_provider_and_folder_topology_changes()
                 binary ~= nil,
                 "new external provider did not narrowly recheck its consumer")
     case binary.origin
-    when dynamic_binary(origin) then
-      test.assert(origin.provider_file == second,
+    when dynamic_binary{binary_file = provider_file} then
+      test.assert(binary_file == second,
                   "external provider switch retained the old identity")
     else test.assert(false, "dynamic provider changed provenance kind")
     end
@@ -1698,8 +1694,7 @@ local function detects_external_provider_and_folder_topology_changes()
     analyzer.external_files = {external_main, part}
     resolver.provenance["vendor.source"] =
       compiler_bridge.Provenance.external_source(
-        compiler_bridge.SourceProvenance.new(
-          external_main, {external_main, part}))
+          external_main, {external_main, part})
     local added?, add_error? = service:refresh()
     local after_add = service:counters()
     local source? = service:external_module("vendor.source")
@@ -1714,8 +1709,7 @@ local function detects_external_provider_and_folder_topology_changes()
     analyzer.external_files = {external_main}
     resolver.provenance["vendor.source"] =
       compiler_bridge.Provenance.external_source(
-        compiler_bridge.SourceProvenance.new(
-          external_main, {external_main}))
+          external_main, {external_main})
     local removed?, remove_error? = service:refresh()
     local after_remove = service:counters()
     source = service:external_module("vendor.source")
@@ -1755,10 +1749,10 @@ local function invalidates_a_compiled_facade_when_its_contextual_owner_moves()
     local resolver = new_resolver()
     resolver.provenance["vendor.binary"] =
       compiler_bridge.Provenance.dynamic_binary(
-        compiler_bridge.BinaryProvenance.new(facade))
+        facade)
     resolver.provenance["vendor.owner"] =
       compiler_bridge.Provenance.dynamic_binary(
-        compiler_bridge.BinaryProvenance.new(first_owner))
+        first_owner)
     local service = require_resolved_service(fixture, analyzer, resolver)
 
     local facade_imports = service:direct_imports("vendor.binary")
@@ -1774,7 +1768,7 @@ local function invalidates_a_compiled_facade_when_its_contextual_owner_moves()
     analyzer.contextual_owner_file = second_owner
     resolver.provenance["vendor.owner"] =
       compiler_bridge.Provenance.dynamic_binary(
-        compiler_bridge.BinaryProvenance.new(second_owner))
+        second_owner)
     local report?, failure? = service:refresh()
     local after = service:counters()
     test.assert(failure == nil and report ~= nil and not report.stale and
@@ -1841,7 +1835,7 @@ local function missing_provider_appearance_recovers_failed_revision()
           modules[2] = compiler_bridge.ModuleSnapshot.new(
             "vendor.binary",
             compiler_bridge.Provenance.dynamic_binary(
-              compiler_bridge.BinaryProvenance.new(provider)),
+              provider),
             compiler_bridge.Manifest.new(
               "vendor.binary", "binary-public", nil),
             {}, {}, {}, {}, nil, provider_identity)
@@ -1880,7 +1874,7 @@ local function missing_provider_appearance_recovers_failed_revision()
     fixture:write("binary-modules/provider.so", "available provider")
     resolver.provenance["vendor.binary"] =
       compiler_bridge.Provenance.dynamic_binary(
-        compiler_bridge.BinaryProvenance.new(provider))
+        provider)
     available = true
     local recovered?, recovery_error? = service:refresh()
     local current? = find_project(service:latest(), "app.main")
@@ -1914,7 +1908,7 @@ local function accepts_stable_first_binary_provider()
     local resolver = new_resolver()
     resolver.provenance["vendor.binary"] =
       compiler_bridge.Provenance.dynamic_binary(
-        compiler_bridge.BinaryProvenance.new(provider))
+        provider)
 
     local service = require_resolved_service(fixture, analyzer, resolver)
     local counters = service:counters()
@@ -1975,8 +1969,7 @@ local function validates_binary_observation_before_source_result()
           compiler_bridge.ModuleSnapshot.new(
             "vendor.mixed",
             compiler_bridge.Provenance.external_source(
-              compiler_bridge.SourceProvenance.new(
-                source_provider, {source_provider})),
+                source_provider, {source_provider}),
             compiler_bridge.Manifest.new(
               "vendor.mixed", "mixed-public",
               external_source_manifest(
@@ -2079,7 +2072,7 @@ local function retries_conflicting_binary_against_existing_baseline()
     local resolver = new_resolver()
     resolver.provenance["vendor.binary"] =
       compiler_bridge.Provenance.dynamic_binary(
-        compiler_bridge.BinaryProvenance.new(provider))
+        provider)
     local service = require_resolved_service(fixture, analyzer, resolver)
     local before = service:counters()
 
@@ -2126,7 +2119,7 @@ local function retries_replaced_first_binary_provider()
     local resolver = new_resolver()
     resolver.provenance["vendor.binary"] =
       compiler_bridge.Provenance.dynamic_binary(
-        compiler_bridge.BinaryProvenance.new(provider))
+        provider)
     local service = require_resolved_service(fixture, analyzer, resolver)
     local before = service:counters()
 
@@ -2169,10 +2162,10 @@ local function accepts_stable_first_contextual_provider()
     local resolver = new_resolver()
     resolver.provenance["vendor.binary"] =
       compiler_bridge.Provenance.dynamic_binary(
-        compiler_bridge.BinaryProvenance.new(facade))
+        facade)
     resolver.provenance["vendor.owner"] =
       compiler_bridge.Provenance.dynamic_binary(
-        compiler_bridge.BinaryProvenance.new(owner))
+        owner)
 
     local service = require_resolved_service(fixture, analyzer, resolver)
     local before = service:counters()
@@ -2221,10 +2214,10 @@ local function retries_replaced_first_contextual_provider()
     local resolver = new_resolver()
     resolver.provenance["vendor.binary"] =
       compiler_bridge.Provenance.dynamic_binary(
-        compiler_bridge.BinaryProvenance.new(facade))
+        facade)
     resolver.provenance["vendor.owner"] =
       compiler_bridge.Provenance.dynamic_binary(
-        compiler_bridge.BinaryProvenance.new(owner))
+        owner)
 
     local service = require_resolved_service(fixture, analyzer, resolver)
     local before = service:counters()
@@ -2270,8 +2263,7 @@ local function rejects_external_change_during_analysis()
     local resolver = new_resolver()
     resolver.provenance["vendor.source"] =
       compiler_bridge.Provenance.external_source(
-        compiler_bridge.SourceProvenance.new(
-          external_main, {external_main}))
+          external_main, {external_main})
     local service = require_resolved_service(fixture, analyzer, resolver)
     local before = service:counters()
 
@@ -2938,7 +2930,7 @@ function test_project_service_same_content_external_touch_preserves_cached_inter
         else
           local resolver = new_resolver()
           resolver.provenance["vendor.source"] = compiler_bridge.Provenance.external_source(
-            compiler_bridge.SourceProvenance.new(path, {path}))
+            path, {path})
           service = require_resolved_service(fixture, analyzer, resolver)
         end
         if service == nil then raise "external touch fixture Service is missing" end

@@ -308,6 +308,32 @@ function test_coordinator_rejects_duplicate_active_request_ids(
   test_runtime.run(rejects_duplicate_active_request_ids)
 end
 
+function test_coordinator_preserves_semantic_failure_parts(_context: test.Context)
+  test_runtime.run(function ()
+    local output = response_queue.create()
+    local handler: coordinator.SemanticHandler = function (
+        _request: dispatcher.SemanticRequest): dispatcher.SemanticOutcome
+      return dispatcher.SemanticOutcome.failure {
+        message = "saved project changed; retry",
+        code = -32803,
+      }
+    end
+    local server = coordinator.create(output, handler)
+    defer server:cancel_all("semantic failure test cleanup")
+    initialize(server, output)
+    server:handle([[{"jsonrpc":"2.0","id":"failed","method":"test/failure"}]])
+    while server:active_count() > 0 do timer.yield() end
+    test.assert(output:pending() == 1,
+      "semantic failure did not produce exactly one terminal response")
+    local response = response_object(output:take())
+    local failure? = wire.as_object(response["error"])
+    test.assert(wire.as_string(response["id"]) == "failed" and
+      failure ~= nil and wire.as_integer(failure["code"]) == -32803 and
+      wire.as_string(failure["message"]) == "saved project changed; retry",
+      "semantic failure lost its request id, code, or message")
+  end)
+end
+
 local function recovers_after_unencodable_result_and_preserves_nulls()
   local output = response_queue.create()
   local handler: coordinator.SemanticHandler = function (

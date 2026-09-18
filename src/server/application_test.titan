@@ -173,7 +173,7 @@ local function project_snapshot(module: bridge.ProjectModule):
   return bridge.ModuleSnapshot.new(
     module.module_name,
     bridge.Provenance.project_source(
-      bridge.SourceProvenance.new(filenames[1], filenames)),
+      filenames[1], filenames),
     bridge.Manifest.new(
       module.module_name, "public:" .. module.module_name,
       "source:" .. module.module_name),
@@ -202,7 +202,7 @@ local function SavingRenameAnalyzer:analyze(
   local checked = bridge.ModuleSnapshot.new(
     module.module_name,
     bridge.Provenance.project_source(
-      bridge.SourceProvenance.new(self.filename, {self.filename})),
+      self.filename, {self.filename}),
     bridge.Manifest.new(
       module.module_name, "public:" .. module.module_name,
       "source:" .. module.module_name),
@@ -344,8 +344,8 @@ local function result_array_length(
     local array? = wire.as_array(item)
     if array == nil then raise subject .. " did not return a JSON array" end
     return #array
-  when failure(failure) then
-    test.assert(false, subject .. ": " .. failure.message)
+  when failure{message} then
+    test.assert(false, subject .. ": " .. message)
   end
   return -1
 end
@@ -354,8 +354,8 @@ local function assert_result(outcome: dispatcher.SemanticOutcome,
                              subject: string)
   case outcome
   when result() then
-  when failure(failure) then
-    test.assert(false, subject .. ": " .. failure.message)
+  when failure{message} then
+    test.assert(false, subject .. ": " .. message)
   end
 end
 
@@ -372,8 +372,8 @@ local function assert_null_result(outcome: dispatcher.SemanticOutcome,
   case outcome
   when result(item) then
     test.assert(wire.is_null(item), subject .. " did not return null")
-  when failure(failure) then
-    test.assert(false, subject .. ": " .. failure.message)
+  when failure{message} then
+    test.assert(false, subject .. ": " .. message)
   end
 end
 
@@ -405,8 +405,7 @@ local function join_outcome(
   when cancelled() then raise subject .. " was cancelled"
   else raise subject .. " did not finish"
   end
-  return dispatcher.SemanticOutcome.failure(
-    dispatcher.SemanticError.new(-32603, subject .. " had no outcome"))
+  return dispatcher.SemanticOutcome.failure(-32603, subject .. " had no outcome")
 end
 
 local function with_application_state(
@@ -1508,8 +1507,7 @@ local function rebuilds_view_when_external_recheck_fails_clean_module()
           modules[#modules + 1] = bridge.ModuleSnapshot.new(
             name,
             bridge.Provenance.project_source(
-              bridge.SourceProvenance.new(
-                module.files[1].filename, {module.files[1].filename})),
+                module.files[1].filename, {module.files[1].filename}),
             nil, {}, {}, imports, {}, nil, nil)
           diagnostics[#diagnostics + 1] = bridge.Diagnostic.new(
             bridge.DiagnosticKind.type_error(),
@@ -1529,7 +1527,7 @@ local function rebuilds_view_when_external_recheck_fails_clean_module()
         modules[#modules + 1] = bridge.ModuleSnapshot.new(
           "vendor.binary",
           bridge.Provenance.dynamic_binary(
-            bridge.BinaryProvenance.new(provider_file)),
+            provider_file),
           bridge.Manifest.new("vendor.binary", "vendor-public", nil),
           {}, {}, {}, {}, nil, provider_identity)
         binary_observations[1] = bridge.BinaryProviderObservation.new(
@@ -1547,7 +1545,7 @@ local function rebuilds_view_when_external_recheck_fails_clean_module()
         resolutions[index] = bridge.ExternalResolution.new(
           requests[index].module_name,
           bridge.Provenance.dynamic_binary(
-            bridge.BinaryProvenance.new(provider_file)), nil)
+            provider_file), nil)
       end
       return resolutions
     end
@@ -2407,10 +2405,10 @@ local function rejects_save_during_successful_rename_preflight()
   case outcome
   when result() then
     test.assert(false, "rename returned edits for an obsolete saved generation")
-  when failure(failure) then
+  when failure{code; message} then
     test.assert(
-      failure.code == -32803 and
-      strings.find(failure.message,
+      code == -32803 and
+      strings.find(message,
                    "saved Titan project changed") ~= nil,
       "rename save race did not return the retryable RequestFailed error")
   end
@@ -2447,9 +2445,9 @@ local function rejects_query_captured_before_sql_publication()
     access:release()
     local rejected = false
     case join_outcome(queued, "query queued behind publication")
-    when failure(failure) then
-      rejected = failure.code == -32803 and
-        strings.find(failure.message, "retry", 1, true) ~= nil
+    when failure{code; message} then
+      rejected = code == -32803 and
+        strings.find(message, "retry", 1, true) ~= nil
     else
     end
     test.assert(rejected, "a captured old Features handle read the replacement generation")

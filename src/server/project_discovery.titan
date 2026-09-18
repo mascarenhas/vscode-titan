@@ -113,14 +113,8 @@ local record Candidate
   owner_by_file: {string: string}
 end
 
-local record PhysicalSource
-  kind: ModuleKind
-  main_file: string
-  files: {string}
-end
-
 local union SourceResolution
-  found(PhysicalSource)
+  found(kind: ModuleKind, main_file: string, files: {string})
   blocked(string)
 end
 
@@ -729,8 +723,7 @@ local function source_resolution_in_root(root: SourceRoot, name: string):
     for index = 1, #contributor_names do
       files[#files + 1] = join(folder, contributor_names[index])
     end
-    return SourceResolution.found(
-      PhysicalSource.new(ModuleKind.folder(), folder_main, files))
+    return SourceResolution.found(ModuleKind.folder(), folder_main, files)
   end
 
   local flat = join(root.lexical, relative .. ".titan")
@@ -744,8 +737,7 @@ local function source_resolution_in_root(root: SourceRoot, name: string):
       return SourceResolution.blocked(owner_main)
     end
   end
-  return SourceResolution.found(
-    PhysicalSource.new(ModuleKind.flat(), flat, {flat}))
+  return SourceResolution.found(ModuleKind.flat(), flat, {flat})
 end
 
 
@@ -762,21 +754,22 @@ local function module_is_folder(module: Module): boolean
   return module:is_folder()
 end
 
-local function physical_is_folder(source: PhysicalSource): boolean
-  case source.kind
+local function physical_is_folder(kind: ModuleKind): boolean
+  case kind
   when folder() then return true
   else return false
   end
 end
 
 local function same_physical_source(module: Module,
-                                    source: PhysicalSource): boolean
-  if module_is_folder(module) ~= physical_is_folder(source) or
-     #module.files ~= #source.files then
+                                    kind: ModuleKind,
+                                    files: {string}): boolean
+  if module_is_folder(module) ~= physical_is_folder(kind) or
+     #module.files ~= #files then
     return false
   end
   for index = 1, #module.files do
-    if canonical_path(module.files[index]) ~= canonical_path(source.files[index])
+    if canonical_path(module.files[index]) ~= canonical_path(files[index])
        then
       return false
     end
@@ -923,8 +916,8 @@ local function discover_or_raise(include: {string}, exclude: {string},
           "logical Titan module '" .. name ..
           "' is blocked by folder source '" .. blocking_source .. "'",
           IssueKind.invalid_module())
-      when found(source) then
-        if same_physical_source(candidate.module, source) then
+      when found{kind; main_file; files} then
+        if same_physical_source(candidate.module, kind, files) then
           modules[#modules + 1] = candidate.module
           for file, owner in iteration.pairs(candidate.owner_by_file) do
             if owner == name then owner_by_file[file] = name end
@@ -934,7 +927,7 @@ local function discover_or_raise(include: {string}, exclude: {string},
             candidate.module.main_file,
             "logical Titan module '" .. name ..
             "' resolves to a different physical provider through " ..
-            "source_module_roots: '" .. source.main_file .. "'",
+            "source_module_roots: '" .. main_file .. "'",
             IssueKind.invalid_module())
         end
       end

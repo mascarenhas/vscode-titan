@@ -182,6 +182,70 @@ describe("Titan TextMate grammar", () => {
     assertScope(state, "L", "variable.language.lua-state.titan");
   });
 
+  test("recognizes multiple union parts, constructors, and both case forms", () => {
+    const [declaration, parts, positional, named, prefix, selected, empty] =
+      tokenizeLines([
+        "union Message",
+        "  moved(x: integer, text: string, note: string?)",
+        'local first = Message.moved(1, "one")',
+        'local second = Message.moved { text = "two", x = 2 }',
+        "when moved(string) then",
+        "when moved{body = text; x} then",
+        "when moved{} then"
+      ]);
+
+    assertScope(declaration, "Message", "entity.name.type.titan");
+    assertScope(parts, "integer", "storage.type.primitive.titan");
+    assertScope(parts, ",", "punctuation.separator.titan");
+    assertScope(parts, "?", "keyword.operator.titan");
+    for (const line of [positional, named]) {
+      assertScope(line, "moved", "variable.other.member.titan");
+    }
+    for (const line of [prefix, selected, empty]) {
+      assertScope(line, "when", "keyword.control.titan");
+      assertScope(line, "moved", "entity.name.tag.titan");
+      assertScope(line, "then", "keyword.control.titan");
+    }
+    assertScope(prefix, "string", "variable.other.readwrite.titan");
+    assertScope(selected, "body", "variable.other.readwrite.titan");
+    assertScope(selected, "text", "variable.other.member.titan");
+    assertScope(selected, "x}", "variable.other.readwrite.titan");
+    assertScope(selected, ";", "punctuation.separator.titan");
+    assertScope(empty, "{", "punctuation.section.group.begin.titan");
+    assertScope(empty, "}", "punctuation.section.group.end.titan");
+  });
+
+  test("keeps named case aliases distinct from keyword parts across lines", () => {
+    const [head, comment, aliases, end, body] = tokenizeLines([
+      "when end {",
+      "  -- return is comment text",
+      "  finish = end; string = value, ffi",
+      "} then",
+      "return string"
+    ]);
+
+    assertScope(head, "end", "entity.name.tag.titan");
+    assertScope(comment, "return", "comment.line.double-dash.titan");
+    for (const name of ["finish", "string", "ffi"]) {
+      assertScope(aliases, name, "variable.other.readwrite.titan");
+    }
+    for (const name of ["end", "value"]) {
+      assertScope(aliases, name, "variable.other.member.titan");
+    }
+    assertScope(end, "then", "keyword.control.titan");
+    assertScope(body, "return", "keyword.control.titan");
+
+    const [splitAlias, splitPart, closed] = tokenizeLines([
+      "when moved{finish = -- selected part follows",
+      "end",
+      "} then"
+    ]);
+    assertScope(splitAlias, "finish", "variable.other.readwrite.titan");
+    assertScope(splitAlias, "selected", "comment.line.double-dash.titan");
+    assertScope(splitPart, "end", "variable.other.member.titan");
+    assertScope(closed, "then", "keyword.control.titan");
+  });
+
   test("allows contextual type and builtin words as local bindings", () => {
     const [typeWord, builtin] = tokenizeLines([
       "local string = 1",
@@ -258,5 +322,7 @@ describe("Titan TextMate grammar", () => {
       "case", "keyword.control.titan");
     assertScope(lines.find((line) => line.line.includes("0x1.8p1"))!,
       ".5", "constant.numeric.titan");
+    assertScope(lines.find((line) => line.line.includes("when moved{"))!,
+      "moved", "entity.name.tag.titan");
   });
 });
