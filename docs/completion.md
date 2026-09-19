@@ -85,7 +85,8 @@ batch stays within Titan's variadic binding limit; superseded TEMP publication
 rolls back the complete transaction, including any already inserted batches.
 The saved descriptor table keeps its large payload outside the primary-key index,
 so child foreign-key checks read only the narrow module key. Workspace cache
-schema 5 rebuilds earlier caches with this layout.
+schema 6 rebuilds earlier caches with this layout and the saved semantic identity
+needed for shorthand union case bindings.
 
 TEMP owns open documents, input vectors, coverage, scopes and scalar candidates,
 with cascading foreign keys confined to that schema. Snapshots identify saved

@@ -6,6 +6,45 @@ local stores = import "server.workspace_store"
 local header_store = import "server.header_store"
 local test_runtime = import "server.test_runtime"
 
+function test_project_metadata_roundtrips_named_origin_parts(_context: test.Context)
+  test_runtime.run(function ()
+    local store = stores.open(":memory:")
+    defer store:close()
+    local access = store:acquire()
+    defer access:release()
+    local cache = graph.create<|bridge.ModuleSnapshot|>(access.connection)
+    local saved = metadata.create(access.connection, cache)
+    local origins = {
+      metadata.ExternalOrigin.source {
+        source_files = {"pkg/pkg.titan", "pkg/part.titan"},
+        main_file = "pkg/pkg.titan",
+      },
+      metadata.ExternalOrigin.dynamic_binary { provider_file = "vendor.so" },
+      metadata.ExternalOrigin.static_binary { provider_file = "vendor.a" },
+    }
+    for index = 1, #origins do
+      local name = "vendor" .. index
+      saved:write_external(metadata.ExternalModule.new(name, origins[index],
+        graph.Manifest.new("public", "source"), {}, nil, {}, {}, {}))
+      local restored? = saved:external(name)
+      test.assert(restored ~= nil, "saved origin disappeared")
+      case restored.origin
+      when source{source_files; main_file} then
+        test.assert(index == 1 and main_file == "pkg/pkg.titan" and
+          #source_files == 2 and source_files[1] == main_file and
+          source_files[2] == "pkg/part.titan",
+          "source origin lost its main path or ordered contributors")
+      when dynamic_binary{provider_file} then
+        test.assert(index == 2 and provider_file == "vendor.so",
+          "dynamic origin lost its provider path or variant")
+      when static_binary{provider_file} then
+        test.assert(index == 3 and provider_file == "vendor.a",
+          "static origin lost its provider path or variant")
+      end
+    end
+  end)
+end
+
 function test_project_metadata_roundtrips_ordered_batches_and_nullable_binary_fields(
     _context: test.Context)
   test_runtime.run(function ()
@@ -51,7 +90,7 @@ function test_project_metadata_roundtrips_ordered_batches_and_nullable_binary_fi
     saved:write_diagnostics("folder", diagnostics)
     saved:write_header("folder", headers)
     saved:write_external(metadata.ExternalModule.new("vendor",
-      metadata.ExternalOrigin.source(metadata.ExternalSource.new(paths[1], paths)),
+      metadata.ExternalOrigin.source(paths[1], paths),
       graph.Manifest.new("public\0\255", "source\0\255"), stamps, nil, {}, {}, headers))
     access.connection:commit()
     local project? = saved:project("folder")
@@ -115,7 +154,7 @@ function test_project_metadata_refreshes_observations_without_rewriting_semantic
     local saved = metadata.create(access.connection, cache)
     local stamp = graph.FileStamp.new("main.titan", 1, 2, 3, "digest", "physical")
     local source = metadata.SourceFileSnapshot.new("main.titan", "saved\0bytes", stamp)
-    local origin = metadata.ExternalOrigin.source(metadata.ExternalSource.new("main.titan", {"main.titan"}))
+    local origin = metadata.ExternalOrigin.source("main.titan", {"main.titan"})
     local header = bridge.CHeaderDependency.new(bridge.CHeaderDependencyKind.file(),
       "input.h", "header-digest", bridge.HeaderObservation.new(1, 2, "header-physical"))
     cache:observe_project("main", {stamp})

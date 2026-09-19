@@ -132,6 +132,9 @@ installation. During prerelease development the compiler/server API stays at
 `1`; update both consumers and fixtures against the pinned metadata contract.
 Treat source syntax, saved-source fixture strings, hover text, semantic spans,
 TextMate scopes and editor bracket/indent rules as separate migration surfaces.
+Assert scopes for each newly introduced identifier position, including contextual
+keyword names in declarations and constructor labels. Test nested types, values,
+comments and strings so delimiter state does not leak into subsequent code.
 Do not rewrite SQL, embedded Lua or other string payloads as Titan syntax.
 Compare production string payloads after automated migrations and validate the
 result with the compiler parser and semantic/protocol tests.
@@ -140,6 +143,21 @@ Read the compiler's current AST/type definitions before adapting the typed
 bridge. Foreign type names live in a distinct C namespace and do not acquire
 ordinary Titan definition-navigation targets. Retain lexical traversal order
 and exclude compiler DAG backreferences when walking the saved AST.
+
+Use the driver's `analysis_only` resolver mode for source semantics. It returns
+checked source terms before runtime generic erasure, while preserving detached
+declared interfaces for manifests. Read specialized expression annotations for
+hover; do not replace them with generic declaration signatures or infer missing
+type arguments from source text. Native compilation still owns runtime lowering.
+
+For multi-part unions, follow [union-payload-parts.md](../../../docs/union-payload-parts.md).
+Traverse `parts`, case `bindings` and constructor `values`. Keep part identity
+qualified by its variant; a named-pattern alias is a separate local binding.
+A shorthand pattern selects a part and declares a local at the same span: rename
+must expand it to `alias = part` when either side changes. Preserve that dual
+meaning in saved SQL facts and invalidate incompatible caches. Prefer direct
+parts for variant-only wrapper data; retain records with independent APIs,
+methods or shared mutable ownership, using the documented server payload audit.
 
 Architecture reviews should examine the entire server. Configuration flow is
 one example: trace environment inputs and project configuration to the compiler

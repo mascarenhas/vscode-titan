@@ -165,6 +165,30 @@ try {
   result = await ready(filename, source.position, "method", "colon methods", { triggerKind: 2, triggerCharacter: ":" });
   excludes(result, "field", "callback", "new", "static");
 
+  const union = "union Message\n moved(x: integer, text: string, end: integer)\n empty()\nend\n";
+  source = marked(union + "function make(): Message return Message.mo@ved(1, \"one\", 2) end\n");
+  change(filename, source.text);
+  result = await ready(filename, source.position, "moved", "union positional constructor");
+  const constructor = result.items.find((item) => item.label === "moved");
+  assert.match(constructor.detail, /integer/);
+  assert.match(constructor.detail, /string/);
+  source = marked(union + "function make(): Message return Message.mo@ved {text = \"one\", end = 2, x = 1} end\n");
+  change(filename, source.text);
+  await ready(filename, source.position, "moved", "union named constructor");
+  source = marked(union + "function read(message: Message): integer\n case message\n when moved(coordinate) then return coord@inate\n else return 0\n end\nend\n");
+  change(filename, source.text);
+  result = await ready(filename, source.position, "coordinate", "union positional prefix binder");
+  assert.match(result.items.find((item) => item.label === "coordinate").detail, /integer/);
+  excludes(result, "text");
+  source = marked(union + "function read(message: Message): string\n case message\n when moved{body = text; x; finish = end} then return body .. x .. finish\n catch return bo@dy\n else return \"empty\"\n end\nend\n");
+  change(filename, source.text);
+  result = await ready(filename, source.position, "body", "union named binder in catch");
+  assert.match(result.items.find((item) => item.label === "body").detail, /string/);
+  source = marked(union + "function read(message: Message): string\n case message\n when moved{body = text} then return body\n else return @\n end\nend\n");
+  change(filename, source.text);
+  result = await ready(filename, source.position, "message", "union binder outside arm");
+  excludes(result, "body");
+
   source = marked('local imported = import "de@p"\n');
   change(filename, source.text);
   result = await ready(filename, source.position, "dep", "import catalog");

@@ -46,8 +46,6 @@ function ProjectModule:compiler_input(): compiler_bridge.ProjectModule
   return compiler_bridge.ProjectModule.new(self.module_name, files)
 end
 
-type ExternalSource = metadata.ExternalSource
-type ExternalBinary = metadata.ExternalBinary
 type ExternalOrigin = metadata.ExternalOrigin
 type ExternalModule = metadata.ExternalModule
 type ExternalFingerprint = metadata.ExternalFingerprint
@@ -300,15 +298,13 @@ end
 
 local function copy_external_origin(source: ExternalOrigin): ExternalOrigin
   case source
-  when source(origin) then
-    return ExternalOrigin.source(ExternalSource.new(
-      origin.main_file, copy_strings(origin.source_files)))
-  when dynamic_binary(origin) then
-    return ExternalOrigin.dynamic_binary(
-      ExternalBinary.new(origin.provider_file))
-  when static_binary(origin) then
-    return ExternalOrigin.static_binary(
-      ExternalBinary.new(origin.provider_file))
+  when source{main_file; source_files} then
+    return ExternalOrigin.source(
+      main_file, copy_strings(source_files))
+  when dynamic_binary{provider_file} then
+    return ExternalOrigin.dynamic_binary(provider_file)
+  when static_binary{provider_file} then
+    return ExternalOrigin.static_binary(provider_file)
   end
 end
 
@@ -326,20 +322,20 @@ end
 local function origin_identity(origin: ExternalOrigin?): string
   if origin == nil then return "missing" end
   case origin as ExternalOrigin
-  when source(source) then
+  when source{main_file; source_files} then
     local output = strings.writer()
-    output:write("source:" .. #source.main_file .. ":" .. source.main_file)
-    for index = 1, #source.source_files do
-      local path = source.source_files[index]
+    output:write("source:" .. #main_file .. ":" .. main_file)
+    for index = 1, #source_files do
+      local path = source_files[index]
       output:write(":" .. #path .. ":" .. path)
     end
     return output:drain()
-  when dynamic_binary(binary) then
-    return "dynamic:" .. #binary.provider_file .. ":" ..
-           binary.provider_file
-  when static_binary(binary) then
-    return "static:" .. #binary.provider_file .. ":" ..
-           binary.provider_file
+  when dynamic_binary{provider_file} then
+    return "dynamic:" .. #provider_file .. ":" ..
+           provider_file
+  when static_binary{provider_file} then
+    return "static:" .. #provider_file .. ":" ..
+           provider_file
   end
 end
 
@@ -697,18 +693,16 @@ local function Service:fingerprint_from_resolution(
   local paths: {string} = {}
   if resolution.provenance ~= nil then
     case resolution.provenance as compiler_bridge.Provenance
-    when external_source(source) then
-      origin = ExternalOrigin.source(ExternalSource.new(
-        source.main_file, copy_strings(source.source_files)))
-      paths = copy_strings(source.source_files)
-    when dynamic_binary(binary) then
-      origin = ExternalOrigin.dynamic_binary(
-        ExternalBinary.new(binary.provider_file))
-      paths[1] = binary.provider_file
-    when static_binary(binary) then
-      origin = ExternalOrigin.static_binary(
-        ExternalBinary.new(binary.provider_file))
-      paths[1] = binary.provider_file
+    when external_source{main_file; source_files} then
+      origin = ExternalOrigin.source(
+        main_file, copy_strings(source_files))
+      paths = copy_strings(source_files)
+    when dynamic_binary{provider_file} then
+      origin = ExternalOrigin.dynamic_binary(provider_file)
+      paths[1] = provider_file
+    when static_binary{provider_file} then
+      origin = ExternalOrigin.static_binary(provider_file)
+      paths[1] = provider_file
     when project_source() then
       return fail<|ExternalFingerprint|>(resolution.module_name,
         "external resolver returned project-source provenance")
@@ -740,9 +734,9 @@ local function Service:restat_external_fingerprint(
   if previous.origin ~= nil then
     origin = copy_external_origin(previous.origin as ExternalOrigin)
     case origin as ExternalOrigin
-    when source(source) then paths = copy_strings(source.source_files)
-    when dynamic_binary(binary) then paths[1] = binary.provider_file
-    when static_binary(binary) then paths[1] = binary.provider_file
+    when source{source_files} then paths = copy_strings(source_files)
+    when dynamic_binary{provider_file} then paths[1] = provider_file
+    when static_binary{provider_file} then paths[1] = provider_file
     end
   end
   local stamps: {project_graph.FileStamp} = {}
@@ -1142,12 +1136,12 @@ local function Service:prepare_work_avoiding(
     end
     if trusted then
       case external.origin
-      when source(source) then
+      when source{main_file; source_files} then
         cached_sources[#cached_sources + 1] =
           compiler_bridge.CachedSourceInterface.new(
             external.module_name, external.manifest.public_digest,
             external.manifest.source_digest,
-            source.main_file, source.source_files,
+            main_file, source_files,
             external.compiler_imports,
             external.c_header_dependencies)
       else
@@ -1339,40 +1333,38 @@ local function Service:external_candidate(
   local origin?: ExternalOrigin
   local analyzed_input_identity: string? = nil
   case snapshot.provenance
-  when external_source(source) then
-    for index = 1, #source.source_files do
-      local path = source.source_files[index]
+  when external_source{main_file; source_files} then
+    for index = 1, #source_files do
+      local path = source_files[index]
       local stamp? = self:stamp_for(path, find_stamp(prior_stamps, path))
       if stamp == nil then
-        return fail<|ExternalModule|>(source.source_files[index],
+        return fail<|ExternalModule|>(source_files[index],
           "external source disappeared while compiler results were committed")
       end
       stamps[index] = stamp
     end
-    origin = ExternalOrigin.source(ExternalSource.new(
-      source.main_file, copy_strings(source.source_files)))
+    origin = ExternalOrigin.source(
+      main_file, copy_strings(source_files))
     analyzed_input_identity = analyzed_input_digest(
       stamp_digest(stamps), snapshot.c_header_dependencies)
-  when dynamic_binary(binary) then
-    local stamp? = self:stamp_for(binary.provider_file,
-      find_stamp(prior_stamps, binary.provider_file))
+  when dynamic_binary{provider_file} then
+    local stamp? = self:stamp_for(provider_file,
+      find_stamp(prior_stamps, provider_file))
     if stamp == nil then
-      return fail<|ExternalModule|>(binary.provider_file,
+      return fail<|ExternalModule|>(provider_file,
         "external binary disappeared while compiler results were committed")
     end
     stamps[1] = stamp
-    origin = ExternalOrigin.dynamic_binary(
-      ExternalBinary.new(binary.provider_file))
-  when static_binary(binary) then
-    local stamp? = self:stamp_for(binary.provider_file,
-      find_stamp(prior_stamps, binary.provider_file))
+    origin = ExternalOrigin.dynamic_binary(provider_file)
+  when static_binary{provider_file} then
+    local stamp? = self:stamp_for(provider_file,
+      find_stamp(prior_stamps, provider_file))
     if stamp == nil then
-      return fail<|ExternalModule|>(binary.provider_file,
+      return fail<|ExternalModule|>(provider_file,
         "external static provider disappeared while compiler results were committed")
     end
     stamps[1] = stamp
-    origin = ExternalOrigin.static_binary(
-      ExternalBinary.new(binary.provider_file))
+    origin = ExternalOrigin.static_binary(provider_file)
   when project_source() then
     return nil
   end
@@ -1644,8 +1636,8 @@ local function contextual_provider_is_current(
       found = true
       local provider_file?: string = nil
       case resolution.provenance
-      when dynamic_binary(binary) then provider_file = binary.provider_file
-      when static_binary(binary) then provider_file = binary.provider_file
+      when dynamic_binary{selected_provider = provider_file} then provider_file = selected_provider
+      when static_binary{selected_provider = provider_file} then provider_file = selected_provider
       else return false
       end
       local identity? = resolution.provider_identity
@@ -1792,16 +1784,16 @@ local function Service:commit_or_raise(
     when project_source() then
     else
       case snapshot.provenance
-      when dynamic_binary(binary) then
+      when dynamic_binary{provider_file} then
         snapshot_binary_keys[snapshot.module_name] =
           binary_provider_key(
-            snapshot.module_name, "dynamic", binary.provider_file)
+            snapshot.module_name, "dynamic", provider_file)
         snapshot_binaries[snapshot.module_name] = snapshot
         insert_name(snapshot_binary_names, snapshot.module_name)
-      when static_binary(binary) then
+      when static_binary{provider_file} then
         snapshot_binary_keys[snapshot.module_name] =
           binary_provider_key(
-            snapshot.module_name, "static", binary.provider_file)
+            snapshot.module_name, "static", provider_file)
         snapshot_binaries[snapshot.module_name] = snapshot
         insert_name(snapshot_binary_names, snapshot.module_name)
       else

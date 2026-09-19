@@ -5,9 +5,11 @@ atomically stores scalar `main.completion_*` facts and compatible body-free
 descriptors with saved semantics. Unsaved text and derived facts remain in
 connection-local, memory-only TEMP tables. The measurements below describe the
 earlier saved-only baseline and do not include the new completion inventory.
-Workspace schema 5 recreates earlier caches; completion descriptors use a rowid
+Workspace schema 6 recreates earlier caches; completion descriptors use a rowid
 table with a separate non-null primary-key index so foreign-key probes do not
-read large descriptor payloads.
+read large descriptor payloads. Saved semantic occurrences also retain the
+selected union-part identity of shorthand case bindings, separate from their
+local binding identity. These additions are outside the historical measurements.
 
 This updates the storage breakdown in the [earlier schema research](https://github.com/mascarenhas/vscode-titan/blob/e0bff3b6f46725880b5c8a9b7633eff82643c8a4/docs/sqlite-backend-schema.md#storage-and-serialization-research-workflow). It records the preserved, completed single-FFI baseline and the measured compact-manifest implementation below. The historical schema document remains a record of its older compiler and multi-step workload.
 

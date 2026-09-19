@@ -164,6 +164,9 @@ record SymbolOccurrence
   type_info: TypeInfo?
   callable_signature: CallableSignature?
   summary_id: integer?
+  -- A shorthand named case pattern spells both a local definition and a
+  -- selected union part. Keep its second identity without overlapping spans.
+  case_part_id: string?
 end
 
 record Import
@@ -179,20 +182,11 @@ record Manifest
   source_serialized: string?
 end
 
-record SourceProvenance
-  main_file: string
-  source_files: {string}
-end
-
-record BinaryProvenance
-  provider_file: string
-end
-
 union Provenance
-  project_source(SourceProvenance)
-  external_source(SourceProvenance)
-  dynamic_binary(BinaryProvenance)
-  static_binary(BinaryProvenance)
+  project_source(main_file: string, source_files: {string})
+  external_source(main_file: string, source_files: {string})
+  dynamic_binary(provider_file: string)
+  static_binary(provider_file: string)
 end
 
 record ExternalResolutionRequest
@@ -1345,19 +1339,19 @@ function Compiler:resolve_external_modules(
     local provenance?: Provenance = nil
     local message?: string = nil
     if kind == "source" then
-      provenance = Provenance.external_source(SourceProvenance.new(
+      provenance = Provenance.external_source(
         required_string(raw["main_file"], DRIVER_MODULE,
                         subject .. ".main_file"),
         required_string_list(raw["source_files"], DRIVER_MODULE,
-                             subject .. ".source_files")))
+                             subject .. ".source_files"))
     elseif kind == "dynamic" then
-      provenance = Provenance.dynamic_binary(BinaryProvenance.new(
+      provenance = Provenance.dynamic_binary(
         required_string(raw["provider_file"], DRIVER_MODULE,
-                        subject .. ".provider_file")))
+                        subject .. ".provider_file"))
     elseif kind == "static" or kind == "embedded" then
-      provenance = Provenance.static_binary(BinaryProvenance.new(
+      provenance = Provenance.static_binary(
         required_string(raw["provider_file"], DRIVER_MODULE,
-                        subject .. ".provider_file")))
+                        subject .. ".provider_file"))
     elseif kind == "error" then
       message = required_string(raw["message"], DRIVER_MODULE,
                                 subject .. ".message")
@@ -1691,8 +1685,28 @@ local function callable_signature(
         raw["name"], TYPES_MODULE, subject .. ".name"),
       raw["paramnames"], subject .. ".type", nil)
   elseif tag == "Type.Method" or tag == "Type.StaticMethod" then
+    local display_owner: string? = nil
+    if tag == "Type.StaticMethod" and source_node is {string: value} then
+      local source = source_node as {string: value}
+      local applied: value = source["_closed_generic_declaration"]
+      if applied ~= nil and applied ~= false then
+        -- Identity remains canonical; hover uses the checked application that
+        -- analysis-only checking retains on this written namespace selector.
+        candidate = required_map(applied, TYPES_MODULE,
+          subject .. "._closed_generic_declaration")
+        local fqtn = required_string(raw["fqtn"], TYPES_MODULE, subject .. ".fqtn")
+        local owner = registered_owner(compiler, fqtn)
+        local arguments: value = source["_generic_owner_arguments"]
+        if owner ~= nil and owner ~= false and
+            arguments ~= nil and arguments ~= false then
+          display_owner = applied_owner_title(compiler, owner,
+            required_value_list(arguments, subject .. "._generic_owner_arguments"),
+            subject)
+        end
+      end
+    end
     return render_callable_type(
-      compiler, candidate, module_name, ".", "", nil, subject, nil)
+      compiler, candidate, module_name, ".", "", nil, subject, display_owner)
   end
   return nil
 end
@@ -1836,10 +1850,11 @@ local function variant_summary_line(compiler: Compiler, candidate: value,
   output:write(visibility_prefix(raw))
   output:write(name)
   output:write("(")
-  local payload: value = raw["payload"]
-  if payload ~= nil and payload ~= false then
-    output:write(render_type(
-      compiler, payload, subject .. ".payload").display)
+  local parts = required_value_list(raw["parts"], subject .. ".parts")
+  for index = 1, #parts do
+    if index > 1 then output:write(", ") end
+    output:write(field_summary_line(
+      compiler, parts[index], subject .. ".parts[" .. index .. "]").display)
   end
   output:write(")")
   return PendingSummaryLine.new(0, name, output:drain())
@@ -1955,29 +1970,26 @@ local function occurrence_type_arguments(source_node: value,
     return required_value_list(
       namespace_arguments, subject .. "._generic_namespace_arguments")
   end
-  local surface_arguments: value = raw["_surface_typeargs"]
+  local surface_arguments: value = raw["typeargs"]
   if surface_arguments ~= nil and surface_arguments ~= false then
     local surface = required_value_list(
-      surface_arguments, subject .. "._surface_typeargs")
+      surface_arguments, subject .. ".typeargs")
     if #surface > 0 then
       local arguments: {integer: value} = {}
       local resolved_surface = true
       for index = 1, #surface do
         local argument = required_map(
           surface[index], DRIVER_MODULE,
-          subject .. "._surface_typeargs[" .. index .. "]")
+          subject .. ".typeargs[" .. index .. "]")
         local resolved: value = argument["_resolved_typearg"]
         if resolved == nil or resolved == false then
-          -- Keep accepting an explicitly annotated syntax node at the
-          -- compiler boundary. Current compiler lowering publishes the
-          -- private resolved-typearg edge because ordinary type syntax does
-          -- not otherwise retain its checked Type descriptor.
+          -- Generic application checking records the resolved argument on
+          -- the written syntax; accept ordinary checked type annotations too.
           resolved = argument["_type"]
         end
         if resolved == nil or resolved == false then
-          -- Lowered generic syntax may retain surface arguments that were not
-          -- individually annotated. Prefer the resolved nominal below; if it
-          -- is absent too, the canonical generic owner is still a useful view.
+          -- Incomplete checked syntax may not have a resolved argument.
+          -- Prefer the nominal annotation below when one is available.
           resolved_surface = false
           break
         end
@@ -2748,6 +2760,7 @@ local record Walker
   local hover_summaries: {HoverSummary}
   local summary_ids: {string: integer}
   local summary_views: {string: integer}
+  local case_variant: value
 end
 
 local function summary_kind_key(kind: HoverSummaryKind): string
@@ -2927,11 +2940,24 @@ local function exact_occurrence_span(node: {string: value}, tag: string,
   return nil
 end
 
+local function union_part_identity(variant: {string: value},
+                                   part: {string: value}): string
+  -- Constructor named arguments already use this canonical parameter identity.
+  -- Type.Field.fqtn alone is insufficient: two variants may reuse a part name.
+  return "parameter:member:" .. required_string(
+    variant["fqtn"], TYPES_MODULE, "union variant.fqtn") .. ":" ..
+    required_string(variant["name"], TYPES_MODULE, "union variant.name") .. ":" ..
+    required_integer(part["index"], TYPES_MODULE, "union part.index") .. ":" ..
+    required_string(part["name"], TYPES_MODULE, "union part.name")
+end
+
 local function Walker:add_occurrence(node: {string: value}, tag: string,
                                      name: string, role_name: string,
                                      location: SourceLocation,
                                      local_hint: boolean?,
-                                     parent_tag: string?)
+                                     parent_tag: string?,
+                                     part_identity: string?,
+                                     case_part_id: string?)
   local declaration: value = semantic_declaration(node, tag)
   local declaration_id: string? = nil
   local localness = node_is_local(node)
@@ -2950,6 +2976,7 @@ local function Walker:add_occurrence(node: {string: value}, tag: string,
   elseif role_name == "definition" or role_name == "import_alias" then
     declaration_id = declaration_identity(self.module_name, node)
   end
+  if part_identity ~= nil then declaration_id = part_identity end
   if local_hint ~= nil then localness = local_hint end
 
   local span: SourceSpan? = nil
@@ -2959,7 +2986,7 @@ local function Walker:add_occurrence(node: {string: value}, tag: string,
       or tag == "Ast.TopLevelMethod" or tag == "Ast.TopLevelStatic"
       or tag == "Ast.InterfaceMethod" then
     -- Declaration occurrences own the frozen surface callable metadata. The
-    -- semantic identity may instead be an erased Type.Method descriptor.
+    -- semantic identity may instead be the canonical Type.Method descriptor.
     signature_candidate = node
   elseif signature_candidate == nil or signature_candidate == false then
     signature_candidate = node
@@ -2976,7 +3003,8 @@ local function Walker:add_occurrence(node: {string: value}, tag: string,
       self.compiler, self.module_name, signature_candidate,
       node, tag .. " callable declaration"),
     self:summary_id(
-      signature_candidate, node, tag .. " hover summary declaration"))
+      signature_candidate, node, tag .. " hover summary declaration"),
+    case_part_id)
 end
 
 local function Walker:add_bound_occurrence(name: string, declaration: value,
@@ -3041,19 +3069,19 @@ end
 -- list. Traversing it is redundant now and could mis-parent the carrier if
 -- expression-list traversal order changes.
 local const AST_CHILD_FIELDS: const {string} = {
-  "typeparams", "typeargs", "_surface_typeparams", "_surface_typeargs",
+  "typeparams", "typeargs", "_nominal_typeargs",
   "_surface_named_args",
   "constraint", "class", "params",
   "argtypes", "rettypes", "varargtype", "flexrettype", "block",
-  "decl", "decls", "value", "type", "fields", "variants",
+  "decl", "decls", "value", "values", "type", "fields", "variants", "parts",
   "name",
   "members", "methods", "stats", "condition", "start", "finish",
   "inc", "exps", "vars", "callexp", "exp", "first", "last",
   "var", "arms",
   "elseblock", "thens", "elsestat", "catchblock", "finallyblock",
   "exp1", "exp2", "lhs", "rhs", "target", "args", "subtype",
-  "base", "keystype", "valuestype", "basetype", "payload",
-  "binding", "index", "owner", "variant", "method",
+  "base", "keystype", "valuestype", "basetype",
+  "bindings", "index", "owner", "variant", "method",
 }
 
 local function Walker:visit_node(candidate: value, parent_id: integer?,
@@ -3066,6 +3094,8 @@ local function Walker:visit_node(candidate: value, parent_id: integer?,
   if strings.sub(tag, 1, 4) ~= "Ast." then
     fail<|value|>(DRIVER_MODULE, "invalid AST tag '" .. tag .. "'")
   end
+  local previous_case = self.case_variant
+  if tag == "Ast.CaseArm" then self.case_variant = raw["_variant"] end
   local location? = semantic_location(raw, tag)
   local source_span? = structural_span(raw, tag)
   local name? = node_name(raw, tag)
@@ -3111,6 +3141,35 @@ local function Walker:visit_node(candidate: value, parent_id: integer?,
 
   local parent_tag: string? = nil
   if parent_id then parent_tag = self.nodes[parent_id].tag end
+  local part_identity: string? = nil
+  local selected_part_id: string? = nil
+  local selected_part_name: string? = nil
+  local part_location: SourceLocation? = nil
+  local shorthand = false
+  if tag == "Ast.Decl" and parent_tag == "Ast.UnionVariant"
+      and parent_id ~= nil and raw["_decl"] is {string: value} then
+    local part = required_map(raw["_decl"], TYPES_MODULE, "union part declaration")
+    local variant_name? = self.nodes[parent_id].name
+    if variant_name ~= nil then
+      part_identity = "parameter:member:" .. required_string(
+        part["fqtn"], TYPES_MODULE, "union part.fqtn") .. ":" ..
+        variant_name .. ":" .. required_integer(
+        part["index"], TYPES_MODULE, "union part.index") .. ":" ..
+        required_string(part["name"], TYPES_MODULE, "union part.name")
+    end
+  elseif tag == "Ast.Decl" and raw["part"] is string
+      and self.case_variant is {string: value}
+      and raw["_part"] is {string: value} then
+    selected_part_name = raw["part"] as string
+    selected_part_id = union_part_identity(
+      self.case_variant as {string: value}, raw["_part"] as {string: value})
+    part_location = optional_field_location(raw, "_part_loc", tag)
+    if part_location ~= nil and location ~= nil then
+      shorthand = part_location.filename == location.filename and
+        part_location.line == location.line and
+        part_location.column == location.column
+    end
+  end
   if not synthetic and location and name then
     local role = role_name
     if strings.sub(tag, 1, 12) == "Ast.TopLevel"
@@ -3122,8 +3181,23 @@ local function Walker:visit_node(candidate: value, parent_id: integer?,
         tag == "Ast.TypeForeignName" then
       role = "type_reference"
     end
+    local shorthand_id: string? = nil
+    if shorthand then shorthand_id = selected_part_id end
     self:add_occurrence(
-      raw, tag, name, role, location, local_hint, parent_tag)
+      raw, tag, name, role, location, local_hint, parent_tag,
+      part_identity, shorthand_id)
+  end
+  if not synthetic and not shorthand and selected_part_id ~= nil
+      and selected_part_name ~= nil and part_location ~= nil then
+    local part_type? = optional_type(self.compiler, raw, "_declared_type", tag)
+    if part_type == nil then
+      part_type = optional_type(self.compiler, raw, "_type", tag)
+    end
+    self.symbols[#self.symbols + 1] = SymbolOccurrence.new(
+      selected_part_name, selected_part_id, OccurrenceRole.reference(),
+      part_location, exact_name_span(part_location, selected_part_name),
+      false, DeclarationVisibility.exported(),
+      part_type, nil, nil, nil)
   end
   if not synthetic and tag == "Ast.TypeQualName" then
     local module_location? = optional_field_location(
@@ -3173,6 +3247,7 @@ local function Walker:visit_node(candidate: value, parent_id: integer?,
     self:visit_any(
       raw[AST_CHILD_FIELDS[index]], id, "reference", nil, children_synthetic)
   end
+  self.case_variant = previous_case
 end
 
 local function walk_ast(compiler: Compiler, module_name: string,
@@ -3183,7 +3258,7 @@ local function walk_ast(compiler: Compiler, module_name: string,
       DRIVER_MODULE, "annotated AST root must be a Lua table")
   end
   local walker = Walker.new(
-    compiler, module_name, work, {}, {}, {}, {}, {}, {}, {})
+    compiler, module_name, work, {}, {}, {}, {}, {}, {}, {}, nil)
   walker:visit_any(candidate, nil, "reference", nil, false)
   return walker.nodes, walker.symbols, walker.imports,
          walker.hover_summaries
@@ -3475,33 +3550,32 @@ local function provenance(entry: {string: value}, module_name: string,
         entry["source_files"], DRIVER_MODULE,
         "compiler provenance for '" .. module_name .. "'.source_files")
     end
-    local source = SourceProvenance.new(main_file, source_files)
     if projects[module_name] ~= nil then
       return NormalizedProvenance.new(
-        Provenance.project_source(source), false)
+        Provenance.project_source(main_file, source_files), false)
     end
     return NormalizedProvenance.new(
-      Provenance.external_source(source), false)
+      Provenance.external_source(main_file, source_files), false)
   end
   if kind == "dynamic" then
     return NormalizedProvenance.new(
-      Provenance.dynamic_binary(BinaryProvenance.new(required_string(
+      Provenance.dynamic_binary(required_string(
         entry["filename"], DRIVER_MODULE,
-        "compiler provenance for '" .. module_name .. "'.filename"))),
+        "compiler provenance for '" .. module_name .. "'.filename")),
       false)
   end
   if kind == "static" then
     return NormalizedProvenance.new(
-      Provenance.static_binary(BinaryProvenance.new(required_string(
+      Provenance.static_binary(required_string(
         entry["static_archive"], DRIVER_MODULE,
-        "compiler provenance for '" .. module_name .. "'.static_archive"))),
+        "compiler provenance for '" .. module_name .. "'.static_archive")),
       false)
   end
   if kind == "embedded" then
     return NormalizedProvenance.new(
-      Provenance.static_binary(BinaryProvenance.new(required_string(
+      Provenance.static_binary(required_string(
         entry["filename"], DRIVER_MODULE,
-        "compiler provenance for '" .. module_name .. "'.filename"))),
+        "compiler provenance for '" .. module_name .. "'.filename")),
       true)
   end
   return fail<|NormalizedProvenance|>(DRIVER_MODULE,
@@ -3599,9 +3673,9 @@ local function snapshot_module(compiler: Compiler, module_name: string,
     end
     local filename = "<" .. module_name .. ">"
     case origin
-    when external_source(source) then filename = source.main_file
-    when dynamic_binary(binary) then filename = binary.provider_file
-    when static_binary(binary) then filename = binary.provider_file
+    when external_source{main_file, source_files} then filename = main_file
+    when dynamic_binary{provider_file} then filename = provider_file
+    when static_binary{provider_file} then filename = provider_file
     when project_source() then
     end
     for index = 1, #dependencies do
@@ -3615,8 +3689,8 @@ local function snapshot_module(compiler: Compiler, module_name: string,
     local payload: string? = nil
     local provenance_key = ""
     case origin
-    when external_source(source) then
-      provenance_key = completion_source_key(source.main_file, source.source_files, header_dependencies)
+    when external_source{main_file, source_files} then
+      provenance_key = completion_source_key(main_file, source_files, header_dependencies)
     else
     end
     if entry["kind"] == "source" and entry["ast"] ~= nil then
@@ -3688,10 +3762,10 @@ local function normalize_contextual_resolutions(
     local origin?: Provenance = nil
     if kind == "dynamic" then
       origin = Provenance.dynamic_binary(
-        BinaryProvenance.new(provider_file))
+        provider_file)
     elseif kind == "static" or kind == "embedded" then
       origin = Provenance.static_binary(
-        BinaryProvenance.new(provider_file))
+        provider_file)
     else
       return fail<|{NormalizedContextualResolution}|>(DRIVER_MODULE,
         "compiler contextual resolution '" .. key ..
@@ -3716,10 +3790,10 @@ local function normalize_contextual_resolutions(
       local previous_kind = "dynamic"
       local previous_file = ""
       case previous.provenance
-      when dynamic_binary(binary) then previous_file = binary.provider_file
-      when static_binary(binary) then
+      when dynamic_binary{provider_file} then previous_file = provider_file
+      when static_binary{provider_file} then
         previous_kind = "static"
-        previous_file = binary.provider_file
+        previous_file = provider_file
       else
       end
       local previous_identity = previous.exposer_module .. "\0" ..
@@ -3737,8 +3811,8 @@ end
 local function contextual_provider_file(
     resolution: ContextualResolution): string
   case resolution.provenance
-  when dynamic_binary(binary) then return binary.provider_file
-  when static_binary(binary) then return binary.provider_file
+  when dynamic_binary{provider_file} then return provider_file
+  when static_binary{provider_file} then return provider_file
   else
     return fail<|string|>(DRIVER_MODULE,
       "contextual owner has non-binary provider provenance")
@@ -3799,8 +3873,8 @@ local function attach_module_provider_identities(
     local snapshot = modules[index]
     local provider_file?: string = nil
     case snapshot.provenance
-    when dynamic_binary(binary) then provider_file = binary.provider_file
-    when static_binary(binary) then provider_file = binary.provider_file
+    when dynamic_binary{selected = provider_file} then provider_file = selected
+    when static_binary{selected = provider_file} then provider_file = selected
     else
     end
     if provider_file ~= nil and
@@ -3823,13 +3897,13 @@ local function binary_provider_selection(
     snapshot: ModuleSnapshot,
     embedded_provider: boolean): BinaryProviderSelection?
   case snapshot.provenance
-  when dynamic_binary(binary) then
+  when dynamic_binary{provider_file} then
     return BinaryProviderSelection.new(
-      snapshot.module_name, "dynamic", binary.provider_file,
+      snapshot.module_name, "dynamic", provider_file,
       embedded_provider)
-  when static_binary(binary) then
+  when static_binary{provider_file} then
     return BinaryProviderSelection.new(
-      snapshot.module_name, "static", binary.provider_file,
+      snapshot.module_name, "static", provider_file,
       embedded_provider)
   else return nil
   end
@@ -4073,17 +4147,17 @@ local function failed_project_snapshot(project: ProjectModule): ModuleSnapshot
   end
   return ModuleSnapshot.new(
     project.module_name,
-    Provenance.project_source(SourceProvenance.new(
-      project.files[1].filename, files)),
+    Provenance.project_source(
+      project.files[1].filename, files),
     nil, {}, {}, {}, {}, nil, nil)
 end
 
 local function snapshot_profile_filename(snapshot: ModuleSnapshot): string
   case snapshot.provenance
-  when project_source(source) then return source.main_file
-  when external_source(source) then return source.main_file
-  when dynamic_binary(binary) then return binary.provider_file
-  when static_binary(binary) then return binary.provider_file
+  when project_source{main_file, source_files} then return main_file
+  when external_source{main_file, source_files} then return main_file
+  when dynamic_binary{provider_file} then return provider_file
+  when static_binary{provider_file} then return provider_file
   end
 end
 

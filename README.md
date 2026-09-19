@@ -29,6 +29,10 @@ JSON-RPC messages and structured stderr logs use `titan.json` through the
 `server.wire` boundary, with native Maps and Arrays and explicit JSON nulls.
 Request IDs and parsed LSP parameters retain their nominal types.
 
+The extension supports [multiple named union payload parts](docs/union-payload-parts.md),
+including named constructors and selective case bindings, with saved-file
+navigation and rename plus completion in unsaved buffers.
+
 ## Prerequisites
 
 - A sibling Titan checkout at `../titan` (override with `TITAN_REPO=...`).
@@ -278,9 +282,11 @@ They are not selected through the value binding `ffi`.
 
 Persisted compiler artifacts use `c-header-v6` and `ffi-conversion-v7` for
 extracted C definitions. Project entries retain declared member/type manifests,
-including trusted source visibility and generic schemes. SQLite schema 5 shares
+including trusted source visibility and generic schemes. SQLite schema 6 shares
 ordered header provenance across cache owners and stores fixed-size graph
-comparison hashes. Incompatible old publications are rebuilt.
+comparison hashes. It also retains the selected-part identity of shorthand union
+case bindings so rename preserves their meaning. Incompatible old publications
+are rebuilt.
 
 The bundled compiler modules and SDK files remain outside the executable.
 They contain no `lib/titan` provider tree or provider archive. Initialized Titan
