@@ -1,0 +1,423 @@
+local async = import "async"
+local fs = import "fs"
+local lua = import "lua"
+local sqlite3 = import "sqlite3"
+local strings = import "string"
+local test = import "test"
+local runtime = import "server.test_runtime"
+local service = import "server.completion_service.titan"
+local buffers = import "server.document_buffers"
+local storage = import "server.completion_store"
+local bridge = import "server.compiler_bridge"
+local scheduler = import "server.compiler_scheduler"
+local loader = import "server.project_loader"
+local sql = import "server.workspace_store"
+local semantic = import "server.semantic_index"
+local lsp = import "server.lsp_types"
+local dispatcher = import "server.dispatcher"
+local source_text = import "server.source_text"
+local wire = import "server.wire"
+foreign import "compiler_io_clock.h"
+
+local PATH = "/completion-fixture/app.titan"
+
+local function seed(store: sql.Store, projects: {bridge.ProjectModule})
+  local access = store:acquire()
+  defer access:release()
+  semantic.initialize_schema(access.connection)
+  sql.execute(access.connection,
+    "CREATE TABLE IF NOT EXISTS main.header_graphs(key BLOB PRIMARY KEY,payload BLOB NOT NULL) WITHOUT ROWID")
+  sql.execute(access.connection,
+    "CREATE TABLE IF NOT EXISTS main.ffi_conversion_snapshots(key BLOB PRIMARY KEY,payload BLOB NOT NULL) WITHOUT ROWID")
+  local descriptors: {storage.SavedDescriptor} = {}
+  local names: {string} = {}
+  for index = 1, #projects do
+    local project = projects[index]
+    names[index] = project.module_name
+    local files: {string} = {}
+    sql.execute(access.connection, "INSERT INTO main.semantic_projects VALUES(?,?,1,2)",
+      sqlite3.Blob.new(project.module_name), index)
+    for file_index = 1, #project.files do
+      local file = project.files[file_index]
+      files[file_index] = file.filename
+      sql.execute(access.connection, "INSERT INTO main.semantic_files VALUES(?,?,?,?,?)",
+        sqlite3.Blob.new(file.filename), sqlite3.Blob.new(project.module_name),
+        sqlite3.Blob.new(file.contents), index, file_index)
+    end
+    descriptors[index] = storage.SavedDescriptor.new(project.module_name, 1, 2,
+      "project", files[1], "root-not-decoded", "", nil, files, {}, {}, {})
+  end
+  storage.publish_saved(access.connection, descriptors, names,
+    bridge.CompilerConfiguration.new({"/completion-fixture"}, nil, nil, nil),
+    {"/completion-fixture"}, {})
+  sql.execute(access.connection, "UPDATE main.store_state SET published_generation=7 WHERE singleton=1")
+end
+
+local function open(documents: buffers.BufferStore, path: string, version: integer, text: string)
+  local uri? = source_text.path_to_file_uri(path)
+  documents:apply(lsp.DocumentNotification.opened(lsp.OpenDocument.new(
+    lsp.TextDocument.new(uri, path), version, text)))
+end
+
+local function seed_checked(store: sql.Store, projects: {bridge.ProjectModule})
+  seed(store, projects)
+  local compiler = bridge.load()
+  local configuration = bridge.CompilerConfiguration.new({"/completion-fixture"}, nil, nil, nil)
+  compiler:configure(configuration)
+  local analysis = compiler:analyze(projects[1].module_name, projects)
+  test.assert(#analysis.diagnostics == 0, "saved dependency fixture did not compile")
+  local names: {string} = {}
+  for index = 1, #projects do names[index] = projects[index].module_name end
+  local payloads = compiler:export_projects(projects, names)
+  test.assert(#payloads == #projects, "saved dependency descriptors were not exported")
+  local descriptors: {storage.SavedDescriptor} = {}
+  for index = 1, #projects do
+    local project = projects[index]
+    local module? = analysis:find_module(project.module_name)
+    local files: {string} = {}
+    for file_index = 1, #project.files do files[file_index] = project.files[file_index].filename end
+    local payload = ""
+    for payload_index = 1, #payloads do
+      if payloads[payload_index].module_name == project.module_name then payload = payloads[payload_index].payload end
+    end
+    descriptors[index] = storage.SavedDescriptor.new(project.module_name, 1, 2, "project",
+      files[1], payload, module.manifest.serialized, module.manifest.source_serialized,
+      files, module.imports, module.c_header_dependencies, {})
+  end
+  local access = store:acquire()
+  defer access:release()
+  storage.publish_saved(access.connection, descriptors, names, configuration, {"/completion-fixture"}, {})
+end
+
+local function request(path: string, contents: string, needle: string): dispatcher.CompletionRequest
+  local first? = strings.find(contents, needle, 1, true)
+  test.assert(first ~= nil, "missing test completion token")
+  local position? = source_text.position_for_offset(contents, first - 1 + #needle)
+  local uri? = source_text.path_to_file_uri(path)
+  return dispatcher.CompletionRequest.new(dispatcher.RequestId.integer_id(1),
+    lsp.CompletionParams.new(lsp.DocumentPosition.new(uri, path, position), 1, nil))
+end
+
+local function labels(outcome: dispatcher.SemanticOutcome): ({string}, boolean)
+  case outcome
+  when result(value) then
+    local object? = wire.as_object(value)
+    local items? = wire.as_array(object["items"])
+    local result: {string} = {}
+    for index = 1, #items do
+      local item? = wire.as_object(items[index])
+      result[index] = wire.as_string(item["label"])
+    end
+    return result, wire.as_boolean(object["isIncomplete"])
+  when failure(failure) then raise failure.message
+  end
+end
+
+local function contains(items: {string}, expected: string): boolean
+  for index = 1, #items do if items[index] == expected then return true end end
+  return false
+end
+
+local function await_preparation(completion: service.Service)
+  if completion.worker ~= nil then
+    case async.join(completion.worker)
+    when succeeded() then
+    when failed(failure) then raise failure.error
+    else raise "completion owner did not finish"
+    end
+  end
+end
+
+function test_completion_service_unsaved_receiver_and_whole_token_edit(_context: test.Context)
+  runtime.run(function ()
+    local store = sql.open(":memory:")
+    defer store:close()
+    seed(store, {bridge.ProjectModule.new("app", {bridge.SourceFile.new(PATH, "local saved = 1\n")})})
+    local documents = buffers.create()
+    local completion = service.create(store, documents)
+    defer completion:close()
+    local text = "record Cat\n  field: integer\nend\nfunction read(cat: Cat): integer\n  return cat.fiXYZ\nend\n"
+    open(documents, PATH, 1, text)
+    local work = completion:capture(request(PATH, text, "cat.fi"))
+    work()
+    await_preparation(completion)
+    local result = work()
+    local names, incomplete = labels(result)
+    test.assert(contains(names, "field"),
+      "unsaved receiver fields were not resolved from the captured text")
+    test.assert(not contains(names, "saved"), "saved root names leaked into member completion")
+    case result
+    when result(value) then
+      local object? = wire.as_object(value)
+      local items? = wire.as_array(object["items"])
+      local item? = wire.as_object(items[1])
+      local edit? = wire.as_object(item["textEdit"])
+      local range? = wire.as_object(edit["range"])
+      local finish? = wire.as_object(range["end"])
+      test.assert(wire.as_integer(finish["character"]) == 18,
+        "replacement left the suffix after the caret intact")
+    else raise "completion result missing"
+    end
+  end)
+end
+
+function test_completion_service_capture_before_deferred_change_and_reopen(_context: test.Context)
+  runtime.run(function ()
+    local store = sql.open(":memory:")
+    defer store:close()
+    seed(store, {bridge.ProjectModule.new("app", {bridge.SourceFile.new(PATH, "local saved = 1\n")})})
+    local documents = buffers.create()
+    local completion = service.create(store, documents)
+    defer completion:close()
+    local first = "function f(): integer\n local alpha = 1\n return al\nend\n"
+    open(documents, PATH, 1, first)
+    local stale = completion:capture(request(PATH, first, "return al"))
+    local second = "function f(): integer\n local bravo = 1\n return br\nend\n"
+    local document = lsp.TextDocument.new("file://" .. PATH, PATH)
+    documents:apply(lsp.DocumentNotification.changed(lsp.ChangeDocument.new(document, 5, second)))
+    completion:changed()
+    local stale_names, stale_incomplete = labels(stale())
+    test.assert(#stale_names == 0 and stale_incomplete, "deferred request sampled a newer buffer")
+    local work = completion:capture(request(PATH, second, "return br"))
+    work()
+    await_preparation(completion)
+    test.assert(contains(labels(work()), "bravo"), "new document version was not analyzed")
+    documents:apply(lsp.DocumentNotification.saved(document))
+    test.assert(contains(labels(work()), "bravo"), "didSave retired editor completion state")
+    documents:apply(lsp.DocumentNotification.closed(document))
+    completion:changed()
+    await_preparation(completion)
+    do
+      local access = store:acquire()
+      defer access:release()
+      test.assert(sql.scalar_integer(access.connection, "SELECT count(*) FROM temp.open_documents") == 0,
+        "close retained TEMP editor rows")
+    end
+    open(documents, PATH, 5, second)
+    completion:changed()
+    test.assert(#labels(work()) == 0, "reopen reused the previous open session")
+  end)
+end
+
+function test_completion_service_bounded_while_shared_compiler_permit_held(_context: test.Context)
+  runtime.run(function ()
+    local store = sql.open(":memory:")
+    defer store:close()
+    seed(store, {bridge.ProjectModule.new("app", {bridge.SourceFile.new(PATH, "local saved = 1\n")})})
+    local documents = buffers.create()
+    local completion = service.create(store, documents)
+    defer completion:close()
+    local text = "function f(): integer\n local alpha = 1\n return al\nend\n"
+    open(documents, PATH, 1, text)
+    local work = completion:capture(request(PATH, text, "return al"))
+    local paused = false
+    local barrier = async.ResumeToken.new("completion.test.hydration-held")
+    local hydration = loader.restoration(function (): {string}
+      local permit = scheduler.acquire()
+      defer permit:release()
+      paused = true
+      async.suspend(barrier, function () paused = false end)
+      return {}
+    end)
+    defer hydration:close()
+    hydration:start()
+    while not paused do async.yield() end
+    local started = ffi.vscode_titan_monotonic_ms()
+    local names, incomplete = labels(work())
+    local elapsed = ffi.vscode_titan_monotonic_ms() - started
+    test.assert(paused, "completion resumed workspace hydration")
+    hydration:close()
+    test.assert(#names == 0 and incomplete and elapsed < 2000.0,
+      "completion waited for shared hydration permit instead of returning bounded fallback")
+    await_preparation(completion)
+    test.assert(contains(labels(work()), "alpha"), "private preparation did not resume after permit release")
+  end)
+end
+
+function test_completion_service_provisional_candidates_follow_current_token_during_refresh(_context: test.Context)
+  runtime.run(function ()
+    local store = sql.open(":memory:")
+    defer store:close()
+    seed(store, {bridge.ProjectModule.new("app", {bridge.SourceFile.new(PATH, "local saved = 1\n")})})
+    local documents = buffers.create()
+    local completion = service.create(store, documents)
+    defer completion:close()
+    local text = "function f(): integer\n local alpha = 1\n return al\nend\n"
+    open(documents, PATH, 1, text)
+    local first = completion:capture(request(PATH, text, "return al"))
+    first()
+    await_preparation(completion)
+    test.assert(contains(labels(first()), "alpha"), "initial completion was not prepared")
+    local permit = scheduler.acquire()
+    defer permit:release()
+    do
+      local access = store:acquire()
+      defer access:release()
+      sql.execute(access.connection, "UPDATE main.store_state SET published_generation=8 WHERE singleton=1")
+    end
+    local refreshed = completion:capture(request(PATH, text, "return al"))
+    local previous_names, previous_incomplete = labels(refreshed())
+    test.assert(contains(previous_names, "alpha") and previous_incomplete,
+      "saved reanalysis hid useful previous candidates while the compiler permit was held")
+    local document = lsp.TextDocument.new("file://" .. PATH, PATH)
+    local changed = "function f(): integer\n local alpha = 1\n return alphSuffix\nend\n"
+    documents:apply(lsp.DocumentNotification.changed(lsp.ChangeDocument.new(document, 2, changed)))
+    completion:changed()
+    local typed = completion:capture(request(PATH, changed, "return alph"))
+    local started = ffi.vscode_titan_monotonic_ms()
+    local result = typed()
+    local names, incomplete = labels(result)
+    test.assert(contains(names, "alpha") and incomplete and
+        ffi.vscode_titan_monotonic_ms() - started < 1000.0,
+      "typing waited for new compiler analysis instead of filtering prepared candidates")
+    case result
+    when result(value) then
+      local object? = wire.as_object(value)
+      local items? = wire.as_array(object["items"])
+      local item? = wire.as_object(items[1])
+      local edit? = wire.as_object(item["textEdit"])
+      local range? = wire.as_object(edit["range"])
+      local finish? = wire.as_object(range["end"])
+      test.assert(wire.as_integer(finish["character"]) == 18,
+        "provisional edit used the old buffer's replacement range")
+    else raise "completion result missing"
+    end
+    test.assert(#labels(refreshed()) == 0, "previous captured request survived a buffer change")
+    local other = "function f(): integer\n local alpha = 1\n return object.al\nend\n"
+    documents:apply(lsp.DocumentNotification.changed(lsp.ChangeDocument.new(document, 3, other)))
+    completion:changed()
+    test.assert(#labels(completion:capture(request(PATH, other, "object.al"))()) == 0,
+      "provisional lexical candidates leaked into a changed receiver context")
+    documents:apply(lsp.DocumentNotification.closed(document))
+    completion:changed()
+    open(documents, PATH, 4, text)
+    completion:changed()
+    test.assert(#labels(completion:capture(request(PATH, text, "return al"))()) == 0,
+      "provisional candidates survived close and reopen into another document session")
+  end)
+end
+
+function test_completion_service_restart_prepares_while_hydration_paused_and_select_never_decodes(_context: test.Context)
+  runtime.run(function ()
+    local path = fs.tmpname()
+    defer fs.unlink(path)
+    do
+      local first = sql.open(path)
+      defer first:close()
+      seed_checked(first, {
+        bridge.ProjectModule.new("app", {bridge.SourceFile.new(PATH,
+          "local dep = import \"dep\"\nfunction f(): integer return dep.public() end\n")}),
+        bridge.ProjectModule.new("dep", {bridge.SourceFile.new("/completion-fixture/dep.titan",
+          "local record Box<|T|>\n value: T\nend\nfunction public(): integer return 1 end\n")}),
+      })
+    end
+    local store = sql.open(path)
+    defer store:close()
+    local driver = lua.require("titan-compiler.driver") as {string: value}
+    local types = lua.require("titan-compiler.types") as {string: value}
+    local previous_imported = driver["imported"]
+    local previous_registry = types["registry"]
+    local imported: {string: value} = {}
+    local registry: {string: value} = {}
+    driver["imported"], types["registry"] = imported, registry
+    defer driver["imported"] = previous_imported
+    defer types["registry"] = previous_registry
+    local original_decode = driver["decode_project_entry"] as function (string, value): (value, value)
+    local decodes = 0
+    driver["decode_project_entry"] = function (payload: string, options: value): (value, value)
+      decodes = decodes + 1
+      return original_decode(payload, options)
+    end
+    defer driver["decode_project_entry"] = original_decode
+    local paused = false
+    local barrier = async.ResumeToken.new("completion.test.hydration-free")
+    local hydration = loader.restoration(function (): {string}
+      paused = true
+      async.suspend(barrier, function () paused = false end)
+      return {}
+    end)
+    defer hydration:close()
+    hydration:start()
+    while not paused do async.yield() end
+    local documents = buffers.create()
+    local completion = service.create(store, documents)
+    defer completion:close()
+    local text = "local dep = import \"dep.titan\"\nfunction f(box: dep.Box<|integer|>): integer\n return box.va\nend\n"
+    open(documents, PATH, 1, text)
+    local work = completion:capture(request(PATH, text, "box.va"))
+    work()
+    await_preparation(completion)
+    test.assert(paused and contains(labels(work()), "value"),
+      "private generic completion required shared workspace hydration")
+    test.assert(decodes == 1, "preparation decoded more than its one required detached dependency")
+    local permit = scheduler.acquire()
+    defer permit:release()
+    for index = 1, 3 do
+      test.assert(contains(labels(work()), "value"), "published TEMP selection waited for the compiler permit")
+    end
+    test.assert(decodes == 1 and driver["imported"] == imported and types["registry"] == registry,
+      "SELECT decoded a compiler payload or private preparation populated the shared registry")
+  end)
+end
+
+function test_completion_service_folder_contributors_and_new_file(_context: test.Context)
+  runtime.run(function ()
+    local store = sql.open(":memory:")
+    defer store:close()
+    local main = "/completion-fixture/box/box.titan"
+    local child = "/completion-fixture/box/fields.titan"
+    seed(store, {bridge.ProjectModule.new("box", {bridge.SourceFile.new(main, "local saved = 1\n")})})
+    local documents = buffers.create()
+    local completion = service.create(store, documents)
+    defer completion:close()
+    local text = "function f(): integer\n return current.va\nend\n"
+    open(documents, main, 1, text)
+    open(documents, child, 2, "record Box\n value: integer\nend\nlocal current = Box.new(1)\n")
+    local work = completion:capture(request(main, text, "current.va"))
+    work()
+    await_preparation(completion)
+    test.assert(contains(labels(work()), "value"), "new open folder contributor was not part of the logical module")
+    local new_path = "/completion-fixture/fresh.titan"
+    local new_text = "function f(): integer\n local answer = 1\n return ans\nend\n"
+    open(documents, new_path, 1, new_text)
+    completion:changed()
+    local fresh = completion:capture(request(new_path, new_text, "return ans"))
+    fresh()
+    await_preparation(completion)
+    test.assert(contains(labels(fresh()), "answer"), "unambiguous new file-backed module was deferred")
+  end)
+end
+
+function test_completion_service_detached_dependencies_ignore_dirty_imports(_context: test.Context)
+  runtime.run(function ()
+    local store = sql.open(":memory:")
+    defer store:close()
+    local dependency = "/completion-fixture/dep.titan"
+    seed_checked(store, {
+      bridge.ProjectModule.new("app", {bridge.SourceFile.new(PATH,
+        "local dep = import \"dep\"\nfunction f(): integer return dep.public() end\n")}),
+      bridge.ProjectModule.new("dep", {bridge.SourceFile.new(dependency,
+        "function public(): integer return 1 end\nlocal function secret(): integer return 2 end\n")}),
+    })
+    local documents = buffers.create()
+    local completion = service.create(store, documents)
+    defer completion:close()
+    open(documents, dependency, 1, "function newer(): integer return 3 end\n")
+    local ordinary = "local dep = import \"dep\"\nfunction f(): integer return dep. end\n"
+    open(documents, PATH, 1, ordinary)
+    local work = completion:capture(request(PATH, ordinary, "dep."))
+    work()
+    await_preparation(completion)
+    local names = labels(work())
+    test.assert(contains(names, "public") and not contains(names, "secret") and not contains(names, "newer"),
+      "ordinary imports lost saved public visibility or consumed another module's dirty bytes")
+    local direct = "local dep = import \"dep.titan\"\nfunction f(): integer return dep.sec end\n"
+    documents:apply(lsp.DocumentNotification.changed(lsp.ChangeDocument.new(
+      lsp.TextDocument.new("file://" .. PATH, PATH), 2, direct)))
+    completion:changed()
+    local private_work = completion:capture(request(PATH, direct, "dep.sec"))
+    private_work()
+    await_preparation(completion)
+    test.assert(contains(labels(private_work()), "secret"), "detached direct-source visibility was lost")
+  end)
+end

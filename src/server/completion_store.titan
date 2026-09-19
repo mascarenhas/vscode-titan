@@ -1,0 +1,832 @@
+local sqlite3 = import "sqlite3"
+local async = import "async"
+local strings = import "string"
+local iteration = import "iteration"
+local sql = import "server.workspace_store"
+local bridge = import "server.compiler_bridge"
+local headers = import "server.header_store"
+local facts = import "server.completion_types"
+
+-- Main rows are written only by the existing saved publication owner. A nil
+-- project payload selects the exact-revision payload published by Cache in the
+-- same transaction. No compiler registry is needed to preserve unchanged rows.
+record SavedDescriptor
+  const module_name: string
+  const revision: integer
+  const state: integer
+  const provenance: string
+  const main_file: string
+  const payload: string?
+  const public_interface: string
+  const source_interface: string?
+  const source_files: {string}
+  const imports: {bridge.Import}
+  const header_inputs: {bridge.CHeaderDependency}
+  const candidates: {facts.Candidate}
+end
+
+record SavedModule
+  const module_name: string
+  const revision: integer
+  const state: integer
+  const provenance: string
+  const main_file: string
+  const public_interface: string
+  const source_interface: string?
+  const source_files: {string}
+  const imports: {bridge.Import}
+end
+
+record Baseline
+  const generation: integer
+  const configuration: bridge.CompilerConfiguration
+  const modules: {SavedModule}
+  const projects: {bridge.ProjectModule}
+  const include: {string}
+  const exclude: {string}
+end
+
+local function saved_headers(connection: sqlite3.Connection,
+                             module_name: string): {bridge.CHeaderDependency}
+  local rows = sql.rows(connection,
+    "SELECT kind,path,identity,modified_seconds,modified_nanoseconds,physical_identity " ..
+    "FROM main.completion_header_inputs WHERE module_name=? ORDER BY position", blob(module_name))
+  local result: {bridge.CHeaderDependency} = {}
+  for index = 1, #rows do
+    local row = rows[index]
+    local kind = bridge.CHeaderDependencyKind.file()
+    if row:get(1) == 1 then kind = bridge.CHeaderDependencyKind.search() end
+    local observation?: bridge.HeaderObservation
+    if row:get(4) ~= nil then
+      observation = bridge.HeaderObservation.new(row:get(4), row:get(5), sql.bytes(row, 6))
+    end
+    result[index] = bridge.CHeaderDependency.new(kind, sql.bytes(row, 2), sql.bytes(row, 3), observation)
+  end
+  return result
+end
+
+local function saved_files(connection: sqlite3.Connection,
+                           module_name: string): {string}
+  local rows = sql.rows(connection,
+    "SELECT filename FROM main.completion_source_files WHERE module_name=? ORDER BY position", blob(module_name))
+  local result: {string} = {}
+  for index = 1, #rows do result[index] = sql.bytes(rows[index], 1) end
+  return result
+end
+
+local function saved_imports(connection: sqlite3.Connection,
+                             module_name: string): {bridge.Import}
+  local rows = sql.rows(connection,
+    "SELECT alias,dependency,source_required,filename,line,column " ..
+    "FROM main.completion_imports WHERE module_name=? ORDER BY position", blob(module_name))
+  local result: {bridge.Import} = {}
+  for index = 1, #rows do
+    local row = rows[index]
+    result[index] = bridge.Import.new(sql.bytes(row, 1), sql.bytes(row, 2),
+      (row:get(3) as integer) ~= 0, bridge.SourceLocation.new(sql.bytes(row, 4), row:get(5), row:get(6)))
+  end
+  return result
+end
+
+local function saved_roots(connection: sqlite3.Connection, kind: integer): {string}
+  local rows = sql.rows(connection,
+    "SELECT path FROM main.completion_roots WHERE kind=? ORDER BY position", kind)
+  local result: {string} = {}
+  for index = 1, #rows do result[index] = sql.bytes(rows[index], 1) end
+  return result
+end
+
+-- External graph revisions are always zero. Their reusable descriptor identity
+-- is the full declared interface and exact ordered source/import/header plan.
+function descriptor_matches(connection: sqlite3.Connection,
+                              descriptor: SavedDescriptor): boolean
+  local rows = sql.rows(connection,
+    "SELECT revision,state,provenance,main_file,public_interface,source_interface " ..
+    "FROM main.completion_descriptors WHERE module_name=?", blob(descriptor.module_name))
+  if #rows ~= 1 then return false end
+  local row = rows[1]
+  if row:get(1) ~= descriptor.revision or row:get(2) ~= descriptor.state or
+      row:get(3) ~= descriptor.provenance or sql.bytes(row, 4) ~= descriptor.main_file or
+      sql.bytes(row, 5) ~= descriptor.public_interface or
+      sql.optional_bytes(row, 6) ~= descriptor.source_interface then return false end
+  local files = saved_files(connection, descriptor.module_name)
+  if #files ~= #descriptor.source_files then return false end
+  for index = 1, #files do
+    if files[index] ~= descriptor.source_files[index] then return false end
+  end
+  local imports = saved_imports(connection, descriptor.module_name)
+  if #imports ~= #descriptor.imports then return false end
+  for index = 1, #imports do
+    local old, new = imports[index], descriptor.imports[index]
+    if old.alias ~= new.alias or old.module_name ~= new.module_name or
+        old.source_required ~= new.source_required or old.location.filename ~= new.location.filename or
+        old.location.line ~= new.location.line or old.location.column ~= new.location.column then return false end
+  end
+  local inputs = saved_headers(connection, descriptor.module_name)
+  if #inputs ~= #descriptor.header_inputs then return false end
+  for index = 1, #inputs do
+    local old, new = inputs[index], descriptor.header_inputs[index]
+    local old_kind, new_kind = 0, 0
+    case old.kind when search() then old_kind = 1 end
+    case new.kind when search() then new_kind = 1 end
+    if old_kind ~= new_kind or old.path ~= new.path or old.identity ~= new.identity then return false end
+  end
+  return true
+end
+
+-- Capture one complete committed view. Payloads and header inventories remain
+-- lazy preparation-only reads fenced by this generation, so ordinary SELECTs
+-- and a new completion do not load a workspace-sized compiler graph.
+function Store:capture_baseline(): Baseline?
+  local access = self.store:acquire()
+  defer access:release()
+  local connection = access.connection
+  if sql.scalar_integer(connection,
+      "SELECT count(*) FROM main.sqlite_master WHERE type='table' AND name IN " ..
+      "('completion_configuration','completion_roots','completion_descriptors'," ..
+      "'completion_source_files','completion_imports','completion_header_inputs'," ..
+      "'completion_members','semantic_files')") ~= 8 then return nil end
+  local settings = sql.rows(connection,
+    "SELECT source_roots_present,binary_root,include_roots_present,cppflags " ..
+    "FROM main.completion_configuration WHERE singleton=1")
+  if #settings ~= 1 then return nil end
+  local setting = settings[1]
+  if sql.scalar_integer(connection,
+      "SELECT COALESCE(SUM(length(public_interface)+COALESCE(length(source_interface),0)),0) " ..
+      "FROM main.completion_descriptors") > MAX_DESCRIPTOR_BYTES then return nil end
+  local source_roots?: {string}
+  local include_roots?: {string}
+  if setting:get(1) == 1 then source_roots = saved_roots(connection, 0) end
+  if setting:get(3) == 1 then include_roots = saved_roots(connection, 1) end
+  local configuration = bridge.CompilerConfiguration.new(source_roots,
+    sql.optional_bytes(setting, 2), include_roots, sql.optional_bytes(setting, 4))
+  local rows = sql.rows(connection,
+    "SELECT module_name,revision,state,provenance,main_file,public_interface,source_interface " ..
+    "FROM main.completion_descriptors ORDER BY module_name")
+  local modules: {SavedModule} = {}
+  for index = 1, #rows do
+    local row = rows[index]
+    local name = sql.bytes(row, 1)
+    modules[index] = SavedModule.new(name, row:get(2), row:get(3), row:get(4),
+      sql.bytes(row, 5), sql.bytes(row, 6), sql.optional_bytes(row, 7),
+      saved_files(connection, name), saved_imports(connection, name))
+  end
+  if sql.scalar_integer(connection,
+      "SELECT COALESCE(SUM(length(contents)),0) FROM main.semantic_files") > MAX_BUFFER_BYTES then
+    return nil
+  end
+  local files = sql.rows(connection,
+    "SELECT module_name,filename,contents FROM main.semantic_files ORDER BY module_order,file_order")
+  local projects: {bridge.ProjectModule} = {}
+  local by_name: {string: bridge.ProjectModule} = {}
+  for index = 1, #files do
+    local row = files[index]
+    local name = sql.bytes(row, 1)
+    local project? = by_name[name]
+    if project == nil then
+      project = bridge.ProjectModule.new(name, {})
+      by_name[name] = project
+      projects[#projects + 1] = project
+    end
+    project.files[#project.files + 1] = bridge.SourceFile.new(sql.bytes(row, 2), sql.bytes(row, 3))
+  end
+  return Baseline.new(generation(connection), configuration, modules, projects,
+    saved_roots(connection, 2), saved_roots(connection, 3))
+end
+
+function Store:read_descriptor(expected_generation: integer,
+                                module_name: string): bridge.ProjectPayload?
+  local access = self.store:acquire()
+  defer access:release()
+  local connection = access.connection
+  if not current_generation(connection, expected_generation) then return nil end
+  local rows = sql.rows(connection,
+    "SELECT payload FROM main.completion_descriptors " ..
+    "WHERE module_name=? AND (provenance<>'project' OR state=2) AND payload IS NOT NULL " ..
+    "AND length(payload)<=?", blob(module_name), MAX_DESCRIPTOR_BYTES)
+  if #rows ~= 1 then return nil end
+  return bridge.ProjectPayload.new(module_name, sql.bytes(rows[1], 1), saved_headers(connection, module_name))
+end
+
+-- Routing captures only the committed identity. Preparation may materialize
+-- its immutable rows later, provided this exact generation is still current.
+function Store:saved_generation(): integer
+  local access = self.store:acquire()
+  defer access:release()
+  return sql.scalar_integer(access.connection,
+    "SELECT published_generation FROM main.store_state WHERE singleton=1")
+end
+
+function Store:read_header_inputs(expected_generation: integer,
+                                  module_name: string): {bridge.CHeaderDependency}?
+  local access = self.store:acquire()
+  defer access:release()
+  if not current_generation(access.connection, expected_generation) then return nil end
+  return saved_headers(access.connection, module_name)
+end
+
+-- This preparation-only accessor bypasses Cache.pending. Its persisted payload
+-- and scope-2/3 provenance are committed by the watcher in the same publication.
+function Store:read_saved_cache(expected_generation: integer,
+    kind: string, key: string): (string?, {bridge.CHeaderDependency}?)
+  local table = ""
+  local scope = 0
+  if kind == "c-header-v6" then
+    table, scope = "main.header_graphs", 2
+  elseif kind == "ffi-conversion-v7" then
+    table, scope = "main.ffi_conversion_snapshots", 3
+  else
+    return nil, nil
+  end
+  local access = self.store:acquire()
+  defer access:release()
+  if not current_generation(access.connection, expected_generation) then return nil, nil end
+  local rows = sql.rows(access.connection,
+    "SELECT payload FROM " .. table .. " WHERE key=? AND length(payload)<=?", blob(key), MAX_DESCRIPTOR_BYTES)
+  if #rows ~= 1 then return nil, nil end
+  local inputs? = headers.read(access.connection, scope, key)
+  if inputs == nil then return nil, nil end
+  return sql.bytes(rows[1], 1), inputs
+end
+
+record Store
+  local const store: sql.Store
+  local writers: {async.Task<|boolean, value|>}
+  local closed: boolean
+end
+
+type Current = function (): boolean
+
+local MAX_DOCUMENT_BYTES = 4 * 1024 * 1024
+local MAX_BUFFER_BYTES = 32 * 1024 * 1024
+local MAX_DOCUMENTS = 256
+local MAX_SNAPSHOT_BYTES = 16 * 1024 * 1024
+local MAX_ANALYSIS_BYTES = 64 * 1024 * 1024
+local MAX_SNAPSHOTS = 16
+local MAX_CANDIDATES = 100000
+local MAX_DESCRIPTOR_BYTES = 64 * 1024 * 1024
+
+local function blob(text: string): sqlite3.Blob
+  return sqlite3.Blob.new(text)
+end
+
+local function generation(connection: sqlite3.Connection): integer
+  return sql.scalar_integer(connection,
+    "SELECT published_generation FROM main.store_state WHERE singleton=1")
+end
+
+local function current_generation(connection: sqlite3.Connection,
+                                  expected: integer): boolean
+  return generation(connection) == expected
+end
+
+function initialize_saved_schema(connection: sqlite3.Connection)
+  -- Keep large descriptor payloads outside the primary-key index. Every child
+  -- foreign-key probe otherwise reads the payload's overflow pages when this
+  -- parent uses WITHOUT ROWID (SDK headers can produce multi-megabyte rows).
+  local schema = {
+    "CREATE TABLE IF NOT EXISTS main.completion_configuration(singleton INTEGER PRIMARY KEY CHECK(singleton=1),source_roots_present INTEGER NOT NULL,binary_root BLOB,include_roots_present INTEGER NOT NULL,cppflags BLOB)",
+    "CREATE TABLE IF NOT EXISTS main.completion_roots(kind INTEGER NOT NULL,position INTEGER NOT NULL,path BLOB NOT NULL,PRIMARY KEY(kind,position)) WITHOUT ROWID",
+    "CREATE TABLE IF NOT EXISTS main.completion_descriptors(module_name BLOB PRIMARY KEY NOT NULL,revision INTEGER NOT NULL,state INTEGER NOT NULL,provenance TEXT NOT NULL,main_file BLOB NOT NULL,payload BLOB,public_interface BLOB NOT NULL,source_interface BLOB)",
+    "CREATE TABLE IF NOT EXISTS main.completion_source_files(module_name BLOB NOT NULL REFERENCES completion_descriptors(module_name) ON DELETE CASCADE,position INTEGER NOT NULL,filename BLOB NOT NULL,PRIMARY KEY(module_name,position)) WITHOUT ROWID",
+    "CREATE TABLE IF NOT EXISTS main.completion_imports(module_name BLOB NOT NULL REFERENCES completion_descriptors(module_name) ON DELETE CASCADE,position INTEGER NOT NULL,alias BLOB NOT NULL,dependency BLOB NOT NULL,source_required INTEGER NOT NULL,filename BLOB NOT NULL,line INTEGER NOT NULL,column INTEGER NOT NULL,PRIMARY KEY(module_name,position)) WITHOUT ROWID",
+    "CREATE TABLE IF NOT EXISTS main.completion_header_inputs(module_name BLOB NOT NULL REFERENCES completion_descriptors(module_name) ON DELETE CASCADE,position INTEGER NOT NULL,kind INTEGER NOT NULL,path BLOB NOT NULL,identity BLOB NOT NULL,modified_seconds INTEGER,modified_nanoseconds INTEGER,physical_identity BLOB,PRIMARY KEY(module_name,position)) WITHOUT ROWID",
+    "CREATE TABLE IF NOT EXISTS main.completion_members(module_name BLOB NOT NULL REFERENCES completion_descriptors(module_name) ON DELETE CASCADE,ordinal INTEGER NOT NULL,label TEXT COLLATE BINARY NOT NULL,lookup_domain TEXT NOT NULL,lookup_key TEXT NOT NULL,kind INTEGER NOT NULL,detail BLOB NOT NULL,type_key BLOB NOT NULL,scope_id INTEGER NOT NULL,scope_depth INTEGER NOT NULL,declaration_order INTEGER NOT NULL,available INTEGER NOT NULL,visibility TEXT NOT NULL,owner_key TEXT NOT NULL,access_mode TEXT NOT NULL,PRIMARY KEY(module_name,ordinal)) WITHOUT ROWID",
+    "CREATE INDEX IF NOT EXISTS main.completion_members_owner ON completion_members(module_name,owner_key,access_mode,label COLLATE BINARY)",
+  }
+  for index = 1, #schema do sql.execute(connection, schema[index]) end
+end
+
+local function initialize_temp_schema(connection: sqlite3.Connection)
+  -- Store.open configured and read back temp_store before creating any TEMP
+  -- objects. Never change that connection-wide setting after this point.
+  if sql.scalar_integer(connection, "PRAGMA temp_store") ~= 2 then
+    raise "completion requires SQLite memory TEMP storage"
+  end
+  local schema = {
+    "CREATE TEMP TABLE IF NOT EXISTS open_documents(filename BLOB PRIMARY KEY,uri BLOB NOT NULL,module_name BLOB NOT NULL,session INTEGER NOT NULL,version INTEGER NOT NULL,contents BLOB,byte_count INTEGER NOT NULL) WITHOUT ROWID",
+    "CREATE TEMP TABLE IF NOT EXISTS completion_document_state(singleton INTEGER PRIMARY KEY CHECK(singleton=1),epoch INTEGER NOT NULL)",
+    "INSERT OR IGNORE INTO temp.completion_document_state VALUES(1,0)",
+    "CREATE TEMP TABLE IF NOT EXISTS completion_snapshots(id BLOB PRIMARY KEY,module_name BLOB NOT NULL,saved_generation INTEGER NOT NULL,buffer_epoch INTEGER NOT NULL,context_key BLOB NOT NULL,filename BLOB NOT NULL,document_session INTEGER NOT NULL,document_version INTEGER NOT NULL,caret_byte INTEGER NOT NULL,replace_start INTEGER NOT NULL,replace_finish INTEGER NOT NULL,prefix TEXT NOT NULL,quality TEXT NOT NULL,byte_count INTEGER NOT NULL,serial INTEGER NOT NULL) WITHOUT ROWID",
+    "CREATE TEMP TABLE IF NOT EXISTS completion_inputs(snapshot_id BLOB NOT NULL REFERENCES completion_snapshots(id) ON DELETE CASCADE,position INTEGER NOT NULL,filename BLOB NOT NULL,session INTEGER NOT NULL,version INTEGER NOT NULL,contents BLOB NOT NULL,PRIMARY KEY(snapshot_id,position)) WITHOUT ROWID",
+    "CREATE TEMP TABLE IF NOT EXISTS covered_modules(snapshot_id BLOB NOT NULL REFERENCES completion_snapshots(id) ON DELETE CASCADE,module_name BLOB NOT NULL,PRIMARY KEY(snapshot_id,module_name)) WITHOUT ROWID",
+    "CREATE TEMP TABLE IF NOT EXISTS completion_scopes(snapshot_id BLOB NOT NULL REFERENCES completion_snapshots(id) ON DELETE CASCADE,scope_id INTEGER NOT NULL,parent_id INTEGER,kind TEXT NOT NULL,filename BLOB NOT NULL,byte_start INTEGER NOT NULL,byte_finish INTEGER NOT NULL,PRIMARY KEY(snapshot_id,scope_id)) WITHOUT ROWID",
+    "CREATE TEMP TABLE IF NOT EXISTS completion_candidates(snapshot_id BLOB NOT NULL REFERENCES completion_snapshots(id) ON DELETE CASCADE,ordinal INTEGER NOT NULL,label TEXT COLLATE BINARY NOT NULL,lookup_domain TEXT NOT NULL,lookup_key TEXT NOT NULL,kind INTEGER NOT NULL,detail BLOB NOT NULL,type_key BLOB NOT NULL,scope_id INTEGER NOT NULL,scope_depth INTEGER NOT NULL,declaration_order INTEGER NOT NULL,available INTEGER NOT NULL,visibility TEXT NOT NULL,owner_key TEXT NOT NULL,access_mode TEXT NOT NULL,PRIMARY KEY(snapshot_id,ordinal)) WITHOUT ROWID",
+    "CREATE INDEX IF NOT EXISTS temp.completion_candidates_lookup ON completion_candidates(snapshot_id,scope_id,label COLLATE BINARY)",
+    "CREATE INDEX IF NOT EXISTS temp.completion_candidates_owner ON completion_candidates(snapshot_id,owner_key,access_mode,label COLLATE BINARY)",
+    "CREATE INDEX IF NOT EXISTS temp.completion_snapshots_context ON completion_snapshots(filename,caret_byte,context_key)",
+  }
+  for index = 1, #schema do sql.execute(connection, schema[index]) end
+end
+
+function open(store: sql.Store): Store
+  local access = store:acquire()
+  defer access:release()
+  initialize_temp_schema(access.connection)
+  return Store.new(store, {}, false)
+end
+
+local function optional_blob(text: string?): value
+  if text == nil then return nil end
+  return blob(text)
+end
+
+-- Each execute crosses the asynchronous SQLite worker boundary. Batch scalar
+-- rows as the saved semantic index does; 13 * 15 bindings stay below Titan's
+-- 200-position variadic-call limit. All values, including names, remain bound.
+local function write_candidates(connection: sqlite3.Connection, table_name: string,
+    owner: string, candidates: {facts.Candidate}, current: Current?): boolean
+  if #candidates == 0 then return true end
+  local width = 13
+  if #candidates < width then width = #candidates end
+  local row_sql = "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+  local prefix = "INSERT INTO " .. table_name .. " VALUES "
+  local statement = connection:prepare(prefix .. strings.rep(row_sql .. ",", width - 1) .. row_sql)
+  defer statement:close()
+  local owner_value = blob(owner)
+  local offset = 1
+  while offset <= #candidates do
+    if current ~= nil and not current() then return false end
+    local finish = offset + width - 1
+    if finish > #candidates then finish = #candidates end
+    local insert = statement
+    local tail?: sqlite3.Statement
+    if finish - offset + 1 < width then
+      tail = connection:prepare(prefix .. strings.rep(row_sql .. ",", finish - offset) .. row_sql)
+      insert = tail
+    end
+    defer do if tail ~= nil then tail:close() end end
+    local parameters: {value} = {}
+    for index = offset, finish do
+      local candidate = candidates[index]
+      parameters[#parameters + 1] = owner_value
+      parameters[#parameters + 1] = index
+      parameters[#parameters + 1] = candidate.label
+      parameters[#parameters + 1] = candidate.lookup_domain
+      parameters[#parameters + 1] = candidate.lookup_key
+      parameters[#parameters + 1] = candidate.kind
+      parameters[#parameters + 1] = blob(candidate.detail)
+      parameters[#parameters + 1] = blob(candidate.type_key)
+      parameters[#parameters + 1] = candidate.scope_id
+      parameters[#parameters + 1] = candidate.scope_depth
+      parameters[#parameters + 1] = candidate.declaration_order
+      parameters[#parameters + 1] = candidate.available
+      parameters[#parameters + 1] = candidate.visibility
+      parameters[#parameters + 1] = candidate.owner_key
+      parameters[#parameters + 1] = candidate.access_mode
+    end
+    insert:execute(...parameters)
+    offset = finish + 1
+  end
+  return true
+end
+
+local function read_candidate(row: sqlite3.Row): facts.Candidate
+  return facts.Candidate.new(row:get(1), row:get(2), row:get(3), row:get(4),
+    sql.bytes(row, 5), sql.bytes(row, 6), row:get(7), row:get(8), row:get(9),
+    (row:get(10) as integer) ~= 0, row:get(11), row:get(12), row:get(13))
+end
+
+local CANDIDATE_COLUMNS = "label,lookup_domain,lookup_key,kind,detail,type_key,scope_id,scope_depth,declaration_order,available,visibility,owner_key,access_mode"
+
+local function publish_header_inputs(connection: sqlite3.Connection,
+                                     descriptor: SavedDescriptor)
+  local insert = connection:prepare(
+    "INSERT INTO main.completion_header_inputs VALUES(?,?,?,?,?,?,?,?)")
+  defer insert:close()
+  for index = 1, #descriptor.header_inputs do
+    local input = descriptor.header_inputs[index]
+    local kind = 0
+    case input.kind when search() then kind = 1 end
+    local seconds?: integer
+    local nanoseconds?: integer
+    local physical?: string
+    if input.observation ~= nil then
+      seconds = input.observation.modified_seconds
+      nanoseconds = input.observation.modified_nanoseconds
+      physical = input.observation.physical_identity
+    end
+    insert:execute(blob(descriptor.module_name), index, kind, blob(input.path),
+      blob(input.identity), seconds, nanoseconds, optional_blob(physical))
+  end
+end
+
+function publish_saved(connection: sqlite3.Connection,
+                       descriptors: {SavedDescriptor}, retained_modules: {string},
+                       configuration: bridge.CompilerConfiguration,
+                       include: {string}?, exclude: {string}?)
+  initialize_saved_schema(connection)
+  local retained: {string: boolean} = {}
+  for index = 1, #retained_modules do retained[retained_modules[index]] = true end
+  local previous = sql.rows(connection,
+    "SELECT module_name FROM main.completion_descriptors")
+  for index = 1, #previous do
+    local name = sql.bytes(previous[index], 1)
+    if retained[name] ~= true then
+      sql.execute(connection, "DELETE FROM main.completion_descriptors WHERE module_name=?", blob(name))
+    end
+  end
+  for index = 1, #descriptors do
+    local descriptor = descriptors[index]
+    if retained[descriptor.module_name] ~= true then
+      raise "completion descriptor is absent from its saved inventory"
+    end
+    sql.execute(connection, "DELETE FROM main.completion_descriptors WHERE module_name=?", blob(descriptor.module_name))
+    sql.execute(connection,
+      "INSERT INTO main.completion_descriptors VALUES(?,?,?,?,?,?,?,?)",
+      blob(descriptor.module_name), descriptor.revision, descriptor.state,
+      descriptor.provenance, blob(descriptor.main_file), optional_blob(descriptor.payload),
+      blob(descriptor.public_interface), optional_blob(descriptor.source_interface))
+    if descriptor.payload == nil and descriptor.provenance == "project" then
+      sql.execute(connection,
+        "UPDATE main.completion_descriptors SET payload=(SELECT p.payload FROM main.project_snapshots AS p " ..
+        "WHERE p.module=? AND p.revision=?) WHERE module_name=?",
+        blob(descriptor.module_name), descriptor.revision, blob(descriptor.module_name))
+    end
+    do
+      local insert = connection:prepare("INSERT INTO main.completion_source_files VALUES(?,?,?)")
+      defer insert:close()
+      for file_index = 1, #descriptor.source_files do
+        insert:execute(blob(descriptor.module_name), file_index, blob(descriptor.source_files[file_index]))
+      end
+    end
+    do
+      local insert = connection:prepare("INSERT INTO main.completion_imports VALUES(?,?,?,?,?,?,?,?)")
+      defer insert:close()
+      for import_index = 1, #descriptor.imports do
+        local item = descriptor.imports[import_index]
+        insert:execute(blob(descriptor.module_name), import_index, blob(item.alias),
+          blob(item.module_name), item.source_required, blob(item.location.filename),
+          item.location.line, item.location.column)
+      end
+    end
+    publish_header_inputs(connection, descriptor)
+    write_candidates(connection, "main.completion_members", descriptor.module_name,
+      descriptor.candidates)
+  end
+  sql.execute(connection, "DELETE FROM main.completion_configuration")
+  sql.execute(connection, "INSERT INTO main.completion_configuration VALUES(1,?,?,?,?)",
+    configuration.source_roots ~= nil, optional_blob(configuration.binary_root),
+    configuration.include_roots ~= nil, optional_blob(configuration.cppflags))
+  sql.execute(connection, "DELETE FROM main.completion_roots")
+  local insert = connection:prepare("INSERT INTO main.completion_roots VALUES(?,?,?)")
+  defer insert:close()
+  if configuration.source_roots ~= nil then
+    for index = 1, #configuration.source_roots do
+      insert:execute(0, index, blob(configuration.source_roots[index]))
+    end
+  end
+  if configuration.include_roots ~= nil then
+    for index = 1, #configuration.include_roots do
+      insert:execute(1, index, blob(configuration.include_roots[index]))
+    end
+  end
+  if include ~= nil then
+    for index = 1, #include do insert:execute(2, index, blob(include[index])) end
+  end
+  if exclude ~= nil then
+    for index = 1, #exclude do insert:execute(3, index, blob(exclude[index])) end
+  end
+end
+
+local function Store:prune_writers()
+  local live: {async.Task<|boolean, value|>} = {}
+  for index = 1, #self.writers do
+    local writer = self.writers[index]
+    if not writer:status():has_finished() then live[#live + 1] = writer end
+  end
+  self.writers = live
+end
+
+-- An ordinary cancelled Task cannot submit SQLite ROLLBACK. The TEMP owner
+-- therefore owns each accepted transaction independently of its request waiter.
+-- Cancelling the waiter does not cancel this bounded writer or the saved updater.
+local function Store:write(body: function (sqlite3.Connection): boolean): boolean
+  if self.closed then return false end
+  self:prune_writers()
+  local writer = async.run<|boolean, value|>(function (): boolean
+    local access = self.store:acquire()
+    defer access:release()
+    local connection = access.connection
+    connection:set_autocommit(false)
+    do
+      local accepted = body(connection)
+      if accepted then connection:commit() else connection:rollback() end
+      return accepted
+    catch
+      if not connection:get_autocommit() then connection:rollback() end
+      raise
+    end
+  end)
+  self.writers[#self.writers + 1] = writer
+  case async.join(writer)
+  when succeeded(accepted) then
+    self:prune_writers()
+    return accepted
+  when failed(failure) then
+    self:prune_writers()
+    raise failure.error
+  when cancelled() then
+    raise "completion transaction owner was cancelled"
+  else
+    raise "completion transaction did not reach a terminal state"
+  end
+end
+
+function Store:close()
+  self.closed = true
+  for index = 1, #self.writers do async.join(self.writers[index]) end
+  self.writers = {}
+end
+
+local function invalidate_module(connection: sqlite3.Connection, module_name: string)
+  sql.execute(connection,
+    "DELETE FROM temp.completion_snapshots WHERE module_name=?", blob(module_name))
+end
+
+local function put_document(connection: sqlite3.Connection, document: facts.OpenDocument,
+                             batch_budget: boolean?): boolean
+    local old = sql.rows(connection,
+      "SELECT session,version,module_name FROM temp.open_documents WHERE filename=?", blob(document.filename))
+    if #old > 0 then
+      local old_session: integer = old[1]:get(1)
+      local old_version: integer = old[1]:get(2)
+      if old_session > document.session or
+          (old_session == document.session and old_version > document.version) then return false end
+      if old_session == document.session and old_version == document.version then
+        local same_contents = sql.scalar_integer(connection,
+          "SELECT count(*) FROM temp.open_documents WHERE filename=? AND contents=?",
+          blob(document.filename), blob(document.contents)) == 1
+        if not same_contents then return false end
+        if sql.bytes(old[1], 3) == document.module_name then return true end
+      end
+      if old_session ~= document.session or sql.bytes(old[1], 3) ~= document.module_name then
+        invalidate_module(connection, sql.bytes(old[1], 3))
+      end
+    elseif sql.scalar_integer(connection, "SELECT count(*) FROM temp.open_documents") >= MAX_DOCUMENTS then
+      return false
+    end
+    local accepted = #document.contents <= MAX_DOCUMENT_BYTES and
+      (batch_budget == true or sql.scalar_integer(connection,
+        "SELECT COALESCE(SUM(byte_count),0) FROM temp.open_documents WHERE filename<>?",
+        blob(document.filename)) + #document.contents <= MAX_BUFFER_BYTES)
+    local contents: value = nil
+    local bytes = 0
+    if accepted then contents, bytes = blob(document.contents), #document.contents end
+    sql.execute(connection,
+      "INSERT INTO temp.open_documents VALUES(?,?,?,?,?,?,?) " ..
+      "ON CONFLICT(filename) DO UPDATE SET uri=excluded.uri,module_name=excluded.module_name," ..
+      "session=excluded.session,version=excluded.version,contents=excluded.contents,byte_count=excluded.byte_count",
+      blob(document.filename), blob(document.uri), blob(document.module_name),
+      document.session, document.version, contents, bytes)
+    return accepted
+end
+
+function Store:put_document(document: facts.OpenDocument): boolean
+  local accepted = false
+  local committed = self:write(function (connection: sqlite3.Connection): boolean
+    accepted = put_document(connection, document)
+    return true
+  end)
+  return committed and accepted
+end
+
+function Store:sync_documents(documents: {facts.OpenDocument}, epoch: integer,
+                               current: Current): boolean
+  if #documents > MAX_DOCUMENTS then return false end
+  local bytes = 0
+  local present: {string: boolean} = {}
+  for index = 1, #documents do
+    local document = documents[index]
+    if present[document.filename] then raise "duplicate completion buffer filename" end
+    present[document.filename] = true
+    if #document.contents > MAX_DOCUMENT_BYTES then return false end
+    bytes = bytes + #document.contents
+  end
+  if bytes > MAX_BUFFER_BYTES then return false end
+  return self:write(function (connection: sqlite3.Connection): boolean
+    if not current() or sql.scalar_integer(connection,
+        "SELECT epoch FROM temp.completion_document_state WHERE singleton=1") > epoch then return false end
+    local old = sql.rows(connection, "SELECT filename,module_name FROM temp.open_documents")
+    for index = 1, #old do
+      local filename = sql.bytes(old[index], 1)
+      if present[filename] ~= true then
+        invalidate_module(connection, sql.bytes(old[index], 2))
+        sql.execute(connection, "DELETE FROM temp.open_documents WHERE filename=?", blob(filename))
+      end
+    end
+    -- Admission uses the final captured batch, not the insertion order or the
+    -- transient old byte total while a shrinking row still awaits replacement.
+    for index = 1, #documents do
+      if not put_document(connection, documents[index], true) then return false end
+    end
+    sql.execute(connection, "UPDATE temp.completion_document_state SET epoch=? WHERE singleton=1", epoch)
+    sql.execute(connection,
+      "DELETE FROM temp.completion_snapshots WHERE NOT EXISTS(" ..
+      "SELECT 1 FROM temp.open_documents d WHERE d.filename=temp.completion_snapshots.filename " ..
+      "AND d.session=temp.completion_snapshots.document_session)")
+    return current()
+  end)
+end
+
+function Store:remove_document(filename: string, session: integer): boolean
+  return self:write(function (connection: sqlite3.Connection): boolean
+    local old = sql.rows(connection,
+      "SELECT module_name FROM temp.open_documents WHERE filename=? AND session=?", blob(filename), session)
+    if #old == 0 then return false end
+    invalidate_module(connection, sql.bytes(old[1], 1))
+    sql.execute(connection,
+      "DELETE FROM temp.open_documents WHERE filename=? AND session=?", blob(filename), session)
+    return true
+  end)
+end
+
+function Store:invalidate(module_name: string): boolean
+  return self:write(function (connection: sqlite3.Connection): boolean
+    invalidate_module(connection, module_name)
+    return true
+  end)
+end
+
+function Store:discard_obsolete(epoch: integer): boolean
+  return self:write(function (connection: sqlite3.Connection): boolean
+    sql.execute(connection,
+      "DELETE FROM temp.completion_snapshots WHERE buffer_epoch<>? OR saved_generation<>?", epoch, generation(connection))
+    return true
+  end)
+end
+
+function Store:current_generation(expected: integer): boolean
+  local access = self.store:acquire()
+  defer access:release()
+  return current_generation(access.connection, expected)
+end
+
+local function snapshot_bytes(snapshot: facts.Snapshot): integer
+  local bytes = #snapshot.id + #snapshot.module_name + #snapshot.context_key +
+    #snapshot.filename + #snapshot.prefix + #snapshot.quality + 256
+  for index = 1, #snapshot.inputs do
+    local input = snapshot.inputs[index]
+    bytes = bytes + #input.filename + #input.contents + 64
+  end
+  for index = 1, #snapshot.scopes do
+    local scope = snapshot.scopes[index]
+    bytes = bytes + #scope.kind + #scope.filename + 64
+  end
+  for index = 1, #snapshot.candidates do
+    local candidate = snapshot.candidates[index]
+    bytes = bytes + #candidate.label + #candidate.lookup_domain + #candidate.lookup_key +
+      #candidate.detail + #candidate.type_key + #candidate.visibility +
+      #candidate.owner_key + #candidate.access_mode + 128
+  end
+  return bytes
+end
+
+local function inputs_current(connection: sqlite3.Connection,
+                               inputs: {facts.Input}): boolean
+  for index = 1, #inputs do
+    local input = inputs[index]
+    if input.session > 0 then
+      if sql.scalar_integer(connection,
+          "SELECT count(*) FROM temp.open_documents WHERE filename=? AND session=? " ..
+          "AND version=? AND contents=?", blob(input.filename), input.session,
+          input.version, blob(input.contents)) ~= 1 then return false end
+    end
+  end
+  return true
+end
+
+function Store:publish(snapshot: facts.Snapshot, current: Current): boolean
+  local bytes = snapshot_bytes(snapshot)
+  if bytes > MAX_SNAPSHOT_BYTES or #snapshot.candidates > MAX_CANDIDATES then return false end
+  if snapshot.replace_start < 0 or snapshot.replace_finish < snapshot.replace_start or
+      snapshot.caret_byte < snapshot.replace_start or snapshot.caret_byte > snapshot.replace_finish then
+    raise "invalid completion replacement span"
+  end
+  return self:write(function (connection: sqlite3.Connection): boolean
+    if not current_generation(connection, snapshot.saved_generation) or
+        not current() or not inputs_current(connection, snapshot.inputs) then return false end
+    -- Module-wide replacement remains explicit even for zero/error candidates.
+    invalidate_module(connection, snapshot.module_name)
+    sql.execute(connection,
+      "DELETE FROM temp.completion_snapshots WHERE saved_generation<>?", snapshot.saved_generation)
+    while sql.scalar_integer(connection, "SELECT count(*) FROM temp.completion_snapshots") >= MAX_SNAPSHOTS or
+        sql.scalar_integer(connection,
+          "SELECT COALESCE(SUM(byte_count),0) FROM temp.completion_snapshots") + bytes > MAX_ANALYSIS_BYTES do
+      sql.execute(connection,
+        "DELETE FROM temp.completion_snapshots WHERE id=(SELECT id FROM temp.completion_snapshots ORDER BY serial,id LIMIT 1)")
+    end
+    local serial = sql.scalar_integer(connection,
+      "SELECT COALESCE(MAX(serial),0)+1 FROM temp.completion_snapshots")
+    sql.execute(connection,
+      "INSERT INTO temp.completion_snapshots VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+      blob(snapshot.id), blob(snapshot.module_name), snapshot.saved_generation,
+      snapshot.buffer_epoch, blob(snapshot.context_key), blob(snapshot.filename),
+      snapshot.document_session, snapshot.document_version, snapshot.caret_byte,
+      snapshot.replace_start, snapshot.replace_finish, snapshot.prefix, snapshot.quality, bytes, serial)
+    sql.execute(connection, "INSERT INTO temp.covered_modules VALUES(?,?)", blob(snapshot.id), blob(snapshot.module_name))
+    do
+      local insert = connection:prepare("INSERT INTO temp.completion_inputs VALUES(?,?,?,?,?,?)")
+      defer insert:close()
+      for index = 1, #snapshot.inputs do
+        if index % 128 == 0 and not current() then return false end
+        local input = snapshot.inputs[index]
+        insert:execute(blob(snapshot.id), index, blob(input.filename), input.session, input.version, blob(input.contents))
+      end
+    end
+    do
+      local insert = connection:prepare("INSERT INTO temp.completion_scopes VALUES(?,?,?,?,?,?,?)")
+      defer insert:close()
+      for index = 1, #snapshot.scopes do
+        if index % 128 == 0 and not current() then return false end
+        local scope = snapshot.scopes[index]
+        insert:execute(blob(snapshot.id), scope.id, scope.parent_id, scope.kind,
+          blob(scope.filename), scope.byte_start, scope.byte_finish)
+      end
+    end
+    if not write_candidates(connection, "temp.completion_candidates", snapshot.id,
+        snapshot.candidates, current) then return false end
+    -- A change notification may run while native SQLite operations suspend.
+    -- Returning false rolls back the whole transaction without a stale row.
+    return current()
+  end)
+end
+
+local function prefix_upper(prefix: string): string
+  if prefix == "" then return "" end
+  for index = #prefix, 1, -1 do
+    local byte: integer = strings.byte(prefix, index)
+    if byte < 255 then return strings.sub(prefix, 1, index - 1) .. strings.char(byte + 1) end
+  end
+  return ""
+end
+
+local function select_candidates(connection: sqlite3.Connection, snapshot_id: string,
+    prefix: string, limit: integer, quality: string, current: Current): facts.Selection?
+  if limit < 1 then limit = 1 end
+  if limit > 1000 then limit = 1000 end
+  local query = "WITH ranked AS (SELECT " .. CANDIDATE_COLUMNS .. "," ..
+    "ROW_NUMBER() OVER(PARTITION BY lookup_domain,lookup_key " ..
+    "ORDER BY scope_depth DESC,declaration_order DESC,ordinal) AS nearest " ..
+    "FROM temp.completion_candidates WHERE snapshot_id=? AND available<>0) " ..
+    "SELECT " .. CANDIDATE_COLUMNS .. " FROM ranked WHERE nearest=1"
+  local rows: {sqlite3.Row} = {}
+  if prefix == "" then
+    rows = sql.rows(connection, query ..
+      " ORDER BY scope_depth DESC,label COLLATE BINARY,kind,lookup_domain,lookup_key LIMIT ?", blob(snapshot_id), limit + 1)
+  else
+    rows = sql.rows(connection, query ..
+      " AND label COLLATE BINARY>=? AND label COLLATE BINARY<? " ..
+      "ORDER BY scope_depth DESC,label COLLATE BINARY,kind,lookup_domain,lookup_key LIMIT ?",
+      blob(snapshot_id), prefix, prefix_upper(prefix), limit + 1)
+  end
+  if not current() then return nil end
+  local incomplete = #rows > limit or quality ~= "complete"
+  local candidates: {facts.Candidate} = {}
+  for index = 1, #rows do
+    if index > limit then break end
+    candidates[index] = read_candidate(rows[index])
+  end
+  return facts.Selection.new(candidates, incomplete)
+end
+
+-- The complete read owns one connection lease from generation/context checks
+-- through ranking and decoding scalar rows. No compiler, payload, or hydration
+-- operation is reachable here; only explicitly qualified SELECT statements.
+function Store:select(snapshot_id: string, context_key: string,
+                       prefix: string, limit: integer, current: Current): facts.Selection?
+  if self.closed then return nil end
+  local access = self.store:acquire()
+  defer access:release()
+  local connection = access.connection
+  local snapshots = sql.rows(connection,
+    "SELECT saved_generation,quality FROM temp.completion_snapshots WHERE id=? AND context_key=? AND prefix=?",
+    blob(snapshot_id), blob(context_key), prefix)
+  if #snapshots ~= 1 or not current() or
+      not current_generation(connection, snapshots[1]:get(1)) then return nil end
+  if sql.scalar_integer(connection,
+      "SELECT count(*) FROM temp.completion_inputs AS i WHERE i.snapshot_id=? AND i.session>0 " ..
+      "AND NOT EXISTS(SELECT 1 FROM temp.open_documents AS d WHERE d.filename=i.filename " ..
+      "AND d.session=i.session AND d.version=i.version AND d.contents=i.contents)", blob(snapshot_id)) ~= 0 then
+    return nil
+  end
+  return select_candidates(connection, snapshot_id, prefix, limit, snapshots[1]:get(2), current)
+end
+
+-- Provisional suggestions deliberately retain older compiler knowledge while
+-- replacement preparation runs. They never join newer saved facts, and their
+-- caller supplies a current-text prefix/edit after matching the source anchor.
+function Store:select_provisional(snapshot_id: string, filename: string,
+    session: integer, prefix: string, limit: integer, current: Current): facts.Selection?
+  if self.closed then return nil end
+  local access = self.store:acquire()
+  defer access:release()
+  local connection = access.connection
+  if not current() or sql.scalar_integer(connection,
+      "SELECT count(*) FROM temp.completion_snapshots s " ..
+      "JOIN temp.open_documents d ON d.filename=s.filename AND d.session=s.document_session " ..
+      "WHERE s.id=? AND s.filename=? AND s.document_session=?", blob(snapshot_id), blob(filename), session) ~= 1 then
+    return nil
+  end
+  return select_candidates(connection, snapshot_id, prefix, limit, "partial", current)
+end

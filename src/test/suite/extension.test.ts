@@ -13,6 +13,7 @@ import * as path from "node:path";
 import * as vscode from "vscode";
 import {
   createWorkspaceDocumentSelector,
+  createWorkspaceMiddleware,
   createWorkspaceUriConverters
 } from "../../extension/workspaceUris";
 
@@ -601,12 +602,14 @@ suite("Titan extension", () => {
         fakeServer,
         nestedLifecycleMarker,
         "--semantic",
+        "--completion",
         "--semantic-marker",
         nestedSemanticMarker,
         "--fixture-token",
         "nested-inner"
       ];
       let nestedFolder: vscode.WorkspaceFolder | undefined;
+      let document: vscode.TextDocument | undefined;
 
       await rm(nestedRoot, { force: true, recursive: true });
       await mkdir(path.join(nestedRoot, ".vscode"), { recursive: true });
@@ -640,6 +643,7 @@ suite("Titan extension", () => {
             fakeServer,
             alphaMarkerPath,
             "--semantic",
+            "--completion",
             "--semantic-marker",
             outerSemanticMarker,
             "--fixture-token",
@@ -647,11 +651,19 @@ suite("Titan extension", () => {
           ],
           vscode.ConfigurationTarget.WorkspaceFolder
         );
-        await waitForEventSequence(
+        const initialEvents = await waitForEventSequence(
           alphaMarkerPath,
           ["shutdown", "exit", "initialize"],
           10_000
         );
+        const initialOuterPid = initialEvents[2].pid;
+        document = await vscode.workspace.openTextDocument(
+          vscode.Uri.file(path.join(nestedRoot, "sample.titan"))
+        );
+        await replaceDocumentText(document, "local before_nested = 1\n");
+        assert.equal(document.isDirty, true);
+        assert.equal(await waitForBufferCompletion(document, 10_000),
+          initialOuterPid);
 
         await updateWorkspaceFolders(
           vscode.workspace.workspaceFolders?.length ?? 0,
@@ -676,9 +688,55 @@ suite("Titan extension", () => {
           10_000
         );
 
-        const document = await vscode.workspace.openTextDocument(
-          vscode.Uri.joinPath(nestedFolder.uri, "sample.titan")
-        );
+        assert.equal(await waitForBufferCompletion(document, 10_000),
+          initialization.pid,
+          "the new nested client must open the already dirty document");
+        await waitForProcessEvents(alphaMarkerPath, initialOuterPid,
+          ["shutdown", "exit"], 10_000);
+        const outerAfterAdd = (await readEvents(alphaMarkerPath))
+          .filter((event) => event.event === "initialize").at(-1)!;
+        assert.notEqual(outerAfterAdd.pid, initialOuterPid,
+          "adding a nested root must discard the ancestor's old buffer session");
+        await replaceDocumentText(document, "local inside_nested = 2\n");
+        assert.equal(await waitForBufferCompletion(document, 10_000),
+          initialization.pid);
+        // Every buffer event and completion belongs to the same most-specific
+        // owner as saved-file requests, even while the outer selector matches.
+        const outerMiddleware = createWorkspaceMiddleware(alpha);
+        const innerMiddleware = createWorkspaceMiddleware(nestedFolder);
+        const routed: string[] = [];
+        const changed: vscode.TextDocumentChangeEvent = {
+          document, contentChanges: [], reason: undefined
+        };
+        const cancellation = new vscode.CancellationTokenSource();
+        try {
+          for (const [owner, middleware] of [
+            ["outer", outerMiddleware], ["inner", innerMiddleware]
+          ] as const) {
+            for (const method of ["didOpen", "didSave", "didClose"] as const) {
+              await middleware[method]!(document, async () => {
+                routed.push(`${owner}:${method}`);
+              });
+            }
+            await middleware.didChange!(changed, async () => {
+              routed.push(`${owner}:didChange`);
+            });
+            await middleware.provideCompletionItem!(
+              document, new vscode.Position(0, 0),
+              { triggerKind: vscode.CompletionTriggerKind.Invoke, triggerCharacter: undefined },
+              cancellation.token, () => {
+                routed.push(`${owner}:completion`);
+                return [];
+              }
+            );
+          }
+        } finally {
+          cancellation.dispose();
+        }
+        assert.deepEqual(routed, [
+          "inner:didOpen", "inner:didSave", "inner:didClose",
+          "inner:didChange", "inner:completion"
+        ]);
         await exerciseSemanticProviders(document.uri);
 
         const expectedMethods = [
@@ -716,6 +774,13 @@ suite("Titan extension", () => {
           ["shutdown", "exit"],
           10_000
         );
+        const restoredOuterPid = await waitForBufferCompletion(document, 10_000);
+        assert.notEqual(restoredOuterPid, initialization.pid);
+        assert.notEqual(restoredOuterPid, outerAfterAdd.pid,
+          "removing a nested root must reopen its dirty documents in the ancestor");
+        await replaceDocumentText(document, "local after_nested = 3\n");
+        assert.equal(await waitForBufferCompletion(document, 10_000),
+          restoredOuterPid);
       } finally {
         if (nestedFolder !== undefined) {
           try {
@@ -723,6 +788,11 @@ suite("Titan extension", () => {
           } catch {
             // Preserve the primary assertion failure during best-effort cleanup.
           }
+        }
+        if (document?.isDirty) {
+          await vscode.window.showTextDocument(document);
+          await vscode.commands.executeCommand("workbench.action.files.revert");
+          await vscode.commands.executeCommand("workbench.action.closeActiveEditor");
         }
         await rm(nestedRoot, { force: true, recursive: true });
       }
@@ -1172,6 +1242,38 @@ function findWorkspaceFolder(
   const folder = folders.find((candidate) => candidate.name === name);
   assert.ok(folder, `workspace folder ${name} should be open`);
   return folder;
+}
+
+async function replaceDocumentText(
+  document: vscode.TextDocument,
+  text: string
+): Promise<void> {
+  const edit = new vscode.WorkspaceEdit();
+  edit.replace(document.uri, new vscode.Range(
+    document.positionAt(0), document.positionAt(document.getText().length)
+  ), text);
+  assert.equal(await vscode.workspace.applyEdit(edit), true);
+}
+
+async function waitForBufferCompletion(
+  document: vscode.TextDocument,
+  timeoutMilliseconds: number
+): Promise<number> {
+  const deadline = Date.now() + timeoutMilliseconds;
+  let labels: string[] = [];
+  while (Date.now() < deadline) {
+    const result = await vscode.commands.executeCommand<vscode.CompletionList>(
+      "vscode.executeCompletionItemProvider", document.uri,
+      document.positionAt(document.getText().length)
+    );
+    labels = (result?.items ?? []).map((item) =>
+      typeof item.label === "string" ? item.label : item.label.label);
+    const item = result?.items.find((item) =>
+      item.label === document.getText().trim());
+    if (item !== undefined) return Number(item.detail);
+    await delay(50);
+  }
+  assert.fail(`completion did not receive current dirty text; labels: ${labels}`);
 }
 
 function assertInitialization(

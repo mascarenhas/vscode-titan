@@ -15,6 +15,8 @@ const rejectInitializeAndStayAlive = fixtureArguments.includes(
 const ignoreShutdown = fixtureArguments.includes("--ignore-shutdown");
 const ignoreTerminate = fixtureArguments.includes("--ignore-terminate");
 const provideSemantics = fixtureArguments.includes("--semantic");
+const provideCompletion = fixtureArguments.includes("--completion");
+const documents = new Map();
 const hangSemantic = fixtureArguments.includes("--hang-semantic");
 const omitIndexingGeneration = fixtureArguments.includes(
   "--omit-indexing-generation"
@@ -87,6 +89,10 @@ function handleMessage(message) {
     }
     respond(message.id, {
       capabilities: provideSemantics ? {
+        ...(provideCompletion ? {
+          textDocumentSync: { openClose: true, change: 1, save: {} },
+          completionProvider: { triggerCharacters: [".", ":"] }
+        } : {}),
         definitionProvider: true,
         referencesProvider: true,
         hoverProvider: true,
@@ -165,6 +171,23 @@ function handleMessage(message) {
     appendEvent(traceMarkerPath, {
       event: "trace",
       value: message.params?.value
+    });
+  } else if (provideCompletion && message.method === "textDocument/didOpen") {
+    documents.set(message.params.textDocument.uri, message.params.textDocument);
+  } else if (provideCompletion && message.method === "textDocument/didChange") {
+    const document = documents.get(message.params.textDocument.uri);
+    if (document) {
+      document.text = message.params.contentChanges.at(-1).text;
+      document.version = message.params.textDocument.version;
+    }
+  } else if (provideCompletion && message.method === "textDocument/didClose") {
+    documents.delete(message.params.textDocument.uri);
+  } else if (provideCompletion && message.method === "textDocument/completion") {
+    const document = documents.get(message.params.textDocument.uri);
+    respond(message.id, {
+      isIncomplete: false,
+      items: [{ label: document?.text.trim() ?? "<missing didOpen>",
+        detail: String(process.pid) }]
     });
   } else if (provideSemantics && isSemanticMethod(message.method)) {
     recordSemanticRequest(message);

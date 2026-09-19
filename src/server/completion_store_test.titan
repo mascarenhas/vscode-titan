@@ -1,0 +1,461 @@
+local async = import "async"
+local fs = import "fs"
+local sqlite3 = import "sqlite3"
+local strings = import "string"
+local test = import "test"
+local runtime = import "server.test_runtime"
+local sql = import "server.workspace_store"
+local completion = import "server.completion_store.titan"
+local facts = import "server.completion_types"
+local bridge = import "server.compiler_bridge"
+local semantic = import "server.semantic_index"
+
+local PATH = "/workspace/app.titan"
+
+local function candidate(label: string, detail: string, depth: integer,
+                          order: integer, available: boolean): facts.Candidate
+  return facts.Candidate.new(label, "term", label, 6, detail, "integer",
+    depth, depth, order, available, "private", "module:app", "lexical")
+end
+
+local function snapshot(id: string, prefix: string,
+                         candidates: {facts.Candidate}): facts.Snapshot
+  return facts.Snapshot.new(id, "app", 7, 1, "context", PATH, 1, 1,
+    3, 0, 3, prefix, "complete", {facts.Input.new(PATH, 1, 1, "abc")},
+    {facts.Scope.new(0, nil, "module", PATH, 0, 3)}, candidates)
+end
+
+local function yes(): boolean
+  return true
+end
+
+local function fixture(store: sql.Store): completion.Store
+  do
+    local access = store:acquire()
+    defer access:release()
+    sql.execute(access.connection,
+      "UPDATE main.store_state SET published_generation=7 WHERE singleton=1")
+  end
+  local overlay = completion.open(store)
+  test.assert(overlay:put_document(facts.OpenDocument.new(
+    "file://" .. PATH, PATH, "app", 1, 1, "abc")))
+  return overlay
+end
+
+function test_completion_store_ranks_visible_bindings_before_prefix_limit(_context: test.Context)
+  runtime.run(function ()
+    local store = sql.open(":memory:")
+    defer store:close()
+    local overlay = fixture(store)
+    defer overlay:close()
+    local prepared = snapshot("ranked", "a_", {
+      candidate("a_name", "outer", 0, 1, true),
+      candidate("a_name", "inner-old", 2, 1, true),
+      candidate("a_name", "inner-current", 2, 2, true),
+      candidate("a_name", "unavailable", 3, 1, false),
+      candidate("a_other", "next", 0, 1, true),
+      candidate("aXfalse", "underscore is literal", 0, 1, true),
+      candidate("A_wrong", "case is literal", 0, 1, true),
+    })
+    test.assert(overlay:publish(prepared, yes))
+    local selected? = overlay:select("ranked", "context", "a_", 1, yes)
+    test.assert(selected ~= nil and #selected.candidates == 1 and selected.is_incomplete,
+      "candidate limit was applied before effective binding selection")
+    test.assert(selected.candidates[1].detail == "inner-current",
+      "nearest available same-scope declaration did not shadow earlier bindings")
+    local complete? = overlay:select("ranked", "context", "a_", 100, yes)
+    test.assert(complete ~= nil and #complete.candidates == 2 and not complete.is_incomplete,
+      "binary prefix treated an underscore as a wildcard or ignored case")
+  end)
+end
+
+function test_completion_store_publishes_complete_and_partial_candidate_batches(_context: test.Context)
+  runtime.run(function ()
+    local store = sql.open(":memory:")
+    defer store:close()
+    local overlay = fixture(store)
+    defer overlay:close()
+    local candidates: {facts.Candidate} = {}
+    for index = 1, 29 do
+      candidates[index] = candidate("name" .. index, "detail\0" .. index,
+        0, index, index ~= 14)
+    end
+    do
+      local access = store:acquire()
+      defer access:release()
+      completion.publish_saved(access.connection, {
+        completion.SavedDescriptor.new("app", 1, 2, "project", PATH, strings.rep("p", 2 * 1024 * 1024),
+          "public", nil, {PATH}, {}, {}, candidates),
+      }, {"app"}, bridge.CompilerConfiguration.new())
+    end
+    test.assert(overlay:publish(snapshot("batched", "", candidates), yes))
+    do
+      local access = store:acquire()
+      defer access:release()
+      test.assert(sql.scalar_integer(access.connection,
+        "SELECT wr FROM pragma_table_list('completion_descriptors') WHERE schema='main'") == 0,
+        "child foreign keys would reread the large descriptor payload through its primary-key tree")
+      test.assert(sql.scalar_integer(access.connection,
+        "SELECT [notnull] FROM pragma_table_info('completion_descriptors') WHERE name='module_name'") == 1,
+        "descriptor primary key must reject NULL even in a rowid table")
+      local tables = {"main.completion_members", "temp.completion_candidates"}
+      for table_index = 1, #tables do
+        local table = tables[table_index]
+        local rows = sql.rows(access.connection,
+          "SELECT ordinal,label,detail,declaration_order,available FROM " .. table .. " ORDER BY ordinal")
+        test.assert(#rows == #candidates, "candidate batch omitted its final partial rows")
+        for index = 1, #rows do
+          local row = rows[index]
+          test.assert(row:get(1) == index and row:get(2) == candidates[index].label and
+            sql.bytes(row, 3) == candidates[index].detail and row:get(4) == index and
+            ((row:get(5) as integer) ~= 0) == candidates[index].available,
+            "candidate bindings changed across batch boundaries")
+        end
+      end
+    end
+    local selected? = overlay:select("batched", "context", "", 100, yes)
+    test.assert(selected ~= nil and #selected.candidates == 28 and not selected.is_incomplete,
+      "batched publication changed candidate availability")
+    -- Supersede the new publication after its first candidate batch. Rollback
+    -- must restore the complete prior snapshot, including its replacement mask.
+    local checks = 0
+    test.assert(not overlay:publish(snapshot("superseded", "", candidates), function (): boolean
+      checks = checks + 1
+      return checks < 3
+    end))
+    local retained? = overlay:select("batched", "context", "", 100, yes)
+    test.assert(retained ~= nil and #retained.candidates == 28,
+      "interrupted candidate batch displaced the last complete snapshot")
+    test.assert(overlay:select("superseded", "context", "", 100, yes) == nil,
+      "interrupted candidate batch retained a partial snapshot")
+  end)
+end
+
+function test_completion_store_empty_overlay_masks_saved_module(_context: test.Context)
+  runtime.run(function ()
+    local store = sql.open(":memory:")
+    defer store:close()
+    local overlay = fixture(store)
+    defer overlay:close()
+    do
+      local access = store:acquire()
+      defer access:release()
+      completion.publish_saved(access.connection, {
+        completion.SavedDescriptor.new("app", 1, 2, "project", PATH, "body-free",
+          "public", "source", {PATH}, {}, {}, {candidate("alpha", "saved", 0, 0, true)}),
+      }, {"app"}, bridge.CompilerConfiguration.new(nil, nil, nil, nil))
+    end
+    test.assert(overlay:publish(snapshot("renamed", "al", {
+      candidate("bravo", "unsaved", 0, 0, true),
+    }), yes))
+    local selected? = overlay:select("renamed", "context", "al", 100, yes)
+    test.assert(selected ~= nil and #selected.candidates == 0,
+      "saved spelling reappeared below the module replacement mask")
+    test.assert(overlay:publish(snapshot("empty", "", {}), yes))
+    local empty? = overlay:select("empty", "context", "", 100, yes)
+    test.assert(empty ~= nil and #empty.candidates == 0,
+      "zero-symbol current text revived saved declarations")
+    local access = store:acquire()
+    defer access:release()
+    test.assert(sql.scalar_integer(access.connection,
+      "SELECT count(*) FROM temp.covered_modules") == 1,
+      "empty overlay lost explicit logical-module coverage")
+    test.assert(sql.scalar_integer(access.connection,
+      "SELECT count(*) FROM main.completion_members") == 1,
+      "overlay publication changed the saved member inventory")
+  end)
+end
+
+function test_completion_store_generation_and_context_fences(_context: test.Context)
+  runtime.run(function ()
+    local store = sql.open(":memory:")
+    defer store:close()
+    local overlay = fixture(store)
+    defer overlay:close()
+    local prepared = snapshot("fresh", "", {candidate("alpha", "current", 0, 0, true)})
+    test.assert(not overlay:publish(prepared, function (): boolean return false end))
+    test.assert(overlay:publish(prepared, yes))
+    test.assert(overlay:select("fresh", "other-caret", "", 10, yes) == nil,
+      "one caret reused another completion context")
+    test.assert(overlay:select("fresh", "context", "", 10,
+      function (): boolean return false end) == nil,
+      "a stale request returned successful edits")
+    do
+      local access = store:acquire()
+      defer access:release()
+      sql.execute(access.connection,
+        "UPDATE main.store_state SET published_generation=8 WHERE singleton=1")
+    end
+    test.assert(overlay:select("fresh", "context", "", 10, yes) == nil,
+      "selection mixed old TEMP facts with a newer committed generation")
+    test.assert(not overlay:publish(prepared, yes),
+      "stale saved generation installed a new snapshot")
+  end)
+end
+
+function test_completion_store_external_revision_requires_exact_provenance(_context: test.Context)
+  runtime.run(function ()
+    local store = sql.open(":memory:")
+    defer store:close()
+    local access = store:acquire()
+    defer access:release()
+    local old = completion.SavedDescriptor.new("library", 0, 2, "external", "/old/library.titan",
+      "body-free", "public", "source", {"/old/library.titan"}, {},
+      {bridge.CHeaderDependency.new(bridge.CHeaderDependencyKind.file(), "/sdk/header.h", "first")}, {})
+    completion.publish_saved(access.connection, {old}, {"library"}, bridge.CompilerConfiguration.new())
+    test.assert(completion.descriptor_matches(access.connection, old),
+      "unchanged external descriptor could not retain its detached payload")
+    local changed_header = completion.SavedDescriptor.new("library", 0, 2, "external", "/old/library.titan",
+      nil, "public", "source", {"/old/library.titan"}, {},
+      {bridge.CHeaderDependency.new(bridge.CHeaderDependencyKind.file(), "/sdk/header.h", "second")}, {})
+    test.assert(not completion.descriptor_matches(access.connection, changed_header),
+      "equal external graph revision reused stale C header identities")
+    local changed_root = completion.SavedDescriptor.new("library", 0, 2, "external", "/new/library.titan",
+      nil, "public", "source", {"/new/library.titan"}, {}, old.header_inputs, {})
+    test.assert(not completion.descriptor_matches(access.connection, changed_root),
+      "equal manifest strings reused an external descriptor from another source root")
+    local changed_private = completion.SavedDescriptor.new("library", 0, 2, "external", "/old/library.titan",
+      nil, "public", "new-private-source", old.source_files, {}, old.header_inputs, {})
+    test.assert(not completion.descriptor_matches(access.connection, changed_private),
+      "equal public surface reused changed private source-collaboration facts")
+  end)
+end
+
+function test_completion_store_reopen_sessions_and_close_cascade(_context: test.Context)
+  runtime.run(function ()
+    local store = sql.open(":memory:")
+    defer store:close()
+    local overlay = fixture(store)
+    defer overlay:close()
+    test.assert(overlay:publish(snapshot("first", "", {}), yes))
+    test.assert(overlay:remove_document(PATH, 1))
+    test.assert(overlay:put_document(facts.OpenDocument.new("file://" .. PATH, PATH, "app", 2, 1, "abc")))
+    test.assert(not overlay:publish(snapshot("late", "", {}), yes),
+      "old open-session work repopulated a reopened document")
+    test.assert(not overlay:remove_document(PATH, 1), "late close removed the reopened buffer")
+    local access = store:acquire()
+    defer access:release()
+    local tables = {"completion_snapshots", "completion_inputs", "covered_modules", "completion_scopes", "completion_candidates"}
+    for index = 1, #tables do
+      local table = tables[index]
+      test.assert(sql.scalar_integer(access.connection, "SELECT count(*) FROM temp." .. table) == 0,
+        "closed snapshot retained owned rows in " .. table)
+    end
+  end)
+end
+
+function test_completion_store_sync_versions_and_memory_limits(_context: test.Context)
+  runtime.run(function ()
+    local store = sql.open(":memory:")
+    defer store:close()
+    local overlay = fixture(store)
+    defer overlay:close()
+    test.assert(overlay:sync_documents({facts.OpenDocument.new("file://" .. PATH, PATH, "app", 1, 4, "new")}, 4, yes))
+    test.assert(not overlay:sync_documents({facts.OpenDocument.new("file://" .. PATH, PATH, "app", 1, 3, "old")}, 3, yes),
+      "old notification batch replaced newer contents")
+    test.assert(not overlay:put_document(facts.OpenDocument.new("file://" .. PATH, PATH, "app", 1, 5,
+      strings.rep("x", completion.MAX_DOCUMENT_BYTES + 1))), "oversized source exceeded buffer policy")
+    do
+      local access = store:acquire()
+      defer access:release()
+      test.assert(sql.scalar_integer(access.connection,
+        "SELECT count(*) FROM temp.open_documents WHERE version=5 AND contents IS NULL") == 1,
+        "oversized current version kept stale text eligible for completion")
+    end
+    test.assert(overlay:put_document(facts.OpenDocument.new("file://" .. PATH, PATH, "app", 1, 6, "ok")),
+      "bounded later full-sync text did not recover")
+    test.assert(overlay:sync_documents({}, 6, yes))
+    local access = store:acquire()
+    defer access:release()
+    test.assert(sql.scalar_integer(access.connection, "SELECT count(*) FROM temp.open_documents") == 0,
+      "full buffer synchronization retained a closed document")
+  end)
+end
+
+function test_completion_store_admits_capacity_replacements_atomically(_context: test.Context)
+  runtime.run(function ()
+    local store = sql.open(":memory:")
+    defer store:close()
+    local overlay = completion.open(store)
+    defer overlay:close()
+    local documents: {facts.OpenDocument} = {}
+    for index = 1, completion.MAX_DOCUMENTS do
+      local path = "/workspace/" .. index .. ".titan"
+      documents[index] = facts.OpenDocument.new("file://" .. path, path, "app", index, 1, "a")
+    end
+    test.assert(overlay:sync_documents(documents, 1, yes))
+    documents[1] = facts.OpenDocument.new("file:///workspace/new.titan", "/workspace/new.titan", "app", 300, 1, "a")
+    test.assert(overlay:sync_documents(documents, 2, yes), "closed row consumed replacement capacity")
+    local large = strings.rep("x", completion.MAX_DOCUMENT_BYTES)
+    local sized: {facts.OpenDocument} = {}
+    for index = 1, 9 do
+      local path = "/workspace/sized" .. index .. ".titan"
+      local text = large
+      if index == 1 then text = "" end
+      sized[index] = facts.OpenDocument.new("file://" .. path, path, "app", 400 + index, 1, text)
+    end
+    test.assert(overlay:sync_documents(sized, 3, yes))
+    sized[1] = facts.OpenDocument.new(sized[1].uri, sized[1].filename, "app", 401, 2, large)
+    sized[9] = facts.OpenDocument.new(sized[9].uri, sized[9].filename, "app", 409, 2, "")
+    test.assert(overlay:sync_documents(sized, 4, yes), "growth before shrink rejected a bounded final batch")
+    local access = store:acquire()
+    defer access:release()
+    test.assert(sql.scalar_integer(access.connection,
+      "SELECT SUM(byte_count) FROM temp.open_documents") == completion.MAX_BUFFER_BYTES)
+  end)
+end
+
+function test_completion_store_cancelled_waiter_drains_publication(_context: test.Context)
+  runtime.run(function ()
+    local store = sql.open(":memory:")
+    defer store:close()
+    local overlay = fixture(store)
+    local held = store:acquire()
+    local requester = async.run<|boolean, value|>(function (): boolean
+      return overlay:publish(snapshot("cancelled", "", {}), yes)
+    end)
+    async.yield()
+    async.yield()
+    requester:cancel(async.CancellationReason.simple("cancel completion waiter"))
+    held:release()
+    async.join(requester)
+    overlay:close()
+    local access = store:acquire()
+    defer access:release()
+    test.assert(access.connection:get_autocommit(),
+      "cancelled request left the shared connection inside a TEMP transaction")
+    test.assert(sql.scalar_integer(access.connection,
+      "SELECT published_generation FROM main.store_state WHERE singleton=1") == 7,
+      "cancellation changed the saved publication")
+  end)
+end
+
+function test_completion_store_evicts_oldest_snapshots_and_rejects_oversized_replacement(
+    _context: test.Context)
+  runtime.run(function ()
+    local store = sql.open(":memory:")
+    defer store:close()
+    local overlay = fixture(store)
+    defer overlay:close()
+    local snapshots: {facts.Snapshot} = {}
+    for index = 1, completion.MAX_SNAPSHOTS + 1 do
+      local name = "bounded" .. index
+      local path = "/workspace/" .. name .. ".titan"
+      test.assert(overlay:put_document(facts.OpenDocument.new(
+        "file://" .. path, path, name, index + 1, 1, "abc")))
+      local prepared = facts.Snapshot.new(name, name, 7, 1, "context", path,
+        index + 1, 1, 3, 0, 3, "", "complete",
+        {facts.Input.new(path, index + 1, 1, "abc")},
+        {facts.Scope.new(0, nil, "module", path, 0, 3)},
+        {candidate(name, "retained", 0, 0, true)})
+      snapshots[index] = prepared
+      test.assert(overlay:publish(prepared, yes))
+    end
+    local oldest = snapshots[1]
+    local newest = snapshots[#snapshots]
+    test.assert(overlay:select(oldest.id, "context", "", 10, yes) == nil,
+      "snapshot capacity retained the oldest analysis")
+    local selected? = overlay:select(newest.id, "context", "", 10, yes)
+    test.assert(selected ~= nil and #selected.candidates == 1 and
+      selected.candidates[1].label == newest.module_name,
+      "snapshot eviction discarded the newest usable candidates")
+    do
+      local access = store:acquire()
+      defer access:release()
+      test.assert(sql.scalar_integer(access.connection,
+        "SELECT count(*) FROM temp.completion_snapshots") == completion.MAX_SNAPSHOTS)
+      local tables = {"completion_inputs", "covered_modules", "completion_scopes", "completion_candidates"}
+      for index = 1, #tables do
+        local table = tables[index]
+        test.assert(sql.scalar_integer(access.connection,
+          "SELECT count(*) FROM temp." .. table .. " WHERE snapshot_id=?",
+          sqlite3.Blob.new(oldest.id)) == 0,
+          "evicted snapshot retained owned rows in " .. table)
+        test.assert(sql.scalar_integer(access.connection,
+          "SELECT count(*) FROM temp." .. table) == completion.MAX_SNAPSHOTS,
+          "snapshot capacity did not bound owned rows in " .. table)
+      end
+    end
+    local oversized = facts.Snapshot.new("oversized", newest.module_name,
+      newest.saved_generation, newest.buffer_epoch, newest.context_key,
+      newest.filename, newest.document_session, newest.document_version,
+      newest.caret_byte, newest.replace_start, newest.replace_finish, "", "complete",
+      newest.inputs, newest.scopes,
+      {candidate("oversized", strings.rep("x", completion.MAX_SNAPSHOT_BYTES + 1), 0, 0, true)})
+    test.assert(not overlay:publish(oversized, yes),
+      "oversized scalar detail exceeded the derived snapshot budget")
+    test.assert(overlay:select("oversized", "context", "", 10, yes) == nil)
+    local preserved? = overlay:select(newest.id, "context", "", 10, yes)
+    test.assert(preserved ~= nil and #preserved.candidates == 1 and
+      preserved.candidates[1].label == newest.module_name,
+      "rejected oversized replacement displaced the accepted module snapshot")
+  end)
+end
+
+function test_completion_store_file_main_immutability_and_connection_lifetime(_context: test.Context)
+  runtime.run(function ()
+    local path = fs.tmpname()
+    defer fs.unlink(path)
+    local store = sql.open(path)
+    local overlay = fixture(store)
+    local original = fs.read_file(path)
+    test.assert(overlay:publish(snapshot("memory", "", {candidate("alpha", "unsaved", 0, 0, true)}), yes))
+    test.assert(overlay:select("memory", "context", "", 10, yes) ~= nil)
+    test.assert(fs.read_file(path) == original, "TEMP publication changed persistent database bytes")
+    do
+      local second = sqlite3.connect(path)
+      defer second:close()
+      test.assert(sql.scalar_integer(second,
+        "SELECT count(*) FROM temp.sqlite_master WHERE type='table'") == 0,
+        "another connection saw the private completion overlay")
+    end
+    overlay:close()
+    store:close()
+    local reopened = sql.open(path)
+    defer reopened:close()
+    local access = reopened:acquire()
+    defer access:release()
+    test.assert(sql.scalar_integer(access.connection, "PRAGMA temp_store") == 2)
+    test.assert(sql.scalar_integer(access.connection,
+      "SELECT count(*) FROM temp.sqlite_master WHERE type='table'") == 0,
+      "restart persisted an unsaved completion table")
+    test.assert(sql.scalar_integer(access.connection,
+      "SELECT published_generation FROM main.store_state WHERE singleton=1") == 7)
+  end)
+end
+
+function test_completion_store_saved_descriptor_matches_published_sources(_context: test.Context)
+  runtime.run(function ()
+    local store = sql.open(":memory:")
+    defer store:close()
+    local overlay = fixture(store)
+    defer overlay:close()
+    do
+      local access = store:acquire()
+      defer access:release()
+      local connection = access.connection
+      semantic.initialize_schema(connection)
+      sql.execute(connection, "INSERT INTO main.semantic_projects VALUES(?,1,9,2)", sqlite3.Blob.new("app"))
+      sql.execute(connection, "INSERT INTO main.semantic_files VALUES(?,?,?,1,1)",
+        sqlite3.Blob.new(PATH), sqlite3.Blob.new("app"), sqlite3.Blob.new("saved bytes"))
+      completion.publish_saved(connection, {
+        completion.SavedDescriptor.new("app", 9, 2, "project", PATH, "descriptor-v1", "public", "private",
+          {PATH}, {}, {bridge.CHeaderDependency.new(bridge.CHeaderDependencyKind.file(), "/sdk/header.h", "old-hash")}, {}),
+      }, {"app"}, bridge.CompilerConfiguration.new({"/workspace"}, "/sdk/lib", {"/sdk/include"}, "-DMODE=1"), {"**/*.titan"}, {"ignored/**"})
+      -- Work tables can advance before the saved view. They are deliberately
+      -- absent from the capture query and cannot contaminate its source bytes.
+      sql.execute(connection, "CREATE TABLE main.project_sources(contents BLOB)")
+      sql.execute(connection, "INSERT INTO main.project_sources VALUES(?)", sqlite3.Blob.new("new work bytes"))
+    end
+    local baseline? = overlay:capture_baseline()
+    test.assert(baseline ~= nil and baseline.generation == 7 and #baseline.projects == 1)
+    test.assert(baseline.projects[1].files[1].contents == "saved bytes",
+      "baseline joined newer working source to the committed semantic view")
+    test.assert(baseline.configuration.cppflags == "-DMODE=1" and baseline.exclude[1] == "ignored/**")
+    local payload? = overlay:read_descriptor(7, "app")
+    test.assert(payload ~= nil and payload.payload == "descriptor-v1" and payload.header_inputs[1].identity == "old-hash",
+      "detached descriptor lost its exact saved header provenance")
+    test.assert(overlay:read_descriptor(8, "app") == nil,
+      "preparation read a payload from a different saved generation")
+  end)
+end

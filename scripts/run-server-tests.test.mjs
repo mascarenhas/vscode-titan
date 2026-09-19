@@ -1,8 +1,10 @@
 import assert from "node:assert/strict";
-import { chmod, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { spawnSync } from "node:child_process";
+import { chmod, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { test } from "node:test";
+import { fileURLToPath } from "node:url";
 import { runShards, serverTestShards, validateShards } from "./run-server-tests.mjs";
 
 const shards = [["server.first_test"], ["server.second_test"]];
@@ -60,6 +62,76 @@ test("runs both shards concurrently in isolated directories and records results"
   await assert.rejects(readdir(first.cwd), { code: "ENOENT" });
   await assert.rejects(readdir(second.cwd), { code: "ENOENT" });
   assert.deepEqual(await readdir(options.logs), ["shard-1.log", "shard-2.log", "summary.json"]);
+});
+
+test("Make execution targets query the selected Lua for paths outside its installed tree", async (context) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "titan-test-runtime-"));
+  context.after(() => rm(root, { recursive: true, force: true }));
+  await mkdir(path.join(root, "scripts"));
+  await mkdir(path.join(root, "src/server"), { recursive: true });
+  await writeFile(path.join(root, "scripts/run-server-tests.mjs"),
+    await readFile(new URL("./run-server-tests.mjs", import.meta.url)));
+  await writeFile(path.join(root, "src/server/tests.titan"),
+    await readFile(new URL("../src/server/tests.titan", import.meta.url)));
+  const binary = path.join(root, "suite");
+  const script = path.join(root, "suite.mjs");
+  await writeFile(binary, `#!/bin/sh\nunset NODE_TEST_CONTEXT\nexec '${process.execPath}' '${script}' "$@"\n`);
+  await chmod(binary, 0o755);
+  await writeFile(script, `import { writeFile } from "node:fs/promises";
+import * as path from "node:path";
+await writeFile(path.join(${JSON.stringify(root)}, process.pid + ".environment"), JSON.stringify({
+  versioned: process.env.TITAN_PATH_0_6 ?? null, fallback: process.env.TITAN_PATH ?? null,
+  lua: process.env.LUA_PATH_5_5, c: process.env.LUA_CPATH_5_5, cache: process.env.CCACHE_DISABLE
+}));
+for (const filter of process.argv.slice(2)) {
+  const owner = filter.slice("--filter=^".length, -2).replaceAll("%.", ".");
+  console.log("[ RUN      ] " + owner + ".test_case");
+}
+`);
+  const prefix = path.join(root, "selected-sdk");
+  await mkdir(path.join(prefix, "bin"), { recursive: true });
+  const lua = path.join(prefix, "bin/lua");
+  const query = path.join(prefix, "bin/query.mjs");
+  await writeFile(lua, `#!/bin/sh\nunset NODE_TEST_CONTEXT\nexec '${process.execPath}' '${query}' "$@"\n`);
+  await chmod(lua, 0o755);
+  await writeFile(query, `import assert from "node:assert/strict";
+import * as path from "node:path";
+assert.deepEqual(process.argv.slice(2, 4), ["-E", "-e"]);
+const prefix = path.dirname(path.dirname(process.argv[1]));
+switch (process.argv[4]) {
+  case "io.write(package.path)": process.stdout.write(prefix + "/share/lua/5.5/?.lua"); break;
+  case "io.write(package.cpath)": process.stdout.write(prefix + "/lib/titan/0.6/?.so;" + prefix + "/lib/lua/5.5/?.so"); break;
+  default: throw new Error("unexpected Lua query");
+}
+`);
+  for (const ambient of [false, true]) {
+    const env = { ...process.env };
+    delete env.TITAN_PATH_0_6;
+    delete env.TITAN_PATH;
+    if (ambient) {
+      env.TITAN_PATH_0_6 = path.join(root, "unrelated-versioned");
+      env.TITAN_PATH = path.join(root, "unrelated-fallback");
+      env.LUA_PATH_5_5 = path.join(root, "unrelated-lua/?.lua");
+      env.LUA_CPATH_5_5 = path.join(root, "unrelated-c/?.so");
+    }
+    for (const target of ["server-test-run", "server-test-sharded"]) {
+      const result = spawnSync("make", ["--no-print-directory",
+        "-f", fileURLToPath(new URL("../Makefile", import.meta.url)),
+        "-o", "server-test-build", "NON_NATIVE_GOALS=server-test-run server-test-sharded",
+        `TITAN_PREFIX=${prefix}`, `SERVER_TEST=${binary}`, "CCACHE_DISABLE=1", target],
+      { cwd: root, env, encoding: "utf8", timeout: 15_000 });
+      assert.equal(result.status, 0, result.error?.message ?? result.stderr);
+    }
+  }
+  const captures = (await readdir(root)).filter((name) => name.endsWith(".environment"));
+  assert.equal(captures.length, 6, "two serial executions and four shards must run");
+  for (const filename of captures) {
+    assert.deepEqual(JSON.parse(await readFile(path.join(root, filename), "utf8")), {
+      versioned: null, fallback: null,
+      lua: path.join(prefix, "share/lua/5.5/?.lua"),
+      c: path.join(prefix, "lib/titan/0.6/?.so") + ";" + path.join(prefix, "lib/lua/5.5/?.so"), cache: "1"
+    });
+  }
 });
 
 test("propagates a failed shard while collecting both results", async (context) => {

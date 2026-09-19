@@ -52,9 +52,12 @@ errors. Do not solve discovery by embedding the compiler into the executable.
 - Treat JSON byte lengths, LSP UTF-16 positions, and URI/path conversion as
   explicit boundaries with focused tests.
 - Advertise only implemented capabilities.
-- V1 semantics come from saved disk files. Open/change notifications may affect
-  user messaging, but their text is not compiler input.
-- Attach project generations to asynchronous work and discard stale results.
+- Existing saved features use disk files. Post-V1 completion alone consumes
+  immutable open/change captures; use [completion.md](../../../docs/completion.md)
+  for its input, preparation, TEMP and cancellation ownership contracts.
+- Attach project generations to asynchronous work. Reject superseded captures
+  and require exact inputs for fresh results. Completion may serve bounded
+  provisional compiler candidates under the documented completion policy.
 
 ## Project and cache rules
 
@@ -64,6 +67,9 @@ provenance. Project bodies exist only during fresh checking and semantic
 extraction; release them after accepted SQL publication and retain unchanged
 modules' SQL facts. External source and binary modules retain manifests and
 provenance only. Compiler-observed C-header dependency closures are metadata.
+Keep large compiler payloads out of foreign-key parent key indexes. Completion
+descriptors use a rowid table with a separate unique module key; bump the
+workspace cache schema when changing that layout.
 
 Project watchers cover `.titan` creation, changes, and deletion. They never
 watch external trees. Revalidate an encountered external import from its exact
@@ -72,7 +78,23 @@ candidates where applicable. Propagate invalidation through immediate importers
 only when a module's public manifest changed; stop when it did not.
 
 Definition navigation stays inside project source and excludes foreign
-declarations. Completion and unsaved-buffer semantics remain out of scope.
+declarations. Completion is a separate unsaved pipeline: preserve source-private
+visibility, actual receiver/ffi lookup and the distinct foreign type namespace.
+Read the sibling `titan-completion` skill when changing its compiler boundary.
+Capture committed completion descriptors with semantic publication; never use
+mutable graph work rows as a saved baseline. Selected static archives contribute
+complete sibling inventories. Accumulate captures by physical provider across
+independent roots and fixed-point passes, replace recaptured groups completely,
+and release pending captures after publication or configuration changes. Validate
+pending provider identities from compiler observations; preserve untouched SQL
+catalogs only through accepted provider ownership, with source overlap rejecting
+the entire provider. Retain embedded inventories during compatible warm startup.
+Test unrelated refresh, provider replacement/removal, and warm restoration.
+Decode descriptors only during private preparation; selection reads indexed
+scalar facts under one connection
+lease. Add deterministic held/free compiler-permit tests and measure preparation
+separately from SQL selection. Include new compiler modules in staging and VSIX
+checks, and keep all other semantic features saved-file-only.
 
 ## Verification and delivery
 

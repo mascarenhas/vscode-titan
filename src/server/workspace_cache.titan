@@ -8,7 +8,7 @@ local bridge = import "server.compiler_bridge"
 local logging = import "server.logging"
 local headers = import "server.header_store"
 
-local SCHEMA_VERSION = 4
+local SCHEMA_VERSION = 5
 
 type ProjectPayload = bridge.ProjectPayload
 
@@ -51,8 +51,8 @@ record Cache
 end
 
 local function artifact_table(kind: string): string?
-  if kind == "c-header-v5" then return "main.header_graphs" end
-  if kind == "ffi-conversion-v6" then return "main.ffi_conversion_snapshots" end
+  if kind == "c-header-v6" then return "main.header_graphs" end
+  if kind == "ffi-conversion-v7" then return "main.ffi_conversion_snapshots" end
   return nil
 end
 
@@ -338,8 +338,8 @@ function Cache:rebuild(replacement_compatibility: string?): Cache
 end
 
 local function artifact_scope(kind: string): integer
-  if kind == "c-header-v5" then return 2 end
-  if kind == "ffi-conversion-v6" then return 3 end
+  if kind == "c-header-v6" then return 2 end
+  if kind == "ffi-conversion-v7" then return 3 end
   raise "unknown header artifact namespace"
 end
 
@@ -428,12 +428,16 @@ function Cache:unpublished_projects(): {string}
   local complete = sql.scalar_integer(connection,
     "SELECT count(*) FROM main.sqlite_master WHERE type='table' AND name IN (" ..
     "'semantic_projects','semantic_files','semantic_summaries','semantic_occurrences'," ..
-    "'semantic_hovers','semantic_folds')") == 6
+    "'semantic_hovers','semantic_folds','completion_configuration','completion_roots'," ..
+    "'completion_descriptors','completion_source_files','completion_imports'," ..
+    "'completion_header_inputs','completion_members')") == 13
   local query = "SELECT g.name FROM main.graph_modules AS g " ..
     "WHERE g.provenance=0 AND g.state=2"
   if complete then
     query = query .. " AND NOT EXISTS(SELECT 1 FROM main.semantic_projects AS p " ..
-      "WHERE p.module_name=CAST(g.name AS BLOB) AND p.revision=g.revision AND p.state=2)"
+      "WHERE p.module_name=CAST(g.name AS BLOB) AND p.revision=g.revision AND p.state=2 " ..
+      "AND EXISTS(SELECT 1 FROM main.completion_descriptors AS c " ..
+      "WHERE c.module_name=p.module_name AND c.revision=p.revision AND c.state=2))"
   end
   local rows = sql.rows(connection, query .. " ORDER BY g.name COLLATE BINARY")
   local result: {string} = {}
@@ -525,7 +529,11 @@ local function reusable_publication(connection: sqlite3.Connection,key: string):
     sql.scalar_integer(connection,
       "SELECT count(*) FROM main.sqlite_master WHERE type='table' AND name IN (" ..
       "'semantic_projects','semantic_files','semantic_summaries','semantic_occurrences'," ..
-      "'semantic_hovers','semantic_folds','semantic_diagnostic_publications','semantic_diagnostic_items')") == 8
+      "'semantic_hovers','semantic_folds','semantic_diagnostic_publications','semantic_diagnostic_items'," ..
+      "'completion_configuration','completion_roots','completion_descriptors','completion_source_files'," ..
+      "'completion_imports','completion_header_inputs','completion_members')") == 15 and
+    sql.scalar_integer(connection,
+      "SELECT count(*) FROM main.completion_configuration WHERE singleton=1") == 1
 end
 
 function Cache:can_reuse_publication(): boolean

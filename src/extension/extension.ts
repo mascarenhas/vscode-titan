@@ -118,8 +118,9 @@ class TitanClientManager {
     return this.enqueue(async () => this.synchronizeClients());
   }
 
-  public scheduleSynchronize(): void {
-    void this.enqueue(async () => this.synchronizeClients());
+  public scheduleSynchronize(event: vscode.WorkspaceFoldersChangeEvent): void {
+    const changedFolders = [...event.added, ...event.removed];
+    void this.enqueue(async () => this.synchronizeClients(changedFolders));
   }
 
   public scheduleRestart(event: vscode.ConfigurationChangeEvent): void {
@@ -169,14 +170,21 @@ class TitanClientManager {
     return this.operation;
   }
 
-  private async synchronizeClients(): Promise<void> {
+  private async synchronizeClients(
+    changedFolders: readonly vscode.WorkspaceFolder[] = []
+  ): Promise<void> {
     const workspaceFolders = vscode.workspace.workspaceFolders ?? [];
     const expected = new Set(
       workspaceFolders.map((folder) => folder.uri.toString())
     );
 
     for (const [key, client] of this.clients) {
-      if (!expected.has(key)) {
+      // Middleware ownership changes immediately with the workspace topology.
+      // Restart ancestors so their old buffer sessions are discarded and the
+      // language client opens every document now owned by the new topology.
+      // Keep each event's changed roots even when several events are queued.
+      if (!expected.has(key) || changedFolders.some((folder) =>
+        isNestedWorkspace(vscode.Uri.parse(key), folder.uri))) {
         await this.stopClient(key, client);
       }
     }
@@ -502,6 +510,14 @@ function diagnosticCollectionName(folder: vscode.WorkspaceFolder): string {
   return `titan-${Buffer.from(folder.uri.toString()).toString("base64url")}`;
 }
 
+function isNestedWorkspace(ancestor: vscode.Uri, candidate: vscode.Uri): boolean {
+  const rootPath = ancestor.path.replace(/\/+$/, "");
+  return ancestor.scheme === candidate.scheme &&
+    ancestor.authority === candidate.authority &&
+    candidate.path.startsWith(`${rootPath}/`) &&
+    candidate.path.replace(/\/+$/, "") !== rootPath;
+}
+
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
   const outputChannel = vscode.window.createOutputChannel(
     "Titan Language Server",
@@ -516,8 +532,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       SHOW_LANGUAGE_SERVER_OUTPUT_COMMAND,
       () => outputChannel.show()
     ),
-    vscode.workspace.onDidChangeWorkspaceFolders(() => {
-      clientManager?.scheduleSynchronize();
+    vscode.workspace.onDidChangeWorkspaceFolders((event) => {
+      clientManager?.scheduleSynchronize(event);
     }),
     vscode.workspace.onDidChangeConfiguration((event) => {
       if (event.affectsConfiguration(LANGUAGE_SERVER_CONFIGURATION_SECTION) ||

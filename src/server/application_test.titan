@@ -12,6 +12,7 @@ local bridge = import "server.compiler_bridge"
 local compiler_io = import "server.compiler_io"
 local diagnostics = import "server.diagnostics"
 local dispatcher = import "server.dispatcher"
+local lsp = import "server.lsp_types"
 local indexing_status = import "server.indexing_status"
 local wire = import "server.wire"
 local logging = import "server.logging"
@@ -24,6 +25,41 @@ local semantic_features = import "server.semantic_features"
 local source_text = import "server.source_text"
 local stores = import "server.workspace_store"
 local test_runtime = import "server.test_runtime"
+
+local function buffers_before_saved_service_readiness()
+  local server = application.create("/workspace")
+  defer server:close()
+  local document = lsp.TextDocument.new(
+    "file:///workspace/src/new.titan", "/workspace/src/new.titan")
+  server:on_document(lsp.DocumentNotification.opened(
+    lsp.OpenDocument.new(document, 1, "unsaved")))
+  server:on_document(lsp.DocumentNotification.saved(document))
+  server:on_document(lsp.DocumentNotification.opened(lsp.OpenDocument.new(
+    lsp.TextDocument.new("file:///elsewhere/new.titan", "/elsewhere/new.titan"),
+    1, "outside")))
+  test.assert(#server.buffers:inputs() == 1 and
+    server.buffers:inputs()[1].text == "unsaved",
+    "early sync lost editor text or accepted another workspace's buffer")
+  local request = dispatcher.CompletionRequest.new(
+    dispatcher.RequestId.integer_id(1), lsp.CompletionParams.new(
+      lsp.DocumentPosition.new(document.uri, document.path,
+        source_text.Position.new(0, 3)), 1, nil))
+  local work = server:capture_completion(request)
+  test.assert(server.service == nil and server.refresh_task == nil and
+    server.completion == nil,
+    "early completion started or waited for saved workspace hydration")
+  case work()
+  when result(result) then
+    local object? = wire.as_object(result)
+    local items? = wire.as_array(object["items"])
+    test.assert(wire.as_boolean(object["isIncomplete"]) == true and #items == 0)
+  else test.assert(false, "early completion did not return a bounded fallback")
+  end
+end
+
+function test_application_buffers_before_saved_service_readiness(_context: test.Context)
+  test_runtime.run(buffers_before_saved_service_readiness)
+end
 
 local record YieldingAnalyzer
   runs: integer

@@ -72,6 +72,16 @@ export function createWorkspaceMiddleware(
       folder.uri.toString();
 
   return {
+    didOpen: (document, next) =>
+      owns(document) ? next(document) : Promise.resolve(),
+    didChange: (event, next) =>
+      owns(event.document) ? next(event) : Promise.resolve(),
+    didClose: (document, next) =>
+      owns(document) ? next(document) : Promise.resolve(),
+    didSave: (document, next) =>
+      owns(document) ? next(document) : Promise.resolve(),
+    provideCompletionItem: (document, position, context, token, next) =>
+      owns(document) ? next(document, position, context, token) : undefined,
     provideDefinition: (document, position, token, next) =>
       owns(document) ? next(document, position, token) : undefined,
     provideReferences: (document, position, options, token, next) =>

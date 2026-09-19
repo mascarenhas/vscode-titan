@@ -1,0 +1,140 @@
+local test = import "test"
+local strings = import "string"
+local buffers = import "server.document_buffers"
+local lsp = import "server.lsp_types"
+local source_text = import "server.source_text"
+
+local function document(name: string): lsp.TextDocument
+  return lsp.TextDocument.new("file:///workspace/" .. name,
+    "/workspace/" .. name)
+end
+
+local function open(store: buffers.BufferStore, name: string,
+                     version: integer, text: string)
+  test.assert(store:apply(lsp.DocumentNotification.opened(
+    lsp.OpenDocument.new(document(name), version, text))))
+end
+
+function test_buffers_preserve_captured_versions_and_accept_version_gaps(
+    _context: test.Context)
+  local store = buffers.create()
+  open(store, "main.titan", -1, "old")
+  local captured? = store:capture("/workspace/main.titan",
+    source_text.Position.new(0, 2))
+  test.assert(captured ~= nil and store:current(captured))
+  test.assert(store:apply(lsp.DocumentNotification.changed(
+    lsp.ChangeDocument.new(document("main.titan"), 8, "new"))))
+  test.assert(not store:current(captured) and captured.document.text == "old",
+    "a new version mutated a captured request's source")
+  test.assert(not store:apply(lsp.DocumentNotification.changed(
+    lsp.ChangeDocument.new(document("main.titan"), 8, "duplicate"))))
+  test.assert(not store:apply(lsp.DocumentNotification.changed(
+    lsp.ChangeDocument.new(document("main.titan"), 0, "stale"))))
+  local current? = store:capture("/workspace/main.titan",
+    source_text.Position.new(0, 2))
+  test.assert(current.document.version == 8 and current.document.text == "new")
+end
+
+function test_buffers_capture_all_contributors_without_mutating_saved_state(
+    _context: test.Context)
+  local store = buffers.create()
+  open(store, "folder/folder.titan", 1, "main")
+  open(store, "folder/extra.titan", 4, "extra")
+  local captured? = store:capture("/workspace/folder/folder.titan",
+    source_text.Position.new(0, 1))
+  test.assert(#captured.inputs == 2)
+  test.assert(not store:apply(lsp.DocumentNotification.saved(
+    document("folder/folder.titan"))))
+  test.assert(store:current(captured), "didSave retired newer client text")
+  test.assert(store:apply(lsp.DocumentNotification.changed(
+    lsp.ChangeDocument.new(document("folder/extra.titan"), 9, "changed"))))
+  test.assert(not store:current(captured) and captured.inputs[2].text == "extra",
+    "contributor change was absent from the captured input identity")
+end
+
+function test_buffers_close_and_reopen_create_fresh_sessions(_context: test.Context)
+  local store = buffers.create()
+  open(store, "main.titan", 1, "same")
+  local before? = store:capture("/workspace/main.titan",
+    source_text.Position.new(0, 1))
+  test.assert(store:apply(lsp.DocumentNotification.closed(document("main.titan"))))
+  test.assert(store:bytes() == 0 and #store:inputs() == 0)
+  open(store, "main.titan", 1, "same")
+  local after? = store:capture("/workspace/main.titan",
+    source_text.Position.new(0, 1))
+  test.assert(before.document.session ~= after.document.session and
+    not store:current(before) and store:current(after),
+    "reused client version revived an old request")
+end
+
+function test_buffers_bound_text_and_recover_after_oversize_changes(
+    _context: test.Context)
+  local store = buffers.create()
+  open(store, "main.titan", 1, "small")
+  local before? = store:capture("/workspace/main.titan",
+    source_text.Position.new(0, 1))
+  test.assert(store:apply(lsp.DocumentNotification.changed(
+    lsp.ChangeDocument.new(document("main.titan"), 2,
+      strings.rep("x", 4 * 1024 * 1024 + 1)))))
+  test.assert(store:bytes() == 0 and not store:current(before) and
+    store:capture("/workspace/main.titan", source_text.Position.new(0, 1)) == nil,
+    "over-budget text retained the previous completion view")
+  open(store, "other.titan", 1, "other")
+  local other? = store:capture("/workspace/other.titan", source_text.Position.new(0, 0))
+  test.assert(#other.unavailable_paths == 1 and
+    other.unavailable_paths[1] == "/workspace/main.titan",
+    "over-budget contributor was silently absent from the captured vector")
+  test.assert(not store:apply(lsp.DocumentNotification.changed(
+    lsp.ChangeDocument.new(document("main.titan"), 1, "stale"))))
+  test.assert(store:apply(lsp.DocumentNotification.changed(
+    lsp.ChangeDocument.new(document("main.titan"), 3, "recovered"))))
+  local after? = store:capture("/workspace/main.titan",
+    source_text.Position.new(0, 1))
+  test.assert(after.document.text == "recovered")
+end
+
+function test_buffers_replace_whole_identifier_using_unsaved_utf16_coordinates(
+    _context: test.Context)
+  local store = buffers.create()
+  open(store, "main.titan", 7, "-- saved position differs\r\n\"😀\" alpha_tail\r\n")
+  local capture? = store:capture("/workspace/main.titan",
+    source_text.Position.new(1, 8))
+  local span?, failure? = buffers.identifier_span(capture)
+  test.assert(failure == nil and span ~= nil and span.prefix == "alp" and
+    span.range.start.line == 1 and span.range.start.character == 5 and
+    span.range.finish.line == 1 and span.range.finish.character == 15,
+    "completion replacement omitted the suffix or used byte coordinates")
+  local invalid? = store:capture("/workspace/main.titan",
+    source_text.Position.new(1, 2))
+  local invalid_span?, invalid_error? = buffers.identifier_span(invalid)
+  test.assert(invalid_span == nil and invalid_error ~= nil,
+    "completion accepted a caret inside a UTF-16 surrogate pair")
+end
+
+function test_buffers_document_limit_requires_a_fresh_store(_context: test.Context)
+  local store = buffers.create()
+  for index = 1, 256 do
+    open(store, "document" .. index .. ".titan", 1, "text")
+  end
+  local before? = store:capture("/workspace/document1.titan",
+    source_text.Position.new(0, 0))
+  test.assert(before ~= nil and #before.inputs == 256)
+  open(store, "overflow.titan", 1, "untracked contributor")
+  test.assert(not store:current(before) and #store:inputs() == 256 and
+    store:capture("/workspace/document1.titan", source_text.Position.new(0, 0)) == nil,
+    "document-count overflow retained a completion view missing contributors")
+  for index = 1, 256 do
+    test.assert(store:apply(lsp.DocumentNotification.closed(
+      document("document" .. index .. ".titan"))))
+  end
+  open(store, "fresh.titan", 1, "new text")
+  test.assert(store:capture("/workspace/fresh.titan",
+    source_text.Position.new(0, 0)) == nil,
+    "closing tracked files forgot the untracked contributor")
+  local restarted = buffers.create()
+  open(restarted, "fresh.titan", 1, "new text")
+  local after? = restarted:capture("/workspace/fresh.titan",
+    source_text.Position.new(0, 0))
+  test.assert(after ~= nil and restarted:current(after),
+    "fresh server session did not recover after document-count overflow")
+end

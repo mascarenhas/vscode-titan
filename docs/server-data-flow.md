@@ -5,6 +5,10 @@ its physical workspace root at startup; an LSP `initialize` message does not
 retarget that process. The extension translates remote and symlinked workspace
 URIs at the protocol boundary.
 
+Completion has a separate [unsaved input and TEMP publication path](completion.md).
+Its captured dependency baseline is the committed saved publication; existing
+saved features continue to read `main` semantic facts.
+
 ## Where compiler inputs come from
 
 | Input | Owner and interpretation |
@@ -69,7 +73,7 @@ modules retain their SQL facts. Cancellation still drains owned work and
 restoration before stores close. Structured SQLite, compiler and async errors
 retain useful detail when converted to Service failures.
 
-The persisted compiler kinds are `c-header-v5` and `ffi-conversion-v6` for the
+The persisted compiler kinds are `c-header-v6` and `ffi-conversion-v7` for the
 pinned parser-overhaul compiler. A regression reads the installed compiler's
 protocol identifiers and verifies publication/readback through SQLite, so a
 future pin cannot silently discard a new artifact kind. API version `1` remains

@@ -80,7 +80,7 @@ VSIX := $(VSIX_DIR)/titan-$(VSIX_TARGET).vsix
 
 .PHONY: all help toolchain toolchain-refresh npm-ci server server-test \
 	server-objects server-test-objects server-test-build server-test-run server-test-sharded shard-runner-test incremental-build-test \
-	server-protocol-test codex-native-test extension extension-test extension-host-test test package inspect-server \
+	server-protocol-test completion-protocol-test codex-native-test extension extension-test extension-host-test test package inspect-server \
 	plugin-validate verify inspect-vsix FORCE install-server install-server-test install-vsix clean clean-node
 
 # The compiler intentionally checks only source/object timestamps. Make owns
@@ -116,6 +116,13 @@ NATIVE_COMPILER_ENV = env -u LUA_PATH -u LUA_CPATH -u LUA_PATH_5_5 -u LUA_CPATH_
 	TITAN_NO_LINE_DIRECTIVES=$(call shell_quote,$(TITAN_NO_LINE_DIRECTIVES))
 NATIVE_LINK_ENV = $(NATIVE_COMPILER_ENV) \
 	TITAN_EXTRA_LDFLAGS=$(call shell_quote,$(strip $(TITAN_EXTRA_LDFLAGS) $(EXPORT_LUA_LDFLAGS) $(COMPILER_IO_CLOCK_OBJECT) $(EMBEDDED_INTERFACES_OBJECT) $(TITAN_STANDARD_PROVIDER)))
+# Tests retain dynamic stdlib bindings but live outside the SDK's bin directory.
+# Ask its Lua executable for its own relocatable paths, as Titan's test harness
+# does. Ambient Titan paths must not replace that selected SDK at execution.
+NATIVE_TEST_ENV = env -u TITAN_PATH_0_6 -u TITAN_PATH \
+	CCACHE_DISABLE=$(call shell_quote,$(CCACHE_DISABLE)) \
+	LUA_PATH_5_5="$$( $(call shell_quote,$(TITAN_LUA)) -E -e 'io.write(package.path)' )" \
+	LUA_CPATH_5_5="$$( $(call shell_quote,$(TITAN_LUA)) -E -e 'io.write(package.cpath)' )"
 
 FORCE:
 
@@ -147,6 +154,7 @@ help:
 	@echo "  server-test-build    compile the native test aggregate once"
 	@echo "  server-test-run      run the current native aggregate without rebuilding"
 	@echo "  server-test-sharded  compile once and run two native execution shards"
+	@echo "  completion-protocol-test  exercise unsaved completion through the native server"
 	@echo "  incremental-build-test exercise native invalidation and no-op builds"
 	@echo "  server-protocol-test exercise the native executable over framed stdio"
 	@echo "  codex-native-test    query the native executable through the Codex adapter"
@@ -270,10 +278,10 @@ $(SERVER_TEST): FORCE $(TEST_MODULE_OBJECTS) $(TEST_SUPPORT_OUTPUTS) $(COMPILER_
 	fi
 
 server-test-run:
-	CCACHE_DISABLE="$(CCACHE_DISABLE)" "$(SERVER_TEST)"
+	$(NATIVE_TEST_ENV) $(call shell_quote,$(SERVER_TEST))
 
 server-test-sharded: server-test-build
-	CCACHE_DISABLE="$(CCACHE_DISABLE)" node scripts/run-server-tests.mjs "$(SERVER_TEST)"
+	$(NATIVE_TEST_ENV) node scripts/run-server-tests.mjs $(call shell_quote,$(SERVER_TEST))
 
 shard-runner-test:
 	node --test scripts/run-server-tests.test.mjs
@@ -281,13 +289,18 @@ shard-runner-test:
 incremental-build-test:
 	node scripts/test-incremental-build.mjs --prefix $(call shell_quote,$(TITAN_PREFIX))
 
-server-protocol-test: $(SERVER)
+server-protocol-test: $(SERVER) completion-protocol-test
 	TITAN_LS_LUA_PATH='$(DEVELOPMENT_LUA_PATH)' \
 	TITAN_LS_LUA_CPATH='$(DEVELOPMENT_LUA_CPATH)' \
 		node scripts/test-server-protocol.mjs "$(SERVER)"
 	TITAN_LS_LUA_PATH='$(DEVELOPMENT_LUA_PATH)' \
 	TITAN_LS_LUA_CPATH='$(DEVELOPMENT_LUA_CPATH)' \
 		node scripts/test-workspace-cache.mjs "$(SERVER)"
+
+completion-protocol-test: $(SERVER)
+	TITAN_LS_LUA_PATH='$(DEVELOPMENT_LUA_PATH)' \
+	TITAN_LS_LUA_CPATH='$(DEVELOPMENT_LUA_CPATH)' \
+		node scripts/test-completion-protocol.mjs "$(SERVER)"
 
 codex-native-test: $(SERVER)
 	TITAN_LS_LUA_PATH='$(DEVELOPMENT_LUA_PATH)' \

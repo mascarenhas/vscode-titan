@@ -2,11 +2,15 @@ local async = import "async"
 local dispatcher = import "server.dispatcher"
 local logging = import "server.logging"
 local response_queue = import "server.response_queue"
+local lsp = import "server.lsp_types"
 
 type SemanticHandler = function (dispatcher.SemanticRequest):
   dispatcher.SemanticOutcome
 type InitializedHandler = function (): ()
 type ShutdownHandler = function (): ()
+type CompletionWork = function (): dispatcher.SemanticOutcome
+type CompletionCapture = function (dispatcher.CompletionRequest): CompletionWork
+type DocumentHandler = function (lsp.DocumentNotification): ()
 
 local type RemoveListener = function (): ()
 
@@ -26,6 +30,8 @@ record Coordinator
   local initialized_handler: InitializedHandler?
   local shutdown_handler: ShutdownHandler?
   local active: {ActiveRequest}
+  local document_handler: DocumentHandler?
+  local completion_capture: CompletionCapture?
 end
 
 local REQUEST_CANCELLED = -32800
@@ -47,7 +53,14 @@ function create(output: response_queue.ResponseQueue,
   if handler ~= nil then actual = handler end
   return Coordinator.new(
     dispatcher.create(), output, actual, initialized_handler,
-    shutdown_handler, {})
+    shutdown_handler, {}, nil, nil)
+end
+
+function Coordinator:configure_completion(
+    document_handler: DocumentHandler, capture: CompletionCapture)
+  self.document_handler = document_handler
+  self.completion_capture = capture
+  self.router:enable_completion()
 end
 
 function Coordinator:phase_name(): string
@@ -127,23 +140,24 @@ local function Coordinator:complete(
   })
 end
 
-local function Coordinator:start(request: dispatcher.SemanticRequest)
-  if self:find(request.id) ~= nil then
+local function Coordinator:start(id: dispatcher.RequestId,
+                                  method: string, work: CompletionWork)
+  if self:find(id) ~= nil then
     self:publish(dispatcher.failure_response(
-      request.id, INVALID_REQUEST, "Duplicate active request id"))
+      id, INVALID_REQUEST, "Duplicate active request id"))
     return
   end
 
   local task = async.run<|dispatcher.SemanticOutcome, value|>(
     function (): dispatcher.SemanticOutcome
-      return self.handler(request)
+      return work()
     end)
   local active = ActiveRequest.new(
-    request.id, request.method, task, nil, false, logging.clock())
+    id, method, task, nil, false, logging.clock())
   self.active[#self.active + 1] = active
   logging.emit("debug", "request.start", {
-    ["id"] = request.id:to_json(),
-    ["method"] = request.method,
+    ["id"] = id:to_json(),
+    ["method"] = method,
     ["active_requests"] = #self.active,
   })
   active.remove_listener = task:add_terminal_listener(
@@ -166,6 +180,31 @@ local function Coordinator:cancel(id: dispatcher.RequestId)
   -- Cancellation is a request, not completion. Joining retires the handler's
   -- borrowed state before this ownership operation returns.
   async.join(task)
+end
+
+local function Coordinator:start_completion(request: dispatcher.CompletionRequest)
+  if self:find(request.id) ~= nil then
+    self:publish(dispatcher.failure_response(
+      request.id, INVALID_REQUEST, "Duplicate active request id"))
+    return
+  end
+  local capture? = self.completion_capture
+  if capture == nil then
+    self:publish(dispatcher.failure_response(
+      request.id, METHOD_NOT_FOUND, "Method not found"))
+    return
+  end
+  -- Capture before scheduling: later notifications can change a buffer before
+  -- async.run enters its Task. The closure owns this request's exact input.
+  local work?: CompletionWork
+  do
+    work = capture(request)
+  catch
+    self:publish(dispatcher.failure_response(
+      request.id, INTERNAL_ERROR, "Internal error"))
+    return
+  end
+  self:start(request.id, "textDocument/completion", work)
 end
 
 function Coordinator:cancel_all(reason: string)
@@ -212,7 +251,17 @@ function Coordinator:handle(source: string): integer?
     logging.emit("info", "lifecycle.initialized", nil)
     return nil
   when semantic(request) then
-    self:start(request)
+    self:start(request.id, request.method,
+      function (): dispatcher.SemanticOutcome
+        return self.handler(request)
+      end)
+    return nil
+  when completion(request) then
+    self:start_completion(request)
+    return nil
+  when document(notification) then
+    local handler? = self.document_handler
+    if handler ~= nil then handler(notification) end
     return nil
   when cancel(id) then
     self:cancel(id)

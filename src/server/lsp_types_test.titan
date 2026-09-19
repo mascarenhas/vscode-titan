@@ -173,3 +173,65 @@ function test_lsp_types_preserves_empty_collections_and_optional_omissions(
   test.assert(wire.encode(fold) == [[{"endLine":8,"startLine":1}]],
               "absent folding range fields were encoded as null")
 end
+
+function test_lsp_types_parses_full_sync_and_ordered_replacements(_context: test.Context)
+  local opened?, open_error? = lsp.parse_open(wire.decode(
+    [[{"textDocument":{"uri":"file:///workspace/a/../main.titan","languageId":"titan","version":-3,"text":""}}]]))
+  test.assert(open_error == nil and opened.document.path == "/workspace/main.titan" and
+    opened.version == -3 and opened.text == "")
+  local changed?, change_error? = lsp.parse_change(wire.decode(
+    [[{"textDocument":{"uri":"file:///workspace/main.titan","version":5},"contentChanges":[{"text":"first"},{"text":"last"}]}]]))
+  test.assert(change_error == nil and changed.version == 5 and changed.text == "last",
+    "full replacements were not applied in notification order")
+end
+
+function test_lsp_types_rejects_unsupported_sync_inputs(context: test.Context)
+  context:run("incremental_range", function (_child: test.Context)
+    local parsed?, failure? = lsp.parse_change(wire.decode(
+      [[{"textDocument":{"uri":"file:///workspace/main.titan","version":2},"contentChanges":[{"text":"x","range":{"start":{"line":0,"character":0},"end":{"line":0,"character":1}}}]}]]))
+    test.assert(parsed == nil and failure.code == -32602)
+  end)
+  context:run("float_version", function (_child: test.Context)
+    local parsed?, failure? = lsp.parse_change(wire.decode(
+      [[{"textDocument":{"uri":"file:///workspace/main.titan","version":2.0},"contentChanges":[{"text":"x"}]}]]))
+    test.assert(parsed == nil and failure.code == -32602)
+  end)
+  context:run("out_of_range_version", function (_child: test.Context)
+    local parsed?, failure? = lsp.parse_open(wire.decode(
+      [[{"textDocument":{"uri":"file:///workspace/main.titan","languageId":"titan","version":2147483648,"text":"x"}}]]))
+    test.assert(parsed == nil and failure.code == -32602)
+  end)
+  context:run("untitled_uri", function (_child: test.Context)
+    local parsed?, failure? = lsp.parse_open(wire.decode(
+      [[{"textDocument":{"uri":"untitled:Untitled-1","languageId":"titan","version":1,"text":"x"}}]]))
+    test.assert(parsed == nil and failure.code == -32602)
+  end)
+end
+
+function test_lsp_types_completion_context_and_plain_text_edits(_context: test.Context)
+  local invoked?, invoked_error? = lsp.parse_completion(params(
+    "file:///workspace/main.titan", 2, 4))
+  test.assert(invoked_error == nil and invoked.trigger_kind == 1 and
+    invoked.trigger_character == nil)
+  local punctuated = params("file:///workspace/main.titan", 2, 4)
+  local context: wire.Object = {["triggerKind"] = 2, ["triggerCharacter"] = ":"}
+  punctuated["context"] = context
+  local parsed?, failure? = lsp.parse_completion(punctuated)
+  test.assert(failure == nil and parsed.trigger_kind == 2 and
+    parsed.trigger_character == ":")
+  local range = source_text.Span.new(
+    source_text.Position.new(2, 1), source_text.Position.new(2, 7))
+  local result = lsp.completion_list_value(lsp.CompletionList.new(true, {
+    lsp.CompletionItem.new("method", 2, "function (): integer", "0001:method",
+      "method", lsp.TextEdit.new(range, "method")),
+  }))
+  local items? = wire.as_array(result["items"])
+  local item? = wire.as_object(items[1])
+  test.assert(wire.as_boolean(result["isIncomplete"]) == true and
+    wire.as_integer(item["insertTextFormat"]) == 1 and
+    wire.as_string(item["filterText"]) == "method" and
+    wire.as_object(item["textEdit"]) ~= nil)
+  test.assert(wire.encode(lsp.completion_list_value(
+    lsp.CompletionList.new(false, {}))) == [[{"isIncomplete":false,"items":[]}]],
+    "empty completion results were not encoded as a CompletionList")
+end

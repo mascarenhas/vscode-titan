@@ -1,0 +1,156 @@
+local bridge = import "server.compiler_bridge"
+local discovery = import "server.project_discovery.titan"
+local source_text = import "server.source_text"
+local strings = import "string"
+
+-- This resolver reads the captured catalog only. It never discovers files,
+-- mutates saved membership, or follows a client URI through the filesystem.
+local function within_any(path: string, roots: {string}): boolean
+  for index = 1, #roots do
+    if discovery.path_within(roots[index], path) then return true end
+  end
+  return false
+end
+
+local function admitted(path: string, include: {string}, exclude: {string}): boolean
+  return within_any(path, include) and not within_any(path, exclude) and
+    strings.find(path, "/.titan-ls/") == nil and
+    #path > 6 and strings.sub(path, -6) == ".titan"
+end
+
+local function selected_root(path: string, roots: {string}): integer?
+  local selected?: integer
+  local length = 0
+  for index = 1, #roots do
+    local root = roots[index]
+    if discovery.path_within(root, path) and #root > length then
+      selected = index
+      length = #root
+    end
+  end
+  return selected
+end
+
+local function dotted(path: string): string
+  local output = strings.writer()
+  for index = 1, #path do
+    local character = strings.sub(path, index, index)
+    if character == "/" then character = "." end
+    output:write(character)
+  end
+  return output:drain()
+end
+
+local function saved_owner(path: string, sources: {bridge.ProjectModule}): string?
+  for index = 1, #sources do
+    local module = sources[index]
+    for file_index = 1, #module.files do
+      if module.files[file_index].filename == path then return module.module_name end
+    end
+  end
+  return nil
+end
+
+local function exists(path: string, sources: {bridge.ProjectModule},
+                      include: {string}, exclude: {string},
+                      open_paths: const {string}): boolean
+  if saved_owner(path, sources) ~= nil then return true end
+  if not admitted(path, include, exclude) then return false end
+  for index = 1, #open_paths do
+    if open_paths[index] == path then return true end
+  end
+  return false
+end
+
+local function folder_conflicts(directory: string, module_name: string,
+                                 sources: {bridge.ProjectModule}): boolean
+  for index = 1, #sources do
+    local module = sources[index]
+    for file_index = 1, #module.files do
+      if discovery.parent_directory(module.files[file_index].filename) == directory and
+         module.module_name ~= module_name then
+        return true
+      end
+    end
+  end
+  return false
+end
+
+-- Include roots are a complete saved scan only within their own trees. An
+-- earlier source root outside them may contain an uncaptured provider, so a
+-- new later-root identity cannot safely claim that the earlier lookup missed.
+local function covered_root(root: string, include: {string}): boolean
+  return within_any(root, include)
+end
+
+function find(path: string, sources: {bridge.ProjectModule},
+               source_roots: {string}, include: {string}, exclude: {string},
+               open_paths: const {string}): string?
+  local normalized? = source_text.normalize_absolute_path(path)
+  if normalized == nil then return nil end
+  local known? = saved_owner(normalized, sources)
+  if known ~= nil then return known end
+  if not admitted(normalized, include, exclude) then return nil end
+  local root_index? = selected_root(normalized, source_roots)
+  if root_index == nil then return nil end
+  local root = source_roots[root_index]
+  local relative = discovery.relative_to_root(root, normalized)
+  local directory = discovery.parent_directory(normalized)
+  local relative_directory = discovery.relative_parent(relative)
+  local candidate_relative = strings.sub(relative, 1, #relative - 6)
+
+  -- Choose a folder namespace using its actual canonical main, never the
+  -- number of saved contributors or the order in which buffers were opened.
+  if relative_directory ~= "" then
+    local folder_main = discovery.join(directory,
+      discovery.leaf_name(directory) .. ".titan")
+    if exists(folder_main, sources, include, exclude, open_paths) then
+      candidate_relative = relative_directory
+    end
+  end
+  if not discovery.valid_path_components(candidate_relative) then return nil end
+  local candidate = dotted(candidate_relative)
+  if not discovery.valid_module_name(candidate) then return nil end
+
+  local candidate_path = discovery.module_path(candidate)
+  local basename = discovery.terminal_component(candidate)
+  for index = 1, #source_roots do
+    local candidate_root = source_roots[index]
+    local folder = discovery.join(candidate_root, candidate_path)
+    local folder_main = discovery.join(folder, basename .. ".titan")
+    if exists(folder_main, sources, include, exclude, open_paths) then
+      if folder ~= directory or
+         folder_conflicts(folder, candidate, sources) then return nil end
+      -- A saved module with the same identity but a different provider cannot
+      -- be replaced by an unsaved new main. Wait for watcher publication.
+      for module_index = 1, #sources do
+        local module = sources[module_index]
+        if module.module_name == candidate and #module.files > 0 and
+           module.files[1].filename ~= folder_main then return nil end
+      end
+      return candidate
+    end
+
+    local flat = discovery.join(candidate_root, candidate_path .. ".titan")
+    if exists(flat, sources, include, exclude, open_paths) then
+      local owner? = discovery.module_owner(candidate)
+      if owner ~= nil then
+        local owner_main = discovery.join(
+          discovery.join(candidate_root, discovery.module_path(owner)),
+          discovery.terminal_component(owner) .. ".titan")
+        if exists(owner_main, sources, include, exclude, open_paths) then return nil end
+      end
+      if flat ~= normalized then return nil end
+      for module_index = 1, #sources do
+        local module = sources[module_index]
+        if module.module_name == candidate and #module.files > 0 and
+           module.files[1].filename ~= flat then return nil end
+      end
+      return candidate
+    end
+    if index < root_index and not covered_root(candidate_root, include) then
+      return nil
+    end
+  end
+  return nil
+end

@@ -1,0 +1,190 @@
+local lsp = import "server.lsp_types"
+local source_text = import "server.source_text"
+local strings = import "string"
+
+-- Published inputs never mutate. A new client version replaces the record,
+-- while captured requests retain the old immutable bytes and session identity.
+record Input
+  const uri: string
+  const path: string
+  const session: integer
+  const version: integer
+  const text: string
+end
+
+record Capture
+  const document: Input
+  const inputs: const {Input}
+  const unavailable_paths: const {string}
+  const epoch: integer
+  const position: source_text.Position
+end
+
+record IdentifierSpan
+  const caret_byte: integer
+  const bytes: source_text.ByteSpan
+  const range: source_text.Span
+  const prefix: string
+end
+
+local record DocumentState
+  path: string
+  session: integer
+  version: integer
+  input: Input?
+end
+
+record BufferStore
+  local documents: {DocumentState}
+  local next_session: integer
+  local revision: integer
+  local retained_bytes: integer
+  local capacity_exceeded: boolean
+end
+
+local MAX_DOCUMENT_BYTES = 4 * 1024 * 1024
+local MAX_WORKSPACE_BYTES = 32 * 1024 * 1024
+local MAX_DOCUMENTS = 256
+
+function create(): BufferStore
+  return BufferStore.new({}, 0, 0, 0, false)
+end
+
+function BufferStore:epoch(): integer
+  return self.revision
+end
+
+function BufferStore:bytes(): integer
+  return self.retained_bytes
+end
+
+local function BufferStore:find(path: string): DocumentState?
+  for index = 1, #self.documents do
+    local item = self.documents[index]
+    if item.path == path then return item end
+  end
+  return nil
+end
+
+local function BufferStore:replace(state: DocumentState,
+                                    document: lsp.TextDocument,
+                                    version: integer, text: string)
+  if state.input ~= nil then
+    self.retained_bytes = self.retained_bytes - #state.input.text
+  end
+  state.version = version
+  state.input = nil
+  if #text <= MAX_DOCUMENT_BYTES and
+     self.retained_bytes + #text <= MAX_WORKSPACE_BYTES then
+    local uri? = source_text.path_to_file_uri(document.path)
+    state.input = Input.new(uri, document.path, state.session, version, text)
+    self.retained_bytes = self.retained_bytes + #text
+  end
+  -- Even an over-budget version obsoletes old edits. Retain its version
+  -- watermark so a later bounded full-sync replacement can recover safely.
+  self.revision = self.revision + 1
+end
+
+function BufferStore:apply(notification: lsp.DocumentNotification): boolean
+  case notification
+  when opened(opened) then
+    local state? = self:find(opened.document.path)
+    if state == nil then
+      if #self.documents >= MAX_DOCUMENTS then
+        -- We cannot forget an open contributor and silently reuse its saved
+        -- bytes. Stop completion until this workspace store is recreated.
+        self.capacity_exceeded = true
+        self.revision = self.revision + 1
+        return true
+      end
+      state = DocumentState.new(opened.document.path, 0, opened.version, nil)
+      self.documents[#self.documents + 1] = state
+    end
+    self.next_session = self.next_session + 1
+    state.session = self.next_session
+    self:replace(state, opened.document, opened.version, opened.text)
+    return true
+  when changed(changed) then
+    local state? = self:find(changed.document.path)
+    if state == nil or changed.version <= state.version then return false end
+    self:replace(state, changed.document, changed.version, changed.text)
+    return true
+  when closed(document) then
+    for index = 1, #self.documents do
+      local item = self.documents[index]
+      if item.path == document.path then
+        if item.input ~= nil then
+          self.retained_bytes = self.retained_bytes - #item.input.text
+        end
+        for following = index, #self.documents - 1 do
+          self.documents[following] = self.documents[following + 1]
+        end
+        self.documents[#self.documents] = nil
+        self.revision = self.revision + 1
+        return true
+      end
+    end
+  when saved() then
+    -- didSave has no version. The watcher alone owns saved index publication;
+    -- it cannot retire current editor bytes or promote derived buffer facts.
+    return false
+  end
+  return false
+end
+
+function BufferStore:inputs(): const {Input}
+  local result: {Input} = {}
+  for index = 1, #self.documents do
+    local input? = self.documents[index].input
+    if input ~= nil then result[#result + 1] = input end
+  end
+  return result as const {Input}
+end
+
+function BufferStore:capture(path: string, position: source_text.Position): Capture?
+  if self.capacity_exceeded then return nil end
+  local state? = self:find(path)
+  if state == nil or state.input == nil then return nil end
+  local unavailable: {string} = {}
+  for index = 1, #self.documents do
+    if self.documents[index].input == nil then
+      unavailable[#unavailable + 1] = self.documents[index].path
+    end
+  end
+  return Capture.new(state.input, self:inputs(), unavailable as const {string}, self.revision,
+    source_text.Position.new(position.line, position.character))
+end
+
+function BufferStore:current(capture: Capture): boolean
+  if self.capacity_exceeded or capture.epoch ~= self.revision then return false end
+  local state? = self:find(capture.document.path)
+  return state ~= nil and state.input == capture.document and
+    state.session == capture.document.session and
+    state.version == capture.document.version
+end
+
+local function identifier_byte(byte: integer): boolean
+  return byte == 95 or (byte >= 65 and byte <= 90) or
+    (byte >= 97 and byte <= 122) or (byte >= 48 and byte <= 57)
+end
+
+-- This supplies coordinates only. The compiler owns token classification,
+-- including comments, strings, punctuation, and foreign type-name leaves.
+function identifier_span(capture: Capture): (IdentifierSpan?, source_text.Error?)
+  local source = capture.document.text
+  local coordinates = source_text.coordinate_index(source)
+  local caret?, failure? = coordinates:offset_for_position(capture.position)
+  if caret == nil then return nil, failure end
+  local first: integer = caret
+  local finish: integer = caret
+  while first > 0 and identifier_byte(strings.byte(source, first)) do
+    first = first - 1
+  end
+  while finish < #source and identifier_byte(strings.byte(source, finish + 1)) do
+    finish = finish + 1
+  end
+  local range?, range_error? = coordinates:span_for_offsets(first, finish)
+  if range == nil then return nil, range_error end
+  return IdentifierSpan.new(caret, source_text.ByteSpan.new(first, finish),
+    range, strings.sub(source, first + 1, caret)), nil
+end

@@ -18,6 +18,45 @@ record DocumentPosition
   position: source_text.Position
 end
 
+record OpenDocument
+  document: TextDocument
+  version: integer
+  text: string
+end
+
+record ChangeDocument
+  document: TextDocument
+  version: integer
+  text: string
+end
+
+union DocumentNotification
+  opened(OpenDocument)
+  changed(ChangeDocument)
+  closed(TextDocument)
+  saved(TextDocument)
+end
+
+record CompletionParams
+  document: DocumentPosition
+  trigger_kind: integer
+  trigger_character: string?
+end
+
+record CompletionItem
+  label: string
+  kind: integer
+  detail: string
+  sort_text: string
+  filter_text: string
+  edit: TextEdit
+end
+
+record CompletionList
+  is_incomplete: boolean
+  items: {CompletionItem}
+end
+
 record ReferencesParams
   document: DocumentPosition
   include_declaration: boolean
@@ -152,6 +191,93 @@ function parse_document_position(params: value):
   return parse_document_position_or_error(params)
 end
 
+local function parse_version(params: value): (integer?, Error?)
+  local object? = wire.as_object(params)
+  local document? = wire.as_object(object["textDocument"])
+  local version?, failure? = required_integer(
+    document, "version", "params.textDocument")
+  if version == nil then return nil, failure end
+  if version < -2147483648 or version > 2147483647 then
+    return invalid<|integer|>("document version must be a signed 32-bit integer")
+  end
+  return version, nil
+end
+
+function parse_open(params: value): (OpenDocument?, Error?)
+  local document?, failure? = parse_document(params)
+  if document == nil then return nil, failure end
+  local version?, version_error? = parse_version(params)
+  if version == nil then return nil, version_error end
+  local object? = wire.as_object(params)
+  local item? = wire.as_object(object["textDocument"])
+  local language?, language_error? = required_string(
+    item, "languageId", "params.textDocument")
+  if language == nil then return nil, language_error end
+  if language ~= "titan" then
+    return invalid<|OpenDocument|>("document language must be titan")
+  end
+  local text?, text_error? = required_string(item, "text", "params.textDocument")
+  if text == nil then return nil, text_error end
+  return OpenDocument.new(document, version, text), nil
+end
+
+function parse_change(params: value): (ChangeDocument?, Error?)
+  local document?, failure? = parse_document(params)
+  if document == nil then return nil, failure end
+  local version?, version_error? = parse_version(params)
+  if version == nil then return nil, version_error end
+  local object? = wire.as_object(params)
+  local changes? = wire.as_array(object["contentChanges"])
+  if changes == nil or #changes == 0 then
+    return invalid<|ChangeDocument|>("contentChanges must be a nonempty array")
+  end
+  local text = ""
+  for index = 1, #changes do
+    local change?, change_error? = required_object(
+      changes[index], "params.contentChanges item")
+    if change == nil then return nil, change_error end
+    if change["range"] ~= nil or change["rangeLength"] ~= nil then
+      return invalid<|ChangeDocument|>("only full document changes are supported")
+    end
+    local current?, text_error? = required_string(
+      change, "text", "params.contentChanges item")
+    if current == nil then return nil, text_error end
+    -- A full-sync batch is ordered; each replacement supersedes the last.
+    text = current
+  end
+  return ChangeDocument.new(document, version, text), nil
+end
+
+function parse_completion(params: value): (CompletionParams?, Error?)
+  local document?, failure? = parse_document_position(params)
+  if document == nil then return nil, failure end
+  local object? = wire.as_object(params)
+  local kind = 1
+  local character?: string
+  if object["context"] ~= nil then
+    local context?, context_error? = required_object(
+      object["context"], "params.context")
+    if context == nil then return nil, context_error end
+    local parsed?, kind_error? = required_integer(
+      context, "triggerKind", "params.context")
+    if parsed == nil then return nil, kind_error end
+    if parsed < 1 or parsed > 3 then
+      return invalid<|CompletionParams|>("completion triggerKind must be 1, 2, or 3")
+    end
+    kind = parsed
+    if context["triggerCharacter"] ~= nil then
+      character = wire.as_string(context["triggerCharacter"])
+      if character == nil then
+        return invalid<|CompletionParams|>("triggerCharacter must be a string")
+      end
+    end
+    if kind == 2 and character ~= "." and character ~= ":" then
+      return invalid<|CompletionParams|>("unsupported completion trigger character")
+    end
+  end
+  return CompletionParams.new(document, kind, character), nil
+end
+
 function parse_references(params: value): (ReferencesParams?, Error?)
   local document?, document_error? = parse_document_position_or_error(params)
   if document == nil then return nil, document_error end
@@ -236,6 +362,24 @@ end
 
 function text_edit_value(edit: TextEdit): wire.Object
   return {["range"] = range_value(edit.range), ["newText"] = edit.new_text}
+end
+
+function completion_list_value(list: CompletionList): wire.Object
+  local items: wire.Array = {}
+  for index = 1, #list.items do
+    local item = list.items[index]
+    local encoded: wire.Object = {
+      ["label"] = item.label,
+      ["kind"] = item.kind,
+      ["detail"] = item.detail,
+      ["sortText"] = item.sort_text,
+      ["filterText"] = item.filter_text,
+      ["insertTextFormat"] = 1,
+      ["textEdit"] = text_edit_value(item.edit),
+    }
+    items[index] = encoded
+  end
+  return {["isIncomplete"] = list.is_incomplete, ["items"] = items}
 end
 
 function workspace_edit_value(documents: {DocumentEdits}): wire.Object

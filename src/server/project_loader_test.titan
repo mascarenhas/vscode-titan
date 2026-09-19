@@ -1,0 +1,157 @@
+local test = import "test"
+local sqlite3 = import "sqlite3"
+local bridge = import "server.compiler_bridge"
+local loader = import "server.project_loader.titan"
+local service = import "server.project_service"
+local config = import "server.project_config"
+local graph = import "server.project_graph"
+local storage = import "server.completion_store"
+local sql = import "server.workspace_store"
+local runtime = import "server.test_runtime"
+
+local function selected(name: string, filename: string): service.ExternalModule
+  return service.ExternalModule.new(name,
+    service.ExternalOrigin.static_binary(service.ExternalBinary.new(filename)),
+    graph.Manifest.new("public", "public"), {}, nil, {}, {}, {})
+end
+
+local function snapshot(externals: {service.ExternalModule}): service.Snapshot
+  return service.Snapshot.new(1,
+    config.ProjectConfig.new("/workspace", nil, {}, {}, {}, "/binary", {}, nil),
+    {}, {}, {}, externals, {})
+end
+
+local function module(connection: sqlite3.Connection, name: string, provenance: integer, state: integer)
+  sql.execute(connection, "INSERT INTO main.graph_modules VALUES(?,?,?,0,1,NULL,NULL)", name, provenance, state)
+end
+
+local function fixture(connection: sqlite3.Connection)
+  graph.initialize_schema(connection)
+  module(connection, "app", 0, 2)
+  module(connection, "unrelated", 0, 2)
+  module(connection, "vendor.seed", 2, 2)
+  sql.execute(connection, "INSERT INTO main.graph_imports VALUES('app','vendor.seed',0)")
+end
+
+local function publish(connection: sqlite3.Connection, current: service.Snapshot,
+    binaries: {bridge.CompletionBinary}, reusable: boolean)
+  local descriptors, retained = loader.completion_catalog(connection, current, binaries, reusable)
+  storage.publish_saved(connection, descriptors, retained, bridge.CompilerConfiguration.new())
+end
+
+local function count(connection: sqlite3.Connection, name: string): integer
+  return sql.scalar_integer(connection,
+    "SELECT count(*) FROM main.completion_descriptors WHERE module_name=?", sqlite3.Blob.new(name))
+end
+
+function test_project_loader_catalog_survives_unrelated_refresh_and_replaces_provider(_context: test.Context)
+  runtime.run(function ()
+    local store = sql.open(":memory:")
+    defer store:close()
+    local access = store:acquire()
+    defer access:release()
+    local connection = access.connection
+    fixture(connection)
+    local current = snapshot({selected("vendor.seed", "/binary/vendor.a")})
+    publish(connection, current, {
+      bridge.CompletionBinary.new("vendor.old", "old", "static", "/binary/vendor.a"),
+      bridge.CompletionBinary.new("vendor.shared", "before", "static", "/binary/vendor.a"),
+    }, false)
+    publish(connection, current, {}, false)
+    test.assert(count(connection, "vendor.old") == 1,
+      "unrelated saved refresh discarded an unchanged selected archive sibling")
+    -- The new archive removed this sibling, so a new source with its old name
+    -- must not reject the replacement provider's now-disjoint inventory.
+    module(connection, "vendor.old", 0, 2)
+    publish(connection, current, {
+      bridge.CompletionBinary.new("vendor.shared", "after", "static", "/binary/vendor.a"),
+      bridge.CompletionBinary.new("vendor.new", "new", "static", "/binary/vendor.a"),
+    }, false)
+    test.assert(count(connection, "vendor.old") == 0 and count(connection, "vendor.new") == 1)
+    local rows = sql.rows(connection,
+      "SELECT public_interface FROM main.completion_descriptors WHERE module_name=?", sqlite3.Blob.new("vendor.shared"))
+    test.assert(sql.bytes(rows[1], 1) == "after", "recaptured sibling kept its old descriptor")
+    publish(connection, snapshot({}), {}, false)
+    test.assert(count(connection, "vendor.new") == 0, "deselected provider retained catalog-only siblings")
+  end)
+end
+
+function test_project_loader_catalog_distinguishes_fresh_diagnostics_from_unvalidated_old_provider(_context: test.Context)
+  runtime.run(function ()
+    local store = sql.open(":memory:")
+    defer store:close()
+    local access = store:acquire()
+    defer access:release()
+    local connection = access.connection
+    fixture(connection)
+    local current = snapshot({selected("vendor.seed", "/binary/vendor.a")})
+    local binaries = {bridge.CompletionBinary.new("vendor.extra", "extra", "static", "/binary/vendor.a")}
+    sql.execute(connection, "UPDATE main.graph_modules SET state=3 WHERE name='app'")
+    -- A clean importer of a failed project must not anchor the failed
+    -- project's stale external dependencies through transitive traversal.
+    sql.execute(connection, "INSERT INTO main.graph_imports VALUES('unrelated','app',0)")
+    publish(connection, current, binaries, false)
+    test.assert(count(connection, "vendor.extra") == 1,
+      "unrelated diagnostics rejected a fresh selected provider capture")
+    publish(connection, current, {}, false)
+    test.assert(count(connection, "vendor.extra") == 0,
+      "failed replacement retained a provider without any valid recapture or clean owner")
+    sql.execute(connection, "UPDATE main.graph_modules SET state=2 WHERE name='app'")
+    publish(connection, current, binaries, false)
+    module(connection, "vendor.extra", 1, 2)
+    publish(connection, current, binaries, false)
+    test.assert(count(connection, "vendor.extra") == 0,
+      "selected source failed to reject overlapping pending binary provider")
+  end)
+end
+
+function test_project_loader_catalog_retains_warm_embedded_and_rejects_whole_source_overlap(_context: test.Context)
+  runtime.run(function ()
+    local store = sql.open(":memory:")
+    defer store:close()
+    local access = store:acquire()
+    defer access:release()
+    local connection = access.connection
+    fixture(connection)
+    local current = snapshot({})
+    local binaries = {
+      bridge.CompletionBinary.new("titan.math", "math", "embedded", "/bin/server"),
+      bridge.CompletionBinary.new("titan.string", "string", "embedded", "/bin/server"),
+    }
+    publish(connection, current, binaries, false)
+    publish(connection, current, {}, true)
+    test.assert(count(connection, "titan.math") == 1 and count(connection, "titan.string") == 1,
+      "warm publication lost embedded modules not previously imported")
+    module(connection, "titan.math", 0, 2)
+    publish(connection, current, binaries, false)
+    test.assert(count(connection, "titan.string") == 0,
+      "one source overlap did not reject the complete pending embedded provider")
+  end)
+end
+
+function test_project_loader_catalog_preserves_compiler_provider_order_across_refreshes(_context: test.Context)
+  runtime.run(function ()
+    local store = sql.open(":memory:")
+    defer store:close()
+    local access = store:acquire()
+    defer access:release()
+    local connection = access.connection
+    fixture(connection)
+    local first = selected("vendor.seed", "/binary/first.a")
+    publish(connection, snapshot({first}), {
+      bridge.CompletionBinary.new("vendor.shared", "first", "static", "/binary/first.a"),
+    }, false)
+    module(connection, "other.seed", 2, 2)
+    sql.execute(connection, "INSERT INTO main.graph_imports VALUES('unrelated','other.seed',0)")
+    publish(connection, snapshot({first, selected("other.seed", "/binary/second.a")}), {
+      bridge.CompletionBinary.new("vendor.shared", "second", "static", "/binary/second.a"),
+    }, false)
+    publish(connection, snapshot({first, selected("other.seed", "/binary/second.a")}), {
+      bridge.CompletionBinary.new("vendor.shared", "first refreshed", "static", "/binary/first.a"),
+    }, false)
+    local rows = sql.rows(connection,
+      "SELECT public_interface FROM main.completion_descriptors WHERE module_name=?", sqlite3.Blob.new("vendor.shared"))
+    test.assert(#rows == 1 and sql.bytes(rows[1], 1) == "second",
+      "partial refresh changed the compiler's deterministic catalog ordering")
+  end)
+end

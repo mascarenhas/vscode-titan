@@ -7,6 +7,8 @@ local framing = import "server.framing"
 local wire = import "server.wire"
 local protocol = import "server.protocol"
 local test_runtime = import "server.test_runtime"
+local buffers = import "server.document_buffers"
+local lsp = import "server.lsp_types"
 
 local function response_object(source: string): wire.Object
   local parsed = wire.decode(source)
@@ -22,6 +24,58 @@ local function response_error_code(source: string): integer
   local code? = wire.as_integer(failure["code"])
   test.assert(code ~= nil, "protocol error had no integer code")
   return code
+end
+
+local function full_sync_completion_transcript()
+  local messages: {string} = {
+    [[{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}]],
+    [[{"jsonrpc":"2.0","method":"initialized","params":{}}]],
+    [[{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///workspace/main.titan","languageId":"titan","version":1,"text":"old"}}}]],
+    [[{"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":"file:///workspace/main.titan","version":3},"contentChanges":[{"text":"new"}]}}]],
+    [[{"jsonrpc":"2.0","method":"textDocument/didSave","params":{"textDocument":{"uri":"file:///workspace/main.titan"}}}]],
+    [[{"jsonrpc":"2.0","id":5,"method":"textDocument/completion","params":{"textDocument":{"uri":"file:///workspace/main.titan"},"position":{"line":0,"character":2}}}]],
+    [[{"jsonrpc":"2.0","method":"$/cancelRequest","params":{"id":5}}]],
+    [[{"jsonrpc":"2.0","method":"textDocument/didClose","params":{"textDocument":{"uri":"file:///workspace/main.titan"}}}]],
+    [[{"jsonrpc":"2.0","id":6,"method":"shutdown"}]],
+    [[{"jsonrpc":"2.0","method":"exit"}]],
+  }
+  local input = strings.writer()
+  for index = 1, #messages do input:write(framing.frame(messages[index])) end
+  local output = strings.writer()
+  local store = buffers.create()
+  local captured_version = 0
+  test.assert(protocol.run(strings.reader(input:drain()), output,
+    nil, nil, nil, nil,
+    function (notification: lsp.DocumentNotification)
+      store:apply(notification)
+    end,
+    function (request: dispatcher.CompletionRequest): coordinator.CompletionWork
+      local captured? = store:capture(request.params.document.path,
+        request.params.document.position)
+      captured_version = captured.document.version
+      test.assert(captured.document.text == "new", "save discarded unsaved text")
+      return function (): dispatcher.SemanticOutcome
+        while true do timer.yield() end
+        return dispatcher.SemanticOutcome.result(wire.null())
+      end
+    end) == 0)
+  test.assert(captured_version == 3 and #store:inputs() == 0,
+    "protocol hooks lost the ordered change/capture/close lifecycle")
+  local frames = framing.reader()
+  frames:feed(output:drain())
+  local initialized = response_object(frames:next())
+  local result? = wire.as_object(initialized["result"])
+  local capabilities? = wire.as_object(result["capabilities"])
+  test.assert(wire.as_object(capabilities["completionProvider"]) ~= nil,
+    "completion was configured after initialize had already advertised capabilities")
+  test.assert(response_error_code(frames:next()) == -32800)
+  local shutdown = response_object(frames:next())
+  test.assert(wire.as_integer(shutdown["id"]) == 6 and frames:next() == nil,
+    "sync/cancel transcript emitted unexpected or duplicate responses")
+end
+
+function test_protocol_routes_full_sync_completion_and_cancellation(_context: test.Context)
+  test_runtime.run(full_sync_completion_transcript)
 end
 
 local function runs_reader_coordinator_and_single_writer()

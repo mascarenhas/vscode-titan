@@ -29,7 +29,7 @@ const compiler = path.join(options.prefix, "bin", "titanc");
 const launcher = path.join(output, "titanc");
 const environment = { ...process.env, CCACHE_DISABLE: "1", TITAN_ROCKS_ROOT: options.prefix };
 for (const name of ["C_INCLUDE_PATH", "LUA_PATH", "LUA_CPATH", "LUA_PATH_5_5", "LUA_CPATH_5_5",
-  "TITAN_PREFIX", "TITAN_EXTRA_CPPFLAGS", "TITAN_EXTRA_CFLAGS", "TITAN_EXTRA_LDFLAGS"]) {
+  "TITAN_PREFIX", "TITAN_PATH", "TITAN_PATH_0_6", "TITAN_EXTRA_CPPFLAGS", "TITAN_EXTRA_CFLAGS", "TITAN_EXTRA_LDFLAGS"]) {
   delete environment[name];
 }
 const policy = {
@@ -112,7 +112,7 @@ function unchanged(before, after, filename) {
 
 async function runtime(label, expected, names) {
   await command(`${label}-server`, server, [], expected);
-  const result = await command(`${label}-tests`, tests, ["--verbose"]);
+  const result = await make(`${label}-tests`, { goals: ["server-test-run"] });
   assert.ok(result.output.includes(`[  PASSED  ] ${names.length} tests.`), "test discovery count changed");
   for (const name of names) assert.ok(result.output.includes(`[ RUN      ] ${name}`), `missing case ${name}`);
   return result.output;
@@ -199,6 +199,15 @@ process.exit(child.status ?? 1);
 
   await make("initial");
   await runtime("initial", 5, names);
+  // CI starts without a Titan search path. Also reject a developer's unrelated
+  // SDK: both version-specific and fallback runtime variables must be pinned.
+  environment.TITAN_PATH_0_6 = path.join(output, "unrelated-versioned-sdk");
+  environment.TITAN_PATH = path.join(output, "unrelated-fallback-sdk");
+  environment.LUA_PATH_5_5 = path.join(output, "unrelated-lua/?.lua");
+  environment.LUA_CPATH_5_5 = path.join(output, "unrelated-c/?.so");
+  await runtime("hostile-runtime-paths", 5, names);
+  delete environment.LUA_PATH_5_5;
+  delete environment.LUA_CPATH_5_5;
   await noOp("initial-noop");
   await noOp("relative-build-root-noop", { relativeBuildRoot: true });
 
