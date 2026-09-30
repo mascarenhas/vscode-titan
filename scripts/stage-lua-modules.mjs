@@ -31,6 +31,7 @@ const REQUIRED_SHARE_FILES = [
   "titan-compiler/checker/completion.lua",
   "titan-compiler/completion.lua",
   "titan-compiler/driver.lua",
+  "titan-compiler/maybe3.lua",
   "titan-compiler/parser.lua",
   "titan-compiler/types.lua",
   "titan-compiler/version.lua"

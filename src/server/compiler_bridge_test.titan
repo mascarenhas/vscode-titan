@@ -414,13 +414,35 @@ return function(mode, contextual_provider_file)
             _tag = "Type.Function",
             params = {},
             rettypes = {},
-            varargtype = false,
-            flexrettype = false,
           },
         },
       }
+      -- Ordinary optional metadata has exactly one absent value: nil. These
+      -- malformed fixtures exercise the real normalization paths, including
+      -- fields that used to silently accept false and omit semantic facts.
+      if mode == "false-optional-location" then
+        declaration.loc = false
+      elseif mode == "false-optional-name-location" then
+        declaration._name_loc = false
+      elseif mode == "false-optional-type" then
+        decl._type = false
+      elseif mode == "false-optional-declared-type" then
+        ast[3]._declared_type = false
+      elseif mode == "false-optional-name" then
+        decl.name = false
+      elseif mode == "false-optional-parameter-names" then
+        ast[3]._paramnames = false
+      elseif mode == "false-optional-vararg" then
+        ast[3]._type.varargtype = false
+      elseif mode == "false-optional-flex-result" then
+        ast[3]._type.flexrettype = false
+      elseif mode == "false-optional-adjustment" then
+        cast._adjustment = false
+      end
       local header_dependencies = {}
-      if mode == "header-metadata" then
+      if mode == "header-false" then
+        header_dependencies = false
+      elseif mode == "header-metadata" then
         header_dependencies = {
           { kind = "file", path = "/headers/direct.h",
             identity = "direct bytes", observation = {
@@ -478,8 +500,6 @@ return function(mode, contextual_provider_file)
             _tag = "Type.Function",
             params = {},
             rettypes = {},
-            varargtype = false,
-            flexrettype = false,
           },
         }},
         type = module_type("fixture.external"),
@@ -741,6 +761,48 @@ function test_compiler_bridge_rejects_missing_incompatible_and_malformed_modules
   expect_bridge_error("same-api-missing-compact-project-entry",
                       "'compact_project_entry' must be a function, found nil")
   expect_bridge_error("malformed-parser", "'parse' must be a function")
+end
+
+function test_compiler_bridge_rejects_false_for_optional_metadata(
+    context: test.Context)
+  local modes = {
+    "false-optional-location", "false-optional-name-location",
+    "false-optional-type", "false-optional-declared-type",
+    "false-optional-name", "false-optional-parameter-names",
+    "false-optional-vararg", "false-optional-flex-result",
+    "false-optional-adjustment",
+  }
+  local messages = {
+    ".loc must be a Lua table", "._name_loc must be a Lua table",
+    "._type must be a Lua table", "._declared_type must be a Lua table",
+    ".name must be a string", ".paramnames must be a Lua array",
+    ".varargtype must be a Lua table", ".flexrettype must be a Lua table",
+    "adjustment must be a Lua table",
+  }
+  for index = 1, #modes do
+    local mode = modes[index]
+    local expected = messages[index]
+    context:run(mode, function (_context: test.Context)
+      with_fixture(mode, function ()
+        local compiler = bridge.load()
+        local rejected = false
+        do
+          compiler:analyze("fixture", {
+            bridge.ProjectModule.new("fixture", {bridge.SourceFile.new(
+              "/workspace/fixture.titan", "saved fixture")}),
+          })
+        catch
+          rejected = true
+          test.assert(error is bridge.BridgeError,
+                      "invalid optional metadata raised an untyped error")
+          local failure = error as bridge.BridgeError
+          test.assert(strings.find(failure.message, expected) ~= nil,
+                      failure.message)
+        end
+        test.assert(rejected, "false was accepted as absent metadata")
+      end)
+    end)
+  end
 end
 
 function test_compiler_bridge_rejects_malformed_compiler_results(
@@ -1372,6 +1434,11 @@ function test_compiler_bridge_rejects_malformed_c_header_dependencies(
     "header-unknown-kind", "unknown kind 'directory'")
   expect_c_header_metadata_error(
     "header-empty-identity", "identity must be nonempty")
+end
+
+function test_compiler_bridge_rejects_false_c_header_dependencies(
+    _context: test.Context)
+  expect_c_header_metadata_error("header-false", "must be a Lua array")
 end
 
 function test_compiler_bridge_normalizes_annotated_ast_and_provenance(
@@ -3369,6 +3436,32 @@ function test_compiler_bridge_preserves_cached_manifest_callable_hover_signature
   test_runtime.run(preserves_cached_manifest_callable_hover_signatures)
 end
 
+local function assert_metadata_symbol_types(project: bridge.ModuleSnapshot,
+                                            phase: string)
+  local expected_types: {string: string} = {
+    ["mutable_result"] = "{ integer }",
+    ["immutable_result"] = "const { integer }",
+    ["mutable_view"] = "const? { integer }",
+    ["immutable_view"] = "const? { integer }",
+    ["optional_view"] = "const? { integer }?",
+    ["relayed"] = "foreign function (*lua_State, const *char): int",
+  }
+  local checked_types = 0
+  for index = 1, #project.symbols do
+    local symbol = project.symbols[index]
+    local expected? = expected_types[symbol.name]
+    if expected ~= nil then
+      test.assert(symbol.type_info ~= nil and
+                  symbol.type_info.display == expected,
+                  phase .. " metadata changed the type of '" .. symbol.name .. "'")
+      expected_types[symbol.name] = nil
+      checked_types = checked_types + 1
+    end
+  end
+  test.assert(checked_types == 6,
+              phase .. " metadata fixture lost inferred local symbols")
+end
+
 local function preserves_current_metadata_types_in_cached_external_manifests()
   preload_real_compiler()
   local external_root = fs.tmpname()
@@ -3376,6 +3469,12 @@ local function preserves_current_metadata_types_in_cached_external_manifests()
   fs.mkdir(external_root)
   local external_file = external_root .. "/bridge_metadata.titan"
   fs.write_file(external_file, [[
+function mutable(items: { integer }): { integer }
+  return items
+end
+function immutable(items: const { integer }): const { integer }
+  return items
+end
 function view(items: const? { integer }): const? { integer }
   return items
 end
@@ -3396,6 +3495,8 @@ end
   local source = [[local cached = import "bridge_metadata"
 function use(callback: foreign function (*lua_State, const *char): int,
              mutable: { integer }, immutable: const { integer }): integer
+  local mutable_result = cached.mutable(mutable)
+  local immutable_result = cached.immutable(immutable)
   local mutable_view = cached.view(mutable)
   local immutable_view = cached.view(immutable)
   local optional_view? = cached.optional(nil)
@@ -3417,6 +3518,9 @@ end
   test.assert(#initial.diagnostics == 0,
               "compiler rejected current metadata fixture: " ..
                 diagnostic_messages:drain())
+  local initial_project? = initial:find_module("bridge_metadata_consumer")
+  test.assert(initial_project ~= nil, "fresh metadata consumer was not analyzed")
+  assert_metadata_symbol_types(initial_project, "fresh")
   local external? = initial:find_module("bridge_metadata")
   test.assert(external ~= nil and external.manifest ~= nil and
               #external.nodes == 0 and #external.symbols == 0 and
@@ -3424,7 +3528,9 @@ end
               "external metadata seed retained project semantic state")
   local manifest: bridge.Manifest = external.manifest
   test.assert(manifest.source_serialized ~= nil and
-              strings.find(manifest.serialized, 'Array(Integer(),"maybe")') ~= nil and
+              strings.find(manifest.serialized, 'Array(Integer(),{tag="no"})') ~= nil and
+              strings.find(manifest.serialized, 'Array(Integer(),{tag="yes"})') ~= nil and
+              strings.find(manifest.serialized, 'Array(Integer(),{tag="maybe"})') ~= nil and
               strings.find(manifest.serialized, "CFunction(") ~= nil and
               strings.find(manifest.serialized, "CStruct(") ~= nil,
               "current Array and portable C metadata were not serialized")
@@ -3449,26 +3555,7 @@ end
   test.assert(project ~= nil and #project.nodes > 0 and
               reloaded_compiler:has_project_entry("bridge_metadata_consumer"),
               "manifest consumer lost its fresh snapshot or retained declarations")
-  local expected_types: {string: string} = {
-    ["mutable_view"] = "const? { integer }",
-    ["immutable_view"] = "const? { integer }",
-    ["optional_view"] = "const? { integer }?",
-    ["relayed"] = "foreign function (*lua_State, const *char): int",
-  }
-  local checked_types = 0
-  for index = 1, #project.symbols do
-    local symbol = project.symbols[index]
-    local expected? = expected_types[symbol.name]
-    if expected ~= nil then
-      test.assert(symbol.type_info ~= nil and
-                  symbol.type_info.display == expected,
-                  "cached metadata changed the type of '" .. symbol.name .. "'")
-      expected_types[symbol.name] = nil
-      checked_types = checked_types + 1
-    end
-  end
-  test.assert(checked_types == 4,
-              "cached metadata fixture lost inferred local symbols")
+  assert_metadata_symbol_types(project, "cached")
   local cached_snapshot? = reloaded:find_module("bridge_metadata")
   test.assert(cached_snapshot ~= nil and #cached_snapshot.nodes == 0 and
               #cached_snapshot.symbols == 0 and cached_snapshot.manifest ~= nil and
