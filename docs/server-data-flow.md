@@ -62,7 +62,17 @@ cached representation.
 ## Boundaries retained by the refactor
 
 Compiler Lua tables are normalized in `compiler_bridge`; ordinary server layers
-use typed records. The AST walker retains lexical child order and excludes DAG
+use typed records. Ordinary optional AST/type metadata uses `nil`; a legacy
+`false` in a node, name, list, or type position is malformed metadata. Actual
+boolean flags retain both values. Array constness is a closed tagged value
+(`no`, `yes`, or `maybe`), rendered through the compiler for both fresh and
+restored declarations. The compiler's computed `Maybe3` annotations remain
+inside the compiler and are not traversed as lexical AST children. Packaged Lua
+modules include their shared `titan-compiler.maybe3` helper. Existing compiler
+and server content identities invalidate incompatible saved metadata without
+changing prerelease API or cache version numbers.
+
+The AST walker retains lexical child order and excludes DAG
 backreferences. Its shared child-field inventory avoids allocating the same
 array for every visited node. Declaration-summary sorting shares one local
 algorithm while preserving stable ordering and cooperative checkpoints.
