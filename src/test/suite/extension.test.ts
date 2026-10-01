@@ -760,6 +760,13 @@ suite("Titan extension", () => {
           expectedMethods
         );
         await delay(300);
+        const physicalDocumentUri = vscode.Uri.file(
+          await realpath(document.uri.fsPath)
+        ).toString();
+        for (const request of await readSemanticEvents(nestedSemanticMarker)) {
+          assert.equal(request.pid, initialization.pid);
+          assert.equal(request.uri, physicalDocumentUri);
+        }
         assert.deepEqual(
           await readSemanticEvents(outerSemanticMarker),
           [],
@@ -1508,9 +1515,20 @@ async function waitForSemanticMethods(
   let observed: SemanticFixtureEvent[] = [];
   while (Date.now() < deadline) {
     observed = await readSemanticEvents(file);
+    const requested: SemanticFixtureEvent[] = [];
+    for (const event of observed) {
+      // The editor can request folding automatically before or between our
+      // explicit commands. Keep one expected folding request and every other
+      // method so their counts and order remain checked.
+      if (event.method === "textDocument/foldingRange" &&
+          expected[requested.length] !== event.method) {
+        continue;
+      }
+      requested.push(event);
+    }
     if (expected.every((method, index) =>
-      observed[index]?.method === method)) {
-      return observed;
+      requested[index]?.method === method)) {
+      return requested;
     }
     await delay(50);
   }

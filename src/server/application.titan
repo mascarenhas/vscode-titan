@@ -1,7 +1,9 @@
+foreign import "compiler_io_platform.h"
 local async = import "async"
 local fs = import "fs"
 local json = import "json"
 local strings = import "string"
+local source_text = import "server.source_text"
 local bridge = import "server.compiler_bridge"
 local diagnostics = import "server.diagnostics"
 local dispatcher = import "server.dispatcher"
@@ -161,6 +163,11 @@ local function runtime_error(candidate: value): Error
 end
 
 local function parent_directory(path: string): string
+  if ffi.VSCODE_TITAN_WINDOWS ~= 0 then
+    local parent?, failure? = source_text.resolve_path(path, "..")
+    if parent == nil then raise failure end
+    return parent
+  end
   if path == "/" then return "/" end
   local slash = 0
   for index = 1, #path do
@@ -171,19 +178,37 @@ local function parent_directory(path: string): string
 end
 
 local function child_path(parent: string, name: string): string
-  if parent == "/" then return "/" .. name end
+  if parent == "/" or
+     (ffi.VSCODE_TITAN_WINDOWS ~= 0 and strings.sub(parent, -1) == "/") then
+    return parent .. name
+  end
   return parent .. "/" .. name
 end
 
 local function leaf_name(path: string): string
+  if ffi.VSCODE_TITAN_WINDOWS ~= 0 then
+    local normalized?, failure? = source_text.normalize_absolute_path(path)
+    if normalized == nil then raise failure end
+    path = normalized
+  end
   local parent = parent_directory(path)
-  if parent == "/" then return strings.sub(path, 2) end
+  if path == parent then return "" end
+  if parent == "/" or
+     (ffi.VSCODE_TITAN_WINDOWS ~= 0 and strings.sub(parent, -1) == "/") then
+    return strings.sub(path, #parent + 1)
+  end
   return strings.sub(path, #parent + 2)
 end
 
 local function canonical_directory(path: string): string
   do
-    return fs.realpath(path)
+    local canonical = fs.realpath(path)
+    if ffi.VSCODE_TITAN_WINDOWS ~= 0 then
+      local normalized?, failure? = source_text.normalize_absolute_path(canonical)
+      if normalized == nil then raise failure end
+      return normalized
+    end
+    return canonical
   catch
     if error is async.CancellationReason then raise end
     return path
@@ -200,6 +225,11 @@ local function canonical_configured_path(path: string): string
   while true do
     do
       local canonical = fs.realpath(candidate)
+      if ffi.VSCODE_TITAN_WINDOWS ~= 0 then
+        local normalized?, failure? = source_text.normalize_absolute_path(canonical)
+        if normalized == nil then raise failure end
+        canonical = normalized
+      end
       for index = #suffix, 1, -1 do
         canonical = child_path(canonical, suffix[index])
       end
@@ -207,9 +237,10 @@ local function canonical_configured_path(path: string): string
     catch
       if error is async.CancellationReason then raise end
     end
-    if candidate == "/" then return path end
+    local parent = parent_directory(candidate)
+    if parent == candidate then return path end
     suffix[#suffix + 1] = leaf_name(candidate)
-    candidate = parent_directory(candidate)
+    candidate = parent
   end
   return path
 end
@@ -225,6 +256,9 @@ end
 local function path_within(root: string, path: string): boolean
   if path == root then return true end
   if root == "/" then return strings.sub(path, 1, 1) == "/" end
+  if ffi.VSCODE_TITAN_WINDOWS ~= 0 and strings.sub(root, -1) == "/" then
+    return strings.sub(path, 1, #root) == root
+  end
   return strings.sub(path, 1, #root + 1) == root .. "/"
 end
 
@@ -265,7 +299,10 @@ end
 local function valid_relative_directory(root: string, path: string): boolean
   if path == root then return true end
   local start = #root + 2
-  if root == "/" then start = 2 end
+  if root == "/" or
+     (ffi.VSCODE_TITAN_WINDOWS ~= 0 and strings.sub(root, -1) == "/") then
+    start = #root + 1
+  end
   local component_start = start
   for index = start, #path + 1 do
     if index == #path + 1 or strings.byte(path, index) == 47 then
@@ -308,11 +345,18 @@ end
 local function rebase_path(path: string, source_root: string,
                            observed_root: string): string
   if path == source_root then return observed_root end
-  if source_root == "/" then
-    if observed_root == "/" then return path end
-    return observed_root .. path
+  if ffi.VSCODE_TITAN_WINDOWS == 0 then
+    if source_root == "/" then
+      if observed_root == "/" then return path end
+      return observed_root .. path
+    end
+    return observed_root .. strings.sub(path, #source_root + 1)
   end
-  return observed_root .. strings.sub(path, #source_root + 1)
+  local start = #source_root + 2
+  if strings.sub(source_root, -1) == "/" then start = #source_root + 1 end
+  local separator = "/"
+  if strings.sub(observed_root, -1) == "/" then separator = "" end
+  return observed_root .. separator .. strings.sub(path, start)
 end
 
 local function cache_watch_paths(project_root: string, include_roots: {string},
@@ -1459,6 +1503,12 @@ end
 
 function create(project_root: string, loader: ProjectLoader?,
     rename_analyzer: RenameAnalyzer?): Application
+  if ffi.VSCODE_TITAN_WINDOWS ~= 0 and
+     source_text.is_absolute_path(project_root) then
+    local normalized?, failure? = source_text.normalize_absolute_path(project_root)
+    if normalized == nil then raise failure end
+    project_root = normalized
+  end
   return Application.new(
     project_root, loader or project_loader.load, nil, nil, nil, nil, nil, nil,
     nil, 1, 0, nil, nil, false, 0, 0, 0, nil, false,

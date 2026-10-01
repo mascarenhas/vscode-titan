@@ -1,6 +1,8 @@
+foreign import "compiler_io_platform.h"
 local async = import "async"
 local fs = import "fs"
 local strings = import "string"
+local source_text = import "server.source_text"
 local timer = import "timer"
 
 -- These directories are the complete watch authority for one project. Callers
@@ -353,10 +355,19 @@ function ProjectWatcher:stop()
   if failed then raise failure end
 end
 
+-- libuv returns native Windows separators. Convert them once at this backend
+-- boundary so registrations and event hints use the project's lexical format.
+local function native_path(path: string): string
+  if ffi.VSCODE_TITAN_WINDOWS == 0 then return path end
+  local normalized?, failure? = source_text.normalize_absolute_path(path)
+  if normalized == nil then raise failure end
+  return normalized
+end
+
 local function fs_backend(): Backend
   local watcher = fs.watcher()
   local canonicalize = function (path: string): string
-    local canonical = fs.realpath(path)
+    local canonical = native_path(fs.realpath(path))
     local metadata? = fs.stat(canonical)
     if metadata == nil or metadata.kind ~= "directory" then
       raise "project watch path is not a directory: " .. path
@@ -381,11 +392,11 @@ local function fs_backend(): Backend
     for index = 1, #native do
       case native[index]
       when created(path) then
-        events[#events + 1] = BackendEvent.created(path)
+        events[#events + 1] = BackendEvent.created(native_path(path))
       when modified(path) then
-        events[#events + 1] = BackendEvent.modified(path)
+        events[#events + 1] = BackendEvent.modified(native_path(path))
       when deleted(path) then
-        events[#events + 1] = BackendEvent.deleted(path)
+        events[#events + 1] = BackendEvent.deleted(native_path(path))
       when error(failure) then
         events[#events + 1] = BackendEvent.failed(WatchFailure.new(
           failure.code, failure.name, failure.message, failure.operation))

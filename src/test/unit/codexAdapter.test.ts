@@ -117,6 +117,20 @@ async function waitForEvent(
   throw new Error(`timed out waiting for ${eventName} in ${filename}`);
 }
 
+async function waitForProcessGone(pid: number): Promise<void> {
+  const deadline = Date.now() + 3_000;
+  while (Date.now() < deadline) {
+    try {
+      process.kill(pid, 0);
+    } catch (cause) {
+      if ((cause as NodeJS.ErrnoException).code === "ESRCH") return;
+      throw cause;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  assertProcessGone(pid);
+}
+
 function assertProcessGone(pid: number) {
   assert.throws(
     () => process.kill(pid, 0),
@@ -329,6 +343,17 @@ describe("Codex Titan LSP query adapter", () => {
       await waitForEvent(semanticMarker, "semantic");
       assert.equal(running.child.kill("SIGTERM"), true);
       const run = await running.completion;
+      if (process.platform === "win32") {
+        // Windows TerminateProcess cannot run Node's POSIX signal handler.
+        // The server must still exit when its parent-owned stdio closes.
+        assert.equal(run.signal, "SIGTERM");
+        assert.equal(run.stdout, "");
+        const events = await readEvents(lifecycleMarker);
+        const initialize = events.find((event) => event.event === "initialize");
+        assert.ok(initialize);
+        await waitForProcessGone(initialize.pid as number);
+        return;
+      }
       const output = parseSingleJsonLine<AdapterFailure>(run.stdout);
       assert.deepEqual(
         { code: run.code, signal: run.signal, output, stderr: run.stderr },
@@ -380,8 +405,8 @@ describe("Codex Titan LSP query adapter", () => {
         "--server-arg", lifecycleMarker,
         "--server-arg", "--semantic",
         "--server-arg", "--indexing-delay-ms",
-        "--server-arg", "500",
-        "--timeout-ms", "100"
+        "--server-arg", process.platform === "win32" ? "5000" : "500",
+        "--timeout-ms", process.platform === "win32" ? "1000" : "100"
       ]);
       assert.deepEqual(
         { code: run.code, signal: run.signal },
@@ -464,7 +489,7 @@ describe("Codex Titan LSP query adapter", () => {
         "--server-arg", "--hang-semantic",
         "--server-arg", "--ignore-shutdown",
         "--server-arg", "--ignore-terminate",
-        "--timeout-ms", "100"
+        "--timeout-ms", process.platform === "win32" ? "1000" : "100"
       ]);
       assert.deepEqual(
         { code: run.code, signal: run.signal },
@@ -478,9 +503,11 @@ describe("Codex Titan LSP query adapter", () => {
       const initialize = events.find((event) => event.event === "initialize");
       assert.ok(initialize);
       assert.ok(events.some((event) => event.event === "shutdown"));
-      assert.ok(events.some((event) =>
-        event.event === "terminate" && event.signal === "SIGTERM"
-      ));
+      if (process.platform !== "win32") {
+        assert.ok(events.some((event) =>
+          event.event === "terminate" && event.signal === "SIGTERM"
+        ));
+      }
       assertProcessGone(initialize.pid as number);
     } finally {
       await rm(temporary, { recursive: true, force: true });

@@ -1,3 +1,5 @@
+foreign import "compiler_io_platform.h"
+local test_paths = import "server.test_paths"
 local wire = import "server.wire"
 local lsp = import "server.lsp_types"
 local source_text = import "server.source_text"
@@ -13,20 +15,20 @@ end
 function test_lsp_types_parses_local_document_positions(
     _context: test.Context)
   local parsed?, failure? = lsp.parse_document_position(params(
-    "file:///workspace/a%20b.titan", 3, 5))
+    (test_paths.workspace_uri() .. "/a%20b.titan"), 3, 5))
   test.assert(failure == nil and parsed ~= nil and
-              parsed.uri == "file:///workspace/a%20b.titan" and
-              parsed.path == "/workspace/a b.titan" and
+              parsed.uri == (test_paths.workspace_uri() .. "/a%20b.titan") and
+              parsed.path == (test_paths.workspace_root() .. "/a b.titan") and
               parsed.position.line == 3 and parsed.position.character == 5,
               "valid document position did not normalize")
 
   local text_document: wire.Object = {
-    ["uri"] = "file:///workspace/a%20b.titan",
+    ["uri"] = (test_paths.workspace_uri() .. "/a%20b.titan"),
   }
   local document_params: wire.Object = {["textDocument"] = text_document}
   local document?, document_error? = lsp.parse_document(document_params)
   test.assert(document_error == nil and document ~= nil and
-              document.path == "/workspace/a b.titan",
+              document.path == (test_paths.workspace_root() .. "/a b.titan"),
               "position-free text document params did not normalize")
 end
 
@@ -40,11 +42,17 @@ function test_lsp_types_rejects_malformed_params(_context: test.Context)
 
   local remote?, remote_error? = lsp.parse_document_position(params(
     "file://example.com/workspace/main.titan", 0, 0))
-  test.assert(remote == nil and remote_error ~= nil,
-              "non-local document URI was accepted")
+  if ffi.VSCODE_TITAN_WINDOWS ~= 0 then
+    test.assert(remote ~= nil and remote_error == nil and
+      remote.path == "//example.com/workspace/main.titan",
+      "Windows UNC document URI did not preserve its share path")
+  else
+    test.assert(remote == nil and remote_error ~= nil,
+                "non-local document URI was accepted")
+  end
 
   local negative?, negative_error? = lsp.parse_document_position(params(
-    "file:///workspace/main.titan", -1, 0))
+    (test_paths.workspace_uri() .. "/main.titan"), -1, 0))
   test.assert(negative == nil and negative_error ~= nil,
               "negative LSP position was accepted")
 end
@@ -54,11 +62,11 @@ function test_lsp_types_requires_integer_position_tags(_context: test.Context)
   for index = 1, #spellings do
     local number = wire.decode(spellings[index])
     local line?, line_error? = lsp.parse_document_position(params(
-      "file:///workspace/main.titan", number, 0))
+      (test_paths.workspace_uri() .. "/main.titan"), number, 0))
     test.assert(line == nil and line_error ~= nil and line_error.code == -32602,
                 "an integral JSON float was accepted as an LSP line")
     local character?, character_error? = lsp.parse_document_position(params(
-      "file:///workspace/main.titan", 0, number))
+      (test_paths.workspace_uri() .. "/main.titan"), 0, number))
     test.assert(character == nil and character_error ~= nil and
                 character_error.code == -32602,
                 "an integral JSON float was accepted as an LSP character")
@@ -66,7 +74,7 @@ function test_lsp_types_requires_integer_position_tags(_context: test.Context)
 end
 
 function test_lsp_types_requires_a_boolean_reference_flag(_context: test.Context)
-  local reference_params = params("file:///workspace/main.titan", 0, 0)
+  local reference_params = params((test_paths.workspace_uri() .. "/main.titan"), 0, 0)
   local context: wire.Object = {}
   reference_params["context"] = context
   local missing?, missing_error? = lsp.parse_references(reference_params)
@@ -91,7 +99,7 @@ end
 function test_lsp_types_parses_reference_and_rename_extensions(
     _context: test.Context)
   local reference_params = params(
-    "file:///workspace/main.titan", 1, 2)
+    (test_paths.workspace_uri() .. "/main.titan"), 1, 2)
   local context: wire.Object = {["includeDeclaration"] = false}
   reference_params["context"] = context
   local references?, references_error? =
@@ -101,7 +109,7 @@ function test_lsp_types_parses_reference_and_rename_extensions(
               "reference context did not parse")
 
   local rename_params = params(
-    "file:///workspace/main.titan", 1, 2)
+    (test_paths.workspace_uri() .. "/main.titan"), 1, 2)
   rename_params["newName"] = "renamed_2"
   local rename?, rename_error? = lsp.parse_rename(rename_params)
   test.assert(rename_error == nil and rename ~= nil and
@@ -116,7 +124,7 @@ end
 
 function test_lsp_types_accepts_contextual_ffi_for_rename_preflight(
     _context: test.Context)
-  local rename_params = params("file:///workspace/main.titan", 1, 2)
+  local rename_params = params((test_paths.workspace_uri() .. "/main.titan"), 1, 2)
   rename_params["newName"] = "ffi"
   local renamed?, rename_error? = lsp.parse_rename(rename_params)
   test.assert(renamed ~= nil and rename_error == nil,
@@ -176,11 +184,11 @@ end
 
 function test_lsp_types_parses_full_sync_and_ordered_replacements(_context: test.Context)
   local opened?, open_error? = lsp.parse_open(wire.decode(
-    [[{"textDocument":{"uri":"file:///workspace/a/../main.titan","languageId":"titan","version":-3,"text":""}}]]))
-  test.assert(open_error == nil and opened.document.path == "/workspace/main.titan" and
+    [[{"textDocument":{"uri":"]] .. test_paths.workspace_uri() .. [[/a/../main.titan","languageId":"titan","version":-3,"text":""}}]]))
+  test.assert(open_error == nil and opened.document.path == (test_paths.workspace_root() .. "/main.titan") and
     opened.version == -3 and opened.text == "")
   local changed?, change_error? = lsp.parse_change(wire.decode(
-    [[{"textDocument":{"uri":"file:///workspace/main.titan","version":5},"contentChanges":[{"text":"first"},{"text":"last"}]}]]))
+    [[{"textDocument":{"uri":"]] .. test_paths.workspace_uri() .. [[/main.titan","version":5},"contentChanges":[{"text":"first"},{"text":"last"}]}]]))
   test.assert(change_error == nil and changed.version == 5 and changed.text == "last",
     "full replacements were not applied in notification order")
 end
@@ -188,17 +196,17 @@ end
 function test_lsp_types_rejects_unsupported_sync_inputs(context: test.Context)
   context:run("incremental_range", function (_child: test.Context)
     local parsed?, failure? = lsp.parse_change(wire.decode(
-      [[{"textDocument":{"uri":"file:///workspace/main.titan","version":2},"contentChanges":[{"text":"x","range":{"start":{"line":0,"character":0},"end":{"line":0,"character":1}}}]}]]))
+      [[{"textDocument":{"uri":"]] .. test_paths.workspace_uri() .. [[/main.titan","version":2},"contentChanges":[{"text":"x","range":{"start":{"line":0,"character":0},"end":{"line":0,"character":1}}}]}]]))
     test.assert(parsed == nil and failure.code == -32602)
   end)
   context:run("float_version", function (_child: test.Context)
     local parsed?, failure? = lsp.parse_change(wire.decode(
-      [[{"textDocument":{"uri":"file:///workspace/main.titan","version":2.0},"contentChanges":[{"text":"x"}]}]]))
+      [[{"textDocument":{"uri":"]] .. test_paths.workspace_uri() .. [[/main.titan","version":2.0},"contentChanges":[{"text":"x"}]}]]))
     test.assert(parsed == nil and failure.code == -32602)
   end)
   context:run("out_of_range_version", function (_child: test.Context)
     local parsed?, failure? = lsp.parse_open(wire.decode(
-      [[{"textDocument":{"uri":"file:///workspace/main.titan","languageId":"titan","version":2147483648,"text":"x"}}]]))
+      [[{"textDocument":{"uri":"]] .. test_paths.workspace_uri() .. [[/main.titan","languageId":"titan","version":2147483648,"text":"x"}}]]))
     test.assert(parsed == nil and failure.code == -32602)
   end)
   context:run("untitled_uri", function (_child: test.Context)
@@ -210,10 +218,10 @@ end
 
 function test_lsp_types_completion_context_and_plain_text_edits(_context: test.Context)
   local invoked?, invoked_error? = lsp.parse_completion(params(
-    "file:///workspace/main.titan", 2, 4))
+    (test_paths.workspace_uri() .. "/main.titan"), 2, 4))
   test.assert(invoked_error == nil and invoked.trigger_kind == 1 and
     invoked.trigger_character == nil)
-  local punctuated = params("file:///workspace/main.titan", 2, 4)
+  local punctuated = params((test_paths.workspace_uri() .. "/main.titan"), 2, 4)
   local context: wire.Object = {["triggerKind"] = 2, ["triggerCharacter"] = ":"}
   punctuated["context"] = context
   local parsed?, failure? = lsp.parse_completion(punctuated)

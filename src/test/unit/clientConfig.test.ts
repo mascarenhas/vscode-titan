@@ -120,7 +120,8 @@ describe("server configuration", () => {
           )
         ].join(";"),
         luaCPath: path.join(
-          extensionRoot, "dist", "titan", "lib", "lua", "5.5", "?.so"
+          extensionRoot, "dist", "titan", "lib", "lua", "5.5",
+          process.platform === "win32" ? "?.dll" : "?.so"
         )
       }
     );
@@ -135,7 +136,8 @@ describe("server configuration", () => {
     assert.equal(
       sourceOverride.luaCPath,
       path.join(
-        extensionRoot, "dist", "titan", "lib", "lua", "5.5", "?.so"
+        extensionRoot, "dist", "titan", "lib", "lua", "5.5",
+        process.platform === "win32" ? "?.dll" : "?.so"
       )
     );
 
@@ -155,6 +157,21 @@ describe("server configuration", () => {
       ].join(";")
     );
     assert.equal(nativeOverride.luaCPath, "/configured/?.so");
+  });
+
+  test("selects native Lua module suffix for each target platform", () => {
+    for (const platform of ["linux", "darwin", "win32"] as const) {
+      const extensionRoot = path.resolve("extension with spaces");
+      assert.equal(
+        readCompilerDiscoveryConfiguration("", "", extensionRoot, platform).luaCPath,
+        path.join(extensionRoot, "dist", "titan", "lib", "lua", "5.5",
+          platform === "win32" ? "?.dll" : "?.so")
+      );
+      assert.equal(
+        readCompilerDiscoveryConfiguration("", "custom/?.native", extensionRoot, platform).luaCPath,
+        "custom/?.native"
+      );
+    }
   });
 
   test("rejects non-string compiler discovery paths", () => {
@@ -181,7 +198,7 @@ describe("server executable resolution", () => {
         path.join(path.sep, "workspace"),
         path.join(path.sep, "extension")
       ),
-      path.join(path.sep, "workspace", "tools", "server")
+      path.resolve(path.sep, "workspace", "tools", "server")
     );
   });
 
@@ -209,12 +226,21 @@ describe("server executable resolution", () => {
 });
 
 describe("server launch validation", () => {
-  test("resolves a lexical workspace symlink once before launch", async () => {
+  test("resolves a lexical workspace symlink once before launch", async (context) => {
     const directory = await makeTemporaryDirectory();
     const physical = path.join(directory, "physical-workspace");
     const lexical = path.join(directory, "lexical-workspace");
     await mkdir(physical);
-    await symlink(physical, lexical, "dir");
+    try {
+      await symlink(physical, lexical, "dir");
+    } catch (cause) {
+      if (process.platform === "win32" &&
+          (cause as NodeJS.ErrnoException).code === "EPERM") {
+        context.skip("Windows account cannot create directory symlinks");
+        return;
+      }
+      throw cause;
+    }
 
     assert.equal(
       await resolvePhysicalWorkspaceRoot(lexical),
@@ -257,7 +283,9 @@ describe("server launch validation", () => {
     );
   });
 
-  test("rejects a non-executable file on POSIX", async () => {
+  test("rejects a non-executable file on POSIX", {
+    skip: process.platform === "win32" ? "Windows has no POSIX execute bit" : false
+  }, async () => {
     const directory = await makeTemporaryDirectory();
     const command = path.join(directory, SERVER_BASENAME);
     await writeFile(command, "not executable\n");
@@ -287,7 +315,7 @@ describe("server launch validation", () => {
       options: {
         cwd: "/workspace/project",
         env: {
-          TITAN_LS_LUA_CPATH: "./?.so",
+          TITAN_LS_LUA_CPATH: process.platform === "win32" ? "./?.dll" : "./?.so",
           TITAN_LS_LUA_PATH: "./?.lua",
           TITAN_LANGUAGE_SERVER_LOG_LEVEL: "debug",
           TITAN_TEST_ENV: "configured"

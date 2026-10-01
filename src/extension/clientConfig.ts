@@ -87,7 +87,8 @@ export function readServerConfiguration(
 export function readCompilerDiscoveryConfiguration(
   configuredLuaPath: unknown,
   configuredLuaCPath: unknown,
-  extensionRoot: string
+  extensionRoot: string,
+  platform: NodeJS.Platform = process.platform
 ): CompilerDiscoveryConfiguration {
   if (typeof configuredLuaPath !== "string") {
     throw new ServerConfigurationError(
@@ -112,7 +113,7 @@ export function readCompilerDiscoveryConfiguration(
         ].join(";"),
     luaCPath: configuredLuaCPath.length > 0
       ? configuredLuaCPath
-      : path.join(nativeRoot, "?.so")
+      : path.join(nativeRoot, platform === "win32" ? "?.dll" : "?.so")
   };
 }
 
@@ -190,7 +191,7 @@ export function createServerLaunchOptions(
   environment: NodeJS.ProcessEnv = process.env,
   compilerDiscovery: CompilerDiscoveryConfiguration = {
     luaPath: "./?.lua",
-    luaCPath: "./?.so"
+    luaCPath: process.platform === "win32" ? "./?.dll" : "./?.so"
   },
   logLevel: ServerLogLevel = DEFAULT_SERVER_LOG_LEVEL
 ): ServerLaunchOptions {

@@ -1,3 +1,4 @@
+foreign import "compiler_io_platform.h"
 local fs = import "fs"
 local test = import "test"
 local lua = import "lua"
@@ -9,9 +10,22 @@ local logging = import "server.logging"
 local source_text = import "server.source_text"
 local test_runtime = import "server.test_runtime"
 local content_identity = import "server.content_identity"
+local test_paths = import "server.test_paths"
+
+
+local function fixture_headers_root(): string
+  if ffi.VSCODE_TITAN_WINDOWS ~= 0 then return "C:/headers" end
+  return "/headers"
+end
+
+local function fixture_sdk_root(): string
+  if ffi.VSCODE_TITAN_WINDOWS ~= 0 then return "C:/opt/titan/lib/titan/0.6" end
+  return "/opt/titan/lib/titan/0.6"
+end
 
 local type EmptyFunction = function (): ()
-local type FixtureInstaller = function (string, string?): value
+local type FixtureInstaller =
+  function (string, string?, string, string, string): value
 
 local function run_bridge(body: EmptyFunction)
   do
@@ -27,7 +41,7 @@ end
 
 local function new_fixture_installer(): FixtureInstaller
   return lua.load([==[
-return function(mode, contextual_provider_file)
+return function(mode, contextual_provider_file, workspace_root, headers_root, sdk_root)
   local names = {
     "titan-compiler.parser",
     "titan-compiler.checker",
@@ -76,7 +90,7 @@ return function(mode, contextual_provider_file)
       mode == "wrong-language-server-api" and 2 or 1,
     TITAN_SOURCE_PATH = ".",
     TITAN_BIN_PATH = "",
-    INSTALL_PATHS = { titan_bin = "/opt/titan/lib/titan/0.6" },
+    INSTALL_PATHS = { titan_bin = sdk_root },
     imported = {},
   }
   if mode == "missing-abi" then driver.TITAN_ABI_VERSION = nil end
@@ -263,7 +277,7 @@ return function(mode, contextual_provider_file)
     return function(name)
       if mode == "invalid-source" then
         return false,
-          "/workspace/fixture.titan:2:7: syntax error: expected expression"
+          workspace_root .. "/fixture.titan:2:7: syntax error: expected expression"
       end
       if mode == "location-free-diagnostic" then
         return false, "cannot load " .. name
@@ -277,22 +291,22 @@ return function(mode, contextual_provider_file)
 
       local decl = {
         _tag = "Ast.Decl",
-        loc = { filename = "/workspace/fixture.titan", line = 2, col = 7 },
+        loc = { filename = workspace_root .. "/fixture.titan", line = 2, col = 7 },
         name = "count",
         type = {
           _tag = "Ast.TypeInteger",
-          loc = { filename = "/workspace/fixture.titan", line = 2, col = 14 },
+          loc = { filename = workspace_root .. "/fixture.titan", line = 2, col = 14 },
         },
         _type = integer,
       }
       local declaration = {
         _tag = "Ast.TopLevelVar",
-        loc = { filename = "/workspace/fixture.titan", line = 2, col = 1 },
+        loc = { filename = workspace_root .. "/fixture.titan", line = 2, col = 1 },
         islocal = true,
         decl = decl,
         value = {
           _tag = "Ast.ExpInteger",
-          loc = { filename = "/workspace/fixture.titan", line = 2, col = 24 },
+          loc = { filename = workspace_root .. "/fixture.titan", line = 2, col = 24 },
           value = 1,
           _type = integer,
         },
@@ -300,23 +314,23 @@ return function(mode, contextual_provider_file)
       }
       local reference = {
         _tag = "Ast.VarName",
-        loc = { filename = "/workspace/fixture.titan", line = 3, col = 24 },
+        loc = { filename = workspace_root .. "/fixture.titan", line = 3, col = 24 },
         name = "count",
         _decl = declaration,
         _type = integer,
       }
       local cast = {
         _tag = "Ast.ExpCast",
-        loc = { filename = "/workspace/fixture.titan", line = 3, col = 24 },
+        loc = { filename = workspace_root .. "/fixture.titan", line = 3, col = 24 },
         exp = {
           _tag = "Ast.ExpVar",
-          loc = { filename = "/workspace/fixture.titan", line = 3, col = 24 },
+          loc = { filename = workspace_root .. "/fixture.titan", line = 3, col = 24 },
           var = reference,
           _type = integer,
         },
         target = {
           _tag = "Ast.TypeFloat",
-          loc = { filename = "/workspace/fixture.titan", line = 3, col = 17 },
+          loc = { filename = workspace_root .. "/fixture.titan", line = 3, col = 17 },
         },
         _type = float,
         _implicit_coercion = true,
@@ -329,20 +343,20 @@ return function(mode, contextual_provider_file)
       }
       local local_decl = {
         _tag = "Ast.Decl",
-        loc = { filename = "/workspace/fixture.titan", line = 3, col = 9 },
+        loc = { filename = workspace_root .. "/fixture.titan", line = 3, col = 9 },
         name = "widened",
         type = {
           _tag = "Ast.TypeFloat",
-          loc = { filename = "/workspace/fixture.titan", line = 3, col = 17 },
+          loc = { filename = workspace_root .. "/fixture.titan", line = 3, col = 17 },
         },
         _type = float,
       }
       local ast = {
         {
           _tag = "Ast.TopLevelImport",
-          loc = { filename = "/workspace/fixture.titan", line = 1, col = 1 },
+          loc = { filename = workspace_root .. "/fixture.titan", line = 1, col = 1 },
           _name_loc = {
-            filename = "/workspace/fixture.titan", line = 1, col = 7,
+            filename = workspace_root .. "/fixture.titan", line = 1, col = 7,
           },
           _type = module_type("fixture.external"),
           localname = "dependency",
@@ -352,7 +366,7 @@ return function(mode, contextual_provider_file)
         declaration,
         {
           _tag = "Ast.TopLevelFunc",
-          loc = { filename = "/workspace/fixture.titan", line = 3, col = 1 },
+          loc = { filename = workspace_root .. "/fixture.titan", line = 3, col = 1 },
           islocal = false,
           name = "widen",
           params = {},
@@ -360,12 +374,12 @@ return function(mode, contextual_provider_file)
           typeparams = {},
           block = {
             _tag = "Ast.StatBlock",
-            loc = { filename = "/workspace/fixture.titan", line = 3, col = 3 },
+            loc = { filename = workspace_root .. "/fixture.titan", line = 3, col = 3 },
             stats = {
               {
                 _tag = "Ast.StatDecl",
                 loc = {
-                  filename = "/workspace/fixture.titan", line = 3, col = 3,
+                  filename = workspace_root .. "/fixture.titan", line = 3, col = 3,
                 },
                 decls = { local_decl },
                 exps = { cast },
@@ -373,22 +387,22 @@ return function(mode, contextual_provider_file)
               {
                 _tag = "Ast.StatReturn",
                 loc = {
-                  filename = "/workspace/fixture.titan", line = 4, col = 3,
+                  filename = workspace_root .. "/fixture.titan", line = 4, col = 3,
                 },
                 exps = {{
                   _tag = "Ast.ExpInitList",
                   loc = {
-                    filename = "/workspace/fixture.titan", line = 4, col = 10,
+                    filename = workspace_root .. "/fixture.titan", line = 4, col = 10,
                   },
                   fields = {{
                     _tag = "Ast.Field",
                     loc = {
-                      filename = "/workspace/fixture.titan", line = 4, col = 11,
+                      filename = workspace_root .. "/fixture.titan", line = 4, col = 11,
                     },
                     name = {
                       _tag = "Ast.ExpString",
                       loc = {
-                        filename = "/workspace/fixture.titan",
+                        filename = workspace_root .. "/fixture.titan",
                         line = 4,
                         col = 12,
                       },
@@ -397,7 +411,7 @@ return function(mode, contextual_provider_file)
                     exp = {
                       _tag = "Ast.ExpInteger",
                       loc = {
-                        filename = "/workspace/fixture.titan",
+                        filename = workspace_root .. "/fixture.titan",
                         line = 4,
                         col = 27,
                       },
@@ -444,12 +458,12 @@ return function(mode, contextual_provider_file)
         header_dependencies = false
       elseif mode == "header-metadata" then
         header_dependencies = {
-          { kind = "file", path = "/headers/direct.h",
+          { kind = "file", path = headers_root .. "/direct.h",
             identity = "direct bytes", observation = {
               modified_seconds = 123, modified_nanoseconds = 456,
               physical_identity = "device:inode:target",
             } },
-          { kind = "search", path = "/headers/earlier.h",
+          { kind = "search", path = headers_root .. "/earlier.h",
             identity = "missing candidate" },
         }
       elseif mode == "header-relative-path" then
@@ -459,19 +473,19 @@ return function(mode, contextual_provider_file)
         }
       elseif mode == "header-duplicate" then
         header_dependencies = {
-          { kind = "file", path = "/headers/direct.h",
+          { kind = "file", path = headers_root .. "/direct.h",
             identity = "first" },
-          { kind = "file", path = "/headers/direct.h",
+          { kind = "file", path = headers_root .. "/direct.h",
             identity = "second" },
         }
       elseif mode == "header-unknown-kind" then
         header_dependencies = {
-          { kind = "directory", path = "/headers",
+          { kind = "directory", path = headers_root,
             identity = "directory state" },
         }
       elseif mode == "header-empty-identity" then
         header_dependencies = {
-          { kind = "search", path = "/headers/earlier.h",
+          { kind = "search", path = headers_root .. "/earlier.h",
             identity = "" },
         }
       end
@@ -480,8 +494,8 @@ return function(mode, contextual_provider_file)
         ast = ast,
         type = module_type(name),
         source_manifest = source_manifest(name),
-        filename = "/workspace/fixture.titan",
-        source_files = { "/workspace/fixture.titan" },
+        filename = workspace_root .. "/fixture.titan",
+        source_files = { workspace_root .. "/fixture.titan" },
         c_header_dependencies = header_dependencies,
       }
       driver.imported["fixture.external"] = {
@@ -515,8 +529,8 @@ return function(mode, contextual_provider_file)
           kind = "source",
           ast = ast,
           type = module_type("fixture.dependency"),
-          filename = "/workspace/dependency.titan",
-          source_files = { "/workspace/dependency.titan" },
+          filename = workspace_root .. "/dependency.titan",
+          source_files = { workspace_root .. "/dependency.titan" },
           c_header_dependencies = {},
         }
       end
@@ -577,7 +591,7 @@ return function(mode, contextual_provider_file)
         context.checked_source_modules[
           #context.checked_source_modules + 1] = "fixture.dependency"
         return true, module_type(name), {
-          "/workspace/dependency.titan:1:1: unknown variable 'missing'",
+          workspace_root .. "/dependency.titan:1:1: unknown variable 'missing'",
         }, {}
       end
       if mode == "progress" then
@@ -591,7 +605,7 @@ return function(mode, contextual_provider_file)
       if mode == "source-profiling" then
         assert(type(options.source_process_trace) == "function")
         options.source_process_trace(
-          name, "/workspace/fixture.titan", "complete",
+          name, workspace_root .. "/fixture.titan", "complete",
           7.0, 9.0, 2.0, 3.0)
       end
       if mode == "probe-tracing" then
@@ -713,7 +727,8 @@ end
 local function with_fixture(mode: string, body: EmptyFunction,
                             contextual_provider_file: string?)
   local restore = new_fixture_installer()(
-    mode, contextual_provider_file) as EmptyFunction
+    mode, contextual_provider_file, test_paths.workspace_root(),
+    fixture_headers_root(), fixture_sdk_root()) as EmptyFunction
   defer restore()
   body()
 catch
@@ -789,7 +804,7 @@ function test_compiler_bridge_rejects_false_for_optional_metadata(
         do
           compiler:analyze("fixture", {
             bridge.ProjectModule.new("fixture", {bridge.SourceFile.new(
-              "/workspace/fixture.titan", "saved fixture")}),
+              test_paths.workspace_root() .. "/fixture.titan", "saved fixture")}),
           })
         catch
           rejected = true
@@ -812,7 +827,7 @@ function test_compiler_bridge_rejects_malformed_compiler_results(
     local rejected = false
     do
       compiler:analyze("fixture", {bridge.ProjectModule.new(
-        "fixture", {bridge.SourceFile.new("/workspace/fixture.titan", "")})})
+        "fixture", {bridge.SourceFile.new(test_paths.workspace_root() .. "/fixture.titan", "")})})
     catch
       rejected = true
       test.assert(error is bridge.BridgeError,
@@ -825,7 +840,7 @@ function test_compiler_bridge_rejects_malformed_compiler_results(
     local rejected = false
     do
       compiler:analyze("fixture", {bridge.ProjectModule.new(
-        "fixture", {bridge.SourceFile.new("/workspace/fixture.titan", "")})})
+        "fixture", {bridge.SourceFile.new(test_paths.workspace_root() .. "/fixture.titan", "")})})
     catch
       rejected = true
       test.assert(error is bridge.BridgeError,
@@ -838,7 +853,7 @@ function test_compiler_bridge_rejects_malformed_compiler_results(
     local rejected = false
     do
       compiler:analyze("fixture", {bridge.ProjectModule.new(
-        "fixture", {bridge.SourceFile.new("/workspace/fixture.titan", "")})})
+        "fixture", {bridge.SourceFile.new(test_paths.workspace_root() .. "/fixture.titan", "")})})
     catch
       rejected = true
       test.assert(error is bridge.BridgeError,
@@ -860,10 +875,10 @@ function test_compiler_bridge_scopes_one_c_header_analysis_to_all_root_attempts(
     local compiler = bridge.load()
     local first = compiler:analyze_incremental({
       bridge.ProjectModule.new("fixture.first", {
-        bridge.SourceFile.new("/workspace/first.titan", ""),
+        bridge.SourceFile.new(test_paths.workspace_root() .. "/first.titan", ""),
       }),
       bridge.ProjectModule.new("fixture.second", {
-        bridge.SourceFile.new("/workspace/second.titan", ""),
+        bridge.SourceFile.new(test_paths.workspace_root() .. "/second.titan", ""),
       }),
     }, {"fixture.first", "fixture.second"}, {})
     test.assert(#first.modules >= 2,
@@ -871,7 +886,7 @@ function test_compiler_bridge_scopes_one_c_header_analysis_to_all_root_attempts(
 
     local second = compiler:analyze_incremental({
       bridge.ProjectModule.new("fixture.first", {
-        bridge.SourceFile.new("/workspace/first.titan", ""),
+        bridge.SourceFile.new(test_paths.workspace_root() .. "/first.titan", ""),
       }),
     }, {"fixture.first"}, {})
     test.assert(#second.modules >= 1,
@@ -885,10 +900,10 @@ function test_compiler_bridge_attributes_location_free_diagnostics_to_each_root(
     local compiler = bridge.load()
     local analysis = compiler:analyze_incremental({
       bridge.ProjectModule.new("fixture.first", {
-        bridge.SourceFile.new("/workspace/first.titan", ""),
+        bridge.SourceFile.new(test_paths.workspace_root() .. "/first.titan", ""),
       }),
       bridge.ProjectModule.new("fixture.second", {
-        bridge.SourceFile.new("/workspace/second.titan", ""),
+        bridge.SourceFile.new(test_paths.workspace_root() .. "/second.titan", ""),
       }),
     }, {"fixture.first", "fixture.second"}, {})
     test.assert(#analysis.diagnostics == 2 and
@@ -910,7 +925,7 @@ function test_compiler_bridge_accepts_parse_and_check_source_profile_fields(
     local compiler = bridge.load()
     local analysis = compiler:analyze("fixture", {
       bridge.ProjectModule.new("fixture", {bridge.SourceFile.new(
-        "/workspace/fixture.titan", "saved fixture")}),
+        test_paths.workspace_root() .. "/fixture.titan", "saved fixture")}),
     })
     test.assert(#analysis.diagnostics == 0,
                 "source-profile callback changed compiler analysis")
@@ -927,7 +942,7 @@ function test_compiler_bridge_bounds_and_types_c_probe_trace_callbacks(
     local compiler = bridge.load()
     local analysis = compiler:analyze("fixture", {
       bridge.ProjectModule.new("fixture", {bridge.SourceFile.new(
-        "/workspace/fixture.titan", "saved fixture")}),
+        test_paths.workspace_root() .. "/fixture.titan", "saved fixture")}),
     })
     test.assert(#analysis.diagnostics == 0,
                 "C-probe trace callbacks changed compiler analysis")
@@ -941,7 +956,7 @@ local function expect_source_manifest_error(mode: string, expected: string)
     do
       compiler:analyze("fixture", {bridge.ProjectModule.new(
         "fixture", {bridge.SourceFile.new(
-          "/workspace/fixture.titan", "saved fixture")})})
+          test_paths.workspace_root() .. "/fixture.titan", "saved fixture")})})
     catch
       rejected = true
       test.assert(error is bridge.BridgeError,
@@ -970,9 +985,9 @@ function test_compiler_bridge_accepts_missing_manifest_after_dependency_error(
     local compiler = bridge.load()
     local analysis = compiler:analyze("fixture", {
       bridge.ProjectModule.new("fixture", {bridge.SourceFile.new(
-        "/workspace/fixture.titan", "saved fixture")}),
+        test_paths.workspace_root() .. "/fixture.titan", "saved fixture")}),
       bridge.ProjectModule.new("fixture.dependency", {bridge.SourceFile.new(
-        "/workspace/dependency.titan", "invalid dependency")}),
+        test_paths.workspace_root() .. "/dependency.titan", "invalid dependency")}),
     })
     local root? = analysis:find_module("fixture")
     local dependency? = analysis:find_module("fixture.dependency")
@@ -990,14 +1005,14 @@ end
 function test_compiler_bridge_keeps_source_manifests_off_binary_snapshots(
     _context: test.Context)
   run_bridge(function ()
-    local provider = fs.tmpname()
+    local provider = test_paths.temporary_name()
     defer fs.unlink(provider)
     fs.write_file(provider, "fixture binary provider")
     with_fixture("binary-manifest", function ()
       local compiler = bridge.load()
       local analysis = compiler:analyze("fixture", {
         bridge.ProjectModule.new("fixture", {bridge.SourceFile.new(
-          "/workspace/fixture.titan", "saved fixture")}),
+          test_paths.workspace_root() .. "/fixture.titan", "saved fixture")}),
       })
       local binary? = analysis:find_module("fixture.binary")
       test.assert(binary ~= nil and binary.manifest ~= nil and
@@ -1028,7 +1043,7 @@ function test_compiler_bridge_observes_embedded_provider_identity(
       local compiler = bridge.load()
       local analysis = compiler:analyze("fixture", {
         bridge.ProjectModule.new("fixture", {bridge.SourceFile.new(
-          "/workspace/fixture.titan", "saved fixture")}),
+          test_paths.workspace_root() .. "/fixture.titan", "saved fixture")}),
       })
       local embedded? = analysis:find_module("fixture.binary")
       test.assert(embedded ~= nil and
@@ -1065,7 +1080,7 @@ function test_compiler_bridge_does_not_treat_an_ordinary_executable_path_as_embe
       local compiler = bridge.load()
       local analysis = compiler:analyze("fixture", {
         bridge.ProjectModule.new("fixture", {bridge.SourceFile.new(
-          "/workspace/fixture.titan", "saved fixture")}),
+          test_paths.workspace_root() .. "/fixture.titan", "saved fixture")}),
       })
       local ordinary? = analysis:find_module("fixture.binary")
       test.assert(ordinary ~= nil and ordinary.provider_identity == nil and
@@ -1090,7 +1105,7 @@ end
 function test_compiler_bridge_rejects_mixed_binary_providers_across_attempts(
     _context: test.Context)
   run_bridge(function ()
-    local first_provider = fs.tmpname()
+    local first_provider = test_paths.temporary_name()
     local second_provider = first_provider .. ".second"
     defer do
       fs.unlink(second_provider)
@@ -1102,10 +1117,10 @@ function test_compiler_bridge_rejects_mixed_binary_providers_across_attempts(
       local compiler = bridge.load()
       local analysis = compiler:analyze_incremental({
         bridge.ProjectModule.new("fixture.first", {
-          bridge.SourceFile.new("/workspace/first.titan", ""),
+          bridge.SourceFile.new(test_paths.workspace_root() .. "/first.titan", ""),
         }),
         bridge.ProjectModule.new("fixture.second", {
-          bridge.SourceFile.new("/workspace/second.titan", ""),
+          bridge.SourceFile.new(test_paths.workspace_root() .. "/second.titan", ""),
         }),
       }, {"fixture.first", "fixture.second"}, {})
       local binary? = analysis:find_module("fixture.binary")
@@ -1135,7 +1150,7 @@ end
 
 function test_compiler_bridge_completion_catalog_owns_complete_pending_providers(_context: test.Context)
   run_bridge(function ()
-    local provider = fs.tmpname()
+    local provider = test_paths.temporary_name()
     local second = provider .. ".second"
     defer do fs.unlink(second); fs.unlink(provider) end
     fs.write_file(provider, "first provider")
@@ -1143,9 +1158,9 @@ function test_compiler_bridge_completion_catalog_owns_complete_pending_providers
     with_fixture("completion-catalog", function ()
       local compiler = bridge.load()
       local projects = {
-        bridge.ProjectModule.new("fixture.first", {bridge.SourceFile.new("/workspace/first.titan", "old")}),
-        bridge.ProjectModule.new("fixture.second", {bridge.SourceFile.new("/workspace/second.titan", "old")}),
-        bridge.ProjectModule.new("fixture.last", {bridge.SourceFile.new("/workspace/last.titan", "old")}),
+        bridge.ProjectModule.new("fixture.first", {bridge.SourceFile.new(test_paths.workspace_root() .. "/first.titan", "old")}),
+        bridge.ProjectModule.new("fixture.second", {bridge.SourceFile.new(test_paths.workspace_root() .. "/second.titan", "old")}),
+        bridge.ProjectModule.new("fixture.last", {bridge.SourceFile.new(test_paths.workspace_root() .. "/last.titan", "old")}),
       }
       compiler:analyze_incremental(projects, {"fixture.first", "fixture.second", "fixture.last"}, {})
       test.assert(#compiler:completion_binary_catalog() == 2,
@@ -1154,7 +1169,7 @@ function test_compiler_bridge_completion_catalog_owns_complete_pending_providers
       test.assert(#compiler:completion_binary_catalog() == 2,
         "a later fixed-point iteration lost an unpublished provider")
       projects[1] = bridge.ProjectModule.new("fixture.first", {
-        bridge.SourceFile.new("/workspace/first.titan", "replacement"),
+        bridge.SourceFile.new(test_paths.workspace_root() .. "/first.titan", "replacement"),
       })
       compiler:analyze_incremental(projects, {"fixture.first"}, {})
       local catalog = compiler:completion_binary_catalog()
@@ -1182,7 +1197,7 @@ function test_compiler_bridge_completion_catalog_owns_complete_pending_providers
 end
 
 local function preserves_binary_observation_when_final_snapshot_is_source()
-  local first_provider = fs.tmpname()
+  local first_provider = test_paths.temporary_name()
   local second_provider = first_provider .. ".second"
   defer do
     fs.unlink(second_provider)
@@ -1194,10 +1209,10 @@ local function preserves_binary_observation_when_final_snapshot_is_source()
     local compiler = bridge.load()
     local analysis = compiler:analyze_incremental({
       bridge.ProjectModule.new("fixture.first", {
-        bridge.SourceFile.new("/workspace/first.titan", ""),
+        bridge.SourceFile.new(test_paths.workspace_root() .. "/first.titan", ""),
       }),
       bridge.ProjectModule.new("fixture.second", {
-        bridge.SourceFile.new("/workspace/second.titan", ""),
+        bridge.SourceFile.new(test_paths.workspace_root() .. "/second.titan", ""),
       }),
     }, {"fixture.first", "fixture.second"}, {})
     local provider? = analysis:find_module("fixture.binary")
@@ -1311,14 +1326,14 @@ end
 function test_compiler_bridge_normalizes_contextual_owner_provenance(
     _context: test.Context)
   run_bridge(function ()
-    local provider = fs.tmpname()
+    local provider = test_paths.temporary_name()
     defer fs.unlink(provider)
     fs.write_file(provider, "fixture static provider")
     with_fixture("contextual-resolution", function ()
       local compiler = bridge.load()
       local analysis = compiler:analyze("fixture", {
         bridge.ProjectModule.new("fixture", {bridge.SourceFile.new(
-          "/workspace/fixture.titan", "saved fixture")}),
+          test_paths.workspace_root() .. "/fixture.titan", "saved fixture")}),
       })
       test.assert(#analysis.contextual_resolutions == 1,
                   "contextual owner metadata was not normalized")
@@ -1347,14 +1362,14 @@ end
 function test_compiler_bridge_resets_contextual_provider_observations_between_analyses(
     _context: test.Context)
   run_bridge(function ()
-    local provider = fs.tmpname()
+    local provider = test_paths.temporary_name()
     defer fs.unlink(provider)
     fs.write_file(provider, "fixture static provider")
     with_fixture("contextual-resolution-once", function ()
       local compiler = bridge.load()
       local project = bridge.ProjectModule.new(
         "fixture", {bridge.SourceFile.new(
-          "/workspace/fixture.titan", "saved fixture")})
+          test_paths.workspace_root() .. "/fixture.titan", "saved fixture")})
       local first = compiler:analyze("fixture", {project})
       local second = compiler:analyze("fixture", {project})
       test.assert(#first.contextual_resolutions == 1 and
@@ -1373,7 +1388,7 @@ function test_compiler_bridge_normalizes_and_restats_c_header_dependencies(
     local compiler = bridge.load()
     local analysis = compiler:analyze("fixture", {
       bridge.ProjectModule.new("fixture", {bridge.SourceFile.new(
-        "/workspace/fixture.titan", "saved fixture")}),
+        test_paths.workspace_root() .. "/fixture.titan", "saved fixture")}),
     })
     local module? = analysis:find_module("fixture")
     test.assert(module ~= nil and #module.c_header_dependencies == 2,
@@ -1394,9 +1409,9 @@ function test_compiler_bridge_normalizes_and_restats_c_header_dependencies(
       observation.modified_nanoseconds == 456 and
       observation.physical_identity == "device:inode:target",
       "header restat lost its observation or explicit change result")
-    test.assert(current[1].path == "/headers/direct.h" and
+    test.assert(current[1].path == fixture_headers_root() .. "/direct.h" and
                 current[1].identity == "direct bytes:restatted" and
-                current[2].path == "/headers/earlier.h" and
+                current[2].path == fixture_headers_root() .. "/earlier.h" and
                 current[2].identity == "missing candidate:restatted",
                 "typed restat changed ownership/order or lost identities")
   end)
@@ -1410,7 +1425,7 @@ local function expect_c_header_metadata_error(mode: string,
     do
       compiler:analyze("fixture", {
         bridge.ProjectModule.new("fixture", {bridge.SourceFile.new(
-          "/workspace/fixture.titan", "saved fixture")}),
+          test_paths.workspace_root() .. "/fixture.titan", "saved fixture")}),
       })
     catch
       rejected = true
@@ -1446,11 +1461,11 @@ function test_compiler_bridge_normalizes_annotated_ast_and_provenance(
   with_fixture("valid", function ()
     local compiler = bridge.load()
     test.assert(compiler:installed_binary_modules_root() ==
-                  "/opt/titan/lib/titan/0.6",
+                  fixture_sdk_root(),
                 "compiler installation library directory was not exposed")
     local analysis = compiler:analyze("fixture", {bridge.ProjectModule.new(
       "fixture", {bridge.SourceFile.new(
-        "/workspace/fixture.titan", "saved fixture")})})
+        test_paths.workspace_root() .. "/fixture.titan", "saved fixture")})})
     test.assert(#analysis.diagnostics == 0, "valid fixture had diagnostics")
     test.assert(compiler:has_project_entry("fixture"),
                 "project declarations were not retained behind the bridge")
@@ -1537,7 +1552,7 @@ function test_compiler_bridge_normalizes_invalid_source_diagnostic(
   with_fixture("invalid-source", function ()
     local compiler = bridge.load()
     local analysis = compiler:analyze("fixture", {bridge.ProjectModule.new(
-      "fixture", {bridge.SourceFile.new("/workspace/fixture.titan", "bad")})})
+      "fixture", {bridge.SourceFile.new(test_paths.workspace_root() .. "/fixture.titan", "bad")})})
     test.assert(#analysis.diagnostics == 1,
                 "invalid fixture did not produce one diagnostic")
     local diagnostic = analysis.diagnostics[1]
@@ -1605,7 +1620,7 @@ local function executes_installed_compiler_on_valid_and_invalid_source()
   local compiler = bridge.load()
   local valid = compiler:analyze("bridge.fixture.valid", {
     bridge.ProjectModule.new("bridge.fixture.valid", {bridge.SourceFile.new(
-      "/workspace/bridge_fixture_valid.titan",
+      test_paths.workspace_root() .. "/bridge_fixture_valid.titan",
       "function widen(n: integer): float\n" ..
       "  local result: float = n\n" ..
       "  return result\n" ..
@@ -1619,7 +1634,7 @@ local function executes_installed_compiler_on_valid_and_invalid_source()
 
   local invalid = compiler:analyze("bridge.fixture.invalid", {
     bridge.ProjectModule.new("bridge.fixture.invalid", {bridge.SourceFile.new(
-      "/workspace/bridge_fixture_invalid.titan",
+      test_paths.workspace_root() .. "/bridge_fixture_invalid.titan",
       "function broken(: integer)\nend\n")})
   })
   test.assert(#invalid.diagnostics > 0 and
@@ -1642,23 +1657,23 @@ local function recovers_after_dependency_checking_errors()
   preload_real_compiler()
   local compiler = bridge.load()
   local consumer = bridge.ProjectModule.new("manifest_consumer", {
-    bridge.SourceFile.new("/workspace/manifest_consumer.titan", [[
+    bridge.SourceFile.new(test_paths.workspace_root() .. "/manifest_consumer.titan", [[
 local dependency = import "manifest_middle.titan"
 local healthy = import "manifest_healthy"
 function answer(): integer return dependency.answer() + healthy.answer() end
 ]]),
   })
   local middle = bridge.ProjectModule.new("manifest_middle", {
-    bridge.SourceFile.new("/workspace/manifest_middle.titan", [[
+    bridge.SourceFile.new(test_paths.workspace_root() .. "/manifest_middle.titan", [[
 local dependency = import "manifest_dependency"
 function answer(): integer return dependency.answer() end
 ]]),
   })
   local healthy = bridge.ProjectModule.new("manifest_healthy", {
-    bridge.SourceFile.new("/workspace/manifest_healthy.titan",
+    bridge.SourceFile.new(test_paths.workspace_root() .. "/manifest_healthy.titan",
       "function answer(): integer return 1 end\n"),
   })
-  local filename = "/workspace/manifest_dependency.titan"
+  local filename = test_paths.workspace_root() .. "/manifest_dependency.titan"
   local dependency = bridge.ProjectModule.new("manifest_dependency", {
     bridge.SourceFile.new(filename,
       "function answer(): integer return 'invalid' end\n"),
@@ -1717,7 +1732,7 @@ local function runs_incremental_declared_interface_cache()
   local compiler = bridge.load()
   local provider = bridge.ProjectModule.new("bridge_cache_provider", {
     bridge.SourceFile.new(
-      "/workspace/bridge_cache_provider.titan",
+      test_paths.workspace_root() .. "/bridge_cache_provider.titan",
       "local function secret(): integer\n" ..
       "  local body_only_answer = 41\n" ..
       "  return body_only_answer\n" ..
@@ -1725,7 +1740,7 @@ local function runs_incremental_declared_interface_cache()
   })
   local consumer = bridge.ProjectModule.new("bridge_cache_consumer", {
     bridge.SourceFile.new(
-      "/workspace/bridge_cache_consumer.titan",
+      test_paths.workspace_root() .. "/bridge_cache_consumer.titan",
       "local provider = import \"bridge_cache_provider.titan\"\n" ..
       "function answer(): integer return provider.secret() end\n")
   })
@@ -1741,7 +1756,7 @@ local function runs_incremental_declared_interface_cache()
 
   local edited_consumer = bridge.ProjectModule.new(
     "bridge_cache_consumer", {bridge.SourceFile.new(
-      "/workspace/bridge_cache_consumer.titan",
+      test_paths.workspace_root() .. "/bridge_cache_consumer.titan",
       "local provider = import \"bridge_cache_provider.titan\"\n" ..
       "function answer(): integer return provider.secret() + 1 end\n")})
   local incremental = compiler:analyze_incremental(
@@ -1767,8 +1782,8 @@ local function preserves_mixed_sparse_project_payloads()
   local compiler = bridge.load()
   local provider_name = "sparse_provider"
   local consumer_name = "sparse_consumer"
-  local provider_file = "/workspace/sparse_provider.titan"
-  local consumer_file = "/workspace/sparse_consumer.titan"
+  local provider_file = test_paths.workspace_root() .. "/sparse_provider.titan"
+  local consumer_file = test_paths.workspace_root() .. "/sparse_consumer.titan"
   local provider = bridge.ProjectModule.new(provider_name,{bridge.SourceFile.new(provider_file,
     "record Box<|A|> item: A local hidden: A end\n" ..
     "local function secret<|A|>(item: A): A\n" ..
@@ -1847,7 +1862,8 @@ local function preserves_mixed_sparse_project_payloads()
     owner:markdown() == (initial_owner as features.Hover):markdown(),
     "checking against restored manifests changed source-private or generic owner metadata")
   local definition? = replayed:definition(consumer_file,secret_position)
-  test.assert(definition ~= nil and definition.uri == "file://" .. provider_file and
+  test.assert(definition ~= nil and definition.uri ==
+    test_paths.workspace_uri() .. "/sparse_provider.titan" and
     definition.range.start.line == 1 and definition.range.start.character == 15,
     "checking against restored declarations lost the provider's definition target")
   assert_declared_project_entry(restarted, provider_name)
@@ -1906,7 +1922,7 @@ local function joins_source_imported_local_function_definition_identity()
   -- Source-defined foreign functions require a writable sibling directory for
   -- the compiler's temporary checking header, even though project source reads
   -- themselves come from the bridge overlay.
-  local fixture_root = fs.tmpname()
+  local fixture_root = test_paths.temporary_name()
   fs.unlink(fixture_root)
   fs.mkdir(fixture_root)
   defer fs.rmdir(fixture_root)
@@ -2041,11 +2057,11 @@ local function reports_dirty_saved_file_progress()
   with_fixture("progress", function ()
     local compiler = bridge.load()
     local first = bridge.ProjectModule.new("fixture.first", {
-      bridge.SourceFile.new("/workspace/first.titan", ""),
-      bridge.SourceFile.new("/workspace/first_part.titan", ""),
+      bridge.SourceFile.new(test_paths.workspace_root() .. "/first.titan", ""),
+      bridge.SourceFile.new(test_paths.workspace_root() .. "/first_part.titan", ""),
     })
     local second = bridge.ProjectModule.new("fixture.second", {
-      bridge.SourceFile.new("/workspace/second.titan", ""),
+      bridge.SourceFile.new(test_paths.workspace_root() .. "/second.titan", ""),
     })
     local observed: {bridge.AnalysisProgress} = {}
     local analysis = compiler:analyze_incremental(
@@ -2079,8 +2095,8 @@ local function completes_progress_for_failed_root_without_yield()
     local observed: {bridge.AnalysisProgress} = {}
     local analysis = compiler:analyze_incremental({
       bridge.ProjectModule.new("fixture.failed", {
-        bridge.SourceFile.new("/workspace/failed.titan", ""),
-        bridge.SourceFile.new("/workspace/failed_part.titan", ""),
+        bridge.SourceFile.new(test_paths.workspace_root() .. "/failed.titan", ""),
+        bridge.SourceFile.new(test_paths.workspace_root() .. "/failed_part.titan", ""),
       }),
     }, {"fixture.failed"}, {}, function (progress: bridge.AnalysisProgress)
       observed[#observed + 1] = progress
@@ -2103,7 +2119,7 @@ end
 
 local function reparses_source_required_external_for_cached_project()
   preload_real_compiler()
-  local external_root = fs.tmpname()
+  local external_root = test_paths.temporary_name()
   fs.unlink(external_root)
   fs.mkdir(external_root)
   local external_file =
@@ -2119,7 +2135,7 @@ local function reparses_source_required_external_for_cached_project()
   compiler:configure(bridge.CompilerConfiguration.new { source_roots = {external_root} })
   local provider = bridge.ProjectModule.new("bridge_cached_provider", {
     bridge.SourceFile.new(
-      "/workspace/bridge_cached_provider.titan",
+      test_paths.workspace_root() .. "/bridge_cached_provider.titan",
       "local external = import \"bridge_cached_external.titan\"\n" ..
       "function answer(): integer return external.secret() end\n")
   })
@@ -2141,7 +2157,7 @@ local function reparses_source_required_external_for_cached_project()
 
   local consumer = bridge.ProjectModule.new("bridge_cached_consumer", {
     bridge.SourceFile.new(
-      "/workspace/bridge_cached_consumer.titan",
+      test_paths.workspace_root() .. "/bridge_cached_consumer.titan",
       "local provider = import \"bridge_cached_provider.titan\"\n" ..
       "function result(): integer return provider.answer() + 1 end\n")
   })
@@ -2171,7 +2187,7 @@ end
 
 local function uses_analysis_local_ffi_configuration()
   preload_real_compiler()
-  local include_root = fs.tmpname()
+  local include_root = test_paths.temporary_name()
   fs.unlink(include_root)
   fs.mkdir(include_root)
   -- The literal include is part of a native probe's source-only cache key.
@@ -2193,7 +2209,7 @@ typedef int vscode_titan_lsp_project_only_int;
 
   local module = bridge.ProjectModule.new("bridge_ffi_include", {
     bridge.SourceFile.new(
-      "/workspace/bridge_ffi_include.titan",
+      test_paths.workspace_root() .. "/bridge_ffi_include.titan",
       "foreign import \"" .. header_name .. "\"\n" ..
       "foreign type ProjectInteger = vscode_titan_lsp_project_only_int\n" ..
       "function answer(): integer return 42 end\n")
@@ -2317,7 +2333,7 @@ end
 
 local function normalizes_spread_expression_metadata()
   preload_real_compiler()
-  local filename = "/workspace/spread_semantics.titan"
+  local filename = test_paths.workspace_root() .. "/spread_semantics.titan"
   local source = [[function sink(left: integer?, right: integer?)
 end
 
@@ -2432,7 +2448,7 @@ end
 ]]
   local analysis = compiler:analyze("bridge_metadata", {
     bridge.ProjectModule.new("bridge_metadata", {bridge.SourceFile.new(
-      "/workspace/bridge_metadata.titan", source)})
+      test_paths.workspace_root() .. "/bridge_metadata.titan", source)})
   })
   test.assert(#analysis.diagnostics == 0,
               "representative semantic metadata fixture did not compile")
@@ -2480,7 +2496,7 @@ end
 
 local function preserves_checked_generic_case_bindings()
   preload_real_compiler()
-  local filename = "/workspace/generic_case_payload.titan"
+  local filename = test_paths.workspace_root() .. "/generic_case_payload.titan"
   local source = [[union Maybe<|T|>
   present(T)
   absent()
@@ -2532,7 +2548,7 @@ end
 
 local function drives_shadowing_and_record_definition_features_from_compiler()
   preload_real_compiler()
-  local filename = "/workspace/semantic_acceptance.titan"
+  local filename = test_paths.workspace_root() .. "/semantic_acceptance.titan"
   local source = [[record Parcel
   amount: integer
 end
@@ -2631,7 +2647,7 @@ end
 
 local function excludes_foreign_and_external_declarations_from_features()
   preload_real_compiler()
-  local external_root = fs.tmpname()
+  local external_root = test_paths.temporary_name()
   fs.unlink(external_root)
   fs.mkdir(external_root)
   local external_file =
@@ -2643,7 +2659,7 @@ local function excludes_foreign_and_external_declarations_from_features()
     fs.rmdir(external_root)
   end
 
-  local filename = "/workspace/semantic_boundaries.titan"
+  local filename = test_paths.workspace_root() .. "/semantic_boundaries.titan"
   local source = [[foreign import "string.h"
 local external = import "semantic_acceptance_external"
 function ffi_use(): integer
@@ -2713,7 +2729,7 @@ end
 
 local function preserves_imported_callable_hover_signatures()
   preload_real_compiler()
-  local external_root = fs.tmpname()
+  local external_root = test_paths.temporary_name()
   fs.unlink(external_root)
   fs.mkdir(external_root)
   local external_file = external_root .. "/hover_external.titan"
@@ -2739,7 +2755,7 @@ end
     fs.rmdir(external_root)
   end
 
-  local filename = "/workspace/hover_consumer.titan"
+  local filename = test_paths.workspace_root() .. "/hover_consumer.titan"
   local source = [[local external = import "hover_external.titan"
 function run(): integer
   local counter = external.Counter.create(1)
@@ -2816,7 +2832,7 @@ end
 
 local function preserves_generic_callable_hover_signatures()
   preload_real_compiler()
-  local filename = "/workspace/generic_callable_hover.titan"
+  local filename = test_paths.workspace_root() .. "/generic_callable_hover.titan"
   local source = [[record Box<|T|>
   item: T
 end
@@ -2891,7 +2907,7 @@ end
 
 local function preserves_contextual_aggregate_and_module_hover_summaries()
   preload_real_compiler()
-  local provider_filename = "/workspace/summary_provider.titan"
+  local provider_filename = test_paths.workspace_root() .. "/summary_provider.titan"
   local provider_source = [[local const secret: integer = 7
 answer = 42
 record Box<|T|>
@@ -2904,7 +2920,7 @@ local function Box:hidden(): T return self.item end
 function Box:get(): T return self.item end
 function exposed(): integer return answer end
 ]]
-  local consumer_filename = "/workspace/summary_consumer.titan"
+  local consumer_filename = test_paths.workspace_root() .. "/summary_consumer.titan"
   local consumer_source = [[local public = import "summary_provider"
 local source = import "summary_provider.titan"
 function compare(left: public.Box<|integer|>, right: source.Box<|integer|>): public.Box<|integer|>
@@ -3078,7 +3094,7 @@ end
 local function keeps_source_visibility_nontransitive_through_aliases()
   preload_real_compiler()
   local provider_filename =
-    "/workspace/summary_visibility_provider.titan"
+    test_paths.workspace_root() .. "/summary_visibility_provider.titan"
   local provider_source = [[record Box
   local hidden: integer
   shown: integer
@@ -3087,12 +3103,12 @@ local function Box:secret(): integer return self.hidden end
 function Box:visible(): integer return self.shown end
 ]]
   local facade_filename =
-    "/workspace/summary_visibility_facade.titan"
+    test_paths.workspace_root() .. "/summary_visibility_facade.titan"
   local facade_source = [[local provider = import "summary_visibility_provider"
 type Box = provider.Box
 ]]
   local consumer_filename =
-    "/workspace/summary_visibility_consumer.titan"
+    test_paths.workspace_root() .. "/summary_visibility_consumer.titan"
   local consumer_source =
     [[local facade = import "summary_visibility_facade.titan"
 local direct = import "summary_visibility_provider.titan"
@@ -3154,7 +3170,7 @@ end
 local function keeps_function_valued_module_variables_as_bare_types()
   preload_real_compiler()
   local provider_filename =
-    "/workspace/function_variable_provider.titan"
+    test_paths.workspace_root() .. "/function_variable_provider.titan"
   local provider_source = [[callback: function (integer): integer =
   function(item) return item + 1 end
 function declared(item: integer): integer
@@ -3162,7 +3178,7 @@ function declared(item: integer): integer
 end
 ]]
   local consumer_filename =
-    "/workspace/function_variable_consumer.titan"
+    test_paths.workspace_root() .. "/function_variable_consumer.titan"
   local consumer_source =
     [[local provider = import "function_variable_provider"
 function apply(item: integer): integer
@@ -3211,7 +3227,7 @@ end
 
 local function preserves_cached_manifest_callable_hover_signatures()
   preload_real_compiler()
-  local external_root = fs.tmpname()
+  local external_root = test_paths.temporary_name()
   fs.unlink(external_root)
   fs.mkdir(external_root)
   local external_file = external_root .. "/hover_manifest.titan"
@@ -3247,7 +3263,7 @@ end
     fs.rmdir(external_root)
   end
 
-  local seed_filename = "/workspace/hover_manifest_seed.titan"
+  local seed_filename = test_paths.workspace_root() .. "/hover_manifest_seed.titan"
   local seed = bridge.ProjectModule.new("hover_manifest_seed", {
     bridge.SourceFile.new(seed_filename,
       "local cached = import \"hover_manifest\"\n" ..
@@ -3273,7 +3289,7 @@ end
   -- A syntax error makes an accidental source reload observable. The second
   -- Compiler must resolve every declaration below from the serialized cache.
   fs.write_file(external_file, "function broken(: integer) end\n")
-  local filename = "/workspace/hover_manifest_consumer.titan"
+  local filename = test_paths.workspace_root() .. "/hover_manifest_consumer.titan"
   local source = [[local cached = import "hover_manifest"
 function use(formatter: cached.Formatter,
              parcel: cached.Parcel,
@@ -3464,7 +3480,7 @@ end
 
 local function preserves_current_metadata_types_in_cached_external_manifests()
   preload_real_compiler()
-  local external_root = fs.tmpname()
+  local external_root = test_paths.temporary_name()
   fs.unlink(external_root)
   fs.mkdir(external_root)
   local external_file = external_root .. "/bridge_metadata.titan"
@@ -3491,7 +3507,7 @@ end
     fs.rmdir(external_root)
   end
 
-  local filename = "/workspace/bridge_metadata_consumer.titan"
+  local filename = test_paths.workspace_root() .. "/bridge_metadata_consumer.titan"
   local source = [[local cached = import "bridge_metadata"
 function use(callback: foreign function (*lua_State, const *char): int,
              mutable: { integer }, immutable: const { integer }): integer
@@ -3572,7 +3588,7 @@ end
 
 local function preserves_direct_c_callable_hover_signatures()
   preload_real_compiler()
-  local include_root = fs.tmpname()
+  local include_root = test_paths.temporary_name()
   fs.unlink(include_root)
   fs.mkdir(include_root)
   local header = include_root .. "/hover_callable.h"
@@ -3584,7 +3600,7 @@ local function preserves_direct_c_callable_hover_signatures()
     fs.rmdir(include_root)
   end
 
-  local filename = "/workspace/hover_c_consumer.titan"
+  local filename = test_paths.workspace_root() .. "/hover_c_consumer.titan"
   local source = [[foreign import "hover_callable.h"
 function run(): integer
   local named: integer = ffi.hover_named_sum(1, 2)
@@ -3643,7 +3659,7 @@ end
 
 local function preserves_source_manifest_across_trivia_shifts()
   preload_real_compiler()
-  local filename = "/workspace/private_identity.titan"
+  local filename = test_paths.workspace_root() .. "/private_identity.titan"
   local source = [[local secret = 41
 local function hidden(increment: integer): integer
   return secret + increment
@@ -3680,8 +3696,8 @@ end
 
 local function preserves_alias_and_named_parameter_rename_metadata()
   preload_real_compiler()
-  local provider_file = "/workspace/named_provider.titan"
-  local consumer_file = "/workspace/named_consumer.titan"
+  local provider_file = test_paths.workspace_root() .. "/named_provider.titan"
+  local consumer_file = test_paths.workspace_root() .. "/named_consumer.titan"
   local provider_source = [[record Box
   amount: integer
 end
@@ -3734,9 +3750,9 @@ end
               "named-argument parameter rename failed compiler preflight")
   local documents = verified:document_edits()
   test.assert(#documents == 2 and
-              documents[1].uri == "file:///workspace/named_consumer.titan" and
+              documents[1].uri == test_paths.workspace_uri() .. "/named_consumer.titan" and
               #documents[1].edits == 1 and
-              documents[2].uri == "file:///workspace/named_provider.titan" and
+              documents[2].uri == test_paths.workspace_uri() .. "/named_provider.titan" and
               #documents[2].edits == 2,
               "parameter rename did not edit its definition, uses, and label")
 end
@@ -3764,8 +3780,8 @@ local function assert_namespace_definition_and_references(
     definition_position: source_text.Position,
     provider_reference: source_text.Position,
     consumer_reference: source_text.Position)
-  local provider_uri = "file://" .. provider_file
-  local consumer_uri = "file://" .. consumer_file
+  local provider_uri = test_paths.workspace_uri() .. "/namespace_provider.titan"
+  local consumer_uri = test_paths.workspace_uri() .. "/namespace_consumer.titan"
   local definition? = model:definition(consumer_file, consumer_reference)
   test.assert(definition ~= nil and definition.uri == provider_uri and
               definition.range.start.line == definition_position.line and
@@ -3797,9 +3813,9 @@ local function assert_namespace_rename(model: features.Features,
               "namespace-preserving rename failed compiler preflight")
   local documents = verified:document_edits()
   test.assert(#documents == 2 and
-              documents[1].uri == "file:///workspace/namespace_consumer.titan" and
+              documents[1].uri == test_paths.workspace_uri() .. "/namespace_consumer.titan" and
               #documents[1].edits == 1 and
-              documents[2].uri == "file:///workspace/namespace_provider.titan" and
+              documents[2].uri == test_paths.workspace_uri() .. "/namespace_provider.titan" and
               #documents[2].edits == 2,
               "rename crossed the type/value or lexical shadow boundary")
 end
@@ -3807,8 +3823,8 @@ end
 local function separates_declaration_namespaces(is_interface: boolean,
                                                 is_local: boolean)
   preload_real_compiler()
-  local provider_file = "/workspace/namespace_provider.titan"
-  local consumer_file = "/workspace/namespace_consumer.titan"
+  local provider_file = test_paths.workspace_root() .. "/namespace_provider.titan"
+  local consumer_file = test_paths.workspace_root() .. "/namespace_consumer.titan"
   local local_prefix = is_local and "local " or ""
   local type_declaration = local_prefix .. "type Shared = integer\n"
   local value_declaration = local_prefix .. "Shared = 7\n"
@@ -3901,7 +3917,7 @@ end
 
 local function renames_into_the_other_namespace(rename_type: boolean)
   preload_real_compiler()
-  local filename = "/workspace/namespace_rename.titan"
+  local filename = test_paths.workspace_root() .. "/namespace_rename.titan"
   local source = [[type Input = integer
 Shared = 7
 function read(input: Input): integer
@@ -3945,7 +3961,7 @@ local function joins_nominal_type_and_constructor_namespaces()
   preload_real_compiler()
   local projects = {
     bridge.ProjectModule.new("nominal_provider", {bridge.SourceFile.new(
-      "/workspace/nominal_provider.titan", [[record Box
+      test_paths.workspace_root() .. "/nominal_provider.titan", [[record Box
   amount: integer
 end
 union Choice
@@ -3956,7 +3972,7 @@ type BoxAlias = Box
 type ChoiceAlias = Choice
 ]])}),
     bridge.ProjectModule.new("nominal_consumer", {bridge.SourceFile.new(
-      "/workspace/nominal_consumer.titan", [[local p = import "nominal_provider"
+      test_paths.workspace_root() .. "/nominal_consumer.titan", [[local p = import "nominal_provider"
 function make(box: p.Box): p.Choice
   local other: p.BoxAlias = p.BoxAlias.new(box.amount)
   local choice: p.ChoiceAlias = p.ChoiceAlias.some(other.amount)
@@ -3991,7 +4007,7 @@ end
 
 local function overlays_current_header_observations_on_project_payloads()
   preload_real_compiler()
-  local root = fs.tmpname()
+  local root = test_paths.temporary_name()
   fs.unlink(root)
   fs.mkdir(root)
   local header = root .. "/observed.h"
@@ -4060,7 +4076,7 @@ end
 
 local function preserves_combined_ffi_namespace_semantics()
   preload_real_compiler()
-  local root = fs.tmpname()
+  local root = test_paths.temporary_name()
   fs.unlink(root)
   fs.mkdir(root)
   local first_header = root .. "/ordered_base.h"
@@ -4163,7 +4179,7 @@ end
 
 local function preserves_foreign_type_and_current_module_metadata()
   preload_real_compiler()
-  local filename = "/workspace/foreign_type_metadata.titan"
+  local filename = test_paths.workspace_root() .. "/foreign_type_metadata.titan"
   local source = [[foreign type Word = int
 record Word
   amount: integer
@@ -4257,7 +4273,7 @@ end
 
 local function preserves_inherited_ffi_payloads(external_provider: boolean)
   preload_real_compiler()
-  local root = fs.tmpname()
+  local root = test_paths.temporary_name()
   fs.unlink(root)
   fs.mkdir(root)
   local first_header = root .. "/inherited_base.h"
@@ -4397,7 +4413,7 @@ end
 
 local function allows_ffi_member_and_shadowing_binding_renames()
   preload_real_compiler()
-  local filename = "/workspace/ffi_rename_consumer.titan"
+  local filename = test_paths.workspace_root() .. "/ffi_rename_consumer.titan"
   local source = [[local provider = import "ffi_rename_provider"
 record Item
   amount: integer
@@ -4410,7 +4426,7 @@ end
 ]]
   local projects = {
     bridge.ProjectModule.new("ffi_rename_provider", {
-      bridge.SourceFile.new("/workspace/ffi_rename_provider.titan",
+      bridge.SourceFile.new(test_paths.workspace_root() .. "/ffi_rename_provider.titan",
         "function answer(): integer return 41 end\n"),
     }),
     bridge.ProjectModule.new("ffi_rename_consumer", {
@@ -4436,8 +4452,8 @@ end
 
 local function union_parts_fixture():
     ({bridge.ProjectModule}, string, string, string, string)
-  local provider_file = "/workspace/union_parts_provider.titan"
-  local consumer_file = "/workspace/union_parts_consumer.titan"
+  local provider_file = test_paths.workspace_root() .. "/union_parts_provider.titan"
+  local consumer_file = test_paths.workspace_root() .. "/union_parts_consumer.titan"
   local provider = [[union Packet<|T|>
   moved(x: T, text: string, end: integer, note: string?)
   other(x: T)
@@ -4494,7 +4510,11 @@ local function assert_union_part_definition(model: features.Features,
   local definition? = model:definition(source_file,
     marked_name_position(source, marker, name))
   local expected = marked_name_position(provider, declaration_marker, name)
-  test.assert(definition ~= nil and definition.uri == "file://" .. provider_file and
+  local provider_uri?, provider_uri_error? =
+    source_text.path_to_file_uri(provider_file)
+  test.assert(provider_uri_error == nil and provider_uri ~= nil,
+    "named union provider path did not become a file URI")
+  test.assert(definition ~= nil and definition.uri == provider_uri and
     definition.range.start.line == expected.line and
     definition.range.start.character == expected.character,
     "named union part did not resolve to its own variant declaration: " .. marker)
@@ -4663,4 +4683,180 @@ end
 
 function test_compiler_bridge_restores_named_union_part_descriptors(_context: test.Context)
   run_bridge(restores_named_union_part_descriptors)
+end
+
+function test_compiler_bridge_native_windows_header_paths(_context: test.Context)
+  if ffi.VSCODE_TITAN_WINDOWS == 0 then test.skip("native Windows paths") end
+  local file: {string: value} = {
+    ["kind"] = "file", ["path"] = "w:\\live\\api.h", ["identity"] = "file bytes",
+  }
+  local search: {string: value} = {
+    ["kind"] = "search", ["path"] = "\\\\server\\share\\api.h",
+    ["identity"] = "missing candidate",
+  }
+  local entries: {integer: value} = {file, search}
+  local decoded = bridge.normalize_c_header_dependencies(entries, "test headers")
+  test.assert(#decoded == 2 and decoded[1].path == "w:\\live\\api.h" and
+              decoded[1].identity == "file bytes" and
+              decoded[2].path == "\\\\server\\share\\api.h",
+              "absolute native header paths changed their compiler provenance")
+  file["path"] = "W:relative.h"
+  local rejected = false
+  do
+    bridge.normalize_c_header_dependencies(entries, "test headers")
+  catch
+    rejected = error is bridge.BridgeError
+  end
+  test.assert(rejected, "drive-relative compiler header metadata was accepted")
+end
+
+local function add_windows_metadata_root(context: test.Context, name: string,
+                                         path: string, expected: boolean)
+  context:run(name, function(_child: test.Context)
+    test.assert(bridge.windows_metadata_absolute_path(path) == expected,
+      "compiler metadata root classification disagreed: " .. path)
+  end)
+end
+
+function test_compiler_bridge_windows_metadata_absolute_roots(context: test.Context)
+  add_windows_metadata_root(context, "drive_root",
+    "C:/", true)
+  add_windows_metadata_root(context, "native_drive",
+    "w:\\live\\api.h", true)
+  add_windows_metadata_root(context, "ordinary_dot_segments",
+    "c:/literal/../api.h", true)
+  add_windows_metadata_root(context, "native_unc_root",
+    "\\\\server\\share", true)
+  add_windows_metadata_root(context, "slash_unc",
+    "//server/share/api.h", true)
+  add_windows_metadata_root(context, "mixed_unc",
+    "\\/server/share\\api.h", true)
+  add_windows_metadata_root(context, "unicode_unc",
+    "//sérver/share name/api.h", true)
+  add_windows_metadata_root(context, "unc_authority_bytes",
+    "//server:port/share/api.h", true)
+  add_windows_metadata_root(context, "extended_drive_root",
+    "\\\\?\\C:\\", true)
+  add_windows_metadata_root(context, "extended_drive_literal_dots",
+    "\\\\?\\c:\\literal\\..\\api.h", true)
+  add_windows_metadata_root(context, "extended_unc_root",
+    "\\\\?\\UNC\\server\\share", true)
+  add_windows_metadata_root(context, "extended_unc_unicode",
+    "\\\\?\\uNc\\sérver\\share name\\api.h", true)
+  add_windows_metadata_root(context, "volume_root",
+    "\\\\?\\Volume{01234567-89ab-CDEF-0123-456789abcdef}\\", true)
+  add_windows_metadata_root(context, "volume_case",
+    "\\\\?\\vOlUmE{01234567-89ab-CDEF-0123-456789abcdef}\\api.h", true)
+end
+
+function test_compiler_bridge_windows_metadata_rejects_relative_roots(context: test.Context)
+  add_windows_metadata_root(context, "empty",
+    "", false)
+  add_windows_metadata_root(context, "relative",
+    "api.h", false)
+  add_windows_metadata_root(context, "bare_drive",
+    "C:", false)
+  add_windows_metadata_root(context, "drive_relative",
+    "C:api.h", false)
+  add_windows_metadata_root(context, "slash_rooted",
+    "/api.h", false)
+  add_windows_metadata_root(context, "backslash_rooted",
+    "\\api.h", false)
+  add_windows_metadata_root(context, "unc_server_only",
+    "\\\\server", false)
+  add_windows_metadata_root(context, "unc_empty_share",
+    "//server/", false)
+  add_windows_metadata_root(context, "unc_empty_server",
+    "///share", false)
+  add_windows_metadata_root(context, "unc_dot_server",
+    "//./share", false)
+  add_windows_metadata_root(context, "unc_parent_server",
+    "//../share", false)
+  add_windows_metadata_root(context, "unc_dot_share",
+    "//server/.", false)
+  add_windows_metadata_root(context, "unc_parent_share",
+    "//server/..", false)
+  add_windows_metadata_root(context, "drive_nul",
+    "C:/api\0.h", false)
+  add_windows_metadata_root(context, "unc_nul",
+    "\\\\server\\sh\0are", false)
+end
+
+function test_compiler_bridge_windows_metadata_rejects_device_namespaces(context: test.Context)
+  add_windows_metadata_root(context, "slash_namespace",
+    "//?/C:/api.h", false)
+  add_windows_metadata_root(context, "mixed_namespace_suffix",
+    "\\\\?/C:\\api.h", false)
+  add_windows_metadata_root(context, "mixed_namespace_prefix",
+    "\\/?\\C:\\api.h", false)
+  add_windows_metadata_root(context, "pipe_device",
+    "\\\\.\\pipe\\api", false)
+  add_windows_metadata_root(context, "slash_device",
+    "//./C:/api.h", false)
+  add_windows_metadata_root(context, "globalroot",
+    "\\\\?\\GLOBALROOT\\Device\\api.h", false)
+  add_windows_metadata_root(context, "extended_bare_drive",
+    "\\\\?\\C:", false)
+  add_windows_metadata_root(context, "extended_drive_relative",
+    "\\\\?\\C:api.h", false)
+  add_windows_metadata_root(context, "extended_drive_slash",
+    "\\\\?\\C:\\api/h", false)
+  add_windows_metadata_root(context, "extended_unc_server_only",
+    "\\\\?\\UNC\\server", false)
+  add_windows_metadata_root(context, "extended_unc_empty_share",
+    "\\\\?\\UNC\\server\\", false)
+  add_windows_metadata_root(context, "extended_unc_dot_server",
+    "\\\\?\\UNC\\.\\share", false)
+  add_windows_metadata_root(context, "extended_unc_parent_share",
+    "\\\\?\\UNC\\server\\..", false)
+  add_windows_metadata_root(context, "extended_unc_slash",
+    "\\\\?\\UNC\\server\\share\\api/h", false)
+  add_windows_metadata_root(context, "extended_nul",
+    "\\\\?\\C:\\api\0.h", false)
+end
+
+function test_compiler_bridge_windows_metadata_rejects_malformed_volume_roots(context: test.Context)
+  add_windows_metadata_root(context, "volume_missing_separator",
+    "\\\\?\\Volume{01234567-89ab-cdef-0123-456789abcdef}", false)
+  add_windows_metadata_root(context, "volume_forward_separator",
+    "\\\\?\\Volume{01234567-89ab-cdef-0123-456789abcdef}/api.h", false)
+  add_windows_metadata_root(context, "volume_guid_punctuation",
+    "\\\\?\\Volume{01234567_89ab-cdef-0123-456789abcdef}\\api.h", false)
+  add_windows_metadata_root(context, "volume_guid_nonhex",
+    "\\\\?\\Volume{01234567-89ab-cdef-0123-456789abcdeg}\\api.h", false)
+  add_windows_metadata_root(context, "volume_guid_short",
+    "\\\\?\\Volume{01234567-89ab-cdef-0123-456789abcde}\\api.h", false)
+  add_windows_metadata_root(context, "volume_wrong_braces",
+    "\\\\?\\Volume(01234567-89ab-cdef-0123-456789abcdef)\\api.h", false)
+end
+function test_compiler_bridge_native_windows_extended_header_paths(_context: test.Context)
+  if ffi.VSCODE_TITAN_WINDOWS == 0 then test.skip("native Windows metadata") end
+  local paths: {string} = {
+    "\\\\?\\c:\\literal\\..\\api.h",
+    "\\\\?\\uNc\\sérver\\share name\\api.h",
+    "\\\\?\\vOlUmE{01234567-89ab-CDEF-0123-456789abcdef}\\api.h",
+  }
+  local entries: {integer: value} = {}
+  for index = 1, #paths do
+    local path = paths[index]
+    local item: {string: value} = {
+      ["kind"] = "file", ["path"] = path, ["identity"] = "exact identity " .. index,
+    }
+    entries[index] = item
+  end
+  local decoded = bridge.normalize_c_header_dependencies(entries, "test headers")
+  test.assert(#decoded == #paths, "extended compiler metadata inputs were lost")
+  for index = 1, #paths do
+    local path = paths[index]
+    test.assert(decoded[index].path == path and
+      decoded[index].identity == "exact identity " .. index,
+      "extended compiler path or physical identity bytes changed")
+  end
+  local raw = bridge.raw_c_header_dependencies(decoded)
+  for index = 1, #paths do
+    local path = paths[index]
+    local item = raw[index] as {string: value}
+    test.assert(item["path"] == path and item["identity"] == "exact identity " .. index,
+      "extended compiler provenance changed when exported")
+  end
 end

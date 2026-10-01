@@ -3,9 +3,10 @@ local lfs = require "lfs"
 local parser = require "titan-compiler.parser"
 local util = require "titan-compiler.util"
 
-local source_root, build_root, sdk_root = ...
-assert(source_root and build_root and sdk_root and select("#", ...) == 3,
-    "usage: generate-native-build.lua SOURCE_ROOT BUILD_ROOT TITAN_PREFIX")
+local source_root, build_root, sdk_root, format = ...
+assert(source_root and build_root and sdk_root and
+    (select("#", ...) == 3 or (select("#", ...) == 4 and format == "--windows-plan")),
+    "usage: generate-native-build.lua SOURCE_ROOT BUILD_ROOT TITAN_PREFIX [--windows-plan]")
 
 local function read(path)
     local file = assert(io.open(path, "rb"))
@@ -28,6 +29,9 @@ local function write_changed(path, contents)
     local file = assert(io.open(temporary, "wb"))
     assert(file:write(contents))
     assert(file:close())
+    -- Windows rename does not replace an existing file. These are private
+    -- generated build inputs, never authored source.
+    if package.config:sub(1, 1) == "\\" then os.remove(path) end
     assert(os.rename(temporary, path))
 end
 
@@ -203,6 +207,43 @@ for _, variable in ipairs({"CC", "AR", "RANLIB", "PATH", "TITANC", "TITAN_LUA",
     configuration[#configuration + 1] = variable .. "=" .. string.format("%q", os.getenv(variable) or "")
 end
 write_changed(build_root .. "/native.config", table.concat(configuration, "\n") .. "\n")
+
+-- The Windows driver consumes the same parsed module ownership and staged
+-- source graph. Unix Make rendering below remains the default.
+if format == "--windows-plan" then
+    local function json_string(value)
+        return '"' .. value:gsub('[%z\1-\31\\"]', function(character)
+            return string.format("\\u%04x", character:byte())
+        end) .. '"'
+    end
+    local function array(values)
+        local result = {}
+        for index, value in ipairs(values) do result[index] = json_string(value) end
+        return "[" .. table.concat(result, ",") .. "]"
+    end
+    local result = {
+        '{"version":1,"sourceRoot":' .. json_string(source_root),
+        ',"buildRoot":' .. json_string(build_root),
+        ',"sdkRoot":' .. json_string(sdk_root),
+        ',"sdkFiles":' .. array(sdk_files),
+        ',"headers":' .. array(headers),
+        ',"server":' .. array(server_modules),
+        ',"tests":' .. array(test_modules),
+        ',"modules":{'
+    }
+    for index, name in ipairs(names) do
+        local module = modules[name]
+        result[#result + 1] = (index == 1 and "" or ",") .. json_string(name) ..
+            ':{"main":' .. json_string(module.main) ..
+            ',"sources":' .. array(module.sources) ..
+            ',"imports":' .. array(module.imports) ..
+            ',"foreign":' .. tostring(module.foreign) ..
+            ',"parseError":' .. (module.parse_error and json_string(module.parse_error) or "null") .. '}'
+    end
+    result[#result + 1] = "}}\n"
+    write_changed(build_root .. "/native-plan.json", table.concat(result))
+    return
+end
 
 local output = {"# Generated from parsed source declarations; do not edit.\n"}
 local function emit(line) output[#output + 1] = line .. "\n" end

@@ -31,6 +31,7 @@ SERVER_TEST := $(TEST_BUILD_DIR)/server/tests
 COMPILER_IO_CLOCK_SOURCE := src/server/compiler_io_clock.c
 COMPILER_IO_CLOCK_HEADER := src/server/compiler_io_clock.h
 COMPILER_IO_CLOCK_OBJECT := $(NATIVE_BUILD_DIR)/compiler_io_clock.o
+COMPILER_IO_PROCESS_FIXTURE := $(NATIVE_BUILD_DIR)/compiler_io_process_fixture
 EMBEDDED_INTERFACES_GENERATOR := scripts/generate-embedded-interfaces.lua
 EMBEDDED_INTERFACES_HEADER := src/server/embedded_interfaces_native.h
 EMBEDDED_INTERFACES_SOURCE := $(NATIVE_BUILD_DIR)/embedded_interfaces_native.c
@@ -120,6 +121,7 @@ NATIVE_LINK_ENV = $(NATIVE_COMPILER_ENV) \
 # Ask its Lua executable for its own relocatable paths, as Titan's test harness
 # does. Ambient Titan paths must not replace that selected SDK at execution.
 NATIVE_TEST_ENV = env -u TITAN_PATH_0_6 -u TITAN_PATH \
+	TITAN_COMPILER_IO_PROCESS_FIXTURE=$(call shell_quote,$(COMPILER_IO_PROCESS_FIXTURE)) \
 	CCACHE_DISABLE=$(call shell_quote,$(CCACHE_DISABLE)) \
 	LUA_PATH_5_5="$$( $(call shell_quote,$(TITAN_LUA)) -E -e 'io.write(package.path)' )" \
 	LUA_CPATH_5_5="$$( $(call shell_quote,$(TITAN_LUA)) -E -e 'io.write(package.cpath)' )"
@@ -201,6 +203,11 @@ $(COMPILER_IO_CLOCK_OBJECT): $(COMPILER_IO_CLOCK_SOURCE) $(COMPILER_IO_CLOCK_HEA
 		-c "$(COMPILER_IO_CLOCK_SOURCE)" \
 		-o "$(COMPILER_IO_CLOCK_OBJECT)"
 
+$(COMPILER_IO_PROCESS_FIXTURE): test/fixtures/compiler-io-process.c
+	@mkdir -p "$(dir $(COMPILER_IO_PROCESS_FIXTURE))"
+	CCACHE_DISABLE="$(CCACHE_DISABLE)" $(CC) -std=c99 -O2 \
+		-Wall -Wextra -Werror "$<" -o "$@"
+
 $(TITAN_STANDARD_PROVIDER): | $(TITANC)
 	@test -f "$@" || { \
 		echo "Titan standard provider not found at $@" >&2; \
@@ -263,7 +270,7 @@ $(filter-out $(TEST_SUPPORT_STEM).o,$(TEST_SUPPORT_OUTPUTS)): $(TEST_SUPPORT_STE
 	@test -f $(call shell_quote,$@)
 
 server-test-objects: $(TEST_MODULE_OBJECTS) $(TEST_SUPPORT_OUTPUTS)
-server-test-build: $(SERVER_TEST)
+server-test-build: $(SERVER_TEST) $(COMPILER_IO_PROCESS_FIXTURE)
 
 $(SERVER_TEST): FORCE $(TEST_MODULE_OBJECTS) $(TEST_SUPPORT_OUTPUTS) $(COMPILER_IO_CLOCK_OBJECT) \
 	$(EMBEDDED_INTERFACES_OBJECT) $(NATIVE_BUILD_INPUTS) $(NATIVE_CONFIG_STAMP)

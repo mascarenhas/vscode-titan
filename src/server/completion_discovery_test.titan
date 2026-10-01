@@ -1,6 +1,13 @@
 local test = import "test"
 local bridge = import "server.compiler_bridge"
 local discovery = import "server.completion_discovery"
+local test_paths = import "server.test_paths"
+foreign import "compiler_io_platform.h"
+
+local function external_root(): string
+  if ffi.VSCODE_TITAN_WINDOWS ~= 0 then return "C:/external" end
+  return "/external"
+end
 
 local function module(name: string, filename: string): bridge.ProjectModule
   return bridge.ProjectModule.new(name, {bridge.SourceFile.new(filename, "saved")})
@@ -8,31 +15,31 @@ end
 
 function test_completion_discovery_retains_saved_membership_even_when_unwatched(
     _context: test.Context)
-  local saved = module("pkg", "/workspace/src/pkg/pkg.titan")
-  saved.files[2] = bridge.SourceFile.new("/workspace/src/pkg/private.titan", "saved")
-  test.assert(discovery.find("/workspace/src/pkg/private.titan", {saved},
-    {"/workspace/src"}, {"/workspace/src"}, {"/workspace/src/pkg"}, {}) == "pkg")
+  local saved = module("pkg", test_paths.workspace_root() .. "/src/pkg/pkg.titan")
+  saved.files[2] = bridge.SourceFile.new(test_paths.workspace_root() .. "/src/pkg/private.titan", "saved")
+  test.assert(discovery.find(test_paths.workspace_root() .. "/src/pkg/private.titan", {saved},
+    {test_paths.workspace_root() .. "/src"}, {test_paths.workspace_root() .. "/src"}, {test_paths.workspace_root() .. "/src/pkg"}, {}) == "pkg")
   test.assert(#saved.files == 2 and saved.files[2].contents == "saved",
     "ephemeral lookup altered saved project membership or bytes")
 end
 
 function test_completion_discovery_adds_sibling_to_one_file_folder(_context: test.Context)
-  local saved = module("pkg", "/workspace/src/pkg/pkg.titan")
-  test.assert(discovery.find("/workspace/src/pkg/new-part.titan", {saved},
-    {"/workspace/src"}, {"/workspace/src"}, {},
-    {"/workspace/src/pkg/new-part.titan"}) == "pkg",
+  local saved = module("pkg", test_paths.workspace_root() .. "/src/pkg/pkg.titan")
+  test.assert(discovery.find(test_paths.workspace_root() .. "/src/pkg/new-part.titan", {saved},
+    {test_paths.workspace_root() .. "/src"}, {test_paths.workspace_root() .. "/src"}, {},
+    {test_paths.workspace_root() .. "/src/pkg/new-part.titan"}) == "pkg",
     "a folder was misclassified as flat because it had only its main file")
   test.assert(#saved.files == 1, "unsaved contributor entered saved membership")
 end
 
 function test_completion_discovery_groups_new_folder_buffers_independent_of_open_order(
     _context: test.Context)
-  local roots = {"/workspace/src"}
+  local roots = {test_paths.workspace_root() .. "/src"}
   local first: const {string} = {
-    "/workspace/src/pkg/part.titan", "/workspace/src/pkg/pkg.titan",
+    test_paths.workspace_root() .. "/src/pkg/part.titan", test_paths.workspace_root() .. "/src/pkg/pkg.titan",
   }
   local second: const {string} = {
-    "/workspace/src/pkg/pkg.titan", "/workspace/src/pkg/part.titan",
+    test_paths.workspace_root() .. "/src/pkg/pkg.titan", test_paths.workspace_root() .. "/src/pkg/part.titan",
   }
   test.assert(discovery.find(first[1], {}, roots, roots, {}, first) == "pkg" and
     discovery.find(first[2], {}, roots, roots, {}, first) == "pkg" and
@@ -42,44 +49,44 @@ end
 
 function test_completion_discovery_uses_deepest_root_for_new_flat_identity(
     _context: test.Context)
-  local roots = {"/workspace/src", "/workspace/src/nested"}
-  local path = "/workspace/src/nested/new.titan"
-  test.assert(discovery.find(path, {}, roots, {"/workspace/src"}, {}, {path}) == "new")
-  local saved = module("new", "/workspace/src/new.titan")
-  test.assert(discovery.find(path, {saved}, roots, {"/workspace/src"}, {}, {path}) == nil,
+  local roots = {test_paths.workspace_root() .. "/src", test_paths.workspace_root() .. "/src/nested"}
+  local path = test_paths.workspace_root() .. "/src/nested/new.titan"
+  test.assert(discovery.find(path, {}, roots, {test_paths.workspace_root() .. "/src"}, {}, {path}) == "new")
+  local saved = module("new", test_paths.workspace_root() .. "/src/new.titan")
+  test.assert(discovery.find(path, {saved}, roots, {test_paths.workspace_root() .. "/src"}, {}, {path}) == nil,
     "deepest naming overrode earlier-root provider selection")
 end
 
 function test_completion_discovery_obeys_folder_provider_and_root_precedence(
     _context: test.Context)
-  local roots = {"/workspace/first", "/workspace/second"}
-  local saved = module("pkg", "/workspace/first/pkg/pkg.titan")
-  saved.files[2] = bridge.SourceFile.new("/workspace/first/pkg/part.titan", "saved")
-  local late = "/workspace/second/pkg/part.titan"
-  test.assert(discovery.find(late, {saved}, roots, {"/workspace"}, {}, {late}) == nil,
+  local roots = {test_paths.workspace_root() .. "/first", test_paths.workspace_root() .. "/second"}
+  local saved = module("pkg", test_paths.workspace_root() .. "/first/pkg/pkg.titan")
+  saved.files[2] = bridge.SourceFile.new(test_paths.workspace_root() .. "/first/pkg/part.titan", "saved")
+  local late = test_paths.workspace_root() .. "/second/pkg/part.titan"
+  test.assert(discovery.find(late, {saved}, roots, {test_paths.workspace_root()}, {}, {late}) == nil,
     "a later source root bypassed an earlier folder contributor blocker")
-  local flat = "/workspace/first/pkg.titan"
-  test.assert(discovery.find(flat, {saved}, roots, {"/workspace"}, {}, {flat}) == nil,
+  local flat = test_paths.workspace_root() .. "/first/pkg.titan"
+  test.assert(discovery.find(flat, {saved}, roots, {test_paths.workspace_root()}, {}, {flat}) == nil,
     "a new flat provider displaced a selected folder")
-  local new_main = "/workspace/second/new/new.titan"
-  local old_flat = module("new", "/workspace/second/new.titan")
-  test.assert(discovery.find(new_main, {old_flat}, roots, {"/workspace"}, {}, {new_main}) == nil,
+  local new_main = test_paths.workspace_root() .. "/second/new/new.titan"
+  local old_flat = module("new", test_paths.workspace_root() .. "/second/new.titan")
+  test.assert(discovery.find(new_main, {old_flat}, roots, {test_paths.workspace_root()}, {}, {new_main}) == nil,
     "new folder provider was mixed with the captured flat module")
 end
 
 function test_completion_discovery_defers_new_folder_that_reassigns_saved_modules(
     _context: test.Context)
-  local old_part = module("pkg.part", "/workspace/src/pkg/part.titan")
-  local main = "/workspace/src/pkg/pkg.titan"
-  test.assert(discovery.find(main, {old_part}, {"/workspace/src"}, {"/workspace"}, {},
-    {main, "/workspace/src/pkg/part.titan"}) == nil,
+  local old_part = module("pkg.part", test_paths.workspace_root() .. "/src/pkg/part.titan")
+  local main = test_paths.workspace_root() .. "/src/pkg/pkg.titan"
+  test.assert(discovery.find(main, {old_part}, {test_paths.workspace_root() .. "/src"}, {test_paths.workspace_root()}, {},
+    {main, test_paths.workspace_root() .. "/src/pkg/part.titan"}) == nil,
     "new folder silently stole another saved logical module's contributor")
 end
 
 function test_completion_discovery_defers_uncaptured_earlier_root(_context: test.Context)
-  local path = "/workspace/src/new.titan"
-  test.assert(discovery.find(path, {}, {"/external", "/workspace/src"},
-    {"/workspace/src"}, {}, {path}) == nil,
+  local path = test_paths.workspace_root() .. "/src/new.titan"
+  test.assert(discovery.find(path, {}, {external_root(), test_paths.workspace_root() .. "/src"},
+    {test_paths.workspace_root() .. "/src"}, {}, {path}) == nil,
     "uncaptured external source root was assumed to contain no provider")
 end
 
@@ -92,15 +99,15 @@ local function rejects(context: test.Context, name: string, path: string,
 end
 
 function test_completion_discovery_rejects_unmapped_or_excluded_paths(context: test.Context)
-  local roots = {"/workspace/src"}
+  local roots = {test_paths.workspace_root() .. "/src"}
   rejects(context, "untitled", "untitled:Untitled-1", roots, roots, {})
-  rejects(context, "outside_source_root", "/workspace/other/new.titan", roots,
-    {"/workspace"}, {})
-  rejects(context, "outside_include", "/workspace/src/new.titan", roots,
-    {"/workspace/tests"}, {})
-  rejects(context, "excluded_new", "/workspace/src/generated/new.titan", roots,
-    roots, {"/workspace/src/generated"})
-  rejects(context, "invalid_component", "/workspace/src/bad.name/new.titan", roots, roots, {})
-  rejects(context, "reserved_terminal", "/workspace/src/pkg/titan.titan", roots, roots, {})
-  rejects(context, "private_database", "/workspace/src/.titan-ls/new.titan", roots, roots, {})
+  rejects(context, "outside_source_root", test_paths.workspace_root() .. "/other/new.titan", roots,
+    {test_paths.workspace_root()}, {})
+  rejects(context, "outside_include", test_paths.workspace_root() .. "/src/new.titan", roots,
+    {test_paths.workspace_root() .. "/tests"}, {})
+  rejects(context, "excluded_new", test_paths.workspace_root() .. "/src/generated/new.titan", roots,
+    roots, {test_paths.workspace_root() .. "/src/generated"})
+  rejects(context, "invalid_component", test_paths.workspace_root() .. "/src/bad.name/new.titan", roots, roots, {})
+  rejects(context, "reserved_terminal", test_paths.workspace_root() .. "/src/pkg/titan.titan", roots, roots, {})
+  rejects(context, "private_database", test_paths.workspace_root() .. "/src/.titan-ls/new.titan", roots, roots, {})
 end

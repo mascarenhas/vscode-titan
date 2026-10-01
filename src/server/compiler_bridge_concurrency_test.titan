@@ -5,16 +5,24 @@ local strings = import "string"
 local test = import "test"
 local timer = import "timer"
 foreign import "utime.h"
+foreign import "compiler_io_platform.h"
 local bridge = import "server.compiler_bridge.titan"
 local compiler_scheduler = import "server.compiler_scheduler"
 local test_runtime = import "server.test_runtime"
+local test_paths = import "server.test_paths"
+
+
+local function other_workspace_root(): string
+  if ffi.VSCODE_TITAN_WINDOWS ~= 0 then return "C:/other-workspace" end
+  return "/other-workspace"
+end
 
 local DRIVER_MODULE = "titan-compiler.driver"
 local SHARED_MODULE = "bridge_concurrency_shared"
 local PROJECT_A = "bridge_concurrency_project_a"
 
 local function temporary_root(): string
-  local root = fs.tmpname()
+  local root = test_paths.temporary_name()
   fs.unlink(root)
   fs.mkdir(root)
   return root
@@ -286,7 +294,7 @@ function test_compiler_bridge_load_waits_for_inherited_driver_configuration(
     driver["EXTRA_CPPFLAGS"] = inherited_flags
     local first = bridge.load()
     first:configure(bridge.CompilerConfiguration.new {
-      source_roots = {"/other-workspace"}, cppflags = "-DOTHER_WORKSPACE=1",
+      source_roots = {other_workspace_root()}, cppflags = "-DOTHER_WORKSPACE=1",
     })
     local loading: async.Task<|bridge.Compiler, value|>?
     defer do
@@ -351,7 +359,7 @@ local function serializes_real_compilers_across_cancellation()
 
   local project_a = bridge.ProjectModule.new(PROJECT_A, {
     bridge.SourceFile.new(
-      "/workspace/" .. PROJECT_A .. ".titan",
+      test_paths.workspace_root() .. "/" .. PROJECT_A .. ".titan",
       "local shared = import \"" .. SHARED_MODULE .. ".titan\"\n" ..
       "function identity(): string return shared.identity() end\n")
   })
@@ -669,7 +677,7 @@ function LuaProxyIoStrategy:read_after_yield(): string
 end
 
 local function lua_proxy_resumes_titan_async_method()
-  local path = fs.tmpname()
+  local path = test_paths.temporary_name()
   defer fs.unlink(path)
   fs.write_file(path, "read through Titan async fs")
 
@@ -756,7 +764,7 @@ local function large_diagnostic_normalization_yields()
   local entries: {string: value} = {}
   for index = 1, module_count do
     local name = strings.format("module_%05d", index)
-    local filename = "/workspace/" .. name .. ".titan"
+    local filename = test_paths.workspace_root() .. "/" .. name .. ".titan"
     projects[name] = bridge.ProjectModule.new(name, {
       bridge.SourceFile.new(filename, "-- fixture\n"),
     })
@@ -766,7 +774,7 @@ local function large_diagnostic_normalization_yields()
   for index = 1, diagnostic_count do
     local owner = (index - 1) % module_count + 1
     raw[index] = strings.format(
-      "/workspace/module_%05d.titan:1:1: type error: broken", owner)
+      test_paths.workspace_root() .. "/module_%05d.titan:1:1: type error: broken", owner)
   end
 
   local started = false
@@ -950,7 +958,7 @@ local function large_project_payload_restoration_yields_and_cleans_up()
   end
   local name = "large_restoration"
   local projects = {bridge.ProjectModule.new(name,{
-    bridge.SourceFile.new("/workspace/large_restoration.titan",source:drain())})}
+    bridge.SourceFile.new(test_paths.workspace_root() .. "/large_restoration.titan",source:drain())})}
   local compiler = bridge.load()
   local driver = lua.require(DRIVER_MODULE) as {string: value}
   local restore_hooks, counts, barrier = observe_payload_hooks(driver)

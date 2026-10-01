@@ -9,6 +9,7 @@ local test = import "test"
 local compiler_io = import "server.compiler_io.titan"
 local logging = import "server.logging"
 local test_runtime = import "server.test_runtime"
+foreign import "compiler_io_platform.h"
 
 local function temporary_root(): string
   local root = fs.tmpname()
@@ -75,6 +76,37 @@ local function dump_fields(result: {string: value}): string
   return output:drain()
 end
 
+local function native_process_fixture(): string
+  local fixture? = system.getenv("TITAN_COMPILER_IO_PROCESS_FIXTURE")
+  if not fixture or #fixture == 0 then
+    raise "native CompilerIO tests require TITAN_COMPILER_IO_PROCESS_FIXTURE"
+  end
+  return fixture
+end
+
+local function link_fixture(strategy: compiler_io.CompilerIO, source: string,
+                            link: string, symbolic: boolean): {string: value}
+  if ffi.VSCODE_TITAN_WINDOWS ~= 0 then
+    local command = "hard-link"
+    if symbolic then command = "symbolic-link" end
+    return strategy:run({[1] = native_process_fixture(), [2] = command,
+                         [3] = source, [4] = link}, nil)
+  end
+  if symbolic then
+    return strategy:run({[1] = "ln", [2] = "-s", [3] = source, [4] = link}, nil)
+  end
+  return strategy:run({[1] = "ln", [2] = source, [3] = link}, nil)
+end
+
+local function require_symlink(result: {string: value})
+  if ffi.VSCODE_TITAN_WINDOWS ~= 0 and bool_field(result, "started") and
+     integer_field(result, "status") == 1314 then
+    test.skip("Windows account cannot create symbolic links (Win32 1314)")
+  end
+  test.assert(bool_field(result, "ok"),
+              "could not create symlink fixture: " .. string_field(result, "diagnostic"))
+end
+
 local function filesystem_contract()
   local strategy = compiler_io.create()
   local root = temporary_root()
@@ -139,9 +171,7 @@ local function filesystem_contract()
 
   local hard_link = directory .. "/source-hard-link"
   defer remove_path(hard_link)
-  local hard_linked = strategy:run({
-    [1] = "ln", [2] = source, [3] = hard_link,
-  }, nil)
+  local hard_linked = link_fixture(strategy, source, hard_link, false)
   test.assert(bool_field(hard_linked, "ok"),
               "could not create hard-link fixture: " ..
               string_field(hard_linked, "diagnostic"))
@@ -164,32 +194,15 @@ local function filesystem_contract()
   local canonical?, canonical_error? = strategy:realpath(source)
   local canonical_path = required_string(
     canonical, canonical_error, "realpath")
-  test.assert(strings.sub(canonical_path, 1, 1) == "/",
-              "realpath did not return an absolute source path")
-
-  local link = directory .. "/source-link"
-  defer remove_path(link)
-  local linked = strategy:run({
-    [1] = "ln", [2] = "-s", [3] = source, [4] = link,
-  }, nil)
-  test.assert(bool_field(linked, "ok"),
-              "could not create symlink fixture: " ..
-              string_field(linked, "diagnostic"))
-  local followed? = strategy:stat(link)
-  local unlinked? = strategy:lstat(link)
-  test.assert(followed ~= nil and unlinked ~= nil,
-              "stat/lstat omitted an existing symlink")
-  local followed_metadata: {string: value} = followed
-  local link_metadata: {string: value} = unlinked
-  local followed_kind: string = followed_metadata["kind"]
-  local link_kind: string = link_metadata["kind"]
-  test.assert(followed_kind == "file" and link_kind == "symlink",
-              "stat/lstat did not distinguish a symlink from its target")
-  local link_canonical?, link_canonical_error? = strategy:realpath(link)
-  test.assert(required_string(
-    link_canonical, link_canonical_error, "symlink realpath") ==
-    canonical_path,
-    "realpath did not canonicalize a symlink to its target")
+  if ffi.VSCODE_TITAN_WINDOWS ~= 0 then
+    test.assert(strings.sub(canonical_path, 2, 2) == ":" and
+      (strings.sub(canonical_path, 3, 3) == "\\" or
+       strings.sub(canonical_path, 3, 3) == "/"),
+      "realpath did not return the fixture absolute Windows drive path")
+  else
+    test.assert(strings.sub(canonical_path, 1, 1) == "/",
+                "realpath did not return an absolute source path")
+  end
 
   local renamed = directory .. "/renamed.bin"
   defer remove_path(renamed)
@@ -220,7 +233,6 @@ local function filesystem_contract()
   test.assert(temporary_stat ~= nil,
               "tmpname did not leave its caller-owned empty file")
 
-  remove_path(link)
   local replacement?, replacement_error? =
     strategy:write_file(directory, "must not replace a directory")
   test.assert(replacement == nil and replacement_error ~= nil,
@@ -241,7 +253,90 @@ function test_compiler_io_preserves_files_paths_and_lua_tables(
   test_runtime.run(filesystem_contract)
 end
 
+local function filesystem_symlink_contract()
+  local strategy = compiler_io.create()
+  local directory = temporary_root()
+  defer remove_path(directory)
+  local source = directory .. "/source.bin"
+  fs.write_file(source, "symlink target bytes")
+  defer remove_path(source)
+  local canonical_path = fs.realpath(source)
+  local link = directory .. "/source-link"
+  defer remove_path(link)
+  require_symlink(link_fixture(strategy, source, link, true))
+  local followed? = strategy:stat(link)
+  local unlinked? = strategy:lstat(link)
+  test.assert(followed ~= nil and unlinked ~= nil,
+              "stat/lstat omitted an existing symlink")
+  local followed_metadata: {string: value} = followed
+  local link_metadata: {string: value} = unlinked
+  local followed_kind: string = followed_metadata["kind"]
+  local link_kind: string = link_metadata["kind"]
+  test.assert(followed_kind == "file" and link_kind == "symlink",
+              "stat/lstat did not distinguish a symlink from its target")
+  local link_canonical?, link_canonical_error? = strategy:realpath(link)
+  test.assert(required_string(
+    link_canonical, link_canonical_error, "symlink realpath") ==
+    canonical_path,
+    "realpath did not canonicalize a symlink to its target")
+
+end
+
+function test_compiler_io_follows_created_symbolic_links(_context: test.Context)
+  test_runtime.run(filesystem_symlink_contract)
+end
+
+local function windows_process_contract()
+  local strategy = compiler_io.create()
+  local fixture = native_process_fixture()
+  local original_lang? = system.getenv("LANG")
+  local original_all? = system.getenv("LC_ALL")
+  local success = strategy:run({ [1] = fixture, [2] = "locale" }, nil)
+  test.assert(bool_field(success, "started") and bool_field(success, "ok") and
+              integer_field(success, "status") == 0 and
+              float_field(success, "wall_ms") >= 0.0,
+              "native compiler child failed: " .. dump_fields(success))
+  test.assert(string_field(success, "output") == "C|C|A\0B|diagnostic" and
+              string_field(success, "diagnostic") == string_field(success, "output"),
+              "native capture changed locale, binary bytes, or merged output")
+  test.assert(system.getenv("LANG") == original_lang and
+              system.getenv("LC_ALL") == original_all,
+              "compiler I/O changed parent locale variables")
+  test.assert(strings.find(string_field(success, "command"), "LANG=C LC_ALL=C ") == 1,
+              "native command label omitted child locale options")
+  local codes = {7, 126, 127}
+  for index = 1, #codes do
+    local result = strategy:run({
+      [1] = fixture, [2] = "exit", [3] = strings.tostring(codes[index]),
+    }, nil)
+    test.assert(bool_field(result, "started") and not bool_field(result, "ok") and
+                integer_field(result, "status") == codes[index] and
+                string_field(result, "output") == "rejected",
+                "native exit code was mistaken for a launch failure")
+  end
+  local missing = strategy:run({ [1] = fixture .. ".missing" }, nil)
+  test.assert(not bool_field(missing, "started") and not bool_field(missing, "ok") and
+              missing["status"] == nil,
+              "native prelaunch failure fabricated a child exit status")
+  local unmerged = strategy:run({ [1] = fixture, [2] = "stdout" },
+      { ["stderr_to_stdout"] = false })
+  test.assert(string_field(unmerged, "output") == "stdout-only" and
+              strings.sub(string_field(unmerged, "command"), -5) ~= " 2>&1",
+              "native capture changed split stderr policy")
+  local delayed = strategy:run({ [1] = fixture, [2] = "delay" }, nil)
+  local elapsed = float_field(delayed, "wall_ms")
+  test.assert(bool_field(delayed, "ok") and elapsed >= 10.0 and elapsed < 5000.0,
+              "native monotonic clock did not measure child wall time")
+  local large = strategy:run({ [1] = fixture, [2] = "large" }, nil)
+  test.assert(bool_field(large, "ok") and #string_field(large, "output") == 131072,
+              "native capture failed to drain output larger than pipe capacity")
+end
+
 local function process_contract()
+  if ffi.VSCODE_TITAN_WINDOWS ~= 0 then
+    windows_process_contract()
+    return
+  end
   local strategy = compiler_io.create()
   local script =
     "printf '%s|%s|' \"$LANG\" \"$LC_ALL\"; " ..
@@ -483,16 +578,18 @@ local function lstat_observation_contract()
               "new analysis did not capture the current provider identity")
   compiler_io.end_lstat_observations(strategy)
 
+end
+
+local function symlink_lstat_observation_contract()
+  local strategy = compiler_io.create()
+  local root = temporary_root()
+  defer remove_path(root)
   local target = root .. "/provider-target.so"
   local link = root .. "/provider-link.so"
   fs.write_file(target, "first target")
   defer remove_path(target)
   defer remove_path(link)
-  local linked = strategy:run({
-    [1] = "ln", [2] = "-s", [3] = target, [4] = link,
-  }, nil)
-  test.assert(bool_field(linked, "ok"),
-              "could not create provider symlink fixture")
+  require_symlink(link_fixture(strategy, target, link, true))
 
   compiler_io.begin_lstat_observations(strategy)
   local raw_link? = strategy:lstat(link)
@@ -517,6 +614,11 @@ end
 function test_compiler_io_tracks_only_consistent_per_analysis_lstat_identity(
     _context: test.Context)
   test_runtime.run(lstat_observation_contract)
+end
+
+function test_compiler_io_tracks_created_symbolic_link_targets(
+    _context: test.Context)
+  test_runtime.run(symlink_lstat_observation_contract)
 end
 
 local function compiler_progress_contract()
@@ -579,6 +681,9 @@ local function cancellation_contract()
     [1] = "sh", [2] = "-c",
     [3] = "echo $$ > '" .. marker .. "'; exec /bin/sleep 60",
   }
+  if ffi.VSCODE_TITAN_WINDOWS ~= 0 then
+    command = { [1] = native_process_fixture(), [2] = "wait", [3] = marker }
+  end
   local running = async.run<|{string: value}, value|>(
     function (): {string: value} return strategy:run(command, nil) end)
 
@@ -602,18 +707,29 @@ local function cancellation_contract()
   local gone = false
   attempts = 0
   while not gone and attempts < 100 do
-    local probe = strategy:run({
-      [1] = "sh", [2] = "-c",
-      [3] = "kill -0 " .. pid .. " 2>/dev/null",
-    }, nil)
+    local probe_arguments: {integer: string} = {
+      [1] = "sh", [2] = "-c", [3] = "kill -0 " .. pid .. " 2>/dev/null",
+    }
+    if ffi.VSCODE_TITAN_WINDOWS ~= 0 then
+      probe_arguments = { [1] = native_process_fixture(), [2] = "probe", [3] = pid }
+    end
+    local probe = strategy:run(probe_arguments, nil)
+    if ffi.VSCODE_TITAN_WINDOWS ~= 0 then
+      test.assert(bool_field(probe, "started") and integer_field(probe, "status") <= 1,
+                  "native child liveness probe failed")
+    end
     gone = not bool_field(probe, "ok")
     if not gone then async.yield() end
     attempts = attempts + 1
   end
   if not gone then
-    strategy:run({
+    local cleanup_arguments: {integer: string} = {
       [1] = "sh", [2] = "-c", [3] = "kill -KILL " .. pid,
-    }, nil)
+    }
+    if ffi.VSCODE_TITAN_WINDOWS ~= 0 then
+      cleanup_arguments = { [1] = native_process_fixture(), [2] = "kill", [3] = pid }
+    end
+    strategy:run(cleanup_arguments, nil)
   end
   test.assert(gone,
               "cancellation did not terminate and reap the owned child")
@@ -751,4 +867,33 @@ end
 function test_compiler_io_cancelled_owned_mkdir_removes_directory(
     _context: test.Context)
   test_runtime.run(cancelled_owned_mkdir_removes_directory)
+end
+
+function test_compiler_io_temporary_leaf_uses_native_separators(
+    _context: test.Context)
+  test.assert(compiler_io.temporary_leaf("/tmp/reservation") == "reservation",
+              "temporary leaf lost slash separator")
+  local windows_path = "C:\\Users\\worker\\reservation"
+  local expected = windows_path
+  if ffi.VSCODE_TITAN_WINDOWS ~= 0 then expected = "reservation" end
+  test.assert(compiler_io.temporary_leaf(windows_path) == expected,
+              "temporary leaf changed native backslash semantics")
+end
+
+function test_compiler_io_keeps_opaque_provider_identity_complete(_context: test.Context)
+  local native = compiler_io.LstatIdentity.new(
+    "C:/provider.dll", 42, "file", nil, nil, 100, 700, "volume\0full-128-bit-file-id")
+  local same = compiler_io.LstatIdentity.new(
+    native.path, native.size, native.kind, nil, nil, 100, 700, native.native_identity)
+  test.assert(compiler_io.same_lstat_identity(native, same), "matching opaque identity changed")
+  same.native_identity = nil
+  test.assert(not compiler_io.same_lstat_identity(native, same), "missing opaque identity fell back to integers")
+  same.native_identity = "volume\0different-full-file-id"
+  test.assert(not compiler_io.same_lstat_identity(native, same), "different full file identity was ignored")
+  same.native_identity = native.native_identity
+  same.path = "C:/other.dll"
+  test.assert(not compiler_io.same_lstat_identity(native, same), "provider pathname was ignored")
+  if ffi.VSCODE_TITAN_WINDOWS == 0 then
+    test.assert(not compiler_io.lstat_identity_is_current(native), "Unix accepted a forged Windows identity")
+  end
 end

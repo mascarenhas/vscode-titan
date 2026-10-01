@@ -659,6 +659,7 @@ local function write_if_changed(filename, contents)
             string.format("%q", temporary) ..
             ": " .. tostring(close_error)
     end
+    if package.config:sub(1, 1) == "\\" then os.remove(filename) end
     local published, publish_error = os.rename(temporary, filename)
     if not published then
         os.remove(temporary)
@@ -744,16 +745,36 @@ if arg[1] == "--self-test" then
     return
 end
 
-local archive = arg[1]
-local output = arg[2]
-if archive == nil or output == nil or arg[3] ~= nil then
+local windows = arg[1] == "--windows-profile"
+local archive = windows and arg[2] and (arg[2] .. "/lib/titan/0.6/titan.dll") or (not windows and arg[1])
+local output = windows and arg[3] or arg[2]
+if archive == nil or output == nil or arg[windows and 4 or 3] ~= nil then
     script_error("usage: lua scripts/generate-embedded-interfaces.lua " ..
-        "TITAN_ARCHIVE OUTPUT_C")
+        "TITAN_ARCHIVE OUTPUT_C | --windows-profile TITAN_PREFIX OUTPUT_C")
 end
 
-local provider, scan_error = staticmetadata.scan_archive(archive, {
-    expected_abi = EXPECTED_ABI,
-})
+local provider, scan_error
+if windows then
+    local support = require "titan"
+    local driver = require "titan-compiler.driver"
+    provider = { entries = {} }
+    for _, name in ipairs(EXPECTED_MODULES) do
+        local symbol = driver.mangle_module_name(name) .. "_abi_value"
+        local abi, error = support._abivalue(archive, symbol)
+        if abi ~= EXPECTED_ABI then
+            script_error(name .. " ABI mismatch: " .. tostring(abi or error))
+        end
+        provider.entries[name] = { module = name, abi = abi }
+    end
+    for _, name in ipairs(EXPECTED_MODULES) do
+        local symbol = driver.mangle_module_name(name) .. "_types"
+        local query, error = support._loadlib(archive, symbol)
+        if not query then script_error(tostring(error)) end
+        provider.entries[name].types = query()
+    end
+else
+    provider, scan_error = staticmetadata.scan_archive(archive, { expected_abi = EXPECTED_ABI })
+end
 if not provider then
     script_error("cannot scan canonical Titan archive: " .. tostring(scan_error))
 end
@@ -797,7 +818,31 @@ elseif not closed then
     script_error("cannot close build target resolver: " .. tostring(close_error))
 end
 
-local contents, render_error = render_source(provider.entries, profile)
+local contents, render_error
+if windows then
+    local declarations, body = render_profile(profile)
+    local lines = {
+        "/* Windows target profile only; runtime interfaces come from the canonical Titan DLL. */",
+        '#include "lua.h"', '#include "lauxlib.h"', declarations,
+        [[static void titan_ls_push_bytes(lua_State *L,
+                                          const unsigned char *bytes,
+                                          size_t size) {
+    lua_pushlstring(L, (const char *)bytes, size);
+}]],
+        body,
+        "struct titan_ls_windows_interface { const char *name; const char *abi; const char *types; };",
+        "static const struct titan_ls_windows_interface titan_ls_windows_interfaces[] = {",
+    }
+    for _, name in ipairs(names) do
+        local symbol = driver.mangle_module_name(name)
+        lines[#lines + 1] = string.format('    { "%s", "%s_abi_value", "%s_types" },', name, symbol, symbol)
+    end
+    lines[#lines + 1] = "};"
+    lines[#lines + 1] = '#include <embedded_interfaces_windows.c>'
+    contents = table.concat(lines, "\n")
+else
+    contents, render_error = render_source(provider.entries, profile)
+end
 if not contents then
     script_error(string.format("archive %q: %s", archive, render_error))
 end

@@ -16,6 +16,18 @@ graph without linking its executable. `server` links and installs the native
 language server; `server-test-build` links the single test executable used by
 both execution shards. `server-test-run` runs an already built test executable.
 
+On macOS, put GNU Make 4.4.1 first on `PATH` before building, including for
+recursive `make` invocations. With Homebrew's Make installed:
+
+```sh
+export PATH="$(brew --prefix make)/libexec/gnubin:$PATH"
+make --version
+```
+
+Apple Make 3.81 can retain a stale generated include graph during incremental
+checks. The local macOS validation used Intel x86_64; it does not establish
+Apple Silicon runtime coverage.
+
 ## Object and link ownership
 
 Authored source remains under `src/`. Persistent `.build/server-src` and
@@ -111,3 +123,115 @@ module and a competing saved refresh. This focused gate is also a prerequisite
 of `server-protocol-test`, so CI and `make verify` include it. Pass matching
 `BUILD_ROOT`, `SERVER`, and compiler flags when testing a separate development
 build.
+
+## Experimental Windows CompilerIO
+
+The Windows CompilerIO path launches the compiler executable directly with
+child-only `os.with_env("LANG", "C")` and `os.with_env("LC_ALL", "C")` options.
+Unix retains its existing `/usr/bin/env` path. A Windows launch failure has
+`started=false` without a fabricated child exit code; a successfully launched
+program exiting with 126 or 127 remains `started=true`.
+
+The source-private target constant also selects Windows path separators.
+The existing native wall-clock boundary uses QueryPerformanceCounter on Windows;
+public `os.clock` measures CPU time and `timer` has no monotonic clock query.
+Linux and macOS retain their previous native clock implementations.
+
+The portable `test/fixtures/compiler-io-process.c` executable supplies Windows
+locale, binary-output, nonzero-exit, delayed/large-output, and cancellation
+fixtures. Windows keeps the cancellation marker pathname in UTF-16 through
+`wmain` and `_wfopen`; the CLANG64 fixture link uses `-municode`. Test execution
+supplies its exact path through `TITAN_COMPILER_IO_PROCESS_FIXTURE`. Linux retains its existing shell-process
+assertions. These source adaptations do not by themselves validate the complete
+Windows language server, extension package, or interactive F5 workflow.
+
+## Experimental Windows DLL build
+
+Windows x64 uses native Node.js 24, the MSYS2 CLANG64/UCRT tools, and a separately
+prepared Windows Titan SDK with the complete ABI-2 standard provider. It does
+not use the Unix Make recipes. Supply an immutable SDK copy; the build writes
+only its own source stages, outputs, and the extension's packaged payload.
+Install JavaScript dependencies using native Windows npm in this checkout; do
+not reuse a Linux `node_modules` tree.
+
+For example, from a normal PowerShell prompt with native Node on the process PATH:
+
+```powershell
+$sdk = 'C:\TitanSDK'
+$tools = 'C:\CLANG64\bin'
+$native = @('--sdk', $sdk, '--clang', "$tools\clang.exe",
+            '--ar', "$tools\llvm-ar.exe", '--ranlib', "$tools\llvm-ranlib.exe")
+node scripts/build-windows.mjs plan @native
+node scripts/build-windows.mjs server @native
+node scripts/build-windows.mjs server-test-build @native
+node scripts/build-windows.mjs server-test-run @native
+node scripts/build-windows.mjs package @native
+```
+
+The example locations must refer to the actual prepared SDK and tool prefix.
+The driver starts native executables directly without a command shell. It
+inherits the parent environment, clears conflicting Lua/Titan search overrides,
+and sets compiler paths only for its children. It neither installs tools nor
+changes global PATH, accounts, privileges, or execution policy.
+
+`--build-root` and `--source-root` accept absolute alternate paths;
+`server-test-run --filter PATTERN` runs an existing aggregate with Titan's normal
+test filter. A build-directory lock prevents two drivers from mutating the same
+state. The compiler graph comes from the same parsed-import generator as Unix;
+Windows executes the selected graph serially and hashes source constituents,
+headers, compiler/SDK inputs, dependency fingerprints and effective settings.
+Compiler probes live under the build directory in a configuration-keyed cache;
+SDK/header/tool/flag changes select a fresh cache. Native test execution disables
+persistent probe records because independent fixtures may reuse header names.
+Missing generated companions force rebuilding. Production and test objects use
+separate stages. The default Unix graph and recipes retain their existing static
+production behavior.
+
+The application is `bin/titan-language-server.exe` plus
+`lib/titan/0.6/titan_language_server.dll` and `lib/titan/0.6/titan.dll`.
+The controlled Lua DLL and five native runtime DLLs live in `bin`; `lfs.dll` and
+`lpeglabel.dll` live in the compiler's `dist/titan/lib/lua/5.5` tree. Windows
+never packages a static Titan provider archive. The build still stages the
+compiler's Lua sources, SDK analysis headers, and matching Lua internal sources.
+The tiny launcher can be renamed within `bin` without changing logical module
+identity.
+
+The Windows embedded-interface boundary reads callable metadata from the
+**canonical, actually loaded standard provider**. All 21 plain-C ABI values are
+checked before invoking any Lua metadata callback. The generated source contains
+the C type profile, not a second serialized copy of the provider interfaces.
+Provider identity uses the runtime's complete volume/file identifiers and exact
+100 ns timestamps. A retained read handle denies write/delete sharing and makes
+that transient identity snapshot immutable. Later Task-path revalidation compares
+the full opaque identity and normalized provider pathname without synchronous
+filesystem calls. Ordinary filesystem observations retain their existing async
+path; the opaque field is not stored in SQLite and changes no cache schema.
+Failed construction closes the handle immediately. Restart the server before
+updating or replacing its loaded standard provider on Windows.
+
+Windows compiler dependency notices come from the SDK's verified
+`share/titan/0.6/compiler-dependencies.tsv` source receipt. Staging checks the
+pinned source identities and every installed artifact/license hash; it requires
+no LuaRocks installation or invented rock metadata. The unsigned package target
+preserves these notices, then verifies the `win32-x64` VSIX target, exact DLL/EXE
+inventory, compiler/SDK bytes and PE imports. An unexpected compiler runtime DLL
+fails inspection. Signing and publishing are separate operations.
+
+Shared-folder notifications are best effort. Live file access is required, but
+watcher correctness on a guest-local NTFS workspace is the supported validation
+boundary; a shared folder may require an explicit refresh. Native process tests,
+SQLite/cache reopen tests, stdio protocol tests, package inspection, and an actual
+interactive Extension Host/F5 session are separate gates. A successful plan,
+DLL helper test, or SSH-launched Code command does not establish those gates.
+
+For F5, the interactive account needs read/execute access to the validated SDK
+and the compiler tool prefix, plus its own writable workspace, build output,
+Node dependencies, VS Code user state, and analysis cache. Use ordinary protected
+shared tool installation or independent per-user copies. Do not broaden another
+account's profile permissions. Set `TITAN_PREFIX`, `CC`, `AR`, `RANLIB`, `RC`, and the
+native Node/tool PATH in the process launching Code; the existing F5 task then
+stages the selected SDK's compiler payload. Its Windows debug-launch override
+clears `TITAN_PREFIX` only in the Extension Host so the server selects its
+normal project-owned `.titan-ls` cache; the prelaunch staging task retains the
+selected SDK input. Keep the workspace on writable guest-local NTFS. Build the native
+server first.

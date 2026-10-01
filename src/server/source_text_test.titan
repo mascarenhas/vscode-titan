@@ -1,3 +1,4 @@
+foreign import "compiler_io_platform.h"
 local test = import "test"
 local strings = import "string"
 local source_text = import "server.source_text.titan"
@@ -86,6 +87,7 @@ end
 
 function test_source_text_normalizes_file_uris_and_paths(
     _context: test.Context)
+  if ffi.VSCODE_TITAN_WINDOWS ~= 0 then test.skip("Unix path semantics") end
   local path?, path_error? = source_text.file_uri_to_path(
     "file:///workspace/a%20folder/../caf%C3%A9.titan")
   test.assert(path_error == nil and path == "/workspace/café.titan",
@@ -128,8 +130,14 @@ function test_source_text_rejects_malformed_or_nonlocal_file_uris(
 
   local remote?, remote_error? =
     source_text.file_uri_to_path("file://example.com/workspace/main.titan")
-  test.assert(remote == nil and remote_error ~= nil,
-              "non-local file URI authority was accepted")
+  if ffi.VSCODE_TITAN_WINDOWS ~= 0 then
+    test.assert(remote_error == nil and
+                remote == "//example.com/workspace/main.titan",
+                "UNC file URI authority was not preserved")
+  else
+    test.assert(remote == nil and remote_error ~= nil,
+                "non-local file URI authority was accepted")
+  end
 end
 
 function test_source_text_coordinate_index_has_bounded_lookup_work(
@@ -185,4 +193,144 @@ function test_source_text_coordinate_index_has_bounded_lookup_work(
   local lookup_steps = source_text.coordinate_work_steps(work) - build_steps
   test.assert(lookup_steps <= line_count * 40,
               "coordinate lookup performed full-prefix scans")
+end
+
+local function assert_windows_rejected(action: function (): ())
+  local rejected = false
+  do
+    action()
+  catch
+    rejected = error is source_text.Error
+  end
+  test.assert(rejected, "ambiguous or unsupported Windows path was accepted")
+end
+
+function test_source_text_windows_drive_paths_and_uris(_context: test.Context)
+  test.assert(source_text.normalize_absolute_or_raise(
+    "c:\\Users\\titan-dev\\a folder\\..\\café.titan", true) ==
+    "C:/Users/titan-dev/café.titan")
+  test.assert(source_text.normalize_absolute_or_raise("C:/../../", true) == "C:/",
+              "parent traversal escaped a drive root")
+  test.assert(source_text.resolve_path_or_raise(
+    "C:\\project", "src\\..\\main.titan", true) == "C:/project/main.titan")
+  test.assert(source_text.resolve_path_or_raise(
+    "C:/project", "w:\\live\\main.titan", true) == "W:/live/main.titan",
+              "absolute shared drive path was appended to the project root")
+  test.assert(source_text.relative_path_or_raise(
+    "c:/", "C:\\project\\main.titan", true) == "project/main.titan")
+  test.assert(source_text.relative_path_or_raise(
+    "C:/project", "C:/project-other/main.titan", true) == nil)
+  test.assert(source_text.relative_path_or_raise(
+    "C:/", "W:/main.titan", true) == nil)
+  local uri = source_text.path_to_file_uri_or_raise(
+    "c:\\a folder\\café#100%.titan", true)
+  test.assert(uri == "file:///C:/a%20folder/caf%C3%A9%23100%25.titan",
+              "drive path did not produce a correctly escaped file URI")
+  test.assert(source_text.file_uri_to_path_or_raise(uri, true) ==
+              "C:/a folder/café#100%.titan")
+  test.assert(source_text.file_uri_to_path_or_raise(
+    "file:///c%3A/a%20folder/../main.titan", true) == "C:/main.titan")
+  test.assert(source_text.file_uri_to_path_or_raise(
+    "file://LOCALHOST/c:/main.titan", true) == "C:/main.titan")
+  test.assert(source_text.file_uri_to_path_or_raise(
+    "file://LOCALHOST/c%3A/main.titan", true) == "C:/main.titan")
+end
+
+function test_source_text_windows_unc_paths_and_uris(_context: test.Context)
+  test.assert(source_text.normalize_absolute_or_raise(
+    "\\\\server\\share\\folder\\..\\main.titan", true) ==
+    "//server/share/main.titan")
+  test.assert(source_text.normalize_absolute_or_raise(
+    "//server/share/../../../main.titan", true) == "//server/share/main.titan",
+              "parent traversal escaped a UNC share")
+  test.assert(source_text.normalize_absolute_or_raise(
+    "//server/share/", true) == "//server/share")
+  test.assert(source_text.resolve_path_or_raise(
+    "C:/project", "\\\\server\\share\\main.titan", true) ==
+    "//server/share/main.titan")
+  test.assert(source_text.relative_path_or_raise(
+    "//server/share", "//server/share/main.titan", true) == "main.titan")
+  test.assert(source_text.relative_path_or_raise(
+    "//server/share", "//server/share-other/main.titan", true) == nil)
+  local uri = source_text.path_to_file_uri_or_raise(
+    "\\\\server\\share\\café #%.titan", true)
+  test.assert(uri == "file://server/share/caf%C3%A9%20%23%25.titan")
+  test.assert(source_text.file_uri_to_path_or_raise(uri, true) ==
+              "//server/share/café #%.titan")
+  test.assert(source_text.file_uri_to_path_or_raise(
+    "file:////server/share/main.titan", true) == "//server/share/main.titan")
+  local local_share = "//LOCALHOST/share/main.titan"
+  local local_uri = source_text.path_to_file_uri_or_raise(local_share, true)
+  test.assert(local_uri == "file://LOCALHOST/share/main.titan" and
+              source_text.file_uri_to_path_or_raise(local_uri, true) == local_share,
+              "localhost UNC host was confused with the local URI authority")
+end
+
+function test_source_text_windows_rejects_ambiguous_paths(_context: test.Context)
+  assert_windows_rejected(function()
+    source_text.normalize_absolute_or_raise("C:relative.titan", true)
+  end)
+  assert_windows_rejected(function()
+    source_text.normalize_absolute_or_raise("\\relative.titan", true)
+  end)
+  assert_windows_rejected(function()
+    source_text.resolve_path_or_raise("C:/project", "D:relative.titan", true)
+  end)
+  assert_windows_rejected(function()
+    source_text.resolve_path_or_raise("C:/project", "/relative.titan", true)
+  end)
+  assert_windows_rejected(function()
+    source_text.normalize_absolute_or_raise("//server", true)
+  end)
+  assert_windows_rejected(function()
+    source_text.normalize_absolute_or_raise("//server/", true)
+  end)
+  assert_windows_rejected(function()
+    source_text.normalize_absolute_or_raise("//?/C:/main.titan", true)
+  end)
+  assert_windows_rejected(function()
+    source_text.normalize_absolute_or_raise("//./pipe/main", true)
+  end)
+  assert_windows_rejected(function()
+    source_text.file_uri_to_path_or_raise("file://user@server/share/main", true)
+  end)
+  assert_windows_rejected(function()
+    source_text.file_uri_to_path_or_raise("file://server:80/share/main", true)
+  end)
+  assert_windows_rejected(function()
+    source_text.file_uri_to_path_or_raise("file:///C:/bad%00.titan", true)
+  end)
+end
+
+function test_source_text_native_windows_path_dispatch(_context: test.Context)
+  if ffi.VSCODE_TITAN_WINDOWS == 0 then test.skip("native Windows dispatch") end
+  local path?, failure? = source_text.normalize_absolute_path("c:\\project")
+  test.assert(failure == nil and path == "C:/project")
+  local resolved?, resolve_error? = source_text.resolve_path(path, "W:\\live")
+  test.assert(resolve_error == nil and resolved == "W:/live")
+  local uri?, uri_error? = source_text.path_to_file_uri(resolved .. "/main.titan")
+  test.assert(uri_error == nil and uri == "file:///W:/live/main.titan")
+  local roundtrip?, decode_error? = source_text.file_uri_to_path(uri)
+  test.assert(decode_error == nil and roundtrip == "W:/live/main.titan")
+  test.assert(source_text.relative_path("W:/", roundtrip) == "live/main.titan")
+  test.assert(source_text.is_absolute_path("C:\\") and
+              source_text.is_absolute_path("\\\\server\\share") and
+              not source_text.is_absolute_path("C:relative"))
+end
+
+function test_source_text_unix_preserves_backslashes_and_colons(
+    _context: test.Context)
+  if ffi.VSCODE_TITAN_WINDOWS ~= 0 then test.skip("Unix filename semantics") end
+  local path = "/workspace/c:\\file.titan"
+  local normalized?, failure? = source_text.normalize_absolute_path(path)
+  test.assert(failure == nil and normalized == path)
+  local uri?, uri_error? = source_text.path_to_file_uri(path)
+  test.assert(uri_error == nil and uri == "file:///workspace/c:%5Cfile.titan")
+  local roundtrip?, decode_error? = source_text.file_uri_to_path(uri)
+  test.assert(decode_error == nil and roundtrip == path)
+  local collapsed?, collapse_error? = source_text.normalize_absolute_path(
+    "//workspace/../workspace//file.titan")
+  test.assert(collapse_error == nil and collapsed == "/workspace/file.titan")
+  local resolved?, resolve_error? = source_text.resolve_path("/workspace", "c:relative")
+  test.assert(resolve_error == nil and resolved == "/workspace/c:relative")
 end

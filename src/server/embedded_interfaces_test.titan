@@ -1,3 +1,4 @@
+foreign import "compiler_io_platform.h"
 local test = import "test"
 local iteration = import "iteration"
 local lua = import "lua"
@@ -32,13 +33,30 @@ function test_embedded_interfaces_expose_the_complete_metadata_only_provider(
     _context: test.Context)
   local provider, identity = embedded_interfaces.provider()
   local provider_file: string = provider["provider_file"]
-  test.assert(#provider_file > 0 and strings.sub(provider_file, 1, 1) == "/",
-              "embedded interface provider path is not absolute")
+  local absolute = strings.sub(provider_file, 1, 1) == "/"
+  if ffi.VSCODE_TITAN_WINDOWS ~= 0 then
+    -- Native metadata preserves GetFinalPathNameByHandleW's extended spelling;
+    -- this is a provider identity, not a user-facing source URI.
+    local native_root = strings.sub(provider_file, 1, 4) == "\\\\?\\"
+    local drive_root = strings.sub(provider_file, 2, 3)
+    absolute = drive_root == ":/" or drive_root == ":\\" or
+      (native_root and strings.sub(provider_file, 6, 7) == ":\\") or
+      (#provider_file > 8 and strings.sub(provider_file, 1, 8) == "\\\\?\\UNC\\")
+  end
+  test.assert(#provider_file > 0 and absolute,
+              "embedded interface provider path is not absolute: " .. provider_file)
   local identity_path: string = identity["path"]
   local identity_kind: string = identity["kind"]
   local identity_size: integer = identity["size"]
-  local identity_device: integer = identity["device"]
-  local identity_inode: integer = identity["inode"]
+  if ffi.VSCODE_TITAN_WINDOWS ~= 0 then
+    local native: string = identity["native_identity"]
+    test.assert(#native > 0 and identity["device"] == nil and identity["inode"] == nil,
+                "Windows provider identity was truncated to integers")
+  else
+    local identity_device: integer = identity["device"]
+    local identity_inode: integer = identity["inode"]
+    test.assert(identity["native_identity"] == nil, "Unix identity unexpectedly changed")
+  end
   local identity_seconds: integer = identity["modified_seconds"]
   local identity_nanoseconds: integer = identity["modified_nanoseconds"]
   test.assert(identity_path == provider_file and identity_kind == "file" and

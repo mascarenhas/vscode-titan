@@ -7,7 +7,7 @@ Titan projects. The server is an ordinary LSP process over stdio. A bundled
 skills-only Codex plugin queries that same executable for read-only saved-file
 code intelligence.
 
-The native executable statically links the selected Titan standard-library
+On Linux and macOS, the native executable statically links the selected Titan standard-library
 runtime modules, the embedded Lua interpreter, and the selected native
 dependencies. Initialized statically linked modules register their runtime
 openers in `package.preload`. Separately, the executable carries a metadata-only
@@ -40,9 +40,10 @@ navigation and rename plus completion in unsaved buffers.
 - Node.js 24 and npm.
 - VS Code 1.106 or newer for extension development and installation.
 
-Version 1 builds native packages on Linux and macOS. Windows requires a future
-native Titan toolchain/package path rather than relabeling another host's
-executable.
+Version 1 builds native packages on Linux and macOS. The experimental Windows
+x64 workflow uses a native CLANG64/UCRT Titan SDK, a DLL application and controlled
+shared Lua. See [Windows native builds](docs/native-build.md#experimental-windows-dll-build)
+for setup, validation gates, and documented limitations.
 
 The repository owns an ignored Titan installation in `.titan/` (override with
 `TITAN_PREFIX=...`); build commands do not rely on an ambient `titanc` or Lua
@@ -52,6 +53,18 @@ require that development toolchain.
 
 ## Build and test
 
+On macOS, put GNU Make 4.4.1 first on `PATH` before building, including for
+recursive `make` invocations. With Homebrew's Make installed:
+
+```sh
+export PATH="$(brew --prefix make)/libexec/gnubin:$PATH"
+make --version
+```
+
+Apple Make 3.81 can retain a stale generated include graph during incremental
+checks. The local macOS validation used Intel x86_64; it does not establish
+Apple Silicon runtime coverage.
+
 ```sh
 make toolchain
 make npm-ci
@@ -59,7 +72,7 @@ make -j2
 make test
 ```
 
-`make` produces `bin/titan-language-server` and `dist/extension.js`, and stages
+On Linux and macOS, `make` produces `bin/titan-language-server` and `dist/extension.js`, and stages
 the project-local Lua source and native-module trees under
 `dist/titan/share/lua/5.5` and `dist/titan/lib/lua/5.5`, together with the SDK
 include tree and matching Lua sources. Packaging checks compare all four trees
@@ -548,3 +561,27 @@ For the repository-local Codex skill, its deterministic query command, and
 compiler search-path setup, see [docs/codex.md](docs/codex.md). Development
 scope and milestones are recorded in
 [the bootstrap plan](https://github.com/mascarenhas/vscode-titan/blob/main/.agents/plans/bootstrap.md).
+
+## Experimental Windows validation
+
+The Windows port is experimental. The extension uses `.exe` language-server
+names and `.dll` compiler modules. Native compiler/server, SDK staging, protocol,
+and interactive Extension Host validation are separate from the JavaScript unit
+and bundle checks.
+
+Node's Windows process termination cannot deliver a catchable POSIX `SIGTERM`
+to the query adapter. Forced termination therefore cannot promise its structured
+interruption JSON; the language server must exit when parent-owned stdio closes.
+Ordinary protocol shutdown and bounded timeout cleanup retain their own tests.
+Symlink fixture checks skip when the Windows account lacks symlink privileges;
+no Developer Mode or privilege change is required to run the remaining tests.
+
+Windows source paths must be fully qualified drive paths (`C:/project`,
+including a mapped share such as `W:/project`) or UNC paths
+(`//server/share/project`). Drive-relative, current-drive-rooted, and device
+namespace paths are rejected. UNC server names use bounded ASCII hostname
+spelling. Drive letters are normalized; whole pathnames are not case-folded.
+
+File notifications on shared folders are best effort. Guest-local NTFS folders
+are the supported watcher test location; shared source bytes must remain live,
+but absent shared-folder notifications are an acceptable documented limitation.
