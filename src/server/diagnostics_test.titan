@@ -11,6 +11,13 @@ local project_config = import "server.project_config"
 local project_discovery = import "server.project_discovery"
 local project_graph = import "server.project_graph"
 local project_service = import "server.project_service"
+local test_paths = import "server.test_paths"
+foreign import "compiler_io_platform.h"
+
+local function sdk_root(): string
+  if ffi.VSCODE_TITAN_WINDOWS ~= 0 then return "C:/sdk" end
+  return "/sdk"
+end
 
 local function snapshot(filename: string, contents: string,
                         items: {bridge.Diagnostic}): project_service.Snapshot
@@ -23,23 +30,23 @@ local function snapshot(filename: string, contents: string,
   return project_service.Snapshot.new(
     1,
     project_config.ProjectConfig.new(
-      "/workspace", nil, {"/workspace"}, {}, {"/workspace"},
-      "/sdk", {}, nil),
-    {}, {"/workspace"}, {module}, {}, {})
+      test_paths.workspace_root(), nil, {test_paths.workspace_root()}, {}, {test_paths.workspace_root()},
+      sdk_root(), {}, nil),
+    {}, {test_paths.workspace_root()}, {module}, {}, {})
 end
 
 function test_diagnostics_publish_and_clear_unmapped_source_warnings(
     _context: test.Context)
-  local saved = snapshot("/workspace/src/main.titan", "", {})
+  local saved = snapshot(test_paths.workspace_root() .. "/src/main.titan", "", {})
   local issues = {
     project_discovery.Issue.new(
-      "/workspace/loose.titan", "outside source_module_roots",
+      test_paths.workspace_root() .. "/loose.titan", "outside source_module_roots",
       project_discovery.IssueKind.unmapped_source()),
     project_discovery.Issue.new(
-      "/workspace/other.titan", "outside source_module_roots",
+      test_paths.workspace_root() .. "/other.titan", "outside source_module_roots",
       project_discovery.IssueKind.unmapped_source()),
     project_discovery.Issue.new(
-      "/workspace/src/invalid.name.titan", "invalid logical module name",
+      test_paths.workspace_root() .. "/src/invalid.name.titan", "invalid logical module name",
       project_discovery.IssueKind.invalid_module()),
   }
   local with_issues = project_service.Snapshot.new(
@@ -47,8 +54,8 @@ function test_diagnostics_publish_and_clear_unmapped_source_warnings(
     saved.project_modules, saved.external_modules, saved.dirty_modules)
   local publications = diagnostics.from_snapshot(with_issues)
   test.assert(#publications == 2 and #publications[1].items == 1 and
-              publications[1].uri == "file:///workspace/loose.titan" and
-              publications[2].uri == "file:///workspace/other.titan",
+              publications[1].uri == test_paths.workspace_uri() .. "/loose.titan" and
+              publications[2].uri == test_paths.workspace_uri() .. "/other.titan",
               "discovery did not publish one warning per unmapped saved source")
   local envelope? = wire.as_object(wire.decode(
     diagnostics.notification(publications[1])))
@@ -78,7 +85,7 @@ end
 
 function test_diagnostics_map_saved_compiler_byte_locations_to_lsp(
     _context: test.Context)
-  local filename = "/workspace/main.titan"
+  local filename = test_paths.workspace_root() .. "/main.titan"
   local publications = diagnostics.from_snapshot(snapshot(
     filename, "\u{10400}broken\n", {
       bridge.Diagnostic.new(
@@ -91,7 +98,7 @@ function test_diagnostics_map_saved_compiler_byte_locations_to_lsp(
   test.assert(#publications == 1 and #publications[1].items == 1,
               "saved compiler diagnostic was not assigned or deduplicated")
   local item = publications[1].items[1]
-  test.assert(publications[1].uri == "file:///workspace/main.titan" and
+  test.assert(publications[1].uri == test_paths.workspace_uri() .. "/main.titan" and
               item.range.start.line == 0 and
               item.range.start.character == 2 and
               item.range.finish.line == 0 and
@@ -117,7 +124,7 @@ end
 
 function test_diagnostics_filter_external_locations_and_clear_stale_files(
     _context: test.Context)
-  local filename = "/workspace/main.titan"
+  local filename = test_paths.workspace_root() .. "/main.titan"
   local publisher = diagnostics.create()
   local observed: {diagnostics.Publication} = {}
   publisher:set_listener(function (publication: diagnostics.Publication)
@@ -128,7 +135,7 @@ function test_diagnostics_filter_external_locations_and_clear_stale_files(
     filename, "function answer(): integer return 1 end\n", {
       bridge.Diagnostic.new(
         bridge.DiagnosticKind.compiler(), "external failure",
-        bridge.SourceLocation.new("/sdk/vendor.titan", 1, 1)),
+        bridge.SourceLocation.new(sdk_root() .. "/vendor.titan", 1, 1)),
     }))
   test.assert(#external == 0,
               "external source diagnostic was published as a project error")
@@ -140,12 +147,12 @@ function test_diagnostics_filter_external_locations_and_clear_stale_files(
         bridge.SourceLocation.new(filename, 1, 1)),
     })))
   publisher:publish(diagnostics.from_snapshot(snapshot(
-    "/workspace/new-root/main.titan",
+    test_paths.workspace_root() .. "/new-root/main.titan",
     "function answer(): integer return 1 end\n", {})))
   test.assert(#observed == 2 and #observed[1].items == 1 and
-              observed[1].uri == "file:///workspace/main.titan" and
+              observed[1].uri == test_paths.workspace_uri() .. "/main.titan" and
               #observed[2].items == 0 and
-              observed[2].uri == "file:///workspace/main.titan",
+              observed[2].uri == test_paths.workspace_uri() .. "/main.titan",
               "root replacement did not clear the stale diagnostic URI")
 
   publisher:publish(diagnostics.from_snapshot(snapshot(
@@ -156,7 +163,7 @@ function test_diagnostics_filter_external_locations_and_clear_stale_files(
     })))
   publisher:stop()
   test.assert(#observed == 4 and #observed[4].items == 0 and
-              observed[4].uri == "file:///workspace/main.titan",
+              observed[4].uri == test_paths.workspace_uri() .. "/main.titan",
               "publisher shutdown did not clear its active diagnostic URI")
 end
 
@@ -173,7 +180,7 @@ function test_diagnostics_replays_published_rows_after_file_reopen(
         items[1] = diagnostics.Item.new(diagnostics.Kind.unmapped_source(),
           "binary message\0\255" .. index, source_text.Span.new(position, position))
       end
-      input[index] = diagnostics.Publication.new("file:///workspace/source" .. index .. ".titan", items)
+      input[index] = diagnostics.Publication.new(test_paths.workspace_uri() .. "/source" .. index .. ".titan", items)
     end
     do
       local store = stores.open(path)

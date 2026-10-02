@@ -2,11 +2,13 @@ local async = import "async"
 local fs = import "fs"
 local iteration = import "iteration"
 local wire = import "server.wire"
+local embedded_interfaces = import "server.embedded_interfaces"
 local logging = import "server.logging"
 local math = import "math"
 local system = import "os"
 local strings = import "string"
 foreign import "compiler_io_clock.h"
+foreign import "compiler_io_platform.h"
 
 type CheckpointListener = function (string?): ()
 
@@ -27,10 +29,11 @@ record LstatIdentity
   path: string
   size: integer
   kind: string
-  device: integer
-  inode: integer
+  device: integer?
+  inode: integer?
   modified_seconds: integer
   modified_nanoseconds: integer
+  native_identity: string?
 end
 
 local record LstatObservation
@@ -81,7 +84,7 @@ end
 local function copy_lstat_identity(source: LstatIdentity): LstatIdentity
   return LstatIdentity.new(
     source.path, source.size, source.kind, source.device, source.inode,
-    source.modified_seconds, source.modified_nanoseconds)
+    source.modified_seconds, source.modified_nanoseconds, source.native_identity)
 end
 
 function same_lstat_identity(left: LstatIdentity,
@@ -92,13 +95,35 @@ function same_lstat_identity(left: LstatIdentity,
          left.device == right.device and
          left.inode == right.inode and
          left.modified_seconds == right.modified_seconds and
-         left.modified_nanoseconds == right.modified_nanoseconds
+         left.modified_nanoseconds == right.modified_nanoseconds and
+         left.native_identity == right.native_identity
 end
 
 local function identity_for(path: string, metadata: fs.Stat): LstatIdentity
   return LstatIdentity.new(
     path, metadata.size, metadata.kind, metadata.device, metadata.inode,
     metadata.modified_seconds, metadata.modified_nanoseconds)
+end
+
+-- Only the Windows embedded provider carries an opaque identity. Its native
+-- owner retains a file handle denying writes/deletion, so this snapshot read
+-- performs no blocking filesystem work on a Task. All ordinary providers keep
+-- the async libuv stat path and Unix integer identities.
+function lstat_identity_is_current(identity: LstatIdentity): boolean
+  if identity.native_identity ~= nil then
+    if ffi.VSCODE_TITAN_WINDOWS == 0 then return false end
+    local current = embedded_interfaces.identity()
+    local native?: string = current["native_identity"]
+    return native ~= nil and native == identity.native_identity and
+      current["path"] == identity.path and current["kind"] == identity.kind and
+      current["size"] == identity.size and
+      current["modified_seconds"] == identity.modified_seconds and
+      current["modified_nanoseconds"] == identity.modified_nanoseconds and
+      identity.device == nil and identity.inode == nil
+  end
+  local current? = fs.stat(identity.path)
+  if current == nil then return false end
+  return same_lstat_identity(identity, identity_for(identity.path, current))
 end
 
 local function same_optional_lstat_identity(left: LstatIdentity?,
@@ -319,7 +344,9 @@ end
 local function temporary_leaf(path: string): string
   local index = #path
   while index >= 1 do
-    if strings.sub(path, index, index) == "/" then
+    local separator = strings.sub(path, index, index)
+    if separator == "/" or
+       (ffi.VSCODE_TITAN_WINDOWS ~= 0 and separator == "\\") then
       return strings.sub(path, index + 1)
     end
     index = index - 1
@@ -638,7 +665,8 @@ end
 
 local function command_label(argv: {string}, merged: boolean): string
   local output = strings.writer()
-  output:write("env LANG=C LC_ALL=C")
+  if ffi.VSCODE_TITAN_WINDOWS == 0 then output:write("env ") end
+  output:write("LANG=C LC_ALL=C")
   for index = 1, #argv do
     output:write(" ")
     output:write(quote_word(argv[index]))
@@ -790,6 +818,22 @@ end
 local function spawn_and_capture_untimed(
     env_arguments: {string}, command: string,
     merged: boolean): {string: value}
+  if ffi.VSCODE_TITAN_WINDOWS ~= 0 then
+    local arguments: {string} = {}
+    for index = 4, #env_arguments do
+      arguments[#arguments + 1] = env_arguments[index]
+    end
+    local output_option = system.with_parent_stderr
+    if merged then output_option = system.with_merged_output end
+    local process = system.spawn(env_arguments[3], arguments,
+      system.with_env("LANG", "C"), system.with_env("LC_ALL", "C"),
+      output_option)
+    local result = capture_spawned_process(process, command)
+    -- A directly launched program can legitimately exit with 126 or 127.
+    -- There is no env wrapper whose exit status means executable lookup failed.
+    result["started"] = true
+    return result
+  end
   if merged then
     local process = system.spawn(
       "/usr/bin/env", env_arguments, system.with_merged_output)

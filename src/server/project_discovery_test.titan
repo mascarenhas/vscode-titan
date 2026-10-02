@@ -1,9 +1,11 @@
+foreign import "compiler_io_platform.h"
 local fs = import "fs"
-local os = import "os"
 local test = import "test"
 local strings = import "string"
-local discovery = import "server.project_discovery"
+local discovery = import "server.project_discovery.titan"
+local source_text = import "server.source_text"
 local test_runtime = import "server.test_runtime"
+local test_links = import "server.test_links"
 
 local record Fixture
   root: string
@@ -19,7 +21,9 @@ local function new_fixture(): Fixture
   local root = fs.tmpname()
   fs.unlink(root)
   fs.mkdir(root)
-  return Fixture.new(root, {}, {root}, {}, {[root] = true})
+  local normalized?, failure? = source_text.normalize_absolute_path(root)
+  if normalized == nil then raise failure end
+  return Fixture.new(normalized, {}, {normalized}, {}, {[normalized] = true})
 end
 
 local function Fixture:path(relative: string): string
@@ -411,16 +415,8 @@ local function preserves_lexical_source_ancestry_above_symlinked_include()
     fixture:write("actual/item.titan")
     local actual = fixture:path("actual")
     local linked = fixture:path("linked")
-    local linker = os.spawn("/bin/ln", {"-s", actual, linked})
-    local link_input? = linker.stdin
-    if link_input ~= nil then link_input:close() end
-    local link_status = linker:wait()
-    local link_output? = linker.stdout
-    if link_output ~= nil then link_output:close() end
-    local link_error? = linker.stderr
-    if link_error ~= nil then link_error:close() end
-    test.assert(link_status.code == 0 and link_status.signal == nil,
-                "could not create source-ancestry symlink fixture")
+    test_links.directory(actual, linked,
+      "could not create source-ancestry symlink fixture")
     defer fs.unlink(linked)
 
     local found?, failure? = discovery.discover(
@@ -550,16 +546,8 @@ local function canonicalizes_aliased_include_and_exclude_roots()
     local actual = fixture:path("actual")
     local nested = fixture:path("actual/pkg")
     local linked = fixture:path("linked")
-    local linker = os.spawn("/bin/ln", {"-s", actual, linked})
-    local link_input? = linker.stdin
-    if link_input ~= nil then link_input:close() end
-    local link_status = linker:wait()
-    local link_output? = linker.stdout
-    if link_output ~= nil then link_output:close() end
-    local link_error? = linker.stderr
-    if link_error ~= nil then link_error:close() end
-    test.assert(link_status.code == 0 and link_status.signal == nil,
-                "could not create include-root symlink fixture")
+    test_links.directory(actual, linked,
+      "could not create include-root symlink fixture")
     defer fs.unlink(linked)
 
     local found?, failure? = discovery.discover(
@@ -734,6 +722,44 @@ function test_project_discovery_excludes_workspace_cache_even_as_explicit_root(
       for index = 1, #found.directories do
         test.assert(found.directories[index] ~= cache,"cache directory acquired a watcher")
       end
+    end)
+  end)
+end
+
+function test_project_discovery_native_windows_roots(_context: test.Context)
+  if ffi.VSCODE_TITAN_WINDOWS == 0 then test.skip("native Windows paths") end
+  test.assert(discovery.parent_directory("C:/") == "C:/")
+  test.assert(discovery.parent_directory("C:/project") == "C:/")
+  test.assert(discovery.parent_directory("//server/share") == "//server/share")
+  test.assert(discovery.parent_directory("//server/share/project") == "//server/share")
+  test.assert(discovery.leaf_name("C:/project") == "project")
+  test.assert(discovery.leaf_name("C:/") == "")
+  test.assert(discovery.join("C:/", "project") == "C:/project")
+  test.assert(discovery.relative_to_root("C:/", "C:/project/main.titan") ==
+              "project/main.titan")
+  test.assert(discovery.path_within("C:/", "C:/project") and
+              not discovery.path_within("C:/", "W:/project"))
+  test.assert(discovery.rebase_path("C:/main.titan", "C:/", "W:/") ==
+              "W:/main.titan")
+  test_runtime.run(function()
+    with_fixture(function(fixture: Fixture)
+      fixture:write("main.titan")
+      local native = strings.writer()
+      for index = 1, #fixture.root do
+        local byte: integer = strings.byte(fixture.root, index)
+        if byte == 47 then byte = 92 end
+        native:write(strings.char(byte))
+      end
+      local native_root = native:drain()
+      local found = require_discovery(native_root)
+      test.assert(#found.modules == 1 and found.modules[1].name == "main")
+      test.assert(found:owner_for_file(native_root .. "\\main.titan") == "main" and
+                  found:owner_for_file(fixture:path("main.titan")) == "main",
+                  "native and normalized paths did not share the saved owner")
+      local physical?, failure? = source_text.normalize_absolute_path(
+        fs.realpath(fixture:path("main.titan")))
+      test.assert(failure == nil and found:owner_for_file(physical) == "main",
+                  "physical file spelling did not retain the saved owner")
     end)
   end)
 end

@@ -1,3 +1,4 @@
+local test_paths = import "server.test_paths"
 local fs = import "fs"
 local test = import "test"
 local strings = import "string"
@@ -8,7 +9,7 @@ local test_runtime = import "server.test_runtime"
 local type FixtureBody = function (string): ()
 
 local function with_temporary_project(body: FixtureBody)
-  local root = fs.tmpname()
+  local root = test_paths.temporary_name()
   fs.unlink(root)
   fs.mkdir(root)
   defer fs.rmdir(root)
@@ -17,7 +18,7 @@ end
 
 local function run_without_config()
   with_temporary_project(function (root: string)
-    local loaded?, failure? = config.load(root, "/sdk/lib/titan/0.6")
+    local loaded?, failure? = config.load(root, test_paths.sdk_binary_root())
     test.assert(failure == nil and loaded ~= nil,
                 "missing optional config did not use defaults")
     test.assert(loaded.project_root == root and loaded.config_file == nil,
@@ -30,7 +31,7 @@ local function run_without_config()
                 "source module roots did not default to project src")
     test.assert(#loaded.exclude == 0,
                 "exclude did not default to an empty array")
-    test.assert(loaded.binary_modules_root == "/sdk/lib/titan/0.6",
+    test.assert(loaded.binary_modules_root == test_paths.sdk_binary_root(),
                 "binary root did not default to the library-versioned tree")
     test.assert(#loaded.extra_ffi_include_dirs == 0,
                 "include directories did not default to an empty array")
@@ -53,7 +54,7 @@ local function defaults_root_lists_independently()
 include = { "./watched" }
 ]])
     local include_only?, include_failure? =
-      config.load(root, "/sdk/lib/titan/0.6")
+      config.load(root, test_paths.sdk_binary_root())
     test.assert(include_failure == nil and include_only ~= nil and
                 include_only.include[1] == root .. "/watched" and
                 #include_only.source_module_roots == 1 and
@@ -64,7 +65,7 @@ include = { "./watched" }
 source_module_roots = { "./lookup" }
 ]])
     local source_only?, source_failure? =
-      config.load(root, "/sdk/lib/titan/0.6")
+      config.load(root, test_paths.sdk_binary_root())
     test.assert(source_failure == nil and source_only ~= nil and
                 #source_only.include == 1 and
                 source_only.include[1] == root .. "/src" and
@@ -93,7 +94,7 @@ extra_ffi_cppflags = "-DPROJECT_FFI=1 '-Ipath with spaces'"
 ]])
     defer fs.unlink(filename)
 
-    local loaded?, failure? = config.load(root, "/sdk/lib/titan/0.6")
+    local loaded?, failure? = config.load(root, test_paths.sdk_binary_root())
     test.assert(failure == nil and loaded ~= nil,
                 "valid titan-config.lua was rejected")
     test.assert(loaded.config_file == filename,
@@ -138,7 +139,7 @@ local function assert_config_error(root: string, source: string,
                                    expected: string)
   local filename = root .. "/titan-config.lua"
   fs.write_file(filename, source)
-  local loaded?, failure? = config.load(root, "/sdk/lib/titan/0.6")
+  local loaded?, failure? = config.load(root, test_paths.sdk_binary_root())
   test.assert(loaded == nil and failure ~= nil,
               "malformed project configuration was accepted")
   test.assert(failure.path == filename and
@@ -204,13 +205,13 @@ function test_project_config_rejects_untyped_sparse_or_invalid_values(
 end
 
 local function rejects_semicolon_after_relative_resolution()
-  local reservation = fs.tmpname()
+  local reservation = test_paths.temporary_name()
   fs.unlink(reservation)
   local root = reservation .. ";project"
   fs.mkdir(root)
   defer fs.rmdir(root)
 
-  local loaded?, failure? = config.load(root, "/sdk/lib/titan/0.6")
+  local loaded?, failure? = config.load(root, test_paths.sdk_binary_root())
   test.assert(loaded == nil and failure ~= nil and
               failure.path == root .. "/titan-config.lua" and
               strings.find(
@@ -225,23 +226,22 @@ function test_project_config_rejects_ambiguous_normalized_source_path(
 end
 
 local function permits_semicolon_in_watcher_include_root()
-  local reservation = fs.tmpname()
+  local reservation = test_paths.temporary_name()
   fs.unlink(reservation)
   local root = reservation .. ";project"
   fs.mkdir(root)
   defer fs.rmdir(root)
   local filename = root .. "/titan-config.lua"
-  fs.write_file(filename, [[
-include = { "./watched" }
-source_module_roots = { "/compiler/source" }
-]])
+  fs.write_file(filename,
+    "include = { \"./watched\" }\n" ..
+    "source_module_roots = { \"" .. test_paths.compiler_source_root() .. "\" }\n")
   defer fs.unlink(filename)
 
-  local loaded?, failure? = config.load(root, "/sdk/lib/titan/0.6")
+  local loaded?, failure? = config.load(root, test_paths.sdk_binary_root())
   test.assert(failure == nil and loaded ~= nil and
               loaded.include[1] == root .. "/watched" and
               #loaded.source_module_roots == 1 and
-              loaded.source_module_roots[1] == "/compiler/source",
+              loaded.source_module_roots[1] == test_paths.compiler_source_root(),
               "watcher include was incorrectly parsed as compiler source path")
 end
 

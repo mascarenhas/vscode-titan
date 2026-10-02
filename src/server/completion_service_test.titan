@@ -18,8 +18,11 @@ local dispatcher = import "server.dispatcher"
 local source_text = import "server.source_text"
 local wire = import "server.wire"
 foreign import "compiler_io_clock.h"
+foreign import "compiler_io_platform.h"
 
+local ROOT = "/completion-fixture"
 local PATH = "/completion-fixture/app.titan"
+local URI = "file:///completion-fixture/app.titan"
 
 local function seed(store: sql.Store, projects: {bridge.ProjectModule})
   local access = store:acquire()
@@ -48,8 +51,8 @@ local function seed(store: sql.Store, projects: {bridge.ProjectModule})
       "project", files[1], "root-not-decoded", "", nil, files, {}, {}, {})
   end
   storage.publish_saved(access.connection, descriptors, names,
-    bridge.CompilerConfiguration.new({"/completion-fixture"}, nil, nil, nil),
-    {"/completion-fixture"}, {})
+    bridge.CompilerConfiguration.new({ROOT}, nil, nil, nil),
+    {ROOT}, {})
   sql.execute(access.connection, "UPDATE main.store_state SET published_generation=7 WHERE singleton=1")
 end
 
@@ -62,7 +65,7 @@ end
 local function seed_checked(store: sql.Store, projects: {bridge.ProjectModule})
   seed(store, projects)
   local compiler = bridge.load()
-  local configuration = bridge.CompilerConfiguration.new({"/completion-fixture"}, nil, nil, nil)
+  local configuration = bridge.CompilerConfiguration.new({ROOT}, nil, nil, nil)
   compiler:configure(configuration)
   local analysis = compiler:analyze(projects[1].module_name, projects)
   test.assert(#analysis.diagnostics == 0, "saved dependency fixture did not compile")
@@ -86,7 +89,7 @@ local function seed_checked(store: sql.Store, projects: {bridge.ProjectModule})
   end
   local access = store:acquire()
   defer access:release()
-  storage.publish_saved(access.connection, descriptors, names, configuration, {"/completion-fixture"}, {})
+  storage.publish_saved(access.connection, descriptors, names, configuration, {ROOT}, {})
 end
 
 local function request(path: string, contents: string, needle: string): dispatcher.CompletionRequest
@@ -173,7 +176,7 @@ function test_completion_service_capture_before_deferred_change_and_reopen(_cont
     open(documents, PATH, 1, first)
     local stale = completion:capture(request(PATH, first, "return al"))
     local second = "function f(): integer\n local bravo = 1\n return br\nend\n"
-    local document = lsp.TextDocument.new("file://" .. PATH, PATH)
+    local document = lsp.TextDocument.new(URI, PATH)
     documents:apply(lsp.DocumentNotification.changed(lsp.ChangeDocument.new(document, 5, second)))
     completion:changed()
     local stale_names, stale_incomplete = labels(stale())
@@ -259,7 +262,7 @@ function test_completion_service_provisional_candidates_follow_current_token_dur
     local previous_names, previous_incomplete = labels(refreshed())
     test.assert(contains(previous_names, "alpha") and previous_incomplete,
       "saved reanalysis hid useful previous candidates while the compiler permit was held")
-    local document = lsp.TextDocument.new("file://" .. PATH, PATH)
+    local document = lsp.TextDocument.new(URI, PATH)
     local changed = "function f(): integer\n local alpha = 1\n return alphSuffix\nend\n"
     documents:apply(lsp.DocumentNotification.changed(lsp.ChangeDocument.new(document, 2, changed)))
     completion:changed()
@@ -307,7 +310,7 @@ function test_completion_service_restart_prepares_while_hydration_paused_and_sel
       seed_checked(first, {
         bridge.ProjectModule.new("app", {bridge.SourceFile.new(PATH,
           "local dep = import \"dep\"\nfunction f(): integer return dep.public() end\n")}),
-        bridge.ProjectModule.new("dep", {bridge.SourceFile.new("/completion-fixture/dep.titan",
+        bridge.ProjectModule.new("dep", {bridge.SourceFile.new(ROOT .. "/dep.titan",
           "local record Box<|T|>\n value: T\nend\nfunction public(): integer return 1 end\n")}),
       })
     end
@@ -364,8 +367,8 @@ function test_completion_service_folder_contributors_and_new_file(_context: test
   runtime.run(function ()
     local store = sql.open(":memory:")
     defer store:close()
-    local main = "/completion-fixture/box/box.titan"
-    local child = "/completion-fixture/box/fields.titan"
+    local main = ROOT .. "/box/box.titan"
+    local child = ROOT .. "/box/fields.titan"
     seed(store, {bridge.ProjectModule.new("box", {bridge.SourceFile.new(main, "local saved = 1\n")})})
     local documents = buffers.create()
     local completion = service.create(store, documents)
@@ -377,7 +380,7 @@ function test_completion_service_folder_contributors_and_new_file(_context: test
     work()
     await_preparation(completion)
     test.assert(contains(labels(work()), "value"), "new open folder contributor was not part of the logical module")
-    local new_path = "/completion-fixture/fresh.titan"
+    local new_path = ROOT .. "/fresh.titan"
     local new_text = "function f(): integer\n local answer = 1\n return ans\nend\n"
     open(documents, new_path, 1, new_text)
     completion:changed()
@@ -392,7 +395,7 @@ function test_completion_service_detached_dependencies_ignore_dirty_imports(_con
   runtime.run(function ()
     local store = sql.open(":memory:")
     defer store:close()
-    local dependency = "/completion-fixture/dep.titan"
+    local dependency = ROOT .. "/dep.titan"
     seed_checked(store, {
       bridge.ProjectModule.new("app", {bridge.SourceFile.new(PATH,
         "local dep = import \"dep\"\nfunction f(): integer return dep.public() end\n")}),
@@ -413,11 +416,19 @@ function test_completion_service_detached_dependencies_ignore_dirty_imports(_con
       "ordinary imports lost saved public visibility or consumed another module's dirty bytes")
     local direct = "local dep = import \"dep.titan\"\nfunction f(): integer return dep.sec end\n"
     documents:apply(lsp.DocumentNotification.changed(lsp.ChangeDocument.new(
-      lsp.TextDocument.new("file://" .. PATH, PATH), 2, direct)))
+      lsp.TextDocument.new(URI, PATH), 2, direct)))
     completion:changed()
     local private_work = completion:capture(request(PATH, direct, "dep.sec"))
     private_work()
     await_preparation(completion)
     test.assert(contains(labels(private_work()), "secret"), "detached direct-source visibility was lost")
   end)
+end
+
+do
+  if ffi.VSCODE_TITAN_WINDOWS ~= 0 then
+    ROOT = "C:/completion-fixture"
+    PATH = "C:/completion-fixture/app.titan"
+    URI = "file:///C:/completion-fixture/app.titan"
+  end
 end

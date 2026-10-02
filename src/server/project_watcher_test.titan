@@ -1,7 +1,9 @@
+foreign import "compiler_io_platform.h"
 local async = import "async"
 local fs = import "fs"
 local test = import "test"
 local timer = import "timer"
+local source_text = import "server.source_text"
 local project_watcher = import "server.project_watcher.titan"
 local test_runtime = import "server.test_runtime"
 
@@ -310,7 +312,9 @@ local function real_saved_file_hint()
   -- Directory watchers report canonical paths. The desktop harness places
   -- TMPDIR below a /home -> /var/home symlink, so compare against the
   -- canonical parent even though the child does not exist yet.
-  local changed = fs.realpath(root) .. "/changed.titan"
+  local canonical_root?, canonical_error? = source_text.normalize_absolute_path(fs.realpath(root))
+  if canonical_root == nil then raise canonical_error end
+  local changed = canonical_root .. "/changed.titan"
   local late = root .. "/late.titan"
   defer remove_if_present(changed)
   defer remove_if_present(late)
@@ -375,4 +379,12 @@ end
 function test_project_watcher_observes_real_saved_file_changes(
     _context: test.Context)
   test_runtime.run(real_saved_file_hint)
+end
+
+function test_project_watcher_native_windows_paths(_context: test.Context)
+  if ffi.VSCODE_TITAN_WINDOWS == 0 then test.skip("native Windows paths") end
+  test.assert(project_watcher.native_path("w:\\live\\main.titan") ==
+              "W:/live/main.titan")
+  test.assert(project_watcher.native_path("\\\\server\\share\\main.titan") ==
+              "//server/share/main.titan")
 end

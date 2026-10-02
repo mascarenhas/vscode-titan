@@ -158,7 +158,7 @@ async function testLuaModulePathConfiguration() {
   delete defaultEnvironment.TITAN_LS_LUA_CPATH;
   assert.equal(
     await printedLuaPaths(defaultEnvironment),
-    "package.path=./?.lua\npackage.cpath=./?.so\n"
+    `package.path=./?.lua\npackage.cpath=./?.${process.platform === "win32" ? "dll" : "so"}\n`
   );
 
   const sourcePath = "/extension with spaces/share/lua/5.5/?.lua";
@@ -493,6 +493,7 @@ async function testLifecycle() {
     );
   } finally {
     if (child.exitCode === null && child.signalCode === null) child.kill();
+    await awaitExit(exit);
     await rm(root, { recursive: true, force: true });
   }
 }
@@ -699,6 +700,7 @@ async function testUnionPayloadSemantics() {
     throw new Error(`${cause.message}; stderr: ${stderr().toString("utf8").trim()}`, { cause });
   } finally {
     if (child.exitCode === null && child.signalCode === null) child.kill();
+    await awaitExit(exit);
     await rm(root, { recursive: true, force: true });
   }
 }
@@ -986,6 +988,7 @@ async function testSavedProjectSemantics() {
     );
   } finally {
     if (child.exitCode === null && child.signalCode === null) child.kill();
+    await awaitExit(exit);
     await rm(root, { recursive: true, force: true });
   }
 }
@@ -1077,6 +1080,7 @@ async function testUnmappedSourceWarnings() {
     );
   } finally {
     if (child.exitCode === null && child.signalCode === null) child.kill();
+    await awaitExit(exit);
     await rm(root, { recursive: true, force: true });
   }
 }
@@ -1306,6 +1310,7 @@ async function testSelfContainedCompilerModules({ sdkHeaders = false } = {}) {
     );
   } finally {
     if (child.exitCode === null && child.signalCode === null) child.kill();
+    await awaitExit(exit);
     await rm(root, { recursive: true, force: true });
   }
 }
@@ -1362,6 +1367,7 @@ async function testConfigCannotWriteProtocolStdout() {
     assert.equal(stderr().length, 0, stderr().toString("utf8"));
   } finally {
     if (child.exitCode === null && child.signalCode === null) child.kill();
+    await awaitExit(exit);
     await rm(root, { recursive: true, force: true });
   }
 }
@@ -1558,6 +1564,7 @@ async function testSourceImportCppflagsAndUnchangedRequests() {
     );
   } finally {
     if (child.exitCode === null && child.signalCode === null) child.kill();
+    await awaitExit(exit);
     await rm(root, { recursive: true, force: true });
   }
 }
@@ -1734,6 +1741,7 @@ async function testCrossModuleFolderAndIncrementalSemantics() {
     assert.equal(stderr().length, 0, stderr().toString("utf8"));
   } finally {
     if (child.exitCode === null && child.signalCode === null) child.kill();
+    await awaitExit(exit);
     await rm(root, { recursive: true, force: true });
   }
 }
@@ -1901,6 +1909,7 @@ async function testDebugCompilerProgress() {
     );
   } finally {
     if (child.exitCode === null && child.signalCode === null) child.kill();
+    await awaitExit(exit);
     await rm(root, { recursive: true, force: true });
   }
 }
@@ -1924,6 +1933,7 @@ async function testTruncatedFrame() {
     assert.match(record.message, /unexpected EOF in LSP frame/);
   } finally {
     if (child.exitCode === null && child.signalCode === null) child.kill();
+    await awaitExit(exit);
   }
 }
 

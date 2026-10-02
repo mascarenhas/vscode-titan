@@ -1,8 +1,10 @@
+local test_paths = import "server.test_paths"
+local test_links = import "server.test_links"
+foreign import "compiler_io_platform.h"
 local test_service = import "server.test_service"
 local async = import "async"
 local fs = import "fs"
 local json = import "json"
-local os = import "os"
 local sqlite3 = import "sqlite3"
 local strings = import "string"
 local test = import "test"
@@ -27,16 +29,17 @@ local stores = import "server.workspace_store"
 local test_runtime = import "server.test_runtime"
 
 local function buffers_before_saved_service_readiness()
-  local server = application.create("/workspace")
+  local root = test_paths.workspace_root()
+  local server = application.create(root)
   defer server:close()
   local document = lsp.TextDocument.new(
-    "file:///workspace/src/new.titan", "/workspace/src/new.titan")
+    test_paths.workspace_uri() .. "/src/new.titan", root .. "/src/new.titan")
   server:on_document(lsp.DocumentNotification.opened(
     lsp.OpenDocument.new(document, 1, "unsaved")))
   server:on_document(lsp.DocumentNotification.saved(document))
   server:on_document(lsp.DocumentNotification.opened(lsp.OpenDocument.new(
-    lsp.TextDocument.new("file:///elsewhere/new.titan", "/elsewhere/new.titan"),
-    1, "outside")))
+    lsp.TextDocument.new(test_paths.elsewhere_uri() .. "/new.titan",
+      test_paths.elsewhere_root() .. "/new.titan"), 1, "outside")))
   test.assert(#server.buffers:inputs() == 1 and
     server.buffers:inputs()[1].text == "unsaved",
     "early sync lost editor text or accepted another workspace's buffer")
@@ -59,6 +62,96 @@ end
 
 function test_application_buffers_before_saved_service_readiness(_context: test.Context)
   test_runtime.run(buffers_before_saved_service_readiness)
+end
+
+local function captures_document_buffers_for_native_project_root()
+  local root = "/workspace Ω"
+  local path = "/workspace Ω/src/main.titan"
+  local uri = "file:///workspace%20%CE%A9/src/main.titan"
+  local sibling_uri = "file:///workspace%20%CE%A9-other/src/main.titan"
+  if ffi.VSCODE_TITAN_WINDOWS ~= 0 then
+    root = "c:\\workspace Ω"
+    path = "C:/workspace Ω/src/main.titan"
+    uri = "file:///c%3A/workspace%20%CE%A9/src/main.titan"
+    sibling_uri = "file:///c%3A/workspace%20%CE%A9-other/src/main.titan"
+  end
+  local server = application.create(root)
+  defer server:close()
+  local saved = "local helper = import \"helper\"\n\n" ..
+    "function main(): integer\n  return helper.answer()\nend\n"
+  local dirty = "local helper = import \"helper\"\n\n" ..
+    "function main(): integer\n  return helper.a()\nend\n"
+  local document: wire.Object = {
+    ["uri"] = uri, ["languageId"] = "titan", ["version"] = 4, ["text"] = saved,
+  }
+  local open_params: wire.Object = {["textDocument"] = document}
+  local opened?, open_error? = lsp.parse_open(open_params)
+  test.assert(opened ~= nil and open_error == nil and opened.document.path == path,
+    "native workspace document URI did not parse to its normalized path")
+  server:on_document(lsp.DocumentNotification.opened(opened))
+  local inputs = server.buffers:inputs()
+  test.assert(#inputs == 1 and inputs[1].path == path and
+    inputs[1].version == 4 and inputs[1].text == saved,
+    "native constructor path dropped the parsed open notification")
+
+  local changed_document: wire.Object = {["uri"] = uri, ["version"] = 5}
+  local replacement: wire.Object = {["text"] = dirty}
+  local changes: wire.Array = {replacement}
+  local change_params: wire.Object = {
+    ["textDocument"] = changed_document, ["contentChanges"] = changes,
+  }
+  local changed?, change_error? = lsp.parse_change(change_params)
+  test.assert(changed ~= nil and change_error == nil,
+    "full-sync native workspace document change did not parse")
+  server:on_document(lsp.DocumentNotification.changed(changed))
+  local capture? = server.buffers:capture(path, source_text.Position.new(3, 17))
+  test.assert(capture ~= nil and capture.document.path == path and
+    capture.document.version == 5 and capture.document.text == dirty and
+    capture.position.line == 3 and capture.position.character == 17 and
+    #capture.inputs == 1 and capture.inputs[1] == capture.document and
+    server.buffers:current(capture),
+    "parsed dirty editor text was unavailable for the completion capture")
+
+  local sibling_document: wire.Object = {
+    ["uri"] = sibling_uri, ["languageId"] = "titan",
+    ["version"] = 1, ["text"] = "outside",
+  }
+  local sibling_params: wire.Object = {["textDocument"] = sibling_document}
+  local sibling?, sibling_error? = lsp.parse_open(sibling_params)
+  test.assert(sibling ~= nil and sibling_error == nil,
+    "sibling workspace document URI did not parse")
+  server:on_document(lsp.DocumentNotification.opened(sibling))
+  test.assert(#server.buffers:inputs() == 1 and server.buffers:current(capture) and
+    server.buffers:capture(sibling.document.path, source_text.Position.new(0, 0)) == nil,
+    "same-prefix sibling workspace entered the completion buffer store")
+  test.assert(server.service == nil and server.refresh_task == nil and
+    server.completion == nil,
+    "document bookkeeping unexpectedly started saved workspace indexing")
+end
+
+function test_application_captures_document_buffers_for_native_project_root(
+    _context: test.Context)
+  test_runtime.run(captures_document_buffers_for_native_project_root)
+end
+
+local function preserves_nonabsolute_constructor_roots()
+  local relative = "workspace\\Ω/../project"
+  local server = application.create(relative)
+  defer server:close()
+  test.assert(server.project_root == relative,
+    "construction changed a relative workspace root")
+  if ffi.VSCODE_TITAN_WINDOWS == 0 then
+    local root = "/workspace//Ω/../project\\root/"
+    local unix_server = application.create(root)
+    defer unix_server:close()
+    test.assert(unix_server.project_root == root,
+      "construction changed the original Unix workspace path bytes")
+  end
+end
+
+function test_application_preserves_nonabsolute_constructor_roots(
+    _context: test.Context)
+  test_runtime.run(preserves_nonabsolute_constructor_roots)
 end
 
 local record YieldingAnalyzer
@@ -411,7 +504,7 @@ end
 local function with_application_state(
     indexed: boolean,
     body: function (string, YieldingAnalyzer, application.Application): ())
-  local root = fs.tmpname()
+  local root = test_paths.temporary_name()
   fs.unlink(root)
   fs.mkdir(root)
   local source_root = root .. "/src"
@@ -430,7 +523,7 @@ local function with_application_state(
   local analyzer = YieldingAnalyzer.new(0, false, false, false, false)
   local service?, service_error? = test_service.load {
     project_root = root,
-    installed_binary_modules_root = "/sdk/lib/titan/0.6",
+    installed_binary_modules_root = test_paths.sdk_binary_root(),
     analyzer = analyzer:analyze,
   }
   test.assert(service_error == nil and service ~= nil,
@@ -462,7 +555,7 @@ end
 
 local function with_cold_application(
     body: function (string, YieldingAnalyzer, application.Application): ())
-  local root = fs.tmpname()
+  local root = test_paths.temporary_name()
   fs.unlink(root)
   fs.mkdir(root)
   local source_root = root .. "/src"
@@ -487,7 +580,7 @@ local function with_cold_application(
         (project_service.Service?, project_service.Error?, project_loader.Restoration?)
       local loaded?,failure? = test_service.load {
         project_root = project_root,
-        installed_binary_modules_root = "/sdk/lib/titan/0.6",
+        installed_binary_modules_root = test_paths.sdk_binary_root(),
         analyzer = analyzer:analyze,
         snapshot_listener = snapshot_listener,
       }
@@ -624,7 +717,7 @@ local function recovers_initial_error_from_later_save()
 end
 
 local function recovers_configuration_load_failure_from_later_save()
-  local root = fs.tmpname()
+  local root = test_paths.temporary_name()
   fs.unlink(root)
   fs.mkdir(root)
   local filename = root .. "/main.titan"
@@ -646,7 +739,7 @@ local function recovers_configuration_load_failure_from_later_save()
         (project_service.Service?, project_service.Error?, project_loader.Restoration?)
       local loaded?,failure? = test_service.load {
         project_root = project_root,
-        installed_binary_modules_root = "/sdk/lib/titan/0.6",
+        installed_binary_modules_root = test_paths.sdk_binary_root(),
         analyzer = analyzer:analyze,
         snapshot_listener = snapshot_listener,
       }
@@ -666,7 +759,7 @@ local function recovers_configuration_load_failure_from_later_save()
            not app:indexing_metrics().refresh_chain_active
   end, "invalid cold configuration did not finish with a failure")
   test.assert(
-    contains_string(app:watched_directories_for_testing(), fs.realpath(root)),
+    contains_string(app:watched_directories_for_testing(), test_paths.canonical_path(root)),
     "configuration failure did not retain a provisional project watcher")
 
   local failed_statuses = #statuses
@@ -700,7 +793,7 @@ local function recovers_configuration_load_failure_from_later_save()
 end
 
 local function reconciles_expanded_scope_before_existing_analysis()
-  local workspace = fs.tmpname()
+  local workspace = test_paths.temporary_name()
   fs.unlink(workspace)
   fs.mkdir(workspace)
   local root = workspace .. "/project"
@@ -730,7 +823,7 @@ local function reconciles_expanded_scope_before_existing_analysis()
   local analyzer = YieldingAnalyzer.new(0, false, false, false, false)
   local service?, service_error? = test_service.load {
     project_root = root,
-    installed_binary_modules_root = "/sdk/lib/titan/0.6",
+    installed_binary_modules_root = test_paths.sdk_binary_root(),
     analyzer = analyzer:analyze,
   }
   test.assert(service_error == nil and service ~= nil,
@@ -753,7 +846,7 @@ local function reconciles_expanded_scope_before_existing_analysis()
              "expanded-scope analyzer did not start")
   test.assert(
     contains_string(
-      app:watched_directories_for_testing(), fs.realpath(next_root)),
+      app:watched_directories_for_testing(), test_paths.canonical_path(next_root)),
     "new source root was not watched before existing-Service analysis")
 
   local changed = "function answer(): integer return 987654 end\n"
@@ -984,7 +1077,7 @@ local function filters_irrelevant_watcher_hints()
                     project_root .. "/titan-config.lua.tmp")) and
                 not application.relevant_watch_change(
                   saved, project_watcher.PathChange.modified(
-                    "/outside/project.titan")) and
+                    test_paths.outside_project_file())) and
                 not application.relevant_watch_change(
                   filtered, project_watcher.PathChange.modified(
                     lookup_root .. "/external.titan")) and
@@ -1073,6 +1166,9 @@ local function filters_irrelevant_watcher_hints()
                "watch-set retirement did not refresh")
     test.assert(app:indexing_metrics().refresh_passes == before + 2,
                 "relevant watcher hints did not start bounded refreshes")
+    -- Both injected refreshes reconcile and restart the native watcher. Keep
+    -- directory creation below owned by the explicit batch under test.
+    app:stop_watching_for_testing()
 
     fs.mkdir(package_directory)
     fs.mkdir(build_directory)
@@ -1113,7 +1209,7 @@ local function filters_irrelevant_watcher_hints()
 end
 
 local function refreshes_unmapped_warnings_only_during_ordinary_discovery()
-  local root = fs.tmpname()
+  local root = test_paths.temporary_name()
   fs.unlink(root)
   fs.mkdir(root)
   local source_root = root .. "/src"
@@ -1143,7 +1239,7 @@ local function refreshes_unmapped_warnings_only_during_ordinary_discovery()
   local analyzer = YieldingAnalyzer.new(0, false, false, false, false)
   local service?, service_error? = test_service.load {
     project_root = root,
-    installed_binary_modules_root = "/sdk/lib/titan/0.6",
+    installed_binary_modules_root = test_paths.sdk_binary_root(),
     analyzer = analyzer:analyze,
   }
   test.assert(service_error == nil and service ~= nil,
@@ -1151,9 +1247,9 @@ local function refreshes_unmapped_warnings_only_during_ordinary_discovery()
   local app = application.create_with_service(root, service)
   defer app:close()
   local watched = app:watched_directories_for_testing()
-  test.assert(contains_string(watched, fs.realpath(root)) and
-              contains_string(watched, fs.realpath(source_root)) and
-              not contains_string(watched, fs.realpath(unmapped_root)),
+  test.assert(contains_string(watched, test_paths.canonical_path(root)) and
+              contains_string(watched, test_paths.canonical_path(source_root)) and
+              not contains_string(watched, test_paths.canonical_path(unmapped_root)),
               "unmapped branch acquired a native directory watcher")
   app:stop_watching_for_testing()
 
@@ -1232,7 +1328,7 @@ local function refreshes_unmapped_warnings_only_during_ordinary_discovery()
               #publications[loose_uri].items == 1 and
               #service:latest().project_modules == 2 and
               contains_string(app:watched_directories_for_testing(),
-                              fs.realpath(unmapped_root)),
+                              test_paths.canonical_path(unmapped_root)),
               "configured source root did not clear its warning and enter project scope")
   app:stop_watching_for_testing()
 
@@ -1334,7 +1430,7 @@ local function builds_semantics_from_independently_valid_modules()
 end
 
 local function failed_revision_waits_for_a_saved_change_and_recovers()
-  local root = fs.tmpname()
+  local root = test_paths.temporary_name()
   fs.unlink(root)
   fs.mkdir(root)
   local source_root = root .. "/src"
@@ -1353,7 +1449,7 @@ local function failed_revision_waits_for_a_saved_change_and_recovers()
   local analyzer = RecoveringAnalyzer.new(true, 0)
   local service?, service_error? = test_service.load {
     project_root = root,
-    installed_binary_modules_root = "/sdk/lib/titan/0.6",
+    installed_binary_modules_root = test_paths.sdk_binary_root(),
     analyzer = analyzer:analyze,
   }
   test.assert(service_error == nil and service ~= nil,
@@ -1447,7 +1543,7 @@ local function failed_revision_waits_for_a_saved_change_and_recovers()
 end
 
 local function rebuilds_view_when_external_recheck_fails_clean_module()
-  local root = fs.tmpname()
+  local root = test_paths.temporary_name()
   fs.unlink(root)
   fs.mkdir(root)
   local source_root = root .. "/src"
@@ -1553,7 +1649,7 @@ local function rebuilds_view_when_external_recheck_fails_clean_module()
   local service?, service_error? =
     test_service.load {
       project_root = root,
-      installed_binary_modules_root = "/sdk/lib/titan/0.6",
+      installed_binary_modules_root = test_paths.sdk_binary_root(),
       analyzer = analyzer,
       external_resolver = resolver,
     }
@@ -1705,7 +1801,7 @@ local function ignores_extensionless_temporary_during_active_refresh()
 end
 
 local function classifies_canonical_symlink_watcher_paths()
-  local workspace = fs.tmpname()
+  local workspace = test_paths.temporary_name()
   fs.unlink(workspace)
   fs.mkdir(workspace)
   local actual_root = workspace .. "/actual"
@@ -1722,16 +1818,6 @@ local function classifies_canonical_symlink_watcher_paths()
     "include = { './src' }\n" ..
     "source_module_roots = { './src', " ..
     "'./src/vendor.foo/future' }\n")
-  local linker = os.spawn("/bin/ln", {"-s", actual_root, linked_root})
-  local link_input? = linker.stdin
-  if link_input ~= nil then link_input:close() end
-  local link_status = linker:wait()
-  local link_output? = linker.stdout
-  if link_output ~= nil then link_output:close() end
-  local link_error? = linker.stderr
-  if link_error ~= nil then link_error:close() end
-  test.assert(link_status.code == 0 and link_status.signal == nil,
-              "could not create project-root symlink fixture")
   defer do
     if fs.lstat(linked_root) ~= nil then fs.unlink(linked_root) end
     if fs.lstat(filename) ~= nil then fs.unlink(filename) end
@@ -1741,11 +1827,13 @@ local function classifies_canonical_symlink_watcher_paths()
     if fs.lstat(actual_root) ~= nil then fs.rmdir(actual_root) end
     if fs.lstat(workspace) ~= nil then fs.rmdir(workspace) end
   end
+  test_links.directory(actual_root, linked_root,
+    "could not create project-root symlink fixture")
 
   local analyzer = YieldingAnalyzer.new(0, false, false, false, false)
   local service?, service_error? = test_service.load {
     project_root = linked_root,
-    installed_binary_modules_root = "/sdk/lib/titan/0.6",
+    installed_binary_modules_root = test_paths.sdk_binary_root(),
     analyzer = analyzer:analyze,
   }
   test.assert(service_error == nil and service ~= nil,
@@ -1757,18 +1845,18 @@ local function classifies_canonical_symlink_watcher_paths()
   test.assert(snapshot ~= nil, "symlinked project fixture has no snapshot")
   local saved = snapshot as project_service.Snapshot
 
-  local canonical_cache = fs.realpath(linked_root) .. "/.titan-ls"
+  local canonical_cache = test_paths.canonical_path(linked_root) .. "/.titan-ls"
   test.assert(not application.relevant_watch_change(saved,
     project_watcher.PathChange.modified(canonical_cache)) and
     not application.relevant_watch_change(saved,
       project_watcher.PathChange.modified(canonical_cache .. "/generated.titan")),
     "canonical workspace cache alias triggered saved-project indexing")
 
-  local canonical_source = fs.realpath(linked_root .. "/src")
+  local canonical_source = test_paths.canonical_path(linked_root .. "/src")
   local canonical_file = canonical_source .. "/main.titan"
   local canonical_package = canonical_source .. "/package"
   local canonical_future = canonical_source .. "/vendor.foo/future"
-  local canonical_config = fs.realpath(linked_root) .. "/titan-config.lua"
+  local canonical_config = test_paths.canonical_path(linked_root) .. "/titan-config.lua"
   test.assert(canonical_source ~= saved.config.include[1],
               "symlink fixture did not retain its lexical configured root")
   test.assert(application.relevant_watch_change(
@@ -1791,8 +1879,13 @@ local function classifies_canonical_symlink_watcher_paths()
               "deleted canonical source directory was filtered out")
 end
 
+function test_application_classifies_canonical_symlink_watcher_paths(
+    _context: test.Context)
+  test_runtime.run(classifies_canonical_symlink_watcher_paths)
+end
+
 local function watches_canonical_targets_of_lexically_mapped_include_symlinks()
-  local base = fs.tmpname()
+  local base = test_paths.temporary_name()
   fs.unlink(base)
   fs.mkdir(base)
   local project = base .. "/workspace"
@@ -1815,21 +1908,13 @@ local function watches_canonical_targets_of_lexically_mapped_include_symlinks()
   fs.write_file(filename, "function answer(): integer return 1 end\n")
   fs.write_file(config,
     "include = { 'link' }\nsource_module_roots = { '.' }\n")
-  local linker = os.spawn("/bin/ln", {"-s", actual, linked})
-  local link_input? = linker.stdin
-  if link_input ~= nil then link_input:close() end
-  local link_status = linker:wait()
-  local link_output? = linker.stdout
-  if link_output ~= nil then link_output:close() end
-  local link_error? = linker.stderr
-  if link_error ~= nil then link_error:close() end
-  test.assert(link_status.code == 0 and link_status.signal == nil,
-              "could not create lexical source-ancestry symlink fixture")
+  test_links.directory(actual, linked,
+    "could not create lexical source-ancestry symlink fixture")
 
   local analyzer = YieldingAnalyzer.new(0, false, false, false, false)
   local service?, service_error? = test_service.load {
     project_root = project,
-    installed_binary_modules_root = "/sdk/lib/titan/0.6",
+    installed_binary_modules_root = test_paths.sdk_binary_root(),
     analyzer = analyzer:analyze,
   }
   test.assert(service_error == nil and service ~= nil,
@@ -1842,8 +1927,8 @@ local function watches_canonical_targets_of_lexically_mapped_include_symlinks()
               saved.project_modules[1].module_name == "link.main" and
               #saved.discovery_issues == 0,
               "symlink target outside physical source root lost its lexical owner")
-  local canonical_file = fs.realpath(filename)
-  local canonical_nested = fs.realpath(actual) .. "/new_branch"
+  local canonical_file = test_paths.canonical_path(filename)
+  local canonical_nested = test_paths.canonical_path(actual) .. "/new_branch"
   test.assert(application.relevant_watch_change(
                 saved, project_watcher.PathChange.modified(canonical_file)) and
               application.relevant_watch_change(
@@ -1939,7 +2024,7 @@ local function probes_source_ancestors_with_titan_suffix()
              not metrics.refresh_chain_active
     end, "directory with Titan suffix did not reveal the future source-root path")
     test.assert(contains_string(app:watched_directories_for_testing(),
-                                fs.realpath(ancestor)),
+                                test_paths.canonical_path(ancestor)),
                 "source-root ancestor with Titan suffix did not acquire a watcher")
   end)
 end
@@ -2359,8 +2444,6 @@ function test_application_indexing_state_machine(_context: test.Context)
       "same-generation provider failure View rebuild",
       rebuilds_view_when_external_recheck_fails_clean_module)
     run_indexing_case(
-      "canonical symlink paths", classifies_canonical_symlink_watcher_paths)
-    run_indexing_case(
       "unchanged View reuse", reuses_view_without_unchanged_refresh)
     run_indexing_case(
       "saved failure repair fallback",
@@ -2371,7 +2454,7 @@ function test_application_indexing_state_machine(_context: test.Context)
 end
 
 local function rejects_save_during_successful_rename_preflight()
-  local root = fs.tmpname()
+  local root = test_paths.temporary_name()
   fs.unlink(root)
   fs.mkdir(root)
   local source_root = root .. "/src"
@@ -2389,7 +2472,7 @@ local function rejects_save_during_successful_rename_preflight()
   local analyzer = YieldingAnalyzer.new(0, false, false, false, false)
   local service?, service_error? = test_service.load {
     project_root = root,
-    installed_binary_modules_root = "/sdk/lib/titan/0.6",
+    installed_binary_modules_root = test_paths.sdk_binary_root(),
     analyzer = analyzer:analyze,
   }
   test.assert(service_error == nil and service ~= nil,
@@ -2578,7 +2661,7 @@ end
 
 local function with_restoring_application(missing: boolean,
     body: function (string, YieldingAnalyzer, RestorationGate, application.Application): ())
-  local root = fs.tmpname()
+  local root = test_paths.temporary_name()
   fs.unlink(root)
   fs.mkdir(root)
   local source_root = root .. "/src"
@@ -2598,7 +2681,7 @@ local function with_restoring_application(missing: boolean,
         (project_service.Service?,project_service.Error?,project_loader.Restoration?)
       local loaded?,failure? = test_service.load {
         project_root = project_root,
-        installed_binary_modules_root = "/sdk/lib/titan/0.6",
+        installed_binary_modules_root = test_paths.sdk_binary_root(),
         analyzer = analyzer:analyze,
         snapshot_listener = listener,
       }
@@ -2618,6 +2701,11 @@ local function with_restoring_application(missing: boolean,
       return loaded,nil,restoring
     end)
   defer do gate.block = false; app:close() end
+  -- Saved changes in this restoration fixture are injected explicitly. Keep
+  -- native hints from starting another epoch before its controlled READY.
+  app.watcher = project_watcher.start(
+    project_watcher.DirectoryScope.new({}, {}),
+    function (_batch: project_watcher.RediscoveryBatch) end)
   body(filename,analyzer,gate,app)
 end
 
@@ -2720,4 +2808,19 @@ end
 
 function test_application_closes_blocked_background_restoration(_context: test.Context)
   test_runtime.run(closes_blocked_restoration)
+end
+
+function test_application_native_windows_watch_paths(_context: test.Context)
+  if ffi.VSCODE_TITAN_WINDOWS == 0 then test.skip("native Windows paths") end
+  test.assert(application.parent_directory("C:/") == "C:/")
+  test.assert(application.parent_directory("W:/live/main.titan") == "W:/live")
+  test.assert(application.parent_directory("//server/share") == "//server/share")
+  test.assert(application.child_path("W:/", "main.titan") == "W:/main.titan")
+  test.assert(application.leaf_name("W:/main.titan") == "main.titan")
+  test.assert(application.path_within("W:/", "W:/main.titan") and
+              not application.path_within("C:/", "W:/main.titan"))
+  test.assert(application.valid_relative_directory("W:/", "W:/pkg/nested") and
+              not application.valid_relative_directory("W:/", "W:/build.debug"))
+  test.assert(application.rebase_path("C:/main.titan", "C:/", "W:/") ==
+              "W:/main.titan")
 end

@@ -8,6 +8,7 @@ import {
   writeFile
 } from "node:fs/promises";
 import * as path from "node:path";
+import { receiptPath, verifyCompilerReceipt } from "./windows-compiler-receipt.mjs";
 
 const repositoryRoot = process.cwd();
 const titanRepository = path.resolve(
@@ -66,7 +67,7 @@ const luaRockComponents = [
     name: "LuaFileSystem",
     rockName: "luafilesystem",
     version: "1.9.0-1",
-    payloads: [path.join(luaNativeRoot, "lfs.so")],
+    payloads: [path.join(luaNativeRoot, process.platform === "win32" ? "lfs.dll" : "lfs.so")],
     licenseRelativePath: path.join("docs", "license.html"),
     licenseDestination: path.join("lua", "luafilesystem", "LICENSE.html"),
     licenseMarkers: ["<h1>License</h1>", "The LuaFileSystem authors"]
@@ -77,7 +78,7 @@ const luaRockComponents = [
     rockDirectory: "lpeglabel",
     version: "1.6.2-1",
     payloads: [
-      path.join(luaNativeRoot, "lpeglabel.so"),
+      path.join(luaNativeRoot, process.platform === "win32" ? "lpeglabel.dll" : "lpeglabel.so"),
       path.join(luaShareRoot, "relabel.lua")
     ],
     licenseRelativePath: path.join("doc", "LICENSE"),
@@ -173,7 +174,9 @@ async function copyRequired(source, destination, description) {
 async function stageTitanNotices() {
   const destination = path.join(outputRoot, "titan");
   await copyRequired(
-    path.join(titanRepository, "LICENSE"),
+    process.platform === "win32"
+      ? path.join(titanPrefix, "share", "titan", "LICENSE")
+      : path.join(titanRepository, "LICENSE"),
     path.join(destination, "LICENSE"),
     "Titan license"
   );
@@ -201,6 +204,23 @@ async function stageTitanNotices() {
 
 async function stageLuaNotices() {
   const versions = [];
+  if (process.platform === "win32") {
+    // Validate the installed source receipt against every shipped native/Lua
+    // artifact and notice; Windows has no LuaRocks installation to consult.
+    const rows = await verifyCompilerReceipt(titanPrefix);
+    await copyRequired(path.join(titanPrefix, receiptPath),
+      path.join(outputRoot, "lua", "compiler-dependencies.tsv"), "compiler dependency receipt");
+    for (const name of [...new Set(rows.map((row) => row.name))]) {
+      const row = rows.find((entry) => entry.name === name);
+      const source = path.join(titanPrefix, row.notice);
+      const contents = await readRequired(source, `${name} source license`);
+      requireContent(contents, "Permission is hereby granted", source, "MIT license source");
+      const destination = path.join("lua", name, "LICENSE");
+      await copyRequired(source, path.join(outputRoot, destination), `${name} license`);
+      versions.push({ name, version: row.version, notice: destination });
+    }
+    return versions;
+  }
 
   const luaRocksVersion = "3.13.0";
   const installedConfig = path.join(luaShareRoot, "luarocks", "core", "cfg.lua");
@@ -319,8 +339,11 @@ async function stageJavaScriptNotices() {
     );
     const destination = path.join(outputRoot, "javascript", packageName);
     await mkdir(destination, { recursive: true });
+    const sourceNames = new Set(await readdir(packageRoot));
     let copied = 0;
     for (const filename of licenseNames) {
+      // Preserve the real basename on case-insensitive filesystems as well.
+      if (!sourceNames.has(filename)) continue;
       try {
         await copyFile(
           path.join(packageRoot, filename),
@@ -350,7 +373,9 @@ await writeFile(
     "# Bundled component notices",
     "",
     "This VSIX contains the native Titan language-server executable and its",
-    "selected statically linked runtime modules, the Titan compiler and its Lua",
+    process.platform === "win32"
+      ? "DLL application, controlled shared Lua and native runtime DLLs, plus the compiler and its Lua"
+      : "selected statically linked runtime modules, the Titan compiler and its Lua",
     "dependencies under `share/lua/5.5` and `lib/lua/5.5`,",
     "and a bundled JavaScript language client. Their license and notice files are",
     "preserved below. The extension's own license is at the VSIX root.",

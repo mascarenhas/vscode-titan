@@ -1,3 +1,4 @@
+foreign import "compiler_io_platform.h"
 local iteration = import "iteration"
 local lua = import "lua"
 local math = import "math"
@@ -535,20 +536,36 @@ local function embedded_provider_identity(
       "embedded compiler provider identity kind must be 'file', found '" ..
       kind .. "'")
   end
+  local native_identity?: string = candidate["native_identity"]
+  local device?: integer = nil
+  local inode?: integer = nil
+  if ffi.VSCODE_TITAN_WINDOWS ~= 0 then
+    if native_identity == nil or #native_identity == 0 or
+       candidate["device"] ~= nil or candidate["inode"] ~= nil then
+      return fail<|compiler_io.LstatIdentity|>(DRIVER_MODULE,
+        "Windows embedded provider requires its full opaque native identity")
+    end
+  else
+    device = required_integer(candidate["device"], DRIVER_MODULE,
+                              "embedded compiler provider identity.device")
+    inode = required_integer(candidate["inode"], DRIVER_MODULE,
+                             "embedded compiler provider identity.inode")
+    if native_identity ~= nil then
+      return fail<|compiler_io.LstatIdentity|>(DRIVER_MODULE,
+        "unexpected opaque identity for Unix embedded provider")
+    end
+  end
   return compiler_io.LstatIdentity.new(
     path,
     required_integer(candidate["size"], DRIVER_MODULE,
                      "embedded compiler provider identity.size"),
     kind,
-    required_integer(candidate["device"], DRIVER_MODULE,
-                     "embedded compiler provider identity.device"),
-    required_integer(candidate["inode"], DRIVER_MODULE,
-                     "embedded compiler provider identity.inode"),
+    device, inode,
     required_integer(candidate["modified_seconds"], DRIVER_MODULE,
                      "embedded compiler provider identity.modified_seconds"),
     required_integer(
       candidate["modified_nanoseconds"], DRIVER_MODULE,
-      "embedded compiler provider identity.modified_nanoseconds"))
+      "embedded compiler provider identity.modified_nanoseconds"), native_identity)
 end
 
 local function required_boolean(candidate: value, module_name: string,
@@ -757,6 +774,93 @@ local function required_string_list(candidate: value, module_name: string,
   return result
 end
 
+-- Compiler observations may use canonical extended Windows filesystem roots.
+-- Validate their root grammar without normalizing any bytes: these paths are
+-- provenance, not user-facing file URIs. Keep this aligned with the compiler's
+-- windows_path.is_absolute rather than SourceText's deliberately narrower API.
+local function metadata_separator(byte: integer, extended: boolean): boolean
+  if byte == 92 then return true end
+  if not extended and byte == 47 then return true end
+  return false
+end
+
+local function metadata_drive(byte: integer): boolean
+  if byte >= 65 and byte <= 90 then return true end
+  return byte >= 97 and byte <= 122
+end
+
+local function metadata_unc_root(path: string, start: integer,
+                                  extended: boolean): boolean
+  local server_end = start
+  while server_end <= #path and
+        not metadata_separator(strings.byte(path, server_end), extended) do
+    server_end = server_end + 1
+  end
+  if server_end > #path then return false end
+  local server = strings.sub(path, start, server_end - 1)
+  local share_start = server_end + 1
+  local share_end = share_start
+  while share_end <= #path and
+        not metadata_separator(strings.byte(path, share_end), extended) do
+    share_end = share_end + 1
+  end
+  local share = strings.sub(path, share_start, share_end - 1)
+  return server ~= "" and server ~= "." and server ~= ".." and
+         share ~= "" and share ~= "." and share ~= ".."
+end
+
+local function metadata_volume_root(component: string): boolean
+  if #component ~= 44 or strings.lower(strings.sub(component, 1, 7)) ~= "volume{" or
+     strings.sub(component, -1) ~= "}" then return false end
+  local guid = strings.sub(component, 8, -2)
+  for index = 1, 36 do
+    local byte: integer = strings.byte(guid, index)
+    if index == 9 or index == 14 or index == 19 or index == 24 then
+      if byte ~= 45 then return false end
+    else
+      local hex = false
+      if byte >= 48 and byte <= 57 then hex = true end
+      if byte >= 65 and byte <= 70 then hex = true end
+      if byte >= 97 and byte <= 102 then hex = true end
+      if not hex then return false end
+    end
+  end
+  return true
+end
+
+local function windows_metadata_absolute_path(path: string): boolean
+  if path == "" or strings.find(path, "\0") ~= nil then return false end
+  if strings.sub(path, 1, 4) == "\\\\?\\" then
+    if strings.find(path, "/") ~= nil then return false end
+    if #path >= 7 and metadata_drive(strings.byte(path, 5)) and
+       strings.sub(path, 6, 7) == ":\\" then return true end
+    if strings.upper(strings.sub(path, 5, 8)) == "UNC\\" then
+      return metadata_unc_root(path, 9, true)
+    end
+    local slash? = strings.find(path, "\\", 5)
+    return slash ~= nil and
+           metadata_volume_root(strings.sub(path, 5, slash - 1))
+  end
+  if #path >= 3 and metadata_drive(strings.byte(path, 1)) and
+     strings.sub(path, 2, 2) == ":" then
+    return metadata_separator(strings.byte(path, 3), false)
+  end
+  if #path < 2 or not metadata_separator(strings.byte(path, 1), false) or
+     not metadata_separator(strings.byte(path, 2), false) then return false end
+  if #path >= 4 and metadata_separator(strings.byte(path, 4), false) and
+     (strings.sub(path, 3, 3) == "?" or strings.sub(path, 3, 3) == ".") then
+    return false
+  end
+  return metadata_unc_root(path, 3, false)
+end
+
+local function metadata_absolute_path(path: string): boolean
+  if ffi.VSCODE_TITAN_WINDOWS ~= 0 then
+    return windows_metadata_absolute_path(path)
+  end
+  return strings.sub(path, 1, 1) == "/"
+end
+
 local function normalize_c_header_dependencies(
     candidate: value, subject: string): {CHeaderDependency}
   if candidate == nil then return {} end
@@ -787,7 +891,7 @@ local function normalize_c_header_dependencies(
     local identity = required_string(
       item["identity"], DRIVER_MODULE,
       subject .. "[" .. index .. "].identity")
-    if strings.sub(path, 1, 1) ~= "/" then
+    if not metadata_absolute_path(path) then
       return fail<|{CHeaderDependency}|>(DRIVER_MODULE,
         subject .. "[" .. index .. "].path must be absolute")
     elseif identity == "" then
@@ -3820,7 +3924,7 @@ local function copy_provider_identity(
     source: compiler_io.LstatIdentity): compiler_io.LstatIdentity
   return compiler_io.LstatIdentity.new(
     source.path, source.size, source.kind, source.device, source.inode,
-    source.modified_seconds, source.modified_nanoseconds)
+    source.modified_seconds, source.modified_nanoseconds, source.native_identity)
 end
 
 -- The embedded provider never traverses the compiler's filesystem
@@ -5001,12 +5105,7 @@ function Compiler:completion_binary_catalog(): {CompletionBinary}
       checked[key] = true
       local identity? = binary.provider_identity
       if identity ~= nil then
-        local current? = fs.stat(identity.path)
-        valid[key] = current ~= nil and current.size == identity.size and
-          current.kind == identity.kind and current.device == identity.device and
-          current.inode == identity.inode and
-          current.modified_seconds == identity.modified_seconds and
-          current.modified_nanoseconds == identity.modified_nanoseconds
+        valid[key] = compiler_io.lstat_identity_is_current(identity)
       end
     end
     if valid[key] then result[#result + 1] = binary end

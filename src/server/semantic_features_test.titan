@@ -9,6 +9,13 @@ local features = import "server.semantic_features"
 local wire = import "server.wire"
 local lsp = import "server.lsp_types"
 local source_text = import "server.source_text"
+local test_paths = import "server.test_paths"
+foreign import "compiler_io_platform.h"
+
+local function vendor_root(): string
+  if ffi.VSCODE_TITAN_WINDOWS ~= 0 then return "C:/vendor" end
+  return "/vendor"
+end
 
 local function location(filename: string, line: integer,
                         column: integer): bridge.SourceLocation
@@ -126,7 +133,7 @@ end
 function test_semantic_features_reports_index_build_context(
     _context: test.Context)
   runtime.run(function ()
-    local filename = "/workspace/invalid-index.titan"
+    local filename = test_paths.workspace_root() .. "/invalid-index.titan"
     local rejected = false
     do
       features.build({project("invalid_index", {
@@ -157,7 +164,7 @@ function test_semantic_features_reuses_indexed_file_coordinates(
     local files: {bridge.SourceFile} = {}
     local filenames: {string} = {}
     for index = 1, 8 do
-      local filename = "/workspace/reuse" .. index .. ".titan"
+      local filename = test_paths.workspace_root() .. "/reuse" .. index .. ".titan"
       filenames[index] = filename
       files[index] = bridge.SourceFile.new(
         filename, strings.rep("a", 1100) .. "\n")
@@ -233,8 +240,8 @@ function test_semantic_features_retains_unchanged_facts_and_prunes_old_file_owne
   runtime.run(function ()
     local store = stores.open(":memory:")
     defer store:close()
-    local main_file, old_file = "/workspace/folder/main.titan", "/workspace/folder/old.titan"
-    local keep_file = "/workspace/keep.titan"
+    local main_file, old_file = test_paths.workspace_root() .. "/folder/main.titan", test_paths.workspace_root() .. "/folder/old.titan"
+    local keep_file = test_paths.workspace_root() .. "/keep.titan"
     local main = bridge.SourceFile.new(main_file, "first\nbody\nend\n")
     local old = bridge.SourceFile.new(old_file, "second\nbody\nend\n")
     local keep = bridge.SourceFile.new(keep_file, "third\nbody\nend\n")
@@ -251,11 +258,11 @@ function test_semantic_features_retains_unchanged_facts_and_prunes_old_file_owne
       defer access:release()
       stores.execute(access.connection,
         "CREATE TEMP TRIGGER retain_hovers BEFORE DELETE ON main.semantic_hovers " ..
-        "WHEN OLD.filename=CAST('/workspace/keep.titan' AS BLOB) " ..
+        "WHEN OLD.filename=CAST('" .. keep_file .. "' AS BLOB) " ..
         "BEGIN SELECT RAISE(ABORT,'retained hover'); END")
       stores.execute(access.connection,
         "CREATE TEMP TRIGGER retain_folds BEFORE DELETE ON main.semantic_folds " ..
-        "WHEN OLD.filename=CAST('/workspace/keep.titan' AS BLOB) " ..
+        "WHEN OLD.filename=CAST('" .. keep_file .. "' AS BLOB) " ..
         "BEGIN SELECT RAISE(ABORT,'retained fold'); END")
     end
     a = project("folder", {main})
@@ -293,9 +300,9 @@ function test_semantic_features_rebuilds_all_facts_after_missing_file_ownership(
   runtime.run(function ()
     local store = stores.open(":memory:")
     defer store:close()
-    local clean_file = "/workspace/clean.titan"
-    local failed_file = "/workspace/failed.titan"
-    local removed_file = "/workspace/removed.titan"
+    local clean_file = test_paths.workspace_root() .. "/clean.titan"
+    local failed_file = test_paths.workspace_root() .. "/failed.titan"
+    local removed_file = test_paths.workspace_root() .. "/removed.titan"
     local clean = project("clean", {bridge.SourceFile.new(clean_file, "first\nbody\nend\n")})
     local failed = project("failed", {bridge.SourceFile.new(failed_file, "local broken = missing\n")})
     local removed = project("removed", {bridge.SourceFile.new(removed_file, "old\nbody\nend\n")})
@@ -354,7 +361,7 @@ function test_semantic_features_rejects_stale_update_before_pruning(
   runtime.run(function ()
     local store = stores.open(":memory:")
     defer store:close()
-    local a_file, b_file = "/workspace/a.titan", "/workspace/b.titan"
+    local a_file, b_file = test_paths.workspace_root() .. "/a.titan", test_paths.workspace_root() .. "/b.titan"
     local a = project("a", {bridge.SourceFile.new(a_file, "first\nbody\nend\n")})
     local b = project("b", {bridge.SourceFile.new(b_file, "second\nbody\nend\n")})
     local integer_type = bridge.TypeInfo.new("Type.Integer", "integer")
@@ -402,9 +409,9 @@ end
 function test_semantic_features_definition_and_all_project_references(
     _context: test.Context)
   runtime.run(function ()
-    local main_file = "/workspace/pkg/pkg.titan"
-    local part_file = "/workspace/pkg/use.titan"
-    local user_file = "/workspace/use.titan"
+    local main_file = test_paths.workspace_root() .. "/pkg/pkg.titan"
+    local part_file = test_paths.workspace_root() .. "/pkg/use.titan"
+    local user_file = test_paths.workspace_root() .. "/use.titan"
     local symbol = "export:pkg:answer"
     local model = features.build({
       project("use", {
@@ -432,7 +439,7 @@ function test_semantic_features_definition_and_all_project_references(
     local definition? = model:definition(
       user_file, source_text.Position.new(1, 16))
     test.assert(definition ~= nil and
-                definition.uri == "file:///workspace/pkg/pkg.titan" and
+                definition.uri == test_paths.workspace_uri() .. "/pkg/pkg.titan" and
                 definition.range.start.line == 0 and
                 definition.range.start.character == 0 and
                 definition.range.finish.character == 6,
@@ -441,14 +448,14 @@ function test_semantic_features_definition_and_all_project_references(
     local without = model:references(
       user_file, source_text.Position.new(1, 16), false)
     test.assert(#without == 2 and
-                without[1].uri == "file:///workspace/pkg/use.titan" and
-                without[2].uri == "file:///workspace/use.titan",
+                without[1].uri == test_paths.workspace_uri() .. "/pkg/use.titan" and
+                without[2].uri == test_paths.workspace_uri() .. "/use.titan",
                 "references did not exclude the declaration or sort by path")
     local with_declaration = model:references(
       user_file, source_text.Position.new(1, 16), true)
     test.assert(#with_declaration == 3 and
                 with_declaration[1].uri ==
-                  "file:///workspace/pkg/pkg.titan",
+                  test_paths.workspace_uri() .. "/pkg/pkg.titan",
                 "includeDeclaration did not include the project definition")
   end)
 end
@@ -456,8 +463,8 @@ end
 function test_semantic_features_excludes_external_definition_locations(
     _context: test.Context)
   runtime.run(function ()
-    local project_file = "/workspace/main.titan"
-    local external_file = "/vendor/dep.titan"
+    local project_file = test_paths.workspace_root() .. "/main.titan"
+    local external_file = vendor_root() .. "/dep.titan"
     local symbol = "export:vendor.dep:remote"
     local model = features.build({project("main", {
       bridge.SourceFile.new(project_file, "local x = remote\n"),
@@ -480,7 +487,7 @@ function test_semantic_features_excludes_external_definition_locations(
     local references = model:references(
       project_file, source_text.Position.new(0, 12), true)
     test.assert(#references == 1 and
-                references[1].uri == "file:///workspace/main.titan",
+                references[1].uri == test_paths.workspace_uri() .. "/main.titan",
                 "external source leaked into all-project references")
     local rename?, rename_error? = model:rename(
       project_file, source_text.Position.new(0, 12), "renamed")
@@ -493,7 +500,7 @@ end
 function test_semantic_features_hover_preserves_compiler_type_views(
     _context: test.Context)
   runtime.run(function ()
-    local filename = "/workspace/hover.titan"
+    local filename = test_paths.workspace_root() .. "/hover.titan"
     local integer_type = bridge.TypeInfo.new("Type.Integer", "integer")
     local float_type = bridge.TypeInfo.new("Type.Float", "float")
     local symbol = "ast:hover:/workspace/hover.titan:1:7:count"
@@ -528,7 +535,7 @@ end
 function test_semantic_features_hover_matches_nodes_after_unicode_prefix(
     _context: test.Context)
   runtime.run(function ()
-    local filename = "/workspace/unicode_hover.titan"
+    local filename = test_paths.workspace_root() .. "/unicode_hover.titan"
     local integer_type = bridge.TypeInfo.new("Type.Integer", "integer")
     local symbol = "ast:unicode-hover:count"
     local model = features.build({project("unicode_hover", {
@@ -555,7 +562,7 @@ end
 function test_semantic_features_hover_reads_unnamed_adjustment_ancestors(
     _context: test.Context)
   runtime.run(function ()
-    local filename = "/workspace/ancestor_hover.titan"
+    local filename = test_paths.workspace_root() .. "/ancestor_hover.titan"
     local integer_type = bridge.TypeInfo.new("Type.Integer", "integer")
     local float_type = bridge.TypeInfo.new("Type.Float", "float")
     local symbol = "ast:hover:/workspace/ancestor_hover.titan:1:7:count"
@@ -602,7 +609,7 @@ end
 function test_semantic_features_hover_prefers_named_callable_signatures(
     _context: test.Context)
   runtime.run(function ()
-    local filename = "/workspace/callable_hover.titan"
+    local filename = test_paths.workspace_root() .. "/callable_hover.titan"
     local function_type = bridge.TypeInfo.new(
       "Type.Function", "function (integer): string")
     local model = features.build({project("sample", {
@@ -638,7 +645,7 @@ end
 function test_semantic_features_hover_appends_cached_aggregate_summary(
     _context: test.Context)
   runtime.run(function ()
-    local filename = "/workspace/aggregate_hover.titan"
+    local filename = test_paths.workspace_root() .. "/aggregate_hover.titan"
     local record_type = bridge.TypeInfo.new(
       "Type.Record", "sample.Box<|integer|>")
     local symbol = occurrence(
@@ -675,7 +682,7 @@ end
 function test_semantic_features_hover_reports_imported_terms(
     _context: test.Context)
   runtime.run(function ()
-    local filename = "/workspace/import_hover.titan"
+    local filename = test_paths.workspace_root() .. "/import_hover.titan"
     local module_type = bridge.TypeInfo.new(
       "Type.Module", "module titan.math")
     local float_type = bridge.TypeInfo.new("Type.Float", "float")
@@ -740,7 +747,7 @@ end
 function test_semantic_features_hover_returns_nil_at_empty_position(
     _context: test.Context)
   runtime.run(function ()
-    local filename = "/workspace/empty_hover.titan"
+    local filename = test_paths.workspace_root() .. "/empty_hover.titan"
     local integer_type = bridge.TypeInfo.new("Type.Integer", "integer")
     local symbol =
       "ast:empty_hover:/workspace/empty_hover.titan:1:7:item"
@@ -765,8 +772,8 @@ end
 function test_semantic_features_uses_half_open_structural_folding_spans(
     _context: test.Context)
   runtime.run(function ()
-    local filename = "/workspace/fold.titan"
-    local external_file = "/vendor/fold.titan"
+    local filename = test_paths.workspace_root() .. "/fold.titan"
+    local external_file = vendor_root() .. "/fold.titan"
     local contents =
       "function outer()\n" ..
       "  if ready then\n" ..
@@ -830,7 +837,7 @@ end
 function test_semantic_features_folds_multiline_comments_only(
     _context: test.Context)
   runtime.run(function ()
-    local filename = "/workspace/comment_fold.titan"
+    local filename = test_paths.workspace_root() .. "/comment_fold.titan"
     local contents =
       "--[=[\n" ..
       "header 😀\n" ..
@@ -869,7 +876,7 @@ end
 function test_semantic_features_deduplicates_equal_comment_and_structural_folds(
     _context: test.Context)
   runtime.run(function ()
-    local filename = "/workspace/equal_fold.titan"
+    local filename = test_paths.workspace_root() .. "/equal_fold.titan"
     local contents =
       "function first() --[[\n" ..
       "body\n" ..
@@ -901,7 +908,7 @@ end
 function test_semantic_features_comment_fold_keeps_trailing_code_visible(
     _context: test.Context)
   runtime.run(function ()
-    local filename = "/workspace/comment_trailing_code.titan"
+    local filename = test_paths.workspace_root() .. "/comment_trailing_code.titan"
     local contents =
       "--[[\n" ..
       "comment\n" ..
@@ -922,7 +929,7 @@ end
 function test_semantic_features_folds_incomplete_parseable_saved_source(
     _context: test.Context)
   runtime.run(function ()
-    local filename = "/workspace/draft_fold.titan"
+    local filename = test_paths.workspace_root() .. "/draft_fold.titan"
     -- This is a valid checked draft despite its empty unfinished branch and
     -- missing trailing newline. Compiler spans, not keyword guessing, own both
     -- structural ranges.
@@ -953,9 +960,9 @@ function test_semantic_features_folds_incomplete_parseable_saved_source(
 end
 
 local function rename_fixture(): features.Features
-  local main_file = "/workspace/pkg/pkg.titan"
-  local part_file = "/workspace/pkg/use.titan"
-  local user_file = "/workspace/use.titan"
+  local main_file = test_paths.workspace_root() .. "/pkg/pkg.titan"
+  local part_file = test_paths.workspace_root() .. "/pkg/use.titan"
+  local user_file = test_paths.workspace_root() .. "/use.titan"
   local symbol = "export:pkg:answer"
   return features.build({
     project("pkg", {
@@ -985,32 +992,32 @@ function test_semantic_features_rename_requires_successful_compiler_preflight(
     local model = rename_fixture()
     defer model:close()
     local candidate?, candidate_error? = model:rename(
-      "/workspace/pkg/pkg.titan", source_text.Position.new(0, 2), "sum")
+      test_paths.workspace_root() .. "/pkg/pkg.titan", source_text.Position.new(0, 2), "sum")
     test.assert(candidate_error == nil and candidate ~= nil and
                 candidate:source_name() == "answer" and
                 candidate:target_name() == "sum",
                 "valid rename did not produce an unverified candidate")
     local edited = candidate:edited_project_modules()
-    test.assert(find_contents(edited, "/workspace/pkg/pkg.titan") ==
+    test.assert(find_contents(edited, test_paths.workspace_root() .. "/pkg/pkg.titan") ==
                   "sum = 1\n" and
-                find_contents(edited, "/workspace/pkg/use.titan") ==
+                find_contents(edited, test_paths.workspace_root() .. "/pkg/use.titan") ==
                   "local other = sum\n" and
-                find_contents(edited, "/workspace/use.titan") ==
+                find_contents(edited, test_paths.workspace_root() .. "/use.titan") ==
                   "local copy = sum\n",
                 "rename candidate did not edit the complete saved project")
 
     local renamed = "export:pkg:sum"
     local checked = bridge.Analysis.new("pkg", {}, {
-      snapshot("pkg", "/workspace/pkg/pkg.titan", {
-        "/workspace/pkg/pkg.titan", "/workspace/pkg/use.titan",
+      snapshot("pkg", test_paths.workspace_root() .. "/pkg/pkg.titan", {
+        test_paths.workspace_root() .. "/pkg/pkg.titan", test_paths.workspace_root() .. "/pkg/use.titan",
       }, {}, {
-        occurrence("/workspace/pkg/pkg.titan", 1, 1, 4, "sum", renamed,
+        occurrence(test_paths.workspace_root() .. "/pkg/pkg.titan", 1, 1, 4, "sum", renamed,
                    bridge.OccurrenceRole.definition(), false, nil),
-        occurrence("/workspace/pkg/use.titan", 1, 15, 18, "sum", renamed,
+        occurrence(test_paths.workspace_root() .. "/pkg/use.titan", 1, 15, 18, "sum", renamed,
                    bridge.OccurrenceRole.reference(), false, nil),
       }),
-      snapshot("use", "/workspace/use.titan", {"/workspace/use.titan"}, {}, {
-        occurrence("/workspace/use.titan", 1, 14, 17, "sum", renamed,
+      snapshot("use", test_paths.workspace_root() .. "/use.titan", {test_paths.workspace_root() .. "/use.titan"}, {}, {
+        occurrence(test_paths.workspace_root() .. "/use.titan", 1, 14, 17, "sum", renamed,
                    bridge.OccurrenceRole.reference(), false, nil),
       }),
     }, {}, {}, {})
@@ -1019,9 +1026,9 @@ function test_semantic_features_rename_requires_successful_compiler_preflight(
                 "consistent compiler bindings did not verify the rename")
     local documents = verified:document_edits()
     test.assert(#documents == 3 and
-                documents[1].uri == "file:///workspace/pkg/pkg.titan" and
-                documents[2].uri == "file:///workspace/pkg/use.titan" and
-                documents[3].uri == "file:///workspace/use.titan" and
+                documents[1].uri == test_paths.workspace_uri() .. "/pkg/pkg.titan" and
+                documents[2].uri == test_paths.workspace_uri() .. "/pkg/use.titan" and
+                documents[3].uri == test_paths.workspace_uri() .. "/use.titan" and
                 documents[1].edits[1].range.finish.character == 6 and
                 documents[1].edits[1].new_text == "sum",
                 "verified workspace edits were not deterministic or pre-edit")
@@ -1038,29 +1045,29 @@ function test_semantic_features_rename_rejects_invalid_names_and_capture(
     local model = rename_fixture()
     defer model:close()
     local invalid?, invalid_error? = model:rename(
-      "/workspace/pkg/pkg.titan", source_text.Position.new(0, 2), "function")
+      test_paths.workspace_root() .. "/pkg/pkg.titan", source_text.Position.new(0, 2), "function")
     test.assert(invalid == nil and invalid_error ~= nil,
                 "rename accepted a Titan keyword")
 
     local candidate?, candidate_error? = model:rename(
-      "/workspace/pkg/pkg.titan", source_text.Position.new(0, 2), "sum")
+      test_paths.workspace_root() .. "/pkg/pkg.titan", source_text.Position.new(0, 2), "sum")
     test.assert(candidate_error == nil and candidate ~= nil,
                 "capture fixture did not produce a candidate")
     local exported = "export:pkg:sum"
     local captured = "ast:pkg:/workspace/pkg/use.titan:1:7:sum"
     local split = bridge.Analysis.new("pkg", {}, {
-      snapshot("pkg", "/workspace/pkg/pkg.titan", {
-        "/workspace/pkg/pkg.titan", "/workspace/pkg/use.titan",
+      snapshot("pkg", test_paths.workspace_root() .. "/pkg/pkg.titan", {
+        test_paths.workspace_root() .. "/pkg/pkg.titan", test_paths.workspace_root() .. "/pkg/use.titan",
       }, {}, {
-        occurrence("/workspace/pkg/pkg.titan", 1, 1, 4, "sum", exported,
+        occurrence(test_paths.workspace_root() .. "/pkg/pkg.titan", 1, 1, 4, "sum", exported,
                    bridge.OccurrenceRole.definition(), false, nil),
-        occurrence("/workspace/pkg/use.titan", 1, 7, 12, "other", captured,
+        occurrence(test_paths.workspace_root() .. "/pkg/use.titan", 1, 7, 12, "other", captured,
                    bridge.OccurrenceRole.definition(), true, nil),
-        occurrence("/workspace/pkg/use.titan", 1, 15, 18, "sum", captured,
+        occurrence(test_paths.workspace_root() .. "/pkg/use.titan", 1, 15, 18, "sum", captured,
                    bridge.OccurrenceRole.reference(), true, nil),
       }),
-      snapshot("use", "/workspace/use.titan", {"/workspace/use.titan"}, {}, {
-        occurrence("/workspace/use.titan", 1, 14, 17, "sum", exported,
+      snapshot("use", test_paths.workspace_root() .. "/use.titan", {test_paths.workspace_root() .. "/use.titan"}, {}, {
+        occurrence(test_paths.workspace_root() .. "/use.titan", 1, 14, 17, "sum", exported,
                    bridge.OccurrenceRole.reference(), false, nil),
       }),
     }, {}, {}, {})
@@ -1106,7 +1113,7 @@ local function assert_materialized_view(view: features.Features, filename: strin
 end
 
 local function materialized_roundtrip(path: string)
-  local filename = "/workspace/materialized.titan"
+  local filename = test_paths.workspace_root() .. "/materialized.titan"
   local output = strings.writer()
   local nodes: {bridge.Node} = {}
   local symbols: {bridge.SymbolOccurrence} = {}

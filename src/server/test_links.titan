@@ -1,0 +1,30 @@
+foreign import "compiler_io_platform.h"
+local os = import "os"
+local test = import "test"
+
+-- Directory-link fixtures retain their native path arguments and report a
+-- missing Windows privilege only after the actual creation attempt.
+function directory(source: string, link: string, message: string)
+  local command = "/bin/ln"
+  local arguments = {"-s", source, link}
+  if ffi.VSCODE_TITAN_WINDOWS ~= 0 then
+    local fixture? = os.getenv("TITAN_COMPILER_IO_PROCESS_FIXTURE")
+    test.assert(fixture ~= nil and #fixture > 0,
+      "directory-link tests require TITAN_COMPILER_IO_PROCESS_FIXTURE")
+    command = fixture
+    arguments = {"directory-symbolic-link", source, link}
+  end
+  local linker = os.spawn(command, arguments)
+  local link_input? = linker.stdin
+  if link_input ~= nil then link_input:close() end
+  local status = linker:wait()
+  local link_output? = linker.stdout
+  if link_output ~= nil then link_output:close() end
+  local link_error? = linker.stderr
+  if link_error ~= nil then link_error:close() end
+  if ffi.VSCODE_TITAN_WINDOWS ~= 0 and
+     status.code == 1314 and status.signal == nil then
+    test.skip("Windows account cannot create directory symbolic links (Win32 1314)")
+  end
+  test.assert(status.code == 0 and status.signal == nil, message)
+end

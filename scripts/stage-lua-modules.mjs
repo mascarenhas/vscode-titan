@@ -14,14 +14,14 @@ const EXPECTED_SHARE_ROOT = [
   "argparse.lua:file",
   "c-parser:directory",
   "inspect.lua:file",
-  "luarocks:directory",
+  ...(process.platform === "win32" ? [] : ["luarocks:directory"]),
   "relabel.lua:file",
   "titan:directory",
   "titan-compiler:directory"
 ];
 const EXPECTED_NATIVE_ROOT = [
-  "lfs.so:file",
-  "lpeglabel.so:file"
+  `lfs.${process.platform === "win32" ? "dll" : "so"}:file`,
+  `lpeglabel.${process.platform === "win32" ? "dll" : "so"}:file`
 ];
 const REQUIRED_SHARE_FILES = [
   "c-parser/cdriver.lua",
