@@ -25,6 +25,7 @@ end
 record CompletionRequest
   id: RequestId
   params: lsp.CompletionParams
+  options: lsp.CompletionOptions?
 end
 
 union SemanticOutcome
@@ -45,6 +46,7 @@ end
 
 record Dispatcher
   local lifecycle_state: lifecycle.Lifecycle
+  local completion_options: lsp.CompletionOptions?
 end
 
 local PARSE_ERROR = -32700
@@ -55,7 +57,7 @@ local MIN_REQUEST_ID = -2147483648
 local MAX_REQUEST_ID = 2147483647
 
 function create(): Dispatcher
-  return Dispatcher.new(lifecycle.create())
+  return Dispatcher.new(lifecycle.create(), nil)
 end
 
 function Dispatcher:phase_name(): string
@@ -246,6 +248,9 @@ local function Dispatcher:route_call(object: wire.Object): Route
   case decision
   when result(result) then
     if not is_request then return immediate(no_response()) end
+    if actual_method == "initialize" then
+      self.completion_options = lsp.completion_options(params)
+    end
     local reply = result_response(id, result)
     if actual_method == "shutdown" then return Route.shutdown(reply) end
     return immediate(reply)
@@ -275,7 +280,7 @@ local function Dispatcher:route_call(object: wire.Object): Route
       if parsed == nil then
         return immediate(failure_response(id, failure.code, failure.message))
       end
-      return Route.completion(CompletionRequest.new(id, parsed))
+      return Route.completion(CompletionRequest.new(id, parsed, self.completion_options))
     end
     return Route.semantic(SemanticRequest.new(id, actual_method, params))
   end

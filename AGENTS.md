@@ -34,8 +34,9 @@ project workflow.
   dependencies loaded through `package.cpath` can bind to that same Lua state.
 - Stdout is exclusively for LSP framing. Diagnostics and debug logs go to
   stderr.
-- Definition, references, hover, rename, folding and diagnostics use saved disk
-  files. Post-V1 completion alone uses captured editor buffers; follow
+- Definition, references, rename, folding and diagnostics use saved disk files.
+  Completion uses captured editor buffers; hover can reuse exact current
+  completion-derived TEMP occurrence facts. Follow
   `docs/completion.md` and `.agents/plans/unsaved-completion.md`.
 - FFI-definition navigation, external-source navigation, and watching external
   source trees remain out of scope.

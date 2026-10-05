@@ -5,6 +5,7 @@ local indexer = import "server.semantic_index"
 local source_text = import "server.source_text"
 local sqlite3 = import "sqlite3"
 local workspace_store = import "server.workspace_store"
+local completion_types = import "server.completion_types"
 
 record Error
   const message: string
@@ -746,6 +747,49 @@ function prepare_update(projects: {bridge.ProjectModule},
                         snapshots: {bridge.ModuleSnapshot},
                         plan: indexer.PublicationPlan, yield_now: Yield?): PreparedView
   return prepare_internal(projects, snapshots, plan, yield_now)
+end
+
+-- Completion preparation shares the saved hover renderer, but exports only
+-- scalar rows. Its caller maps the disposable source spans back to editor
+-- text before publishing them in TEMP.
+function PreparedView:completion_hovers(yield_now: Yield?): {completion_types.Hover}
+  local result: {completion_types.Hover} = {}
+  if #self.index.occurrences > completion_types.MAX_HOVER_ROWS then return result end
+  local state = ExtractionState.new(yield_now, 0)
+  local bytes = 0
+  local by_location: {string: MaterializedHover} = {}
+  for index = 1, #self.hovers do
+    account(state)
+    local hover = self.hovers[index]
+    by_location[hover_key(hover.filename, hover.byte_start, "")] = hover
+  end
+  for index = 1, #self.index.occurrences do
+    account(state)
+    local occurrence = self.index.occurrences[index]
+    local materialized = by_location[hover_key(occurrence.filename,
+      occurrence.byte_span.start, "")]
+    local hover = Hover.new(occurrence.span, materialized.inferred_type,
+      materialized.declared_type, materialized.original_type, materialized.coerced_type,
+      occurrence.visibility, occurrence.callable_signature,
+      self.index:hover_summary(occurrence))
+    local markdown = hover:markdown()
+    bytes = bytes + #occurrence.filename + #markdown + 64
+    if bytes > completion_types.MAX_HOVER_BYTES then return {} end
+    result[index] = completion_types.Hover.new(occurrence.filename,
+      occurrence.byte_span.start, occurrence.byte_span.finish, markdown)
+  end
+  return result
+end
+
+-- A saved hover's coordinates are safe for an open document only when its
+-- complete captured text still matches the committed semantic file.
+function Features:matches_source(filename: string, contents: string): boolean
+  local access = self.store:acquire()
+  defer access:release()
+  indexer.check_generation(access.connection, self.published_generation)
+  return workspace_store.scalar_integer(access.connection,
+    "SELECT COUNT(*) FROM main.semantic_files WHERE filename=? AND contents=?",
+    indexer.blob(filename), indexer.blob(contents)) == 1
 end
 
 local function prune_module_features(connection: sqlite3.Connection, name: string)

@@ -1386,10 +1386,30 @@ local function Application:handle_references(
       params.include_declaration)))
 end
 
+local record HoverRequest
+  const params: lsp.DocumentPosition
+  const capture: document_buffers.Capture?
+  const epoch: integer
+  const tracked: boolean
+end
+
 local function Application:handle_hover(
-    request: dispatcher.SemanticRequest): dispatcher.SemanticOutcome
-  local params?, params_error? = lsp.parse_document_position(request.params)
-  if params == nil then return parse_error(params_error) end
+    request: dispatcher.SemanticRequest, captured: HoverRequest?): dispatcher.SemanticOutcome
+  if captured == nil then
+    local params?, params_error? = lsp.parse_document_position(request.params)
+    if params == nil then return parse_error(params_error) end
+    captured = HoverRequest.new(params, self.buffers:capture(params.path, params.position),
+      self.buffers:epoch(), self.buffers:tracked(params.path))
+  end
+  local params = captured.params
+  local capture? = captured.capture
+  if self.buffers:epoch() ~= captured.epoch or (capture == nil and captured.tracked) then
+    return dispatcher.SemanticOutcome.result(wire.null())
+  end
+  if capture ~= nil and self.completion ~= nil then
+    local ephemeral? = self.completion:hover(capture)
+    if ephemeral ~= nil then return ephemeral end
+  end
   local view?, view_error? = self:current_view()
   if view == nil then
     if view_error ~= nil then
@@ -1397,12 +1417,37 @@ local function Application:handle_hover(
     end
     return dispatcher.SemanticOutcome.result(wire.null())
   end
+  if capture ~= nil then
+    local matches = view.features:matches_source(params.path, capture.document.text)
+    if not matches or not self.buffers:current(capture) then
+      return dispatcher.SemanticOutcome.result(wire.null())
+    end
+  end
   local hover? = view.features:hover(params.path, params.position)
-  if hover == nil then
+  if hover == nil or self.buffers:epoch() ~= captured.epoch then
     return dispatcher.SemanticOutcome.result(wire.null())
   end
   return dispatcher.SemanticOutcome.result(
     lsp.hover_value(hover:markdown(), hover.range))
+catch
+  if error is async.CancellationReason then raise end
+  if error is semantic_index.StaleView then
+    return failure(REQUEST_FAILED, "saved Titan project changed while reading; retry")
+  end
+  return failure(INTERNAL_ERROR, runtime_error(error).message)
+end
+
+-- Called synchronously by the coordinator, before dispatch creates a Task.
+-- A nil capture still records its receipt epoch so later open/reopen messages
+-- cannot attach a new editor session to an earlier hover position.
+function Application:capture_hover(request: dispatcher.SemanticRequest): coordinator.CompletionWork
+  local params?, params_error? = lsp.parse_document_position(request.params)
+  if params == nil then
+    return function (): dispatcher.SemanticOutcome return parse_error(params_error) end
+  end
+  local captured = HoverRequest.new(params, self.buffers:capture(params.path, params.position),
+    self.buffers:epoch(), self.buffers:tracked(params.path))
+  return function (): dispatcher.SemanticOutcome return self:handle_hover(request, captured) end
 end
 
 local function Application:handle_folding(
@@ -1529,7 +1574,8 @@ function Application:on_document(notification: lsp.DocumentNotification)
     return
   end
   -- This bookkeeping is synchronous, including before saved indexing starts.
-  -- Only completion consumes these bytes; didSave never publishes them.
+  -- Completion prepares ephemeral hover context from these bytes; didSave
+  -- never publishes either kind of unsaved fact.
   if self.buffers:apply(notification) then
     local completion? = self.completion
     if completion ~= nil then completion:changed() end

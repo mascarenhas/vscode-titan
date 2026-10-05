@@ -9,6 +9,8 @@ Work board: [Titan VSCode Extension project #2](https://github.com/users/mascare
 > Post-V1 amendment: issue #50 adds unsaved completion only. Its authority is
 > [unsaved-completion.md](unsaved-completion.md); historical V1 exclusions below
 > remain the original milestone, not a prohibition on this approved extension.
+> Issues #94/#95 additionally add named call snippets and exact current
+> completion-derived ephemeral hover; see `docs/completion.md`.
 
 ## Objective
 

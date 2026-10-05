@@ -92,13 +92,29 @@ local function seed_checked(store: sql.Store, projects: {bridge.ProjectModule})
   storage.publish_saved(access.connection, descriptors, names, configuration, {ROOT}, {})
 end
 
-local function request(path: string, contents: string, needle: string): dispatcher.CompletionRequest
+local function request(path: string, contents: string, needle: string,
+                        options: lsp.CompletionOptions?): dispatcher.CompletionRequest
   local first? = strings.find(contents, needle, 1, true)
   test.assert(first ~= nil, "missing test completion token")
   local position? = source_text.position_for_offset(contents, first - 1 + #needle)
   local uri? = source_text.path_to_file_uri(path)
   return dispatcher.CompletionRequest.new(dispatcher.RequestId.integer_id(1),
-    lsp.CompletionParams.new(lsp.DocumentPosition.new(uri, path, position), 1, nil))
+    lsp.CompletionParams.new(lsp.DocumentPosition.new(uri, path, position), 1, nil), options)
+end
+
+local function selected_item(outcome: dispatcher.SemanticOutcome,
+                             label: string): wire.Object
+  case outcome
+  when result(value) then
+    local object? = wire.as_object(value)
+    local items? = wire.as_array(object["items"])
+    for index = 1, #items do
+      local item? = wire.as_object(items[index])
+      if wire.as_string(item["label"]) == label then return item end
+    end
+    raise "missing completion " .. label
+  when failure{message} then raise message
+  end
 end
 
 local function labels(outcome: dispatcher.SemanticOutcome): ({string}, boolean)
@@ -161,6 +177,69 @@ function test_completion_service_unsaved_receiver_and_whole_token_edit(_context:
         "replacement left the suffix after the caret intact")
     else raise "completion result missing"
     end
+  end)
+end
+
+local function hover_markdown(outcome: dispatcher.SemanticOutcome?): string?
+  if outcome == nil then return nil end
+  case outcome
+  when result(value) then
+    local object? = wire.as_object(value)
+    if object == nil then return nil end
+    local contents? = wire.as_object(object["contents"])
+    if contents == nil then return nil end
+    return wire.as_string(contents["value"])
+  when failure{message} then raise message
+  end
+end
+
+function test_completion_service_hover_uses_exact_ephemeral_source_and_retires_on_change(_context: test.Context)
+  runtime.run(function ()
+    local store = sql.open(":memory:")
+    defer store:close()
+    seed(store, {bridge.ProjectModule.new("app", {bridge.SourceFile.new(PATH, "local saved = 1\n")})})
+    local documents = buffers.create()
+    local completion = service.create(store, documents)
+    defer completion:close()
+    local text = "function read(): integer\r\n local unsaved = 1\r\n return unsaved\r\nend\r\n" ..
+      "function after(): string local emoji = \"😀\" return emoji end\r\n"
+    open(documents, PATH, 1, text)
+    local before = documents:capture(PATH, source_text.Position.new(1, 8))
+    test.assert(completion:hover(before) == nil, "hover invented a private preparation")
+    local work = completion:capture(request(PATH, text, "return uns"))
+    work()
+    await_preparation(completion)
+    local hover? = hover_markdown(completion:hover(before))
+    test.assert(hover ~= nil and strings.find(hover, "Type: `integer`") ~= nil,
+      "hover omitted a local from the completion's unsaved source")
+    local suffix = documents:capture(PATH, source_text.Position.new(4, 54))
+    local suffix_hover? = hover_markdown(completion:hover(suffix))
+    test.assert(suffix_hover ~= nil and strings.find(suffix_hover, "Type: `string`") ~= nil,
+      "hover did not remap an occurrence after the dummy and UTF-16 text")
+    local hole = documents:capture(PATH, source_text.Position.new(2, 10))
+    test.assert(completion:hover(hole) == nil,
+      "the dummy token became a real editor occurrence")
+    do
+      local access = store:acquire()
+      defer access:release()
+      sql.execute(access.connection, "UPDATE main.store_state SET published_generation=8 WHERE singleton=1")
+    end
+    test.assert(completion:hover(before) == nil, "hover ignored changed saved generation")
+    do
+      local access = store:acquire()
+      defer access:release()
+      sql.execute(access.connection, "UPDATE main.store_state SET published_generation=7 WHERE singleton=1")
+    end
+    documents:apply(lsp.DocumentNotification.changed(lsp.ChangeDocument.new(
+      lsp.TextDocument.new(URI, PATH), 2, text .. "-- changed\n")))
+    completion:changed()
+    test.assert(completion:hover(before) == nil, "edit retained ephemeral hover context")
+    await_preparation(completion)
+    documents:apply(lsp.DocumentNotification.closed(lsp.TextDocument.new(URI, PATH)))
+    completion:changed()
+    open(documents, PATH, 1, text)
+    test.assert(completion:hover(documents:capture(PATH, source_text.Position.new(1, 8))) == nil,
+      "reopened buffer borrowed the previous session's hover")
   end)
 end
 
@@ -391,6 +470,61 @@ function test_completion_service_folder_contributors_and_new_file(_context: test
   end)
 end
 
+function test_completion_service_restored_callable_snippets_and_provisional_argument_guard(_context: test.Context)
+  runtime.run(function ()
+    local store = sql.open(":memory:")
+    defer store:close()
+    local dependency = ROOT .. "/dep.titan"
+    seed_checked(store, {
+      bridge.ProjectModule.new("app", {bridge.SourceFile.new(PATH,
+        "local dep = import \"dep\"\nfunction f(): integer return dep.public(1, \"one\") end\n")}),
+      bridge.ProjectModule.new("dep", {bridge.SourceFile.new(dependency,
+        "function public(count: integer, label: string): integer return count end\n")}),
+    })
+    local documents = buffers.create()
+    local completion = service.create(store, documents)
+    defer completion:close()
+    open(documents, dependency, 1, "function newer(): integer return 3 end\n")
+    local text = "local dep = import \"dep\"\nfunction f(): integer return dep.pubXYZ end\n"
+    open(documents, PATH, 1, text)
+    local options = lsp.CompletionOptions.new(true, true, true)
+    local work = completion:capture(request(PATH, text, "dep.pub", options))
+    work()
+    await_preparation(completion)
+    local permit = scheduler.acquire()
+    defer permit:release()
+    local item = selected_item(work(), "public")
+    local edit? = wire.as_object(item["textEdit"])
+    local details? = wire.as_object(item["labelDetails"])
+    test.assert(wire.as_string(item["detail"]) == "public(count: integer, label: string): integer" and
+      wire.as_string(details["detail"]) == "(count: integer, label: string): integer",
+      "detached dependency lost declared parameter names before SQL selection")
+    test.assert(wire.as_integer(item["insertTextFormat"]) == 2 and
+      wire.as_string(edit["newText"]) == "public(${1:count}, ${2:label})$0",
+      "ready SQL selection did not preserve callable snippet metadata")
+    local reference = completion:capture(request(PATH, text, "dep.pub",
+      lsp.CompletionOptions.new(true, true, false)))
+    local plain = selected_item(reference(), "public")
+    local plain_edit? = wire.as_object(plain["textEdit"])
+    test.assert(wire.as_integer(plain["insertTextFormat"]) == 1 and
+      wire.as_string(plain_edit["newText"]) == "public",
+      "reference preference was lost on a reused prepared snapshot")
+
+    local with_arguments = "local dep = import \"dep\"\nfunction f(): integer return dep.pubXYZ {count = 1, label = \"one\"} end\n"
+    documents:apply(lsp.DocumentNotification.changed(lsp.ChangeDocument.new(
+      lsp.TextDocument.new(URI, PATH), 2, with_arguments)))
+    completion:changed()
+    local provisional = completion:capture(request(PATH, with_arguments, "dep.pub", options))
+    local outcome = provisional()
+    local _, incomplete = labels(outcome)
+    local retained = selected_item(outcome, "public")
+    local retained_edit? = wire.as_object(retained["textEdit"])
+    test.assert(incomplete and wire.as_integer(retained["insertTextFormat"]) == 1 and
+      wire.as_string(retained_edit["newText"]) == "public",
+      "provisional completion duplicated the current buffer's named call arguments")
+  end)
+end
+
 function test_completion_service_detached_dependencies_ignore_dirty_imports(_context: test.Context)
   runtime.run(function ()
     local store = sql.open(":memory:")
@@ -422,6 +556,33 @@ function test_completion_service_detached_dependencies_ignore_dirty_imports(_con
     private_work()
     await_preparation(completion)
     test.assert(contains(labels(private_work()), "secret"), "detached direct-source visibility was lost")
+  end)
+end
+
+function test_completion_service_hover_declines_unwatched_unsaved_headers(_context: test.Context)
+  runtime.run(function ()
+    local header = fs.tmpname()
+    defer fs.unlink(header)
+    fs.write_file(header, "int headerFunction(int argument);\n")
+    local store = sql.open(":memory:")
+    defer store:close()
+    seed(store, {bridge.ProjectModule.new("app", {bridge.SourceFile.new(PATH, "local saved = 1\n")})})
+    local documents = buffers.create()
+    local completion = service.create(store, documents)
+    defer completion:close()
+    local text = "foreign import " .. strings.format("%q", header) ..
+      "\nlocal newLocal = 1\nfunction read(): integer return newLo end\n"
+    open(documents, PATH, 1, text)
+    local work = completion:capture(request(PATH, text, "return newLo"))
+    work()
+    await_preparation(completion)
+    test.assert(contains(labels(work()), "newLocal"),
+      "volatile header fixture did not prepare compiler candidates")
+    test.assert(completion.ready ~= nil and #completion.ready.volatile_headers > 0,
+      "new unsaved header was incorrectly treated as watcher-owned")
+    test.assert(completion.hover_context == nil and
+      completion:hover(documents:capture(PATH, source_text.Position.new(1, 8))) == nil,
+      "hover retained C knowledge without watcher-owned header freshness")
   end)
 end
 

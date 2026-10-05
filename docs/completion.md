@@ -1,7 +1,8 @@
 # Completion from editor buffers
 
-Completion analyzes unsaved text. Definition, references, hover, rename, folding
-and diagnostics still describe saved files. The extension synchronizes complete
+Completion analyzes unsaved text. Hover can reuse the ephemeral semantic
+context from the last accepted completion preparation. Definition, references,
+rename, folding and diagnostics still describe saved files. The extension synchronizes complete
 file contents and advertises `.` and `:` triggers. The usual editor completion
 command also works in lexical, import-name, qualified-type and foreign-type
 positions.
@@ -19,6 +20,60 @@ multiword primitives insert the complete spelling. Comments and unrelated string
 literals have no candidates. Unresolved receivers and unrelated syntax errors
 can produce empty, incomplete lists. General malformed-source recovery is
 outside this feature.
+
+## Callable presentation and insertion
+
+Declared functions and methods show their full signature, including parameter
+names, generic parameters and results. The `label` and `filterText` remain the
+bare name. Clients supporting `labelDetails` see the signature suffix alongside
+the name; every client receives the full signature in `detail`.
+
+Snippet-capable clients insert calls such as
+`choose(${1:first}, ${2:second})$0`; each placeholder defaults to the declaration's
+parameter name. Bound methods have only their explicit arguments. Missing names
+use `arg1`, `arg2` placeholders without inventing declaration names in the
+signature. Zero-argument calls include `()`, and variadic tails remain open.
+Existing positional, named, generic or string-call arguments suppress the call
+snippet, including across comments and before long-bracket strings, preserving
+the existing arguments and whole-token replacement range. Type aliases in type
+positions always insert their plain names.
+
+`titan.completion.insertCallSnippets` defaults to `true`. Disable it to insert
+plain names when taking function or bound-method references. Standalone clients
+can send `initializationOptions.insertCallSnippets: false`. Clients without
+snippet support always receive a plain identifier. The compiler does not yet
+expose expected callable types in its completion context, so the setting is the
+explicit escape hatch for ambiguous function-reference positions. Signature
+display is independent of insertion policy.
+
+Private preparation adapts the compiler's scalar fact conversion while its
+specialized type and declaration metadata are available, reusing the existing
+named-signature renderer. It holds the compiler permit and restores the exact
+original converter on every exit. Saved compiler descriptors retain their
+compiler-owned schema; only TEMP candidates carry insertion presentation.
+See [the primary-source research](completion-usability-research.md).
+
+## Hover from recent completion
+
+Accepted preparation also materializes per-occurrence hover text for the active
+logical module's captured contributors. Hover reads these scalar TEMP rows
+without rechecking source or decoding compiler descriptors. It maps positions
+back from the disposable source and omits the synthetic hole itself; occurrences
+before and after the hole retain their original UTF-16 coordinates.
+
+This hover context requires the same open sessions, exact document/contributor
+versions, buffer epoch and committed saved generation. Provisional completion
+candidates do not authorize provisional hover. Editing a buffer, accepting a
+completion, closing/reopening a contributor or publishing a saved generation
+invalidates the context; a subsequent accepted completion prepares a fresh one.
+Hover does not initiate completion analysis by itself. On dirty text without an
+eligible context it returns no hover, avoiding unrelated saved symbols at the
+same coordinates. Clean text and closed documents retain ordinary saved hover.
+Saving never promotes ephemeral hover facts. Context depending on unsaved-only
+C headers is not retained for hover because those headers have no saved watcher
+freshness. Optional hover data is capped at 4 MiB and 100,000 occurrences within
+the existing snapshot retention limit; exceeding it drops hover data while
+preserving otherwise valid completion results. Process exit discards the rows.
 
 ## Input and publication ownership
 
@@ -85,10 +140,10 @@ batch stays within Titan's variadic binding limit; superseded TEMP publication
 rolls back the complete transaction, including any already inserted batches.
 The saved descriptor table keeps its large payload outside the primary-key index,
 so child foreign-key checks read only the narrow module key. Workspace cache
-schema 6 rebuilds earlier caches with this layout and the saved semantic identity
-needed for shorthand union case bindings.
+schema 7 rebuilds earlier caches, retaining this layout and the saved semantic
+identity for shorthand union case bindings while adding nullable call snippets.
 
-TEMP owns open documents, input vectors, coverage, scopes and scalar candidates,
+TEMP owns open documents, input vectors, coverage, scopes, scalar candidates and hover rows,
 with cascading foreign keys confined to that schema. Snapshots identify saved
 generation, buffer epoch, session/version and exact caret context. Coverage
 remains explicit for empty/error analyses, so obsolete saved declarations cannot

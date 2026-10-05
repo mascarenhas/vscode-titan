@@ -454,7 +454,8 @@ async function testLifecycle() {
         foldingRangeProvider: true,
         positionEncoding: "utf-16",
         textDocumentSync: { openClose: true, change: 1, save: { includeText: false } },
-        completionProvider: { resolveProvider: false, triggerCharacters: [".", ":"] }
+        completionProvider: { resolveProvider: false, triggerCharacters: [".", ":"],
+          completionItem: { labelDetailsSupport: true } }
       }
     });
 
@@ -744,7 +745,8 @@ async function testSavedProjectSemantics() {
   try {
     const initialized = await request(child, responses, 1, "initialize", {});
     assert.deepEqual(initialized.result.capabilities.completionProvider,
-      { resolveProvider: false, triggerCharacters: [".", ":"] });
+      { resolveProvider: false, triggerCharacters: [".", ":"],
+        completionItem: { labelDetailsSupport: true } });
     child.stdin.write(frame({
       jsonrpc: "2.0",
       method: "initialized",
@@ -754,7 +756,7 @@ async function testSavedProjectSemantics() {
 
     // Navigation semantics remain saved-file-only. Text synchronization is
     // advertised for completion, but divergent buffers must not change saved
-    // definition, references, hover, rename, or folding results. Keep the
+    // definition, references, rename, or folding results. Keep the
     // buffer valid so a buffer-backed implementation cannot pass by falling
     // back to the last valid disk AST.
     const unsavedSource = [
@@ -823,6 +825,19 @@ async function testSavedProjectSemantics() {
       location.range.start.character === unicodeUse
     ));
 
+    const dirtyHover = await semanticRequest(
+      child, responses, "dirty-hover", "textDocument/hover", documentPosition
+    );
+    assert.equal(dirtyHover.result, null,
+      "dirty text borrowed saved hover without a completion context");
+    child.stdin.write(frame({
+      jsonrpc: "2.0",
+      method: "textDocument/didChange",
+      params: {
+        textDocument: { uri, version: 3 },
+        contentChanges: [{ text: sourceLines.join("\n") }]
+      }
+    }));
     const hover = await semanticRequest(
       child,
       responses,
@@ -863,6 +878,14 @@ async function testSavedProjectSemantics() {
       end: { line: 7, character: coercedItem + "item".length }
     });
 
+    child.stdin.write(frame({
+      jsonrpc: "2.0",
+      method: "textDocument/didChange",
+      params: {
+        textDocument: { uri, version: 4 },
+        contentChanges: [{ text: unsavedSource }]
+      }
+    }));
     const folding = await semanticRequest(
       child,
       responses,

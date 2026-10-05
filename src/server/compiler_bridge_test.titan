@@ -11,6 +11,7 @@ local source_text = import "server.source_text"
 local test_runtime = import "server.test_runtime"
 local content_identity = import "server.content_identity"
 local test_paths = import "server.test_paths"
+local completion_types = import "server.completion_types"
 
 
 local function fixture_headers_root(): string
@@ -5022,4 +5023,238 @@ function test_compiler_bridge_native_windows_extended_header_paths(_context: tes
     test.assert(item["path"] == path and item["identity"] == "exact identity " .. index,
       "extended compiler provenance changed when exported")
   end
+end
+
+local function completion_named_candidate(source: string, needle: string,
+    label: string): completion_types.Candidate
+  preload_real_compiler()
+  local filename = test_paths.workspace_root() .. "/completion_presentation.titan"
+  local _, caret? = strings.find(source, needle)
+  test.assert(caret ~= nil, "completion test caret missing")
+  local hole? = bridge.prepare_completion(filename, source, caret)
+  test.assert(hole ~= nil, "completion test hole excluded")
+  local module = lua.require("titan-compiler.completion") as {string: value}
+  local original: value = module["fact"]
+  local analysis = bridge.load():analyze_completion("completion_presentation", {
+    bridge.ProjectModule.new("completion_presentation", {
+      bridge.SourceFile.new(filename, hole.contents),
+    }),
+  }, {}, hole)
+  test.assert(module["fact"] == original, "private completion retained its fact observer")
+  for index = 1, #analysis.candidates do
+    if analysis.candidates[index].label == label then return analysis.candidates[index] end
+  end
+  raise "missing completion candidate " .. label
+end
+
+function test_compiler_bridge_completion_named_function_signature(_context: test.Context)
+  run_bridge(function ()
+    local candidate = completion_named_candidate([[
+function choose(first: integer, second: string?): (integer, string?)
+  return first, second
+end
+function use(): integer
+  return cho
+end
+]], "return cho", "choose")
+    test.assert(candidate.detail == "choose(first: integer, second: string?): (integer, string?)",
+      "completion lost declared names or multiple result types: " .. candidate.detail)
+    test.assert(candidate.call_snippet == "choose(${1:first}, ${2:second})$0",
+      "completion placeholders do not use declared names")
+  end)
+end
+
+function test_compiler_bridge_completion_function_alias_in_type_position(_context: test.Context)
+  run_bridge(function ()
+    local candidate = completion_named_candidate([[
+type Callback = function (integer): integer
+function use(value: Call) end
+]], "value: Call", "Callback")
+    test.assert(candidate.lookup_domain == "type",
+      "function alias was not selected as a type")
+    test.assert(candidate.call_snippet == nil,
+      "type completion inserted a function call")
+    test.assert(strings.sub(candidate.detail, 1, 8) == "function",
+      "type completion replaced the compiler's function type presentation")
+  end)
+end
+
+function test_compiler_bridge_completion_specialized_method_signature(_context: test.Context)
+  run_bridge(function ()
+    local candidate = completion_named_candidate([[
+record Box<|T|>
+  item: T
+end
+function Box:replace(item: T): T
+  return item
+end
+function use(box: Box<|integer|>): integer
+  return box:rep
+end
+]], "box:rep", "replace")
+    test.assert(candidate.detail == "replace(item: integer): integer",
+      "completion lost receiver specialization: " .. candidate.detail)
+    test.assert(candidate.call_snippet == "replace(${1:item})$0",
+      "bound method dropped its first explicit parameter")
+  end)
+end
+
+function test_compiler_bridge_completion_constructor_and_generic_signature(_context: test.Context)
+  run_bridge(function ()
+    local constructor = completion_named_candidate([[
+record Counter
+  amount: integer
+end
+function Counter.new(initial: integer?): Counter
+  return {amount = initial or 0}
+end
+function use(): Counter
+  return Counter.ne
+end
+]], "return Counter.ne", "new")
+    test.assert(constructor.detail == "new(initial: integer?): completion_presentation.Counter",
+      "constructor completion used field names instead of override parameters")
+    test.assert(constructor.call_snippet == "new(${1:initial})$0")
+    local generic = completion_named_candidate([[
+function identity<|T|>(item: T): T
+  return item
+end
+function use(): integer
+  return ide
+end
+]], "return ide", "identity")
+    test.assert(generic.detail == "identity<|T|>(item: T): T",
+      "completion erased generic signature: " .. generic.detail)
+    test.assert(generic.call_snippet == "identity(${1:item})$0")
+  end)
+end
+
+function test_compiler_bridge_completion_interface_method_signature(_context: test.Context)
+  run_bridge(function ()
+    local candidate = completion_named_candidate([[
+interface Writer
+  function write(contents: string)
+end
+function use(writer: Writer)
+  writer:wri
+end
+]], "writer:wri", "write")
+    test.assert(candidate.detail == "write(contents: string): ()",
+      "interface method completion lost declaration names")
+    test.assert(candidate.call_snippet == "write(${1:contents})$0")
+  end)
+end
+
+function test_compiler_bridge_completion_restores_observer_after_failure(_context: test.Context)
+  run_bridge(function ()
+    preload_real_compiler()
+    local module = lua.require("titan-compiler.completion") as {string: value}
+    local original: value = module["fact"]
+    defer module["fact"] = original
+    local observed = false
+    local rejected = function (...: value): value
+      observed = true
+      raise "completion observation rejected"
+    end
+    module["fact"] = rejected
+    local filename = test_paths.workspace_root() .. "/completion_failure.titan"
+    local source = "function visible() end\nfunction use() vis end\n"
+    local _, caret? = strings.find(source, "vis end")
+    local hole? = bridge.prepare_completion(filename, source, caret - 4)
+    do
+      bridge.load():analyze_completion("completion_failure", {
+        bridge.ProjectModule.new("completion_failure", {
+          bridge.SourceFile.new(filename, hole.contents),
+        }),
+      }, {}, hole)
+    catch
+      -- The ordinary compiler may surface or classify the observation error.
+    end
+    test.assert(observed, "completion did not exercise the failing observer")
+    test.assert(module["fact"] == rejected,
+      "completion failure did not restore the exact original observer")
+  end)
+end
+
+function test_compiler_bridge_completion_preserves_candidates_without_optional_hover_snapshot(_context: test.Context)
+  run_bridge(function ()
+    preload_real_compiler()
+    local driver = lua.require("titan-compiler.driver") as {string: value}
+    local original: value = driver["defaultloader"]
+    local factory = original as function (value, value): value
+    local close_loader = driver["close_loader"] as function (value): (value, value)
+    defer driver["defaultloader"] = original
+    local corrupted = false
+    driver["defaultloader"] = function (static_deps: value, options: value): value
+      local loader = factory(static_deps, options)
+      local invoke = loader as function (string): (value, value, value, value)
+      return function (name: string): (value, value, value, value)
+        defer close_loader(loader)
+        local first, second, third, fourth = invoke(name)
+        local imported = driver["imported"] as {string: value}
+        local root = imported[name] as {string: value}
+        test.assert(root["completion"] ~= nil,
+          "fixture corrupted the AST before caret facts were available")
+        root["ast"] = false
+        corrupted = true
+        return first, second, third, fourth
+      end
+    end
+    local filename = test_paths.workspace_root() .. "/hover_failure.titan"
+    local source = "function visible() end\nfunction use() vis end\n"
+    local start? = strings.find(source, "vis end")
+    local hole? = bridge.prepare_completion(filename, source, start - 1 + 3)
+    local analysis = bridge.load():analyze_completion("hover_failure", {
+      bridge.ProjectModule.new("hover_failure", {bridge.SourceFile.new(filename, hole.contents)}),
+    }, {}, hole)
+    test.assert(corrupted and analysis.snapshot == nil,
+      "invalid optional AST was not omitted")
+    local found = false
+    for index = 1, #analysis.candidates do
+      if analysis.candidates[index].label == "visible" then found = true end
+    end
+    test.assert(found, "optional hover normalization discarded valid compiler candidates")
+  end)
+end
+
+function test_compiler_bridge_completion_foreign_callable_signature(_context: test.Context)
+  run_bridge(function ()
+    preload_real_compiler()
+    local include_root = test_paths.temporary_name()
+    fs.unlink(include_root)
+    fs.mkdir(include_root)
+    local header = include_root .. "/completion_callable.h"
+    fs.write_file(header, "int native_choose(int left, int right);\n" ..
+      "int native_unnamed(int, int);\n")
+    defer do fs.unlink(header); fs.rmdir(include_root) end
+    local filename = test_paths.workspace_root() .. "/completion_c.titan"
+    local source = "foreign import \"completion_callable.h\"\n" ..
+      "function run(): integer return ffi.native_ch end\n"
+    local _, caret? = strings.find(source, "ffi.native_ch")
+    local hole? = bridge.prepare_completion(filename, source, caret)
+    local compiler = bridge.load()
+    compiler:configure(bridge.CompilerConfiguration.new {include_roots = {include_root}})
+    local analysis = compiler:analyze_completion("completion_c", {
+      bridge.ProjectModule.new("completion_c", {bridge.SourceFile.new(filename, hole.contents)}),
+    }, {}, hole)
+    local found = false
+    local found_unnamed = false
+    for index = 1, #analysis.candidates do
+      local candidate = analysis.candidates[index]
+      if candidate.label == "native_choose" then
+        found = true
+        test.assert(candidate.detail == "native_choose(left: foreign int, right: foreign int): foreign int",
+          "C completion lost named prototype: " .. candidate.detail)
+        test.assert(candidate.call_snippet == "native_choose(${1:left}, ${2:right})$0")
+      elseif candidate.label == "native_unnamed" then
+        found_unnamed = true
+        test.assert(candidate.detail == "native_unnamed(foreign int, foreign int): foreign int",
+          "unnamed C completion invented declaration names: " .. candidate.detail)
+        test.assert(candidate.call_snippet == "native_unnamed(${1:arg1}, ${2:arg2})$0",
+          "unnamed C completion did not provide positional placeholders")
+      end
+    end
+    test.assert(found, "named C completion missing")
+    test.assert(found_unnamed, "unnamed C completion missing")
+  end)
 end

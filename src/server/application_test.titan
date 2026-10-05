@@ -553,6 +553,48 @@ local function with_unindexed_application(
   with_application_state(false, body)
 end
 
+function test_application_hover_receipt_fences_open_change_and_reopen(_context: test.Context)
+  test_runtime.run(function ()
+    with_application(function (filename: string, _analyzer: YieldingAnalyzer,
+        app: application.Application)
+      app:stop_watching_for_testing()
+      local text = "local answer = 1\nlocal copy = answer\n"
+      fs.write_file(filename, text)
+      app:note_saved_change()
+      wait_until(function (): boolean return not app:indexing_metrics().refresh_chain_active end,
+        "hover capture fixture did not publish saved occurrences")
+      local request = position_request_for(filename, 600, "textDocument/hover", 8)
+      local document = lsp.TextDocument.new(source_text.path_to_file_uri(filename), filename)
+      local assert_hover = function ()
+        case app:handle(request)
+        when result(value) then test.assert(wire.as_object(value) ~= nil, "saved hover fixture had no occurrence")
+        when failure{message} then raise message
+        end
+      end
+      local assert_retired = function (work: function (): dispatcher.SemanticOutcome)
+        case work()
+        when result(value) then test.assert(wire.is_null(value), "hover sampled a later editor session or version")
+        when failure{message} then raise message
+        end
+      end
+      assert_hover()
+      local closed = app:capture_hover(request)
+      app:on_document(lsp.DocumentNotification.opened(lsp.OpenDocument.new(document, 1, text)))
+      assert_retired(closed)
+      assert_hover()
+      local changed = app:capture_hover(request)
+      app:on_document(lsp.DocumentNotification.changed(lsp.ChangeDocument.new(document, 2, text)))
+      assert_retired(changed)
+      assert_hover()
+      local reopened = app:capture_hover(request)
+      app:on_document(lsp.DocumentNotification.closed(document))
+      app:on_document(lsp.DocumentNotification.opened(lsp.OpenDocument.new(document, 2, text)))
+      assert_retired(reopened)
+      assert_hover()
+    end)
+  end)
+end
+
 local function with_cold_application(
     body: function (string, YieldingAnalyzer, application.Application): ())
   local root = test_paths.temporary_name()

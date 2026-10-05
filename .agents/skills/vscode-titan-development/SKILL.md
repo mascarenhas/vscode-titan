@@ -52,8 +52,10 @@ errors. Do not solve discovery by embedding the compiler into the executable.
 - Treat JSON byte lengths, LSP UTF-16 positions, and URI/path conversion as
   explicit boundaries with focused tests.
 - Advertise only implemented capabilities.
-- Existing saved features use disk files. Post-V1 completion alone consumes
-  immutable open/change captures; use [completion.md](../../../docs/completion.md)
+- Definition, references, rename, folding and diagnostics use disk files.
+  Completion consumes immutable open/change captures; hover can reuse exact
+  current completion-derived TEMP occurrence facts. Use
+  [completion.md](../../../docs/completion.md)
   for its input, preparation, TEMP and cancellation ownership contracts.
 - Attach project generations to asynchronous work. Reject superseded captures
   and require exact inputs for fresh results. Completion may serve bounded
@@ -94,7 +96,13 @@ Decode descriptors only during private preparation; selection reads indexed
 scalar facts under one connection
 lease. Add deterministic held/free compiler-permit tests and measure preparation
 separately from SQL selection. Include new compiler modules in staging and VSIX
-checks, and keep all other semantic features saved-file-only.
+checks. Keep other navigation and diagnostics saved-file-only. Completion
+callables retain declaration names and specialized types in scalar presentation;
+keep identifiers as labels/filter text and honor snippet/label-details capabilities
+and insertion preferences. Restore a private compiler fact observer before
+releasing its permit. Recent-completion hover uses exact occurrence facts with
+matching session/version/contributor/generation identity, never provisional
+completion facts or saved coordinates against differing dirty text.
 
 ## Verification and delivery
 

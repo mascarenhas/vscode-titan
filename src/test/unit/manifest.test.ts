@@ -100,6 +100,9 @@ describe("extension manifest", () => {
       };
     };
     const properties = manifest.contributes.configuration.properties;
+    assert.equal(properties["titan.completion.insertCallSnippets"].type, "boolean");
+    assert.equal(properties["titan.completion.insertCallSnippets"].default, true);
+    assert.equal(properties["titan.completion.insertCallSnippets"].scope, "resource");
 
     for (const setting of [
       "titan.languageServer.path",

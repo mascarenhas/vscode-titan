@@ -24,6 +24,7 @@ import {
   formatStartupError,
   packagedServerName,
   readCompilerDiscoveryConfiguration,
+  readCompletionConfiguration,
   readServerConfiguration,
   resolvePhysicalWorkspaceRoot,
   resolveServerExecutable
@@ -46,6 +47,15 @@ afterEach(async () => {
 });
 
 describe("server configuration", () => {
+  test("defaults to call snippets and accepts the function-reference opt-out", () => {
+    assert.deepEqual(readCompletionConfiguration(), { insertCallSnippets: true });
+    assert.deepEqual(readCompletionConfiguration(false), { insertCallSnippets: false });
+    assert.throws(
+      () => readCompletionConfiguration("false"),
+      (error: unknown) => error instanceof ServerConfigurationError &&
+        /insertCallSnippets must be a boolean/.test(error.message)
+    );
+  });
   test("normalizes a configured path and copies arguments", () => {
     const argumentsSetting = ["--trace", "messages"];
     const configuration = readServerConfiguration(

@@ -94,6 +94,26 @@ function test_dispatcher_validates_completion_and_drops_malformed_sync(_context:
   end
 end
 
+function test_dispatcher_captures_initialize_completion_preferences(_context: test.Context)
+  local server = dispatcher.create()
+  server:dispatch([[{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{"textDocument":{"completion":{"completionItem":{"snippetSupport":true,"labelDetailsSupport":true}}}},"initializationOptions":{"insertCallSnippets":false}}}]])
+  server:dispatch([[{"jsonrpc":"2.0","method":"initialized","params":{}}]])
+  case server:route([[{"jsonrpc":"2.0","id":2,"method":"textDocument/completion","params":{"textDocument":{"uri":"]] .. test_paths.workspace_uri() .. [[/main.titan"},"position":{"line":0,"character":0}}}]])
+  when completion(request) then
+    test.assert(request.options ~= nil and request.options.snippet_support and
+      request.options.label_details_support and not request.options.insert_call_snippets,
+      "completion lost the accepted client's capabilities or reference preference")
+  else test.assert(false, "completion was not routed")
+  end
+  server:dispatch([[{"jsonrpc":"2.0","id":3,"method":"initialize","params":{"initializationOptions":{"insertCallSnippets":true}}}]])
+  case server:route([[{"jsonrpc":"2.0","id":4,"method":"textDocument/completion","params":{"textDocument":{"uri":"]] .. test_paths.workspace_uri() .. [[/main.titan"},"position":{"line":0,"character":0}}}]])
+  when completion(request) then
+    test.assert(request.options.snippet_support and not request.options.insert_call_snippets,
+      "rejected repeated initialization replaced completion preferences")
+  else test.assert(false, "completion was not routed after rejected initialization")
+  end
+end
+
 local function assert_internal_error(object: wire.Object,
                                      id: dispatcher.RequestId)
   local failure? = wire.as_object(object["error"])
