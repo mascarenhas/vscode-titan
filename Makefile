@@ -89,6 +89,9 @@ VSIX := $(VSIX_DIR)/titan-$(VSIX_TARGET).vsix
 # imported objects, native headers, SDK/compiler inputs and effective settings.
 # The graph generator finishes both source stages before parallel recipes start.
 shell_quote = '$(subst ','"'"',$(1))'
+# LuaRocks launches nested Make processes and needs the recursive jobserver.
+# Recursive recipes still run under -n/-t/-q; inspect only Make's short flags.
+RECURSIVE_WRAPPER_GUARD = flags=$${MAKEFLAGS%% *}; case "$$flags" in -*) ;; *q*) exit 1 ;; *n*|*t*) exit 0 ;; esac;
 NATIVE_BUILD_GENERATOR := scripts/generate-native-build.lua
 NATIVE_BUILD_GRAPH := $(BUILD_ROOT)/native-modules.mk
 NATIVE_CONFIG_STAMP := $(BUILD_ROOT)/native.config
@@ -207,7 +210,7 @@ $(TITANC):
 	$(MAKE) -C "$(abspath $(TITAN_REPO))" lua PREFIX="$(TITAN_PREFIX)"
 	$(MAKE) -C "$(abspath $(TITAN_REPO))" luarocks PREFIX="$(TITAN_PREFIX)"
 	$(MAKE) -C "$(abspath $(TITAN_REPO))" libuv PREFIX="$(TITAN_PREFIX)"
-	cd "$(abspath $(TITAN_REPO))" && \
+	+$(RECURSIVE_WRAPPER_GUARD) cd "$(abspath $(TITAN_REPO))" && \
 		PATH="$(TITAN_PREFIX)/bin:$$PATH" \
 		"$(LUAROCKS)" make --force "$(TITAN_ROCKSPEC)"
 	@# Re-read SDK-dependent preflight even when a retained graph is unchanged.
@@ -216,7 +219,7 @@ $(TITANC):
 	fi
 
 toolchain-refresh: toolchain
-	cd "$(abspath $(TITAN_REPO))" && \
+	+$(RECURSIVE_WRAPPER_GUARD) cd "$(abspath $(TITAN_REPO))" && \
 		PATH="$(TITAN_PREFIX)/bin:$$PATH" \
 		"$(LUAROCKS)" make --force "$(TITAN_ROCKSPEC)"
 

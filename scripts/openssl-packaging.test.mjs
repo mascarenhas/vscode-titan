@@ -244,3 +244,61 @@ esac
       });
   }
 }
+
+async function luaRocksMakeFixture(context, goal) {
+  const state = await fixture(context);
+  const titanRepo = path.join(state.root, "titan");
+  const invoked = path.join(state.root, "luarocks-invoked");
+  const nestedMakefile = await state.put("nested.mk", `.PHONY: all
+all:
+\t@printf '%s\\n' 'JOBSERVER:$(MAKEFLAGS)'
+`);
+  const rocks = await state.put("luarocks", `#!/bin/bash
+set -e
+printf '%s\\n' invoked >> ${shellQuote(invoked)}
+make --no-print-directory -f ${shellQuote(nestedMakefile)}
+mkdir -p ${shellQuote(path.join(state.sdk, "bin"))}
+printf '#!/bin/sh\\nexit 0\\n' > ${shellQuote(path.join(state.sdk, "bin", "titanc"))}
+chmod 755 ${shellQuote(path.join(state.sdk, "bin", "titanc"))}
+`, true);
+  // Keep the wrapper available for dry runs, independently of Make's bootstrap.
+  await state.put("sdk/bin/luarocks", await readFile(rocks, "utf8"), true);
+  if (goal === "toolchain-refresh") await state.put("sdk/bin/titanc", "#!/bin/sh\nexit 0\n", true);
+  await state.put("titan/titan-0.6.0-1.rockspec");
+  // The SDK prerequisites are ready; only compiler installation is missing.
+  for (const name of ["lua", "luarocks", "libuv"]) await state.put(`titan/${name}`);
+  await state.put("titan/Makefile", "lua luarocks libuv:\n");
+  const env = { ...process.env };
+  for (const name of ["MAKEFLAGS", "MFLAGS", "MAKELEVEL"]) delete env[name];
+  const makeHelp = spawnSync("make", ["--help"], { env, encoding: "utf8" }).stdout ?? "";
+  const pipeStyle = makeHelp.includes("--jobserver-style") ? ["--jobserver-style=pipe"] : [];
+  const run = (flags = []) => spawnSync("make", ["--no-print-directory", "-j2", ...pipeStyle,
+    ...flags, "-f", repositoryMakefile, `TITAN_PREFIX=${state.sdk}`, `TITAN_REPO=${titanRepo}`, goal],
+  { cwd: state.root, env, encoding: "utf8", timeout: 30_000 });
+  return { ...state, invoked, run };
+}
+
+for (const goal of ["toolchain", "toolchain-refresh"]) {
+  test(`${goal} LuaRocks wrapper preserves the pipe jobserver`,
+    { skip: process.platform === "win32" }, async (context) => {
+      const state = await luaRocksMakeFixture(context, goal);
+      const result = state.run();
+      assert.equal(result.status, 0, result.error?.message ?? result.stderr);
+      assert.doesNotMatch(result.stderr, /jobserver unavailable/, result.stderr);
+      assert.match(result.stdout, /JOBSERVER:.*--jobserver-auth=\d+,\d+/);
+      assert.equal(await readFile(state.invoked, "utf8"), "invoked\n");
+    });
+  for (const flag of ["-n", "-t", "-q"]) {
+    test(`${goal} does not invoke LuaRocks under ${flag}`,
+      { skip: process.platform === "win32" }, async (context) => {
+        const state = await luaRocksMakeFixture(context, goal);
+        const result = state.run([flag]);
+        assert.equal(result.status, flag === "-q" ? 1 : 0, result.error?.message ?? result.stderr);
+        await assert.rejects(lstat(state.invoked), { code: "ENOENT" });
+        assert.doesNotMatch(result.stdout, /^JOBSERVER:/m);
+        if (goal === "toolchain" && flag !== "-t") {
+          await assert.rejects(lstat(path.join(state.sdk, "bin", "titanc")), { code: "ENOENT" });
+        }
+      });
+  }
+}

@@ -97,7 +97,7 @@ test("configured compiler arguments retain spaces and Unicode without a command 
   assert.equal(compilerArgument("C:\\Program Files\\路径\\clang.exe"), '"C:/Program Files/路径/clang.exe"');
   assert.throws(() => compilerArgument('C:/bad"argument'), /cannot contain/);
   assert.throws(() => compilerArgument("bad\nargument"), /cannot contain/);
-  assert.deepEqual(runtimeDlls, ["lua-5.5.1.dll", "libuv-1.dll", "libllhttp-9.4.dll", "libsqlite3-0.dll", "libssl-3-x64.dll", "libcrypto-3-x64.dll"]);
+  assert.deepEqual(runtimeDlls, ["lua55.dll", "libuv-1.dll", "libllhttp-9.4.dll", "libsqlite3-0.dll", "libssl-3-x64.dll", "libcrypto-3-x64.dll"]);
 });
 
 test("child build environment overrides all Windows spellings and leaves its parent untouched", () => {

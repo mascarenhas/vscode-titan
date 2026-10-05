@@ -38,6 +38,8 @@ navigation and rename plus completion in unsaved buffers.
 ## Prerequisites
 
 - A sibling Titan checkout at `../titan` (override with `TITAN_REPO=...`).
+  Initialize its pinned submodules with
+  `git -C ../titan submodule update --init --recursive` before building.
 - A C toolchain and the native prerequisites used by Titan.
 - Node.js 24 and npm.
 - VS Code 1.106 or newer for extension development and installation.
