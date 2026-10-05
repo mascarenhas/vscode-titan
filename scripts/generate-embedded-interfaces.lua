@@ -23,6 +23,7 @@ local EXPECTED_MODULES = {
     "titan.timer",
     "titan.url",
     "titan.uv",
+    "titan.websocket"
 }
 
 local function script_error(message)
