@@ -44,7 +44,6 @@ const EXPECTED_INCLUDE_ROOT = [
   "lua.hpp:file",
   "lualib.h:file",
   "minicoro.h:file",
-  "openssl:directory",
   "sqlite3.h:file",
   "titan:directory",
   "titan.h:file",
@@ -57,6 +56,13 @@ const titanPrefix = path.resolve(
   repositoryRoot,
   process.env.TITAN_PREFIX ?? ".titan"
 );
+let bundledOpenSSL = false;
+try {
+  bundledOpenSSL = (await lstat(path.join(titanPrefix, "include", "openssl"))).isDirectory();
+} catch (cause) {
+  if (cause.code !== "ENOENT") throw cause;
+}
+if (bundledOpenSSL) EXPECTED_INCLUDE_ROOT.push("openssl:directory");
 const outputPrefix = path.join(repositoryRoot, "dist", "titan");
 const trees = [
   {
@@ -231,6 +237,13 @@ for (const relativePath of REQUIRED_SHARE_FILES) {
   );
 }
 await validateCompilerVersion(trees[0].source);
+if (bundledOpenSSL) {
+  for (const header of ["ssl.h", "crypto.h", "opensslv.h"]) {
+    await requireRegularFile(
+      trees[2].source, `openssl/${header}`, `bundled OpenSSL header ${header}`
+    );
+  }
+}
 
 let fileCount = 0;
 let byteCount = 0;

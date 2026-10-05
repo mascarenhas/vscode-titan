@@ -6,7 +6,7 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 
 export const runtimeDlls = [
-  "lua-5.5.1.dll", "libuv-1.dll", "libllhttp-9.4.dll", "libsqlite3-0.dll",
+  "lua55.dll", "libuv-1.dll", "libllhttp-9.4.dll", "libsqlite3-0.dll",
   "libssl-3-x64.dll", "libcrypto-3-x64.dll"
 ];
 const repository = fileURLToPath(new URL("..", import.meta.url));

@@ -49,6 +49,15 @@ the objects and perform the normal standalone/test link. Native payloads,
 exported Lua API flags, the standard-library archive and bootstrap options
 remain final-link inputs.
 
+Titan's system OpenSSL provider needs the selected host's OpenSSL 3 development
+files and `pkg-config`. Make repeats its ordered OpenSSL libraries after the
+native objects and standard archive at both final links. The installed SDK's
+`include/openssl` directory identifies a bundled provider; that provider already
+carries the OpenSSL archive payload. System SDKs omit the directory. Set
+`OPENSSL_PKG_CONFIG` to select another pkg-config command when required.
+Effective system include/link flags and OpenSSL headers participate in native
+build invalidation, including inputs outside the SDK tree.
+
 Production compilation and linking use `--static --source-first`. Test objects
 have their own consistent `--test --source-first` policy. The test graph first
 builds shared support at `.build/tests/titan/test__test_support.o`; the final
@@ -197,7 +206,7 @@ The tiny launcher can be renamed within `bin` without changing logical module
 identity.
 
 The Windows embedded-interface boundary reads callable metadata from the
-**canonical, actually loaded standard provider**. All 21 plain-C ABI values are
+**canonical, actually loaded standard provider**. All 22 plain-C ABI values are
 checked before invoking any Lua metadata callback. The generated source contains
 the C type profile, not a second serialized copy of the provider interfaces.
 Provider identity uses the runtime's complete volume/file identifiers and exact

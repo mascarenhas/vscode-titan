@@ -15,6 +15,11 @@
 #define LS_PROVIDER_GUARD "vscode-titan.windows.embedded-provider-handle"
 #define LS_PATH_CAPACITY 32768
 
+enum {
+    LS_INTERFACE_COUNT = sizeof(titan_ls_windows_interfaces) /
+                         sizeof(titan_ls_windows_interfaces[0])
+};
+
 typedef struct ls_provider_handle { HANDLE file; HMODULE module; } ls_provider_handle;
 
 static int ls_close_provider(lua_State *L) {
@@ -146,7 +151,7 @@ static void ls_push_cache(lua_State *L) {
     lua_pushvalue(L, path_index); lua_setfield(L, -2, "path");
     lua_setfield(L, cache_index, "identity");
     lua_pop(L, 1); /* support table */
-    lua_createtable(L, 0, 21);
+    lua_createtable(L, 0, LS_INTERFACE_COUNT);
     for (size_t index = 0; index < sizeof(titan_ls_windows_interfaces) / sizeof(titan_ls_windows_interfaces[0]); ++index) {
         const struct titan_ls_windows_interface *entry = &titan_ls_windows_interfaces[index];
         lua_pushcfunction(L, titan_cast_func(lua_CFunction, ls_symbol(L, module, entry->types)));
@@ -183,7 +188,7 @@ int titan_ls_push_embedded_interface_provider(lua_State *L) {
     lua_createtable(L, 0, 3); result = lua_gettop(L);
     lua_getfield(L, cache, "path"); lua_setfield(L, result, "provider_file");
     titan_ls_push_target_profile(L); lua_setfield(L, result, "target_profile");
-    lua_createtable(L, 0, 21); entries = lua_gettop(L);
+    lua_createtable(L, 0, LS_INTERFACE_COUNT); entries = lua_gettop(L);
     for (size_t index = 0; index < sizeof(titan_ls_windows_interfaces) / sizeof(titan_ls_windows_interfaces[0]); ++index) {
         const struct titan_ls_windows_interface *entry = &titan_ls_windows_interfaces[index];
         /* Do not call luaopen_titan_*: querying metadata must not initialize an

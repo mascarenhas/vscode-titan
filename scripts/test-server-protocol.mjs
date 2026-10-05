@@ -1153,7 +1153,9 @@ async function testSelfContainedCompilerModules({ sdkHeaders = false } = {}) {
     path.join(root, "titan-config.lua"),
     'include = { "." }\nsource_module_roots = { "." }\n' +
       (sdkHeaders
-        ? 'extra_ffi_cppflags = "-D_GNU_SOURCE -DOPENSSL_API_COMPAT=30000"\n'
+        ? `extra_ffi_cppflags = ${JSON.stringify(
+          `-D_GNU_SOURCE -DOPENSSL_API_COMPAT=30000 ${process.env.VSCODE_TITAN_OPENSSL_CPPFLAGS ?? ""}`.trim()
+        )}\n`
         : ""),
     "utf8"
   );

@@ -121,11 +121,11 @@ returns a `WorkspaceEdit` with `applied: false`. It never changes source files.
   conversions without requiring a C compiler or Titan SDK for reflection
   imports and ordinary semantic analysis. C header imports and native
   compilation still require the configured C toolchain and SDK. The complete
-  21-entry inventory covers `titan.async`, `titan.coroutine`, `titan.fs`,
+  22-entry inventory covers `titan.async`, `titan.coroutine`, `titan.fs`,
   `titan.gc`, `titan.http`, `titan.io`, `titan.iteration`, `titan.json`, `titan.lua`,
   `titan.math`, `titan.net`, `titan.os`, `titan.peg`, `titan.reflect`,
   `titan.sqlite3`, `titan.ssl`, `titan.string`, `titan.test`, `titan.timer`,
-  `titan.url`, and `titan.uv`.
+  `titan.url`, `titan.uv`, and `titan.websocket`.
   The Titan ABI alone does not promise that surface.
 
 To remove the integration, use the ordinary Codex plugin commands:

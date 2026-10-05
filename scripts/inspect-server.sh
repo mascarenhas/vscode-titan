@@ -7,6 +7,21 @@ if [[ $# -ne 1 ]]; then
 fi
 
 server=$1
+repository_root=$(CDPATH= cd "$(dirname "$0")/.." && pwd -P)
+titan_prefix=${TITAN_PREFIX:-$repository_root/.titan}
+if [[ ! -d "$titan_prefix/include" ]]; then
+  echo "selected Titan SDK include tree is missing: $titan_prefix/include" >&2
+  exit 1
+fi
+bundled_openssl=0
+if [[ -L "$titan_prefix/include/openssl" ||
+      ( -e "$titan_prefix/include/openssl" && ! -d "$titan_prefix/include/openssl" ) ]]; then
+  echo "selected Titan SDK OpenSSL headers must be a regular directory" >&2
+  exit 1
+fi
+if [[ -d "$titan_prefix/include/openssl" ]]; then
+  bundled_openssl=1
+fi
 if [[ ! -x "$server" ]]; then
   echo "server is missing or not executable: $server" >&2
   exit 1
@@ -18,6 +33,15 @@ case "$(uname -s)" in
   Linux)
     dependencies=$(ldd "$server")
     printf '%s\n' "$dependencies"
+    if grep -Fq 'not found' <<<"$dependencies"; then
+      echo "server has an unresolved dynamic dependency" >&2
+      exit 1
+    fi
+    runtime_dependencies=$dependencies
+    if [[ "$bundled_openssl" == 0 ]]; then
+      runtime_dependencies=$(grep -Ev '^[[:space:]]*lib(ssl|crypto)[.]so[.]3[[:space:]]' \
+        <<<"$dependencies" || true)
+    fi
     required_glibc=$(
       objdump -T "$server" |
         sed -n 's/.*(GLIBC_\([0-9][0-9.]*\)).*/\1/p' |
@@ -43,7 +67,7 @@ case "$(uname -s)" in
         exit 1
       fi
     fi
-    if grep -Eiq 'lib(lua|uv|ssl|crypto|lpeg|pcre)' <<<"$dependencies"; then
+    if grep -Eiq 'lib(lua|uv|ssl|crypto|lpeg|pcre)' <<<"$runtime_dependencies"; then
       echo "server has an unexpected dynamic language/runtime dependency" >&2
       exit 1
     fi
@@ -56,7 +80,12 @@ case "$(uname -s)" in
   Darwin)
     dependencies=$(otool -L "$server")
     printf '%s\n' "$dependencies"
-    if grep -Eiq 'lib(lua|uv|ssl|crypto|lpeg|pcre)' <<<"$dependencies"; then
+    runtime_dependencies=$dependencies
+    if [[ "$bundled_openssl" == 0 ]]; then
+      runtime_dependencies=$(grep -Ev '^[[:space:]]+([^[:space:]]*/)?lib(ssl|crypto)[.]3[.]dylib[[:space:]]+[(]' \
+        <<<"$dependencies" || true)
+    fi
+    if grep -Eiq 'lib(lua|uv|ssl|crypto|lpeg|pcre)' <<<"$runtime_dependencies"; then
       echo "server has an unexpected dynamic language/runtime dependency" >&2
       exit 1
     fi

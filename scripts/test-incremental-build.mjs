@@ -24,6 +24,8 @@ const server = path.join(output, "titan-language-server");
 const tests = path.join(build, "tests", "server", "tests");
 const callsFile = path.join(output, "compiler-calls.jsonl");
 const failureMarker = path.join(output, "fail-next-server-link");
+const opensslFlagsFile = path.join(output, "openssl-flags.json");
+const opensslLauncher = path.join(output, "pkg-config-openssl");
 const linkedServer = path.join(build, "server", "titan_language_server");
 const compiler = path.join(options.prefix, "bin", "titanc");
 const launcher = path.join(output, "titanc");
@@ -133,8 +135,12 @@ function answer(): integer return leaf.value() + ${expression} end
 `;
 const leaf = (adjustment) => `foreign import "value.h"
 foreign function native_value(): int return ffi.incremental_header_value() end
+foreign function native_digest_ok(): int return ffi.incremental_digest_ok() end
 local function hidden(): integer return ${adjustment} end
-function value(): integer return native_value() + hidden() - 1 end
+function value(): integer
+  if native_digest_ok() == 0 then raise "OpenSSL SHA256 consumer failed" end
+  return native_value() + hidden() - 1
+end
 `;
 const appTests = (name, extra = "") => `local test = import "test"
 local app = import "fixture.app"
@@ -151,11 +157,27 @@ try {
   await put("fixture/value.h", `#ifndef INCREMENTAL_VALUE_H
 #define INCREMENTAL_VALUE_H
 #include "detail.h"
+#include <openssl/sha.h>
+#include <string.h>
 #ifndef INCREMENTAL_BIAS
 #define INCREMENTAL_BIAS 0
 #endif
+#ifndef INCREMENTAL_OPENSSL_BIAS
+#define INCREMENTAL_OPENSSL_BIAS 0
+#endif
 static inline int incremental_header_value(void) {
-  return INCREMENTAL_HEADER_VALUE + INCREMENTAL_BIAS;
+  return INCREMENTAL_HEADER_VALUE + INCREMENTAL_BIAS + INCREMENTAL_OPENSSL_BIAS;
+}
+static inline int incremental_digest_ok(void) {
+  unsigned char digest[SHA256_DIGEST_LENGTH];
+  const unsigned char expected[SHA256_DIGEST_LENGTH] = {
+    0xba, 0x78, 0x16, 0xbf, 0x8f, 0x01, 0xcf, 0xea,
+    0x41, 0x41, 0x40, 0xde, 0x5d, 0xae, 0x22, 0x23,
+    0xb0, 0x03, 0x61, 0xa3, 0x96, 0x17, 0x7a, 0x9c,
+    0xb4, 0x10, 0xff, 0x61, 0xf2, 0x00, 0x15, 0xad
+  };
+  return SHA256((const unsigned char *)"abc", 3, digest) != NULL &&
+    memcmp(digest, expected, sizeof(expected)) == 0;
 }
 #endif
 `);
@@ -196,6 +218,31 @@ process.exit(child.status ?? 1);
   const quote = (text) => `'${text.replaceAll("'", "'\\''")}'`;
   await writeFile(launcher, `#!/bin/sh\nexec ${quote(process.execPath)} ${quote(wrapper)} "$@"\n`);
   await chmod(launcher, 0o755);
+
+  try {
+    await stat(path.join(options.prefix, "include", "openssl"));
+    report.opensslFlagInvalidation = { skipped: "bundled provider carries its OpenSSL objects" };
+  } catch (error) {
+    if (error.code !== "ENOENT") throw error;
+    report.opensslFlagInvalidation = { mode: "system" };
+    const pkgConfigWrapper = path.join(output, "pkg-config-openssl.mjs");
+    await writeFile(opensslFlagsFile, JSON.stringify({ cppflags: "", ldflags: "" }));
+    await writeFile(pkgConfigWrapper, `import {readFileSync} from 'node:fs';
+import {spawnSync} from 'node:child_process';
+const args=process.argv.slice(2);
+const child=spawnSync('pkg-config',args,{encoding:'utf8',env:process.env});
+if(child.error) console.error(child.error.message);
+if(child.stderr) process.stderr.write(child.stderr);
+if(child.status !== 0) process.exit(child.status ?? 1);
+const flags=JSON.parse(readFileSync(${JSON.stringify(opensslFlagsFile)},'utf8'));
+const extra=args.includes('--cflags') ? flags.cppflags : args.includes('--libs') ? flags.ldflags : '';
+const stdout=[child.stdout.trim(),extra].filter(Boolean).join(' ');
+if(stdout) process.stdout.write(stdout+'\\n');
+`);
+    await writeFile(opensslLauncher, `#!/bin/sh\nexec ${quote(process.execPath)} ${quote(pkgConfigWrapper)} "$@"\n`);
+    await chmod(opensslLauncher, 0o755);
+    policy.OPENSSL_PKG_CONFIG = opensslLauncher;
+  }
 
   await make("initial");
   await runtime("initial", 5, names);
@@ -277,6 +324,38 @@ process.exit(child.status ?? 1);
   for (const mode of ["server-src", "test-src"]) changed(before, after, `${mode}/fixture/leaf.o`);
   await runtime("preprocessor-flags-change", 15, names);
   await noOp("flags-noop");
+
+  if (report.opensslFlagInvalidation.mode === "system") {
+    // Keep the SDK and pkg-config executable unchanged. Only its effective
+    // metadata changes, so cached objects must follow the resulting inputs.
+    before = await observedFiles();
+    await writeFile(opensslFlagsFile, JSON.stringify({ cppflags: "-DINCREMENTAL_OPENSSL_BIAS=2", ldflags: "" }));
+    await make("system-openssl-preprocessor-change");
+    after = await observedFiles();
+    for (const mode of ["server-src", "test-src"]) {
+      changed(before, after, `${mode}/fixture/leaf.o`);
+      changed(before, after, `${mode}/fixture/unrelated.o`);
+    }
+    await runtime("system-openssl-preprocessor-change", 17, names);
+
+    before = await observedFiles();
+    const libraryDirectory = path.join(output, "openssl-library-search");
+    await mkdir(libraryDirectory);
+    await writeFile(opensslFlagsFile, JSON.stringify({
+      cppflags: "-DINCREMENTAL_OPENSSL_BIAS=2", ldflags: `-L${quote(libraryDirectory)}`
+    }));
+    await make("system-openssl-link-flags-change");
+    after = await observedFiles();
+    changed(before, after, "server-executable");
+    changed(before, after, "test-executable");
+    await runtime("system-openssl-link-flags-change", 17, names);
+    await noOp("system-openssl-flags-noop");
+
+    await writeFile(opensslFlagsFile, JSON.stringify({ cppflags: "", ldflags: "" }));
+    await make("system-openssl-flags-restored");
+    await runtime("system-openssl-flags-restored", 15, names);
+    await noOp("system-openssl-restored-noop");
+  }
 
   policy.TITAN_EXTRA_CFLAGS += " -fno-omit-frame-pointer";
   before = await observedFiles();

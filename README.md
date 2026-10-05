@@ -7,11 +7,13 @@ Titan projects. The server is an ordinary LSP process over stdio. A bundled
 skills-only Codex plugin queries that same executable for read-only saved-file
 code intelligence.
 
-On Linux and macOS, the native executable statically links the selected Titan standard-library
-runtime modules, the embedded Lua interpreter, and the selected native
-dependencies. Initialized statically linked modules register their runtime
+On Linux and macOS, the native executable statically links the selected Titan
+standard-library runtime modules, the embedded Lua interpreter, libuv, llhttp,
+and SQLite. OpenSSL follows the selected Titan SDK: the default uses system
+OpenSSL 3 libraries, while bundled mode carries its archive payload.
+Initialized statically linked modules register their runtime
 openers in `package.preload`. Separately, the executable carries a metadata-only
-inventory of all 21 canonical Titan standard-module interfaces; compiler
+inventory of all 22 canonical Titan standard-module interfaces; compiler
 language-server API 1 validates and decodes those serialized interfaces and
 their build target's C type profile for project typechecking. The inventory
 contains no standard-module implementation, provider archive, header, or SDK
@@ -36,6 +38,8 @@ navigation and rename plus completion in unsaved buffers.
 ## Prerequisites
 
 - A sibling Titan checkout at `../titan` (override with `TITAN_REPO=...`).
+  Initialize its pinned submodules with
+  `git -C ../titan submodule update --init --recursive` before building.
 - A C toolchain and the native prerequisites used by Titan.
 - Node.js 24 and npm.
 - VS Code 1.106 or newer for extension development and installation.
@@ -265,8 +269,11 @@ validated build target profile describes portable C types in those interfaces
 and their numeric conversions, allowing reflection imports and ordinary
 semantic analysis without a C compiler or Titan SDK. C header imports still
 require a configured C toolchain; the VSIX supplies Titan and Lua SDK headers
-and the bundled libuv, OpenSSL, llhttp, and SQLite headers. Additional libraries'
-headers must be supplied through the project configuration.
+and the bundled libuv, llhttp, and SQLite headers. A Titan SDK built with
+`OPENSSL_MODE=bundled` also supplies its OpenSSL headers. The default system
+OpenSSL build requires OpenSSL 3 runtime libraries; its headers come from the
+configured C toolchain, including explicit project include paths when needed.
+Additional libraries' headers must be supplied through the project configuration.
 Native compilation requires a full Titan installation. The ABI
 alone is not the language-server API contract.
 
@@ -309,7 +316,8 @@ typechecking uses the executable's separate, validated metadata-only inventory
 for `titan.async`, `titan.coroutine`, `titan.fs`, `titan.gc`, `titan.http`,
 `titan.io`, `titan.iteration`, `titan.json`, `titan.lua`, `titan.math`, `titan.net`,
 `titan.os`, `titan.peg`, `titan.reflect`, `titan.sqlite3`, `titan.ssl`,
-`titan.string`, `titan.test`, `titan.timer`, `titan.url`, and `titan.uv`.
+`titan.string`, `titan.test`, `titan.timer`, `titan.url`, `titan.uv`, and
+`titan.websocket`.
 
 The server defaults the compiler probe-cache prefix to the directory containing
 its SQLite database: `<workspace>/.titan-ls`. Accepted and rejected probes live

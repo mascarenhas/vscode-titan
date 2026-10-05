@@ -41,6 +41,7 @@ HOST_ARCH := $(shell uname -m)
 CC ?= cc
 AR ?= ar
 RANLIB ?= ranlib
+OPENSSL_PKG_CONFIG ?= pkg-config
 CCACHE_DISABLE ?= 1
 INSTALL_PREFIX ?= /usr/local
 
@@ -88,6 +89,9 @@ VSIX := $(VSIX_DIR)/titan-$(VSIX_TARGET).vsix
 # imported objects, native headers, SDK/compiler inputs and effective settings.
 # The graph generator finishes both source stages before parallel recipes start.
 shell_quote = '$(subst ','"'"',$(1))'
+# LuaRocks launches nested Make processes and needs the recursive jobserver.
+# Recursive recipes still run under -n/-t/-q; inspect only Make's short flags.
+RECURSIVE_WRAPPER_GUARD = flags=$${MAKEFLAGS%% *}; case "$$flags" in -*) ;; *q*) exit 1 ;; *n*|*t*) exit 0 ;; esac;
 NATIVE_BUILD_GENERATOR := scripts/generate-native-build.lua
 NATIVE_BUILD_GRAPH := $(BUILD_ROOT)/native-modules.mk
 NATIVE_CONFIG_STAMP := $(BUILD_ROOT)/native.config
@@ -111,12 +115,16 @@ NATIVE_COMPILER_ENV = env -u LUA_PATH -u LUA_CPATH -u LUA_PATH_5_5 -u LUA_CPATH_
 	TITAN_ROCKS_ROOT=$(call shell_quote,$(TITAN_PREFIX)) \
 	TITAN_PATH_0_6=$(call shell_quote,$(TITAN_PREFIX)/lib/titan/0.6) \
 	TITAN_PATH=$(call shell_quote,$(TITAN_PREFIX)/lib/titan/0.6) \
-	TITAN_EXTRA_CPPFLAGS=$(call shell_quote,$(TITAN_EXTRA_CPPFLAGS)) \
+	TITAN_EXTRA_CPPFLAGS=$(call shell_quote,$(strip $(TITAN_EXTRA_CPPFLAGS) $(NATIVE_OPENSSL_CPPFLAGS))) \
 	TITAN_EXTRA_CFLAGS=$(call shell_quote,$(TITAN_EXTRA_CFLAGS)) \
 	TITAN_EXTRA_LDFLAGS=$(call shell_quote,$(TITAN_EXTRA_LDFLAGS)) \
-	TITAN_NO_LINE_DIRECTIVES=$(call shell_quote,$(TITAN_NO_LINE_DIRECTIVES))
+	TITAN_NO_LINE_DIRECTIVES=$(call shell_quote,$(TITAN_NO_LINE_DIRECTIVES)) \
+	VSCODE_TITAN_OPENSSL_MODE=$(call shell_quote,$(NATIVE_OPENSSL_MODE)) \
+	VSCODE_TITAN_OPENSSL_CPPFLAGS=$(call shell_quote,$(NATIVE_OPENSSL_CPPFLAGS)) \
+	VSCODE_TITAN_OPENSSL_LDFLAGS=$(call shell_quote,$(NATIVE_OPENSSL_LDFLAGS)) \
+	VSCODE_TITAN_OPENSSL_INCLUDEDIR=$(call shell_quote,$(NATIVE_OPENSSL_INCLUDEDIR))
 NATIVE_LINK_ENV = $(NATIVE_COMPILER_ENV) \
-	TITAN_EXTRA_LDFLAGS=$(call shell_quote,$(strip $(TITAN_EXTRA_LDFLAGS) $(EXPORT_LUA_LDFLAGS) $(COMPILER_IO_CLOCK_OBJECT) $(EMBEDDED_INTERFACES_OBJECT) $(TITAN_STANDARD_PROVIDER)))
+	TITAN_EXTRA_LDFLAGS=$(call shell_quote,$(strip $(TITAN_EXTRA_LDFLAGS) $(EXPORT_LUA_LDFLAGS) $(COMPILER_IO_CLOCK_OBJECT) $(EMBEDDED_INTERFACES_OBJECT) $(TITAN_STANDARD_PROVIDER) $(NATIVE_OPENSSL_LDFLAGS)))
 # Tests retain dynamic stdlib bindings but live outside the SDK's bin directory.
 # Ask its Lua executable for its own relocatable paths, as Titan's test harness
 # does. Ambient Titan paths must not replace that selected SDK at execution.
@@ -131,6 +139,29 @@ FORCE:
 # Keep housekeeping and JavaScript-only goals usable without a native SDK.
 NON_NATIVE_GOALS := help clean clean-node toolchain toolchain-refresh npm-ci extension extension-test shard-runner-test incremental-build-test plugin-validate inspect-vsix server-test-run
 ifneq ($(filter-out $(NON_NATIVE_GOALS),$(if $(MAKECMDGOALS),$(MAKECMDGOALS),all)),)
+# Titan installs OpenSSL headers only for its bundled provider. System-provider
+# static consumers repeat the ordered pkg-config inputs after the archive.
+NATIVE_OPENSSL_MODE := $(if $(wildcard $(TITAN_PREFIX)/include/openssl),bundled,system)
+ifneq ($(wildcard $(TITANC)),)
+ifeq ($(NATIVE_OPENSSL_MODE),system)
+NATIVE_OPENSSL_READY := $(shell $(OPENSSL_PKG_CONFIG) --atleast-version=3.0.0 openssl && echo ready)
+ifneq ($(NATIVE_OPENSSL_READY),ready)
+$(error system OpenSSL >= 3.0 development files and pkg-config are required for this Titan SDK)
+endif
+NATIVE_OPENSSL_CPPFLAGS := $(shell $(OPENSSL_PKG_CONFIG) --cflags openssl || echo __titan_openssl_query_failed__)
+NATIVE_OPENSSL_LDFLAGS := $(shell $(OPENSSL_PKG_CONFIG) --libs openssl || echo __titan_openssl_query_failed__)
+NATIVE_OPENSSL_INCLUDEDIR := $(shell $(OPENSSL_PKG_CONFIG) --variable=includedir openssl || echo __titan_openssl_query_failed__)
+ifneq ($(filter __titan_openssl_query_failed__,$(NATIVE_OPENSSL_CPPFLAGS) $(NATIVE_OPENSSL_LDFLAGS) $(NATIVE_OPENSSL_INCLUDEDIR)),)
+$(error cannot query system OpenSSL compiler/linker inputs with $(OPENSSL_PKG_CONFIG))
+endif
+ifeq ($(strip $(NATIVE_OPENSSL_LDFLAGS)),)
+$(error pkg-config returned no system OpenSSL libraries)
+endif
+ifeq ($(strip $(NATIVE_OPENSSL_INCLUDEDIR)),)
+$(error pkg-config returned no system OpenSSL include directory)
+endif
+endif
+endif
 $(NATIVE_BUILD_GRAPH): FORCE $(NATIVE_BUILD_GENERATOR) | $(TITANC)
 	@$(NATIVE_COMPILER_ENV) \
 		LUA_PATH=$(call shell_quote,$(DEVELOPMENT_LUA_PATH)) \
@@ -179,12 +210,16 @@ $(TITANC):
 	$(MAKE) -C "$(abspath $(TITAN_REPO))" lua PREFIX="$(TITAN_PREFIX)"
 	$(MAKE) -C "$(abspath $(TITAN_REPO))" luarocks PREFIX="$(TITAN_PREFIX)"
 	$(MAKE) -C "$(abspath $(TITAN_REPO))" libuv PREFIX="$(TITAN_PREFIX)"
-	cd "$(abspath $(TITAN_REPO))" && \
+	+$(RECURSIVE_WRAPPER_GUARD) cd "$(abspath $(TITAN_REPO))" && \
 		PATH="$(TITAN_PREFIX)/bin:$$PATH" \
 		"$(LUAROCKS)" make --force "$(TITAN_ROCKSPEC)"
+	@# Re-read SDK-dependent preflight even when a retained graph is unchanged.
+	@if test -f $(call shell_quote,$(NATIVE_BUILD_GRAPH)); then \
+		touch $(call shell_quote,$(NATIVE_BUILD_GRAPH)); \
+	fi
 
 toolchain-refresh: toolchain
-	cd "$(abspath $(TITAN_REPO))" && \
+	+$(RECURSIVE_WRAPPER_GUARD) cd "$(abspath $(TITAN_REPO))" && \
 		PATH="$(TITAN_PREFIX)/bin:$$PATH" \
 		"$(LUAROCKS)" make --force "$(TITAN_ROCKSPEC)"
 
@@ -292,6 +327,7 @@ server-test-sharded: server-test-build
 
 shard-runner-test:
 	node --test scripts/run-server-tests.test.mjs
+	node --test scripts/openssl-packaging.test.mjs
 
 incremental-build-test:
 	node scripts/test-incremental-build.mjs --prefix $(call shell_quote,$(TITAN_PREFIX))
@@ -334,7 +370,7 @@ package: $(SERVER) npm-ci
 		--target "$(VSIX_TARGET)" --out "$(VSIX)"
 
 inspect-server: $(SERVER)
-	./scripts/inspect-server.sh "$(SERVER)"
+	TITAN_PREFIX=$(call shell_quote,$(TITAN_PREFIX)) ./scripts/inspect-server.sh "$(SERVER)"
 
 plugin-validate:
 	node scripts/validate-plugin.mjs
@@ -344,6 +380,7 @@ verify: test extension-host-test package inspect-server plugin-validate install-
 
 inspect-vsix:
 	TITAN_PREFIX="$(TITAN_PREFIX)" \
+		OPENSSL_PKG_CONFIG=$(call shell_quote,$(OPENSSL_PKG_CONFIG)) \
 		./scripts/inspect-vsix.sh "$(VSIX)" "$(VSIX_TARGET)"
 
 install-server: $(SERVER)
