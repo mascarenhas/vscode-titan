@@ -10,6 +10,15 @@ vsix=$1
 target=$2
 repository_root=$(CDPATH= cd "$(dirname "$0")/.." && pwd -P)
 titan_prefix=${TITAN_PREFIX:-$repository_root/.titan}
+bundled_openssl=0
+if [[ -L "$titan_prefix/include/openssl" ||
+      ( -e "$titan_prefix/include/openssl" && ! -d "$titan_prefix/include/openssl" ) ]]; then
+  echo "selected Titan SDK OpenSSL headers must be a regular directory" >&2
+  exit 1
+fi
+if [[ -d "$titan_prefix/include/openssl" ]]; then
+  bundled_openssl=1
+fi
 if [[ ! -f "$vsix" ]]; then
   echo "VSIX is missing: $vsix" >&2
   exit 1
@@ -53,8 +62,6 @@ for required in \
   extension/dist/titan/include/minicoro.h \
   extension/dist/titan/include/llhttp.h \
   extension/dist/titan/include/sqlite3.h \
-  extension/dist/titan/include/openssl/ssl.h \
-  extension/dist/titan/include/openssl/e_ostime.h \
   extension/dist/titan/include/uv.h \
   extension/dist/titan/include/lua.h \
   extension/dist/titan/src/lua-5.5.1/lobject.h \
@@ -64,6 +71,16 @@ for required in \
     exit 1
   fi
 done
+
+if [[ "$bundled_openssl" == 1 ]]; then
+  for header in ssl.h crypto.h opensslv.h; do
+    required="extension/dist/titan/include/openssl/$header"
+    if ! grep -Fxq "$required" <<<"$contents"; then
+      echo "VSIX is missing $required" >&2
+      exit 1
+    fi
+  done
+fi
 
 if grep -Eq '^extension/(\.agents|\.build|\.titan|node_modules|plugins|src|test)/' \
     <<<"$contents"; then
@@ -283,6 +300,16 @@ mkdir -p \
   unset TITAN_ROCKS_ROOT
   export CC="$sdk_compiler"
   export TITAN_PROBE_CACHE_DISABLE=1
+  if [[ "$bundled_openssl" == 0 ]]; then
+    openssl_pkg_config=${OPENSSL_PKG_CONFIG:-pkg-config}
+    if ! VSCODE_TITAN_OPENSSL_CPPFLAGS=$("$openssl_pkg_config" --cflags openssl); then
+      echo "system OpenSSL SDK smoke requires pkg-config OpenSSL compiler flags" >&2
+      exit 1
+    fi
+    export VSCODE_TITAN_OPENSSL_CPPFLAGS
+  else
+    unset VSCODE_TITAN_OPENSSL_CPPFLAGS
+  fi
   "$node_executable" "$repository_root/scripts/test-server-protocol.mjs" \
     "$extract_root/extension/bin/titan-language-server" \
     --sdk-smoke

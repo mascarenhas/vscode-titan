@@ -196,11 +196,37 @@ for _, directory in ipairs({"bin", "lib", "include", "src", "share/lua", "share/
         for _, member in ipairs(members) do sdk_files[#sdk_files + 1] = sdk_root .. "/" .. directory .. "/" .. member end
     end
 end
+-- System OpenSSL headers are not copied into Titan's SDK. They still own the
+-- generated C boundary and must invalidate both native object graphs.
+local openssl_include = os.getenv("VSCODE_TITAN_OPENSSL_INCLUDEDIR")
+if openssl_include and openssl_include ~= "" then
+    local cpp = require "c-parser.cpp"
+    local cppflags = assert(cpp.split_shell_words(os.getenv("TITAN_EXTRA_CPPFLAGS") or ""))
+    local context = assert(cpp.new_context({compiler = os.getenv("CC"), cppflags = cppflags}))
+    local directories, seen = {openssl_include}, {}
+    -- Multiarch configuration headers can live outside pkg-config's includedir.
+    for _, kind in ipairs({"quote", "system"}) do
+        for _, directory in ipairs(context.incdirs[kind] or {}) do
+            directories[#directories + 1] = directory
+        end
+    end
+    for _, include in ipairs(directories) do
+        local directory = include .. "/openssl"
+        if not seen[directory] and lfs.attributes(directory, "mode") == "directory" then
+            seen[directory] = true
+            local members = {}
+            scan(directory, "", members)
+            for _, member in ipairs(members) do sdk_files[#sdk_files + 1] = directory .. "/" .. member end
+        end
+    end
+end
 write_changed(input_root .. "/sdk", table.concat(sdk_files, "\n") .. "\n")
 local configuration = {source_root, build_root, sdk_root}
 for _, variable in ipairs({"CC", "AR", "RANLIB", "PATH", "TITANC", "TITAN_LUA",
         "TITAN_EXTRA_CPPFLAGS", "TITAN_EXTRA_CFLAGS", "TITAN_EXTRA_LDFLAGS",
         "TITAN_NO_LINE_DIRECTIVES", "VSCODE_TITAN_EXPORT_FLAGS",
+        "VSCODE_TITAN_OPENSSL_MODE", "VSCODE_TITAN_OPENSSL_CPPFLAGS",
+        "VSCODE_TITAN_OPENSSL_LDFLAGS", "VSCODE_TITAN_OPENSSL_INCLUDEDIR",
         "CPATH", "C_INCLUDE_PATH", "CPLUS_INCLUDE_PATH", "OBJC_INCLUDE_PATH",
         "LIBRARY_PATH", "COMPILER_PATH", "GCC_EXEC_PREFIX", "SDKROOT",
         "MACOSX_DEPLOYMENT_TARGET", "TITAN_RUNTIME_PREBUILT", "TITAN_PROBE_CACHE_DISABLE"}) do
