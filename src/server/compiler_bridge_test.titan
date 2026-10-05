@@ -1777,6 +1777,169 @@ function test_compiler_bridge_reuses_unchanged_declared_interface_incrementally(
   test_runtime.run(runs_incremental_declared_interface_cache)
 end
 
+local function transitive_private_nominal_projects(
+    buffer_source: string?, consumer_source: string?): {bridge.ProjectModule}
+  local root = test_paths.workspace_root()
+  return {
+    bridge.ProjectModule.new("private_nominal_buffer", {
+      bridge.SourceFile.new(root .. "/private_nominal_buffer.titan",
+        buffer_source or [[
+record BufferStore
+  local text: string
+end
+function create(): BufferStore return { text = "ok" } end
+function BufferStore:inputs(): string return self.text end
+]])}),
+    bridge.ProjectModule.new("private_nominal_application", {
+      bridge.SourceFile.new(root .. "/private_nominal_application.titan", [[
+local buffer = import "private_nominal_buffer"
+record Application
+  local const buffers: buffer.BufferStore
+end
+function create(): Application return { buffers = buffer.create() } end
+]])}),
+    bridge.ProjectModule.new("private_nominal_consumer", {
+      bridge.SourceFile.new(root .. "/private_nominal_consumer.titan",
+        consumer_source or [[
+local application = import "private_nominal_application.titan"
+function answer(): string return application.create().buffers:inputs() end
+]])}),
+  }
+end
+
+local function reuses_transitive_private_nominal_incrementally()
+  preload_real_compiler()
+  local compiler = bridge.load()
+  local projects = transitive_private_nominal_projects(nil, nil)
+  local initial = compiler:analyze("private_nominal_consumer", projects)
+  test.assert(#initial.diagnostics == 0,
+    "initial transitive private nominal fixture failed")
+  assert_declared_project_entry(compiler, "private_nominal_buffer")
+  assert_declared_project_entry(compiler, "private_nominal_application")
+
+  local edited = transitive_private_nominal_projects(nil, [[
+local application = import "private_nominal_application.titan"
+function answer(): string return application.create().buffers:inputs() .. "!" end
+]])
+  local changed = compiler:analyze_incremental(
+    edited, {"private_nominal_consumer"}, {})
+  test.assert(#changed.diagnostics == 0 and
+    changed:find_module("private_nominal_consumer") ~= nil,
+    "dirty source importer lost the ordinary dependency owning its private field type")
+  test.assert(changed:find_module("private_nominal_buffer") == nil and
+    changed:find_module("private_nominal_application") == nil,
+    "consumer-only analysis rechecked unchanged nominal owners")
+  assert_declared_project_entry(compiler, "private_nominal_buffer")
+  assert_declared_project_entry(compiler, "private_nominal_application")
+end
+
+function test_compiler_bridge_reuses_transitive_private_nominal_incrementally(
+    _context: test.Context)
+  run_bridge(reuses_transitive_private_nominal_incrementally)
+end
+
+local function restores_transitive_private_nominal_payloads()
+  preload_real_compiler()
+  local compiler = bridge.load()
+  local projects = transitive_private_nominal_projects(nil, nil)
+  local initial = compiler:analyze("private_nominal_consumer", projects)
+  test.assert(#initial.diagnostics == 0,
+    "initial transitive private nominal payload fixture failed")
+  local payloads = compiler:export_projects(projects, {
+    "private_nominal_buffer", "private_nominal_application", "private_nominal_consumer",
+  })
+  test.assert(#payloads == 3,
+    "transitive private nominal project closure did not encode")
+  local restarted = bridge.load()
+  local restored = restarted:restore_projects(projects, payloads)
+  test.assert(#restored == 3,
+    "transitive private nominal project closure did not restore")
+  assert_declared_project_entry(restarted, "private_nominal_buffer")
+  assert_declared_project_entry(restarted, "private_nominal_application")
+
+  local edited = transitive_private_nominal_projects(nil, [[
+local application = import "private_nominal_application.titan"
+function answer(): string return application.create().buffers:inputs() .. "!" end
+]])
+  local changed = restarted:analyze_incremental(
+    edited, {"private_nominal_consumer"}, {})
+  test.assert(#changed.diagnostics == 0 and
+    changed:find_module("private_nominal_consumer") ~= nil and
+    changed:find_module("private_nominal_buffer") == nil and
+    changed:find_module("private_nominal_application") == nil,
+    "restored source-private field could not call its ordinary dependency's method")
+end
+
+function test_compiler_bridge_restores_transitive_private_nominal_payloads(
+    _context: test.Context)
+  run_bridge(restores_transitive_private_nominal_payloads)
+end
+
+local function rejects_changed_transitive_private_nominal_method()
+  preload_real_compiler()
+  local compiler = bridge.load()
+  local projects = transitive_private_nominal_projects(nil, nil)
+  local initial = compiler:analyze("private_nominal_consumer", projects)
+  test.assert(#initial.diagnostics == 0,
+    "initial transitive private nominal method fixture failed")
+  local changed_projects = transitive_private_nominal_projects([[
+record BufferStore
+  local text: string
+end
+function create(): BufferStore return { text = "ok" } end
+]], nil)
+  local changed = compiler:analyze_incremental(changed_projects, {
+    "private_nominal_buffer", "private_nominal_consumer",
+  }, {})
+  local missing_method = false
+  for index = 1, #changed.diagnostics do
+    if strings.find(changed.diagnostics[index].message,
+        "method 'inputs' not found") ~= nil then
+      missing_method = true
+    end
+  end
+  test.assert(missing_method and
+    changed:find_module("private_nominal_buffer") ~= nil and
+    changed:find_module("private_nominal_application") == nil,
+    "retained application declarations hid a removed BufferStore method")
+end
+
+function test_compiler_bridge_rejects_changed_transitive_private_nominal_method(
+    _context: test.Context)
+  run_bridge(rejects_changed_transitive_private_nominal_method)
+end
+
+local function preserves_transitive_private_nominal_import_privacy()
+  preload_real_compiler()
+  local compiler = bridge.load()
+  local projects = transitive_private_nominal_projects(nil, nil)
+  local initial = compiler:analyze("private_nominal_consumer", projects)
+  test.assert(#initial.diagnostics == 0,
+    "initial transitive private nominal privacy fixture failed")
+  local ordinary_import = transitive_private_nominal_projects(nil, [[
+local application = import "private_nominal_application"
+function answer(): string return application.create().buffers:inputs() end
+]])
+  local changed = compiler:analyze_incremental(
+    ordinary_import, {"private_nominal_consumer"}, {})
+  local hidden_field = false
+  for index = 1, #changed.diagnostics do
+    if strings.find(changed.diagnostics[index].message,
+        "field 'buffers' not found") ~= nil then
+      hidden_field = true
+    end
+  end
+  test.assert(hidden_field and
+    changed:find_module("private_nominal_buffer") == nil and
+    changed:find_module("private_nominal_application") == nil,
+    "transitive nominal recovery exposed a private field through an ordinary import")
+end
+
+function test_compiler_bridge_preserves_transitive_private_nominal_import_privacy(
+    _context: test.Context)
+  run_bridge(preserves_transitive_private_nominal_import_privacy)
+end
+
 local function preserves_mixed_sparse_project_payloads()
   preload_real_compiler()
   local compiler = bridge.load()
