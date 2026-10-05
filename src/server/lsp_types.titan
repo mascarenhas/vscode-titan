@@ -50,6 +50,13 @@ record CompletionItem
   sort_text: string
   filter_text: string
   edit: TextEdit
+  call_snippet: string?
+end
+
+record CompletionOptions
+  const snippet_support: boolean
+  const label_details_support: boolean
+  const insert_call_snippets: boolean
 end
 
 record CompletionList
@@ -364,19 +371,110 @@ function text_edit_value(edit: TextEdit): wire.Object
   return {["range"] = range_value(edit.range), ["newText"] = edit.new_text}
 end
 
-function completion_list_value(list: CompletionList): wire.Object
+-- Optional initialization members are capability advertisements rather than
+-- required request parameters. Absent or malformed capabilities enable nothing.
+function completion_options(params: value): CompletionOptions
+  local snippets = false
+  local label_details = false
+  local insert_calls = true
+  local object? = wire.as_object(params)
+  if object ~= nil then
+    local capabilities? = wire.as_object(object["capabilities"])
+    if capabilities ~= nil then
+      local document? = wire.as_object(capabilities["textDocument"])
+      if document ~= nil then
+        local completion? = wire.as_object(document["completion"])
+        if completion ~= nil then
+          local item? = wire.as_object(completion["completionItem"])
+          if item ~= nil then
+            snippets = wire.as_boolean(item["snippetSupport"]) == true
+            label_details = wire.as_boolean(item["labelDetailsSupport"]) == true
+          end
+        end
+      end
+    end
+    local options? = wire.as_object(object["initializationOptions"])
+    if options ~= nil and options["insertCallSnippets"] ~= nil then
+      insert_calls = wire.as_boolean(options["insertCallSnippets"]) == true
+    end
+  end
+  return CompletionOptions.new(snippets, label_details, insert_calls)
+end
+
+local function completion_long_string_delimiter(contents: string,
+                                                cursor: integer): string?
+  if strings.sub(contents, cursor, cursor) ~= "[" then return nil end
+  local finish = cursor + 1
+  while strings.sub(contents, finish, finish) == "=" do finish = finish + 1 end
+  if strings.sub(contents, finish, finish) ~= "[" then return nil end
+  return "]" .. strings.sub(contents, cursor + 1, finish - 1) .. "]"
+end
+
+-- Offsets are zero-based and finish is exclusive. Replace only the identifier
+-- when its existing suffix already supplies call arguments or generic arguments.
+-- Titan permits whitespace and comments between the name and those arguments.
+function completion_call_snippet(contents: string, replace_finish: integer,
+                                 snippet: string?): string?
+  if snippet == nil then return nil end
+  local cursor = replace_finish + 1
+  while cursor <= #contents do
+    local byte = strings.byte(contents, cursor)
+    if byte == 9 or byte == 10 or byte == 11 or byte == 12 or
+        byte == 13 or byte == 32 then
+      cursor = cursor + 1
+    elseif strings.sub(contents, cursor, cursor + 1) == "--" then
+      local delimiter? = completion_long_string_delimiter(contents, cursor + 2)
+      if delimiter ~= nil then
+        local closing? = strings.find(contents, delimiter, cursor + 2 + #delimiter)
+        if closing == nil then return nil end
+        cursor = closing + #delimiter
+      else
+        local finish? = strings.find(contents, "\n", cursor + 2)
+        if finish == nil then break end
+        cursor = finish + 1
+      end
+    else
+      break
+    end
+  end
+  local suffix = strings.sub(contents, cursor, cursor + 1)
+  local first = strings.sub(suffix, 1, 1)
+  if first == "(" or first == "{" or first == "\"" or first == "'" or
+      suffix == "<|" or completion_long_string_delimiter(contents, cursor) ~= nil then return nil end
+  return snippet
+end
+
+function completion_list_value(list: CompletionList,
+                                options: CompletionOptions?): wire.Object
   local items: wire.Array = {}
   for index = 1, #list.items do
     local item = list.items[index]
+    local edit = item.edit
+    local insert_format = 1
+    if options ~= nil and options.snippet_support and
+        options.insert_call_snippets and item.call_snippet ~= nil then
+      edit = TextEdit.new(item.edit.range, item.call_snippet)
+      insert_format = 2
+    end
     local encoded: wire.Object = {
       ["label"] = item.label,
       ["kind"] = item.kind,
       ["detail"] = item.detail,
       ["sortText"] = item.sort_text,
       ["filterText"] = item.filter_text,
-      ["insertTextFormat"] = 1,
-      ["textEdit"] = text_edit_value(item.edit),
+      ["insertTextFormat"] = insert_format,
+      ["textEdit"] = text_edit_value(edit),
     }
+    if options ~= nil and options.label_details_support and
+        strings.sub(item.detail, 1, #item.label) == item.label and
+        #item.detail > #item.label then
+      local suffix = strings.sub(item.detail, #item.label + 1)
+      local first = strings.sub(suffix, 1, 1)
+      if first == "(" or strings.sub(suffix, 1, 2) == "<|" then
+        local details: wire.Object = {["detail"] = suffix}
+        encoded["labelDetails"] = details
+      end
+    end
     items[index] = encoded
   end
   return {["isIncomplete"] = list.is_incomplete, ["items"] = items}

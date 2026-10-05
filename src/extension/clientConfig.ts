@@ -35,6 +35,21 @@ export interface CompilerDiscoveryConfiguration {
   luaCPath: string;
 }
 
+export interface CompletionConfiguration {
+  insertCallSnippets: boolean;
+}
+
+export function readCompletionConfiguration(
+  insertCallSnippets: unknown = true
+): CompletionConfiguration {
+  if (typeof insertCallSnippets !== "boolean") {
+    throw new ServerConfigurationError(
+      "titan.completion.insertCallSnippets must be a boolean"
+    );
+  }
+  return { insertCallSnippets };
+}
+
 export interface ServerLaunchOptions {
   command: string;
   args: string[];

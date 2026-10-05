@@ -12,6 +12,8 @@ local lsp = import "server.lsp_types"
 local dispatcher = import "server.dispatcher"
 local coordinator = import "server.coordinator"
 local logging = import "server.logging"
+local semantic_features = import "server.semantic_features"
+local wire = import "server.wire"
 foreign import "compiler_io_clock.h"
 
 local record Request
@@ -21,6 +23,7 @@ local record Request
   module_name: string
   const key: string
   const sequence: integer
+  const options: lsp.CompletionOptions?
 end
 
 local record Prepared
@@ -41,6 +44,11 @@ local record Ready
   const anchor: string
 end
 
+local record HoverContext
+  const id: string
+  const capture: buffers.Capture
+end
+
 record Service
   local const store: storage.Store
   local const buffers: buffers.BufferStore
@@ -54,6 +62,7 @@ record Service
   local baseline: storage.Baseline?
   local requests: integer
   local previous_ready: Ready?
+  local hover_context: HoverContext?
 end
 
 local function empty(): dispatcher.SemanticOutcome
@@ -62,7 +71,7 @@ local function empty(): dispatcher.SemanticOutcome
 end
 
 function create(store: sql.Store, documents: buffers.BufferStore): Service
-  return Service.new(storage.open(store), documents, nil, nil, nil, nil, nil, false, false, nil, 0, nil)
+  return Service.new(storage.open(store), documents, nil, nil, nil, nil, nil, false, false, nil, 0, nil, nil)
 end
 
 local function open_paths(capture: buffers.Capture): {string}
@@ -168,6 +177,44 @@ local function header_kind(kind: bridge.CHeaderDependencyKind): integer
   when file() then return 0
   when search() then return 1
   end
+end
+
+local function completion_hovers(active: bridge.ProjectModule,
+    analysis: bridge.CompletionAnalysis, hole: bridge.CompletionHole,
+    original: string): {facts.Hover}
+  if analysis.snapshot == nil then return {} end
+  if #analysis.snapshot.symbols > facts.MAX_HOVER_ROWS then return {} end
+  local prepared = semantic_features.prepare({active}, {analysis.snapshot},
+    function () async.yield() end)
+  local rows = prepared:completion_hovers(function () async.yield() end)
+  local result: {facts.Hover} = {}
+  local delta = #hole.contents - #original
+  local analysis_finish = hole.replace_finish + delta
+  for index = 1, #rows do
+    if index % 1024 == 0 then async.yield() end
+    local row = rows[index]
+    local first = row.byte_start
+    local finish = row.byte_finish
+    local include = true
+    if row.filename == hole.filename then
+      if first >= analysis_finish then
+        first = first - delta
+        finish = finish - delta
+      elseif finish > hole.replace_start then
+        -- The dummy token has no editor identity. Neither it nor any span
+        -- crossing its replacement may be mistaken for a real occurrence.
+        include = false
+      end
+    end
+    if include then
+      result[#result + 1] = facts.Hover.new(row.filename, first, finish, row.markdown)
+    end
+  end
+  return result
+catch
+  if error is async.CancellationReason then raise end
+  logging.emit("debug", "completion.hover.failure", {["message"] = strings.tostring(error)})
+  return {}
 end
 
 local function Service:prepare(request: Request): Prepared?
@@ -324,7 +371,8 @@ local function Service:prepare(request: Request): Prepared?
     request.baseline.generation, capture.epoch, request.key, capture.document.path,
     capture.document.session, capture.document.version, caret,
     hole.replace_start, hole.replace_finish, hole.prefix, result.quality,
-    inputs, result.scopes, result.candidates), range, volatile_headers)
+    inputs, result.scopes, result.candidates,
+    completion_hovers(active, result, hole, capture.document.text)), range, volatile_headers)
 end
 
 local function Service:run(): nil
@@ -368,6 +416,13 @@ local function Service:run(): nil
               request.capture.document.path, request.capture.document.session,
               strings.sub(request.capture.document.text, 1, prepared.snapshot.replace_start))
             self.previous_ready = self.ready
+            self.hover_context = nil
+            -- Unsaved-only headers have no watcher-owned freshness. A later
+            -- hover does not run compiler probes, so these facts cannot be
+            -- retained as an exact hover context between completion requests.
+            if #prepared.volatile_headers == 0 then
+              self.hover_context = HoverContext.new(prepared.snapshot.id, request.capture)
+            end
           end
         when failed(failure) then
           logging.emit("debug", "completion.prepare.failure", {["message"] = strings.tostring(failure.error)})
@@ -389,6 +444,7 @@ local function Service:run(): nil
 end
 
 function Service:changed()
+  self.hover_context = nil
   if self.ready ~= nil then self.previous_ready = self.ready end
   self.ready = nil
   self.pending = nil
@@ -407,15 +463,18 @@ local function Ready:valid_for(request: Request): boolean
     (#self.volatile_headers == 0 or self.validated_through >= request.sequence)
 end
 
-local function encode(selected: facts.Selection, range: source_text.Span): dispatcher.SemanticOutcome
+local function encode(selected: facts.Selection, range: source_text.Span,
+    capture: buffers.Capture, options: lsp.CompletionOptions?): dispatcher.SemanticOutcome
   local items: {lsp.CompletionItem} = {}
+  local finish = source_text.coordinate_index(capture.document.text):offset_for_position(range.finish)
   for index = 1, #selected.candidates do
     local candidate = selected.candidates[index]
     items[index] = lsp.CompletionItem.new(candidate.label, candidate.kind, candidate.detail,
-      strings.format("%04d", index), candidate.label, lsp.TextEdit.new(range, candidate.label))
+      strings.format("%04d", index), candidate.label, lsp.TextEdit.new(range, candidate.label),
+      lsp.completion_call_snippet(capture.document.text, finish, candidate.call_snippet))
   end
   return dispatcher.SemanticOutcome.result(lsp.completion_list_value(
-    lsp.CompletionList.new(selected.is_incomplete, items)))
+    lsp.CompletionList.new(selected.is_incomplete, items), options))
 end
 
 local function Service:provisional(request: Request): dispatcher.SemanticOutcome?
@@ -433,7 +492,7 @@ local function Service:provisional(request: Request): dispatcher.SemanticOutcome
     end)
   if selected == nil then return nil end
   logging.emit("debug", "completion.provisional", {["items"] = #selected.candidates})
-  return encode(selected, span.range)
+  return encode(selected, span.range, request.capture, request.options)
 end
 
 local function Service:answer(request: Request): dispatcher.SemanticOutcome
@@ -465,7 +524,7 @@ local function Service:answer(request: Request): dispatcher.SemanticOutcome
     ["wall_ms"] = ffi.vscode_titan_monotonic_ms() - wall,
   })
   if selected == nil then return empty() end
-  return encode(selected, ready.range)
+  return encode(selected, ready.range, request.capture, request.options)
 end
 
 -- Called by the coordinator before its deferred request Task is created.
@@ -479,8 +538,26 @@ function Service:capture(request: dispatcher.CompletionRequest): coordinator.Com
   local key = generation .. ":" .. capture.epoch .. ":" .. capture.document.session ..
     ":" .. capture.document.version .. ":" .. capture.position.line .. ":" .. capture.position.character
   self.requests = self.requests + 1
-  local captured = Request.new(capture, generation, nil, "", key, self.requests)
+  local captured = Request.new(capture, generation, nil, "", key, self.requests, request.options)
   return function (): dispatcher.SemanticOutcome return self:answer(captured) end
+end
+
+-- Hover consumes only the last accepted private preparation. Edits retire
+-- this context immediately, even while older candidates remain provisional.
+function Service:hover(capture: buffers.Capture): dispatcher.SemanticOutcome?
+  local context? = self.hover_context
+  if self.closed or context == nil or not self.buffers:current(context.capture) or
+      not self.buffers:current(capture) then return nil end
+  local coordinates = source_text.coordinate_index(capture.document.text)
+  local offset? = coordinates:offset_for_position(capture.position)
+  if offset == nil then return dispatcher.SemanticOutcome.result(wire.null()) end
+  local row? = self.store:hover(context.id, capture.document.path,
+    capture.document.session, capture.document.version, offset,
+    function (): boolean return not self.closed and self.buffers:current(capture) end)
+  if row == nil then return nil end
+  local range? = coordinates:span_for_offsets(row.byte_start, row.byte_finish)
+  if range == nil then return dispatcher.SemanticOutcome.result(wire.null()) end
+  return dispatcher.SemanticOutcome.result(lsp.hover_value(row.markdown, range))
 end
 
 function Service:close()

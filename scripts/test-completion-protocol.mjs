@@ -24,7 +24,8 @@ await mkdir(path.dirname(folderMain));
 await writeFile(path.join(root, "titan-config.lua"),
   'include = { "." }\nsource_module_roots = { "." }\n');
 await writeFile(filename, saved);
-await writeFile(dependency, "function savedOnly(): integer return 1 end\n");
+await writeFile(dependency, "function savedOnly(): integer return 1 end\n" +
+  "function importedCall(count: integer, label: string): boolean return count > 0 end\n");
 await writeFile(header, "typedef struct Widget { int count; } Widget;\nint callable(int argument);\n");
 await writeFile(foreignFile, foreignPrefix + "local saved = 1\n");
 await writeFile(folderMain, "local saved = 1\n");
@@ -86,8 +87,15 @@ async function complete(file, position, label, context) {
   assert.ok(Array.isArray(response.result.items));
   const labels = new Set();
   for (const item of response.result.items) {
-    assert.equal(item.insertTextFormat, 1);
-    assert.equal(item.textEdit.newText, item.label);
+    assert.ok(item.insertTextFormat === 1 || item.insertTextFormat === 2);
+    if (item.insertTextFormat === 2) {
+      assert.ok(item.textEdit.newText.startsWith(`${item.label}(`),
+        `call snippet lost its name: ${JSON.stringify(item)}`);
+      assert.ok(item.textEdit.newText.endsWith("$0"),
+        `call snippet omitted its final caret: ${JSON.stringify(item)}`);
+    } else {
+      assert.equal(item.textEdit.newText, item.label);
+    }
     assert.ok(item.textEdit.range.start.line >= 0 && item.textEdit.range.end.line >= 0);
     assert.equal(item.filterText, item.label);
     assert.equal(labels.has(item.label), false, `duplicate candidate ${item.label}`);
@@ -112,10 +120,31 @@ function excludes(result, ...names) {
   for (const name of names) assert.ok(!result.items.some((item) => item.label === name), `unexpected ${name}`);
 }
 
+function positionOf(text, token, occurrence = 0) {
+  let offset = -1;
+  for (let index = 0; index <= occurrence; index++) offset = text.indexOf(token, offset + 1);
+  assert.ok(offset >= 0, `missing hover token ${token}`);
+  const lines = text.slice(0, offset).split("\n");
+  return { line: lines.length - 1, character: lines.at(-1).length + 1 };
+}
+
+async function hover(file, position) {
+  const response = await request(child, responses, nextId++, "textDocument/hover", {
+    textDocument: { uri: uri(file) }, position
+  });
+  assert.equal(response.error, undefined, JSON.stringify(response));
+  return response.result;
+}
+
 try {
-  const initialized = await request(child, responses, nextId++, "initialize", {});
+  const initialized = await request(child, responses, nextId++, "initialize", {
+    capabilities: { textDocument: { completion: { completionItem: {
+      snippetSupport: true, labelDetailsSupport: true
+    } } } }
+  });
   assert.deepEqual(initialized.result.capabilities.completionProvider,
-    { resolveProvider: false, triggerCharacters: [".", ":"] });
+    { resolveProvider: false, triggerCharacters: [".", ":"],
+      completionItem: { labelDetailsSupport: true } });
   assert.deepEqual(initialized.result.capabilities.textDocumentSync,
     { openClose: true, change: 1, save: { includeText: false } });
   notify("initialized", {});
@@ -124,14 +153,33 @@ try {
   const savedHover = await request(child, responses, nextId++, "textDocument/hover", hoverParams);
   assert.ok(savedHover.result, "saved fixture has no hover");
 
-  let source = marked("function read(): integer\n local unsavedAnswer = 1\n return unsavedA@nswer\nend\n");
+  let source = marked("function read(): integer\n local unsavedAnswer = 1\n return unsavedA@nswer\nend\n" +
+    "function follow(): string local afterHole = \"later\" return afterHole end\n");
   open(filename, source.text, 3);
+  const localPosition = positionOf(source.text, "unsavedAnswer");
+  assert.equal(await hover(filename, localPosition), null,
+    "dirty text borrowed saved offsets before any completion preparation");
   let result = await ready(filename, source.position, "unsavedAnswer", "unsaved lexical");
   const lexical = result.items.find((item) => item.label === "unsavedAnswer");
   assert.deepEqual(lexical.textEdit.range, { start: { line: 2, character: 8 }, end: { line: 2, character: 21 } });
   excludes(result, "disk_value");
   const dirtyHover = await request(child, responses, nextId++, "textDocument/hover", hoverParams);
-  assert.deepEqual(dirtyHover.result, savedHover.result, "dirty text changed saved navigation");
+  assert.equal(dirtyHover.result, null, "dirty text borrowed unrelated saved offsets");
+  const ephemeralHover = await hover(filename, localPosition);
+  assert.match(ephemeralHover.contents.value, /Type: `integer`/,
+    "last completion did not expose the unsaved local declaration");
+  assert.deepEqual(ephemeralHover.range, {
+    start: { line: 1, character: 7 }, end: { line: 1, character: 20 }
+  });
+  const afterHole = await hover(filename, positionOf(source.text, "afterHole", 1));
+  assert.match(afterHole.contents.value, /Type: `string`/,
+    "hover lost an occurrence after the compiler's replacement dummy");
+  const holeHover = await hover(filename, source.position);
+  assert.equal(holeHover, null, "dummy completion token acquired an editor hover identity");
+  change(filename, source.text + "-- new buffer version\n");
+  assert.equal(await hover(filename, localPosition), null,
+    "buffer changes did not retire ephemeral hover context");
+  change(filename, source.text);
   notify("textDocument/didSave", { textDocument: { uri: uri(filename) } });
   await ready(filename, source.position, "unsavedAnswer", "didSave retains open text");
 
@@ -146,12 +194,40 @@ try {
   assert.deepEqual(result.items.find((item) => item.label === "unsavedAnswer").textEdit.range,
     { start: { line: 2, character: unicodeStart }, end: { line: 2, character: unicodeStart + 13 } });
   notify("textDocument/didClose", { textDocument: { uri: uri(filename) } });
+  assert.deepEqual(await hover(filename, hoverParams.position), savedHover.result,
+    "closed document did not restore ordinary saved hover");
   result = await complete(filename, source.position, "closed document");
   assert.deepEqual(result, { isIncomplete: true, items: [] });
   source = marked("function read(): integer\n local reopened = 1\n return reop@ened\nend\n");
   open(filename, source.text, 3);
   result = await ready(filename, source.position, "reopened", "same version new session");
   excludes(result, "unsavedAnswer");
+
+  const callable = "function combine(count: integer, label: string): boolean return count > 0 end\n" +
+    "function nothing(): integer return 1 end\n";
+  source = marked(callable + "function read() comb@ine end\n");
+  change(filename, source.text);
+  result = await ready(filename, source.position, "combine", "named function call snippet");
+  const call = result.items.find((item) => item.label === "combine");
+  assert.equal(call.detail, "combine(count: integer, label: string): boolean");
+  assert.deepEqual(call.labelDetails, { detail: "(count: integer, label: string): boolean" });
+  assert.equal(call.insertTextFormat, 2);
+  assert.equal(call.textEdit.newText, "combine(${1:count}, ${2:label})$0");
+  source = marked(callable + "function read() noth@ing end\n");
+  change(filename, source.text);
+  result = await ready(filename, source.position, "nothing", "zero parameter call snippet");
+  assert.equal(result.items.find((item) => item.label === "nothing").textEdit.newText, "nothing()$0");
+  source = marked(callable + "function read() comb@ine { count = 1, label = \"one\" } end\n");
+  change(filename, source.text);
+  result = await ready(filename, source.position, "combine", "preserved named call arguments");
+  assert.equal(result.items.find((item) => item.label === "combine").insertTextFormat, 1);
+  assert.equal(result.items.find((item) => item.label === "combine").textEdit.newText, "combine");
+
+  source = marked("function read(callback: function(integer): integer) call@back end\n");
+  change(filename, source.text);
+  result = await ready(filename, source.position, "callback", "unnamed function value uses positional placeholders");
+  assert.equal(result.items.find((item) => item.label === "callback").textEdit.newText, "callback(${1:arg1})$0");
+  assert.equal(result.items.find((item) => item.label === "callback").insertTextFormat, 2);
 
   const record = "record Cat\n field: integer\n callback: function(): integer\nend\nfunction Cat:method(): integer return self.field end\nfunction Cat.static(): integer return 1 end\n";
   source = marked(record + "function read(cat: Cat)\n cat.fi@XYZ\nend\n");
@@ -164,6 +240,12 @@ try {
   change(filename, source.text);
   result = await ready(filename, source.position, "method", "colon methods", { triggerKind: 2, triggerCharacter: ":" });
   excludes(result, "field", "callback", "new", "static");
+  assert.equal(result.items.find((item) => item.label === "method").insertTextFormat, 1,
+    "method completion duplicated existing parentheses");
+  source = marked(record + "function read(cat: Cat)\n cat:meth@od\nend\n");
+  change(filename, source.text);
+  result = await ready(filename, source.position, "method", "method placeholder call");
+  assert.equal(result.items.find((item) => item.label === "method").textEdit.newText, "method()$0");
 
   const union = "union Message\n moved(x: integer, text: string, end: integer)\n empty()\nend\n";
   source = marked(union + "function make(): Message return Message.mo@ved(1, \"one\", 2) end\n");
@@ -199,6 +281,12 @@ try {
   change(filename, source.text);
   result = await ready(filename, source.position, "savedOnly", "dirty dependency ignored");
   excludes(result, "dirtyOnly");
+  source = marked('local imported = import "dep"\nfunction read() imported.imp@ortedCall end\n');
+  change(filename, source.text);
+  result = await ready(filename, source.position, "importedCall", "restored dependency callable names");
+  const importedCall = result.items.find((item) => item.label === "importedCall");
+  assert.equal(importedCall.detail, "importedCall(count: integer, label: string): boolean");
+  assert.equal(importedCall.textEdit.newText, "importedCall(${1:count}, ${2:label})$0");
 
   source = marked("function read(x: foreign const *unsigned lo@ng long) end\n");
   change(filename, source.text);

@@ -16,6 +16,8 @@ const ignoreShutdown = fixtureArguments.includes("--ignore-shutdown");
 const ignoreTerminate = fixtureArguments.includes("--ignore-terminate");
 const provideSemantics = fixtureArguments.includes("--semantic");
 const provideCompletion = fixtureArguments.includes("--completion");
+const provideCallCompletion = fixtureArguments.includes("--call-completion");
+let completionInitialization = {};
 const documents = new Map();
 const hangSemantic = fixtureArguments.includes("--hang-semantic");
 const omitIndexingGeneration = fixtureArguments.includes(
@@ -74,11 +76,13 @@ function drainMessages() {
 
 function handleMessage(message) {
   if (message.method === "initialize") {
+    completionInitialization = message.params;
     recordEvent("initialize", {
       rootPath: message.params.rootPath,
       rootUri: message.params.rootUri,
       workspaceFolders: message.params.workspaceFolders,
-      trace: message.params.trace
+      trace: message.params.trace,
+      initializationOptions: message.params.initializationOptions
     });
     if (rejectInitializeAndStayAlive) {
       respondError(message.id, -32603, "fixture initialize failure");
@@ -91,7 +95,10 @@ function handleMessage(message) {
       capabilities: provideSemantics ? {
         ...(provideCompletion ? {
           textDocumentSync: { openClose: true, change: 1, save: {} },
-          completionProvider: { triggerCharacters: [".", ":"] }
+          completionProvider: {
+            triggerCharacters: [".", ":"],
+            completionItem: { labelDetailsSupport: true }
+          }
         } : {}),
         definitionProvider: true,
         referencesProvider: true,
@@ -183,6 +190,33 @@ function handleMessage(message) {
   } else if (provideCompletion && message.method === "textDocument/didClose") {
     documents.delete(message.params.textDocument.uri);
   } else if (provideCompletion && message.method === "textDocument/completion") {
+    if (provideCallCompletion) {
+      const itemCapabilities = completionInitialization.capabilities
+        ?.textDocument?.completion?.completionItem;
+      const insertCall = itemCapabilities?.snippetSupport === true &&
+        completionInitialization.initializationOptions?.insertCallSnippets !== false;
+      respond(message.id, {
+        isIncomplete: false,
+        items: [{
+          label: "method",
+          kind: 2,
+          detail: "method(count: integer, label: string): boolean",
+          ...(itemCapabilities?.labelDetailsSupport ? {
+            labelDetails: { detail: "(count: integer, label: string): boolean" }
+          } : {}),
+          filterText: "method",
+          insertTextFormat: insertCall ? 2 : 1,
+          textEdit: {
+            range: {
+              start: { line: 0, character: 0 },
+              end: { line: 0, character: 6 }
+            },
+            newText: insertCall ? "method(${1:count}, ${2:label})$0" : "method"
+          }
+        }]
+      });
+      return;
+    }
     const document = documents.get(message.params.textDocument.uri);
     respond(message.id, {
       isIncomplete: false,

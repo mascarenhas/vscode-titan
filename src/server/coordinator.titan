@@ -10,6 +10,7 @@ type InitializedHandler = function (): ()
 type ShutdownHandler = function (): ()
 type CompletionWork = function (): dispatcher.SemanticOutcome
 type CompletionCapture = function (dispatcher.CompletionRequest): CompletionWork
+type HoverCapture = function (dispatcher.SemanticRequest): CompletionWork
 type DocumentHandler = function (lsp.DocumentNotification): ()
 
 local type RemoveListener = function (): ()
@@ -32,6 +33,7 @@ record Coordinator
   local active: {ActiveRequest}
   local document_handler: DocumentHandler?
   local completion_capture: CompletionCapture?
+  local hover_capture: HoverCapture?
 end
 
 local REQUEST_CANCELLED = -32800
@@ -52,7 +54,11 @@ function create(output: response_queue.ResponseQueue,
   if handler ~= nil then actual = handler end
   return Coordinator.new(
     dispatcher.create(), output, actual, initialized_handler,
-    shutdown_handler, {}, nil, nil)
+    shutdown_handler, {}, nil, nil, nil)
+end
+
+function Coordinator:configure_hover(capture: HoverCapture)
+  self.hover_capture = capture
 end
 
 function Coordinator:configure_completion(
@@ -250,6 +256,20 @@ function Coordinator:handle(source: string): integer?
     logging.emit("info", "lifecycle.initialized", nil)
     return nil
   when semantic(request) then
+    if request.method == "textDocument/hover" and self.hover_capture ~= nil then
+      local work?: CompletionWork
+      do
+        -- A hover position belongs to the editor state at message receipt,
+        -- including the absence of an open session. Capture before its Task.
+        work = self.hover_capture(request)
+      catch
+        self:publish(dispatcher.failure_response(
+          request.id, INTERNAL_ERROR, "Internal error"))
+        return nil
+      end
+      self:start(request.id, request.method, work)
+      return nil
+    end
     self:start(request.id, request.method,
       function (): dispatcher.SemanticOutcome
         return self.handler(request)

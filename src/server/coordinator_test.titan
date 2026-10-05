@@ -202,6 +202,70 @@ function test_coordinator_captures_completion_before_later_notifications(
   test_runtime.run(captures_completion_before_later_notifications)
 end
 
+function test_coordinator_captures_hover_before_editor_notifications(_context: test.Context)
+  test_runtime.run(function ()
+    local output = response_queue.create()
+    local documents = buffers.create()
+    local captured_version = -1
+    local started = false
+    local server = coordinator.create(output)
+    defer server:cancel_all("hover capture cleanup")
+    server:configure_completion(
+      function (notification: lsp.DocumentNotification) documents:apply(notification) end,
+      function (_request: dispatcher.CompletionRequest): coordinator.CompletionWork
+        return function (): dispatcher.SemanticOutcome return dispatcher.SemanticOutcome.result(wire.null()) end
+      end)
+    server:configure_hover(function (request: dispatcher.SemanticRequest): coordinator.CompletionWork
+      local params? = lsp.parse_document_position(request.params)
+      local capture? = documents:capture(params.path, params.position)
+      local epoch = documents:epoch()
+      captured_version = capture ~= nil and capture.document.version or 0
+      local version = captured_version
+      return function (): dispatcher.SemanticOutcome
+        started = true
+        local current: boolean = epoch == documents:epoch() and
+          (capture == nil or documents:current(capture))
+        local result: wire.Object = {
+          ["captured"] = version,
+          ["current"] = current,
+        }
+        return dispatcher.SemanticOutcome.result(result)
+      end
+    end)
+    initialize(server, output)
+    local uri = test_paths.workspace_uri() .. "/main.titan"
+    local hover = [[{"jsonrpc":"2.0","id":40,"method":"textDocument/hover","params":{"textDocument":{"uri":"]] ..
+      uri .. [["},"position":{"line":0,"character":1}}}]]
+    local open = [[{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"]] ..
+      uri .. [[","languageId":"titan","version":1,"text":"same"}}}]]
+    server:handle(hover)
+    test.assert(captured_version == 0 and not started, "closed hover capture was deferred")
+    server:handle(open)
+    while server:active_count() > 0 do timer.yield() end
+    local first? = wire.as_object(response_object(output:take())["result"])
+    test.assert(wire.as_integer(first["captured"]) == 0 and wire.as_boolean(first["current"]) == false,
+      "later open attached its session to an earlier closed hover")
+    started = false
+    server:handle(hover)
+    test.assert(captured_version == 1 and not started, "open hover capture was deferred")
+    server:handle([[{"jsonrpc":"2.0","method":"textDocument/didClose","params":{"textDocument":{"uri":"]] .. uri .. [["}}}]])
+    server:handle(open)
+    while server:active_count() > 0 do timer.yield() end
+    local reopened? = wire.as_object(response_object(output:take())["result"])
+    test.assert(wire.as_boolean(reopened["current"]) == false,
+      "same-version reopening retained an earlier hover capture")
+    started = false
+    server:handle(hover)
+    test.assert(captured_version == 1 and not started)
+    server:handle([[{"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":"]] ..
+      uri .. [[","version":2},"contentChanges":[{"text":"new"}]}}]])
+    while server:active_count() > 0 do timer.yield() end
+    local changed? = wire.as_object(response_object(output:take())["result"])
+    test.assert(wire.as_boolean(changed["current"]) == false,
+      "later change attached its text to an earlier hover position")
+  end)
+end
+
 local function cancels_completion_before_work_starts()
   local output = response_queue.create()
   local server = coordinator.create(output)

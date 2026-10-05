@@ -302,7 +302,7 @@ They are not selected through the value binding `ffi`.
 
 Persisted compiler artifacts use `c-header-v6` and `ffi-conversion-v7` for
 extracted C definitions. Project entries retain declared member/type manifests,
-including trusted source visibility and generic schemes. SQLite schema 6 shares
+including trusted source visibility and generic schemes. SQLite schema 7 shares
 ordered header provenance across cache owners and stores fixed-size graph
 comparison hashes. It also retains the selected-part identity of shorthand union
 case bindings so rename preserves their meaning. Incompatible old publications
@@ -528,12 +528,15 @@ available as `./?.lua` and `./?.so`; see [the Codex setup guide](docs/codex.md).
 
 ## Version 1 behavior
 
-Definition, references, hover, rename, folding and diagnostics use saved files.
-Post-V1 completion analyzes current editor text for the active logical module
+Definition, references, rename, folding and diagnostics use saved files. Hover
+can additionally reuse the current ephemeral context from accepted completion
+preparation. Post-V1 completion analyzes current editor text for the active logical module
 against a committed saved dependency baseline. Type `.` or `:`, or use the usual
 editor completion command, including after `foreign` in a type annotation.
-See [completion behavior and ownership](docs/completion.md) for supported contexts
-and limits. Foreign-definition navigation, external-source navigation and
+Callable candidates show named signatures and insert parameter-name call
+placeholders. Disable `titan.completion.insertCallSnippets` for function references.
+See [completion behavior and ownership](docs/completion.md) for supported contexts,
+fresh hover requirements and limits. Foreign-definition navigation, external-source navigation and
 watching external source trees remain outside the first-version scope.
 
 Hover presents a named declaration signature, including parameter names, for

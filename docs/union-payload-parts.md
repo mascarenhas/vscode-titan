@@ -63,9 +63,10 @@ Rename preserves shorthand semantics. Renaming the local `left` in
 declared part to `first` instead produces `when pair{left = first}`, leaving
 the local binding and its uses unchanged.
 
-Diagnostics, hover, navigation, references and rename continue to use saved
-files. Completion alone uses captured unsaved buffers, including constructor
-members and case-arm locals. Its provisional-result policy is unchanged; the
+Diagnostics, navigation, references and rename continue to use saved
+files. Completion uses captured unsaved buffers, including constructor
+members and case-arm locals, and prepares the bounded ephemeral hover context
+described in [completion behavior](completion.md). Its provisional-result policy is unchanged; the
 compiler remains the authority for validity.
 
 ## Server implementation

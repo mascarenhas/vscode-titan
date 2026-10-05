@@ -243,3 +243,113 @@ function test_lsp_types_completion_context_and_plain_text_edits(_context: test.C
     lsp.CompletionList.new(false, {}))) == [[{"isIncomplete":false,"items":[]}]],
     "empty completion results were not encoded as a CompletionList")
 end
+
+function test_lsp_types_completion_negotiates_capabilities(_context: test.Context)
+  local defaults = lsp.completion_options(wire.decode([[{}]]))
+  test.assert(not defaults.snippet_support and not defaults.label_details_support and
+    defaults.insert_call_snippets, "missing client capabilities enabled extensions")
+  local supported = lsp.completion_options(wire.decode(
+    [[{"capabilities":{"textDocument":{"completion":{"completionItem":{"snippetSupport":true,"labelDetailsSupport":true}}}}}]]))
+  test.assert(supported.snippet_support and supported.label_details_support and
+    supported.insert_call_snippets, "advertised completion capabilities were lost")
+  local reference = lsp.completion_options(wire.decode(
+    [[{"capabilities":{"textDocument":{"completion":{"completionItem":{"snippetSupport":true}}}},"initializationOptions":{"insertCallSnippets":false}}]]))
+  test.assert(reference.snippet_support and not reference.insert_call_snippets,
+    "function-reference option did not disable call insertion")
+  local malformed = lsp.completion_options(wire.decode(
+    [[{"capabilities":{"textDocument":{"completion":{"completionItem":{"snippetSupport":"true","labelDetailsSupport":1}}}},"initializationOptions":{"insertCallSnippets":"true"}}]]))
+  test.assert(not malformed.snippet_support and not malformed.label_details_support and
+    not malformed.insert_call_snippets, "malformed capability enabled completion extensions")
+end
+
+local function completion_wire_item(options: lsp.CompletionOptions?): wire.Object
+  local range = source_text.Span.new(
+    source_text.Position.new(2, 1), source_text.Position.new(2, 7))
+  local result = lsp.completion_list_value(lsp.CompletionList.new(false, {
+    lsp.CompletionItem.new("method", 2, "method(count: integer, label: string): boolean",
+      "0001:method", "method", lsp.TextEdit.new(range, "method"),
+      "method(${1:count}, ${2:label})$0"),
+  }), options)
+  local items? = wire.as_array(result["items"])
+  return wire.as_object(items[1])
+end
+
+function test_lsp_types_completion_serializes_named_call_snippets(_context: test.Context)
+  local item = completion_wire_item(lsp.CompletionOptions.new(true, true, true))
+  local edit? = wire.as_object(item["textEdit"])
+  local details? = wire.as_object(item["labelDetails"])
+  test.assert(wire.as_string(item["label"]) == "method" and
+    wire.as_string(item["filterText"]) == "method" and
+    wire.as_string(item["detail"]) == "method(count: integer, label: string): boolean",
+    "signature display changed the completion's name or matching text")
+  test.assert(wire.as_integer(item["insertTextFormat"]) == 2 and
+    wire.as_string(edit["newText"]) == "method(${1:count}, ${2:label})$0",
+    "snippet-capable client did not receive editable named placeholders")
+  test.assert(wire.as_string(details["detail"]) ==
+    "(count: integer, label: string): boolean",
+    "list label did not display its named signature suffix")
+  local range? = wire.as_object(edit["range"])
+  local start? = wire.as_object(range["start"])
+  local finish? = wire.as_object(range["end"])
+  test.assert(wire.as_integer(start["character"]) == 1 and
+    wire.as_integer(finish["character"]) == 7,
+    "snippet insertion changed the whole-token replacement range")
+end
+
+local function assert_name_only_completion(options: lsp.CompletionOptions?)
+  local item = completion_wire_item(options)
+  local edit? = wire.as_object(item["textEdit"])
+  test.assert(wire.as_integer(item["insertTextFormat"]) == 1 and
+    wire.as_string(edit["newText"]) == "method" and item["labelDetails"] == nil,
+    "name-only completion exposed snippet syntax or unsupported label details")
+end
+
+function test_lsp_types_completion_plain_text_fallbacks(context: test.Context)
+  context:run("absent_capabilities", function (_child: test.Context)
+    assert_name_only_completion(nil)
+  end)
+  context:run("no_snippet_support", function (_child: test.Context)
+    assert_name_only_completion(lsp.CompletionOptions.new(false, false, true))
+  end)
+  context:run("function_reference_preference", function (_child: test.Context)
+    assert_name_only_completion(lsp.CompletionOptions.new(true, false, false))
+  end)
+end
+
+function test_lsp_types_completion_preserves_existing_call_arguments(context: test.Context)
+  context:run("positional", function (_child: test.Context)
+    test.assert(lsp.completion_call_snippet("method(1)", 6, "method(${1:count})$0") == nil)
+  end)
+  context:run("named", function (_child: test.Context)
+    test.assert(lsp.completion_call_snippet("method \n {count = 1}", 6, "method(${1:count})$0") == nil)
+  end)
+  context:run("generic", function (_child: test.Context)
+    test.assert(lsp.completion_call_snippet("method<|integer|>(1)", 6, "method(${1:count})$0") == nil)
+  end)
+  context:run("string_argument", function (_child: test.Context)
+    test.assert(lsp.completion_call_snippet("method \"one\"", 6, "method(${1:label})$0") == nil)
+  end)
+  context:run("long_string_argument", function (_child: test.Context)
+    test.assert(lsp.completion_call_snippet("method [[one]]", 6, "method(${1:label})$0") == nil)
+    test.assert(lsp.completion_call_snippet("method [==[one]==]", 6, "method(${1:label})$0") == nil)
+  end)
+  context:run("comments_before_arguments", function (_child: test.Context)
+    test.assert(lsp.completion_call_snippet("method -- retained\n (1)", 6,
+      "method(${1:count})$0") == nil)
+    test.assert(lsp.completion_call_snippet("method --[=[ ) ]=]\n {count = 1}", 6,
+      "method(${1:count})$0") == nil)
+    test.assert(lsp.completion_call_snippet("method --[[first]] -- second\n <|integer|>(1)", 6,
+      "method(${1:count})$0") == nil)
+    test.assert(lsp.completion_call_snippet("method --[=[ unfinished", 6,
+      "method(${1:count})$0") == nil)
+  end)
+  context:run("no_arguments", function (_child: test.Context)
+    test.assert(lsp.completion_call_snippet("method", 6, "method(${1:count})$0") ==
+      "method(${1:count})$0")
+    test.assert(lsp.completion_call_snippet("method", 6, nil) == nil)
+    test.assert(lsp.completion_call_snippet("method -- trailing comment", 6,
+      "method(${1:count})$0") == "method(${1:count})$0")
+    test.assert(lsp.completion_call_snippet("method --[=[kept]=] \n end", 6,
+      "method(${1:count})$0") == "method(${1:count})$0")
+  end)
+end

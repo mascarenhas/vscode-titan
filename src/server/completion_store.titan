@@ -291,7 +291,7 @@ function initialize_saved_schema(connection: sqlite3.Connection)
     "CREATE TABLE IF NOT EXISTS main.completion_source_files(module_name BLOB NOT NULL REFERENCES completion_descriptors(module_name) ON DELETE CASCADE,position INTEGER NOT NULL,filename BLOB NOT NULL,PRIMARY KEY(module_name,position)) WITHOUT ROWID",
     "CREATE TABLE IF NOT EXISTS main.completion_imports(module_name BLOB NOT NULL REFERENCES completion_descriptors(module_name) ON DELETE CASCADE,position INTEGER NOT NULL,alias BLOB NOT NULL,dependency BLOB NOT NULL,source_required INTEGER NOT NULL,filename BLOB NOT NULL,line INTEGER NOT NULL,column INTEGER NOT NULL,PRIMARY KEY(module_name,position)) WITHOUT ROWID",
     "CREATE TABLE IF NOT EXISTS main.completion_header_inputs(module_name BLOB NOT NULL REFERENCES completion_descriptors(module_name) ON DELETE CASCADE,position INTEGER NOT NULL,kind INTEGER NOT NULL,path BLOB NOT NULL,identity BLOB NOT NULL,modified_seconds INTEGER,modified_nanoseconds INTEGER,physical_identity BLOB,PRIMARY KEY(module_name,position)) WITHOUT ROWID",
-    "CREATE TABLE IF NOT EXISTS main.completion_members(module_name BLOB NOT NULL REFERENCES completion_descriptors(module_name) ON DELETE CASCADE,ordinal INTEGER NOT NULL,label TEXT COLLATE BINARY NOT NULL,lookup_domain TEXT NOT NULL,lookup_key TEXT NOT NULL,kind INTEGER NOT NULL,detail BLOB NOT NULL,type_key BLOB NOT NULL,scope_id INTEGER NOT NULL,scope_depth INTEGER NOT NULL,declaration_order INTEGER NOT NULL,available INTEGER NOT NULL,visibility TEXT NOT NULL,owner_key TEXT NOT NULL,access_mode TEXT NOT NULL,PRIMARY KEY(module_name,ordinal)) WITHOUT ROWID",
+    "CREATE TABLE IF NOT EXISTS main.completion_members(module_name BLOB NOT NULL REFERENCES completion_descriptors(module_name) ON DELETE CASCADE,ordinal INTEGER NOT NULL,label TEXT COLLATE BINARY NOT NULL,lookup_domain TEXT NOT NULL,lookup_key TEXT NOT NULL,kind INTEGER NOT NULL,detail BLOB NOT NULL,type_key BLOB NOT NULL,scope_id INTEGER NOT NULL,scope_depth INTEGER NOT NULL,declaration_order INTEGER NOT NULL,available INTEGER NOT NULL,visibility TEXT NOT NULL,owner_key TEXT NOT NULL,access_mode TEXT NOT NULL,call_snippet BLOB,PRIMARY KEY(module_name,ordinal)) WITHOUT ROWID",
     "CREATE INDEX IF NOT EXISTS main.completion_members_owner ON completion_members(module_name,owner_key,access_mode,label COLLATE BINARY)",
   }
   for index = 1, #schema do sql.execute(connection, schema[index]) end
@@ -311,10 +311,11 @@ local function initialize_temp_schema(connection: sqlite3.Connection)
     "CREATE TEMP TABLE IF NOT EXISTS completion_inputs(snapshot_id BLOB NOT NULL REFERENCES completion_snapshots(id) ON DELETE CASCADE,position INTEGER NOT NULL,filename BLOB NOT NULL,session INTEGER NOT NULL,version INTEGER NOT NULL,contents BLOB NOT NULL,PRIMARY KEY(snapshot_id,position)) WITHOUT ROWID",
     "CREATE TEMP TABLE IF NOT EXISTS covered_modules(snapshot_id BLOB NOT NULL REFERENCES completion_snapshots(id) ON DELETE CASCADE,module_name BLOB NOT NULL,PRIMARY KEY(snapshot_id,module_name)) WITHOUT ROWID",
     "CREATE TEMP TABLE IF NOT EXISTS completion_scopes(snapshot_id BLOB NOT NULL REFERENCES completion_snapshots(id) ON DELETE CASCADE,scope_id INTEGER NOT NULL,parent_id INTEGER,kind TEXT NOT NULL,filename BLOB NOT NULL,byte_start INTEGER NOT NULL,byte_finish INTEGER NOT NULL,PRIMARY KEY(snapshot_id,scope_id)) WITHOUT ROWID",
-    "CREATE TEMP TABLE IF NOT EXISTS completion_candidates(snapshot_id BLOB NOT NULL REFERENCES completion_snapshots(id) ON DELETE CASCADE,ordinal INTEGER NOT NULL,label TEXT COLLATE BINARY NOT NULL,lookup_domain TEXT NOT NULL,lookup_key TEXT NOT NULL,kind INTEGER NOT NULL,detail BLOB NOT NULL,type_key BLOB NOT NULL,scope_id INTEGER NOT NULL,scope_depth INTEGER NOT NULL,declaration_order INTEGER NOT NULL,available INTEGER NOT NULL,visibility TEXT NOT NULL,owner_key TEXT NOT NULL,access_mode TEXT NOT NULL,PRIMARY KEY(snapshot_id,ordinal)) WITHOUT ROWID",
+    "CREATE TEMP TABLE IF NOT EXISTS completion_candidates(snapshot_id BLOB NOT NULL REFERENCES completion_snapshots(id) ON DELETE CASCADE,ordinal INTEGER NOT NULL,label TEXT COLLATE BINARY NOT NULL,lookup_domain TEXT NOT NULL,lookup_key TEXT NOT NULL,kind INTEGER NOT NULL,detail BLOB NOT NULL,type_key BLOB NOT NULL,scope_id INTEGER NOT NULL,scope_depth INTEGER NOT NULL,declaration_order INTEGER NOT NULL,available INTEGER NOT NULL,visibility TEXT NOT NULL,owner_key TEXT NOT NULL,access_mode TEXT NOT NULL,call_snippet BLOB,PRIMARY KEY(snapshot_id,ordinal)) WITHOUT ROWID",
     "CREATE INDEX IF NOT EXISTS temp.completion_candidates_lookup ON completion_candidates(snapshot_id,scope_id,label COLLATE BINARY)",
     "CREATE INDEX IF NOT EXISTS temp.completion_candidates_owner ON completion_candidates(snapshot_id,owner_key,access_mode,label COLLATE BINARY)",
     "CREATE INDEX IF NOT EXISTS temp.completion_snapshots_context ON completion_snapshots(filename,caret_byte,context_key)",
+    "CREATE TEMP TABLE IF NOT EXISTS completion_hovers(snapshot_id BLOB NOT NULL REFERENCES completion_snapshots(id) ON DELETE CASCADE,filename BLOB NOT NULL,byte_start INTEGER NOT NULL,byte_finish INTEGER NOT NULL,markdown BLOB NOT NULL,PRIMARY KEY(snapshot_id,filename,byte_start)) WITHOUT ROWID",
   }
   for index = 1, #schema do sql.execute(connection, schema[index]) end
 end
@@ -332,14 +333,16 @@ local function optional_blob(text: string?): value
 end
 
 -- Each execute crosses the asynchronous SQLite worker boundary. Batch scalar
--- rows as the saved semantic index does; 13 * 15 bindings stay below Titan's
+-- rows as the saved semantic index does; 12 * 16 bindings stay below Titan's
 -- 200-position variadic-call limit. All values, including names, remain bound.
 local function write_candidates(connection: sqlite3.Connection, table_name: string,
     owner: string, candidates: {facts.Candidate}, current: Current?): boolean
   if #candidates == 0 then return true end
-  local width = 13
+  local width = 12
   if #candidates < width then width = #candidates end
-  local row_sql = "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+  -- A nil assignment removes an Array slot. Empty BLOB is the unused snippet
+  -- sentinel in this fixed-width binding vector; SQL restores NULL on write.
+  local row_sql = "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULLIF(?,X''))"
   local prefix = "INSERT INTO " .. table_name .. " VALUES "
   local statement = connection:prepare(prefix .. strings.rep(row_sql .. ",", width - 1) .. row_sql)
   defer statement:close()
@@ -374,6 +377,7 @@ local function write_candidates(connection: sqlite3.Connection, table_name: stri
       parameters[#parameters + 1] = candidate.visibility
       parameters[#parameters + 1] = candidate.owner_key
       parameters[#parameters + 1] = candidate.access_mode
+      parameters[#parameters + 1] = blob(candidate.call_snippet or "")
     end
     insert:execute(...parameters)
     offset = finish + 1
@@ -384,10 +388,35 @@ end
 local function read_candidate(row: sqlite3.Row): facts.Candidate
   return facts.Candidate.new(row:get(1), row:get(2), row:get(3), row:get(4),
     sql.bytes(row, 5), sql.bytes(row, 6), row:get(7), row:get(8), row:get(9),
-    (row:get(10) as integer) ~= 0, row:get(11), row:get(12), row:get(13))
+    (row:get(10) as integer) ~= 0, row:get(11), row:get(12), row:get(13), sql.optional_bytes(row, 14))
 end
 
-local CANDIDATE_COLUMNS = "label,lookup_domain,lookup_key,kind,detail,type_key,scope_id,scope_depth,declaration_order,available,visibility,owner_key,access_mode"
+local function write_hovers(connection: sqlite3.Connection, snapshot_id: string,
+    hovers: {facts.Hover}, current: Current): boolean
+  local offset = 1
+  while offset <= #hovers do
+    if not current() then return false end
+    local finish = offset + 31
+    if finish > #hovers then finish = #hovers end
+    local parameters: {value} = {}
+    for index = offset, finish do
+      local hover = hovers[index]
+      parameters[#parameters + 1] = blob(snapshot_id)
+      parameters[#parameters + 1] = blob(hover.filename)
+      parameters[#parameters + 1] = hover.byte_start
+      parameters[#parameters + 1] = hover.byte_finish
+      parameters[#parameters + 1] = blob(hover.markdown)
+    end
+    local statement = connection:prepare("INSERT INTO temp.completion_hovers VALUES " ..
+      strings.rep("(?,?,?,?,?),", finish - offset) .. "(?,?,?,?,?)")
+    defer statement:close()
+    statement:execute(...parameters)
+    offset = finish + 1
+  end
+  return true
+end
+
+local CANDIDATE_COLUMNS = "label,lookup_domain,lookup_key,kind,detail,type_key,scope_id,scope_depth,declaration_order,available,visibility,owner_key,access_mode,call_snippet"
 
 local function publish_header_inputs(connection: sqlite3.Connection,
                                      descriptor: SavedDescriptor)
@@ -662,7 +691,7 @@ function Store:current_generation(expected: integer): boolean
   return current_generation(access.connection, expected)
 end
 
-local function snapshot_bytes(snapshot: facts.Snapshot): integer
+local function snapshot_bytes(snapshot: facts.Snapshot, include_hovers: boolean): integer
   local bytes = #snapshot.id + #snapshot.module_name + #snapshot.context_key +
     #snapshot.filename + #snapshot.prefix + #snapshot.quality + 256
   for index = 1, #snapshot.inputs do
@@ -677,7 +706,14 @@ local function snapshot_bytes(snapshot: facts.Snapshot): integer
     local candidate = snapshot.candidates[index]
     bytes = bytes + #candidate.label + #candidate.lookup_domain + #candidate.lookup_key +
       #candidate.detail + #candidate.type_key + #candidate.visibility +
-      #candidate.owner_key + #candidate.access_mode + 128
+      #candidate.owner_key + #candidate.access_mode + #(candidate.call_snippet or "") + 128
+  end
+  if include_hovers and snapshot.hovers ~= nil then
+    for index = 1, #snapshot.hovers do
+      if index % 1024 == 0 then async.yield() end
+      local hover = snapshot.hovers[index]
+      bytes = bytes + #hover.filename + #hover.markdown + 64
+    end
   end
   return bytes
 end
@@ -697,8 +733,16 @@ local function inputs_current(connection: sqlite3.Connection,
 end
 
 function Store:publish(snapshot: facts.Snapshot, current: Current): boolean
-  local bytes = snapshot_bytes(snapshot)
+  local bytes = snapshot_bytes(snapshot, false)
   if bytes > MAX_SNAPSHOT_BYTES or #snapshot.candidates > MAX_CANDIDATES then return false end
+  local retain_hovers = false
+  if snapshot.hovers ~= nil and #snapshot.hovers <= facts.MAX_HOVER_ROWS then
+    local combined_bytes = snapshot_bytes(snapshot, true)
+    if combined_bytes <= MAX_SNAPSHOT_BYTES and combined_bytes - bytes <= facts.MAX_HOVER_BYTES then
+      retain_hovers = true
+      bytes = combined_bytes
+    end
+  end
   if snapshot.replace_start < 0 or snapshot.replace_finish < snapshot.replace_start or
       snapshot.caret_byte < snapshot.replace_start or snapshot.caret_byte > snapshot.replace_finish then
     raise "invalid completion replacement span"
@@ -746,6 +790,8 @@ function Store:publish(snapshot: facts.Snapshot, current: Current): boolean
     end
     if not write_candidates(connection, "temp.completion_candidates", snapshot.id,
         snapshot.candidates, current) then return false end
+    if retain_hovers and not write_hovers(connection, snapshot.id,
+        snapshot.hovers, current) then return false end
     -- A change notification may run while native SQLite operations suspend.
     -- Returning false rolls back the whole transaction without a stale row.
     return current()
@@ -829,4 +875,30 @@ function Store:select_provisional(snapshot_id: string, filename: string,
     return nil
   end
   return select_candidates(connection, snapshot_id, prefix, limit, "partial", current)
+end
+
+-- Hover never borrows provisional completion knowledge. Validate the entire
+-- prepared input vector and saved generation under the same read lease as
+-- the scalar lookup, including other open contributors of the active module.
+function Store:hover(snapshot_id: string, filename: string, session: integer,
+    version: integer, offset: integer, current: Current): facts.Hover?
+  if self.closed then return nil end
+  local access = self.store:acquire()
+  defer access:release()
+  local rows = sql.rows(access.connection,
+    "SELECT h.byte_start,h.byte_finish,h.markdown FROM temp.completion_hovers h " ..
+    "JOIN temp.completion_snapshots s ON s.id=h.snapshot_id " ..
+    "JOIN temp.completion_inputs i ON i.snapshot_id=s.id AND i.filename=h.filename " ..
+    "JOIN temp.open_documents d ON d.filename=i.filename AND d.session=i.session " ..
+    "AND d.version=i.version AND d.contents=i.contents " ..
+    "WHERE h.snapshot_id=? AND h.filename=? AND i.session=? AND i.version=? " ..
+    "AND h.byte_start<=? AND ?<h.byte_finish " ..
+    "AND s.saved_generation=(SELECT published_generation FROM main.store_state WHERE singleton=1) " ..
+    "AND NOT EXISTS(SELECT 1 FROM temp.completion_inputs other WHERE other.snapshot_id=s.id " ..
+    "AND other.session>0 AND NOT EXISTS(SELECT 1 FROM temp.open_documents live " ..
+    "WHERE live.filename=other.filename AND live.session=other.session " ..
+    "AND live.version=other.version AND live.contents=other.contents)) LIMIT 1",
+    blob(snapshot_id), blob(filename), session, version, offset, offset)
+  if #rows ~= 1 or not current() then return nil end
+  return facts.Hover.new(filename, rows[1]:get(1), rows[1]:get(2), sql.bytes(rows[1], 3))
 end

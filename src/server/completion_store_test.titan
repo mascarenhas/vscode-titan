@@ -13,9 +13,9 @@ local semantic = import "server.semantic_index"
 local PATH = "/workspace/app.titan"
 
 local function candidate(label: string, detail: string, depth: integer,
-                          order: integer, available: boolean): facts.Candidate
+                          order: integer, available: boolean, snippet: string?): facts.Candidate
   return facts.Candidate.new(label, "term", label, 6, detail, "integer",
-    depth, depth, order, available, "private", "module:app", "lexical")
+    depth, depth, order, available, "private", "module:app", "lexical", snippet)
 end
 
 local function snapshot(id: string, prefix: string,
@@ -77,8 +77,10 @@ function test_completion_store_publishes_complete_and_partial_candidate_batches(
     defer overlay:close()
     local candidates: {facts.Candidate} = {}
     for index = 1, 29 do
+      local snippet: string? = nil
+      if index % 2 == 1 then snippet = "name" .. index .. "(${1:argument})$0" end
       candidates[index] = candidate("name" .. index, "detail\0" .. index,
-        0, index, index ~= 14)
+        0, index, index ~= 14, snippet)
     end
     do
       local access = store:acquire()
@@ -102,13 +104,14 @@ function test_completion_store_publishes_complete_and_partial_candidate_batches(
       for table_index = 1, #tables do
         local table = tables[table_index]
         local rows = sql.rows(access.connection,
-          "SELECT ordinal,label,detail,declaration_order,available FROM " .. table .. " ORDER BY ordinal")
+          "SELECT ordinal,label,detail,declaration_order,available,call_snippet FROM " .. table .. " ORDER BY ordinal")
         test.assert(#rows == #candidates, "candidate batch omitted its final partial rows")
         for index = 1, #rows do
           local row = rows[index]
           test.assert(row:get(1) == index and row:get(2) == candidates[index].label and
             sql.bytes(row, 3) == candidates[index].detail and row:get(4) == index and
-            ((row:get(5) as integer) ~= 0) == candidates[index].available,
+            ((row:get(5) as integer) ~= 0) == candidates[index].available and
+            sql.optional_bytes(row, 6) == candidates[index].call_snippet,
             "candidate bindings changed across batch boundaries")
         end
       end
@@ -128,6 +131,44 @@ function test_completion_store_publishes_complete_and_partial_candidate_batches(
       "interrupted candidate batch displaced the last complete snapshot")
     test.assert(overlay:select("superseded", "context", "", 100, yes) == nil,
       "interrupted candidate batch retained a partial snapshot")
+  end)
+end
+
+function test_completion_store_optional_hover_bounds_preserve_candidates_and_rollback(_context: test.Context)
+  runtime.run(function ()
+    local store = sql.open(":memory:")
+    defer store:close()
+    local overlay = fixture(store)
+    defer overlay:close()
+    local text = strings.rep("x", 65)
+    test.assert(overlay:put_document(facts.OpenDocument.new(
+      "file://" .. PATH, PATH, "app", 1, 2, text)))
+    local input = facts.Input.new(PATH, 1, 2, text)
+    local hovers: {facts.Hover} = {}
+    for index = 1, 65 do hovers[index] = facts.Hover.new(PATH, index - 1, index, "hover" .. index) end
+    local accepted = facts.Snapshot.new("hover-batched", "app", 7, 2, "context", PATH, 1, 2,
+      3, 0, 3, "", "complete", {input}, {}, {candidate("kept", "ready", 0, 0, true)}, hovers)
+    test.assert(overlay:publish(accepted, yes))
+    test.assert(overlay:hover(accepted.id, PATH, 1, 2, 64, yes).markdown == "hover65",
+      "hover publication omitted its final partial batch")
+    local checks = 0
+    local cancelled = facts.Snapshot.new("hover-cancelled", "app", 7, 2, "context", PATH, 1, 2,
+      3, 0, 3, "", "complete", {input}, {}, {}, hovers)
+    test.assert(not overlay:publish(cancelled, function (): boolean
+      checks = checks + 1
+      return checks <= 3
+    end), "hover publication did not roll back after two full batches")
+    test.assert(overlay:hover(accepted.id, PATH, 1, 2, 64, yes) ~= nil and
+      overlay:hover(cancelled.id, PATH, 1, 2, 0, yes) == nil,
+      "superseded hover batches displaced the accepted snapshot")
+    local oversized = facts.Snapshot.new("hover-overflow", "app", 7, 2, "context", PATH, 1, 2,
+      3, 0, 3, "", "complete", {input}, {}, {candidate("kept", "ready", 0, 0, true)},
+      {facts.Hover.new(PATH, 0, 1, strings.rep("x", facts.MAX_HOVER_BYTES + 1))})
+    test.assert(overlay:publish(oversized, yes), "optional hover overflow rejected completion")
+    local selected? = overlay:select(oversized.id, "context", "", 10, yes)
+    test.assert(selected ~= nil and #selected.candidates == 1 and selected.candidates[1].label == "kept" and
+      overlay:hover(oversized.id, PATH, 1, 2, 0, yes) == nil,
+      "optional hover bounds lost candidates or retained the oversized payload")
   end)
 end
 
@@ -190,6 +231,57 @@ function test_completion_store_generation_and_context_fences(_context: test.Cont
       "selection mixed old TEMP facts with a newer committed generation")
     test.assert(not overlay:publish(prepared, yes),
       "stale saved generation installed a new snapshot")
+  end)
+end
+
+function test_completion_store_hover_fences_contributors_generation_and_session(_context: test.Context)
+  runtime.run(function ()
+    local store = sql.open(":memory:")
+    defer store:close()
+    local overlay = fixture(store)
+    defer overlay:close()
+    local part = "/workspace/part.titan"
+    test.assert(overlay:put_document(facts.OpenDocument.new(
+      "file://" .. part, part, "app", 2, 1, "x")))
+    local prepared = facts.Snapshot.new("hover", "app", 7, 1, "context", PATH, 1, 1,
+      3, 0, 3, "", "complete", {
+        facts.Input.new(PATH, 1, 1, "abc"), facts.Input.new(part, 2, 1, "x"),
+      }, {}, {}, {
+        facts.Hover.new(PATH, 0, 3, "active hover"), facts.Hover.new(part, 0, 1, "contributor hover"),
+      })
+    test.assert(overlay:publish(prepared, yes))
+    local active? = overlay:hover("hover", PATH, 1, 1, 1, yes)
+    local contributor? = overlay:hover("hover", part, 2, 1, 0, yes)
+    test.assert(active ~= nil and active.markdown == "active hover" and
+      contributor ~= nil and contributor.markdown == "contributor hover",
+      "exact ephemeral inputs did not expose both contributors")
+    test.assert(overlay:hover("hover", PATH, 1, 1, 3, yes) == nil,
+      "hover included its exclusive span endpoint")
+    do
+      local access = store:acquire()
+      defer access:release()
+      sql.execute(access.connection, "UPDATE main.store_state SET published_generation=8 WHERE singleton=1")
+    end
+    test.assert(overlay:hover("hover", PATH, 1, 1, 1, yes) == nil,
+      "ephemeral hover borrowed a new saved generation")
+    do
+      local access = store:acquire()
+      defer access:release()
+      sql.execute(access.connection, "UPDATE main.store_state SET published_generation=7 WHERE singleton=1")
+    end
+    test.assert(overlay:put_document(facts.OpenDocument.new(
+      "file://" .. part, part, "app", 2, 2, "y")))
+    test.assert(overlay:hover("hover", PATH, 1, 1, 1, yes) == nil,
+      "changed sibling contributor did not invalidate the active file hover")
+    test.assert(overlay:put_document(facts.OpenDocument.new(
+      "file://" .. PATH, PATH, "app", 3, 1, "abc")))
+    test.assert(overlay:hover("hover", PATH, 3, 1, 1, yes) == nil,
+      "reopening the same bytes borrowed a prior session")
+    local access = store:acquire()
+    defer access:release()
+    test.assert(sql.scalar_integer(access.connection,
+      "SELECT COUNT(*) FROM temp.completion_hovers") == 0,
+      "retired snapshots retained their hover rows")
   end)
 end
 

@@ -15,6 +15,7 @@ import {
   formatServerStartup,
   formatStartupError,
   readCompilerDiscoveryConfiguration,
+  readCompletionConfiguration,
   readServerConfiguration,
   resolvePhysicalWorkspaceRoot,
   resolveServerExecutable
@@ -35,6 +36,7 @@ import {
 
 const LANGUAGE_SERVER_CONFIGURATION_SECTION = "titan.languageServer";
 const COMPILER_CONFIGURATION_SECTION = "titan.compiler";
+const COMPLETION_CONFIGURATION_SECTION = "titan.completion";
 const LANGUAGE_CLIENT_ID = "titan";
 const SHOW_LANGUAGE_SERVER_OUTPUT_COMMAND =
   "titan.showLanguageServerOutput";
@@ -133,6 +135,9 @@ class TitanClientManager {
           ) || event.affectsConfiguration(
             COMPILER_CONFIGURATION_SECTION,
             folder.uri
+          ) || event.affectsConfiguration(
+            COMPLETION_CONFIGURATION_SECTION,
+            folder.uri
           )
         )
         .map((folder) => folder.uri.toString())
@@ -227,6 +232,12 @@ class TitanClientManager {
         COMPILER_CONFIGURATION_SECTION,
         folder.uri
       );
+      const completionConfiguration = readCompletionConfiguration(
+        vscode.workspace.getConfiguration(
+          COMPLETION_CONFIGURATION_SECTION,
+          folder.uri
+        ).get<unknown>("insertCallSnippets", true)
+      );
       const serverConfiguration = readServerConfiguration(
         configuration.get<unknown>("path", ""),
         configuration.get<unknown>("arguments", []),
@@ -256,6 +267,7 @@ class TitanClientManager {
       );
       const documentSelector = createWorkspaceDocumentSelector(folder);
       const clientOptions: LanguageClientOptions = {
+        initializationOptions: completionConfiguration,
         diagnosticCollectionName: diagnosticCollectionName(folder),
         documentSelector,
         middleware: createWorkspaceMiddleware(folder),
@@ -537,7 +549,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     }),
     vscode.workspace.onDidChangeConfiguration((event) => {
       if (event.affectsConfiguration(LANGUAGE_SERVER_CONFIGURATION_SECTION) ||
-          event.affectsConfiguration(COMPILER_CONFIGURATION_SECTION)) {
+          event.affectsConfiguration(COMPILER_CONFIGURATION_SECTION) ||
+          event.affectsConfiguration(COMPLETION_CONFIGURATION_SECTION)) {
         clientManager?.scheduleRestart(event);
       }
     }),

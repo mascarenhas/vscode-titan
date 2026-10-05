@@ -366,6 +366,7 @@ record CompletionAnalysis
   const candidates: {completion_types.Candidate}
   const scopes: {completion_types.Scope}
   const observed_headers: {CHeaderDependency}?
+  const snapshot: ModuleSnapshot?
 end
 
 record CompletionBinary
@@ -4973,6 +4974,76 @@ local function completion_string(raw: {string: value}, key: string,
   return required_string(raw[key], "titan-compiler.completion", key)
 end
 
+-- The compiler's scalar completion type intentionally omits declaration
+-- parameter names. Observe its existing fact conversion while the checked,
+-- specialized type and declaration are together. Only private preparation
+-- installs this adapter, under the compiler permit; saved descriptors keep
+-- their compiler-owned schema and identity.
+local function Compiler:completion_presentation(row: {string: value},
+    name: string, candidate: value, declaration: value)
+  -- Function aliases are callable types, but completing one in a type
+  -- annotation must keep the compiler's type presentation and plain name.
+  if row["lookup_domain"] ~= "value" and row["lookup_domain"] ~= "foreign-value" then return end
+  local raw = required_map(candidate, TYPES_MODULE, "completion callable")
+  local tag = raw["_tag"]
+  if tag == "Type.FunctionScheme" then
+    raw = required_map(raw["signature"], TYPES_MODULE, "completion callable signature")
+    tag = raw["_tag"]
+  end
+  if tag ~= "Type.Function" and tag ~= "Type.CFunction" then return end
+  local names: value = raw["paramnames"]
+  if declaration is {string: value} then
+    local declared = declaration as {string: value}
+    names = declared["paramnames"]
+    if names == nil then names = declared["_paramnames"] end
+    if names == nil then names = raw["paramnames"] end
+  end
+  local signature? = render_callable_type(self, candidate, "", "", name,
+    names, "completion callable", nil)
+  if signature ~= nil then row["detail"] = signature.display end
+  local parameters = required_value_list(raw["params"], "completion callable.params")
+  local parameter_names? = optional_name_list(names, "completion callable.paramnames")
+  local output = strings.writer()
+  output:write(name)
+  output:write("(")
+  for index = 1, #parameters do
+    if index > 1 then output:write(", ") end
+    local placeholder = "arg" .. index
+    if parameter_names ~= nil then placeholder = parameter_names[index] end
+    output:write("${" .. index .. ":")
+    for byte_index = 1, #placeholder do
+      local byte = strings.sub(placeholder, byte_index, byte_index)
+      if byte == "\\" or byte == "$" or byte == "}" then output:write("\\") end
+      output:write(byte)
+    end
+    output:write("}")
+  end
+  -- Keep variadic tails open without inventing an operand named `...`.
+  if #parameters == 0 and (raw["varargtype"] ~= nil or raw["vararg"] == true) then
+    output:write("$1")
+  end
+  output:write(")$0")
+  row["call_snippet"] = output:drain()
+end
+
+local function Compiler:observe_completion_facts(): function (): ()
+  local module = completion_module()
+  local previous: value = module["fact"]
+  local original = previous as function (...: value): (...: value)
+  module["fact"] = function (name: value, candidate: value, declaration: value,
+      domain: value, owner: value, mode: value, depth: value,
+      private: value, spelling_only: value): value
+    local fact: value = original(name, candidate, declaration, domain, owner,
+      mode, depth, private, spelling_only)
+    if fact ~= nil then
+      local row = required_map(fact, "titan-compiler.completion", "candidate")
+      self:completion_presentation(row, name, candidate, declaration)
+    end
+    return fact
+  end
+  return function () module["fact"] = previous end
+end
+
 local function completion_candidates(raw: value): {completion_types.Candidate}
   local result: {completion_types.Candidate} = {}
   if raw == nil then return result end
@@ -4992,7 +5063,8 @@ local function completion_candidates(raw: value): {completion_types.Candidate}
       completion_integer(row, "declaration_order", 0),
       row["available"] ~= false, visibility,
       completion_string(row, "owner_key", ""),
-      completion_string(row, "access_mode", "lexical"))
+      completion_string(row, "access_mode", "lexical"),
+      optional_string(row["call_snippet"], "titan-compiler.completion", "call_snippet"))
   end
   return result
 end
@@ -5122,6 +5194,8 @@ function Compiler:analyze_completion(root_module: string,
     binaries: {CompletionBinary}?): CompletionAnalysis
   local permit = compiler_scheduler.acquire()
   defer permit:release()
+  local restore_facts = self:observe_completion_facts()
+  defer restore_facts()
   local previous = self:install_configuration()
   defer previous:apply()
   local overrides, project_map = project_loader_inputs(projects)
@@ -5190,10 +5264,25 @@ function Compiler:analyze_completion(root_module: string,
     return CompletionAnalysis.new("unresolved", hole.kind, {}, {})
   end
   local raw = required_map(raw_entry["completion"], "titan-compiler.completion", "analysis")
+  local snapshot: ModuleSnapshot? = nil
+  if raw_entry["ast"] ~= nil then
+    do
+      snapshot = snapshot_module(self, root_module, entry, project_map, {},
+        false, NormalizationWork.new(0)).snapshot
+    catch
+      -- Completion intentionally stops checking at its dummy lookup. The
+      -- optional hover walker may encounter an unfinished annotation even
+      -- when caret candidates are usable; preserve that candidate result.
+      if error is async.CancellationReason then raise end
+      logging.emit("debug", "completion.hover.failure", {
+        ["module"] = root_module, ["message"] = strings.tostring(error),
+      })
+    end
+  end
   return CompletionAnalysis.new(completion_string(raw, "quality", "unresolved"),
     completion_string(raw, "kind", hole.kind), completion_candidates(raw["candidates"]),
     completion_scopes(raw["scopes"]), normalize_c_header_dependencies(
-      raw_entry["c_header_dependencies"], "completion header inputs"))
+      raw_entry["c_header_dependencies"], "completion header inputs"), snapshot)
 end
 
 local function containing_directory(path: string): string

@@ -30,6 +30,7 @@ interface FixtureEvent {
   rootUri?: string | null;
   workspaceFolders?: Array<{ uri: string; name: string }> | null;
   trace?: string;
+  initializationOptions?: { insertCallSnippets: boolean };
   signal?: string;
 }
 
@@ -571,6 +572,69 @@ suite("Titan extension", () => {
       localDocument.toString()
     );
   });
+
+  test("converts completion call snippets and restarts only the opted-out workspace",
+    async function () {
+      this.timeout(30_000);
+      const configuration = vscode.workspace.getConfiguration("titan.languageServer", alpha.uri);
+      const completionConfiguration = vscode.workspace.getConfiguration("titan.completion", alpha.uri);
+      const previousArguments = configuration.inspect<string[]>("arguments")?.workspaceFolderValue;
+      const previousSnippets = completionConfiguration.inspect<boolean>("insertCallSnippets")?.workspaceFolderValue;
+      const fakeServer = path.resolve(__dirname, "../../../../test/fixtures/fake-lsp-server.cjs");
+      const betaBefore = (await readEvents(betaMarkerPath)).filter((event) => event.event === "initialize").at(-1);
+      let document: vscode.TextDocument | undefined;
+      try {
+        await completionConfiguration.update("insertCallSnippets", true, vscode.ConfigurationTarget.WorkspaceFolder);
+        await configuration.update("arguments", [fakeServer, alphaMarkerPath, "--semantic", "--completion",
+          "--call-completion", "--fixture-token", "call-snippets"], vscode.ConfigurationTarget.WorkspaceFolder);
+        const initialization = await waitForInitializationToken(alphaMarkerPath, "call-snippets", 10_000);
+        assert.deepEqual(initialization.initializationOptions, { insertCallSnippets: true });
+        document = await vscode.workspace.openTextDocument(vscode.Uri.joinPath(alpha.uri, "sample.titan"));
+        await replaceDocumentText(document, "method");
+        const result = await vscode.commands.executeCommand<vscode.CompletionList>(
+          "vscode.executeCompletionItemProvider", document.uri, new vscode.Position(0, 3));
+        const item = result.items.find((candidate) =>
+          (typeof candidate.label === "string" ? candidate.label : candidate.label.label) === "method");
+        assert.ok(item, "call completion did not reach the editor");
+        assert.ok(item.insertText instanceof vscode.SnippetString);
+        assert.equal(item.insertText.value, "method(${1:count}, ${2:label})$0");
+        assert.equal(item.detail, "method(count: integer, label: string): boolean");
+        assert.notEqual(typeof item.label, "string");
+        const label = item.label as vscode.CompletionItemLabel;
+        assert.equal(label.label, "method");
+        assert.equal(label.detail, "(count: integer, label: string): boolean");
+        assert.ok(item.range instanceof vscode.Range);
+        assert.equal(item.range.start.character, 0);
+        assert.equal(item.range.end.character, 6);
+
+        await completionConfiguration.update("insertCallSnippets", false, vscode.ConfigurationTarget.WorkspaceFolder);
+        const optedOut = await waitForInitializationToken(alphaMarkerPath, "call-snippets", 10_000, initialization.pid);
+        assert.notEqual(optedOut.pid, initialization.pid);
+        assert.deepEqual(optedOut.initializationOptions, { insertCallSnippets: false });
+        const plain = await vscode.commands.executeCommand<vscode.CompletionList>(
+          "vscode.executeCompletionItemProvider", document.uri, new vscode.Position(0, 3));
+        const reference = plain.items.find((candidate) =>
+          (typeof candidate.label === "string" ? candidate.label : candidate.label.label) === "method");
+        assert.ok(reference, "name-only completion did not reach the editor");
+        assert.equal(reference.insertText, "method");
+        const betaAfter = (await readEvents(betaMarkerPath)).filter((event) => event.event === "initialize").at(-1);
+        assert.equal(betaAfter?.pid, betaBefore?.pid, "alpha completion preference restarted beta");
+      } finally {
+        if (document?.isDirty) {
+          await vscode.window.showTextDocument(document);
+          await vscode.commands.executeCommand("workbench.action.files.revert");
+          await vscode.commands.executeCommand("workbench.action.closeActiveEditor");
+        }
+        const previousEventCount = (await readEvents(alphaMarkerPath)).length;
+        await completionConfiguration.update("insertCallSnippets", previousSnippets, vscode.ConfigurationTarget.WorkspaceFolder);
+        await configuration.update("arguments", previousArguments, vscode.ConfigurationTarget.WorkspaceFolder);
+        const previousToken = previousArguments?.at(-1);
+        if (previousToken !== undefined) {
+          await waitForInitializationToken(alphaMarkerPath, previousToken, 10_000, undefined, previousEventCount);
+        }
+      }
+    }
+  );
 
   test("routes nested-root semantics only to the most-specific workspace",
     async function () {
@@ -1298,6 +1362,7 @@ function assertInitialization(
     "the native server owns the default probe-cache location");
   assert.equal(event.serverLogLevel, "info");
   assert.equal(event.trace, "off");
+  assert.deepEqual(event.initializationOptions, { insertCallSnippets: true });
   assert.equal(event.rootPath, folder.uri.fsPath);
   assert.equal(event.rootUri, folder.uri.toString());
   assert.deepEqual(event.workspaceFolders, [{
@@ -1378,14 +1443,17 @@ async function waitForEventSequence(
 async function waitForInitializationToken(
   file: string,
   token: string,
-  timeoutMilliseconds: number
+  timeoutMilliseconds: number,
+  previousPid?: number,
+  afterEventCount: number = 0
 ): Promise<FixtureEvent> {
   const deadline = Date.now() + timeoutMilliseconds;
   let observed: FixtureEvent[] = [];
   while (Date.now() < deadline) {
     observed = await readEvents(file);
-    const initialization = observed.find((event) =>
-      event.event === "initialize" && event.arguments.includes(token));
+    const initialization = observed.slice(afterEventCount).find((event) =>
+      event.event === "initialize" && event.arguments.includes(token) &&
+      event.pid !== previousPid);
     if (initialization !== undefined) {
       return initialization;
     }
