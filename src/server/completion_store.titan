@@ -1,3 +1,6 @@
+--- Connection-local TEMP completion facts and indexed selection without AST traversal.
+-- @module server.completion_store
+
 local sqlite3 = import "sqlite3"
 local async = import "async"
 local strings = import "string"
@@ -23,6 +26,7 @@ record SavedDescriptor
   const imports: {bridge.Import}
   const header_inputs: {bridge.CHeaderDependency}
   const candidates: {facts.Candidate}
+  const documentation: string?
 end
 
 record SavedModule
@@ -35,6 +39,7 @@ record SavedModule
   const source_interface: string?
   const source_files: {string}
   const imports: {bridge.Import}
+  const documentation: string?
 end
 
 record Baseline
@@ -161,7 +166,7 @@ function Store:capture_baseline(): Baseline?
   local configuration = bridge.CompilerConfiguration.new(source_roots,
     sql.optional_bytes(setting, 2), include_roots, sql.optional_bytes(setting, 4))
   local rows = sql.rows(connection,
-    "SELECT module_name,revision,state,provenance,main_file,public_interface,source_interface " ..
+    "SELECT module_name,revision,state,provenance,main_file,public_interface,source_interface,documentation " ..
     "FROM main.completion_descriptors ORDER BY module_name")
   local modules: {SavedModule} = {}
   for index = 1, #rows do
@@ -169,7 +174,7 @@ function Store:capture_baseline(): Baseline?
     local name = sql.bytes(row, 1)
     modules[index] = SavedModule.new(name, row:get(2), row:get(3), row:get(4),
       sql.bytes(row, 5), sql.bytes(row, 6), sql.optional_bytes(row, 7),
-      saved_files(connection, name), saved_imports(connection, name))
+      saved_files(connection, name), saved_imports(connection, name), sql.optional_bytes(row, 8))
   end
   if sql.scalar_integer(connection,
       "SELECT COALESCE(SUM(length(contents)),0) FROM main.semantic_files") > MAX_BUFFER_BYTES then
@@ -287,11 +292,11 @@ function initialize_saved_schema(connection: sqlite3.Connection)
   local schema = {
     "CREATE TABLE IF NOT EXISTS main.completion_configuration(singleton INTEGER PRIMARY KEY CHECK(singleton=1),source_roots_present INTEGER NOT NULL,binary_root BLOB,include_roots_present INTEGER NOT NULL,cppflags BLOB)",
     "CREATE TABLE IF NOT EXISTS main.completion_roots(kind INTEGER NOT NULL,position INTEGER NOT NULL,path BLOB NOT NULL,PRIMARY KEY(kind,position)) WITHOUT ROWID",
-    "CREATE TABLE IF NOT EXISTS main.completion_descriptors(module_name BLOB PRIMARY KEY NOT NULL,revision INTEGER NOT NULL,state INTEGER NOT NULL,provenance TEXT NOT NULL,main_file BLOB NOT NULL,payload BLOB,public_interface BLOB NOT NULL,source_interface BLOB)",
+    "CREATE TABLE IF NOT EXISTS main.completion_descriptors(module_name BLOB PRIMARY KEY NOT NULL,revision INTEGER NOT NULL,state INTEGER NOT NULL,provenance TEXT NOT NULL,main_file BLOB NOT NULL,payload BLOB,public_interface BLOB NOT NULL,source_interface BLOB,documentation BLOB)",
     "CREATE TABLE IF NOT EXISTS main.completion_source_files(module_name BLOB NOT NULL REFERENCES completion_descriptors(module_name) ON DELETE CASCADE,position INTEGER NOT NULL,filename BLOB NOT NULL,PRIMARY KEY(module_name,position)) WITHOUT ROWID",
     "CREATE TABLE IF NOT EXISTS main.completion_imports(module_name BLOB NOT NULL REFERENCES completion_descriptors(module_name) ON DELETE CASCADE,position INTEGER NOT NULL,alias BLOB NOT NULL,dependency BLOB NOT NULL,source_required INTEGER NOT NULL,filename BLOB NOT NULL,line INTEGER NOT NULL,column INTEGER NOT NULL,PRIMARY KEY(module_name,position)) WITHOUT ROWID",
     "CREATE TABLE IF NOT EXISTS main.completion_header_inputs(module_name BLOB NOT NULL REFERENCES completion_descriptors(module_name) ON DELETE CASCADE,position INTEGER NOT NULL,kind INTEGER NOT NULL,path BLOB NOT NULL,identity BLOB NOT NULL,modified_seconds INTEGER,modified_nanoseconds INTEGER,physical_identity BLOB,PRIMARY KEY(module_name,position)) WITHOUT ROWID",
-    "CREATE TABLE IF NOT EXISTS main.completion_members(module_name BLOB NOT NULL REFERENCES completion_descriptors(module_name) ON DELETE CASCADE,ordinal INTEGER NOT NULL,label TEXT COLLATE BINARY NOT NULL,lookup_domain TEXT NOT NULL,lookup_key TEXT NOT NULL,kind INTEGER NOT NULL,detail BLOB NOT NULL,type_key BLOB NOT NULL,scope_id INTEGER NOT NULL,scope_depth INTEGER NOT NULL,declaration_order INTEGER NOT NULL,available INTEGER NOT NULL,visibility TEXT NOT NULL,owner_key TEXT NOT NULL,access_mode TEXT NOT NULL,call_snippet BLOB,PRIMARY KEY(module_name,ordinal)) WITHOUT ROWID",
+    "CREATE TABLE IF NOT EXISTS main.completion_members(module_name BLOB NOT NULL REFERENCES completion_descriptors(module_name) ON DELETE CASCADE,ordinal INTEGER NOT NULL,label TEXT COLLATE BINARY NOT NULL,lookup_domain TEXT NOT NULL,lookup_key TEXT NOT NULL,kind INTEGER NOT NULL,detail BLOB NOT NULL,type_key BLOB NOT NULL,scope_id INTEGER NOT NULL,scope_depth INTEGER NOT NULL,declaration_order INTEGER NOT NULL,available INTEGER NOT NULL,visibility TEXT NOT NULL,owner_key TEXT NOT NULL,access_mode TEXT NOT NULL,call_snippet BLOB,documentation BLOB,PRIMARY KEY(module_name,ordinal)) WITHOUT ROWID",
     "CREATE INDEX IF NOT EXISTS main.completion_members_owner ON completion_members(module_name,owner_key,access_mode,label COLLATE BINARY)",
   }
   for index = 1, #schema do sql.execute(connection, schema[index]) end
@@ -311,7 +316,7 @@ local function initialize_temp_schema(connection: sqlite3.Connection)
     "CREATE TEMP TABLE IF NOT EXISTS completion_inputs(snapshot_id BLOB NOT NULL REFERENCES completion_snapshots(id) ON DELETE CASCADE,position INTEGER NOT NULL,filename BLOB NOT NULL,session INTEGER NOT NULL,version INTEGER NOT NULL,contents BLOB NOT NULL,PRIMARY KEY(snapshot_id,position)) WITHOUT ROWID",
     "CREATE TEMP TABLE IF NOT EXISTS covered_modules(snapshot_id BLOB NOT NULL REFERENCES completion_snapshots(id) ON DELETE CASCADE,module_name BLOB NOT NULL,PRIMARY KEY(snapshot_id,module_name)) WITHOUT ROWID",
     "CREATE TEMP TABLE IF NOT EXISTS completion_scopes(snapshot_id BLOB NOT NULL REFERENCES completion_snapshots(id) ON DELETE CASCADE,scope_id INTEGER NOT NULL,parent_id INTEGER,kind TEXT NOT NULL,filename BLOB NOT NULL,byte_start INTEGER NOT NULL,byte_finish INTEGER NOT NULL,PRIMARY KEY(snapshot_id,scope_id)) WITHOUT ROWID",
-    "CREATE TEMP TABLE IF NOT EXISTS completion_candidates(snapshot_id BLOB NOT NULL REFERENCES completion_snapshots(id) ON DELETE CASCADE,ordinal INTEGER NOT NULL,label TEXT COLLATE BINARY NOT NULL,lookup_domain TEXT NOT NULL,lookup_key TEXT NOT NULL,kind INTEGER NOT NULL,detail BLOB NOT NULL,type_key BLOB NOT NULL,scope_id INTEGER NOT NULL,scope_depth INTEGER NOT NULL,declaration_order INTEGER NOT NULL,available INTEGER NOT NULL,visibility TEXT NOT NULL,owner_key TEXT NOT NULL,access_mode TEXT NOT NULL,call_snippet BLOB,PRIMARY KEY(snapshot_id,ordinal)) WITHOUT ROWID",
+    "CREATE TEMP TABLE IF NOT EXISTS completion_candidates(snapshot_id BLOB NOT NULL REFERENCES completion_snapshots(id) ON DELETE CASCADE,ordinal INTEGER NOT NULL,label TEXT COLLATE BINARY NOT NULL,lookup_domain TEXT NOT NULL,lookup_key TEXT NOT NULL,kind INTEGER NOT NULL,detail BLOB NOT NULL,type_key BLOB NOT NULL,scope_id INTEGER NOT NULL,scope_depth INTEGER NOT NULL,declaration_order INTEGER NOT NULL,available INTEGER NOT NULL,visibility TEXT NOT NULL,owner_key TEXT NOT NULL,access_mode TEXT NOT NULL,call_snippet BLOB,documentation BLOB,PRIMARY KEY(snapshot_id,ordinal)) WITHOUT ROWID",
     "CREATE INDEX IF NOT EXISTS temp.completion_candidates_lookup ON completion_candidates(snapshot_id,scope_id,label COLLATE BINARY)",
     "CREATE INDEX IF NOT EXISTS temp.completion_candidates_owner ON completion_candidates(snapshot_id,owner_key,access_mode,label COLLATE BINARY)",
     "CREATE INDEX IF NOT EXISTS temp.completion_snapshots_context ON completion_snapshots(filename,caret_byte,context_key)",
@@ -333,16 +338,16 @@ local function optional_blob(text: string?): value
 end
 
 -- Each execute crosses the asynchronous SQLite worker boundary. Batch scalar
--- rows as the saved semantic index does; 12 * 16 bindings stay below Titan's
+-- rows as the saved semantic index does; 11 * 17 bindings stay below Titan's
 -- 200-position variadic-call limit. All values, including names, remain bound.
 local function write_candidates(connection: sqlite3.Connection, table_name: string,
     owner: string, candidates: {facts.Candidate}, current: Current?): boolean
   if #candidates == 0 then return true end
-  local width = 12
+  local width = 11
   if #candidates < width then width = #candidates end
   -- A nil assignment removes an Array slot. Empty BLOB is the unused snippet
   -- sentinel in this fixed-width binding vector; SQL restores NULL on write.
-  local row_sql = "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULLIF(?,X''))"
+  local row_sql = "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULLIF(?,X''),NULLIF(?,X''))"
   local prefix = "INSERT INTO " .. table_name .. " VALUES "
   local statement = connection:prepare(prefix .. strings.rep(row_sql .. ",", width - 1) .. row_sql)
   defer statement:close()
@@ -378,6 +383,7 @@ local function write_candidates(connection: sqlite3.Connection, table_name: stri
       parameters[#parameters + 1] = candidate.owner_key
       parameters[#parameters + 1] = candidate.access_mode
       parameters[#parameters + 1] = blob(candidate.call_snippet or "")
+      parameters[#parameters + 1] = blob(candidate.documentation or "")
     end
     insert:execute(...parameters)
     offset = finish + 1
@@ -388,7 +394,7 @@ end
 local function read_candidate(row: sqlite3.Row): facts.Candidate
   return facts.Candidate.new(row:get(1), row:get(2), row:get(3), row:get(4),
     sql.bytes(row, 5), sql.bytes(row, 6), row:get(7), row:get(8), row:get(9),
-    (row:get(10) as integer) ~= 0, row:get(11), row:get(12), row:get(13), sql.optional_bytes(row, 14))
+    (row:get(10) as integer) ~= 0, row:get(11), row:get(12), row:get(13), sql.optional_bytes(row, 14), sql.optional_bytes(row, 15))
 end
 
 local function write_hovers(connection: sqlite3.Connection, snapshot_id: string,
@@ -416,7 +422,7 @@ local function write_hovers(connection: sqlite3.Connection, snapshot_id: string,
   return true
 end
 
-local CANDIDATE_COLUMNS = "label,lookup_domain,lookup_key,kind,detail,type_key,scope_id,scope_depth,declaration_order,available,visibility,owner_key,access_mode,call_snippet"
+local CANDIDATE_COLUMNS = "label,lookup_domain,lookup_key,kind,detail,type_key,scope_id,scope_depth,declaration_order,available,visibility,owner_key,access_mode,call_snippet,documentation"
 
 local function publish_header_inputs(connection: sqlite3.Connection,
                                      descriptor: SavedDescriptor)
@@ -462,10 +468,10 @@ function publish_saved(connection: sqlite3.Connection,
     end
     sql.execute(connection, "DELETE FROM main.completion_descriptors WHERE module_name=?", blob(descriptor.module_name))
     sql.execute(connection,
-      "INSERT INTO main.completion_descriptors VALUES(?,?,?,?,?,?,?,?)",
+      "INSERT INTO main.completion_descriptors VALUES(?,?,?,?,?,?,?,?,?)",
       blob(descriptor.module_name), descriptor.revision, descriptor.state,
       descriptor.provenance, blob(descriptor.main_file), optional_blob(descriptor.payload),
-      blob(descriptor.public_interface), optional_blob(descriptor.source_interface))
+      blob(descriptor.public_interface), optional_blob(descriptor.source_interface), optional_blob(descriptor.documentation))
     if descriptor.payload == nil and descriptor.provenance == "project" then
       sql.execute(connection,
         "UPDATE main.completion_descriptors SET payload=(SELECT p.payload FROM main.project_snapshots AS p " ..
@@ -706,7 +712,7 @@ local function snapshot_bytes(snapshot: facts.Snapshot, include_hovers: boolean)
     local candidate = snapshot.candidates[index]
     bytes = bytes + #candidate.label + #candidate.lookup_domain + #candidate.lookup_key +
       #candidate.detail + #candidate.type_key + #candidate.visibility +
-      #candidate.owner_key + #candidate.access_mode + #(candidate.call_snippet or "") + 128
+      #candidate.owner_key + #candidate.access_mode + #(candidate.call_snippet or "") + #(candidate.documentation or "") + 128
   end
   if include_hovers and snapshot.hovers ~= nil then
     for index = 1, #snapshot.hovers do

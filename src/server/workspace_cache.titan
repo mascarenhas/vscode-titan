@@ -1,3 +1,6 @@
+--- Validate and stage persistent compiler payloads and saved publication inventories.
+-- @module server.workspace_cache
+
 local async = import "async"
 local fs = import "fs"
 local sqlite3 = import "sqlite3"
@@ -12,6 +15,7 @@ local SCHEMA_VERSION = 7
 
 type ProjectPayload = bridge.ProjectPayload
 
+--- Persistent project payload candidate with accepted source identity.
 record ProjectCandidate
   const module_name: string
   const revision: integer
@@ -36,6 +40,7 @@ local record Artifact
   const inputs: {bridge.CHeaderDependency}
 end
 
+--- Stage compiler payloads and inventories for atomic saved publication.
 record Cache
   const store: sql.Store
   const path: string
@@ -110,6 +115,7 @@ local function open_compatible(path: string, compatibility: string?): Cache?
 end
 
 -- Native startup and SQLite persistence share this workspace-local root.
+--- Return the shared workspace-cache directory for a normalized project root.
 function directory(root: string): string
   if root == "/" then return "/.titan-ls" end
   return root .. "/.titan-ls"
@@ -178,6 +184,7 @@ local function open_cache(root: string, compatibility: string?): Cache
   end
 end
 
+--- Open or rebuild a persistent workspace cache using its compatibility identity.
 function open(root: string, compatibility: string): Cache
   return open_cache(root,compatibility)
 end
@@ -343,6 +350,7 @@ local function artifact_scope(kind: string): integer
   raise "unknown header artifact namespace"
 end
 
+--- Read a compatible compiler payload and its ordered header closure.
 function Cache:lookup(kind: string, key: string): (string?,{bridge.CHeaderDependency}?)
   local refreshed?: {bridge.CHeaderDependency}
   for index = #self.pending, 1, -1 do
@@ -369,6 +377,7 @@ end
 
 -- Compiler hooks only stage successful records. SQLite writes remain with the
 -- updater's completed-view publication; speculative rename has no such hook.
+--- Stage a complete compiler payload for later accepted publication.
 function Cache:stage(kind: string, key: string, payload: string,
                       inputs: {bridge.CHeaderDependency})
   if artifact_table(kind) == nil then return end
@@ -577,6 +586,7 @@ function Cache:stage_context(root: string,compatibility: string,native_context: 
   self.publication_native_context = native_context
 end
 
+--- Publish staged cache state within the shared semantic transaction.
 function Cache:publish(connection: sqlite3.Connection)
   if self.publication_key == nil then raise "cache publication was not prepared" end
   -- Pruning belongs to the same completed publication as replacement facts.
@@ -617,6 +627,7 @@ function Cache:publish(connection: sqlite3.Connection)
   -- back this transaction can retry the same complete publication.
 end
 
+--- Retire staged state after successful transaction commit.
 function Cache:publication_committed()
   self.pending = {}
   self.projects = nil

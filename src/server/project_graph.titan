@@ -1,3 +1,6 @@
+--- Saved-module generations, dependency edges, checking state, and manifest invalidation.
+-- @module server.project_graph
+
 local iteration = import "iteration"
 local sqlite3 = import "sqlite3"
 local sql = import "server.workspace_store"
@@ -16,6 +19,7 @@ record FileStamp
   const physical_identity: string?
 end
 
+--- Detached public interface identity used for dependency invalidation.
 record Manifest
   -- Public imports depend only on public_digest. source_digest represents the
   -- complete source-collaboration surface, including the public surface.
@@ -44,6 +48,7 @@ record ReverseImport
   const visibility: ImportVisibility
 end
 
+--- Generation capability identifying one in-progress module check.
 record CheckToken
   const module_name: string
   const generation: integer
@@ -69,6 +74,7 @@ record AstSnapshot<|A|>
   local const asts: {string: A}
 end
 
+--- Persistent dependency graph with transient project bodies and saved generations.
 record Graph<|A|>
   const connection: sqlite3.Connection
   local asts: {string: A}
@@ -254,6 +260,7 @@ function initialize_schema(connection: sqlite3.Connection)
     "ON graph_modules(provenance,state,name)")
 end
 
+--- Open a typed graph over the supplied SQLite connection.
 function create<|A|>(connection: sqlite3.Connection): Graph<|A|>
   initialize_schema(connection)
   return Graph<|A|>.new(connection, {})
@@ -568,6 +575,7 @@ end
 
 -- SQL owns completed lexical facts. The accepted publication retires every
 -- transient body snapshot without changing module revisions or clean state.
+--- Release transient checked bodies after their accepted semantic publication.
 function Graph:release_project_snapshots()
   self.asts = {}
 end
@@ -604,6 +612,7 @@ function Graph:restart_interrupted_checks()
     "UPDATE main.graph_modules SET state=0 WHERE provenance=0 AND state=1")
 end
 
+--- Reconcile observed source membership and invalidate changed project inputs.
 function Graph:observe_project(module_name: string,
     stamps: {FileStamp}): ChangeReport
   local normalized = copy_stamps(stamps)
@@ -639,6 +648,7 @@ function Graph:invalidate_project(module_name: string): ChangeReport
   return ChangeReport.new(true, self:generation(), {})
 end
 
+--- Reserve a dirty module for checking and capture its generation token.
 function Graph:begin_project_check(module_name: string): CheckToken?
   if sql.execute(self.connection,
     "UPDATE main.graph_modules SET state=1 WHERE name=? AND provenance=0 AND state=0",
@@ -673,6 +683,7 @@ function Graph:fail_project_check(token: CheckToken,
   return true
 end
 
+--- Accept a checked module only while its token and input generation remain current.
 function Graph:commit_project(token: CheckToken, manifest: Manifest,
     imports: {ImportEdge}, ast: A): CommitResult
   local entry? = self:accepts(token)

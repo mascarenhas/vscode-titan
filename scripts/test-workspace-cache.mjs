@@ -554,6 +554,35 @@ try {
   assert.deepEqual(checkedModules(compilerChanged.records), ["consumer", "mathlib"],
     "changed-mtime compiler change reused a checked project graph");
 
+  const docProvider = path.join(sourceRoot, "docprovider.titan");
+  const docConsumer = path.join(sourceRoot, "docconsumer.titan");
+  const documentedSource = (summary) => `--- ${summary} private count.\n` +
+    "-- @usage functions.md#named-calls\nlocal function hidden(): integer return 1 end\n";
+  await writeFile(docProvider, documentedSource("Before"));
+  await writeFile(docConsumer, 'local docs = import "docprovider.titan"\n' +
+    'function read(): integer return docs.hidden() end\n');
+  const documentedPosition = {textDocument: {uri: uri(docConsumer)},
+    position: {line: 1, character: 39}};
+  const docEdited = await withServer("saved-private-documentation-edit", async (session) => {
+    const before = await session.query("textDocument/hover", documentedPosition);
+    assert.match(before.contents.value, /Before private count/);
+    await writeSavedGeneration(session.responses, docProvider, documentedSource("Updated"));
+    const after = await session.query("textDocument/hover", documentedPosition);
+    assert.match(after.contents.value, /Updated private count/,
+      "doc-only source import edit retained stale dependent hover");
+    assert.doesNotMatch(after.contents.value, /Before private count/);
+    return after;
+  });
+  const docWarm = await withServer("warm-private-documentation", async (session) =>
+    session.query("textDocument/hover", documentedPosition));
+  assert.deepEqual(docWarm.result, docEdited.result,
+    "private declaration documentation changed across warm restart");
+  assertWarmInitial(initialRecords(docWarm.records).initial);
+  assert.deepEqual(checkedModules(docWarm.records), [],
+    "warm documentation lookup rechecked source modules");
+  await rm(docConsumer);
+  await rm(docProvider);
+
   await rm(path.dirname(databaseFile), {recursive: true});
   await writeFile(path.dirname(databaseFile), "persistence intentionally unavailable\n");
   const fallback = await withServer("memory-fallback", featureSnapshot);

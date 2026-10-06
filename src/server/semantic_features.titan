@@ -1,3 +1,6 @@
+--- Saved-source definition, references, rename, hover, and folding views.
+-- @module server.semantic_features
+
 local strings = import "string"
 local bridge = import "server.compiler_bridge"
 local lsp = import "server.lsp_types"
@@ -25,6 +28,7 @@ record Hover
   const visibility: bridge.DeclarationVisibility
   const callable_signature: bridge.CallableSignature?
   const summary_markdown: string?
+  const documentation: string?
 end
 
 local record SavedFile
@@ -379,7 +383,8 @@ function Features:hover(filename: string, position: source_text.Position): Hover
     coerced = indexer.row_type(row, 7)
   end
   return Hover.new(copy_span(occurrence.span), inferred, declared, original, coerced,
-    occurrence.visibility, occurrence.callable_signature, self.index:hover_summary(occurrence))
+    occurrence.visibility, occurrence.callable_signature, self.index:hover_summary(occurrence),
+    occurrence.documentation)
 end
 
 local function write_type_line(output: strings.StringWriter, label: string,
@@ -419,6 +424,7 @@ function Hover:markdown(): string
   when module() then output:write("module\n")
   when exported() then output:write("exported\n")
   end
+  if self.documentation ~= nil then output:write("\n" .. self.documentation) end
   return output:drain()
 end
 
@@ -771,7 +777,7 @@ function PreparedView:completion_hovers(yield_now: Yield?): {completion_types.Ho
     local hover = Hover.new(occurrence.span, materialized.inferred_type,
       materialized.declared_type, materialized.original_type, materialized.coerced_type,
       occurrence.visibility, occurrence.callable_signature,
-      self.index:hover_summary(occurrence))
+      self.index:hover_summary(occurrence), occurrence.documentation)
     local markdown = hover:markdown()
     bytes = bytes + #occurrence.filename + #markdown + 64
     if bytes > completion_types.MAX_HOVER_BYTES then return {} end

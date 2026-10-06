@@ -1,3 +1,6 @@
+--- Persist qualified symbol occurrences and scalar presentation facts by saved generation.
+-- @module server.semantic_index
+
 local strings = import "string"
 local iteration = import "iteration"
 local bridge = import "server.compiler_bridge"
@@ -32,6 +35,7 @@ record Occurrence
   const callable_signature: bridge.CallableSignature?
   const summary_id: integer?
   const shared_case_name: SharedCaseName?
+  const documentation: string?
 end
 
 record Error
@@ -390,7 +394,7 @@ local function append_snapshot_occurrences(
         symbol.location.filename, symbol.name, symbol.role, span, bytes,
         symbol.is_local, symbol.visibility, symbol.type_info,
         symbol.callable_signature,
-        summary_id, shared)
+        summary_id, shared, symbol.documentation)
     end
   end
 end
@@ -521,7 +525,7 @@ end
 
 local OCCURRENCE_COLUMNS = "declaration_id,module_name,filename,name,role," ..
   "start_line,start_character,finish_line,finish_character,byte_start," ..
-  "byte_finish,is_local,visibility,type_tag,type_display,callable,summary_id,case_part_id"
+  "byte_finish,is_local,visibility,type_tag,type_display,callable,summary_id,case_part_id,documentation"
 local SOURCE_ORDER = " ORDER BY filename,byte_start,byte_finish,declaration_id,role"
 
 function initialize_schema(connection: sqlite3.Connection)
@@ -543,7 +547,7 @@ function initialize_schema(connection: sqlite3.Connection)
     "finish_line INTEGER NOT NULL,finish_character INTEGER NOT NULL," ..
     "byte_start INTEGER NOT NULL,byte_finish INTEGER NOT NULL," ..
     "is_local INTEGER NOT NULL,visibility INTEGER NOT NULL," ..
-    "type_tag BLOB,type_display BLOB,callable BLOB,summary_id INTEGER,case_part_id BLOB)")
+    "type_tag BLOB,type_display BLOB,callable BLOB,summary_id INTEGER,case_part_id BLOB,documentation BLOB)")
   execute(connection, "CREATE TABLE IF NOT EXISTS main.semantic_occurrence_inputs AS " ..
     "SELECT " .. OCCURRENCE_COLUMNS .. " FROM main.semantic_occurrences WHERE 0")
   execute(connection, "CREATE INDEX IF NOT EXISTS main.semantic_occurrences_file " ..
@@ -643,13 +647,13 @@ function binding(parameters: {value}, item: value): string
   return "?"
 end
 
--- Eleven rows stay below Titan's 200-position variadic-call limit even when
--- all eighteen columns are non-NULL. SQL orders and normalizes the rows.
+-- Ten rows stay below Titan's 200-position variadic-call limit even when
+-- all nineteen columns are non-NULL. SQL orders and normalizes the rows.
 local function publish_occurrences(connection: sqlite3.Connection,
                                    items: {Occurrence})
   local offset = 1
   while offset <= #items do
-    local finish = offset + 10
+    local finish = offset + 9
     if finish > #items then finish = #items end
     local parameters: {value} = {}
     local sql = "INSERT INTO main.semantic_occurrence_inputs VALUES "
@@ -682,7 +686,8 @@ local function publish_occurrences(connection: sqlite3.Connection,
         binding(parameters, type_display(item.type_info)) .. "," ..
         binding(parameters, signature_blob(item.callable_signature)) .. "," ..
         binding(parameters, item.summary_id) .. "," ..
-        binding(parameters, blob(case_part_id)) .. ")"
+        binding(parameters, blob(case_part_id)) .. "," ..
+        binding(parameters, blob(item.documentation)) .. ")"
     end
     local statement = connection:prepare(sql)
     defer statement:close()
@@ -952,7 +957,8 @@ local function row_occurrence(row: sqlite3.Row, selected_id: string?): Occurrenc
       source_text.Position.new(row:get(8) as integer, row:get(9) as integer)),
     source_text.ByteSpan.new(row:get(10) as integer, row:get(11) as integer),
     (row:get(12) as integer) ~= 0, row_visibility(row, 13),
-    row_type(row, 14), row_signature(row, 16), row:get(17) as integer?, shared)
+    row_type(row, 14), row_signature(row, 16), row:get(17) as integer?, shared,
+    optional_bytes(row, 19))
 end
 
 local function collect(cursor: sqlite3.Cursor, selected_id: string?): {Occurrence}

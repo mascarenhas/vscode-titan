@@ -24,7 +24,10 @@ await mkdir(path.dirname(folderMain));
 await writeFile(path.join(root, "titan-config.lua"),
   'include = { "." }\nsource_module_roots = { "." }\n');
 await writeFile(filename, saved);
-await writeFile(dependency, "function savedOnly(): integer return 1 end\n" +
+await writeFile(dependency, "--- Saved dependency module.\n-- @module dep\n" +
+  "function savedOnly(): integer return 1 end\n" +
+  "--- Test a saved count.\n-- @param count The number to test.\n-- @return Whether it is positive.\n" +
+  "-- @usage functions.md#named-calls\n" +
   "function importedCall(count: integer, label: string): boolean return count > 0 end\n");
 await writeFile(header, "typedef struct Widget { int count; } Widget;\nint callable(int argument);\n");
 await writeFile(foreignFile, foreignPrefix + "local saved = 1\n");
@@ -152,6 +155,9 @@ try {
   const hoverParams = { textDocument: { uri: uri(filename) }, position: { line: 0, character: 8 } };
   const savedHover = await request(child, responses, nextId++, "textDocument/hover", hoverParams);
   assert.ok(savedHover.result, "saved fixture has no hover");
+  const savedDependencyHover = await hover(dependency, positionOf(await readFile(dependency, "utf8"), "importedCall"));
+  assert.match(savedDependencyHover.contents.value, /Test a saved count/,
+    "saved hover lost compiler declaration documentation");
 
   let source = marked("function read(): integer\n local unsavedAnswer = 1\n return unsavedA@nswer\nend\n" +
     "function follow(): string local afterHole = \"later\" return afterHole end\n");
@@ -276,6 +282,7 @@ try {
   result = await ready(filename, source.position, "dep", "import catalog");
   assert.equal(result.isIncomplete, false);
   assert.equal(result.items.find((item) => item.label === "dep").kind, 9);
+  assert.match(result.items.find((item) => item.label === "dep").documentation.value, /Saved dependency module/);
   open(dependency, "function dirtyOnly(): integer return 2 end\n");
   source = marked('local imported = import "dep"\nfunction read() imported.@ end\n');
   change(filename, source.text);
@@ -287,6 +294,31 @@ try {
   const importedCall = result.items.find((item) => item.label === "importedCall");
   assert.equal(importedCall.detail, "importedCall(count: integer, label: string): boolean");
   assert.equal(importedCall.textEdit.newText, "importedCall(${1:count}, ${2:label})$0");
+  assert.equal(importedCall.documentation.kind, "markdown");
+  assert.match(importedCall.documentation.value, /Test a saved count/);
+  assert.match(importedCall.documentation.value, /doc\/language\/functions.md#named-calls/);
+  // Hover requires a fresh complete occurrence snapshot. Member completion
+  // above may deliberately reuse provisional candidates while the new
+  // buffer is incomplete; a new lexical candidate fences this valid buffer.
+  source = marked('local imported = import "dep"\n' +
+    'function read(): boolean\n local result = imported.importedCall(1, "one")\n return res@ult\nend\n');
+  change(filename, source.text);
+  await ready(filename, source.position, "result", "fresh imported module hover");
+  const importedHover = await hover(filename, positionOf(source.text, "imported", 0));
+  assert.match(importedHover.contents.value, /Saved dependency module/, "import alias lost module documentation");
+
+  source = marked("--- Test an unsaved count.\n" +
+    "function unsavedDoc(number: integer): integer return number end\n" +
+    "function use(): integer return unsavedDoc(1) end\n" +
+    "function complete(): integer return unsa@vedDoc(2) end\n");
+  change(filename, source.text);
+  result = await ready(filename, source.position, "unsavedDoc", "unsaved documentation");
+  assert.match(result.items.find((item) => item.label === "unsavedDoc").documentation.value, /Test an unsaved count/);
+  const documentedHover = await hover(filename, positionOf(source.text, "unsavedDoc", 1));
+  assert.match(documentedHover.contents.value, /Test an unsaved count/);
+  change(filename, source.text.replace("Test an unsaved count", "Changed documentation"));
+  assert.equal(await hover(filename, positionOf(source.text, "unsavedDoc", 1)), null,
+    "edited documentation reused an older completion hover");
 
   source = marked("function read(x: foreign const *unsigned lo@ng long) end\n");
   change(filename, source.text);

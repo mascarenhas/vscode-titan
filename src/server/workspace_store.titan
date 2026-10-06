@@ -1,3 +1,6 @@
+--- Serialize SQLite connection access with explicit cooperative leases.
+-- @module server.workspace_store
+
 local async = import "async"
 local sqlite3 = import "sqlite3"
 
@@ -11,12 +14,14 @@ local record Waiter
   reserved: boolean
 end
 
+--- Exclusive SQLite connection lease with idempotent release.
 record Access
   const connection: sqlite3.Connection
   local release_owner: function (): ()
   local released: boolean
 end
 
+--- Workspace SQLite connection and cooperative lease ownership.
 record Store
   local const connection: sqlite3.Connection
   local active: boolean
@@ -67,6 +72,7 @@ function optional_bytes(row: sqlite3.Row, column: integer): string?
   return blob.bytes
 end
 
+--- Open workspace SQLite storage and configure its connection policy.
 function open(path: string): Store
   local connection = sqlite3.connect(path)
   local initialized = false
@@ -142,17 +148,20 @@ local function Store:acquire_owner(): Access
   end
 end
 
+--- Wait for an exclusive connection lease; release it before leaving the owner scope.
 function Store:acquire(): Access
   if self.closing or self.closed then raise "workspace store is closed" end
   return self:acquire_owner()
 end
 
+--- Release this exact connection lease once.
 function Access:release()
   if self.released then return end
   self.released = true
   self.release_owner()
 end
 
+--- Close workspace storage after active access has retired.
 function Store:close()
   if self.closed then return end
   self.closing = true

@@ -5053,6 +5053,7 @@ function test_compiler_bridge_completion_named_function_signature(_context: test
 function choose(first: integer, second: string?): (integer, string?)
   return first, second
 end
+
 function use(): integer
   return cho
 end
@@ -5061,6 +5062,48 @@ end
       "completion lost declared names or multiple result types: " .. candidate.detail)
     test.assert(candidate.call_snippet == "choose(${1:first}, ${2:second})$0",
       "completion placeholders do not use declared names")
+  end)
+end
+
+function test_compiler_bridge_documentation_is_typed_and_rejects_malformed_tags(context: test.Context)
+  context:run("detached", function (_child: test.Context)
+    local tag: {string: value} = {["name"] = "param", ["value"] = "item Original bytes."}
+    local raw: {string: value} = {["summary"] = "Read bytes.", ["description"] = "Preserve NUL.",
+      ["tags"] = {[1] = tag} as {integer: value}}
+    local document? = bridge.normalize_documentation(raw)
+    tag["value"] = "Changed"
+    test.assert(document ~= nil and document.tags[1].value == "item Original bytes.",
+      "documentation retained compiler-owned tag tables")
+    test.assert(bridge.normalize_documentation(nil) == nil)
+  end)
+  context:run("invalid", function (_child: test.Context)
+    local rejected = false
+    do
+      local raw: {string: value} = {["summary"] = "Read bytes.", ["description"] = "",
+        ["tags"] = {[1] = {["name"] = "param", ["value"] = false} as {string: value}} as {integer: value}}
+      bridge.normalize_documentation(raw)
+    catch
+      rejected = error is bridge.BridgeError
+    end
+    test.assert(rejected, "malformed documentation crossed the typed compiler boundary")
+  end)
+end
+
+function test_compiler_bridge_completion_retains_doc_comments(_context: test.Context)
+  run_bridge(function ()
+    local candidate = completion_named_candidate([[
+--- Choose a count.
+-- @param first The returned count.
+-- @return The selected integer.
+-- @usage functions.md#named-calls
+function choose(first: integer): integer return first end
+function use(): integer return cho end
+]], "return cho", "choose")
+    test.assert(candidate.documentation ~= nil and
+      strings.find(candidate.documentation, "Choose a count.") ~= nil and
+      strings.find(candidate.documentation, "`first`") ~= nil and
+      strings.find(candidate.documentation, "doc/language/functions.md#named-calls") ~= nil,
+      "completion lost declaration documentation or relative manual link")
   end)
 end
 

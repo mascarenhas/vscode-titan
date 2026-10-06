@@ -1,3 +1,6 @@
+--- Persist ordered compiler-observed C-header dependency closures by scope.
+-- @module server.header_store
+
 local sqlite3 = import "sqlite3"
 local strings = import "string"
 local sql = import "server.workspace_store"
@@ -7,6 +10,7 @@ local bridge = import "server.compiler_bridge"
 -- 2 = parsed C-header artifact, 3 = converted FFI artifact. An owner exists
 -- even when its ordered input list is empty. All operations borrow the caller's
 -- lease and transaction; no dictionary or owner index remains in memory.
+--- Create persistent tables for ordered C-header dependency closures.
 function create(connection: sqlite3.Connection)
   local statements = {
     "CREATE TABLE IF NOT EXISTS main.header_dependencies(" ..
@@ -38,6 +42,7 @@ local function kind_code(input: bridge.CHeaderDependency): integer
   case input.kind when file() then return 0 when search() then return 1 end
 end
 
+--- Read the ordered header closure for one scope and metadata key.
 function read(connection: sqlite3.Connection, scope: integer,
               key: string): {bridge.CHeaderDependency}?
   local owners = sql.rows(connection,
@@ -104,6 +109,7 @@ local function incoming(inputs: {bridge.CHeaderDependency}, first: integer,
   return query:drain(), parameters
 end
 
+--- Replace one complete observed header closure within the caller transaction.
 function replace(connection: sqlite3.Connection, scope: integer, key: string,
                  inputs: {bridge.CHeaderDependency})
   sql.execute(connection,
@@ -171,6 +177,7 @@ end
 
 -- Run once in accepted publication, after all owners have their current links.
 -- Rolling publication back also restores any values pruned here.
+--- Remove header rows no longer retained by their owning metadata.
 function prune(connection: sqlite3.Connection)
   sql.execute(connection, "DELETE FROM main.header_dependencies AS d WHERE NOT EXISTS(" ..
     "SELECT 1 FROM main.header_inputs i WHERE i.dependency_id=d.id)")

@@ -14,6 +14,12 @@ Foreign types have their own C namespace, unaffected by local `ffi` shadowing.
 Direct source imports retain their private Titan visibility; C include
 inheritance follows its separate compiler rules.
 
+Declaration and module doc comments appear in completion extra information and
+hover. The compiler boundary formats their structured metadata during saved
+extraction or private preparation; selection reads rendered Markdown from SQL.
+Relative manual links and saved versus unsaved documentation follow
+[declaration documentation](documentation.md).
+
 Edits replace the entire active name, including its suffix after the caret.
 Foreign completions replace the name leaf, preserving pointer/qualifier syntax;
 multiword primitives insert the complete spelling. Comments and unrelated string

@@ -548,6 +548,11 @@ nominal types. These summaries, hover types, and folding ranges are materialized
 in the completed SQLite view during indexing. Individual feature queries read
 that view without traversing compiler ASTs or writing saved rows.
 
+LDoc-style declaration and module comments appear in hover and completion
+extra information, including links to the corresponding Titan manual pages.
+See [declaration documentation](docs/documentation.md) for metadata, rendering
+and saved versus unsaved behavior.
+
 An unchanged read-only request uses the immutable completed generation without
 rescanning the project. Before the initial index is ready it returns the
 feature's ordinary empty result. A watcher hint classified as a saved-project
