@@ -1,9 +1,13 @@
+--- Stable content digests and filesystem observations used to identify saved inputs.
+-- @module server.content_identity
+
 foreign import "openssl/sha.h"
 local fs = import "fs"
 local strings = import "string"
 
 -- OpenSSL is already a static-provider dependency. Hash arbitrary saved bytes
 -- through its length-bearing API, with a traced owner for the output buffer.
+--- Compute the stable digest used to distinguish exact content bytes.
 function digest(contents: string): string
   local output: owned unsigned char[] = foreign unsigned char.new_array(32)
   if ffi.SHA256(contents, #contents, output) == nil then
@@ -19,6 +23,7 @@ local function stamp(metadata: fs.Stat?): string
     metadata.modified_nanoseconds .. ":" .. metadata.mode
 end
 
+--- Capture the filesystem identity of one saved path.
 function stat_identity(filename: string): string
   local output = strings.writer()
   output:write(stamp(fs.lstat(filename)))
@@ -27,12 +32,14 @@ function stat_identity(filename: string): string
   return digest(output:drain())
 end
 
+--- Combine saved path provenance and exact contents into one input identity.
 function file(filename: string, contents: string): string
   return digest(digest(contents) .. stat_identity(filename))
 end
 
 -- Keep the inexpensive filesystem observation separate from saved content.
 -- Timestamp-only changes do not change the followed physical input.
+--- Saved filesystem observation used to compare accepted input versions.
 record FileObservation
   const kind: string
   const modified_seconds: integer
@@ -46,6 +53,7 @@ local function physical(metadata: fs.Stat): string
     ":" .. metadata.mode
 end
 
+--- Read a file observation, returning nil when the path is absent.
 function observe(filename: string): FileObservation?
   local link? = fs.lstat(filename)
   local target? = fs.stat(filename)
@@ -55,6 +63,7 @@ function observe(filename: string): FileObservation?
     physical(link) .. "\0" .. physical(target))
 end
 
+--- Compare every observation field used to fence saved-source reuse.
 function same_observation(left: FileObservation, right: FileObservation): boolean
   return left.kind == right.kind and
     left.modified_seconds == right.modified_seconds and

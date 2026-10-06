@@ -27,6 +27,7 @@ jobs:
       OPENSSL_MODE: system
       TITAN_MAX_GLIBC_VERSION: "2.39"
       TITAN_JOBS: "2"
+      BUILD_PROFILE: validation
 
     steps:
       - name: Check out vscode-titan
@@ -39,7 +40,7 @@ jobs:
         uses: actions/checkout@v7.0.1
         with:
           repository: mascarenhas/titan
-          ref: ae332cf184c3851f4ac5288ad6ae2cb851fde4e6
+          ref: fc0dfd78a4e0f310e11091be9acc03c60cb7a662
           path: titan
           submodules: recursive
           persist-credentials: false
@@ -99,7 +100,7 @@ jobs:
             import { createHash } from "node:crypto";
             import { appendFileSync, realpathSync } from "node:fs";
             import path from "node:path";
-            const prefix = path.join(realpathSync("."), ".titan");
+            const prefix = path.join(realpathSync("."), ".titan-validation");
             const identity = createHash("sha256").update(prefix).digest("hex");
             appendFileSync(process.env.GITHUB_OUTPUT, `prefix=${identity}\n`);
           '
@@ -111,28 +112,32 @@ jobs:
           # Packaging validates LuaRocks' installed version against these
           # licensing inputs from the unpacked dependency source.
           path: |
-            vscode-titan/.titan
+            vscode-titan/.titan-validation
             titan/luarocks-3.13.0/COPYING
             titan/luarocks-3.13.0/src/luarocks/core/cfg.lua
           # No fallback keys: another compiler revision is never a valid hit.
           # Bump the format when compiler build policy changes.
-          key: titan-sdk-v3-ubuntu24.04-${{ runner.arch }}-readline-bundled-openssl-system-${{ steps.compiler-identity.outputs.commit }}-${{ steps.compiler-identity.outputs.prefix }}
+          key: titan-sdk-v5-validation-titan-o0-lua-deps-optimized-ubuntu24.04-${{ runner.arch }}-readline-bundled-openssl-system-${{ steps.compiler-identity.outputs.commit }}-${{ steps.compiler-identity.outputs.prefix }}
 
       - name: Build the pinned Titan compiler and standard library
         if: steps.compiler-cache.outputs.cache-hit != 'true'
         working-directory: vscode-titan
-        run: make -j2 toolchain TITAN_REPO="$GITHUB_WORKSPACE/titan"
+        # GNU lists this mirror; Titan still verifies the pinned source SHA256.
+        run: |
+          make -j2 toolchain TITAN_REPO="$GITHUB_WORKSPACE/titan" \
+            READLINE_URL="https://mirror.csclub.uwaterloo.ca/gnu/readline/readline-8.3.tar.gz"
 
       - name: Validate the compiler installation
         working-directory: vscode-titan
         run: |
-          test -x .titan/bin/titanc
-          test -s .titan/lib/titan/0.6/titan.a
-          test -s .titan/include/titan/ffi.h
-          test -s .titan/src/lua-5.5.1/lua.h
+          test -x .titan-validation/bin/titanc
+          test -s .titan-validation/lib/titan/0.6/titan.a
+          test -s .titan-validation/include/titan/ffi.h
+          test -s .titan-validation/src/lua-5.5.1/lua.h
+          test "$(cat .titan-validation/etc/titan/build-profile)" = validation
           test -s "$GITHUB_WORKSPACE/titan/luarocks-3.13.0/COPYING"
           test -s "$GITHUB_WORKSPACE/titan/luarocks-3.13.0/src/luarocks/core/cfg.lua"
-          .titan/bin/titanc --help
+          .titan-validation/bin/titanc --help
 
       - name: Cache the completed compiler installation
         if: steps.compiler-cache.outputs.cache-hit != 'true'
@@ -141,7 +146,7 @@ jobs:
           # Packaging validates LuaRocks' installed version against these
           # licensing inputs from the unpacked dependency source.
           path: |
-            vscode-titan/.titan
+            vscode-titan/.titan-validation
             titan/luarocks-3.13.0/COPYING
             titan/luarocks-3.13.0/src/luarocks/core/cfg.lua
           key: ${{ steps.compiler-cache.outputs.cache-primary-key }}
@@ -170,7 +175,7 @@ jobs:
         working-directory: vscode-titan
         run: xvfb-run -a make extension-host-test
 
-      - name: Package the VSIX
+      - name: Build a disposable VSIX for validation
         working-directory: vscode-titan
         run: make package TITAN_REPO="$GITHUB_WORKSPACE/titan"
 
@@ -178,14 +183,6 @@ jobs:
         working-directory: vscode-titan
         run: make -j1 inspect-vsix inspect-server plugin-validate install-server-test TITAN_REPO="$GITHUB_WORKSPACE/titan"
 
-      - name: Upload Linux x64 VSIX
-        # The visible phases above run every `make verify` gate. Routine
-        # verification must not turn red solely because account-wide artifact
-        # storage is unavailable; an explicit manual artifact build stays strict.
-        continue-on-error: ${{ github.event_name != 'workflow_dispatch' }}
-        uses: actions/upload-artifact@v7.0.1
-        with:
-          name: titan-linux-x64-vsix
-          path: vscode-titan/.build/vsix/titan-linux-x64.vsix
-          if-no-files-found: error
-          include-hidden-files: true
+      # Routine CI publishes no package or language-server binaries. A future
+      # main-only release job must rebuild the SDK and server in production
+      # after validation succeeds, rather than reuse this unoptimized graph.

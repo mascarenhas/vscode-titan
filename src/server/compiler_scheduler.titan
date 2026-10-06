@@ -1,3 +1,6 @@
+--- One cooperative permit serializing access to shared compiler Lua state.
+-- @module server.compiler_scheduler
+
 local async = import "async"
 local logging = import "server.logging"
 
@@ -12,16 +15,19 @@ local record Waiter
   reserved: boolean
 end
 
+--- Exclusive compiler-state lease released exactly once by its owner.
 record Permit
   local release_owner: function (): ()
   local released: boolean
 end
 
+--- Cooperative FIFO ownership of one shared compiler Lua state.
 record Scheduler
   local active: boolean
   local waiters: {Waiter}
 end
 
+--- Create an independent compiler permit scheduler.
 function create(): Scheduler
   return Scheduler.new(false, {})
 end
@@ -63,6 +69,7 @@ local function Scheduler:release_owner()
   self:grant_next()
 end
 
+--- Wait for exclusive compiler access; defer the returned permit release immediately.
 function Scheduler:acquire(): Permit
   if not self.active then
     self.active = true
@@ -99,6 +106,7 @@ function Scheduler:acquire(): Permit
   end
 end
 
+--- Release this exact permit and wake the next waiting owner once.
 function Permit:release()
   if self.released then return end
   self.released = true
@@ -108,6 +116,7 @@ end
 
 local shared_scheduler: Scheduler? = nil
 
+--- Acquire the process-wide compiler-state permit.
 function acquire(): Permit
   if shared_scheduler == nil then shared_scheduler = create() end
   return (shared_scheduler as Scheduler):acquire()

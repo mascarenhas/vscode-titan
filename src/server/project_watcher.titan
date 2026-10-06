@@ -1,3 +1,6 @@
+--- Watch project directories and coalesce source changes for rediscovery.
+-- @module server.project_watcher
+
 foreign import "compiler_io_platform.h"
 local async = import "async"
 local fs = import "fs"
@@ -8,6 +11,7 @@ local timer = import "timer"
 -- These directories are the complete watch authority for one project. Callers
 -- discover them from the project source/configuration roots; this module never
 -- derives another registration from a notification path.
+--- Project directories and exclusions selected for filesystem watching.
 record DirectoryScope
   const project_directories: {string}
   const configuration_directories: {string}
@@ -32,6 +36,7 @@ end
 -- A change is only a hint that saved disk state may have changed. Consumers
 -- must still rediscover membership and reread files rather than treating it as
 -- authoritative project state.
+--- Coalesced source-path changes and watcher failures requiring rediscovery.
 record RediscoveryBatch
   const changes: {PathChange}
   const failures: {WatchFailure}
@@ -58,6 +63,7 @@ local record Backend
   poll: function (): {BackendEvent}
 end
 
+--- Runtime-bound owner of project directory registrations and notification draining.
 record ProjectWatcher
   local backend: Backend
   local callback: RediscoveryCallback
@@ -276,6 +282,7 @@ local function ProjectWatcher:pause_polling(allow_current: boolean)
   end
 end
 
+--- Update registrations to match the current project directory scope.
 function ProjectWatcher:reconcile(scope: DirectoryScope)
   self:begin_operation()
   defer self:finish_operation()
@@ -318,6 +325,7 @@ function ProjectWatcher:reconcile(scope: DirectoryScope)
   self.active_order = reordered
 end
 
+--- Stop registrations and drain the owned watcher Task.
 function ProjectWatcher:stop()
   if self.operation_active then
     raise "project watcher already has an active lifecycle operation"
@@ -417,6 +425,7 @@ local function start_with_backend(backend: Backend, scope: DirectoryScope,
   return owner
 end
 
+--- Register project watchers and start the coalesced rediscovery callback owner.
 function start(scope: DirectoryScope,
                callback: RediscoveryCallback): ProjectWatcher
   return start_with_backend(fs_backend(), scope, callback)

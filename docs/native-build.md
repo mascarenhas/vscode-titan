@@ -93,18 +93,38 @@ not validate flags, dependency objects or header contents; the Make rules own
 those inputs. Missing generated companions are repaired through their producer
 rules rather than accepted as a complete build.
 
-The pinned compiler defaults to `-O3` and Linux fat LTO. Final linking can still
-be substantial after a small edit. For an intentional development override,
-apply it consistently to compilation and linking:
+Ordinary `server`, `package`, `toolchain` and installation builds use
+`BUILD_PROFILE=production`, with `-O3` and the compiler's platform LTO defaults
+(fat LTO on Linux). Validation entry points (`test`, `verify`, native test,
+protocol, extension-host and installation-smoke targets) automatically select
+`BUILD_PROFILE=validation`: `-O0` without LTO for Titan SDK providers, the server,
+test modules, native helpers and final links. The SDK keeps Lua and its compiler
+dependencies (including LPegLabel and LuaFileSystem) optimized so compiler
+execution remains fast. The whole Make invocation uses one profile,
+including the ordinary server exercised by transcripts and disposable packages.
+The validation SDK lives in `.titan-validation/`; `.titan/` remains the optimized
+installation. Each prefix has its own compiled standard-library providers.
+To build the server alone for quick iteration:
 
 ```sh
-make -j2 server \
-  TITAN_EXTRA_CFLAGS='-O0 -fno-lto' \
-  TITAN_EXTRA_LDFLAGS='-O0 -fno-lto'
+make -j2 server BUILD_PROFILE=validation
 ```
 
-The configuration change rebuilds affected artifacts. Removing the override
-also invalidates them. The complete validation gate uses the shipping defaults.
+To refresh a validation SDK after compiler changes, use
+`make toolchain-refresh BUILD_PROFILE=validation`. This also reconciles Lua and
+native dependency build settings before reinstalling compiler/stdlib artifacts,
+so an existing SDK cannot retain stale host optimization flags. Explicit `TITAN_PREFIX`
+selects a caller-owned SDK; it must match the requested profile. Extra compiler
+and linker flags remain explicit overrides and follow the profile defaults.
+The configuration stamp includes the profile, compiler/SDK and flag inputs, so
+switching either way rebuilds both graphs. The incremental gate also runs its
+small fixture under production defaults and verifies the return to validation.
+
+Routine CI runs the complete validation profile and builds a disposable VSIX
+only to inspect packaging. It uploads no VSIX or language-server binaries,
+including on manual runs. A future release job must run only on `main` after
+tests pass, use a separate production SDK/cache and rebuild the complete server
+with full optimization; validation binaries cannot become release artifacts.
 
 One Make invocation owns a build directory. Independent concurrent builds in
 one checkout need separate `BUILD_ROOT` values and separate `SERVER` destinations
@@ -121,8 +141,9 @@ compiler invocations, importing-closure rebuilds, folder/import changes, header
 and flag invalidation, changed test discovery, and missing generated companions.
 It also runs the native tests with absent and unrelated ambient Titan paths to
 check that execution uses the selected SDK.
-The fixture uses matching `-O0 -fno-lto` compile/link overrides to keep this gate
-short. `make verify` also builds and tests the full server with shipping defaults.
+The fixture uses the validation profile for most checks, then exercises a small
+production build and switches back. `make verify` builds and tests the full
+server in validation; optimized defaults retain focused smoke coverage.
 
 `make completion-protocol-test` exercises full document synchronization and
 completion through the actual stdio server, including unsaved folder members,
@@ -183,6 +204,22 @@ inherits the parent environment, clears conflicting Lua/Titan search overrides,
 and sets compiler paths only for its children. It neither installs tools nor
 changes global PATH, accounts, privileges, or execution policy.
 
+`server-test-build` and `server-test-run` default to the `validation` build
+profile; `server`, `stage`, and `package` default to `production`. Validation
+uses `-O0 -fno-lto` for generated Titan code and native helpers, with no LTO at
+link time. Production retains the compiler's normal optimized defaults and
+builds the native helpers at `-O3`. Select a profile explicitly with
+`--build-profile validation|production` or `VSCODE_TITAN_BUILD_PROFILE`; the
+shared `TITAN_BUILD_PROFILE` environment setting is also honored. Explicit
+inherited `TITAN_EXTRA_CPPFLAGS`, `TITAN_EXTRA_CFLAGS`, and
+`TITAN_EXTRA_LDFLAGS` follow profile defaults, preserving sanitizer and other
+overrides. Native helper flags use the compiler's argument parser.
+
+The profile participates in object and compiler-probe identities. Test execution
+uses the existing aggregate; build it with the selected profile first. The SDK
+stays immutable: choose a separately prepared validation SDK when its standard
+provider should also use validation flags, and a production SDK for packaging.
+
 `--build-root` and `--source-root` accept absolute alternate paths;
 `server-test-run --filter PATTERN` runs an existing aggregate with Titan's normal
 test filter. A build-directory lock prevents two drivers from mutating the same
@@ -193,8 +230,8 @@ Compiler probes live under the build directory in a configuration-keyed cache;
 SDK/header/tool/flag changes select a fresh cache. Native test execution disables
 persistent probe records because independent fixtures may reuse header names.
 Missing generated companions force rebuilding. Production and test objects use
-separate stages. The default Unix graph and recipes retain their existing static
-production behavior.
+separate stages and separate native-helper directories. The default Unix graph
+and recipes retain their existing static production behavior.
 
 The application is `bin/titan-language-server.exe` plus
 `lib/titan/0.6/titan_language_server.dll` and `lib/titan/0.6/titan.dll`.

@@ -58,9 +58,16 @@ Titan is not publicly released. Keep its language-server API version at `1`
 until the first public release; update the compiler and its consumers together
 without incrementing that API version during prerelease development.
 
-The project owns an isolated Titan installation at `.titan/`; it is ignored by
-Git. Prefer `.titan/bin/titanc`, `.titan/bin/lua`, and
-`.titan/bin/luarocks` over ambient installations. Keep the package lockfile
+The project owns isolated Titan installations at `.titan/` for production and
+`.titan-validation/` for testing; both are ignored by Git. Prefer their selected
+`bin/titanc`, `bin/lua`, and `bin/luarocks` over ambient installations.
+Test/verify entry points use `BUILD_PROFILE=validation` (`-O0`, no LTO) for Titan
+providers, the server and tests. Lua and its compiler dependencies stay optimized
+to run the compiler and parser efficiently. Regular server/package/installation builds use
+production (`-O3`, platform LTO defaults), with minimal optimized smoke coverage
+in the incremental gate. Routine CI publishes no VSIX or server binaries;
+future main-only release jobs must rebuild production after tests pass.
+Keep the package lockfile
 checked in and use `npm ci` for reproducible JavaScript installs.
 
 Native compilation uses persistent production and test object graphs. See

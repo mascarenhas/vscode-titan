@@ -1197,6 +1197,8 @@ async function testSelfContainedCompilerModules({ sdkHeaders = false } = {}) {
   const exit = exitOf(child);
   const stderr = collect(child.stderr);
   const responses = new FrameReader(child.stdout);
+  const started = performance.now();
+  let phase = "initialize";
   try {
     await request(child, responses, 1, "initialize", {});
     child.stdin.write(frame({
@@ -1204,8 +1206,10 @@ async function testSelfContainedCompilerModules({ sdkHeaders = false } = {}) {
       method: "initialized",
       params: {}
     }));
+    phase = "initial indexing";
     await waitForIndexing(responses);
 
+    phase = "definition";
     const definition = await semanticRequest(
       child,
       responses,
@@ -1265,6 +1269,7 @@ async function testSelfContainedCompilerModules({ sdkHeaders = false } = {}) {
       assert.ok(line >= 0);
       const character = lines[line].indexOf(probe.name) + 1;
       assert.ok(character > 0);
+      phase = `hover (${probe.module})`;
       const hover = await semanticRequest(
         child,
         responses,
@@ -1284,6 +1289,7 @@ async function testSelfContainedCompilerModules({ sdkHeaders = false } = {}) {
       line.includes("callback_entry(L)"));
     assert.ok(callbackBindingLine >= 0 && callbackCallLine >= 0);
     const callbackBindingColumn = lines[callbackBindingLine].indexOf("callback_entry");
+    phase = "reflected callback definition";
     const callbackDefinition = await semanticRequest(
       child,
       responses,
@@ -1314,6 +1320,7 @@ async function testSelfContainedCompilerModules({ sdkHeaders = false } = {}) {
       }`
     );
 
+    phase = "shutdown";
     const shutdown = await request(
       child,
       responses,
@@ -1322,15 +1329,22 @@ async function testSelfContainedCompilerModules({ sdkHeaders = false } = {}) {
       null
     );
     assert.equal(shutdown.result, null);
+    phase = "exit";
     child.stdin.write(frame({ jsonrpc: "2.0", method: "exit" }));
     assert.deepEqual(await awaitExit(exit), { code: 0, signal: null });
+    phase = "stdout closure";
     await responses.finish();
     assert.equal(responses.buffer.length, 0);
     assert.equal(stderr().length, 0, stderr().toString("utf8"));
   } catch (cause) {
     const diagnostic = stderr().toString("utf8").trim();
     throw new Error(
-      `${cause.message}${diagnostic.length > 0 ? `; stderr: ${diagnostic}` : ""}`,
+      `${sdkHeaders ? "SDK header" : "self-contained compiler-module"} smoke ` +
+      `failed during ${phase} after ${Math.round(performance.now() - started)}ms: ` +
+      `${cause.message}; last indexing status: ${
+        JSON.stringify(responses.indexingStatuses.at(-1) ?? null)
+      }; diagnostics: ${JSON.stringify(responses.diagnosticPublications)}` +
+      `${diagnostic.length > 0 ? `; stderr: ${diagnostic}` : ""}`,
       { cause }
     );
   } finally {

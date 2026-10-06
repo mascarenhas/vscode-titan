@@ -1,3 +1,6 @@
+--- Incremental Content-Length framing with binary byte counts and bounded input.
+-- @module server.framing
+
 local io = import "io"
 local strings = import "string"
 local math = import "math"
@@ -5,10 +8,12 @@ local math = import "math"
 -- LSP messages use HTTP-like ASCII headers followed by an exact byte count.
 -- A FrameReader owns every byte read past one message so callers never lose a
 -- prefix of the next message when the operating system returns both at once.
+--- Malformed, truncated, or oversized protocol frame.
 record FrameError
   message: string
 end
 
+--- Incremental framing buffer preserving incomplete headers and bodies.
 record FrameReader
   local buffer: string
 end
@@ -20,14 +25,17 @@ local function reject<|T|>(message: string): T
   raise FrameError.new(message)
 end
 
+--- Create an empty incremental protocol frame reader.
 function reader(): FrameReader
   return FrameReader.new("")
 end
 
+--- Prefix a JSON body with Content-Length measured in bytes.
 function frame(body: string): string
   return "Content-Length: " .. #body .. "\r\n\r\n" .. body
 end
 
+--- Append exact input bytes for subsequent frame extraction.
 function FrameReader:feed(bytes: string)
   if #bytes > 0 then self.buffer = self.buffer .. bytes end
 end
@@ -196,6 +204,7 @@ local function parse_headers(headers: string): integer
   return content_length
 end
 
+--- Extract one complete body, return nil while incomplete, or raise FrameError.
 function FrameReader:next(): string?
   local header_first?: integer, header_last?: integer =
     strings.find(self.buffer, "\r\n\r\n")
@@ -226,6 +235,7 @@ function FrameReader:next(): string?
   return body
 end
 
+--- Read chunks until a complete body or clean EOF is available.
 function FrameReader:read(source: io.Reader): string?
   while true do
     local body? = self:next()

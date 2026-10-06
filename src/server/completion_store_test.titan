@@ -81,6 +81,9 @@ function test_completion_store_publishes_complete_and_partial_candidate_batches(
       if index % 2 == 1 then snippet = "name" .. index .. "(${1:argument})$0" end
       candidates[index] = candidate("name" .. index, "detail\0" .. index,
         0, index, index ~= 14, snippet)
+      candidates[index] = facts.Candidate.new(candidates[index].label, "value", candidates[index].label,
+        3, candidates[index].detail, "integer", 0, 0, index, candidates[index].available,
+        "public", "", "lexical", snippet, "Documentation\0" .. index)
     end
     do
       local access = store:acquire()
@@ -104,14 +107,15 @@ function test_completion_store_publishes_complete_and_partial_candidate_batches(
       for table_index = 1, #tables do
         local table = tables[table_index]
         local rows = sql.rows(access.connection,
-          "SELECT ordinal,label,detail,declaration_order,available,call_snippet FROM " .. table .. " ORDER BY ordinal")
+          "SELECT ordinal,label,detail,declaration_order,available,call_snippet,documentation FROM " .. table .. " ORDER BY ordinal")
         test.assert(#rows == #candidates, "candidate batch omitted its final partial rows")
         for index = 1, #rows do
           local row = rows[index]
           test.assert(row:get(1) == index and row:get(2) == candidates[index].label and
             sql.bytes(row, 3) == candidates[index].detail and row:get(4) == index and
             ((row:get(5) as integer) ~= 0) == candidates[index].available and
-            sql.optional_bytes(row, 6) == candidates[index].call_snippet,
+            sql.optional_bytes(row, 6) == candidates[index].call_snippet and
+            sql.optional_bytes(row, 7) == candidates[index].documentation,
             "candidate bindings changed across batch boundaries")
         end
       end
@@ -119,6 +123,8 @@ function test_completion_store_publishes_complete_and_partial_candidate_batches(
     local selected? = overlay:select("batched", "context", "", 100, yes)
     test.assert(selected ~= nil and #selected.candidates == 28 and not selected.is_incomplete,
       "batched publication changed candidate availability")
+    test.assert(selected.candidates[1].documentation == "Documentation\0" .. selected.candidates[1].declaration_order,
+      "SQL selection lost detached documentation")
     -- Supersede the new publication after its first candidate batch. Rollback
     -- must restore the complete prior snapshot, including its replacement mask.
     local checks = 0

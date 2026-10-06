@@ -1,0 +1,88 @@
+--- Format detached compiler documentation for editor presentation.
+-- @module server.documentation
+local strings = import "string"
+
+--- One ordered LDoc tag, including repeated or extension tags.
+record Tag
+  const name: string
+  const value: string
+end
+
+--- Summary, body and tags detached from the compiler's Lua tables.
+record Documentation
+  const summary: string
+  const description: string
+  const tags: {Tag}
+end
+
+local MANUAL_ROOT = "https://github.com/mascarenhas/titan/blob/master/doc/language/"
+
+local function manual_link(value: string): string?
+  if strings.match(value, "^[A-Za-z0-9_./#-]+$") == nil or
+      strings.sub(value, 1, 1) == "/" or
+      strings.find(value, "..") ~= nil or strings.find(value, ".md") == nil then
+    return nil
+  end
+  return MANUAL_ROOT .. value
+end
+
+local function named_tag(output: strings.StringWriter, heading: string,
+                          value: string, typed: boolean)
+  local modifiers = ""
+  if strings.sub(value, 1, 1) == "[" then
+    local finish? = strings.find(value, "]")
+    if finish ~= nil then
+      modifiers = " (" .. strings.sub(value, 2, finish - 1) .. ")"
+      value = strings.sub(value, finish + 1)
+      while strings.sub(value, 1, 1) == " " do value = strings.sub(value, 2) end
+    end
+  end
+  local type_label = ""
+  local split? = strings.find(value, " ")
+  if typed and split ~= nil then
+    type_label = " (`" .. strings.sub(value, 1, split - 1) .. "`)"
+    value = strings.sub(value, split + 1)
+    split = strings.find(value, " ")
+  end
+  if split == nil then
+    output:write("- **" .. heading .. ":** `" .. value .. "`" .. type_label .. modifiers .. "\n")
+  else
+    output:write("- **" .. heading .. ":** `" .. strings.sub(value, 1, split - 1) ..
+      "`" .. type_label .. modifiers .. " — " .. strings.sub(value, split + 1) .. "\n")
+  end
+end
+
+--- Render Markdown once during saved extraction or private completion preparation.
+-- @return Markdown containing prose, useful tags and resolved manual links.
+function Documentation:markdown(): string
+  local output = strings.writer()
+  output:write(self.summary)
+  if self.description ~= "" then output:write("\n\n" .. self.description) end
+  for index = 1, #self.tags do
+    local tag = self.tags[index]
+    if tag.name ~= "module" and tag.name ~= "name" and tag.name ~= "class" then
+      output:write("\n\n")
+      if tag.name == "param" or tag.name == "tparam" then
+        named_tag(output, "Parameter", tag.value, tag.name == "tparam")
+      elseif tag.name == "field" or tag.name == "tfield" then
+        named_tag(output, "Field", tag.value, tag.name == "tfield")
+      elseif tag.name == "return" or tag.name == "treturn" then
+        output:write("**Returns:** " .. tag.value)
+      elseif tag.name == "usage" then
+        local link? = manual_link(tag.value)
+        if link ~= nil then
+          output:write("[More information](" .. link .. ")")
+        else
+          output:write("**Usage:**\n\n```titan\n" .. tag.value .. "\n```")
+        end
+      elseif tag.name == "see" then
+        local link? = manual_link(tag.value)
+        if link ~= nil then output:write("[See also](" .. link .. ")")
+        else output:write("**See also:** " .. tag.value) end
+      else
+        output:write("**" .. tag.name .. ":** " .. tag.value)
+      end
+    end
+  end
+  return output:drain()
+end

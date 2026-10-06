@@ -52,6 +52,7 @@ for required in \
   extension/dist/titan/share/lua/5.5/relabel.lua \
   extension/dist/titan/share/lua/5.5/titan-compiler/driver.lua \
   extension/dist/titan/share/lua/5.5/titan-compiler/maybe3.lua \
+  extension/dist/titan/share/lua/5.5/titan-compiler/documentation.lua \
   extension/dist/titan/share/lua/5.5/titan-compiler/completion.lua \
   extension/dist/titan/share/lua/5.5/titan-compiler/checker/completion.lua \
   extension/dist/titan/share/lua/5.5/titan-compiler/version.lua \
@@ -82,7 +83,7 @@ if [[ "$bundled_openssl" == 1 ]]; then
   done
 fi
 
-if grep -Eq '^extension/(\.agents|\.build|\.titan|node_modules|plugins|src|test)/' \
+if grep -Eq '^extension/(\.agents|\.build|\.titan(-validation)?|node_modules|plugins|src|test)/' \
     <<<"$contents"; then
   echo "VSIX contains a development-only directory" >&2
   exit 1

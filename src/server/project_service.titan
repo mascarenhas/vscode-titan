@@ -1,3 +1,6 @@
+--- Own project scans, bounded compiler work, provenance revalidation, and accepted publication.
+-- @module server.project_service
+
 local async = import "async"
 local sqlite3 = import "sqlite3"
 local fs = import "fs"
@@ -51,6 +54,7 @@ type ExternalModule = metadata.ExternalModule
 type ExternalFingerprint = metadata.ExternalFingerprint
 type HeaderFingerprint = metadata.HeaderFingerprint
 
+--- Accepted saved-project state with module metadata, diagnostics, and generation.
 record Snapshot
   const generation: integer
   const config: project_config.ProjectConfig
@@ -65,6 +69,7 @@ end
 -- dirty_modules is the exact work set. check_tokens capture those modules'
 -- graph revisions before analysis, so a same-generation dependency
 -- invalidation cannot publish an obsolete result.
+--- Captured dirty-module work fenced by project configuration and generation.
 record AnalysisRequest
   const generation: integer
   const config: project_config.ProjectConfig
@@ -92,6 +97,7 @@ type HeaderRestater = function ({compiler_bridge.CHeaderDependency},
 -- before analysis.
 type SnapshotListener = function (Snapshot): ()
 
+--- Transaction hooks coordinating project metadata and scalar semantic publication.
 record PublicationHooks
   const prepare: function (Snapshot): boolean
   const publish: function (sqlite3.Connection): ()
@@ -118,6 +124,7 @@ end
 
 local type ProjectState = metadata.ProjectState
 
+--- Own one project graph, compiler work queue, provenance, and accepted publication.
 record Service
   local project_root: string
   local installed_binary_modules_root: string
@@ -1016,6 +1023,7 @@ local function Service:scan_or_raise(): Snapshot
   return self:accept_discovery(loaded, found)
 end
 
+--- Reconcile saved filesystem inputs into project state before selecting compiler work.
 function Service:scan(): (Snapshot?, Error?)
   local access = self.store:acquire()
   defer access:release()
@@ -1185,6 +1193,7 @@ local function Service:prepare_work_avoiding(
   return request
 end
 
+--- Capture the next bounded dirty-module analysis request.
 function Service:prepare_work(): AnalysisRequest?
   local access = self.store:acquire()
   defer access:release()
@@ -2002,6 +2011,7 @@ local function Service:commit_or_raise(
   return report
 end
 
+--- Accept completed analysis only after generation and input provenance revalidation.
 function Service:commit(request: AnalysisRequest,
                         analysis: compiler_bridge.Analysis):
     (RefreshReport?, Error?)
@@ -2152,6 +2162,7 @@ local function Service:analyze_to_fixed_point(): (RefreshReport?, Error?)
   return report, nil
 end
 
+--- Scan and run pending analysis until the saved-project snapshot settles.
 function Service:refresh(snapshot_listener: SnapshotListener?):
     (RefreshReport?, Error?)
   local started = logging.clock()
@@ -2260,6 +2271,7 @@ local function Service:latest_inner(): Snapshot
     self.graph:dirty_modules())
 end
 
+--- Return the newest accepted saved-project snapshot.
 function Service:latest(): Snapshot
   local access = self.store:acquire()
   defer access:release()
@@ -2305,6 +2317,7 @@ function Service:invalidate_cached_project(module_name: string)
   self.graph:invalidate_project(module_name)
 end
 
+--- Release the owned workspace storage and retained project state.
 function Service:close()
   local active? = self.analysis_task
   if active ~= nil then
@@ -2352,6 +2365,7 @@ end
 -- caller retains that Store; an omitted Store is created and owned here.
 -- Configuration is already normalized by the caller. Initial discovery uses it
 -- once; later scans reload the workspace file with the same installed default.
+--- Create a project service from normalized settings and injectable analysis owners.
 function create(settings: project_config.ProjectConfig,
     installed_binary_modules_root: string, analyzer: Analyzer,
     external_resolver: ExternalResolver?, header_restater: HeaderRestater?,

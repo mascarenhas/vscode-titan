@@ -1,3 +1,6 @@
+--- Load project services and coordinate deferred cached-body restoration.
+-- @module server.project_loader
+
 local async = import "async"
 local strings = import "string"
 local sqlite3 = import "sqlite3"
@@ -146,7 +149,7 @@ local function completion_catalog(connection: sqlite3.Connection,
     if fresh[name] then
       descriptors[#descriptors + 1] = completion_store.SavedDescriptor.new(
         name, 0, 2, binary.kind, binary.filename, nil,
-        binary.serialized, nil, {}, {}, {}, {})
+        binary.serialized, nil, {}, {}, {}, {}, binary.documentation)
     end
   end
   return descriptors, retained
@@ -188,8 +191,10 @@ local function prepare_completion_descriptors(snapshot: service.Snapshot,
   for index = 1, #changed do names[index] = changed[index].name end
   local exported = compiler:export_completion_facts(names)
   local candidates: {string: {completion_types.Candidate}} = {}
+  local documentation: {string: string} = {}
   for index = 1, #exported do
     candidates[exported[index].module_name] = exported[index].candidates
+    documentation[exported[index].module_name] = exported[index].documentation
   end
   local descriptors: {completion_store.SavedDescriptor} = {}
   for index = 1, #changed do
@@ -252,7 +257,7 @@ local function prepare_completion_descriptors(snapshot: service.Snapshot,
     local payload: string? = nil
     local descriptor = completion_store.SavedDescriptor.new(
       revision.name, revision.revision, revision.state, provenance, main_file, nil,
-      public_interface, source_interface, files, imports, headers, members)
+      public_interface, source_interface, files, imports, headers, members, documentation[revision.name])
     local unchanged = false
     if provenance ~= "project" then
       local access = loaded:workspace_store():acquire()
@@ -270,7 +275,7 @@ local function prepare_completion_descriptors(snapshot: service.Snapshot,
       end
       descriptors[#descriptors + 1] = completion_store.SavedDescriptor.new(
         revision.name, revision.revision, revision.state, provenance, main_file, payload,
-        public_interface, source_interface, files, imports, headers, members)
+        public_interface, source_interface, files, imports, headers, members, documentation[revision.name])
     end
   end
   local binaries = compiler:completion_binary_catalog()

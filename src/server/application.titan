@@ -1,3 +1,6 @@
+--- Language-server application ownership, project indexing, editor captures, and semantic dispatch.
+-- @module server.application
+
 foreign import "compiler_io_platform.h"
 local async = import "async"
 local fs = import "fs"
@@ -88,6 +91,7 @@ local record RefreshChain
   const started_cpu: float
 end
 
+--- Own one workspace service, background indexing, and editor-buffer lifecycle.
 record Application
   local const project_root: string
   local const project_loader: ProjectLoader
@@ -1190,6 +1194,7 @@ end
 
 -- Idempotently ensure that the initial or watcher-requested index is running.
 -- The initialized lifecycle hook calls this without waiting for project I/O.
+--- Start the coalesced background indexing owner after initialization.
 function Application:start_indexing()
   self:start_refresh(false, "initialized")
 end
@@ -1440,6 +1445,7 @@ end
 -- Called synchronously by the coordinator, before dispatch creates a Task.
 -- A nil capture still records its receipt epoch so later open/reopen messages
 -- cannot attach a new editor session to an earlier hover position.
+--- Capture exact current hover inputs before deferred request work begins.
 function Application:capture_hover(request: dispatcher.SemanticRequest): coordinator.CompletionWork
   local params?, params_error? = lsp.parse_document_position(request.params)
   if params == nil then
@@ -1546,6 +1552,7 @@ local function Application:handle_rename(
     lsp.workspace_edit_value(verified:document_edits()))
 end
 
+--- Create a workspace application with injectable project loading and rename analysis.
 function create(project_root: string, loader: ProjectLoader?,
     rename_analyzer: RenameAnalyzer?): Application
   if ffi.VSCODE_TITAN_WINDOWS ~= 0 and
@@ -1587,6 +1594,7 @@ local function unavailable_completion(): dispatcher.SemanticOutcome
     lsp.completion_list_value(lsp.CompletionList.new(true, {})))
 end
 
+--- Capture completion inputs before later editor notifications can change them.
 function Application:capture_completion(request: dispatcher.CompletionRequest):
     coordinator.CompletionWork
   if self.closed or self.service == nil then return unavailable_completion end
@@ -1617,6 +1625,7 @@ local function create_with_service(project_root: string,
   return application
 end
 
+--- Answer a saved-source semantic request from its accepted project generation.
 function Application:handle(
     request: dispatcher.SemanticRequest): dispatcher.SemanticOutcome
   if request.method == "textDocument/definition" then
@@ -1639,6 +1648,7 @@ catch
   return failure(INTERNAL_ERROR, runtime_error(error).message)
 end
 
+--- Cancel and drain owned work before closing workspace resources.
 function Application:close()
   if self.closed then return end
   self.closed = true

@@ -1,9 +1,13 @@
+--- Persist saved-source diagnostics, manifests, and external/header provenance.
+-- @module server.project_metadata
+
 local sqlite3 = import "sqlite3"
 local sql = import "server.workspace_store"
 local compiler_bridge = import "server.compiler_bridge"
 local project_graph = import "server.project_graph"
 local header_store = import "server.header_store"
 
+--- Exact saved contributor bytes and observed filesystem stamp.
 record SourceFileSnapshot
   const filename: string
   const contents: string
@@ -19,6 +23,7 @@ end
 -- This record intentionally cannot carry compiler nodes, symbols, or a raw
 -- AST. External compiler snapshots are converted to this metadata-only shape
 -- immediately when a generation is committed.
+--- Detached external manifest and provenance without a retained full AST.
 record ExternalModule
   const module_name: string
   const origin: ExternalOrigin
@@ -45,11 +50,13 @@ end
 -- Exact compiler-observed inputs for one module's C preprocessor closure.
 -- These are deliberately path identities rather than watched directories:
 -- `search` entries include misses and therefore notice a new earlier shadow.
+--- Ordered compiler-observed C-header dependencies retained for revalidation.
 record HeaderFingerprint
   const module_name: string
   const dependencies: {compiler_bridge.CHeaderDependency}
 end
 
+--- Persisted source and diagnostic state for one project module.
 record ProjectState
   module_name: string
   source_files: {SourceFileSnapshot}
@@ -59,6 +66,7 @@ end
 
 -- Borrow the updater's connection. These factories materialize one operation's
 -- typed results; no file, provenance, diagnostics, or name index lives in RAM.
+--- Typed access to project, external, and header provenance rows.
 record Metadata
   const connection: sqlite3.Connection
   local const graph: project_graph.Graph<|compiler_bridge.ModuleSnapshot|>
@@ -114,6 +122,7 @@ local function Batch:append(row: {value})
   if self.count == 20 then self:flush() end
 end
 
+--- Open project metadata storage on the shared workspace connection.
 function create(connection: sqlite3.Connection,
                 graph: project_graph.Graph<|compiler_bridge.ModuleSnapshot|>): Metadata
   header_store.create(connection)

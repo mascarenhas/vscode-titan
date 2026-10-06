@@ -1,3 +1,6 @@
+--- Normalize accepted project diagnostics and publish document notifications.
+-- @module server.diagnostics
+
 local async = import "async"
 local strings = import "string"
 local bridge = import "server.compiler_bridge"
@@ -11,12 +14,14 @@ union Kind
   unmapped_source()
 end
 
+--- One normalized compiler diagnostic with saved-source coordinates.
 record Item
   const kind: Kind
   const message: string
   const range: source_text.Span
 end
 
+--- Complete diagnostic replacement for one document.
 record Publication
   const uri: string
   const items: {Item}
@@ -25,6 +30,7 @@ end
 type Listener = function (Publication): ()
 local type Yield = function (): ()
 
+--- Remember previously published documents so removed diagnostics can be cleared.
 record Publisher
   local listener: Listener?
   local published_order: {string}
@@ -86,6 +92,7 @@ local function item_key(item: Item): string
     strings.tostring(#item.message) .. ":" .. item.message
 end
 
+--- Encode one publishDiagnostics notification.
 function notification(publication: Publication): string
   local encoded: wire.Array = {}
   for index = 1, #publication.items do
@@ -217,6 +224,7 @@ local function build(snapshot: project_service.Snapshot,
   return publications
 end
 
+--- Collect diagnostics from an accepted saved-project snapshot.
 function from_snapshot(snapshot: project_service.Snapshot): {Publication}
   return build(snapshot, nil)
 end
@@ -229,6 +237,7 @@ end
 -- Publication and replacement are nonyielding. The refresh owner can build a
 -- candidate asynchronously, recheck its saved epoch, and then atomically
 -- replace the client-visible diagnostic set.
+--- Publish replacements and clear documents absent from the new accepted set.
 function Publisher:publish(publications: {Publication})
   local listener? = self.listener
   if listener == nil then return end
@@ -260,6 +269,7 @@ function Publisher:clear()
   self.published_order = {}
 end
 
+--- Stop further diagnostic delivery during server shutdown.
 function Publisher:stop()
   self:clear()
   self.listener = nil

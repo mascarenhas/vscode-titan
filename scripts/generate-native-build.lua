@@ -222,7 +222,7 @@ if openssl_include and openssl_include ~= "" then
 end
 write_changed(input_root .. "/sdk", table.concat(sdk_files, "\n") .. "\n")
 local configuration = {source_root, build_root, sdk_root}
-for _, variable in ipairs({"CC", "AR", "RANLIB", "PATH", "TITANC", "TITAN_LUA",
+for _, variable in ipairs({"CC", "AR", "RANLIB", "PATH", "TITANC", "TITAN_LUA", "TITAN_BUILD_PROFILE",
         "TITAN_EXTRA_CPPFLAGS", "TITAN_EXTRA_CFLAGS", "TITAN_EXTRA_LDFLAGS",
         "TITAN_NO_LINE_DIRECTIVES", "VSCODE_TITAN_EXPORT_FLAGS",
         "VSCODE_TITAN_OPENSSL_MODE", "VSCODE_TITAN_OPENSSL_CPPFLAGS",

@@ -1,8 +1,12 @@
+--- Single-reader FIFO serializing framed replies and notifications.
+-- @module server.response_queue
+
 local async = import "async"
 
 -- A single-consumer, unbounded protocol queue. Producers never yield, so a
 -- Task terminal listener can publish exactly one response safely. The one
 -- consumer is the protocol writer Task.
+--- Ordered response buffer with one reserved consumer and explicit stop state.
 record ResponseQueue
   local items: {string}
   local waiter: async.Task?
@@ -10,6 +14,7 @@ record ResponseQueue
   local stopped: boolean
 end
 
+--- Create an empty response queue.
 function create(): ResponseQueue
   return ResponseQueue.new(
     {}, nil, async.ResumeToken.new("server.response_queue"), false)
@@ -22,12 +27,14 @@ local function ResponseQueue:wake()
   waiter:resume(self.resume_token)
 end
 
+--- Append a reply or notification and wake the reserved consumer.
 function ResponseQueue:push(message: string)
   if self.stopped then raise "protocol response queue is stopped" end
   self.items[#self.items + 1] = message
   self:wake()
 end
 
+--- End production while retaining queued messages for the consumer.
 function ResponseQueue:stop()
   if self.stopped then return end
   self.stopped = true
@@ -38,6 +45,7 @@ function ResponseQueue:pending(): integer
   return #self.items
 end
 
+--- Take the next message, suspending while live and empty; nil marks drained stop.
 function ResponseQueue:take(): string?
   if #self.items == 0 then
     if self.stopped then return nil end

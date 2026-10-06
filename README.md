@@ -95,7 +95,8 @@ Native modules now have separate object targets and final executable links.
 See [incremental native builds](docs/native-build.md) for dependency ownership,
 configuration invalidation, separate production/test objects and LTO settings.
 
-The complete local gate builds the server and extension, runs Titan and
+The complete local gate uses `-O0` without LTO and a separate
+`.titan-validation/` SDK. It builds the server and extension, runs Titan and
 JavaScript tests plus the Extension Host smoke test, queries the native server
 through the Codex adapter, checks incremental native rebuilds, packages the VSIX,
 checks its contents, validates the Codex plugin metadata, and inspects native linkage:
@@ -110,13 +111,18 @@ On a headless Linux machine, run the Extension Host under a virtual display:
 xvfb-run -a make verify
 ```
 
-GitHub CI runs the same gates as separate toolchain, build, test, packaging, and
-inspection steps on Ubuntu 24.04 `ubicloud-standard-2` runners. The completed
-`.titan` installation and the two LuaRocks licensing inputs required by packaging
-are cached by the exact pinned Titan commit and installation identity. A cache hit
+GitHub CI runs the same validation profile as separate toolchain, build, test,
+disposable packaging and inspection steps on Ubuntu 24.04 `ubicloud-standard-2`
+runners. It publishes no VSIX or server binaries. The completed
+`.titan-validation` installation and the two LuaRocks licensing inputs required
+by packaging are cached by the exact pinned Titan commit, build profile and
+installation identity. A cache hit
 reuses the compiler and SDK; a miss builds them once before
 server compilation. Make schedules module object recipes across two CPUs, then
 links one native test executable that runs in two parallel execution shards.
+Regular `make`, `make server`, `make package` and compiler installation retain
+optimized production defaults using `.titan/`. A future main-only release job
+must rebuild that complete optimized SDK/server after validation passes.
 Because both repositories are
 private, the vscode-titan repository must define an Actions secret named
 `SSH_PRIVATE_KEY`; its public half must be registered as a read-only deploy key
@@ -547,6 +553,11 @@ hovers summarize visible top-level members without recursively expanding
 nominal types. These summaries, hover types, and folding ranges are materialized
 in the completed SQLite view during indexing. Individual feature queries read
 that view without traversing compiler ASTs or writing saved rows.
+
+LDoc-style declaration and module comments appear in hover and completion
+extra information, including links to the corresponding Titan manual pages.
+See [declaration documentation](docs/documentation.md) for metadata, rendering
+and saved versus unsaved behavior.
 
 An unchanged read-only request uses the immutable completed generation without
 rescanning the project. Before the initial index is ready it returns the

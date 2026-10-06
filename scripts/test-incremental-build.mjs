@@ -31,13 +31,15 @@ const compiler = path.join(options.prefix, "bin", "titanc");
 const launcher = path.join(output, "titanc");
 const environment = { ...process.env, CCACHE_DISABLE: "1", TITAN_ROCKS_ROOT: options.prefix };
 for (const name of ["C_INCLUDE_PATH", "LUA_PATH", "LUA_CPATH", "LUA_PATH_5_5", "LUA_CPATH_5_5",
-  "TITAN_PREFIX", "TITAN_PATH", "TITAN_PATH_0_6", "TITAN_EXTRA_CPPFLAGS", "TITAN_EXTRA_CFLAGS", "TITAN_EXTRA_LDFLAGS"]) {
+  "TITAN_PREFIX", "TITAN_PATH", "TITAN_PATH_0_6", "TITAN_EXTRA_CPPFLAGS", "TITAN_EXTRA_CFLAGS", "TITAN_EXTRA_LDFLAGS",
+  "BUILD_PROFILE", "TITAN_BUILD_PROFILE"]) {
   delete environment[name];
 }
 const policy = {
+  BUILD_PROFILE: "validation",
   TITAN_EXTRA_CPPFLAGS: "",
-  TITAN_EXTRA_CFLAGS: "-O0 -fno-lto",
-  TITAN_EXTRA_LDFLAGS: "-O0 -fno-lto"
+  TITAN_EXTRA_CFLAGS: "",
+  TITAN_EXTRA_LDFLAGS: ""
 };
 const report = { completed: false, source, build, compiler, steps: [] };
 let commandNumber = 0;
@@ -203,7 +205,7 @@ function main(args: {string}): integer return app.answer() + unrelated.value() e
   await writeFile(wrapper, `import {appendFileSync, existsSync, unlinkSync, writeFileSync, chmodSync} from 'node:fs';
 import {spawnSync} from 'node:child_process';
 const args=process.argv.slice(2);
-appendFileSync(${JSON.stringify(callsFile)},JSON.stringify({args})+'\\n');
+appendFileSync(${JSON.stringify(callsFile)},JSON.stringify({args,profile:process.env.TITAN_BUILD_PROFILE})+'\\n');
 if (!args.includes('-c') && !args.includes('--test') && args.includes('titan_language_server') && existsSync(${JSON.stringify(failureMarker)})) {
   unlinkSync(${JSON.stringify(failureMarker)});
   writeFileSync(${JSON.stringify(linkedServer)}, '');
@@ -244,7 +246,9 @@ if(stdout) process.stdout.write(stdout+'\\n');
     policy.OPENSSL_PKG_CONFIG = opensslLauncher;
   }
 
-  await make("initial");
+  const initial = await make("initial");
+  assert.ok(initial.calls.length > 0 && initial.calls.every(call => call.profile === "validation"),
+    "all compiler phases must use the validation profile");
   await runtime("initial", 5, names);
   // CI starts without a Titan search path. Also reject a developer's unrelated
   // SDK: both version-specific and fallback runtime variables must be pinned.
@@ -356,6 +360,23 @@ if(stdout) process.stdout.write(stdout+'\\n');
     await runtime("system-openssl-flags-restored", 15, names);
     await noOp("system-openssl-restored-noop");
   }
+
+  // A profile-only change must rebuild both graphs and native helpers, even
+  // without an explicit extra flag. Use the tiny fixture for optimized smoke.
+  policy.BUILD_PROFILE = "production";
+  before = await observedFiles();
+  const optimized = await make("production-profile");
+  after = await observedFiles();
+  assert.ok(optimized.calls.length > 0 && optimized.calls.every(call => call.profile === "production"));
+  for (const mode of ["server-src", "test-src"]) changed(before, after, `${mode}/fixture/unrelated.o`);
+  changed(before, after, "server-executable");
+  changed(before, after, "test-executable");
+  await runtime("production-profile", 15, names);
+  await noOp("production-profile-noop");
+  policy.BUILD_PROFILE = "validation";
+  await make("validation-profile-restored");
+  await runtime("validation-profile-restored", 15, names);
+  await noOp("validation-profile-noop");
 
   policy.TITAN_EXTRA_CFLAGS += " -fno-omit-frame-pointer";
   before = await observedFiles();

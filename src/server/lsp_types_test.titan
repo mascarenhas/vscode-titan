@@ -5,6 +5,22 @@ local lsp = import "server.lsp_types"
 local source_text = import "server.source_text"
 local test = import "test"
 
+function test_lsp_types_encodes_completion_documentation_as_markdown(_context: test.Context)
+  local range = source_text.Span(source_text.Position(0, 0), source_text.Position(0, 3))
+  local encoded = lsp.completion_list_value(lsp.CompletionList(false, {
+    lsp.CompletionItem("read", 3, "read(): string", "1", "read",
+      lsp.TextEdit(range, "read"), nil, "Read bytes.\n\n**Returns:** A chunk."),
+    lsp.CompletionItem("other", 6, "integer", "2", "other", lsp.TextEdit(range, "other")),
+  }))
+  local items = wire.as_array(encoded["items"])
+  local documented = wire.as_object(items[1])
+  local markup = wire.as_object(documented["documentation"])
+  test.assert(wire.as_string(markup["kind"]) == "markdown" and
+    wire.as_string(markup["value"]) == "Read bytes.\n\n**Returns:** A chunk.")
+  local absent = wire.as_object(items[2])
+  test.assert(absent["documentation"] == nil, "undocumented completion acquired an empty payload")
+end
+
 local function params(uri: value, line: value,
                       character: value): wire.Object
   local document: wire.Object = {["uri"] = uri}

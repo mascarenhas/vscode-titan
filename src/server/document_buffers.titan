@@ -1,9 +1,13 @@
+--- Versioned editor buffers and immutable captures for unsaved completion work.
+-- @module server.document_buffers
+
 local lsp = import "server.lsp_types"
 local source_text = import "server.source_text"
 local strings = import "string"
 
 -- Published inputs never mutate. A new client version replaces the record,
 -- while captured requests retain the old immutable bytes and session identity.
+--- Immutable editor document text with its session and version identity.
 record Input
   const uri: string
   const path: string
@@ -12,6 +16,7 @@ record Input
   const text: string
 end
 
+--- One editor snapshot and cursor position retained for deferred work.
 record Capture
   const document: Input
   const inputs: const {Input}
@@ -34,6 +39,7 @@ local record DocumentState
   input: Input?
 end
 
+--- Own open documents, monotonic capture epochs, and total buffered bytes.
 record BufferStore
   local documents: {DocumentState}
   local next_session: integer
@@ -89,6 +95,7 @@ local function BufferStore:replace(state: DocumentState,
   self.revision = self.revision + 1
 end
 
+--- Apply an ordered open, change, save, or close notification to captured editor state.
 function BufferStore:apply(notification: lsp.DocumentNotification): boolean
   case notification
   when opened(opened) then
@@ -145,6 +152,7 @@ function BufferStore:inputs(): const {Input}
   return result as const {Input}
 end
 
+--- Capture one tracked document and cursor without retaining mutable buffer state.
 function BufferStore:capture(path: string, position: source_text.Position): Capture?
   if self.capacity_exceeded then return nil end
   local state? = self:find(path)
@@ -159,6 +167,7 @@ function BufferStore:capture(path: string, position: source_text.Position): Capt
     source_text.Position.new(position.line, position.character))
 end
 
+--- Check that a retained capture still matches its document session and version.
 function BufferStore:current(capture: Capture): boolean
   if self.capacity_exceeded or capture.epoch ~= self.revision then return false end
   local state? = self:find(capture.document.path)
@@ -174,6 +183,7 @@ end
 
 -- This supplies coordinates only. The compiler owns token classification,
 -- including comments, strings, punctuation, and foreign type-name leaves.
+--- Find the identifier leaf at the captured position for completion replacement.
 function identifier_span(capture: Capture): (IdentifierSpan?, source_text.Error?)
   local source = capture.document.text
   local coordinates = source_text.coordinate_index(source)
