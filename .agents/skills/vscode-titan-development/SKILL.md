@@ -53,8 +53,9 @@ errors. Do not solve discovery by embedding the compiler into the executable.
   explicit boundaries with focused tests.
 - Advertise only implemented capabilities.
 - Definition, references, rename, folding and diagnostics use disk files.
-  Completion consumes immutable open/change captures; hover can reuse exact
-  current completion-derived TEMP occurrence facts. Use
+  Completion consumes immutable open/change captures. Hover continues private
+  analysis after completion activates it, retaining mapped untouched occurrences
+  during debounced refresh and save/watcher handoff. Use
   [completion.md](../../../docs/completion.md)
   for its input, preparation, TEMP and cancellation ownership contracts.
 - Attach project generations to asynchronous work. Reject superseded captures
@@ -100,9 +101,14 @@ checks. Keep other navigation and diagnostics saved-file-only. Completion
 callables retain declaration names and specialized types in scalar presentation;
 keep identifiers as labels/filter text and honor snippet/label-details capabilities
 and insertion preferences. Restore a private compiler fact observer before
-releasing its permit. Recent-completion hover uses exact occurrence facts with
-matching session/version/contributor/generation identity, never provisional
-completion facts or saved coordinates against differing dirty text.
+releasing its permit. Fresh hover publication requires exact session/version/contributor/generation
+identity. Retained hover keeps its original provenance and maps untouched spans
+conservatively through at most 64 edits per contributor, checking complete token
+bytes and boundaries. Superseded requests, edited tokens and reopened sessions
+are rejected. Keep the preceding accepted artifact through unusable rebuilds and
+saved publication; queue a 200 ms debounced full-source refresh against the new
+baseline. Never infer hover from provisional completion candidates or saved
+coordinates against differing dirty text.
 
 ## Verification and delivery
 

@@ -3,15 +3,17 @@ local fs = import "fs"
 local lua = import "lua"
 local sqlite3 = import "sqlite3"
 local strings = import "string"
+local timer = import "timer"
 local test = import "test"
 local runtime = import "server.test_runtime"
 local service = import "server.completion_service.titan"
 local buffers = import "server.document_buffers"
-local storage = import "server.completion_store"
+local storage = import "server.completion_store.titan"
+local fact_types = import "server.completion_types"
 local bridge = import "server.compiler_bridge"
 local scheduler = import "server.compiler_scheduler"
 local loader = import "server.project_loader"
-local sql = import "server.workspace_store"
+local sql = import "server.workspace_store.titan"
 local semantic = import "server.semantic_index"
 local lsp = import "server.lsp_types"
 local dispatcher = import "server.dispatcher"
@@ -147,6 +149,11 @@ local function await_preparation(completion: service.Service)
   end
 end
 
+local function await_refresh(completion: service.Service)
+  if completion.debounce ~= nil then async.join(completion.debounce) end
+  await_preparation(completion)
+end
+
 function test_completion_service_unsaved_receiver_and_whole_token_edit(_context: test.Context)
   runtime.run(function ()
     local store = sql.open(":memory:")
@@ -193,7 +200,7 @@ local function hover_markdown(outcome: dispatcher.SemanticOutcome?): string?
   end
 end
 
-function test_completion_service_hover_uses_exact_ephemeral_source_and_retires_on_change(_context: test.Context)
+function test_completion_service_hover_retains_analysis_until_refresh_and_retires_sessions(_context: test.Context)
   runtime.run(function ()
     local store = sql.open(":memory:")
     defer store:close()
@@ -224,7 +231,8 @@ function test_completion_service_hover_uses_exact_ephemeral_source_and_retires_o
       defer access:release()
       sql.execute(access.connection, "UPDATE main.store_state SET published_generation=8 WHERE singleton=1")
     end
-    test.assert(completion:hover(before) == nil, "hover ignored changed saved generation")
+    test.assert(hover_markdown(completion:hover(before)) ~= nil,
+      "saved publication discarded accepted hover before replacement")
     do
       local access = store:acquire()
       defer access:release()
@@ -233,13 +241,301 @@ function test_completion_service_hover_uses_exact_ephemeral_source_and_retires_o
     documents:apply(lsp.DocumentNotification.changed(lsp.ChangeDocument.new(
       lsp.TextDocument.new(URI, PATH), 2, text .. "-- changed\n")))
     completion:changed()
-    test.assert(completion:hover(before) == nil, "edit retained ephemeral hover context")
-    await_preparation(completion)
+    test.assert(completion:hover(before) == nil, "an obsolete hover request attached to newer editor bytes")
+    test.assert(hover_markdown(completion:hover(documents:capture(PATH,
+      source_text.Position.new(1, 8)))) ~= nil, "edit discarded an untouched accepted occurrence")
+    await_refresh(completion)
+    test.assert(hover_markdown(completion:hover(documents:capture(PATH,
+      source_text.Position.new(2, 10)))) ~= nil, "autonomous source analysis retained the completion hole")
     documents:apply(lsp.DocumentNotification.closed(lsp.TextDocument.new(URI, PATH)))
     completion:changed()
     open(documents, PATH, 1, text)
     test.assert(completion:hover(documents:capture(PATH, source_text.Position.new(1, 8))) == nil,
       "reopened buffer borrowed the previous session's hover")
+  end)
+end
+
+function test_completion_service_acceptance_refreshes_full_source_and_coalesces_edits(_context: test.Context)
+  runtime.run(function ()
+    local store = sql.open(":memory:")
+    defer store:close()
+    seed(store, {bridge.ProjectModule.new("app", {bridge.SourceFile.new(PATH, "local saved = 1\n")})})
+    local documents = buffers.create()
+    local completion = service.create(store, documents)
+    defer completion:close()
+    local text = "function combine(count: integer): integer return count end\n" ..
+      "function read(): integer local count = 1 return comb end\n"
+    open(documents, PATH, 1, text)
+    local work = completion:capture(request(PATH, text, "return comb", lsp.CompletionOptions.new(true, true, true)))
+    work()
+    await_preparation(completion)
+    local item = selected_item(work(), "combine")
+    local edit? = wire.as_object(item["textEdit"])
+    test.assert(wire.as_string(edit["newText"]) == "combine(${1:count})$0",
+      "acceptance fixture did not obtain the real callable snippet")
+    local accepted = "function combine(count: integer): integer return count end\n" ..
+      "function read(): integer local count = 1 return combine(count) end\n"
+    local previous_requests = completion.requests
+    do
+      local permit = scheduler.acquire()
+      defer permit:release()
+      for version = 2, 4 do
+        documents:apply(lsp.DocumentNotification.changed(lsp.ChangeDocument.new(
+          lsp.TextDocument.new(URI, PATH), version, accepted .. "-- version " .. version .. "\n")))
+        completion:changed()
+      end
+      local kept? = hover_markdown(completion:hover(documents:capture(PATH,
+        source_text.Position.new(1, 33))))
+      test.assert(kept ~= nil and strings.find(kept, "Type: `integer`") ~= nil,
+        "accepting a call removed unrelated hover while the compiler permit was held")
+      test.assert(completion:hover(documents:capture(PATH, source_text.Position.new(1, 49))) == nil,
+        "the new callee borrowed the completion dummy's occurrence")
+      timer.sleep(service.HOVER_DEBOUNCE_MS + 50)
+      test.assert(completion.requests == previous_requests + 1,
+        "one edit burst started more than one background capture")
+    end
+    await_refresh(completion)
+    local callee? = hover_markdown(completion:hover(documents:capture(PATH,
+      source_text.Position.new(1, 49))))
+    test.assert(callee ~= nil and strings.find(callee, "combine(count: integer)") ~= nil,
+      "accepted callee required another completion to become hoverable")
+    local repeat_work = completion:capture(request(PATH, accepted .. "-- version 4\n", "return combine"))
+    repeat_work()
+    await_preparation(completion)
+    test.assert(hover_markdown(completion:hover(documents:capture(PATH,
+      source_text.Position.new(1, 49)))) ~= nil,
+      "another completion hole replaced full-source hover for identical editor bytes")
+    local malformed = "-- 😀\r\n" .. accepted .. "function unfinished(\n"
+    documents:apply(lsp.DocumentNotification.changed(lsp.ChangeDocument.new(
+      lsp.TextDocument.new(URI, PATH), 5, malformed)))
+    completion:changed()
+    await_refresh(completion)
+    -- Full sync with two disjoint edits conservatively touches the intervening
+    -- source. Start with one trailing malformed edit to exercise retention.
+    documents:apply(lsp.DocumentNotification.changed(lsp.ChangeDocument.new(
+      lsp.TextDocument.new(URI, PATH), 6, accepted)))
+    completion:changed()
+    await_refresh(completion)
+    documents:apply(lsp.DocumentNotification.changed(lsp.ChangeDocument.new(
+      lsp.TextDocument.new(URI, PATH), 7, accepted .. "function unfinished(\n")))
+    completion:changed()
+    await_refresh(completion)
+    test.assert(hover_markdown(completion:hover(documents:capture(PATH,
+      source_text.Position.new(1, 49)))) ~= nil,
+      "a failed rebuild erased mapped hover from the last accepted analysis")
+  end)
+end
+
+function test_completion_service_rechecks_capture_after_publication_waiter_resumes(_context: test.Context)
+  runtime.run(function ()
+    for mode = 1, 2 do
+      local subject = "publication race mode " .. mode
+      local store = sql.open(":memory:")
+      defer store:close()
+      seed(store, {bridge.ProjectModule.new("app", {bridge.SourceFile.new(PATH, "local saved = 1\n")})})
+      local documents = buffers.create()
+      local completion = service.create(store, documents)
+      defer completion:close()
+      local text = "function read(): integer\n local alpha = 1\n return alpha\nend\n"
+      local document = lsp.TextDocument.new(URI, PATH)
+      open(documents, PATH, 1, text)
+      local initial = completion:capture(request(PATH, text, "return al"))
+      initial()
+      await_preparation(completion)
+      local next_text = "-- pending\n" .. text
+      local next_version = 2
+      if mode == 2 then
+        -- A full-source context at the exact foreground capture makes the
+        -- worker skip hover publication and exercise the candidate writer.
+        next_text = text .. "-- source checked\n"
+        documents:apply(lsp.DocumentNotification.changed(lsp.ChangeDocument.new(document, 2, next_text)))
+        completion:changed()
+        await_refresh(completion)
+        test.assert(completion.hover_context.source, "candidate race fixture did not obtain full-source hover")
+      end
+      local prior_context? = completion.hover_context
+      local permit = scheduler.acquire()
+      defer permit:release()
+      if mode == 1 then
+        documents:apply(lsp.DocumentNotification.changed(lsp.ChangeDocument.new(document, next_version, next_text)))
+        completion:changed()
+      end
+      -- Keep fixture background work from competing with the foreground
+      -- writer whose precise commit/resume boundary this test owns.
+      if completion.debounce ~= nil and not completion.debounce:status():has_finished() then
+        completion.debounce:cancel(async.CancellationReason.simple("publication race fixture"))
+      end
+      -- Reusable candidates may let answer return before its new worker has
+      -- even started. This fixture owns a fresh foreground preparation only.
+      completion.ready = nil
+      completion.previous_ready = nil
+      local foreground = completion:capture(request(PATH, next_text, "return al"))
+      foreground()
+      for _attempt = 1, 5000 do
+        if completion.preparation ~= nil then break end
+        if completion.worker ~= nil and completion.worker:status():has_finished() then break end
+        timer.sleep(1)
+      end
+      local preparing? = completion.preparation
+      test.assert(preparing ~= nil and not preparing:status():has_finished(),
+        subject .. ": did not hold private preparation at the compiler permit")
+      local held: sql.Access? = nil
+      defer do if held ~= nil then held:release() end end
+      local observer: async.Task<|nil, value|>? = nil
+      local preparation_succeeded = false
+      local publication_committed = false
+      local edited_before_resume = false
+      local latest = "-- latest\n" .. next_text
+      local detach_preparation = preparing:add_terminal_listener(
+        function (status: async.TaskStatus<|service.Prepared?, value|>)
+          local succeeded, prepared? = status:has_succeeded()
+          preparation_succeeded = succeeded and prepared ~= nil
+          if not preparation_succeeded then return end
+          -- Preparation already released its compiler permit. Its worker join
+          -- listener queued that continuation, but it cannot run until all
+          -- terminal listeners return; acquire the free SQL lease first.
+          held = store:acquire()
+          observer = async.run<|nil, value|>(function (): nil
+            local writers = completion.store.writers
+            if #writers == 0 then
+              held:release()
+              return nil
+            end
+            local writer = writers[#writers]
+            writer:add_terminal_listener(function (outcome: async.TaskStatus<|boolean, value|>)
+              local accepted, committed? = outcome:has_succeeded()
+              publication_committed = accepted and committed == true
+              if not publication_committed then return end
+              -- The transaction committed and released SQL. The service's join
+              -- waiter is queued, so this synchronous editor notification wins
+              -- before it can install the prepared capture in memory.
+              edited_before_resume = documents:apply(lsp.DocumentNotification.changed(
+                lsp.ChangeDocument.new(document, next_version + 1, latest)))
+              completion:changed()
+              if completion.debounce ~= nil and not completion.debounce:status():has_finished() then
+                completion.debounce:cancel(async.CancellationReason.simple("publication race fixture edited"))
+              end
+            end)
+            held:release()
+            return nil
+          end)
+        end)
+      defer detach_preparation()
+      permit:release()
+      await_preparation(completion)
+      if observer ~= nil then
+        case async.join(observer)
+        when succeeded() then
+        when failed(failure) then raise failure.error
+        else raise "publication race observer did not finish"
+        end
+      end
+      test.assert(preparation_succeeded and publication_committed and edited_before_resume,
+        subject .. ": did not edit between commit and waiter resume")
+      test.assert(completion.hover_context == prior_context and completion.ready == nil,
+        subject .. ": a resumed waiter installed an obsolete hover context or candidate Ready")
+      local first? = strings.find(latest, "local alpha", 1, true)
+      local position? = source_text.position_for_offset(latest, first - 1 + #"local al")
+      local kept? = hover_markdown(completion:hover(documents:capture(PATH, position)))
+      test.assert(kept ~= nil and strings.find(kept, "Type: `integer`") ~= nil and
+          prior_context.files[1].latest.text == latest,
+        subject .. ": post-commit edit lost the prior context's safe mapping to the latest source")
+    end
+  end)
+end
+
+function test_completion_service_background_capture_cannot_overtake_new_active_document(_context: test.Context)
+  runtime.run(function ()
+    local store = sql.open(":memory:")
+    defer store:close()
+    local other = ROOT .. "/other.titan"
+    seed(store, {
+      bridge.ProjectModule.new("app", {bridge.SourceFile.new(PATH, "local saved = 1\n")}),
+      bridge.ProjectModule.new("other", {bridge.SourceFile.new(other, "local saved = \"B\"\n")}),
+    })
+    local documents = buffers.create()
+    local completion = service.create(store, documents)
+    defer completion:close()
+    local first = "function read(): integer\n local kept = 1\n return kept\nend\n"
+    local second = "function read(): string\n local kept = \"from B\"\n return kept\nend\n"
+    open(documents, PATH, 1, first)
+    open(documents, other, 1, second)
+    completion:capture(request(PATH, first, "return ke"))
+    local old_capture? = documents:capture(PATH, source_text.Position.new(0, 0))
+    local stale = service.Request.new(old_capture, 7, nil, "app",
+      "stale-source-app", completion.requests, nil, true)
+    completion.pending_hover = stale
+    local foreground = completion:capture(request(other, second, "return ke"))
+    test.assert(completion.pending_hover == nil,
+      "switching the active completion document retained the previous background slot")
+    test.assert(documents:current(old_capture),
+      "active-document regression accidentally relied on a changed buffer epoch")
+    -- A debounce may already have captured A, then resume its saved-generation
+    -- SQL read after completion switches to B. Reinsert that immutable request
+    -- to exercise the worker's ownership fence separately from queue clearing.
+    completion.pending_hover = stale
+    foreground()
+    await_preparation(completion)
+    test.assert(contains(labels(foreground()), "kept"),
+      "new active document did not prepare its foreground candidates")
+    local context? = completion.hover_context
+    local markdown? = hover_markdown(completion:hover(documents:capture(other,
+      source_text.Position.new(1, 8))))
+    test.assert(context ~= nil and context.module_name == "other" and
+        markdown ~= nil and strings.find(markdown, "Type: `string`") ~= nil,
+      "still-current background A replaced hover accepted for the latest completion in B")
+  end)
+end
+
+function test_completion_service_retained_ranges_reject_rewritten_and_joined_tokens(_context: test.Context)
+  local original = buffers.Input.new(URI, PATH, 1, 1, "local keep = 1\nreturn keep\n")
+  local file = service.HoverFile.new(original, original, {}, false)
+  local context = service.HoverContext.new("test", {file}, true, 1, 7, "app")
+  local row = fact_types.Hover.new(PATH, 22, 26, "kept")
+  local shifted = buffers.Input.new(URI, PATH, 1, 2, "-- 😀\r\n" .. original.text)
+  test.assert(context:follow({shifted}), "same-session edits retired mapped context")
+  local span? = file:current_span(row)
+  test.assert(span ~= nil and span.start == 31 and span.finish == 35,
+    "retained occurrence did not move by UTF-8 bytes")
+  test.assert(file:original_offset(32) == 23, "current cursor did not map into original snapshot")
+  -- A suffix inserted at the occurrence boundary must invalidate the complete
+  -- token even though the retained half-open span itself was untouched.
+  local joined = buffers.Input.new(URI, PATH, 1, 3, "-- 😀\r\nlocal keep = 1\nreturn keeper\n")
+  context:follow({joined})
+  test.assert(file:current_span(row) == nil, "retained hover matched a prefix of a rewritten token")
+  local replacement = buffers.Input.new(URI, PATH, 2, 1, original.text)
+  test.assert(not context:follow({replacement}), "a reopened session inherited an old mapping")
+end
+
+function test_completion_service_full_source_context_does_not_hide_another_module(_context: test.Context)
+  runtime.run(function ()
+    local store = sql.open(":memory:")
+    defer store:close()
+    local other_path = ROOT .. "/other.titan"
+    local first_text = "function read(): integer\n local firstValue = 1\n return firstValue\nend\n"
+    local other_text = "function read(): string\n local secondValue = \"other\"\n return secondValue\nend\n"
+    seed(store, {
+      bridge.ProjectModule.new("app", {bridge.SourceFile.new(PATH, first_text)}),
+      bridge.ProjectModule.new("other", {bridge.SourceFile.new(other_path, other_text)}),
+    })
+    local documents = buffers.create()
+    open(documents, PATH, 1, first_text)
+    open(documents, other_path, 1, other_text)
+    local completion = service.create(store, documents)
+    defer completion:close()
+    completion:capture(request(PATH, first_text, "return firstV"))()
+    await_preparation(completion)
+    documents:apply(lsp.DocumentNotification.changed(lsp.ChangeDocument.new(
+      lsp.TextDocument.new(URI, PATH), 2, first_text .. "-- edited\n")))
+    completion:changed()
+    await_refresh(completion)
+    test.assert(completion.hover_context.source, "fixture did not obtain full-source hover")
+    completion:capture(request(other_path, other_text, "return secondV"))()
+    await_preparation(completion)
+    local other_hover? = hover_markdown(completion:hover(documents:capture(other_path,
+      source_text.Position.new(1, 8))))
+    test.assert(other_hover ~= nil and strings.find(other_hover, "Type: `string`") ~= nil,
+      "same-epoch completion in another module kept unrelated full-source hover")
   end)
 end
 

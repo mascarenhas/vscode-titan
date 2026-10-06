@@ -27,12 +27,14 @@ local record Request
   const key: string
   const sequence: integer
   const options: lsp.CompletionOptions?
+  const hover_only: boolean
 end
 
 local record Prepared
   const snapshot: facts.Snapshot
   const range: source_text.Span
   const volatile_headers: {bridge.CHeaderDependency}
+  const hover_usable: boolean
 end
 
 local record Ready
@@ -47,15 +49,137 @@ local record Ready
   const anchor: string
 end
 
+local record ByteChange
+  const start: integer
+  const old_finish: integer
+  const new_finish: integer
+end
+
+local record HoverFile
+  const original: buffers.Input
+  latest: buffers.Input
+  const changes: {ByteChange}
+  exhausted: boolean
+end
+
 local record HoverContext
   const id: string
-  const capture: buffers.Capture
+  const files: {HoverFile}
+  const source: boolean
+  const epoch: integer
+  const generation: integer
+  const module_name: string
+end
+
+-- Full-sync changes have no edit ranges. A conservative common prefix/suffix
+-- supplies one replacement per version; intervening occurrences are omitted.
+local function changed_bytes(before: string, after: string): ByteChange?
+  if before == after then return nil end
+  local first = 0
+  local limit = #before
+  if #after < limit then limit = #after end
+  while first + 1024 <= limit and
+      strings.sub(before, first + 1, first + 1024) ==
+      strings.sub(after, first + 1, first + 1024) do first = first + 1024 end
+  while first < limit and strings.byte(before, first + 1) ==
+      strings.byte(after, first + 1) do first = first + 1 end
+  local suffix = 0
+  while suffix + 1024 <= limit - first and
+      strings.sub(before, #before - suffix - 1023, #before - suffix) ==
+      strings.sub(after, #after - suffix - 1023, #after - suffix) do suffix = suffix + 1024 end
+  while suffix < limit - first and strings.byte(before, #before - suffix) ==
+      strings.byte(after, #after - suffix) do suffix = suffix + 1 end
+  return ByteChange.new(first, #before - suffix, #after - suffix)
+end
+
+local function HoverContext:follow(inputs: const {buffers.Input}): boolean
+  for index = 1, #self.files do
+    local file = self.files[index]
+    local live: buffers.Input? = nil
+    for input_index = 1, #inputs do
+      local input = inputs[input_index]
+      if input.path == file.original.path then live = input end
+    end
+    if live == nil or live.session ~= file.original.session then return false end
+    local change? = changed_bytes(file.latest.text, live.text)
+    if change ~= nil and not file.exhausted then
+      if #file.changes >= 64 then
+        file.exhausted = true
+      else
+        file.changes[#file.changes + 1] = change
+      end
+    end
+    file.latest = live
+  end
+  return true
+end
+
+local function HoverFile:original_offset(offset: integer): integer?
+  if self.exhausted then return nil end
+  for index = #self.changes, 1, -1 do
+    local change = self.changes[index]
+    if offset >= change.start and offset < change.new_finish then return nil end
+    if offset >= change.new_finish then
+      offset = offset + change.old_finish - change.new_finish
+    end
+  end
+  return offset
+end
+
+local function identifier_byte(byte: integer?): boolean
+  if byte == nil then return false end
+  return byte == 95 or byte >= 65 and byte <= 90 or
+    byte >= 97 and byte <= 122 or byte >= 48 and byte <= 57
+end
+
+local function HoverFile:current_span(row: facts.Hover): source_text.ByteSpan?
+  if self.exhausted then return nil end
+  local first = row.byte_start
+  local finish = row.byte_finish
+  for index = 1, #self.changes do
+    local change = self.changes[index]
+    if finish <= change.start then
+    elseif first >= change.old_finish then
+      first = first + change.new_finish - change.old_finish
+      finish = finish + change.new_finish - change.old_finish
+    else
+      return nil
+    end
+  end
+  if first < 0 or finish > #self.latest.text or
+      strings.sub(self.latest.text, first + 1, finish) ~=
+      strings.sub(self.original.text, row.byte_start + 1, row.byte_finish) then return nil end
+  -- Inserting identifier characters at a span boundary changes that token too.
+  if identifier_byte(strings.byte(self.latest.text, first + 1)) and
+      identifier_byte(strings.byte(self.latest.text, first)) then return nil end
+  if identifier_byte(strings.byte(self.latest.text, finish)) and
+      identifier_byte(strings.byte(self.latest.text, finish + 1)) then return nil end
+  return source_text.ByteSpan.new(first, finish)
+end
+
+local function hover_context(snapshot: facts.Snapshot, capture: buffers.Capture,
+                             source: boolean): HoverContext
+  local files: {HoverFile} = {}
+  for index = 1, #snapshot.inputs do
+    local input = snapshot.inputs[index]
+    if input.session > 0 then
+      for input_index = 1, #capture.inputs do
+        local document = capture.inputs[input_index]
+        if document.path == input.filename then
+          files[#files + 1] = HoverFile.new(document, document, {}, false)
+        end
+      end
+    end
+  end
+  return HoverContext.new(snapshot.id, files, source, capture.epoch, snapshot.saved_generation,
+    snapshot.module_name)
 end
 
 record Service
   local const store: storage.Store
   local const buffers: buffers.BufferStore
   local pending: Request?
+  local pending_hover: Request?
   local active: Request?
   local preparation: async.Task<|Prepared?, value|>?
   local worker: async.Task<|nil, value|>?
@@ -66,7 +190,13 @@ record Service
   local requests: integer
   local previous_ready: Ready?
   local hover_context: HoverContext?
+  local hover_path: string?
+  local hover_session: integer
+  local debounce: async.Task<|nil, value|>?
+  local saved_generation: integer
 end
+
+local HOVER_DEBOUNCE_MS = 200
 
 local function empty(): dispatcher.SemanticOutcome
   return dispatcher.SemanticOutcome.result(lsp.completion_list_value(
@@ -74,7 +204,8 @@ local function empty(): dispatcher.SemanticOutcome
 end
 
 function create(store: sql.Store, documents: buffers.BufferStore): Service
-  return Service.new(storage.open(store), documents, nil, nil, nil, nil, nil, false, false, nil, 0, nil, nil)
+  return Service.new(storage.open(store), documents, nil, nil, nil, nil, nil, nil, false, false, nil, 0, nil, nil,
+    nil, 0, nil, 0)
 end
 
 local function open_paths(capture: buffers.Capture): {string}
@@ -183,23 +314,27 @@ local function header_kind(kind: bridge.CHeaderDependencyKind): integer
 end
 
 local function completion_hovers(active: bridge.ProjectModule,
-    analysis: bridge.CompletionAnalysis, hole: bridge.CompletionHole,
-    original: string): {facts.Hover}
-  if analysis.snapshot == nil then return {} end
-  if #analysis.snapshot.symbols > facts.MAX_HOVER_ROWS then return {} end
+    analysis: bridge.CompletionAnalysis, hole: bridge.CompletionHole?,
+    original: string): ({facts.Hover}, boolean)
+  if analysis.snapshot == nil then return {}, false end
+  if #analysis.snapshot.symbols > facts.MAX_HOVER_ROWS then return {}, false end
   local prepared = semantic_features.prepare({active}, {analysis.snapshot},
     function () async.yield() end)
   local rows = prepared:completion_hovers(function () async.yield() end)
   local result: {facts.Hover} = {}
-  local delta = #hole.contents - #original
-  local analysis_finish = hole.replace_finish + delta
+  local delta = 0
+  local analysis_finish = 0
+  if hole ~= nil then
+    delta = #hole.contents - #original
+    analysis_finish = hole.replace_finish + delta
+  end
   for index = 1, #rows do
     if index % 1024 == 0 then async.yield() end
     local row = rows[index]
     local first = row.byte_start
     local finish = row.byte_finish
     local include = true
-    if row.filename == hole.filename then
+    if hole ~= nil and row.filename == hole.filename then
       if first >= analysis_finish then
         first = first - delta
         finish = finish - delta
@@ -213,11 +348,11 @@ local function completion_hovers(active: bridge.ProjectModule,
       result[#result + 1] = facts.Hover.new(row.filename, first, finish, row.markdown)
     end
   end
-  return result
+  return result, true
 catch
   if error is async.CancellationReason then raise end
   logging.emit("debug", "completion.hover.failure", {["message"] = strings.tostring(error)})
-  return {}
+  return {}, false
 end
 
 local function Service:prepare(request: Request): Prepared?
@@ -228,6 +363,7 @@ local function Service:prepare(request: Request): Prepared?
       ["cpu_ms"] = logging.elapsed_ms(started),
       ["wall_ms"] = ffi.vscode_titan_monotonic_ms() - wall,
       ["module"] = request.module_name, ["saved_generation"] = request.generation,
+      ["hover_only"] = request.hover_only,
     })
   end
   if self.baseline == nil or self.baseline.generation ~= request.generation then
@@ -237,7 +373,7 @@ local function Service:prepare(request: Request): Prepared?
   end
   request.baseline = self.baseline
   local reusable? = self.ready
-  if reusable ~= nil and reusable.key == request.key and #reusable.volatile_headers > 0 then
+  if not request.hover_only and reusable ~= nil and reusable.key == request.key and #reusable.volatile_headers > 0 then
     local validator = bridge.load()
     validator:configure(request.baseline.configuration)
     local _, changed = validator:restat_c_header_dependencies(reusable.volatile_headers)
@@ -257,20 +393,27 @@ local function Service:prepare(request: Request): Prepared?
   local coordinates = source_text.coordinate_index(capture.document.text)
   local caret? = coordinates:offset_for_position(capture.position)
   if caret == nil then return nil end
-  local hole? = bridge.prepare_completion(capture.document.path, capture.document.text, caret)
-  if hole == nil then return nil end
-  local range? = coordinates:span_for_offsets(hole.replace_start, hole.replace_finish)
-  if range == nil then return nil end
+  local hole: bridge.CompletionHole? = nil
+  local range = source_text.Span.new(capture.position, capture.position)
+  if not request.hover_only then
+    hole = bridge.prepare_completion(capture.document.path, capture.document.text, caret)
+    if hole == nil then return nil end
+    local replacement? = coordinates:span_for_offsets(hole.replace_start, hole.replace_finish)
+    if replacement == nil then return nil end
+    range = replacement
+  end
   local active?, inputs = active_module(request)
   if active == nil then return nil end
-  for index = 1, #active.files do
-    if active.files[index].filename == capture.document.path then
-      active.files[index] = bridge.SourceFile.new(capture.document.path, hole.contents)
+  if hole ~= nil then
+    for index = 1, #active.files do
+      if active.files[index].filename == capture.document.path then
+        active.files[index] = bridge.SourceFile.new(capture.document.path, hole.contents)
+      end
     end
   end
-  local result = bridge.CompletionAnalysis.new("complete", hole.kind, {}, {})
+  local result = bridge.CompletionAnalysis.new("complete", "source", {}, {})
   local volatile_headers: {bridge.CHeaderDependency} = {}
-  if hole.kind == "import" then
+  if hole ~= nil and hole.kind == "import" then
     result = bridge.CompletionAnalysis.new("complete", "import", import_candidates(request.baseline), {})
   else
     local compiler = bridge.load()
@@ -370,16 +513,24 @@ local function Service:prepare(request: Request): Prepared?
     if changed_after then return nil end
   end
   if not self.buffers:current(capture) then return nil end
+  local first = caret
+  local finish = caret
+  local prefix = ""
+  if hole ~= nil then
+    first = hole.replace_start
+    finish = hole.replace_finish
+    prefix = hole.prefix
+  end
+  local hovers, usable = completion_hovers(active, result, hole, capture.document.text)
   return Prepared.new(facts.Snapshot.new(request.key, request.module_name,
     request.baseline.generation, capture.epoch, request.key, capture.document.path,
     capture.document.session, capture.document.version, caret,
-    hole.replace_start, hole.replace_finish, hole.prefix, result.quality,
-    inputs, result.scopes, result.candidates,
-    completion_hovers(active, result, hole, capture.document.text)), range, volatile_headers)
+    first, finish, prefix, result.quality, inputs, result.scopes, result.candidates, hovers),
+    range, volatile_headers, usable)
 end
 
 local function Service:run(): nil
-  while (self.pending ~= nil or self.sync_needed) and not self.closed do
+  while (self.pending ~= nil or self.pending_hover ~= nil or self.sync_needed) and not self.closed do
     if self.sync_needed then
       self.sync_needed = false
       local epoch = self.buffers:epoch()
@@ -393,9 +544,16 @@ local function Service:run(): nil
       self.store:sync_documents(documents, epoch,
         function (): boolean return not self.closed and self.buffers:epoch() == epoch end)
     end
+    if self.pending ~= nil or self.pending_hover ~= nil then
+    local request? = self.pending
     if self.pending ~= nil then
-    local request = self.pending as Request
-    self.pending = nil
+      request = self.pending
+      self.pending = nil
+    else
+      request = self.pending_hover
+      self.pending_hover = nil
+    end
+    if request == nil then raise "completion worker lost its pending request" end
     self.active = request
     do
       local paths = open_paths(request.capture)
@@ -406,25 +564,40 @@ local function Service:run(): nil
           "", input.session, input.version, input.text)
       end
       local current = function (): boolean
-        return not self.closed and self.buffers:current(request.capture)
+        return not self.closed and self.buffers:current(request.capture) and
+          (not request.hover_only or request.capture.document.path == self.hover_path and
+            request.capture.document.session == self.hover_session)
       end
       if self.store:sync_documents(documents, request.capture.epoch, current) then
         local task = async.run<|Prepared?, value|>(function (): Prepared? return self:prepare(request) end)
         self.preparation = task
         case async.join(task)
         when succeeded(prepared) then
-          if prepared ~= nil and current() and self.store:publish(prepared.snapshot, current) then
-            self.ready = Ready.new(prepared.snapshot.id, request.key,
-              prepared.snapshot.prefix, prepared.range, prepared.volatile_headers, self.requests,
-              request.capture.document.path, request.capture.document.session,
-              strings.sub(request.capture.document.text, 1, prepared.snapshot.replace_start))
-            self.previous_ready = self.ready
-            self.hover_context = nil
+          if prepared ~= nil and current() then
             -- Unsaved-only headers have no watcher-owned freshness. A later
             -- hover does not run compiler probes, so these facts cannot be
             -- retained as an exact hover context between completion requests.
-            if #prepared.volatile_headers == 0 then
-              self.hover_context = HoverContext.new(prepared.snapshot.id, request.capture)
+            local existing? = self.hover_context
+            local previous_id: string? = nil
+            if existing ~= nil then previous_id = existing.id end
+            local keep_source = not request.hover_only and existing ~= nil and existing.source and
+              existing.epoch == request.capture.epoch and existing.generation == request.generation and
+              existing.module_name == prepared.snapshot.module_name
+            -- The writer can commit before this waiter resumes. An intervening
+            -- edit must not let the resumed waiter install its old capture.
+            if not keep_source and prepared.hover_usable and #prepared.volatile_headers == 0 and current() and
+                self.store:publish_hover(prepared.snapshot, current, previous_id) and current() then
+              self.hover_context = hover_context(prepared.snapshot, request.capture, request.hover_only)
+            end
+            -- Do not expose fresh candidates before their usable hover artifact
+            -- is accepted: selecting the snippet can immediately advance the
+            -- buffer and cancel publication for this capture.
+            if not request.hover_only and current() and self.store:publish(prepared.snapshot, current) and current() then
+              self.ready = Ready.new(prepared.snapshot.id, request.key,
+                prepared.snapshot.prefix, prepared.range, prepared.volatile_headers, self.requests,
+                request.capture.document.path, request.capture.document.session,
+                strings.sub(request.capture.document.text, 1, prepared.snapshot.replace_start))
+              self.previous_ready = self.ready
             end
           end
         when failed(failure) then
@@ -446,19 +619,61 @@ local function Service:run(): nil
   return nil
 end
 
+local function Service:schedule_hover()
+  local debounce? = self.debounce
+  if debounce ~= nil and not debounce:status():has_finished() then
+    debounce:cancel(async.CancellationReason.simple("hover refresh superseded"))
+  end
+  if self.closed or self.hover_path == nil or self.hover_session == 0 then return end
+  self.debounce = async.run<|nil, value|>(function (): nil
+    timer.sleep(HOVER_DEBOUNCE_MS)
+    if self.closed or self.hover_path == nil then return nil end
+    local capture? = self.buffers:capture(self.hover_path, source_text.Position.new(0, 0))
+    if capture == nil or capture.document.session ~= self.hover_session then return nil end
+    local generation = self.store:saved_generation()
+    if generation <= 0 then return nil end
+    self.requests = self.requests + 1
+    local key = "hover:" .. generation .. ":" .. capture.epoch .. ":" .. self.requests
+    -- Explicit completion remains the foreground request. Its preparation can
+    -- finish first; source analysis then fills the hole with actual editor text.
+    self.pending_hover = Request.new(capture, generation, nil, "", key, self.requests, nil, true)
+    if self.worker == nil or self.worker:status():has_finished() then
+      self.worker = async.run<|nil, value|>(function (): nil return self:run() end)
+    end
+    return nil
+  end)
+end
+
 function Service:changed()
-  self.hover_context = nil
+  if self.hover_context ~= nil and not self.hover_context:follow(self.buffers:inputs()) then
+    self.hover_context = nil
+  end
+  if self.hover_path ~= nil then
+    local capture? = self.buffers:capture(self.hover_path, source_text.Position.new(0, 0))
+    if capture == nil then self.hover_session = 0
+    else self.hover_session = capture.document.session end
+  end
   if self.ready ~= nil then self.previous_ready = self.ready end
   self.ready = nil
   self.pending = nil
+  self.pending_hover = nil
   local task? = self.preparation
   if task ~= nil and not task:status():has_finished() then
     task:cancel(async.CancellationReason.simple("completion inputs changed"))
   end
   self.sync_needed = true
+  self:schedule_hover()
   if not self.closed and (self.worker == nil or self.worker:status():has_finished()) then
     self.worker = async.run<|nil, value|>(function (): nil return self:run() end)
   end
+end
+
+-- The watcher remains the sole saved publisher. A new committed baseline
+-- queues private reanalysis without retiring the last accepted hover snapshot.
+function Service:saved_changed(generation: integer)
+  if self.closed or generation == self.saved_generation then return end
+  self.saved_generation = generation
+  self:changed()
 end
 
 local function Ready:valid_for(request: Request): boolean
@@ -542,32 +757,75 @@ function Service:capture(request: dispatcher.CompletionRequest): coordinator.Com
   local key = generation .. ":" .. capture.epoch .. ":" .. capture.document.session ..
     ":" .. capture.document.version .. ":" .. capture.position.line .. ":" .. capture.position.character
   self.requests = self.requests + 1
-  local captured = Request.new(capture, generation, nil, "", key, self.requests, request.options)
+  local captured = Request.new(capture, generation, nil, "", key, self.requests, request.options, false)
+  if self.hover_path ~= capture.document.path or self.hover_session ~= capture.document.session then
+    self.pending_hover = nil
+    local debounce? = self.debounce
+    if debounce ~= nil and not debounce:status():has_finished() then
+      debounce:cancel(async.CancellationReason.simple("active hover document changed"))
+    end
+    local active? = self.active
+    local preparation? = self.preparation
+    if active ~= nil and active.hover_only and preparation ~= nil and not preparation:status():has_finished() then
+      preparation:cancel(async.CancellationReason.simple("active hover document changed"))
+    end
+  end
+  self.hover_path = capture.document.path
+  self.hover_session = capture.document.session
+  self.saved_generation = generation
   return function (): dispatcher.SemanticOutcome return self:answer(captured) end
 end
 
--- Hover consumes only the last accepted private preparation. Edits retire
--- this context immediately, even while older candidates remain provisional.
-function Service:hover(capture: buffers.Capture): dispatcher.SemanticOutcome?
-  local context? = self.hover_context
-  if self.closed or context == nil or not self.buffers:current(context.capture) or
-      not self.buffers:current(capture) then return nil end
+-- Query the accepted analysis in its original coordinates, then map an
+-- untouched occurrence into the exact request capture. No old row is relabeled
+-- as current semantic state; a refresh replaces it when usable facts arrive.
+local function Service:read_hover(capture: buffers.Capture,
+                                  context: HoverContext): dispatcher.SemanticOutcome?
+  local file: HoverFile? = nil
+  for index = 1, #context.files do
+    local candidate = context.files[index]
+    if candidate.original.path == capture.document.path and
+        candidate.original.session == capture.document.session and
+        candidate.latest == capture.document then file = candidate end
+  end
+  if file == nil then return nil end
   local coordinates = source_text.coordinate_index(capture.document.text)
   local offset? = coordinates:offset_for_position(capture.position)
   if offset == nil then return dispatcher.SemanticOutcome.result(wire.null()) end
-  local row? = self.store:hover(context.id, capture.document.path,
-    capture.document.session, capture.document.version, offset,
+  local original_offset? = file:original_offset(offset)
+  if original_offset == nil then return nil end
+  local row? = self.store:hover_retained(context.id, capture.document.path,
+    capture.document.session, original_offset,
     function (): boolean return not self.closed and self.buffers:current(capture) end)
   if row == nil then return nil end
-  local range? = coordinates:span_for_offsets(row.byte_start, row.byte_finish)
+  local bytes? = file:current_span(row)
+  if bytes == nil then return nil end
+  local range? = coordinates:span_for_offsets(bytes.start, bytes.finish)
   if range == nil then return dispatcher.SemanticOutcome.result(wire.null()) end
   return dispatcher.SemanticOutcome.result(lsp.hover_value(row.markdown, range))
+end
+
+function Service:hover(capture: buffers.Capture): dispatcher.SemanticOutcome?
+  for attempt = 1, 2 do
+    local context? = self.hover_context
+    if self.closed or context == nil or not self.buffers:current(capture) then return nil end
+    local outcome? = self:read_hover(capture, context)
+    if outcome ~= nil then return outcome end
+    -- An accepted artifact may change while the lookup waits for SQL. Retained
+    -- original rows cover that handoff; retry once also finds a newly available
+    -- occurrence that was absent from the previous completion-hole snapshot.
+    if self.hover_context == context then return nil end
+  end
+  return nil
 end
 
 function Service:close()
   if self.closed then return end
   self.closed = true
   self:changed()
+  self.hover_context = nil
+  self.hover_path = nil
+  if self.debounce ~= nil then async.join(self.debounce) end
   if self.worker ~= nil then async.join(self.worker) end
   self.store:close()
 end

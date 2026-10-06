@@ -35,8 +35,9 @@ project workflow.
 - Stdout is exclusively for LSP framing. Diagnostics and debug logs go to
   stderr.
 - Definition, references, rename, folding and diagnostics use saved disk files.
-  Completion uses captured editor buffers; hover can reuse exact current
-  completion-derived TEMP occurrence facts. Follow
+  Completion uses captured editor buffers. After completion activates private
+  analysis, hover refreshes on debounced edits and may retain safely mapped
+  untouched occurrences from the preceding accepted TEMP snapshot. Follow
   `docs/completion.md` and `.agents/plans/unsaved-completion.md`.
 - FFI-definition navigation, external-source navigation, and watching external
   source trees remain out of scope.

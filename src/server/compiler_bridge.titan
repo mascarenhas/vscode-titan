@@ -5231,14 +5231,19 @@ end
 -- The caller owns a private Compiler and restores only detached entries from
 -- one committed saved baseline before entering this operation. Every source
 -- override is captured text; no open buffer in another module is consulted.
+-- With no hole, check the real source through the same closed resolver and
+-- return its optional semantic snapshot without inventing caret candidates.
 function Compiler:analyze_completion(root_module: string,
     projects: {ProjectModule}, cached: {CachedSourceInterface},
-    hole: CompletionHole, header_inputs: {CHeaderDependency}?,
+    hole: CompletionHole?, header_inputs: {CHeaderDependency}?,
     binaries: {CompletionBinary}?): CompletionAnalysis
   local permit = compiler_scheduler.acquire()
   defer permit:release()
-  local restore_facts = self:observe_completion_facts()
-  defer restore_facts()
+  local restore_facts: (function (): ())? = nil
+  if hole ~= nil then restore_facts = self:observe_completion_facts() end
+  defer do if restore_facts ~= nil then restore_facts() end end
+  local kind = "source"
+  if hole ~= nil then kind = hole.kind end
   local previous = self:install_configuration()
   defer previous:apply()
   local overrides, project_map = project_loader_inputs(projects)
@@ -5260,7 +5265,6 @@ function Compiler:analyze_completion(root_module: string,
   local options: {string: value} = {
     ["analysis_only"] = true,
     ["completion_closed_world"] = true,
-    ["completion"] = hole.request,
     ["transient_caches"] = true,
     ["source_roots"] = {[root_module] = true} as {string: value},
     ["source_overrides"] = active,
@@ -5268,6 +5272,7 @@ function Compiler:analyze_completion(root_module: string,
     ["cached_source_entries"] = entries,
     ["cached_interfaces"] = interfaces,
   }
+  if hole ~= nil then options["completion"] = hole.request end
   local binary_entries: {string: value} = {}
   if binaries ~= nil then
     for index = 1, #binaries do
@@ -5289,7 +5294,7 @@ function Compiler:analyze_completion(root_module: string,
   local make_registry = self.driver["project_entries_registry"] as function (value, value): (value, value)
   local registry = make_registry(entries, {["yield"] = function () async.yield() end} as {string: value})
   if registry == nil or registry == false then
-    return CompletionAnalysis.new("unresolved", hole.kind, {}, {})
+    return CompletionAnalysis.new("unresolved", kind, {}, {})
   end
   self.types["registry"] = registry
   local context = self:new_context(options)
@@ -5299,31 +5304,39 @@ function Compiler:analyze_completion(root_module: string,
   local loader = defaultloader({} as {string: value}, options)
   defer close_loader(self, loader)
   local invoke = loader as function (string): (value, value, value, value)
-  invoke(root_module)
+  local succeeded: value, _, raw_errors: value = invoke(root_module)
   local entry = imported[root_module]
-  if entry == nil then return CompletionAnalysis.new("unresolved", hole.kind, {}, {}) end
+  if entry == nil then return CompletionAnalysis.new("unresolved", kind, {}, {}) end
   local raw_entry = required_map(entry, DRIVER_MODULE, "completion root entry")
-  if raw_entry["completion"] == nil then
-    return CompletionAnalysis.new("unresolved", hole.kind, {}, {})
+  if hole ~= nil and raw_entry["completion"] == nil then
+    return CompletionAnalysis.new("unresolved", kind, {}, {})
   end
-  local raw = required_map(raw_entry["completion"], "titan-compiler.completion", "analysis")
   local snapshot: ModuleSnapshot? = nil
   if raw_entry["ast"] ~= nil then
     do
       snapshot = snapshot_module(self, root_module, entry, project_map, {},
         false, NormalizationWork.new(0)).snapshot
     catch
-      -- Completion intentionally stops checking at its dummy lookup. The
-      -- optional hover walker may encounter an unfinished annotation even
-      -- when caret candidates are usable; preserve that candidate result.
+      -- A dummy or an ordinary checker error can leave annotations unfinished.
+      -- Optional hover normalization must preserve usable caret candidates;
+      -- source-only callers keep their preceding accepted hover on failure.
       if error is async.CancellationReason then raise end
       logging.emit("debug", "completion.hover.failure", {
         ["module"] = root_module, ["message"] = strings.tostring(error),
       })
     end
   end
+  if hole == nil then
+    local quality = "partial"
+    if succeeded == true and raw_errors is {integer: value} and
+        #(raw_errors as {integer: value}) == 0 then quality = "complete" end
+    if snapshot == nil then quality = "unresolved" end
+    return CompletionAnalysis.new(quality, kind, {}, {}, normalize_c_header_dependencies(
+      raw_entry["c_header_dependencies"], "private source header inputs"), snapshot)
+  end
+  local raw = required_map(raw_entry["completion"], "titan-compiler.completion", "analysis")
   return CompletionAnalysis.new(completion_string(raw, "quality", "unresolved"),
-    completion_string(raw, "kind", hole.kind), completion_candidates(raw["candidates"]),
+    completion_string(raw, "kind", kind), completion_candidates(raw["candidates"]),
     completion_scopes(raw["scopes"]), normalize_c_header_dependencies(
       raw_entry["c_header_dependencies"], "completion header inputs"), snapshot)
 end

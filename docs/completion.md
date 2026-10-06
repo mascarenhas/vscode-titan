@@ -1,7 +1,7 @@
 # Completion from editor buffers
 
-Completion analyzes unsaved text. Hover can reuse the ephemeral semantic
-context from the last accepted completion preparation. Definition, references,
+Completion analyzes unsaved text. After a completion request, hover keeps its
+ephemeral semantic context up to date as the active module is edited. Definition, references,
 rename, folding and diagnostics still describe saved files. The extension synchronizes complete
 file contents and advertises `.` and `:` triggers. The usual editor completion
 command also works in lexical, import-name, qualified-type and foreign-type
@@ -67,19 +67,51 @@ without rechecking source or decoding compiler descriptors. It maps positions
 back from the disposable source and omits the synthetic hole itself; occurrences
 before and after the hole retain their original UTF-16 coordinates.
 
-This hover context requires the same open sessions, exact document/contributor
-versions, buffer epoch and committed saved generation. Provisional completion
-candidates do not authorize provisional hover. Editing a buffer, accepting a
-completion, closing/reopening a contributor or publishing a saved generation
-invalidates the context; a subsequent accepted completion prepares a fresh one.
-Hover does not initiate completion analysis by itself. On dirty text without an
-eligible context it returns no hover, avoiding unrelated saved symbols at the
-same coordinates. Clean text and closed documents retain ordinary saved hover.
-Saving never promotes ephemeral hover facts. Context depending on unsaved-only
+The first completion request activates continuing private analysis for the most
+recently requested document and logical module. Buffer edits, including accepting a call
+snippet, coalesce behind a **200 ms trailing debounce**. Newer edits cancel
+superseded preparation. Explicit completion requests have priority over queued
+hover refreshes. A refresh checks ordinary captured editor bytes without the
+completion hole, so the newly inserted callee and its arguments can acquire
+occurrence facts without another completion request. Imports still see one
+committed saved baseline. This fixed interval is a starting policy informed by
+[language-server scheduling and stale-hover precedents](completion-usability-research.md#continuous-hover-and-debouncing-2026-10-06).
+
+Usable preparation atomically replaces the accepted hover snapshot. During the
+debounce, compiler work or a malformed edit, the preceding snapshot remains
+available with its original version and saved-generation provenance. Hover
+maps the current position back to that snapshot and its occurrence range forward
+to current UTF-16 coordinates. Full-sync changes supply a conservative common
+prefix/suffix replacement per version. An occurrence touched by any replacement,
+or whose complete token bytes/boundaries changed, is omitted. At most 64 changes
+per contributor are mapped until a fresh snapshot resets the history. Two
+separate edits within one full-sync change can conservatively omit unchanged
+occurrences between them. Untouched occurrences may temporarily show the prior
+type or documentation until usable replacement facts arrive; they are never
+relabeled as freshly checked facts. Provisional completion candidates themselves
+do not authorize hover.
+
+Hover requests still capture exact current inputs before scheduling and reject
+requests superseded during SQL reads. Closing/reopening or exceeding a
+contributor's buffer budget retires its context. Reopening the active path queues
+analysis for its new session and cannot borrow old occurrences. A save preserves accepted hover
+while the watcher prepares saved facts; committed saved publication queues
+reanalysis against the new baseline. Saving never promotes TEMP facts. On dirty
+text before completion activates analysis, or at an occurrence without a safe
+mapping, hover returns no result. Clean text and closed documents retain ordinary
+saved hover. Context depending on unsaved-only
 C headers is not retained for hover because those headers have no saved watcher
 freshness. Optional hover data is capped at 4 MiB and 100,000 occurrences within
-the existing snapshot retention limit; exceeding it drops hover data while
-preserving otherwise valid completion results. Process exit discards the rows.
+the shared 16-snapshot/64-MiB TEMP retention limit. Separate retained hover tables
+keep candidate replacement and saved-generation eviction from deleting accepted
+hover during a handoff. The preceding artifact survives one replacement so a
+reader queued behind publication can finish using its captured snapshot id; the
+next publication retires that grace artifact. A miss can retry once against an
+accepted context that changed while waiting for SQL. Fresh candidates become
+ready after their usable hover artifact is accepted, covering immediate snippet
+selection. Exceeding a limit preserves valid completion results and
+does not replace the accepted hover artifact with an unusable one. Eviction can
+still remove bounded retained artifacts. Process exit discards all TEMP rows.
 
 ## Input and publication ownership
 

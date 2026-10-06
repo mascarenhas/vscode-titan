@@ -14,6 +14,7 @@ const dependency = path.join(root, "dep.titan");
 const foreignFile = path.join(root, "foreigns.titan");
 const background = path.join(root, "background.titan");
 const folderMain = path.join(root, "box/box.titan");
+const acceptedFile = path.join(root, "accepted.titan");
 const saved = "local disk_value = 1\nfunction read(): integer\n  return disk_value\nend\n";
 const fields = (type = "integer") => Array.from({ length: 800 }, (_, index) =>
   `  field${String(index).padStart(4, "0")}: ${type}`).join("\n");
@@ -32,6 +33,7 @@ await writeFile(dependency, "--- Saved dependency module.\n-- @module dep\n" +
 await writeFile(header, "typedef struct Widget { int count; } Widget;\nint callable(int argument);\n");
 await writeFile(foreignFile, foreignPrefix + "local saved = 1\n");
 await writeFile(folderMain, "local saved = 1\n");
+await writeFile(acceptedFile, "local diskOnly = 1\n");
 await writeFile(background, largeSaved());
 
 const child = launch(root, "debug");
@@ -131,12 +133,65 @@ function positionOf(text, token, occurrence = 0) {
   return { line: lines.length - 1, character: lines.at(-1).length + 1 };
 }
 
+function offsetAt(text, position) {
+  const lines = text.split("\n");
+  assert.ok(position.line >= 0 && position.line < lines.length);
+  assert.ok(position.character >= 0 && position.character <= lines[position.line].length);
+  return lines.slice(0, position.line).reduce((offset, line) => offset + line.length + 1, 0) +
+    position.character;
+}
+
+function rangeOf(text, token, occurrence = 0) {
+  const position = positionOf(text, token, occurrence);
+  return {
+    start: { line: position.line, character: position.character - 1 },
+    end: { line: position.line, character: position.character - 1 + token.length }
+  };
+}
+
+function acceptCompletion(text, item) {
+  assert.ok(item?.textEdit, "completion did not supply an acceptance edit");
+  let inserted = item.textEdit.newText;
+  if (item.insertTextFormat === 2) {
+    // This server emits fixed parameter defaults and a final caret. Apply
+    // those defaults just as accepting a call snippet in the editor does.
+    inserted = inserted.replace(/\$\{\d+:([^}]*)\}/g, "$1").replace(/\$\d+/g, "");
+    assert.equal(inserted.includes("${"), false, "unsupported call snippet in fixture");
+  }
+  const start = offsetAt(text, item.textEdit.range.start);
+  const finish = offsetAt(text, item.textEdit.range.end);
+  return text.slice(0, start) + inserted + text.slice(finish);
+}
+
 async function hover(file, position) {
   const response = await request(child, responses, nextId++, "textDocument/hover", {
     textDocument: { uri: uri(file) }, position
   });
   assert.equal(response.error, undefined, JSON.stringify(response));
   return response.result;
+}
+
+async function readyHover(file, text, token, expected, label, occurrence = 0) {
+  const deadline = performance.now() + 30_000;
+  let result;
+  do {
+    result = await hover(file, positionOf(text, token, occurrence));
+    if (result?.contents?.value && expected.test(result.contents.value)) {
+      assert.deepEqual(result.range, rangeOf(text, token, occurrence),
+        `${label}: hover did not use the current document's range`);
+      return result;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  } while (performance.now() < deadline);
+  assert.fail(`${label}: hover did not converge: ${JSON.stringify(result)}`);
+}
+
+function assertCurrentHoverWhenReady(result, text, token, expected, label, occurrence = 0) {
+  // Debounced analysis can finish before the first request reaches a busy
+  // server. A nonnull result must already belong to the current real token.
+  if (result === null) return;
+  assert.match(result.contents.value, expected, label);
+  assert.deepEqual(result.range, rangeOf(text, token, occurrence), label);
 }
 
 try {
@@ -181,10 +236,11 @@ try {
   assert.match(afterHole.contents.value, /Type: `string`/,
     "hover lost an occurrence after the compiler's replacement dummy");
   const holeHover = await hover(filename, source.position);
-  assert.equal(holeHover, null, "dummy completion token acquired an editor hover identity");
+  assertCurrentHoverWhenReady(holeHover, source.text, "unsavedAnswer", /Type: `integer`/,
+    "completion hole exposed another occurrence instead of a fresh real token", 1);
   change(filename, source.text + "-- new buffer version\n");
-  assert.equal(await hover(filename, localPosition), null,
-    "buffer changes did not retire ephemeral hover context");
+  assert.deepEqual(await hover(filename, localPosition), ephemeralHover,
+    "an unchanged local lost safe hover while refreshed analysis was pending");
   change(filename, source.text);
   notify("textDocument/didSave", { textDocument: { uri: uri(filename) } });
   await ready(filename, source.position, "unsavedAnswer", "didSave retains open text");
@@ -316,9 +372,141 @@ try {
   assert.match(result.items.find((item) => item.label === "unsavedDoc").documentation.value, /Test an unsaved count/);
   const documentedHover = await hover(filename, positionOf(source.text, "unsavedDoc", 1));
   assert.match(documentedHover.contents.value, /Test an unsaved count/);
-  change(filename, source.text.replace("Test an unsaved count", "Changed documentation"));
-  assert.equal(await hover(filename, positionOf(source.text, "unsavedDoc", 1)), null,
-    "edited documentation reused an older completion hover");
+  const editedDocumentation = source.text.replace("Test an unsaved count", "Changed documentation");
+  change(filename, editedDocumentation);
+  const retainedDocumentation = await hover(filename, positionOf(editedDocumentation, "unsavedDoc", 1));
+  assert.ok(retainedDocumentation, "an unchanged call lost provisional hover after a documentation edit");
+  assert.deepEqual(retainedDocumentation.range, rangeOf(editedDocumentation, "unsavedDoc", 1));
+  await readyHover(filename, editedDocumentation, "unsavedDoc", /Changed documentation/,
+    "documentation refresh without another completion", 1);
+
+  // Exercise actual acceptance, including the newly real occurrence that
+  // was deliberately omitted from the completion's synthetic-hole snapshot.
+  const acceptedPrefix = "--- Complete a named count.\r\n" +
+    "function combine(count: integer, label: string): integer return count end\r\n";
+  let accepted = marked(acceptedPrefix +
+    "function read(count: integer, label: string): integer\r\n" +
+    " local marker = \"😀\"; return comb@ine\r\nend\r\n" +
+    "function stable(): integer local keeper = 1 return keeper end\r\n");
+  open(acceptedFile, accepted.text);
+  const acceptedList = await ready(acceptedFile, accepted.position, "combine", "accept a named function call");
+  const acceptedItem = acceptedList.items.find((item) => item.label === "combine");
+  assert.equal(acceptedItem.textEdit.newText, "combine(${1:count}, ${2:label})$0");
+  const keeperHover = await hover(acceptedFile, positionOf(accepted.text, "keeper", 1));
+  assert.match(keeperHover.contents.value, /Type: `integer`/);
+  let acceptedText = acceptCompletion(accepted.text, acceptedItem);
+  assert.ok(acceptedText.includes("return combine(count, label)"));
+  change(acceptedFile, acceptedText);
+  assertCurrentHoverWhenReady(await hover(acceptedFile, positionOf(acceptedText, "combine", 1)),
+    acceptedText, "combine", /combine\(count: integer, label: string\): integer/,
+    "the inserted callee borrowed another token's hover", 1);
+  const retainedKeeper = await hover(acceptedFile, positionOf(acceptedText, "keeper", 1));
+  assert.match(retainedKeeper.contents.value, /Type: `integer`/,
+    "accepting a snippet hid an existing safe local during refresh");
+  assert.deepEqual(retainedKeeper.range, rangeOf(acceptedText, "keeper", 1));
+  const acceptedHover = await readyHover(acceptedFile, acceptedText, "combine",
+    /combine\(count: integer, label: string\): integer/,
+    "accepted function callee refresh without another completion", 1);
+  assert.match(acceptedHover.contents.value, /Complete a named count/);
+
+  // Accepting default placeholder names usually leaves unresolved arguments
+  // until the user fills them. Their type errors must not erase the known
+  // callable signature or the following, independently checked local.
+  const unresolved = marked(acceptedPrefix +
+    "function read(): integer return comb@ine end\r\n" +
+    "function stable(): integer local followingLocal = 1 return followingLocal end\r\n");
+  change(acceptedFile, unresolved.text);
+  const unresolvedList = await ready(acceptedFile, unresolved.position, "combine",
+    "accept callable placeholders before filling unresolved arguments");
+  const unresolvedText = acceptCompletion(unresolved.text,
+    unresolvedList.items.find((item) => item.label === "combine"));
+  assert.ok(unresolvedText.includes("function read(): integer return combine(count, label)"));
+  change(acceptedFile, unresolvedText);
+  await readyHover(acceptedFile, unresolvedText, "combine",
+    /combine\(count: integer, label: string\): integer/,
+    "unresolved accepted placeholders retain callee hover without another completion", 1);
+  await readyHover(acceptedFile, unresolvedText, "followingLocal", /Type: `integer`/,
+    "unresolved accepted placeholders preserve a following local", 1);
+  change(acceptedFile, acceptedText);
+  await readyHover(acceptedFile, acceptedText, "keeper", /Type: `integer`/,
+    "valid argument scope restores automatically after unresolved placeholders", 1);
+
+  acceptedText = "-- 😀 shifted UTF-16 positions\r\n" + acceptedText
+    .replace("Complete a named count", "Changed accepted documentation")
+    .replaceAll("count: integer", "count: float")
+    .replaceAll("): integer return count", "): float return count")
+    .replace("label: string): integer", "label: string): float");
+  change(acceptedFile, acceptedText);
+  const shiftedKeeper = await hover(acceptedFile, positionOf(acceptedText, "keeper", 1));
+  assert.match(shiftedKeeper.contents.value, /Type: `integer`/);
+  assert.deepEqual(shiftedKeeper.range, rangeOf(acceptedText, "keeper", 1),
+    "provisional hover did not remap unchanged tokens through CRLF and UTF-16 text");
+  const changedCallHover = await readyHover(acceptedFile, acceptedText, "combine",
+    /combine\(count: float, label: string\): float/,
+    "continued signature edits without another completion", 1);
+  assert.match(changedCallHover.contents.value, /Changed accepted documentation/);
+
+  // A parser-invalid tail cannot replace semantic facts, but untouched tokens
+  // retain their prior knowledge while rewritten or newly inserted tokens do not.
+  const broken = acceptedText + "function pending(\r\n";
+  change(acceptedFile, broken);
+  assert.deepEqual(await hover(acceptedFile, positionOf(broken, "keeper", 1)), shiftedKeeper,
+    "an incomplete declaration hid a safe unchanged occurrence");
+  const rewritten = broken.replace("return keeper end", "return other end");
+  change(acceptedFile, rewritten);
+  assert.equal(await hover(acceptedFile, positionOf(rewritten, "other")), null,
+    "a rewritten token borrowed the removed local occurrence's hover");
+  const recovered = acceptedText.replaceAll("keeper", "recoveredKeeper");
+  change(acceptedFile, recovered);
+  await readyHover(acceptedFile, recovered, "recoveredKeeper", /Type: `integer`/,
+    "valid text recovers automatically after incomplete typing", 1);
+  await readyHover(acceptedFile, recovered, "combine", /combine\(count: float, label: string\): float/,
+    "callee hover survives incomplete typing and recovery", 1);
+
+  // didSave itself must not discard current editor knowledge. The subsequent
+  // watcher publication replaces the saved baseline, then current hover recovers.
+  notify("textDocument/didSave", { textDocument: { uri: uri(acceptedFile) } });
+  await readyHover(acceptedFile, recovered, "recoveredKeeper", /Type: `integer`/,
+    "save notification before watcher publication", 1);
+  const savedEpoch = responses.lastIndexingEpoch;
+  await writeFile(acceptedFile, recovered);
+  notify("textDocument/didSave", { textDocument: { uri: uri(acceptedFile) } });
+  await waitForIndexing(responses, "ready", 1, savedEpoch + 1);
+  await readyHover(acceptedFile, recovered, "combine", /combine\(count: float, label: string\): float/,
+    "saved watcher handoff retains the current accepted call", 1);
+
+  const retiredText = recovered.replaceAll("recoveredKeeper", "retiredKeeper");
+  change(acceptedFile, retiredText);
+  notify("textDocument/didClose", { textDocument: { uri: uri(acceptedFile) } });
+  const reopenedText = recovered.replace(
+    "function stable(): integer local recoveredKeeper = 1 return recoveredKeeper end",
+    "function stable(): string local reopenedKeeper = \"new session\" return reopenedKeeper end");
+  assert.ok(reopenedText.includes("local reopenedKeeper = \"new session\""));
+  open(acceptedFile, reopenedText, 1);
+  assertCurrentHoverWhenReady(await hover(acceptedFile, positionOf(reopenedText, "reopenedKeeper", 1)),
+    reopenedText, "reopenedKeeper", /Type: `string`/,
+    "a reopened session inherited its previous session's local type or coordinates", 1);
+  await readyHover(acceptedFile, reopenedText, "reopenedKeeper", /Type: `string`/,
+    "same-version reopened session prepares its own hover", 1);
+  assert.equal(await readFile(acceptedFile, "utf8"), recovered,
+    "automatic hover refresh promoted reopened editor text to disk");
+
+  accepted = marked("record Counter\n value: integer\nend\n" +
+    "function Counter:add(amount: integer): integer return self.value + amount end\n" +
+    "function read(counter: Counter, amount: integer): integer return counter:a@dd end\n");
+  change(acceptedFile, accepted.text);
+  const methodList = await ready(acceptedFile, accepted.position, "add", "accept a bound method call");
+  const methodItem = methodList.items.find((item) => item.label === "add");
+  assert.equal(methodItem.textEdit.newText, "add(${1:amount})$0");
+  const methodText = acceptCompletion(accepted.text, methodItem);
+  assert.ok(methodText.includes("return counter:add(amount)"));
+  change(acceptedFile, methodText);
+  assertCurrentHoverWhenReady(await hover(acceptedFile, positionOf(methodText, "add", 1)),
+    methodText, "add", /Counter:add\(amount: integer\): integer/,
+    "an accepted bound method borrowed another token's hover", 1);
+  await readyHover(acceptedFile, methodText, "add", /Counter:add\(amount: integer\): integer/,
+    "accepted bound method refresh without another completion", 1);
+  notify("textDocument/didClose", { textDocument: { uri: uri(acceptedFile) } });
 
   source = marked("function read(x: foreign const *unsigned lo@ng long) end\n");
   change(filename, source.text);
@@ -351,11 +539,18 @@ try {
   result = await ready(foreignFile, source.position, "volatileFreshFunction", "unsaved-only header refreshed");
   excludes(result, "volatilePriorFunction");
 
-  source = marked("function read(): integer\n return current.va@lue\nend\n");
+  source = marked("function read(): value\n return current.va@lue\nend\n");
   open(folderMain, source.text);
   const contributor = path.join(root, "box/fields.titan");
   open(contributor, "record Box\n value: integer\nend\nlocal current = Box.new(1)\n");
-  await ready(folderMain, source.position, "value", "new unsaved folder contributor");
+  const folderResult = await ready(folderMain, source.position, "value", "new unsaved folder contributor");
+  const folderText = acceptCompletion(source.text, folderResult.items.find((item) => item.label === "value"));
+  change(folderMain, folderText);
+  await readyHover(folderMain, folderText, "value", /Type: `integer`/,
+    "accepted folder member receives current hover", 1);
+  change(contributor, "record Box\n value: string\nend\nlocal current = Box.new(\"later\")\n");
+  await readyHover(folderMain, folderText, "value", /Type: `string`/,
+    "contributor edit refreshes another file's hover without completion", 1);
   const fresh = path.join(root, "fresh.titan");
   source = marked("function read(): integer\n local brandNew = 1\n return brand@New\nend\n");
   open(fresh, source.text);

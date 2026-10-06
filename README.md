@@ -535,14 +535,15 @@ available as `./?.lua` and `./?.so`; see [the Codex setup guide](docs/codex.md).
 ## Version 1 behavior
 
 Definition, references, rename, folding and diagnostics use saved files. Hover
-can additionally reuse the current ephemeral context from accepted completion
-preparation. Post-V1 completion analyzes current editor text for the active logical module
+can additionally reuse an ephemeral context after completion activates private
+analysis. Further edits refresh it after a 200 ms debounce, retaining mapped
+untouched occurrences during preparation and saving. Post-V1 completion analyzes current editor text for the active logical module
 against a committed saved dependency baseline. Type `.` or `:`, or use the usual
 editor completion command, including after `foreign` in a type annotation.
 Callable candidates show named signatures and insert parameter-name call
 placeholders. Disable `titan.completion.insertCallSnippets` for function references.
 See [completion behavior and ownership](docs/completion.md) for supported contexts,
-fresh hover requirements and limits. Foreign-definition navigation, external-source navigation and
+hover freshness, retained-context behavior and limits. Foreign-definition navigation, external-source navigation and
 watching external source trees remain outside the first-version scope.
 
 Hover presents a named declaration signature, including parameter names, for

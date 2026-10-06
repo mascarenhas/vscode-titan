@@ -4,7 +4,7 @@ local sqlite3 = import "sqlite3"
 local strings = import "string"
 local test = import "test"
 local runtime = import "server.test_runtime"
-local sql = import "server.workspace_store"
+local sql = import "server.workspace_store.titan"
 local completion = import "server.completion_store.titan"
 local facts = import "server.completion_types"
 local bridge = import "server.compiler_bridge"
@@ -288,6 +288,170 @@ function test_completion_store_hover_fences_contributors_generation_and_session(
     test.assert(sql.scalar_integer(access.connection,
       "SELECT COUNT(*) FROM temp.completion_hovers") == 0,
       "retired snapshots retained their hover rows")
+  end)
+end
+
+function test_completion_store_retained_hover_survives_candidate_and_saved_replacement(_context: test.Context)
+  runtime.run(function ()
+    local store = sql.open(":memory:")
+    defer store:close()
+    local overlay = fixture(store)
+    defer overlay:close()
+    local original = facts.Snapshot.new("accepted-hover", "app", 7, 1, "context", PATH, 1, 1,
+      0, 0, 0, "", "complete", {facts.Input.new(PATH, 1, 1, "abc")}, {}, {},
+      {facts.Hover.new(PATH, 0, 3, "original semantic context")})
+    test.assert(overlay:publish_hover(original, yes))
+    do
+      local access = store:acquire()
+      defer access:release()
+      sql.execute(access.connection, "UPDATE main.store_state SET published_generation=8 WHERE singleton=1")
+    end
+    test.assert(overlay:put_document(facts.OpenDocument.new(
+      "file://" .. PATH, PATH, "app", 1, 2, "abc!")))
+    local replacement = facts.Snapshot.new("empty-candidates", "app", 8, 2, "new", PATH, 1, 2,
+      0, 0, 0, "", "unresolved", {facts.Input.new(PATH, 1, 2, "abc!")}, {}, {})
+    test.assert(overlay:publish(replacement, yes))
+    test.assert(overlay:discard_obsolete(2))
+    test.assert(not overlay:publish_hover(replacement, yes),
+      "missing optional hover data replaced accepted semantics")
+    local retained? = overlay:hover_retained("accepted-hover", PATH, 1, 1, yes)
+    test.assert(retained ~= nil and retained.markdown == "original semantic context",
+      "candidate or saved generation replacement erased retained hover")
+    test.assert(overlay:hover_retained("accepted-hover", PATH, 1, 1,
+      function (): boolean return false end) == nil,
+      "retained hover ignored the current request proof")
+    do
+      local access = store:acquire()
+      defer access:release()
+      local rows = sql.rows(access.connection,
+        "SELECT saved_generation FROM temp.retained_hover_snapshots WHERE id=?",
+        sqlite3.Blob.new("accepted-hover"))
+      test.assert(#rows == 1 and rows[1]:get(1) == 7,
+        "provisional hover was relabeled as a new saved generation")
+    end
+    local empty = facts.Snapshot.new("valid-empty", "app", 8, 2, "source", PATH, 1, 2,
+      0, 0, 0, "", "complete", {facts.Input.new(PATH, 1, 2, "abc!")}, {}, {}, {})
+    test.assert(overlay:publish_hover(empty, yes))
+    test.assert(overlay:hover_retained("accepted-hover", PATH, 1, 1, yes) == nil,
+      "usable empty replacement retained old hover rows")
+  end)
+end
+
+function test_completion_store_retained_hover_finishes_queued_lookup_across_replacement(_context: test.Context)
+  runtime.run(function ()
+    local store = sql.open(":memory:")
+    defer store:close()
+    local overlay = fixture(store)
+    defer overlay:close()
+    local make = function (id: string, markdown: string): facts.Snapshot
+      return facts.Snapshot.new(id, "app", 7, 1, "context", PATH, 1, 1,
+        0, 0, 0, "", "complete", {facts.Input.new(PATH, 1, 1, "abc")}, {}, {},
+        {facts.Hover.new(PATH, 0, 3, markdown)})
+    end
+    local first = make("handoff-a", "first accepted context")
+    local second = make("handoff-b", "second accepted context")
+    test.assert(overlay:publish_hover(first, yes))
+    local held = store:acquire()
+    defer held:release()
+    local replacement = async.run<|boolean, value|>(function (): boolean
+      return overlay:publish_hover(second, yes, first.id)
+    end)
+    local wait_for_queue = function (count: integer)
+      for _attempt = 1, 20 do
+        if #store.waiters == count then return end
+        async.yield()
+      end
+      test.assert(false, "retained hover test did not establish FIFO SQL lease waiters")
+    end
+    -- Wait for the independently owned publication Task, not only its waiter,
+    -- to queue before the reader which already captured the preceding id.
+    wait_for_queue(1)
+    local reader = async.run<|facts.Hover?, value|>(function (): facts.Hover?
+      return overlay:hover_retained(first.id, PATH, 1, 1, yes)
+    end)
+    wait_for_queue(2)
+    held:release()
+    case async.join(reader)
+    when succeeded(row) then
+      test.assert(row ~= nil and row.markdown == "first accepted context",
+        "a queued old-context lookup became empty after the replacement committed")
+    when failed(failure) then raise failure.error
+    else raise "retained hover reader did not finish"
+    end
+    case async.join(replacement)
+    when succeeded(accepted) then test.assert(accepted, "hover replacement did not commit")
+    when failed(failure) then raise failure.error
+    else raise "retained hover replacement did not finish"
+    end
+    local new_row? = overlay:hover_retained(second.id, PATH, 1, 1, yes)
+    test.assert(new_row ~= nil and new_row.markdown == "second accepted context",
+      "grace retention prevented publication of the replacement artifact")
+    local third = make("handoff-c", "third accepted context")
+    test.assert(overlay:publish_hover(third, yes, second.id))
+    test.assert(overlay:hover_retained(first.id, PATH, 1, 1, yes) == nil and
+        overlay:hover_retained(second.id, PATH, 1, 1, yes) ~= nil and
+        overlay:hover_retained(third.id, PATH, 1, 1, yes) ~= nil,
+      "the next publication failed to retire older grace rows")
+    do
+      local access = store:acquire()
+      defer access:release()
+      test.assert(sql.scalar_integer(access.connection,
+        "SELECT count(*) FROM temp.retained_hover_snapshots") == 2 and
+        sql.scalar_integer(access.connection,
+          "SELECT count(*) FROM temp.retained_hovers WHERE snapshot_id=?",
+          sqlite3.Blob.new(first.id)) == 0,
+        "hover handoff retained more than the accepted and preceding artifacts")
+    end
+    -- Re-publishing an identical id replaces its rows without preserving a
+    -- colliding primary key or letting the older grace artifact accumulate.
+    test.assert(overlay:publish_hover(third, yes, third.id))
+    test.assert(overlay:hover_retained(second.id, PATH, 1, 1, yes) == nil and
+        overlay:hover_retained(third.id, PATH, 1, 1, yes) ~= nil,
+      "same-id hover replacement preserved a duplicate or obsolete artifact")
+  end)
+end
+
+function test_completion_store_retained_hover_bounds_rollback_and_contributor_sessions(_context: test.Context)
+  runtime.run(function ()
+    local store = sql.open(":memory:")
+    defer store:close()
+    local overlay = fixture(store)
+    defer overlay:close()
+    local part = "/workspace/part.titan"
+    test.assert(overlay:put_document(facts.OpenDocument.new("file://" .. part, part, "app", 2, 1, "x")))
+    local inputs = {facts.Input.new(PATH, 1, 1, "abc"), facts.Input.new(part, 2, 1, "x")}
+    local original = facts.Snapshot.new("retained", "app", 7, 1, "context", PATH, 1, 1,
+      0, 0, 0, "", "complete", inputs, {}, {}, {facts.Hover.new(PATH, 0, 3, "accepted")})
+    test.assert(overlay:publish_hover(original, yes))
+    local large = facts.Snapshot.new("too-large", "app", 7, 1, "context", PATH, 1, 1,
+      0, 0, 0, "", "complete", inputs, {}, {},
+      {facts.Hover.new(PATH, 0, 3, strings.rep("x", facts.MAX_HOVER_BYTES))})
+    test.assert(not overlay:publish_hover(large, yes))
+    test.assert(overlay:hover_retained("retained", PATH, 1, 1, yes) ~= nil,
+      "oversized optional hover erased accepted data")
+    local rows: {facts.Hover} = {}
+    for index = 1, 65 do rows[index] = facts.Hover.new(PATH, index, index + 1, "row") end
+    local superseded = facts.Snapshot.new("cancelled", "app", 7, 1, "context", PATH, 1, 1,
+      0, 0, 0, "", "complete", inputs, {}, {}, rows)
+    local checks = 0
+    test.assert(not overlay:publish_hover(superseded, function (): boolean
+      checks = checks + 1
+      return checks < 4
+    end))
+    test.assert(overlay:hover_retained("retained", PATH, 1, 1, yes) ~= nil and
+      overlay:hover_retained("cancelled", PATH, 1, 1, yes) == nil,
+      "superseded retained-hover batches did not roll back atomically")
+    test.assert(overlay:put_document(facts.OpenDocument.new("file://" .. part, part, "app", 2, 2, "y")))
+    test.assert(overlay:hover_retained("retained", PATH, 1, 1, yes) ~= nil,
+      "same-session contributor edit erased provisional old semantics")
+    test.assert(overlay:put_document(facts.OpenDocument.new("file://" .. part, part, "app", 3, 2, "y")))
+    test.assert(overlay:hover_retained("retained", PATH, 1, 1, yes) == nil,
+      "reopened contributor borrowed a previous hover session")
+    local access = store:acquire()
+    defer access:release()
+    test.assert(sql.scalar_integer(access.connection,
+      "SELECT count(*) FROM temp.retained_hover_snapshots") == 0,
+      "retired contributor left its accepted hover context resident")
   end)
 end
 
