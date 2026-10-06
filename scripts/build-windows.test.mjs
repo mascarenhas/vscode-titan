@@ -4,7 +4,8 @@ import path from "node:path";
 import { lstat, mkdir, mkdtemp, readdir, readlink, realpath, rm, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { orderedModules, moduleOutputs, compilerArgument, runtimeDlls, childEnvironment, selectedBuildEnvironment,
-  windowsPathContains, assertBuildRootOutsideSdk } from "./build-windows.mjs";
+  windowsPathContains, assertBuildRootOutsideSdk, buildProfileEnvironment, nativeBuildFlags,
+  nativeBuildDirectory } from "./build-windows.mjs";
 
 test("SDK ownership recognizes Windows case variants without confusing sibling prefixes", () => {
   for (const candidate of ["c:\\sdk", "C:\\SDK\\build", "c:/Sdk/missing/child"]) {
@@ -115,4 +116,78 @@ test("build fingerprints retain explicit compiler controls and exclude unrelated
   for (const [key, value] of Object.entries(controls)) assert.equal(selected[key], value);
   assert(!Object.hasOwn(selected, "UNRELATED_BUILD_NOTE"));
   assert.deepEqual(selected, selectedBuildEnvironment({ ...controls, UNRELATED_BUILD_NOTE: "changed unrelated input" }));
+});
+
+test("Windows test targets select validation while deliverables select production", () => {
+  for (const target of ["server-test-build", "server-test-run"]) {
+    const environment = buildProfileEnvironment(target, {});
+    assert.equal(environment.VSCODE_TITAN_BUILD_PROFILE, "validation");
+    assert.equal(environment.TITAN_BUILD_PROFILE, "validation");
+  }
+  for (const target of ["plan", "server", "stage", "package"]) {
+    assert.equal(buildProfileEnvironment(target, {}).TITAN_BUILD_PROFILE, "production");
+  }
+});
+
+test("explicit Windows profile selection overrides environment and rejects unknown profiles", () => {
+  assert.equal(buildProfileEnvironment("server", { vscode_titan_build_profile: "validation" })
+    .TITAN_BUILD_PROFILE, "validation");
+  assert.equal(buildProfileEnvironment("server-test-build", { TITAN_BUILD_PROFILE: "production" })
+    .TITAN_BUILD_PROFILE, "production");
+  assert.equal(buildProfileEnvironment("server", { VSCODE_TITAN_BUILD_PROFILE: "validation" }, "production")
+    .TITAN_BUILD_PROFILE, "production");
+  assert.throws(() => buildProfileEnvironment("server", {}, "optimized"), /validation or production/);
+  assert.throws(() => buildProfileEnvironment("server", { TITAN_BUILD_PROFILE: "unknown" }),
+    /validation or production/);
+});
+
+test("profile selection retains explicit sanitizer overrides with canonical Windows spellings", () => {
+  const inherited = { Titan_Extra_Cflags: "-O1 -fsanitize=address", titan_extra_ldflags: "-fsanitize=address",
+    TITAN_EXTRA_CPPFLAGS: '-DNAME="two words"', Unrelated: "keep" };
+  const snapshot = { ...inherited };
+  const environment = buildProfileEnvironment("server-test-build", inherited);
+  assert.equal(environment.TITAN_EXTRA_CFLAGS, "-O1 -fsanitize=address");
+  assert.equal(environment.TITAN_EXTRA_LDFLAGS, "-fsanitize=address");
+  assert.equal(environment.TITAN_EXTRA_CPPFLAGS, '-DNAME="two words"');
+  assert(!Object.hasOwn(environment, "Titan_Extra_Cflags"));
+  assert(!Object.hasOwn(environment, "titan_extra_ldflags"));
+  assert.equal(environment.Unrelated, "keep");
+  assert.deepEqual(inherited, snapshot);
+});
+
+test("native helpers share validation defaults and apply explicit compiler/link controls last", () => {
+  const flags = nativeBuildFlags("validation", {
+    cppflags: ["-DNAME=two words"], cflags: ["-O1", "-fsanitize=address"],
+    ldflags: ["-fsanitize=address", "-flto"]
+  });
+  assert.deepEqual(flags.cppflags, ["-DNAME=two words"]);
+  assert.deepEqual(flags.cflags, ["-std=c99", "-O0", "-fno-lto", "-Wall", "-Wextra", "-Werror",
+    "-O1", "-fsanitize=address"]);
+  assert.deepEqual(flags.ldflags, ["-fno-lto", "-fsanitize=address", "-flto"]);
+  const production = nativeBuildFlags("production");
+  assert(production.cflags.includes("-O3"));
+  assert(!production.cflags.includes("-O0"));
+  assert(!production.cflags.includes("-fno-lto"));
+  assert.deepEqual(production.ldflags, []);
+});
+
+test("production and test native helpers have separate graph ownership", () => {
+  const testDirectory = nativeBuildDirectory("build", "server-test-build");
+  assert.equal(nativeBuildDirectory("build", "server-test-run"), testDirectory,
+    "test execution must find the fixture built by its graph");
+  for (const target of ["server", "stage", "package"]) {
+    const productionDirectory = nativeBuildDirectory("build", target);
+    assert.equal(productionDirectory, path.join("build", "server", "native"));
+    assert.notEqual(productionDirectory, testDirectory,
+      "test profile must not replace native production link inputs");
+  }
+});
+
+test("profile identity invalidates a graph even when explicit flags coincide", () => {
+  const inherited = { TITAN_EXTRA_CFLAGS: "-O1", TITAN_EXTRA_LDFLAGS: "-fno-lto" };
+  const validation = selectedBuildEnvironment(buildProfileEnvironment("server", inherited, "validation"));
+  const production = selectedBuildEnvironment(buildProfileEnvironment("server", inherited, "production"));
+  assert.equal(validation.TITAN_EXTRA_CFLAGS, production.TITAN_EXTRA_CFLAGS);
+  assert.equal(validation.TITAN_EXTRA_LDFLAGS, production.TITAN_EXTRA_LDFLAGS);
+  assert.notDeepEqual(validation, production);
 });

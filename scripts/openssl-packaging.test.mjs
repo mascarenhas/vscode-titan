@@ -249,6 +249,7 @@ async function luaRocksMakeFixture(context, goal) {
   const state = await fixture(context);
   const titanRepo = path.join(state.root, "titan");
   const invoked = path.join(state.root, "luarocks-invoked");
+  const profile = path.join(state.root, "luarocks-profile");
   const nestedMakefile = await state.put("nested.mk", `.PHONY: all
 all:
 \t@printf '%s\\n' 'JOBSERVER:$(MAKEFLAGS)'
@@ -256,6 +257,7 @@ all:
   const rocks = await state.put("luarocks", `#!/bin/bash
 set -e
 printf '%s\\n' invoked >> ${shellQuote(invoked)}
+printf '%s\\n' "\${TITAN_BUILD_PROFILE:-unset}" > ${shellQuote(profile)}
 make --no-print-directory -f ${shellQuote(nestedMakefile)}
 mkdir -p ${shellQuote(path.join(state.sdk, "bin"))}
 printf '#!/bin/sh\\nexit 0\\n' > ${shellQuote(path.join(state.sdk, "bin", "titanc"))}
@@ -269,13 +271,13 @@ chmod 755 ${shellQuote(path.join(state.sdk, "bin", "titanc"))}
   for (const name of ["lua", "luarocks", "libuv"]) await state.put(`titan/${name}`);
   await state.put("titan/Makefile", "lua luarocks libuv:\n");
   const env = { ...process.env };
-  for (const name of ["MAKEFLAGS", "MFLAGS", "MAKELEVEL"]) delete env[name];
+  for (const name of ["MAKEFLAGS", "MFLAGS", "MAKELEVEL", "BUILD_PROFILE", "TITAN_BUILD_PROFILE"]) delete env[name];
   const makeHelp = spawnSync("make", ["--help"], { env, encoding: "utf8" }).stdout ?? "";
   const pipeStyle = makeHelp.includes("--jobserver-style") ? ["--jobserver-style=pipe"] : [];
   const run = (flags = []) => spawnSync("make", ["--no-print-directory", "-j2", ...pipeStyle,
     ...flags, "-f", repositoryMakefile, `TITAN_PREFIX=${state.sdk}`, `TITAN_REPO=${titanRepo}`, goal],
   { cwd: state.root, env, encoding: "utf8", timeout: 30_000 });
-  return { ...state, invoked, run };
+  return { ...state, invoked, profile, run };
 }
 
 for (const goal of ["toolchain", "toolchain-refresh"]) {
@@ -287,6 +289,14 @@ for (const goal of ["toolchain", "toolchain-refresh"]) {
       assert.doesNotMatch(result.stderr, /jobserver unavailable/, result.stderr);
       assert.match(result.stdout, /JOBSERVER:.*--jobserver-auth=\d+,\d+/);
       assert.equal(await readFile(state.invoked, "utf8"), "invoked\n");
+      assert.equal(await readFile(state.profile, "utf8"), "production\n");
+    });
+  test(`${goal} carries the validation profile through LuaRocks`,
+    { skip: process.platform === "win32" }, async (context) => {
+      const state = await luaRocksMakeFixture(context, goal);
+      const result = state.run(["BUILD_PROFILE=validation", "TITAN_BUILD_PROFILE=production"]);
+      assert.equal(result.status, 0, result.error?.message ?? result.stderr);
+      assert.equal(await readFile(state.profile, "utf8"), "validation\n");
     });
   for (const flag of ["-n", "-t", "-q"]) {
     test(`${goal} does not invoke LuaRocks under ${flag}`,

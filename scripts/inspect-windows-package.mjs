@@ -78,7 +78,7 @@ export async function inspectPackage(filename, sdk, readobj, repository) {
   const manifest = files.get("extension.vsixmanifest")?.toString("utf8") ?? "";
   assert(manifest.includes('TargetPlatform="win32-x64"'), "VSIX lacks Windows x64 target");
   for (const name of files.keys()) {
-    assert(!/^extension\/(?:\.agents|\.build|\.git|\.titan|node_modules|plugins|scripts|src|test)\//.test(name), `development payload ${name}`);
+    assert(!/^extension\/(?:\.agents|\.build|\.git|\.titan(?:-validation)?|node_modules|plugins|scripts|src|test)\//.test(name), `development payload ${name}`);
     assert(!/(?:^|\/)\.titan-ls(?:\/|$)|[.](?:map|a|so)(?:[.]|$)/.test(name), `unexpected cache/native payload ${name}`);
   }
   const actualImages = [...files.keys()].filter((name) => /[.](dll|exe)$/i.test(name)).map((name) => name.replace(/^extension\//, "")).sort();

@@ -3,7 +3,21 @@ SHELL := /bin/bash
 .DELETE_ON_ERROR:
 
 TITAN_REPO ?= ../titan
-TITAN_PREFIX ?= $(abspath .titan)
+# Choose a whole-invocation profile before generating either native graph.
+# Verification also exercises the ordinary server and disposable packaging.
+VALIDATION_GOALS := verify test server-test server-test-build server-test-objects server-test-run server-test-sharded \
+	server-protocol-test completion-protocol-test codex-native-test extension-host-test incremental-build-test install-server-test
+BUILD_PROFILE ?= $(if $(TITAN_BUILD_PROFILE),$(TITAN_BUILD_PROFILE),$(if $(filter $(VALIDATION_GOALS),$(MAKECMDGOALS)),validation,production))
+ifneq ($(BUILD_PROFILE),validation)
+ifneq ($(BUILD_PROFILE),production)
+$(error BUILD_PROFILE must be validation or production)
+endif
+endif
+export BUILD_PROFILE
+# BUILD_PROFILE owns this invocation even if the compiler knob was supplied
+# on Make's command line; children must receive the same profile as the SDK.
+override export TITAN_BUILD_PROFILE := $(BUILD_PROFILE)
+TITAN_PREFIX ?= $(abspath $(if $(filter validation,$(BUILD_PROFILE)),.titan-validation,.titan))
 override TITAN_PREFIX := $(abspath $(TITAN_PREFIX))
 TITANC := $(TITAN_PREFIX)/bin/titanc
 TITAN_LUA := $(TITAN_PREFIX)/bin/lua
@@ -43,6 +57,12 @@ AR ?= ar
 RANLIB ?= ranlib
 OPENSSL_PKG_CONFIG ?= pkg-config
 CCACHE_DISABLE ?= 1
+NATIVE_OPTFLAGS := $(if $(filter validation,$(BUILD_PROFILE)),-O0 -fno-lto,-O3)
+ifeq ($(BUILD_PROFILE),production)
+ifeq ($(HOST_OS),Linux)
+NATIVE_OPTFLAGS += -flto=auto -ffat-lto-objects
+endif
+endif
 INSTALL_PREFIX ?= /usr/local
 
 ifeq ($(HOST_OS),Linux)
@@ -110,6 +130,7 @@ TEST_LINK_OUTPUTS := $(SERVER_TEST) $(addprefix $(SERVER_TEST)__test_runner,.c .
 # The test DAG uses the stdlib's dynamic-provider preference. Source-backed
 # titan.test otherwise changes a static dependency's binding at the final link.
 NATIVE_COMPILER_ENV = env -u LUA_PATH -u LUA_CPATH -u LUA_PATH_5_5 -u LUA_CPATH_5_5 -u TITAN_SOURCE_PATH \
+	TITAN_BUILD_PROFILE=$(call shell_quote,$(BUILD_PROFILE)) \
 	CC=$(call shell_quote,$(CC)) AR=$(call shell_quote,$(AR)) RANLIB=$(call shell_quote,$(RANLIB)) \
 	CCACHE_DISABLE=$(call shell_quote,$(CCACHE_DISABLE)) \
 	TITAN_ROCKS_ROOT=$(call shell_quote,$(TITAN_PREFIX)) \
@@ -178,8 +199,8 @@ all: server extension
 
 help:
 	@echo "vscode-titan targets:"
-	@echo "  toolchain            build the ignored project-local .titan installation"
-	@echo "  toolchain-refresh    reinstall the sibling Titan checkout into .titan"
+	@echo "  toolchain            build the selected project-local SDK ($(BUILD_PROFILE))"
+	@echo "  toolchain-refresh    reinstall the sibling Titan checkout into the selected SDK"
 	@echo "  server               build bin/titan-language-server as one native executable"
 	@echo "  server-objects       compile production modules without linking"
 	@echo "  server-test-objects  compile test/support modules without linking"
@@ -233,15 +254,15 @@ server: $(SERVER)
 $(COMPILER_IO_CLOCK_OBJECT): $(COMPILER_IO_CLOCK_SOURCE) $(COMPILER_IO_CLOCK_HEADER) \
 	$(NATIVE_BUILD_INPUTS) $(NATIVE_CONFIG_STAMP)
 	@mkdir -p "$(dir $(COMPILER_IO_CLOCK_OBJECT))"
-	CCACHE_DISABLE="$(CCACHE_DISABLE)" $(CC) -std=c99 -O2 \
+	CCACHE_DISABLE="$(CCACHE_DISABLE)" $(CC) -std=c99 $(NATIVE_OPTFLAGS) $(TITAN_EXTRA_CFLAGS) \
 		-Wall -Wextra -Werror \
 		-c "$(COMPILER_IO_CLOCK_SOURCE)" \
 		-o "$(COMPILER_IO_CLOCK_OBJECT)"
 
-$(COMPILER_IO_PROCESS_FIXTURE): test/fixtures/compiler-io-process.c
+$(COMPILER_IO_PROCESS_FIXTURE): test/fixtures/compiler-io-process.c $(NATIVE_BUILD_INPUTS) $(NATIVE_CONFIG_STAMP)
 	@mkdir -p "$(dir $(COMPILER_IO_PROCESS_FIXTURE))"
-	CCACHE_DISABLE="$(CCACHE_DISABLE)" $(CC) -std=c99 -O2 \
-		-Wall -Wextra -Werror "$<" -o "$@"
+	CCACHE_DISABLE="$(CCACHE_DISABLE)" $(CC) -std=c99 $(NATIVE_OPTFLAGS) $(TITAN_EXTRA_CFLAGS) \
+		-Wall -Wextra -Werror "$<" $(TITAN_EXTRA_LDFLAGS) -o "$@"
 
 $(TITAN_STANDARD_PROVIDER): | $(TITANC)
 	@test -f "$@" || { \
@@ -263,7 +284,7 @@ $(EMBEDDED_INTERFACES_OBJECT): $(EMBEDDED_INTERFACES_SOURCE) \
 	$(EMBEDDED_INTERFACES_HEADER) $(TITAN_STANDARD_PROVIDER) \
 	$(NATIVE_BUILD_INPUTS) $(NATIVE_CONFIG_STAMP)
 	@mkdir -p "$(dir $(EMBEDDED_INTERFACES_OBJECT))"
-	CCACHE_DISABLE="$(CCACHE_DISABLE)" $(CC) -std=c99 -O2 \
+	CCACHE_DISABLE="$(CCACHE_DISABLE)" $(CC) -std=c99 $(NATIVE_OPTFLAGS) $(TITAN_EXTRA_CFLAGS) \
 		-Wall -Wextra -Werror \
 		-I "$(TITAN_PREFIX)/include" -I "$(abspath src/server)" \
 		-c "$(EMBEDDED_INTERFACES_SOURCE)" \
@@ -351,19 +372,19 @@ codex-native-test: $(SERVER)
 		node scripts/test-codex-native.mjs "$(SERVER)"
 
 extension: npm-ci | $(TITANC)
-	npm run compile
+	TITAN_PREFIX=$(call shell_quote,$(TITAN_PREFIX)) npm run compile
 
 extension-test: npm-ci
-	npm test
+	TITAN_PREFIX=$(call shell_quote,$(TITAN_PREFIX)) npm test
 
 extension-host-test: $(SERVER) npm-ci
-	npm run test:vscode
+	TITAN_PREFIX=$(call shell_quote,$(TITAN_PREFIX)) npm run test:vscode
 
 test: server-test-sharded server-protocol-test codex-native-test extension-test shard-runner-test incremental-build-test
 
 package: $(SERVER) npm-ci
 	@mkdir -p "$(VSIX_DIR)"
-	npm run compile
+	TITAN_PREFIX=$(call shell_quote,$(TITAN_PREFIX)) npm run compile
 	TITAN_REPO="$(abspath $(TITAN_REPO))" \
 	TITAN_PREFIX="$(TITAN_PREFIX)" \
 	./node_modules/.bin/vsce package --no-dependencies \

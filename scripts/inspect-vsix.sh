@@ -83,7 +83,7 @@ if [[ "$bundled_openssl" == 1 ]]; then
   done
 fi
 
-if grep -Eq '^extension/(\.agents|\.build|\.titan|node_modules|plugins|src|test)/' \
+if grep -Eq '^extension/(\.agents|\.build|\.titan(-validation)?|node_modules|plugins|src|test)/' \
     <<<"$contents"; then
   echo "VSIX contains a development-only directory" >&2
   exit 1
