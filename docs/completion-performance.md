@@ -72,8 +72,8 @@ ownership and independence; the transcript supplies the timing observations.
 Reproduce with the pinned production SDK and shipping compiler flags:
 
 ```sh
-make -j2 server server-test-build
-make completion-protocol-test
+make -j2 server server-test-build BUILD_PROFILE=production
+make completion-protocol-test BUILD_PROFILE=production
 ```
 
 The script prints raw request, preparation, selection and RSS samples as JSON.

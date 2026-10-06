@@ -240,6 +240,9 @@ $(TITANC):
 	fi
 
 toolchain-refresh: toolchain
+	$(MAKE) -C "$(abspath $(TITAN_REPO))" lua PREFIX="$(TITAN_PREFIX)"
+	$(MAKE) -C "$(abspath $(TITAN_REPO))" luarocks PREFIX="$(TITAN_PREFIX)"
+	$(MAKE) -C "$(abspath $(TITAN_REPO))" libuv PREFIX="$(TITAN_PREFIX)"
 	+$(RECURSIVE_WRAPPER_GUARD) cd "$(abspath $(TITAN_REPO))" && \
 		PATH="$(TITAN_PREFIX)/bin:$$PATH" \
 		"$(LUAROCKS)" make --force "$(TITAN_ROCKSPEC)"

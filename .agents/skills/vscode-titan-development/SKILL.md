@@ -184,8 +184,8 @@ compiler/source revisions and host-load limits; an early READY notification is
 not full restoration. Keep failed runs as failed evidence.
 
 CI builds and caches the complete validation compiler installation at
-`.titan-validation` by its exact commit, O0/no-LTO profile, platform/build policy
-and absolute installation prefix. It builds disposable packages for inspection
+`.titan-validation` by its exact commit, O0/no-LTO Titan profile with optimized
+Lua/compiler dependencies, platform/build policy and absolute installation prefix. It builds disposable packages for inspection
 and uploads no VSIX/server artifacts. Future main-only release jobs must rebuild
 all inputs in production after tests pass. Include the unpacked
 LuaRocks COPYING and core/cfg.lua licensing inputs used by stage-notices.mjs; a
@@ -219,8 +219,8 @@ invalidate the expected closure. Preserve two execution shards independently of
 object compilation. Run incremental build regressions and the complete gate
 before delivery. Ordinary server/package/installation builds use the production
 profile (O3 and Linux fat LTO). Test/verify entry points select validation for
-the entire SDK/server/test graph (O0, no LTO), using an isolated
-`.titan-validation` SDK. Keep the minimal production-profile fixture smoke in
+the Titan provider/server/test graphs (O0, no LTO), using an isolated
+`.titan-validation` SDK with optimized Lua and compiler dependencies. Keep the minimal production-profile fixture smoke in
 the incremental gate and the compiler's optimization-default regressions;
 routine testing need not rebuild the full optimized stdlib/server. Explicit
 flags follow profile defaults at compilation and linking. Use one Make process per

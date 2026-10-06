@@ -97,8 +97,10 @@ Ordinary `server`, `package`, `toolchain` and installation builds use
 `BUILD_PROFILE=production`, with `-O3` and the compiler's platform LTO defaults
 (fat LTO on Linux). Validation entry points (`test`, `verify`, native test,
 protocol, extension-host and installation-smoke targets) automatically select
-`BUILD_PROFILE=validation`: `-O0` without LTO for the SDK, server, test modules,
-native helpers and final links. The whole Make invocation uses one profile,
+`BUILD_PROFILE=validation`: `-O0` without LTO for Titan SDK providers, the server,
+test modules, native helpers and final links. The SDK keeps Lua and its compiler
+dependencies (including LPegLabel and LuaFileSystem) optimized so compiler
+execution remains fast. The whole Make invocation uses one profile,
 including the ordinary server exercised by transcripts and disposable packages.
 The validation SDK lives in `.titan-validation/`; `.titan/` remains the optimized
 installation. Each prefix has its own compiled standard-library providers.
@@ -109,7 +111,9 @@ make -j2 server BUILD_PROFILE=validation
 ```
 
 To refresh a validation SDK after compiler changes, use
-`make toolchain-refresh BUILD_PROFILE=validation`. Explicit `TITAN_PREFIX`
+`make toolchain-refresh BUILD_PROFILE=validation`. This also reconciles Lua and
+native dependency build settings before reinstalling compiler/stdlib artifacts,
+so an existing SDK cannot retain stale host optimization flags. Explicit `TITAN_PREFIX`
 selects a caller-owned SDK; it must match the requested profile. Extra compiler
 and linker flags remain explicit overrides and follow the profile defaults.
 The configuration stamp includes the profile, compiler/SDK and flag inputs, so
