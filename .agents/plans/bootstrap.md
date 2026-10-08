@@ -10,7 +10,9 @@ Work board: [Titan VSCode Extension project #2](https://github.com/users/mascare
 > [unsaved-completion.md](unsaved-completion.md); historical V1 exclusions below
 > remain the original milestone, not a prohibition on this approved extension.
 > Issues #94/#95 additionally add named call snippets and exact current
-> completion-derived ephemeral hover; see `docs/completion.md`.
+> completion-derived ephemeral hover; issue #100 continues private hover analysis
+> through debounced edits and save/watcher publication, with mapped retained
+> occurrences until usable replacement. See `docs/completion.md`.
 
 ## Objective
 

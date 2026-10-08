@@ -321,6 +321,9 @@ local function initialize_temp_schema(connection: sqlite3.Connection)
     "CREATE INDEX IF NOT EXISTS temp.completion_candidates_owner ON completion_candidates(snapshot_id,owner_key,access_mode,label COLLATE BINARY)",
     "CREATE INDEX IF NOT EXISTS temp.completion_snapshots_context ON completion_snapshots(filename,caret_byte,context_key)",
     "CREATE TEMP TABLE IF NOT EXISTS completion_hovers(snapshot_id BLOB NOT NULL REFERENCES completion_snapshots(id) ON DELETE CASCADE,filename BLOB NOT NULL,byte_start INTEGER NOT NULL,byte_finish INTEGER NOT NULL,markdown BLOB NOT NULL,PRIMARY KEY(snapshot_id,filename,byte_start)) WITHOUT ROWID",
+    "CREATE TEMP TABLE IF NOT EXISTS retained_hover_snapshots(id BLOB PRIMARY KEY,module_name BLOB NOT NULL,saved_generation INTEGER NOT NULL,buffer_epoch INTEGER NOT NULL,byte_count INTEGER NOT NULL,serial INTEGER NOT NULL) WITHOUT ROWID",
+    "CREATE TEMP TABLE IF NOT EXISTS retained_hover_inputs(snapshot_id BLOB NOT NULL REFERENCES retained_hover_snapshots(id) ON DELETE CASCADE,position INTEGER NOT NULL,filename BLOB NOT NULL,session INTEGER NOT NULL,version INTEGER NOT NULL,contents BLOB NOT NULL,PRIMARY KEY(snapshot_id,position)) WITHOUT ROWID",
+    "CREATE TEMP TABLE IF NOT EXISTS retained_hovers(snapshot_id BLOB NOT NULL REFERENCES retained_hover_snapshots(id) ON DELETE CASCADE,filename BLOB NOT NULL,byte_start INTEGER NOT NULL,byte_finish INTEGER NOT NULL,markdown BLOB NOT NULL,PRIMARY KEY(snapshot_id,filename,byte_start)) WITHOUT ROWID",
   }
   for index = 1, #schema do sql.execute(connection, schema[index]) end
 end
@@ -398,7 +401,7 @@ local function read_candidate(row: sqlite3.Row): facts.Candidate
 end
 
 local function write_hovers(connection: sqlite3.Connection, snapshot_id: string,
-    hovers: {facts.Hover}, current: Current): boolean
+    hovers: {facts.Hover}, current: Current, table_name: string?): boolean
   local offset = 1
   while offset <= #hovers do
     if not current() then return false end
@@ -413,7 +416,7 @@ local function write_hovers(connection: sqlite3.Connection, snapshot_id: string,
       parameters[#parameters + 1] = hover.byte_finish
       parameters[#parameters + 1] = blob(hover.markdown)
     end
-    local statement = connection:prepare("INSERT INTO temp.completion_hovers VALUES " ..
+    local statement = connection:prepare("INSERT INTO " .. (table_name or "temp.completion_hovers") .. " VALUES " ..
       strings.rep("(?,?,?,?,?),", finish - offset) .. "(?,?,?,?,?)")
     defer statement:close()
     statement:execute(...parameters)
@@ -579,6 +582,14 @@ local function invalidate_module(connection: sqlite3.Connection, module_name: st
     "DELETE FROM temp.completion_snapshots WHERE module_name=?", blob(module_name))
 end
 
+local function retire_hover_sessions(connection: sqlite3.Connection)
+  sql.execute(connection,
+    "DELETE FROM temp.retained_hover_snapshots WHERE EXISTS(" ..
+    "SELECT 1 FROM temp.retained_hover_inputs i WHERE i.snapshot_id=temp.retained_hover_snapshots.id " ..
+    "AND i.session>0 AND NOT EXISTS(SELECT 1 FROM temp.open_documents d " ..
+    "WHERE d.filename=i.filename AND d.session=i.session AND d.contents IS NOT NULL))")
+end
+
 local function put_document(connection: sqlite3.Connection, document: facts.OpenDocument,
                              batch_budget: boolean?): boolean
     local old = sql.rows(connection,
@@ -621,6 +632,7 @@ function Store:put_document(document: facts.OpenDocument): boolean
   local accepted = false
   local committed = self:write(function (connection: sqlite3.Connection): boolean
     accepted = put_document(connection, document)
+    retire_hover_sessions(connection)
     return true
   end)
   return committed and accepted
@@ -660,6 +672,7 @@ function Store:sync_documents(documents: {facts.OpenDocument}, epoch: integer,
       "DELETE FROM temp.completion_snapshots WHERE NOT EXISTS(" ..
       "SELECT 1 FROM temp.open_documents d WHERE d.filename=temp.completion_snapshots.filename " ..
       "AND d.session=temp.completion_snapshots.document_session)")
+    retire_hover_sessions(connection)
     return current()
   end)
 end
@@ -672,6 +685,7 @@ function Store:remove_document(filename: string, session: integer): boolean
     invalidate_module(connection, sql.bytes(old[1], 1))
     sql.execute(connection,
       "DELETE FROM temp.open_documents WHERE filename=? AND session=?", blob(filename), session)
+    retire_hover_sessions(connection)
     return true
   end)
 end
@@ -738,6 +752,81 @@ local function inputs_current(connection: sqlite3.Connection,
   return true
 end
 
+local SNAPSHOT_INVENTORY = "SELECT id,byte_count,serial,0 AS kind FROM temp.completion_snapshots " ..
+  "UNION ALL SELECT id,byte_count,serial,1 AS kind FROM temp.retained_hover_snapshots"
+
+local function make_snapshot_room(connection: sqlite3.Connection, bytes: integer)
+  while sql.scalar_integer(connection, "SELECT count(*) FROM (" .. SNAPSHOT_INVENTORY .. ")") >= MAX_SNAPSHOTS or
+      sql.scalar_integer(connection, "SELECT COALESCE(SUM(byte_count),0) FROM (" ..
+        SNAPSHOT_INVENTORY .. ")") + bytes > MAX_ANALYSIS_BYTES do
+    local oldest = sql.rows(connection, "SELECT id,kind FROM (" .. SNAPSHOT_INVENTORY ..
+      ") ORDER BY serial,kind,id LIMIT 1")
+    local table = "temp.completion_snapshots"
+    if oldest[1]:get(2) == 1 then table = "temp.retained_hover_snapshots" end
+    sql.execute(connection, "DELETE FROM " .. table .. " WHERE id=?", oldest[1]:get(1))
+  end
+end
+
+local function next_snapshot_serial(connection: sqlite3.Connection): integer
+  return sql.scalar_integer(connection,
+    "SELECT COALESCE(MAX(serial),0)+1 FROM (" .. SNAPSHOT_INVENTORY .. ")")
+end
+
+-- Retained hover owns its original source/version/generation. It is independent
+-- of caret candidates so failed replacement completion and saved publication
+-- cannot erase the last accepted semantic context. The caller alone authorizes
+-- provisional use; only exact current analysis may replace these rows.
+-- Keep one preceding artifact across the SQL commit/application pointer swap
+-- so a lookup already waiting for this lease can finish against its captured id.
+function Store:publish_hover(snapshot: facts.Snapshot, current: Current,
+    previous_id: string?): boolean
+  if snapshot.hovers == nil or #snapshot.hovers > facts.MAX_HOVER_ROWS then return false end
+  local bytes = #snapshot.id + #snapshot.module_name + 256
+  for index = 1, #snapshot.inputs do
+    if index % 128 == 0 then async.yield() end
+    local input = snapshot.inputs[index]
+    bytes = bytes + #input.filename + #input.contents + 64
+  end
+  local hover_bytes = 0
+  for index = 1, #snapshot.hovers do
+    if index % 1024 == 0 then async.yield() end
+    local hover = snapshot.hovers[index]
+    hover_bytes = hover_bytes + #hover.filename + #hover.markdown + 64
+    if hover_bytes > facts.MAX_HOVER_BYTES then return false end
+  end
+  bytes = bytes + hover_bytes
+  if bytes > MAX_SNAPSHOT_BYTES then return false end
+  return self:write(function (connection: sqlite3.Connection): boolean
+    if not current_generation(connection, snapshot.saved_generation) or not current() or
+        not inputs_current(connection, snapshot.inputs) then return false end
+    if previous_id ~= nil and previous_id ~= snapshot.id then
+      sql.execute(connection,
+        "DELETE FROM temp.retained_hover_snapshots WHERE module_name=? AND id<>?",
+        blob(snapshot.module_name), blob(previous_id))
+    else
+      sql.execute(connection,
+        "DELETE FROM temp.retained_hover_snapshots WHERE module_name=?", blob(snapshot.module_name))
+    end
+    make_snapshot_room(connection, bytes)
+    sql.execute(connection, "INSERT INTO temp.retained_hover_snapshots VALUES(?,?,?,?,?,?)",
+      blob(snapshot.id), blob(snapshot.module_name), snapshot.saved_generation,
+      snapshot.buffer_epoch, bytes, next_snapshot_serial(connection))
+    do
+      local insert = connection:prepare("INSERT INTO temp.retained_hover_inputs VALUES(?,?,?,?,?,?)")
+      defer insert:close()
+      for index = 1, #snapshot.inputs do
+        if index % 128 == 0 and not current() then return false end
+        local input = snapshot.inputs[index]
+        insert:execute(blob(snapshot.id), index, blob(input.filename), input.session,
+          input.version, blob(input.contents))
+      end
+    end
+    if not write_hovers(connection, snapshot.id, snapshot.hovers, current,
+        "temp.retained_hovers") then return false end
+    return current()
+  end)
+end
+
 function Store:publish(snapshot: facts.Snapshot, current: Current): boolean
   local bytes = snapshot_bytes(snapshot, false)
   if bytes > MAX_SNAPSHOT_BYTES or #snapshot.candidates > MAX_CANDIDATES then return false end
@@ -760,14 +849,8 @@ function Store:publish(snapshot: facts.Snapshot, current: Current): boolean
     invalidate_module(connection, snapshot.module_name)
     sql.execute(connection,
       "DELETE FROM temp.completion_snapshots WHERE saved_generation<>?", snapshot.saved_generation)
-    while sql.scalar_integer(connection, "SELECT count(*) FROM temp.completion_snapshots") >= MAX_SNAPSHOTS or
-        sql.scalar_integer(connection,
-          "SELECT COALESCE(SUM(byte_count),0) FROM temp.completion_snapshots") + bytes > MAX_ANALYSIS_BYTES do
-      sql.execute(connection,
-        "DELETE FROM temp.completion_snapshots WHERE id=(SELECT id FROM temp.completion_snapshots ORDER BY serial,id LIMIT 1)")
-    end
-    local serial = sql.scalar_integer(connection,
-      "SELECT COALESCE(MAX(serial),0)+1 FROM temp.completion_snapshots")
+    make_snapshot_room(connection, bytes)
+    local serial = next_snapshot_serial(connection)
     sql.execute(connection,
       "INSERT INTO temp.completion_snapshots VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
       blob(snapshot.id), blob(snapshot.module_name), snapshot.saved_generation,
@@ -905,6 +988,30 @@ function Store:hover(snapshot_id: string, filename: string, session: integer,
     "WHERE live.filename=other.filename AND live.session=other.session " ..
     "AND live.version=other.version AND live.contents=other.contents)) LIMIT 1",
     blob(snapshot_id), blob(filename), session, version, offset, offset)
+  if #rows ~= 1 or not current() then return nil end
+  return facts.Hover.new(filename, rows[1]:get(1), rows[1]:get(2), sql.bytes(rows[1], 3))
+end
+
+-- Read the retained artifact in its original byte coordinates. Versions and
+-- saved generations may be older by design; sessions must still be open, and
+-- the caller proves the current request and its safe source mapping across
+-- every SQLite yield. These rows are never relabeled as current-version facts.
+function Store:hover_retained(snapshot_id: string, filename: string, session: integer,
+    offset: integer, current: Current): facts.Hover?
+  if self.closed or not current() then return nil end
+  local access = self.store:acquire()
+  defer access:release()
+  if not current() then return nil end
+  local rows = sql.rows(access.connection,
+    "SELECT h.byte_start,h.byte_finish,h.markdown FROM temp.retained_hovers h " ..
+    "JOIN temp.retained_hover_inputs i ON i.snapshot_id=h.snapshot_id AND i.filename=h.filename " ..
+    "JOIN temp.open_documents d ON d.filename=i.filename AND d.session=i.session " ..
+    "WHERE h.snapshot_id=? AND h.filename=? AND i.session=? AND d.contents IS NOT NULL " ..
+    "AND h.byte_start<=? AND ?<h.byte_finish " ..
+    "AND NOT EXISTS(SELECT 1 FROM temp.retained_hover_inputs other WHERE other.snapshot_id=h.snapshot_id " ..
+    "AND other.session>0 AND NOT EXISTS(SELECT 1 FROM temp.open_documents live " ..
+    "WHERE live.filename=other.filename AND live.session=other.session AND live.contents IS NOT NULL)) LIMIT 1",
+    blob(snapshot_id), blob(filename), session, offset, offset)
   if #rows ~= 1 or not current() then return nil end
   return facts.Hover.new(filename, rows[1]:get(1), rows[1]:get(2), sql.bytes(rows[1], 3))
 end

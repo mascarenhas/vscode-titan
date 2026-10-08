@@ -5260,6 +5260,54 @@ function test_compiler_bridge_completion_preserves_candidates_without_optional_h
   end)
 end
 
+function test_compiler_bridge_private_source_analysis_preserves_real_call_occurrences(_context: test.Context)
+  run_bridge(function ()
+    preload_real_compiler()
+    local driver = lua.require("titan-compiler.driver") as {string: value}
+    local types = lua.require("titan-compiler.types") as {string: value}
+    local completion = lua.require("titan-compiler.completion") as {string: value}
+    local imported: value = driver["imported"]
+    local registry: value = types["registry"]
+    local observer: value = completion["fact"]
+    local filename = test_paths.workspace_root() .. "/continuous_hover.titan"
+    local source = "function choose(count: integer): integer return count end\n" ..
+      "function use(): integer return choose(1) end\n"
+    local analysis = bridge.load():analyze_completion("continuous_hover", {
+      bridge.ProjectModule.new("continuous_hover", {bridge.SourceFile.new(filename, source)}),
+    }, {}, nil)
+    test.assert(analysis.snapshot ~= nil and analysis.quality == "complete" and analysis.kind == "source",
+      "exact private source did not yield a usable semantic snapshot")
+    test.assert(#analysis.candidates == 0 and #analysis.scopes == 0,
+      "source-only preparation fabricated a caret completion context")
+    local found = false
+    for index = 1, #analysis.snapshot.symbols do
+      local occurrence = analysis.snapshot.symbols[index]
+      case occurrence.role
+      when reference() then
+        if occurrence.name == "choose" then
+          found = true
+          test.assert(occurrence.callable_signature ~= nil and
+            occurrence.callable_signature.display == "continuous_hover.choose(count: integer): integer" and
+            occurrence.exact_span ~= nil,
+            "inserted call reference lost its real callable signature or span")
+        end
+      end
+    end
+    test.assert(found, "source-only preparation omitted the real call as if it were a dummy")
+    test.assert(driver["imported"] == imported and types["registry"] == registry and
+      completion["fact"] == observer,
+      "source-only preparation retained private compiler globals")
+    local broken = bridge.load():analyze_completion("continuous_hover", {
+      bridge.ProjectModule.new("continuous_hover", {bridge.SourceFile.new(filename, "function unfinished(")}),
+    }, {}, nil)
+    test.assert(broken.snapshot == nil and broken.quality == "unresolved",
+      "syntax failure was represented as a usable empty hover replacement")
+    test.assert(driver["imported"] == imported and types["registry"] == registry and
+      completion["fact"] == observer,
+      "failed source-only preparation retained private compiler globals")
+  end)
+end
+
 function test_compiler_bridge_completion_foreign_callable_signature(_context: test.Context)
   run_bridge(function ()
     preload_real_compiler()

@@ -12,6 +12,8 @@ local timer = import "timer"
 local application = import "server.application.titan"
 local bridge = import "server.compiler_bridge"
 local compiler_io = import "server.compiler_io"
+local compiler_scheduler = import "server.compiler_scheduler"
+local completion_service = import "server.completion_service.titan"
 local diagnostics = import "server.diagnostics"
 local dispatcher = import "server.dispatcher"
 local lsp = import "server.lsp_types"
@@ -26,6 +28,7 @@ local project_loader = import "server.project_loader"
 local semantic_features = import "server.semantic_features"
 local source_text = import "server.source_text"
 local stores = import "server.workspace_store"
+local workspace_cache = import "server.workspace_cache"
 local test_runtime = import "server.test_runtime"
 
 local function buffers_before_saved_service_readiness()
@@ -592,6 +595,182 @@ function test_application_hover_receipt_fences_open_change_and_reopen(_context: 
       assert_retired(reopened)
       assert_hover()
     end)
+  end)
+end
+
+local function remove_application_cache(path: string)
+  local metadata? = fs.lstat(path)
+  if metadata == nil then return end
+  if metadata.kind == "directory" then
+    local names = fs.list(path)
+    for index = 1, #names do remove_application_cache(path .. "/" .. names[index]) end
+    fs.rmdir(path)
+  else
+    fs.unlink(path)
+  end
+end
+
+local function join_hover_owner(completion: completion_service.Service)
+  if completion.debounce ~= nil then
+    case async.join(completion.debounce)
+    when succeeded() then
+    when failed(failure) then raise failure.error
+    else raise "application hover debounce did not finish"
+    end
+  end
+  if completion.worker ~= nil then
+    case async.join(completion.worker)
+    when succeeded() then
+    when failed(failure) then raise failure.error
+    else raise "application hover worker did not finish"
+    end
+  end
+end
+
+function test_application_accepted_hover_survives_save_and_watcher_publication(_context: test.Context)
+  test_runtime.run(function ()
+    local root = test_paths.temporary_name()
+    fs.unlink(root)
+    fs.mkdir(root)
+    local source_root = root .. "/src"
+    fs.mkdir(source_root)
+    local filename = source_root .. "/main.titan"
+    local declaration = "function combine(count: integer): integer return count end\n"
+    local saved = declaration .. "function read(): integer return 1 end\n"
+    local editing = declaration .. "function read(): integer local count = 1 return comb end\n"
+    local accepted = declaration .. "function read(): integer local count = 1 return combine(count) end\n"
+    fs.write_file(filename, saved)
+    defer do
+      remove_application_cache(workspace_cache.directory(root))
+      if fs.lstat(filename) ~= nil then fs.unlink(filename) end
+      if fs.lstat(source_root) ~= nil then fs.rmdir(source_root) end
+      if fs.lstat(root) ~= nil then fs.rmdir(root) end
+    end
+    local app = application.create(root)
+    defer app:close()
+    app:start_indexing()
+    local initial_task? = app.refresh_task
+    local initial_view?, initial_error? = application.joined_view(initial_task)
+    test.assert(initial_view ~= nil and initial_error == nil,
+      "real application fixture did not publish its initial saved index")
+    local initial_generation = initial_view.published_generation
+    local uri? = source_text.path_to_file_uri(filename)
+    local document = lsp.TextDocument.new(uri, filename)
+    app:on_document(lsp.DocumentNotification.opened(lsp.OpenDocument.new(document, 1, editing)))
+    local needle? = strings.find(editing, "return comb", 1, true)
+    local position? = source_text.position_for_offset(editing, needle - 1 + #"return comb")
+    local request = dispatcher.CompletionRequest.new(dispatcher.RequestId.integer_id(620),
+      lsp.CompletionParams.new(lsp.DocumentPosition.new(uri, filename, position), 1, nil),
+      lsp.CompletionOptions.new(true, true, true))
+    local work = app:capture_completion(request)
+    work()
+    local completion? = app.completion
+    join_hover_owner(completion)
+    local saw_snippet = false
+    case work()
+    when result(value) then
+      local object? = wire.as_object(value)
+      local items? = wire.as_array(object["items"])
+      for index = 1, #items do
+        local item? = wire.as_object(items[index])
+        if wire.as_string(item["label"]) == "combine" then
+          local edit? = wire.as_object(item["textEdit"])
+          saw_snippet = wire.as_string(edit["newText"]) == "combine(${1:count})$0"
+        end
+      end
+    when failure{message} then raise message
+    end
+    test.assert(saw_snippet, "real application did not prepare the accepted call snippet")
+    app:on_document(lsp.DocumentNotification.changed(lsp.ChangeDocument.new(document, 2, accepted)))
+    join_hover_owner(completion)
+    local accepted_context? = completion.hover_context
+    test.assert(accepted_context.source,
+      "accepting a call did not autonomously replace the completion hole with real source")
+    local accepted_id = accepted_context.id
+    local hover = position_request_for(filename, 621, "textDocument/hover", 49)
+    local params? = wire.as_object(hover.params)
+    local hover_position: wire.Object = {["line"] = 1, ["character"] = 49}
+    params["position"] = hover_position
+    local assert_accepted_hover = function ()
+      case app:handle(hover)
+      when result(value) then
+        local object? = wire.as_object(value)
+        local contents? = wire.as_object(object["contents"])
+        local markdown? = wire.as_string(contents["value"])
+        test.assert(strings.find(markdown, "combine(count: integer)") ~= nil,
+          "accepted call hover disappeared during the saved-index handoff")
+      when failure{message} then raise message
+      end
+    end
+    assert_accepted_hover()
+
+    -- Native watcher timing is excluded from this regression. didSave only
+    -- records editor lifecycle; the explicit saved hint owns the publication.
+    app:stop_watching_for_testing()
+    fs.write_file(filename, accepted)
+    app:on_document(lsp.DocumentNotification.saved(document))
+    assert_accepted_hover()
+    test.assert(completion.hover_context.id == accepted_id and
+      app.completed_view.published_generation == initial_generation,
+      "didSave retired accepted hover or promoted its private source")
+    local store = app.service:workspace_store()
+    do
+      local access = store:acquire()
+      defer access:release()
+      local rows = stores.rows(access.connection,
+        "SELECT contents FROM main.semantic_files WHERE filename=?", sqlite3.Blob.new(filename))
+      test.assert(#rows == 1 and stores.bytes(rows[1], 1) == saved,
+        "didSave wrote unsaved editor facts into the committed saved index")
+    end
+
+    local callback_saw_retention = false
+    local callback_saw_debounce = false
+    app:set_indexing_listener(function (status: indexing_status.Status)
+      if indexing_status.state_name(status.state) == "ready" and
+          status.generation ~= nil and status.generation > initial_generation then
+        callback_saw_retention = completion.hover_context ~= nil and
+          completion.hover_context.id == accepted_id
+        callback_saw_debounce = completion.saved_generation == status.generation and
+          completion.debounce ~= nil and not completion.debounce:status():has_finished()
+      end
+    end)
+    local permit = compiler_scheduler.acquire()
+    defer permit:release()
+    app:note_saved_change()
+    local saved_task? = app.refresh_task
+    local pending_view?, pending_error? = app:current_view()
+    test.assert(pending_error == nil and pending_view == initial_view,
+      "saved refresh did not keep the preceding immutable view serviceable")
+    assert_accepted_hover()
+    test.assert(completion.hover_context.id == accepted_id,
+      "pending saved analysis retired the accepted unsaved hover context")
+    -- Release before joining: both the saved analysis and private replacement
+    -- use the same permit and must be allowed to finish in ordinary FIFO order.
+    permit:release()
+    local published_view?, published_error? = application.joined_view(saved_task)
+    test.assert(published_view ~= nil and published_error == nil and
+        published_view.published_generation > initial_generation,
+      "explicit watcher hint did not publish the changed saved bytes")
+    test.assert(callback_saw_retention and callback_saw_debounce,
+      "saved publication cleared accepted hover or failed to queue private reanalysis")
+    assert_accepted_hover()
+    join_hover_owner(completion)
+    local refreshed? = completion.hover_context
+    test.assert(refreshed.source and refreshed.id ~= accepted_id,
+      "new committed baseline did not receive an autonomous hover replacement")
+    do
+      local access = store:acquire()
+      defer access:release()
+      test.assert(stores.scalar_integer(access.connection,
+        "SELECT saved_generation FROM temp.retained_hover_snapshots WHERE id=?",
+        sqlite3.Blob.new(refreshed.id)) == published_view.published_generation,
+        "replacement hover context used the previous committed saved generation")
+      local rows = stores.rows(access.connection,
+        "SELECT contents FROM main.semantic_files WHERE filename=?", sqlite3.Blob.new(filename))
+      test.assert(#rows == 1 and stores.bytes(rows[1], 1) == accepted,
+        "watcher publication did not own the saved-source replacement")
+    end
+    assert_accepted_hover()
   end)
 end
 
