@@ -39,6 +39,9 @@ for required in \
   extension/dist/notices/titan/LICENSE \
   extension/dist/notices/titan/THIRD_PARTY_NOTICES.md \
   extension/dist/notices/titan/LICENSES/libuv-LICENSE \
+  extension/dist/notices/titan/LICENSES/libuv-LICENSE-extra \
+  extension/dist/notices/titan/LICENSES/libuv-tree-LICENSE \
+  extension/dist/notices/titan/LICENSES/libuv-inet-LICENSE \
   extension/dist/notices/titan/LICENSES/openssl-LICENSE \
   extension/dist/notices/lua/argparse/LICENSE \
   extension/dist/notices/lua/inspect/LICENSE \
@@ -52,6 +55,7 @@ for required in \
   extension/dist/titan/share/lua/5.5/relabel.lua \
   extension/dist/titan/share/lua/5.5/titan-compiler/driver.lua \
   extension/dist/titan/share/lua/5.5/titan-compiler/maybe3.lua \
+  extension/dist/titan/share/lua/5.5/titan-compiler/path.lua \
   extension/dist/titan/share/lua/5.5/titan-compiler/documentation.lua \
   extension/dist/titan/share/lua/5.5/titan-compiler/completion.lua \
   extension/dist/titan/share/lua/5.5/titan-compiler/checker/completion.lua \

@@ -24,7 +24,7 @@ The executable statically selects the Titan standard-library runtime modules
 needed by the server, together with the embedded Lua interpreter and configured
 native dependencies. Initialized statically linked modules register their
 runtime openers in `package.preload`. The executable separately embeds a
-metadata-only inventory of all 22 canonical standard-module interfaces;
+metadata-only inventory of all 23 canonical standard-module interfaces;
 compiler language-server API 1 validates and decodes it and its build target's
 C type profile for project typechecking. This inventory is analysis data, not
 module implementation or a linkable provider.
@@ -96,10 +96,10 @@ example with `-Wl,-E`) so native Lua modules bind to the same Lua state.
 
 Project typechecking does not discover Titan standard-module interfaces through
 an on-disk provider. API 1 validates and decodes the executable's metadata-only
-22-entry inventory before considering disk-backed compiled providers. The
+23-entry inventory before considering disk-backed compiled providers. The
 inventory covers `titan.async`, `titan.coroutine`, `titan.fs`, `titan.gc`,
 `titan.http`, `titan.io`, `titan.iteration`, `titan.json`, `titan.lua`,
-`titan.math`, `titan.net`, `titan.os`, `titan.peg`, `titan.reflect`,
+`titan.math`, `titan.net`, `titan.os`, `titan.path`, `titan.peg`, `titan.reflect`,
 `titan.sqlite3`, `titan.ssl`, `titan.string`, `titan.test`, `titan.timer`,
 `titan.url`, `titan.uv`, and `titan.websocket`; it carries serialized ABI/type data,
 not implementations or link inputs. The provider also carries a validated
@@ -345,7 +345,7 @@ has evidence before moving to Done.
   and package checks aligned.
 - No `lib/titan` provider tree or Titan provider/archive in the VSIX.
 - Initialized statically linked standard modules use `package.preload`; the
-  complete 22-entry embedded inventory is validated metadata-only analysis
+  complete 23-entry embedded inventory is validated metadata-only analysis
   input, not runtime code or a linkable provider.
 - Native compiler dependencies can bind to the exported embedded Lua API.
 - No server logging on stdout.

@@ -14,6 +14,7 @@ local EXPECTED_MODULES = {
     "titan.math",
     "titan.net",
     "titan.os",
+    "titan.path",
     "titan.peg",
     "titan.reflect",
     "titan.sqlite3",

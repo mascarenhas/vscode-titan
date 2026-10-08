@@ -34,15 +34,21 @@ async function compilerSDK(context) {
   for (const directory of directories) await mkdir(path.join(result.sdk, directory), { recursive: true });
   for (const member of ["argparse.lua", "inspect.lua", "relabel.lua", "c-parser/cdriver.lua", "titan-compiler/checker.lua",
     "titan-compiler/checker/completion.lua", "titan-compiler/completion.lua", "titan-compiler/maybe3.lua", "titan-compiler/documentation.lua",
-    "titan-compiler/parser.lua", "titan-compiler/types.lua"]) {
+    "titan-compiler/parser.lua", "titan-compiler/path.lua", "titan-compiler/types.lua"]) {
     await result.put(`sdk/share/lua/5.5/${member}`);
   }
   await result.put("sdk/share/lua/5.5/titan-compiler/driver.lua", "driver.LANGUAGE_SERVER_API_VERSION = 1\n");
   await result.put("sdk/share/lua/5.5/titan-compiler/version.lua", 'LUA_VERSION = "5.5"\nTITAN_ABI_VERSION = "2"\nTITAN_VERSION = "0.6.0"\n');
   const extension = process.platform === "win32" ? "dll" : "so";
   for (const member of ["lfs", "lpeglabel"]) await result.put(`sdk/lib/lua/5.5/${member}.${extension}`);
+  if (process.platform === "win32") await result.put("sdk/lib/lua/5.5/luv.dll");
   for (const header of ["lauxlib.h", "llhttp.h", "luaconf.h", "lua.h", "lua.hpp", "lualib.h", "minicoro.h", "sqlite3.h", "titan.h", "uv.h"]) {
     await result.put(`sdk/include/${header}`);
+  }
+  if (process.platform === "win32") {
+    for (const header of ["backtrace.h", "backtrace-supported.h"]) {
+      await result.put(`sdk/include/${header}`, `/* ${header} */\n`);
+    }
   }
   await result.put("sdk/src/lua-5.5.1/lobject.h");
   return result;
@@ -60,7 +66,26 @@ test("system SDK staging preserves its exact header inventory without copying ho
   assert.equal(result.status, 0, result.stderr);
   await assert.rejects(lstat(path.join(state.root, "dist/titan/include/openssl")), { code: "ENOENT" });
   assert.equal(await readFile(path.join(state.root, "dist/titan/include/titan.h"), "utf8"), "fixture\n");
+  if (process.platform === "win32") {
+    for (const header of ["backtrace.h", "backtrace-supported.h"]) {
+      assert.equal(await readFile(path.join(state.root, "dist/titan/include", header), "utf8"),
+        `/* ${header} */\n`);
+    }
+  }
 });
+
+test("Windows SDK staging accepts an older absent pair and rejects a partial libbacktrace install",
+  { skip: process.platform !== "win32" }, async (context) => {
+    const state = await compilerSDK(context);
+    await rm(path.join(state.sdk, "include/backtrace.h"));
+    let result = stage(state);
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /SDK include tree inventory changed/);
+    await rm(path.join(state.sdk, "include/backtrace-supported.h"));
+    result = stage(state);
+    assert.equal(result.status, 0, result.stderr);
+    await assert.rejects(lstat(path.join(state.root, "dist/titan/include/backtrace.h")), { code: "ENOENT" });
+  });
 
 test("bundled SDK staging requires portable OpenSSL headers across library versions", async (context) => {
   const state = await compilerSDK(context);

@@ -134,6 +134,14 @@ async function assertProbeRecords(prefix) {
   assert.ok(records > 0, `no C-probe records were written below ${prefix}`);
 }
 
+function assertProbePrefix(actual, expected) {
+  assert.equal(typeof actual, "string", "server.start did not report probe_cache_prefix");
+  // Titan's portable path spelling uses forward slashes on Windows. Native
+  // normalization equates those separators while preserving POSIX backslashes.
+  assert.equal(path.normalize(actual), path.normalize(expected),
+    "server selected an unexpected compiler probe cache prefix");
+}
+
 async function featureSnapshot(session) {
   const position = {
     textDocument: {uri: uri(consumerFile)},
@@ -284,7 +292,7 @@ try {
   assert.ok(cacheStats(cold.records).conversion_misses > 0);
   assert.ok((await stat(databaseFile)).size > 0);
   const defaultProbePrefix = path.dirname(databaseFile);
-  assert.equal(cold.records.find((record) => record.event === "server.start")
+  assertProbePrefix(cold.records.find((record) => record.event === "server.start")
     ?.probe_cache_prefix, defaultProbePrefix);
   await assertProbeRecords(defaultProbePrefix);
 
@@ -336,7 +344,7 @@ try {
     "changed-mtime header edit reused a stale preprocessor graph");
   assert.ok(cacheStats(changedHeader.records).conversion_misses > 0,
     "header type edit reused a stale FFI conversion");
-  assert.equal(changedHeader.records.find((record) => record.event === "server.start")
+  assertProbePrefix(changedHeader.records.find((record) => record.event === "server.start")
     ?.probe_cache_prefix, explicitProbePrefix);
   await assertProbeRecords(explicitProbePrefix);
 

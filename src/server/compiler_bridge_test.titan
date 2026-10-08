@@ -4877,12 +4877,13 @@ end
 local function add_windows_metadata_root(context: test.Context, name: string,
                                          path: string, expected: boolean)
   context:run(name, function(_child: test.Context)
-    test.assert(bridge.windows_metadata_absolute_path(path) == expected,
+    test.assert(bridge.metadata_absolute_path(path) == expected,
       "compiler metadata root classification disagreed: " .. path)
   end)
 end
 
 function test_compiler_bridge_windows_metadata_absolute_roots(context: test.Context)
+  if ffi.VSCODE_TITAN_WINDOWS == 0 then test.skip("native Windows metadata") end
   add_windows_metadata_root(context, "drive_root",
     "C:/", true)
   add_windows_metadata_root(context, "native_drive",
@@ -4914,6 +4915,7 @@ function test_compiler_bridge_windows_metadata_absolute_roots(context: test.Cont
 end
 
 function test_compiler_bridge_windows_metadata_rejects_relative_roots(context: test.Context)
+  if ffi.VSCODE_TITAN_WINDOWS == 0 then test.skip("native Windows metadata") end
   add_windows_metadata_root(context, "empty",
     "", false)
   add_windows_metadata_root(context, "relative",
@@ -4947,6 +4949,7 @@ function test_compiler_bridge_windows_metadata_rejects_relative_roots(context: t
 end
 
 function test_compiler_bridge_windows_metadata_rejects_device_namespaces(context: test.Context)
+  if ffi.VSCODE_TITAN_WINDOWS == 0 then test.skip("native Windows metadata") end
   add_windows_metadata_root(context, "slash_namespace",
     "//?/C:/api.h", false)
   add_windows_metadata_root(context, "mixed_namespace_suffix",
@@ -4980,6 +4983,7 @@ function test_compiler_bridge_windows_metadata_rejects_device_namespaces(context
 end
 
 function test_compiler_bridge_windows_metadata_rejects_malformed_volume_roots(context: test.Context)
+  if ffi.VSCODE_TITAN_WINDOWS == 0 then test.skip("native Windows metadata") end
   add_windows_metadata_root(context, "volume_missing_separator",
     "\\\\?\\Volume{01234567-89ab-cdef-0123-456789abcdef}", false)
   add_windows_metadata_root(context, "volume_forward_separator",
@@ -5299,5 +5303,32 @@ function test_compiler_bridge_completion_foreign_callable_signature(_context: te
     end
     test.assert(found, "named C completion missing")
     test.assert(found_unnamed, "unnamed C completion missing")
+  end)
+end
+
+function test_compiler_bridge_native_windows_process_dependency_fences_cache(
+    _context: test.Context)
+  if ffi.VSCODE_TITAN_WINDOWS == 0 then test.skip("native Windows process dependency") end
+  run_bridge(function()
+    preload_real_compiler()
+    local resolve = lua.load([[
+return function() return assert(package.searchpath("luv", package.cpath)) end
+]], "=compiler_bridge_windows_process_dependency", nil)() as function (): string
+    local dependency = resolve()
+    local compiler = bridge.load()
+    local observed = false
+    local revision = "first native transport bytes"
+    local fingerprint = function(filename: string): string
+      if filename == dependency then
+        observed = true
+        return revision
+      end
+      return filename
+    end
+    local first = compiler:cache_identity(fingerprint)
+    revision = "replacement native transport bytes"
+    local replacement = compiler:cache_identity(fingerprint)
+    test.assert(observed and first ~= replacement,
+                "changed native Windows process transport retained compatible workspace facts")
   end)
 end

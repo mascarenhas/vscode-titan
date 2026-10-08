@@ -1,0 +1,68 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+import { spawnSync } from "node:child_process";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import { nativeRootInventory, requiredShareFiles } from "./stage-lua-modules.mjs";
+import { validateSdkIncludeInventory } from "./sdk-include-inventory.mjs";
+
+test("Windows SDK headers permit only the complete regular libbacktrace pair", () => {
+  const base = ["lauxlib.h", "llhttp.h", "luaconf.h", "lua.h", "lua.hpp", "lualib.h",
+    "minicoro.h", "sqlite3.h", "titan.h", "uv.h"].map((name) => `${name}:file`)
+    .concat(["titan:directory", "uv:directory"]);
+  validateSdkIncludeInventory(base, "win32");
+  const pair = ["backtrace.h:file", "backtrace-supported.h:file"];
+  validateSdkIncludeInventory([...base, ...pair], "win32");
+  validateSdkIncludeInventory([...base, ...pair, "openssl:directory"], "win32");
+  for (const extra of [[pair[0]], [pair[1]],
+    ["backtrace.h:symbolic link", pair[1]], [pair[0], "backtrace-supported.h:directory"],
+    [...pair, "unreviewed.h:file"]]) {
+    assert.throws(() => validateSdkIncludeInventory([...base, ...extra], "win32"),
+      /SDK include tree inventory changed/);
+  }
+  validateSdkIncludeInventory(base, "linux");
+  assert.throws(() => validateSdkIncludeInventory([...base, ...pair], "linux"),
+    /SDK include tree inventory changed/);
+});
+
+test("native compiler payload includes Windows luv with the existing controlled Lua modules", () => {
+  assert.deepEqual(nativeRootInventory("win32"), ["lfs.dll:file", "lpeglabel.dll:file", "luv.dll:file"]);
+  assert.deepEqual(nativeRootInventory("linux"), ["lfs.so:file", "lpeglabel.so:file"]);
+});
+
+test("staging requires and copies the portable compiler path helper", async (context) => {
+  const root = await mkdtemp(path.join(tmpdir(), "titan-staging-path-"));
+  context.after(() => rm(root, { recursive: true, force: true }));
+  const sdk = path.join(root, "sdk");
+  const put = async (relative, data = "fixture\n") => {
+    const filename = path.join(sdk, relative);
+    await mkdir(path.dirname(filename), { recursive: true });
+    await writeFile(filename, data);
+  };
+  for (const file of requiredShareFiles.filter((file) => file !== "titan-compiler/path.lua"))
+    await put(`share/lua/5.5/${file}`);
+  await put("share/lua/5.5/titan-compiler/version.lua", 'LUA_VERSION="5.5"\nTITAN_ABI_VERSION="2"\nTITAN_VERSION="0.6.0"\n');
+  await put("share/lua/5.5/titan-compiler/driver.lua", "driver.LANGUAGE_SERVER_API_VERSION = 1\n");
+  await put("share/lua/5.5/argparse.lua");
+  await mkdir(path.join(sdk, "share/lua/5.5/titan"));
+  if (process.platform !== "win32") await mkdir(path.join(sdk, "share/lua/5.5/luarocks"));
+  for (const member of nativeRootInventory()) await put(`lib/lua/5.5/${member.split(":")[0]}`);
+  for (const file of ["lauxlib.h", "llhttp.h", "luaconf.h", "lua.h", "lua.hpp", "lualib.h", "minicoro.h",
+    "sqlite3.h", "titan.h", "uv.h"]) await put(`include/${file}`);
+  for (const directory of ["include/titan", "include/uv", "src/lua-5.5.1"])
+    await mkdir(path.join(sdk, directory), { recursive: true });
+  const script = fileURLToPath(new URL("./stage-lua-modules.mjs", import.meta.url));
+  const run = () => spawnSync(process.execPath, [script], {
+    cwd: root, env: { ...process.env, TITAN_PREFIX: sdk }, encoding: "utf8", shell: false
+  });
+  const missing = run();
+  assert.notEqual(missing.status, 0);
+  assert.match(missing.stderr, /required Lua module titan-compiler\/path.lua/);
+  await put("share/lua/5.5/titan-compiler/path.lua", "return { portable = true }\n");
+  const staged = run();
+  assert.equal(staged.status, 0, staged.stderr);
+  assert.equal(await readFile(path.join(root, "dist/titan/share/lua/5.5/titan-compiler/path.lua"), "utf8"),
+    "return { portable = true }\n");
+});

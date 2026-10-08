@@ -1,6 +1,8 @@
 import { createHash } from "node:crypto";
 import { cp, lstat, mkdir, readFile, readdir, rm } from "node:fs/promises";
 import * as path from "node:path";
+import { fileURLToPath } from "node:url";
+import { validateSdkIncludeInventory } from "./sdk-include-inventory.mjs";
 
 const LUA_VERSION = "5.5";
 const LUA_SOURCE_VERSION = "5.5.1";
@@ -19,11 +21,13 @@ const EXPECTED_SHARE_ROOT = [
   "titan:directory",
   "titan-compiler:directory"
 ];
-const EXPECTED_NATIVE_ROOT = [
-  `lfs.${process.platform === "win32" ? "dll" : "so"}:file`,
-  `lpeglabel.${process.platform === "win32" ? "dll" : "so"}:file`
-];
-const REQUIRED_SHARE_FILES = [
+export function nativeRootInventory(platform = process.platform) {
+  const suffix = platform === "win32" ? "dll" : "so";
+  return [`lfs.${suffix}:file`, `lpeglabel.${suffix}:file`,
+    ...(platform === "win32" ? ["luv.dll:file"] : [])];
+}
+const EXPECTED_NATIVE_ROOT = nativeRootInventory();
+export const requiredShareFiles = [
   "c-parser/cdriver.lua",
   "inspect.lua",
   "relabel.lua",
@@ -34,24 +38,10 @@ const REQUIRED_SHARE_FILES = [
   "titan-compiler/maybe3.lua",
   "titan-compiler/documentation.lua",
   "titan-compiler/parser.lua",
+  "titan-compiler/path.lua",
   "titan-compiler/types.lua",
   "titan-compiler/version.lua"
 ];
-const EXPECTED_INCLUDE_ROOT = [
-  "lauxlib.h:file",
-  "llhttp.h:file",
-  "luaconf.h:file",
-  "lua.h:file",
-  "lua.hpp:file",
-  "lualib.h:file",
-  "minicoro.h:file",
-  "sqlite3.h:file",
-  "titan:directory",
-  "titan.h:file",
-  "uv:directory",
-  "uv.h:file"
-];
-
 const repositoryRoot = process.cwd();
 const titanPrefix = path.resolve(
   repositoryRoot,
@@ -63,7 +53,6 @@ try {
 } catch (cause) {
   if (cause.code !== "ENOENT") throw cause;
 }
-if (bundledOpenSSL) EXPECTED_INCLUDE_ROOT.push("openssl:directory");
 const outputPrefix = path.join(repositoryRoot, "dist", "titan");
 const trees = [
   {
@@ -82,7 +71,7 @@ const trees = [
     description: "Titan SDK include tree",
     source: path.join(titanPrefix, "include"),
     destination: path.join(outputPrefix, "include"),
-    expectedRoot: EXPECTED_INCLUDE_ROOT
+    validateInventory: validateSdkIncludeInventory
   },
   {
     description: "Lua native source tree",
@@ -111,6 +100,10 @@ async function validateRootInventory(tree) {
   const actual = entries
     .map((entry) => `${entry.name}:${entryKind(entry)}`)
     .sort();
+  if (tree.validateInventory) {
+    tree.validateInventory(actual);
+    return;
+  }
   const expected = [...tree.expectedRoot].sort();
   if (JSON.stringify(actual) !== JSON.stringify(expected)) {
     throw new Error(
@@ -225,49 +218,56 @@ function compareInventories(tree, sourceInventory, stagedInventory) {
   }
 }
 
-await rm(outputPrefix, { recursive: true, force: true });
+export async function stageLuaModules() {
+  await rm(outputPrefix, { recursive: true, force: true });
 
-for (const tree of trees) {
-  await validateRootInventory(tree);
-}
-for (const relativePath of REQUIRED_SHARE_FILES) {
-  await requireRegularFile(
-    trees[0].source,
-    relativePath,
-    `required Lua module ${relativePath}`
-  );
-}
-await validateCompilerVersion(trees[0].source);
-if (bundledOpenSSL) {
-  for (const header of ["ssl.h", "crypto.h", "opensslv.h"]) {
+  for (const tree of trees) {
+    await validateRootInventory(tree);
+  }
+  for (const relativePath of requiredShareFiles) {
     await requireRegularFile(
-      trees[2].source, `openssl/${header}`, `bundled OpenSSL header ${header}`
+      trees[0].source,
+      relativePath,
+      `required Lua module ${relativePath}`
     );
   }
-}
-
-let fileCount = 0;
-let byteCount = 0;
-for (const tree of trees) {
-  const sourceInventory = await inventory(tree.source);
-  await mkdir(path.dirname(tree.destination), { recursive: true });
-  await cp(tree.source, tree.destination, {
-    errorOnExist: true,
-    force: false,
-    preserveTimestamps: true,
-    recursive: true
-  });
-  const stagedInventory = await inventory(tree.destination);
-  compareInventories(tree, sourceInventory, stagedInventory);
-  for (const entry of stagedInventory) {
-    if (entry.type !== "file") continue;
-    fileCount += 1;
-    byteCount += entry.size;
+  await validateCompilerVersion(trees[0].source);
+  if (bundledOpenSSL) {
+    for (const header of ["ssl.h", "crypto.h", "opensslv.h"]) {
+      await requireRegularFile(
+        trees[2].source, `openssl/${header}`, `bundled OpenSSL header ${header}`
+      );
+    }
   }
+
+  let fileCount = 0;
+  let byteCount = 0;
+  for (const tree of trees) {
+    const sourceInventory = await inventory(tree.source);
+    await mkdir(path.dirname(tree.destination), { recursive: true });
+    await cp(tree.source, tree.destination, {
+      errorOnExist: true,
+      force: false,
+      preserveTimestamps: true,
+      recursive: true
+    });
+    const stagedInventory = await inventory(tree.destination);
+    compareInventories(tree, sourceInventory, stagedInventory);
+    for (const entry of stagedInventory) {
+      if (entry.type !== "file") continue;
+      fileCount += 1;
+      byteCount += entry.size;
+    }
+  }
+
+  console.log(
+    `staged ${fileCount} compiler module and SDK files (${byteCount} bytes) in ${
+      path.relative(repositoryRoot, outputPrefix)
+    }`
+  );
+
 }
 
-console.log(
-  `staged ${fileCount} compiler module and SDK files (${byteCount} bytes) in ${
-    path.relative(repositoryRoot, outputPrefix)
-  }`
-);
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  await stageLuaModules();
+}

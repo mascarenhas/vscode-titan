@@ -13,7 +13,7 @@ and SQLite. OpenSSL follows the selected Titan SDK: the default uses system
 OpenSSL 3 libraries, while bundled mode carries its archive payload.
 Initialized statically linked modules register their runtime
 openers in `package.preload`. Separately, the executable carries a metadata-only
-inventory of all 22 canonical Titan standard-module interfaces; compiler
+inventory of all 23 canonical Titan standard-module interfaces; compiler
 language-server API 1 validates and decodes those serialized interfaces and
 their build target's C type profile for project typechecking. The inventory
 contains no standard-module implementation, provider archive, header, or SDK
@@ -127,6 +127,8 @@ Because both repositories are
 private, the vscode-titan repository must define an Actions secret named
 `SSH_PRIVATE_KEY`; its public half must be registered as a read-only deploy key
 in `mascarenhas/titan`.
+
+Titan #211 uses ordinary LuaRocks deployment. On Linux, provide Readline development headers (`libreadline-dev` on Debian/Ubuntu or `readline-devel` on Fedora), or select `LUA_PLATFORM=linux` to omit Readline. LuaRocks owns compiler dependencies and native provider preparation. Use separate Titan source/build checkouts when preparing production and validation SDKs; upstream callers own cleanup when tools, flags, profiles or OpenSSL mode change.
 
 Use `make help` for focused targets. In particular, `make server-test` runs the
 native Titan suite serially; `make server-test-sharded` runs the same suite in two

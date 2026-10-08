@@ -265,9 +265,9 @@ function validateIndexingStatus(status) {
   }
 }
 
-async function nextIndexingStatus(responses) {
+async function nextIndexingStatus(responses, timeoutMilliseconds = 30_000) {
   while (responses.indexingStatusCursor >= responses.indexingStatuses.length) {
-    const message = await responses.read(30_000);
+    const message = await responses.read(timeoutMilliseconds);
     assert.equal(message.id, undefined);
     assert.equal(typeof message.method, "string");
     collectNotification(responses, message);
@@ -298,7 +298,8 @@ async function waitForIndexing(
   responses,
   expectedState = "ready",
   cycleCount = 1,
-  minimumEpoch
+  minimumEpoch,
+  { timeoutMilliseconds = 30_000 } = {}
 ) {
   assert.ok(Number.isInteger(cycleCount) && cycleCount >= 1);
   let terminal;
@@ -308,7 +309,7 @@ async function waitForIndexing(
     let activeWorkset;
     const progress = [];
     while (true) {
-      const status = await nextIndexingStatus(responses);
+      const status = await nextIndexingStatus(responses, timeoutMilliseconds);
       if (status.state === "indexing") {
         assert.equal(status.message, undefined);
         if (indexing === undefined) {
@@ -509,6 +510,63 @@ async function request(
 ) {
   child.stdin.write(frame({ jsonrpc: "2.0", id, method, params }));
   return responseFor(responses, id, milliseconds);
+}
+
+async function testInputNestingLimits() {
+  const root = await makePhysicalTemporaryRoot("vscode-titan-nesting-");
+  // Keep this a lifecycle-only session, usable with an unstaged compiler SDK.
+  await writeFile(path.join(root, "titan-config.lua"),
+    "this is not valid Lua and must not be evaluated\n", "utf8");
+  const child = launch(root);
+  const exit = exitOf(child);
+  const stderr = collect(child.stderr);
+  const responses = new FrameReader(child.stdout);
+  function nestedParams(containers, shape) {
+    let value = null;
+    for (let level = 0; level < containers; level += 1) {
+      value = shape === "array" || (shape === "mixed" && level % 2 === 0)
+        ? [value] : { x: value };
+    }
+    return value;
+  }
+  try {
+    const initialized = await request(child, responses, "nesting-initialize", "initialize", {});
+    assert.ok(initialized.result?.capabilities);
+    for (const shape of ["array", "object", "mixed"]) {
+      // The JSON-RPC envelope contributes one container: 127 params containers
+      // reach the accepted total depth 128; 128 reach the rejected depth 129.
+      const accepted = await request(child, responses, `nesting-128-${shape}`,
+        "titan/testInputNesting", nestedParams(127, shape));
+      assert.equal(accepted.error?.code, -32601,
+        `valid depth 128 ${shape} input did not reach method dispatch`);
+      child.stdin.write(frame({ jsonrpc: "2.0", id: `nesting-129-${shape}`,
+        method: "titan/testInputNesting", params: nestedParams(128, shape) }));
+      const rejected = await responseFor(responses, null);
+      assert.equal(rejected.error?.code, -32700,
+        `depth 129 ${shape} input did not produce a parse error`);
+      const recovered = await request(child, responses, `nesting-recovery-${shape}`,
+        "titan/testInputNesting", {});
+      assert.equal(recovered.error?.code, -32601,
+        `server did not recover after rejecting depth 129 ${shape} input`);
+    }
+    const shutdown = await request(child, responses, "nesting-shutdown", "shutdown", null);
+    assert.equal(shutdown.result, null);
+    child.stdin.write(frame({ jsonrpc: "2.0", method: "exit" }));
+    assert.deepEqual(await awaitExit(exit), { code: 0, signal: null });
+    await responses.finish();
+    assert.equal(responses.buffer.length, 0, "unexpected bytes after nesting responses");
+    assert.equal(stderr().length, 0, stderr().toString("utf8"));
+  } catch (cause) {
+    const diagnostic = stderr().toString("utf8").trim();
+    throw new Error(
+      `${cause.message}${diagnostic.length > 0 ? `; stderr: ${diagnostic}` : ""}`,
+      { cause }
+    );
+  } finally {
+    if (child.exitCode === null && child.signalCode === null) child.kill();
+    await awaitExit(exit);
+    await rm(root, { recursive: true, force: true });
+  }
 }
 
 async function semanticRequest(
@@ -1207,7 +1265,11 @@ async function testSelfContainedCompilerModules({ sdkHeaders = false } = {}) {
       params: {}
     }));
     phase = "initial indexing";
-    await waitForIndexing(responses);
+    // This fixture combines the complete native SDK header surface. Cold
+    // Windows preprocessing and conversion exceed the ordinary project limit.
+    await waitForIndexing(responses, "ready", 1, undefined, {
+      timeoutMilliseconds: sdkHeaders && process.platform === "win32" ? 120_000 : 30_000
+    });
 
     phase = "definition";
     const definition = await semanticRequest(
@@ -1979,7 +2041,7 @@ async function testTruncatedFrame() {
 export {
   FrameReader, collect, exitOf, frame, launch, makePhysicalTemporaryRoot,
   printedLuaPaths, request, semanticRequest, structuredLogRecords, waitForIndexing,
-  withTimeout, writeSavedGeneration
+  testInputNestingLimits, withTimeout, writeSavedGeneration
 };
 
 if (isMain) {
@@ -2001,10 +2063,12 @@ if (isMain) {
     console.log("self-contained compiler-module protocol smoke passed");
   } else if (mode === "--sdk-smoke") {
     await testSelfContainedCompilerModules({ sdkHeaders: true });
+    await testInputNestingLimits();
     console.log("packaged SDK header protocol smoke passed");
   } else {
     await testCoalescedIndexingResetStatus();
     await testLifecycle();
+    await testInputNestingLimits();
     await testSavedProjectSemantics();
     await testUnionPayloadSemantics();
     await testUnmappedSourceWarnings();

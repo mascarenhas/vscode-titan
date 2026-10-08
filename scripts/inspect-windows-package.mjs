@@ -7,15 +7,19 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import yauzl from "yauzl";
 import { runtimeDlls } from "./build-windows.mjs";
-import { parseCompilerReceipt } from "./windows-compiler-receipt.mjs";
+import { verifyCompilerRocks } from "./compiler-rocks.mjs";
+import { validateSdkIncludeInventory } from "./sdk-include-inventory.mjs";
 
 const hash = (bytes) => createHash("sha256").update(bytes).digest("hex");
 export const packageImages = [
   ...runtimeDlls.map((name) => `bin/${name}`), "bin/titan-language-server.exe",
   "lib/titan/0.6/titan.dll", "lib/titan/0.6/titan_language_server.dll",
-  "dist/titan/lib/lua/5.5/lfs.dll", "dist/titan/lib/lua/5.5/lpeglabel.dll"
+  "dist/titan/lib/lua/5.5/lfs.dll", "dist/titan/lib/lua/5.5/lpeglabel.dll", "dist/titan/lib/lua/5.5/luv.dll"
 ].sort();
-const systemDlls = new Set(["advapi32.dll", "bcrypt.dll", "crypt32.dll", "dbghelp.dll", "iphlpapi.dll",
+// libuv 1.53 links Synchronization.lib; Windows resolves WaitOnAddress through
+// this documented API-set contract. Keep the core API-set allowance exact.
+const systemDlls = new Set(["advapi32.dll", "api-ms-win-core-synch-l1-2-0.dll",
+  "bcrypt.dll", "crypt32.dll", "dbghelp.dll", "iphlpapi.dll",
   "kernel32.dll", "kernelbase.dll", "normaliz.dll", "ntdll.dll", "ole32.dll", "psapi.dll", "rpcrt4.dll",
   "secur32.dll", "shell32.dll", "shlwapi.dll", "ucrtbase.dll", "user32.dll", "userenv.dll", "version.dll",
   "winmm.dll", "ws2_32.dll"]);
@@ -70,10 +74,14 @@ async function tree(root, relative = "") {
 }
 
 export async function inspectPackage(filename, sdk, readobj, repository) {
+  const includeEntries = await readdir(path.join(sdk, "include"), { withFileTypes: true });
+  validateSdkIncludeInventory(includeEntries.map((entry) => `${entry.name}:${
+    entry.isDirectory() ? "directory" : entry.isFile() ? "file" :
+      entry.isSymbolicLink() ? "symbolic link" : "unsupported"}`), "win32");
   const files = await readPackage(filename);
   const required = ["dist/extension.js", "package.json", "readme.md", "LICENSE.txt", "language-configuration.json",
     "syntaxes/titan.tmLanguage.json", "dist/notices/README.md", "dist/notices/titan/LICENSE",
-    "dist/notices/titan/THIRD_PARTY_NOTICES.md", "dist/notices/lua/compiler-dependencies.tsv", ...packageImages];
+    "dist/notices/titan/THIRD_PARTY_NOTICES.md", ...packageImages];
   for (const name of required) assert(files.has(`extension/${name}`), `missing VSIX file ${name}`);
   const manifest = files.get("extension.vsixmanifest")?.toString("utf8") ?? "";
   assert(manifest.includes('TargetPlatform="win32-x64"'), "VSIX lacks Windows x64 target");
@@ -94,10 +102,12 @@ export async function inspectPackage(filename, sdk, readobj, repository) {
   for (const name of await tree(path.join(repository, "dist/notices"))) {
     assert.equal(hash(files.get(`extension/dist/notices/${name}`)), hash(await readFile(path.join(repository, "dist/notices", name))), `VSIX notice differs: ${name}`);
   }
-  const receipt = parseCompilerReceipt(files.get("extension/dist/notices/lua/compiler-dependencies.tsv").toString("utf8"));
-  for (const row of receipt) {
-    assert.equal(hash(files.get(`extension/dist/titan/${row.artifact}`)), row.artifactHash, `VSIX receipt artifact mismatch: ${row.artifact}`);
-    assert.equal(hash(files.get(`extension/dist/notices/lua/${row.name}/LICENSE`)), row.noticeHash, `VSIX receipt notice mismatch: ${row.name}`);
+  const rocks = await verifyCompilerRocks(sdk, { platform: "win32" });
+  for (const component of rocks) {
+    const notice = files.get(`extension/dist/notices/${component.notice}`);
+    assert(notice, `VSIX lacks LuaRocks dependency notice: ${component.notice}`);
+    assert.equal(notice.toString("utf8"), component.license,
+      `VSIX LuaRocks dependency notice differs: ${component.notice}`);
   }
   const scratch = await mkdtemp(path.join(tmpdir(), "titan-vsix-pe-"));
   try {

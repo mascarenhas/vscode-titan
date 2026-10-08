@@ -3,6 +3,7 @@ local test = import "test"
 local iteration = import "iteration"
 local lua = import "lua"
 local strings = import "string"
+local paths = import "path"
 local embedded_interfaces = import "server.embedded_interfaces"
 
 local EXPECTED: {string: boolean} = {
@@ -18,6 +19,7 @@ local EXPECTED: {string: boolean} = {
   ["titan.math"] = true,
   ["titan.net"] = true,
   ["titan.os"] = true,
+  ["titan.path"] = true,
   ["titan.peg"] = true,
   ["titan.reflect"] = true,
   ["titan.sqlite3"] = true,
@@ -34,16 +36,7 @@ function test_embedded_interfaces_expose_the_complete_metadata_only_provider(
     _context: test.Context)
   local provider, identity = embedded_interfaces.provider()
   local provider_file: string = provider["provider_file"]
-  local absolute = strings.sub(provider_file, 1, 1) == "/"
-  if ffi.VSCODE_TITAN_WINDOWS ~= 0 then
-    -- Native metadata preserves GetFinalPathNameByHandleW's extended spelling;
-    -- this is a provider identity, not a user-facing source URI.
-    local native_root = strings.sub(provider_file, 1, 4) == "\\\\?\\"
-    local drive_root = strings.sub(provider_file, 2, 3)
-    absolute = drive_root == ":/" or drive_root == ":\\" or
-      (native_root and strings.sub(provider_file, 6, 7) == ":\\") or
-      (#provider_file > 8 and strings.sub(provider_file, 1, 8) == "\\\\?\\UNC\\")
-  end
+  local absolute = paths.is_absolute(provider_file)
   test.assert(#provider_file > 0 and absolute,
               "embedded interface provider path is not absolute: " .. provider_file)
   local identity_path: string = identity["path"]
@@ -82,8 +75,8 @@ function test_embedded_interfaces_expose_the_complete_metadata_only_provider(
     test.assert(abi == "2" and #types > 0,
                 "embedded interface entry has invalid ABI/types")
   end
-  test.assert(count == 22,
-              "embedded interface provider did not expose 22 entries")
+  test.assert(count == 23,
+              "embedded interface provider did not expose 23 entries")
 
   -- Discard any support table an earlier compiler test loaded from an ambient
   -- installation. The provider's registry preload must be sufficient by
@@ -155,4 +148,32 @@ end
     test.assert(runtime_is_absent(name),
                 "reading " .. name .. " metadata registered or loaded its runtime")
   end
+end
+
+function test_embedded_interfaces_native_windows_identity_is_complete(_context: test.Context)
+  if ffi.VSCODE_TITAN_WINDOWS == 0 then test.skip("native Windows image identity") end
+  local provider, first = embedded_interfaces.provider()
+  local native: string = first["native_identity"]
+  local complete = false
+  if strings.sub(native, 1, 13) == "win32-volume:" then
+    complete = #native == 73 and strings.sub(native, 30, 30) == "\0" and
+               strings.sub(native, 31, 41) == "win32-file:"
+  elseif strings.sub(native, 1, 18) == "win32-volume-guid:" then
+    complete = #native == 102 and strings.sub(native, 68, 68) == "\0" and
+               strings.sub(native, 69, 86) == "win32-legacy-file:"
+  end
+  test.assert(complete and first["device"] == nil and first["inode"] == nil,
+              "embedded Windows image identity lost its complete opaque native ID")
+  local nanoseconds: integer = first["modified_nanoseconds"]
+  test.assert(nanoseconds % 100 == 0,
+              "embedded image timestamp lost native 100ns precision")
+  local current = embedded_interfaces.identity()
+  local fields = {"path", "size", "kind", "native_identity", "modified_seconds",
+                  "modified_nanoseconds"}
+  for index = 1, #fields do
+    test.assert(current[fields[index]] == first[fields[index]],
+                "repeated embedded image identity changed " .. fields[index])
+  end
+  test.assert(current["path"] == provider["provider_file"],
+              "embedded inventory and identity used different mapped images")
 end

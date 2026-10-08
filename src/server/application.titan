@@ -6,6 +6,7 @@ local async = import "async"
 local fs = import "fs"
 local json = import "json"
 local strings = import "string"
+local paths = import "path"
 local source_text = import "server.source_text"
 local bridge = import "server.compiler_bridge"
 local diagnostics = import "server.diagnostics"
@@ -166,42 +167,21 @@ local function runtime_error(candidate: value): Error
   return Error.new(strings.tostring(candidate))
 end
 
-local function parent_directory(path: string): string
-  if ffi.VSCODE_TITAN_WINDOWS ~= 0 then
-    local parent?, failure? = source_text.resolve_path(path, "..")
-    if parent == nil then raise failure end
-    return parent
-  end
-  if path == "/" then return "/" end
-  local slash = 0
-  for index = 1, #path do
-    if strings.byte(path, index) == 47 then slash = index end
-  end
-  if slash <= 1 then return "/" end
-  return strings.sub(path, 1, slash - 1)
+local function parent_directory(subject: string): string
+  local parent?, failure? = source_text.normalize_absolute_path(paths.dirname(subject))
+  if parent == nil then raise failure end
+  return parent
 end
 
 local function child_path(parent: string, name: string): string
-  if parent == "/" or
-     (ffi.VSCODE_TITAN_WINDOWS ~= 0 and strings.sub(parent, -1) == "/") then
-    return parent .. name
-  end
-  return parent .. "/" .. name
+  return paths.to_slash(paths.join(parent, name))
 end
 
-local function leaf_name(path: string): string
-  if ffi.VSCODE_TITAN_WINDOWS ~= 0 then
-    local normalized?, failure? = source_text.normalize_absolute_path(path)
-    if normalized == nil then raise failure end
-    path = normalized
-  end
-  local parent = parent_directory(path)
-  if path == parent then return "" end
-  if parent == "/" or
-     (ffi.VSCODE_TITAN_WINDOWS ~= 0 and strings.sub(parent, -1) == "/") then
-    return strings.sub(path, #parent + 1)
-  end
-  return strings.sub(path, #parent + 2)
+local function leaf_name(subject: string): string
+  local normalized?, failure? = source_text.normalize_absolute_path(subject)
+  if normalized == nil then raise failure end
+  if normalized == parent_directory(normalized) then return "" end
+  return paths.basename(normalized)
 end
 
 local function canonical_directory(path: string): string
@@ -257,13 +237,13 @@ local function canonical_file_path(path: string): string
     canonical_directory(parent_directory(path)), leaf_name(path))
 end
 
-local function path_within(root: string, path: string): boolean
-  if path == root then return true end
-  if root == "/" then return strings.sub(path, 1, 1) == "/" end
-  if ffi.VSCODE_TITAN_WINDOWS ~= 0 and strings.sub(root, -1) == "/" then
-    return strings.sub(path, 1, #root) == root
-  end
-  return strings.sub(path, 1, #root + 1) == root .. "/"
+-- Inputs are the established slash-separated project identities, not raw
+-- native paths. Containment remains a component boundary and preserves case.
+local function path_within(root: string, subject: string): boolean
+  if subject == root then return true end
+  local prefix = root
+  if strings.sub(prefix, -1) ~= "/" then prefix = prefix .. "/" end
+  return strings.sub(subject, 1, #prefix) == prefix
 end
 
 local function titan_source_path(path: string): boolean
@@ -303,8 +283,7 @@ end
 local function valid_relative_directory(root: string, path: string): boolean
   if path == root then return true end
   local start = #root + 2
-  if root == "/" or
-     (ffi.VSCODE_TITAN_WINDOWS ~= 0 and strings.sub(root, -1) == "/") then
+  if strings.sub(root, -1) == "/" then
     start = #root + 1
   end
   local component_start = start
@@ -346,21 +325,10 @@ local function mapped_source_path(path: string,
   return false
 end
 
-local function rebase_path(path: string, source_root: string,
+local function rebase_path(subject: string, source_root: string,
                            observed_root: string): string
-  if path == source_root then return observed_root end
-  if ffi.VSCODE_TITAN_WINDOWS == 0 then
-    if source_root == "/" then
-      if observed_root == "/" then return path end
-      return observed_root .. path
-    end
-    return observed_root .. strings.sub(path, #source_root + 1)
-  end
-  local start = #source_root + 2
-  if strings.sub(source_root, -1) == "/" then start = #source_root + 1 end
-  local separator = "/"
-  if strings.sub(observed_root, -1) == "/" then separator = "" end
-  return observed_root .. separator .. strings.sub(path, start)
+  local relative = source_text.relative_path(source_root, subject)
+  return paths.to_slash(paths.join(observed_root, relative))
 end
 
 local function cache_watch_paths(project_root: string, include_roots: {string},
