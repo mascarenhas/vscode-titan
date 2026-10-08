@@ -6,6 +6,7 @@ local iteration = import "iteration"
 local lua = import "lua"
 local math = import "math"
 local strings = import "string"
+local paths = import "path"
 local async = import "async"
 local fs = import "fs"
 local content_identity = import "server.content_identity"
@@ -782,39 +783,22 @@ local function required_string_list(candidate: value, module_name: string,
   return result
 end
 
--- Compiler observations may use canonical extended Windows filesystem roots.
--- Validate their root grammar without normalizing any bytes: these paths are
--- provenance, not user-facing file URIs. Keep this aligned with the compiler's
--- windows_path.is_absolute rather than SourceText's deliberately narrower API.
-local function metadata_separator(byte: integer, extended: boolean): boolean
-  if byte == 92 then return true end
-  if not extended and byte == 47 then return true end
-  return false
-end
-
+-- Compiler observations preserve exact physical provenance spelling, including
+-- canonical extended Windows roots. Titan classifies native volumes; this
+-- boundary limits them to filesystem roots supported by the compiler adapter.
 local function metadata_drive(byte: integer): boolean
   if byte >= 65 and byte <= 90 then return true end
   return byte >= 97 and byte <= 122
 end
 
-local function metadata_unc_root(path: string, start: integer,
-                                  extended: boolean): boolean
-  local server_end = start
-  while server_end <= #path and
-        not metadata_separator(strings.byte(path, server_end), extended) do
-    server_end = server_end + 1
-  end
-  if server_end > #path then return false end
-  local server = strings.sub(path, start, server_end - 1)
-  local share_start = server_end + 1
-  local share_end = share_start
-  while share_end <= #path and
-        not metadata_separator(strings.byte(path, share_end), extended) do
-    share_end = share_end + 1
-  end
-  local share = strings.sub(path, share_start, share_end - 1)
+local function metadata_unc_volume(volume: string, start: integer): boolean
+  local separator? = strings.find(volume, "/", start)
+  if separator == nil then return false end
+  local server = strings.sub(volume, start, separator - 1)
+  local share = strings.sub(volume, separator + 1)
   return server ~= "" and server ~= "." and server ~= ".." and
-         share ~= "" and share ~= "." and share ~= ".."
+         share ~= "" and share ~= "." and share ~= ".." and
+         strings.find(share, "/") == nil
 end
 
 local function metadata_volume_root(component: string): boolean
@@ -836,37 +820,32 @@ local function metadata_volume_root(component: string): boolean
   return true
 end
 
-local function windows_metadata_absolute_path(path: string): boolean
-  if path == "" or strings.find(path, "\0") ~= nil then return false end
-  if strings.sub(path, 1, 4) == "\\\\?\\" then
-    if strings.find(path, "/") ~= nil then return false end
-    if #path >= 7 and metadata_drive(strings.byte(path, 5)) and
-       strings.sub(path, 6, 7) == ":\\" then return true end
-    if strings.upper(strings.sub(path, 5, 8)) == "UNC\\" then
-      return metadata_unc_root(path, 9, true)
-    end
-    local slash? = strings.find(path, "\\", 5)
-    return slash ~= nil and
-           metadata_volume_root(strings.sub(path, 5, slash - 1))
-  end
-  if #path >= 3 and metadata_drive(strings.byte(path, 1)) and
-     strings.sub(path, 2, 2) == ":" then
-    return metadata_separator(strings.byte(path, 3), false)
-  end
-  if #path < 2 or not metadata_separator(strings.byte(path, 1), false) or
-     not metadata_separator(strings.byte(path, 2), false) then return false end
-  if #path >= 4 and metadata_separator(strings.byte(path, 4), false) and
-     (strings.sub(path, 3, 3) == "?" or strings.sub(path, 3, 3) == ".") then
+local function metadata_absolute_path(subject: string): boolean
+  if strings.find(subject, "\0") ~= nil or not paths.is_absolute(subject) then
     return false
   end
-  return metadata_unc_root(path, 3, false)
-end
-
-local function metadata_absolute_path(path: string): boolean
-  if ffi.VSCODE_TITAN_WINDOWS ~= 0 then
-    return windows_metadata_absolute_path(path)
+  if ffi.VSCODE_TITAN_WINDOWS == 0 then return true end
+  local volume = paths.to_slash(paths.volume(subject))
+  if #volume == 2 then return metadata_drive(strings.byte(volume, 1)) end
+  if strings.sub(subject, 1, 4) == "\\\\?\\" then
+    -- Verbatim Windows provenance must retain native separators and only the
+    -- filesystem namespace forms supported by the compiler's I/O adapter.
+    if strings.find(subject, "/") ~= nil then return false end
+    local suffix = strings.sub(volume, 5)
+    if #suffix == 2 and strings.sub(suffix, 2) == ":" then
+      return metadata_drive(strings.byte(suffix, 1)) and
+             strings.sub(subject, #volume + 1, #volume + 1) == "\\"
+    end
+    if strings.upper(strings.sub(suffix, 1, 4)) == "UNC/" then
+      return metadata_unc_volume(suffix, 5)
+    end
+    return metadata_volume_root(suffix) and
+           strings.sub(subject, #volume + 1, #volume + 1) == "\\"
   end
-  return strings.sub(path, 1, 1) == "/"
+  if strings.sub(volume, 1, 2) ~= "//" or
+     strings.sub(volume, 3, 3) == "?" or
+     strings.sub(volume, 3, 3) == "." then return false end
+  return metadata_unc_volume(volume, 3)
 end
 
 local function normalize_c_header_dependencies(
@@ -5341,16 +5320,6 @@ function Compiler:analyze_completion(root_module: string,
       raw_entry["c_header_dependencies"], "completion header inputs"), snapshot)
 end
 
-local function containing_directory(path: string): string
-  local slash = 0
-  for index = 1, #path do
-    if strings.byte(path,index) == 47 then slash = index end
-  end
-  if slash == 0 then return "." end
-  if slash == 1 then return "/" end
-  return strings.sub(path,1,slash-1)
-end
-
 local function hash_compiler_tree(directory: string, output: strings.StringWriter,
     fingerprint: function (string): string)
   local entries = fs.list(directory)
@@ -5358,7 +5327,7 @@ local function hash_compiler_tree(directory: string, output: strings.StringWrite
   for index = 1, #entries do names[index] = entries[index] end
   stable_sort(names, string_less, NormalizationWork.new(0))
   for index = 1, #names do
-    local path = directory .. "/" .. names[index]
+    local path = paths.join(directory, names[index])
     local metadata? = fs.stat(path)
     if metadata ~= nil then
       if metadata.kind == "directory" then
@@ -5417,9 +5386,12 @@ end
     return fail<|string|>(DRIVER_MODULE,"cannot identify compiler sources: " ..
       strings.tostring(compiler_error) .. strings.tostring(parser_error))
   end
-  hash_compiler_tree(containing_directory(compiler_path),output,fingerprint)
-  hash_compiler_tree(containing_directory(parser_path),output,fingerprint)
+  hash_compiler_tree(paths.dirname(compiler_path),output,fingerprint)
+  hash_compiler_tree(paths.dirname(parser_path),output,fingerprint)
   local dependencies = {"relabel","inspect","lfs","lpeglabel"}
+  -- The ordinary Windows compiler's native process transport is selected from
+  -- package.cpath too; its bytes must fence persisted compiler observations.
+  if ffi.VSCODE_TITAN_WINDOWS ~= 0 then dependencies[#dependencies + 1] = "luv" end
   for index = 1, #dependencies do
     local path?, path_error? = resolve(dependencies[index],index > 2)
     if path == nil then

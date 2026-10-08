@@ -2,6 +2,7 @@
 local lfs = require "lfs"
 local parser = require "titan-compiler.parser"
 local util = require "titan-compiler.util"
+local filepath = require "titan-compiler.path"
 
 local source_root, build_root, sdk_root, format = ...
 assert(source_root and build_root and sdk_root and
@@ -17,14 +18,14 @@ end
 
 local function mkdir(path)
     if lfs.attributes(path, "mode") == "directory" then return end
-    local parent = path:match("^(.*)/[^/]+$")
-    if parent and parent ~= "" then mkdir(parent) end
+    local parent = filepath.dirname(path)
+    if parent ~= path then mkdir(parent) end
     assert(lfs.mkdir(path))
 end
 
 local function write_changed(path, contents)
     if lfs.attributes(path, "mode") == "file" and read(path) == contents then return end
-    mkdir(assert(path:match("^(.*)/[^/]+$")))
+    mkdir(filepath.dirname(path))
     local temporary = path .. ".tmp"
     local file = assert(io.open(temporary, "wb"))
     assert(file:write(contents))
@@ -46,7 +47,7 @@ end
 
 local function scan(directory, relative, result)
     for _, name in ipairs(entries(directory)) do
-        local path = directory .. "/" .. name
+        local path = filepath.join(directory, name)
         local member = relative == "" and name or relative .. "/" .. name
         local mode = lfs.symlinkattributes(path, "mode")
         if mode == "directory" then scan(path, member, result)
@@ -68,11 +69,11 @@ scan(source_root, "", authored)
 for _, relative in ipairs(authored) do
     if relative:match("%.titan$") then
         titan_files[relative] = true
-        contents[relative] = read(source_root .. "/" .. relative)
+        contents[relative] = read(filepath.join(source_root, relative))
     elseif relative:match("%.h$") and not relative:match("%.ffi%.h$")
             and not relative:match("%.titan%.h$") then
         headers[#headers + 1] = relative
-        contents[relative] = read(source_root .. "/" .. relative)
+        contents[relative] = read(filepath.join(source_root, relative))
     end
 end
 
@@ -113,7 +114,7 @@ for _, name in ipairs(names) do
     end)
     local imported = {}
     for _, relative in ipairs(module.sources) do
-        local ast, failure = parser.parse(source_root .. "/" .. relative, contents[relative])
+        local ast, failure = parser.parse(filepath.join(source_root, relative), contents[relative])
         -- Defer a syntax failure to this module's Make target. An unrelated
         -- malformed test module must not block a production-only build.
         if not ast then module.parse_error = parser.error_to_string(failure) end
@@ -158,7 +159,7 @@ for _, name in ipairs(names) do
 end
 mkdir(build_root)
 for _, stage in ipairs({"server-src", "test-src"}) do
-    local directory = build_root .. "/" .. stage
+    local directory = filepath.join(build_root, stage)
     mkdir(directory)
     local previous = {}
     scan(directory, "", previous)
@@ -170,19 +171,19 @@ for _, stage in ipairs({"server-src", "test-src"}) do
             or relative:match("%.ffi%.h$") or relative:match("%.titan%.h$")
         if authored_output and not contents[relative]
                 or generated_output and not generated_outputs[relative] then
-            assert(os.remove(directory .. "/" .. relative))
+            assert(os.remove(filepath.join(directory, relative)))
         end
     end
     for _, relative in ipairs(authored) do
-        if contents[relative] then write_changed(directory .. "/" .. relative, contents[relative]) end
+        if contents[relative] then write_changed(filepath.join(directory, relative), contents[relative]) end
     end
 end
 
-local input_root = build_root .. "/native-inputs"
-write_changed(input_root .. "/headers", table.concat(headers, "\n") .. "\n")
+local input_root = filepath.join(build_root, "native-inputs")
+write_changed(filepath.join(input_root, "headers"), table.concat(headers, "\n") .. "\n")
 for _, name in ipairs(names) do
     local module = modules[name]
-    write_changed(input_root .. "/" .. name,
+    write_changed(filepath.join(input_root, name),
         table.concat(module.sources, "\n") .. "\nimports\n" ..
         table.concat(module.imports, "\n") .. "\nforeign=" .. tostring(module.foreign) ..
         "\nparse_error=" .. (module.parse_error or "") .. "\n")
@@ -190,10 +191,10 @@ end
 
 local sdk_files = {}
 for _, directory in ipairs({"bin", "lib", "include", "src", "share/lua", "share/titan/0.6/src"}) do
-    if lfs.attributes(sdk_root .. "/" .. directory, "mode") == "directory" then
+    if lfs.attributes(filepath.join(sdk_root, directory), "mode") == "directory" then
         local members = {}
-        scan(sdk_root .. "/" .. directory, "", members)
-        for _, member in ipairs(members) do sdk_files[#sdk_files + 1] = sdk_root .. "/" .. directory .. "/" .. member end
+        scan(filepath.join(sdk_root, directory), "", members)
+        for _, member in ipairs(members) do sdk_files[#sdk_files + 1] = filepath.join(sdk_root, directory, member) end
     end
 end
 -- System OpenSSL headers are not copied into Titan's SDK. They still own the
@@ -211,16 +212,16 @@ if openssl_include and openssl_include ~= "" then
         end
     end
     for _, include in ipairs(directories) do
-        local directory = include .. "/openssl"
+        local directory = filepath.join(include, "openssl")
         if not seen[directory] and lfs.attributes(directory, "mode") == "directory" then
             seen[directory] = true
             local members = {}
             scan(directory, "", members)
-            for _, member in ipairs(members) do sdk_files[#sdk_files + 1] = directory .. "/" .. member end
+            for _, member in ipairs(members) do sdk_files[#sdk_files + 1] = filepath.join(directory, member) end
         end
     end
 end
-write_changed(input_root .. "/sdk", table.concat(sdk_files, "\n") .. "\n")
+write_changed(filepath.join(input_root, "sdk"), table.concat(sdk_files, "\n") .. "\n")
 local configuration = {source_root, build_root, sdk_root}
 for _, variable in ipairs({"CC", "AR", "RANLIB", "PATH", "TITANC", "TITAN_LUA", "TITAN_BUILD_PROFILE",
         "TITAN_EXTRA_CPPFLAGS", "TITAN_EXTRA_CFLAGS", "TITAN_EXTRA_LDFLAGS",
@@ -232,7 +233,7 @@ for _, variable in ipairs({"CC", "AR", "RANLIB", "PATH", "TITANC", "TITAN_LUA", 
         "MACOSX_DEPLOYMENT_TARGET", "TITAN_RUNTIME_PREBUILT", "TITAN_PROBE_CACHE_DISABLE"}) do
     configuration[#configuration + 1] = variable .. "=" .. string.format("%q", os.getenv(variable) or "")
 end
-write_changed(build_root .. "/native.config", table.concat(configuration, "\n") .. "\n")
+write_changed(filepath.join(build_root, "native.config"), table.concat(configuration, "\n") .. "\n")
 
 -- The Windows driver consumes the same parsed module ownership and staged
 -- source graph. Unix Make rendering below remains the default.
@@ -267,7 +268,7 @@ if format == "--windows-plan" then
             ',"parseError":' .. (module.parse_error and json_string(module.parse_error) or "null") .. '}'
     end
     result[#result + 1] = "}}\n"
-    write_changed(build_root .. "/native-plan.json", table.concat(result))
+    write_changed(filepath.join(build_root, "native-plan.json"), table.concat(result))
     return
 end
 
@@ -281,7 +282,8 @@ end
 emit("NATIVE_SDK_INPUTS := " .. paths(sdk_files))
 local function module_outputs(stage, name)
     local module = modules[name]
-    local stem = build_root .. "/" .. stage .. "/" .. module.main:gsub("%.titan$", "")
+    local relative_stem = module.main:gsub("%.titan$", "")
+    local stem = filepath.join(build_root, stage, relative_stem)
     local outputs = {stem .. ".o", stem .. ".c", stem .. ".ffi.h"}
     if module.foreign then outputs[#outputs + 1] = stem .. ".titan.h" end
     return outputs
@@ -293,9 +295,10 @@ local function graph(stage, variable, selected, test_mode)
     for _, name in ipairs(selected) do
         local module = modules[name]
         local outputs = module_outputs(stage, name)
-        local prerequisites = {input_root .. "/" .. name, input_root .. "/headers", input_root .. "/sdk"}
-        for _, source in ipairs(module.sources) do prerequisites[#prerequisites + 1] = build_root .. "/" .. stage .. "/" .. source end
-        for _, header in ipairs(headers) do prerequisites[#prerequisites + 1] = build_root .. "/" .. stage .. "/" .. header end
+        local prerequisites = {filepath.join(input_root, name),
+            filepath.join(input_root, "headers"), filepath.join(input_root, "sdk")}
+        for _, source in ipairs(module.sources) do prerequisites[#prerequisites + 1] = filepath.join(build_root, stage, source) end
+        for _, header in ipairs(headers) do prerequisites[#prerequisites + 1] = filepath.join(build_root, stage, header) end
         for _, dependency in ipairs(module.imports) do
             for _, value in ipairs(module_outputs(stage, dependency)) do prerequisites[#prerequisites + 1] = value end
         end
@@ -315,7 +318,7 @@ local function graph(stage, variable, selected, test_mode)
         emit("\t  cd $(call shell_quote," .. (test_mode and "$(TEST_BUILD_DIR)" or "$(SERVER_BUILD_DIR)") .. "); \\")
         emit("\t  $(NATIVE_COMPILER_ENV) $(call shell_quote,$(TITANC)) " ..
             (test_mode and "--test" or "--static") .. " --source-first --incremental -j1 -c --tree " ..
-            shell_quote(build_root .. "/" .. stage) .. " " .. shell_quote(name) .. "; \\")
+            shell_quote(filepath.join(build_root, stage)) .. " " .. shell_quote(name) .. "; \\")
         emit("\t  for output in " .. table.concat(quoted, " ") .. "; do test -f \"$$output\" || { echo \"missing generated output $$output\" >&2; exit 1; }; done; fi")
         end
         for index = 2, #outputs do
@@ -324,8 +327,8 @@ local function graph(stage, variable, selected, test_mode)
         end
     end
 end
-mkdir(build_root .. "/server")
-mkdir(build_root .. "/tests")
+mkdir(filepath.join(build_root, "server"))
+mkdir(filepath.join(build_root, "tests"))
 graph("server-src", "SERVER_MODULE_OBJECTS", server_modules, false)
 graph("test-src", "TEST_MODULE_OBJECTS", test_modules, true)
-write_changed(build_root .. "/native-modules.mk", table.concat(output))
+write_changed(filepath.join(build_root, "native-modules.mk"), table.concat(output))

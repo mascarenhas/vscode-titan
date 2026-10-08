@@ -130,7 +130,10 @@ One Make invocation owns a build directory. Independent concurrent builds in
 one checkout need separate `BUILD_ROOT` values and separate `SERVER` destinations
 (the default is `bin/titan-language-server`). Object-only and test-only builds
 need only separate build roots. Do not run multiple Make processes against the
-same staged trees. `make clean` removes generated state. Native test execution
+same staged trees. Packaging temporarily stages the selected `SERVER` at
+`bin/titan-language-server` for the VSIX, then restores the preceding file; run
+packaging jobs sequentially in one checkout. `make clean` removes generated
+state. Native test execution
 remains split into the existing two shards, independently of object scheduling.
 
 ## Build regressions
@@ -184,6 +187,13 @@ only its own source stages, outputs, and the extension's packaged payload.
 Install JavaScript dependencies using native Windows npm in this checkout; do
 not reuse a Linux `node_modules` tree.
 
+Prepare that SDK with Titan's consolidated `Makefile.win` and ordinary
+LuaRocks source-rock installation, following the upstream
+[Windows build guide](https://github.com/mascarenhas/titan/blob/master/doc/implementation/windows-build.md).
+Its standard provider includes `titan.path`; compiler dependencies include
+the stock `luv` rock for native Windows process handling. Keep production
+and validation SDKs in separate prefixes and build directories.
+
 For example, from a normal PowerShell prompt with native Node on the process PATH:
 
 ```powershell
@@ -199,10 +209,14 @@ node scripts/build-windows.mjs package @native
 ```
 
 The example locations must refer to the actual prepared SDK and tool prefix.
-The driver starts native executables directly without a command shell. It
-inherits the parent environment, clears conflicting Lua/Titan search overrides,
-and sets compiler paths only for its children. It neither installs tools nor
-changes global PATH, accounts, privileges, or execution policy.
+The driver starts native executables directly without a command shell. Compiler
+commands invoke the selected SDK's `bin/lua.exe -E` with its installed
+`lib/luarocks/rocks-5.5/titan/0.6.0-1/bin/titanc` script and native argument vector.
+LuaRocks' installation-specific batch wrapper is not needed. The controlled Lua
+runtime finds its compiler modules relative to the executable after relocation.
+The driver inherits the parent environment, clears conflicting Lua/Titan search
+overrides, and sets compiler paths only for its children. It neither installs
+tools nor changes global PATH, accounts, privileges, or execution policy.
 
 `server-test-build` and `server-test-run` default to the `validation` build
 profile; `server`, `stage`, and `package` default to `production`. Validation
@@ -214,6 +228,13 @@ shared `TITAN_BUILD_PROFILE` environment setting is also honored. Explicit
 inherited `TITAN_EXTRA_CPPFLAGS`, `TITAN_EXTRA_CFLAGS`, and
 `TITAN_EXTRA_LDFLAGS` follow profile defaults, preserving sanitizer and other
 overrides. Native helper flags use the compiler's argument parser.
+
+The Windows test aggregate also reserves an 8 MiB executable stack, matching
+Titan's stdlib test harness. Its unbootstrapped validation tests round-trip
+protocol JSON through 128 nested containers with unoptimized native frames.
+Explicit `TITAN_EXTRA_LDFLAGS` follow this test-only reserve and can override it.
+The server retains Titan's ordinary executable and Task stack policy; the stdio
+transcript separately checks input at the same depth boundary on its Task.
 
 The profile participates in object and compiler-probe identities. Test execution
 uses the existing aggregate; build it with the selected profile first. The SDK
@@ -235,33 +256,48 @@ and recipes retain their existing static production behavior.
 
 The application is `bin/titan-language-server.exe` plus
 `lib/titan/0.6/titan_language_server.dll` and `lib/titan/0.6/titan.dll`.
-The controlled Lua DLL and five native runtime DLLs live in `bin`; `lfs.dll` and
-`lpeglabel.dll` live in the compiler's `dist/titan/lib/lua/5.5` tree. Windows
+The controlled Lua DLL and five native runtime DLLs live in `bin`; `lfs.dll`,
+`lpeglabel.dll`, and `luv.dll` live in the compiler's `dist/titan/lib/lua/5.5` tree. Windows
 never packages a static Titan provider archive. The build still stages the
 compiler's Lua sources, SDK analysis headers, and matching Lua internal sources.
 The tiny launcher can be renamed within `bin` without changing logical module
 identity.
 
+Fresh Windows runtime installations also include the paired libbacktrace SDK
+headers, `backtrace.h` and `backtrace-supported.h`. Staging and package inspection
+accept the complete regular-file pair or an older SDK that omits both, and
+reject partial pairs, links, and unknown root entries. The packaged header tree
+must still match the selected SDK byte for byte.
+
 The Windows embedded-interface boundary reads callable metadata from the
-**canonical, actually loaded standard provider**. All 22 plain-C ABI values are
+**canonical, actually loaded standard provider**. All 23 plain-C ABI values are
 checked before invoking any Lua metadata callback. The generated source contains
 the C type profile, not a second serialized copy of the provider interfaces.
-Provider identity uses the runtime's complete volume/file identifiers and exact
-100 ns timestamps. A retained read handle denies write/delete sharing and makes
-that transient identity snapshot immutable. Later Task-path revalidation compares
+Provider path and identity use the retained native handle's canonical spelling,
+complete volume/file identifiers and exact 100 ns timestamps. The handle denies
+write/delete sharing and makes that transient identity snapshot immutable. The
+boundary also verifies that this handle still names the mapped provider image.
+Later Task-path revalidation compares
 the full opaque identity and normalized provider pathname without synchronous
 filesystem calls. Ordinary filesystem observations retain their existing async
 path; the opaque field is not stored in SQLite and changes no cache schema.
 Failed construction closes the handle immediately. Restart the server before
 updating or replacing its loaded standard provider on Windows.
 
-Windows compiler dependency notices come from the SDK's verified
-`share/titan/0.6/compiler-dependencies.tsv` source receipt. Staging checks the
-pinned source identities and every installed artifact/license hash; it requires
-no LuaRocks installation or invented rock metadata. The unsigned package target
-preserves these notices, then verifies the `win32-x64` VSIX target, exact DLL/EXE
-inventory, compiler/SDK bytes and PE imports. An unexpected compiler runtime DLL
-fails inspection. Signing and publishing are separate operations.
+Compiler dependency notices come from the ordinary installed LuaRocks rockspecs,
+`rock_manifest` ownership/checksums, and license files in the selected SDK.
+Staging verifies the selected versions and deployed module/license bytes.
+Windows `luv` 1.52.1-0 carries its Apache 2.0 license; its statically bundled
+libuv notices are also included in Titan's `LICENSES/libuv-LICENSE`,
+`libuv-LICENSE-extra`, `libuv-tree-LICENSE`, and `libuv-inet-LICENSE`. The unsigned
+package target preserves these notices, then verifies the `win32-x64` VSIX
+target, exact DLL/EXE inventory including `luv.dll`, compiler/SDK bytes and PE
+imports. Its explicit Windows system imports include libuv's
+`api-ms-win-core-synch-l1-2-0.dll` synchronization contract, documented by
+[Microsoft's WaitOnAddress reference](https://learn.microsoft.com/en-us/windows/win32/api/synchapi/nf-synchapi-waitonaddress).
+The core API-set allowance uses that exact name; unreviewed contracts and
+compiler runtime DLLs fail inspection. Signing and publishing are separate
+operations.
 
 Shared-folder notifications are best effort. Live file access is required, but
 watcher correctness on a guest-local NTFS workspace is the supported validation

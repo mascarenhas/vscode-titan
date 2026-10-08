@@ -5,7 +5,7 @@ import { lstat, mkdir, mkdtemp, readdir, readlink, realpath, rm, symlink } from 
 import { tmpdir } from "node:os";
 import { orderedModules, moduleOutputs, compilerArgument, runtimeDlls, childEnvironment, selectedBuildEnvironment,
   windowsPathContains, assertBuildRootOutsideSdk, buildProfileEnvironment, nativeBuildFlags,
-  nativeBuildDirectory } from "./build-windows.mjs";
+  nativeBuildDirectory, windowsCompilerCommand, windowsApplicationLinkFlags } from "./build-windows.mjs";
 
 test("SDK ownership recognizes Windows case variants without confusing sibling prefixes", () => {
   for (const candidate of ["c:\\sdk", "C:\\SDK\\build", "c:/Sdk/missing/child"]) {
@@ -190,4 +190,26 @@ test("profile identity invalidates a graph even when explicit flags coincide", (
   assert.equal(validation.TITAN_EXTRA_CFLAGS, production.TITAN_EXTRA_CFLAGS);
   assert.equal(validation.TITAN_EXTRA_LDFLAGS, production.TITAN_EXTRA_LDFLAGS);
   assert.notDeepEqual(validation, production);
+});
+
+
+test("Windows compilation invokes the installed LuaRocks script directly", () => {
+  const sdk = path.resolve("SDK space 路径");
+  const arguments_ = ["--tree", "source space", "server.root"];
+  assert.deepEqual(windowsCompilerCommand(sdk, arguments_), {
+    command: path.join(sdk, "bin", "lua.exe"),
+    args: ["-E", path.join(sdk, "lib", "luarocks", "rocks-5.5", "titan", "0.6.0-1", "bin", "titanc"), ...arguments_]
+  });
+  assert.deepEqual(arguments_, ["--tree", "source space", "server.root"]);
+});
+
+test("the Windows test aggregate reserves its own stack before explicit caller overrides", () => {
+  const inputs = ["C:\\build space\\native.o", "C:\\sdk\\libcrypto.dll.a"];
+  const extraFlags = "-Wl,--stack,16777216 -fsanitize=address";
+  const nativeInputs = inputs.map(compilerArgument).join(" ");
+  assert.equal(windowsApplicationLinkFlags({ test: true, extraFlags, inputs }),
+    `-Wl,--stack,8388608 ${extraFlags} ${nativeInputs}`);
+  assert.equal(windowsApplicationLinkFlags({ extraFlags, inputs }), `${extraFlags} ${nativeInputs}`);
+  assert.equal(windowsApplicationLinkFlags({ test: true }), "-Wl,--stack,8388608");
+  assert.equal(windowsApplicationLinkFlags(), "");
 });

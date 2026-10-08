@@ -6,6 +6,7 @@ local async = import "async"
 local fs = import "fs"
 local iteration = import "iteration"
 local strings = import "string"
+local paths = import "path"
 local source_text = import "server.source_text"
 
 union ModuleKind
@@ -198,41 +199,20 @@ local function sort_issues(items: {Issue})
 end
 
 local function join(root: string, name: string): string
-  if root == "/" or
-     (ffi.VSCODE_TITAN_WINDOWS ~= 0 and strings.sub(root, -1) == "/") then
-    return root .. name
-  end
-  return root .. "/" .. name
+  return paths.to_slash(paths.join(root, name))
 end
 
-local function parent_directory(path: string): string
-  if ffi.VSCODE_TITAN_WINDOWS ~= 0 then
-    local parent?, failure? = source_text.resolve_path(path, "..")
-    if parent == nil then raise failure end
-    return parent
-  end
-  if path == "/" then return "/" end
-  local slash = 0
-  for index = 1, #path do
-    if strings.byte(path, index) == 47 then slash = index end
-  end
-  if slash <= 1 then return "/" end
-  return strings.sub(path, 1, slash - 1)
+local function parent_directory(subject: string): string
+  local parent?, failure? = source_text.normalize_absolute_path(paths.dirname(subject))
+  if parent == nil then raise failure end
+  return parent
 end
 
-local function leaf_name(path: string): string
-  if ffi.VSCODE_TITAN_WINDOWS ~= 0 then
-    local normalized?, failure? = source_text.normalize_absolute_path(path)
-    if normalized == nil then raise failure end
-    path = normalized
-  end
-  local parent = parent_directory(path)
-  if path == parent then return "" end
-  if parent == "/" or
-     (ffi.VSCODE_TITAN_WINDOWS ~= 0 and strings.sub(parent, -1) == "/") then
-    return strings.sub(path, #parent + 1)
-  end
-  return strings.sub(path, #parent + 2)
+local function leaf_name(subject: string): string
+  local normalized?, failure? = source_text.normalize_absolute_path(subject)
+  if normalized == nil then raise failure end
+  if normalized == parent_directory(normalized) then return "" end
+  return paths.basename(normalized)
 end
 
 -- Resolve every existing ancestor so deleted/future exclusion leaves retain
@@ -263,21 +243,10 @@ local function canonical_path(path: string): string
   return path
 end
 
-local function rebase_path(path: string, source_root: string,
+local function rebase_path(subject: string, source_root: string,
                            observed_root: string): string
-  if path == source_root then return observed_root end
-  if ffi.VSCODE_TITAN_WINDOWS == 0 then
-    if source_root == "/" then
-      if observed_root == "/" then return path end
-      return observed_root .. path
-    end
-    return observed_root .. strings.sub(path, #source_root + 1)
-  end
-  local start = #source_root + 2
-  if strings.sub(source_root, -1) == "/" then start = #source_root + 1 end
-  local separator = "/"
-  if strings.sub(observed_root, -1) == "/" then separator = "" end
-  return observed_root .. separator .. strings.sub(path, start)
+  local relative = source_text.relative_path(source_root, subject)
+  return paths.to_slash(paths.join(observed_root, relative))
 end
 
 local function titan_source(name: string): boolean
@@ -315,13 +284,13 @@ function valid_module_component(component: string): boolean
   return true
 end
 
-local function path_within(root: string, path: string): boolean
-  if path == root then return true end
-  if root == "/" then return strings.sub(path, 1, 1) == "/" end
-  if ffi.VSCODE_TITAN_WINDOWS ~= 0 and strings.sub(root, -1) == "/" then
-    return strings.sub(path, 1, #root) == root
-  end
-  return strings.sub(path, 1, #root + 1) == root .. "/"
+-- Inputs are the established slash-separated project identities, not raw
+-- native paths. Containment remains a component boundary and preserves case.
+local function path_within(root: string, subject: string): boolean
+  if subject == root then return true end
+  local prefix = root
+  if strings.sub(prefix, -1) ~= "/" then prefix = prefix .. "/" end
+  return strings.sub(subject, 1, #prefix) == prefix
 end
 
 local function pruned(path: string, roots: {string}): boolean
@@ -332,8 +301,7 @@ local function pruned(path: string, roots: {string}): boolean
 end
 
 local function relative_to_root(root: string, path: string): string
-  if root == "/" or
-     (ffi.VSCODE_TITAN_WINDOWS ~= 0 and strings.sub(root, -1) == "/") then
+  if strings.sub(root, -1) == "/" then
     return strings.sub(path, #root + 1)
   end
   return strings.sub(path, #root + 2)
@@ -639,13 +607,10 @@ local function scan_root(root: IncludeRoot, excluded: {string},
   end
 end
 
-local function relative_parent(path: string): string
-  local slash = 0
-  for index = 1, #path do
-    if strings.byte(path, index) == 47 then slash = index end
-  end
-  if slash == 0 then return "" end
-  return strings.sub(path, 1, slash - 1)
+local function relative_parent(subject: string): string
+  local parent = paths.to_slash(paths.dirname(subject))
+  if parent == "." then return "" end
+  return parent
 end
 
 local function path_depth(path: string): integer

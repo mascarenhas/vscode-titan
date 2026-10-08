@@ -13,6 +13,16 @@ const repository = fileURLToPath(new URL("..", import.meta.url));
 const forward = (value) => value.replaceAll("\\", "/");
 const hash = (value) => createHash("sha256").update(value).digest("hex");
 
+// LuaRocks' Windows wrapper is a batch file with installation-specific paths.
+// Invoke the installed script with its selected Lua to retain native argv and
+// relocated SDK support without entering cmd.exe.
+export function windowsCompilerCommand(sdk, args = []) {
+  return {
+    command: path.join(sdk, "bin", "lua.exe"),
+    args: ["-E", path.join(sdk, "lib", "luarocks", "rocks-5.5", "titan", "0.6.0-1", "bin", "titanc"), ...args]
+  };
+}
+
 export function orderedModules(plan, selected) {
   const result = [], seen = new Set(), visiting = new Set();
   function visit(name) {
@@ -47,6 +57,14 @@ export function nativeBuildDirectory(buildRoot, target) {
 export function compilerArgument(value) {
   assert(!/[\0\r\n"]/.test(value), "native tool arguments cannot contain NUL/newline/quotes");
   return `"${forward(value)}"`;
+}
+
+export function windowsApplicationLinkFlags({ test = false, extraFlags = "", inputs = [] } = {}) {
+  // The unbootstrapped validation aggregate exercises the protocol's depth-128
+  // JSON round trips on the executable stack. Match Titan's Windows stdlib
+  // test harness reserve; explicit caller flags follow this test-only default.
+  return [...(test ? ["-Wl,--stack,8388608"] : []), extraFlags,
+    ...inputs.map(compilerArgument)].filter(Boolean).join(" ");
 }
 
 export function childEnvironment(inherited, overrides, removed = []) {
@@ -197,7 +215,7 @@ export async function buildWindows(target, {
   await assertBuildRootOutsideSdk(sdk, buildRoot);
   const targets = ["plan", "server", "server-test-build", "server-test-run", "stage", "package"];
   assert(targets.includes(target), `expected one of ${targets.join(", ")}`);
-  const lua = path.join(sdk, "bin", "lua.exe"), titanc = path.join(sdk, "bin", "titanc.exe");
+  const lua = path.join(sdk, "bin", "lua.exe");
   const inheritedPath = Object.entries(process.env).find(([key]) => key.toUpperCase() === "PATH")?.[1] ?? "";
   const env = childEnvironment(buildProfileEnvironment(target, process.env, buildProfile), {
     CC: compilerArgument(clang), AR: compilerArgument(ar), RANLIB: compilerArgument(ranlib),
@@ -216,6 +234,10 @@ export async function buildWindows(target, {
     });
     if (result.error) throw result.error;
     assert.equal(result.status, 0, `${path.basename(command)} failed (${result.signal ?? result.status})`);
+  }
+  function compile(args, cwd, overrides) {
+    const invocation = windowsCompilerCommand(sdk, args);
+    run(invocation.command, invocation.args, cwd, overrides);
   }
   await mkdir(buildRoot, { recursive: true });
   const lockPath = path.join(buildRoot, "build.lock");
@@ -262,8 +284,8 @@ export async function buildWindows(target, {
     // tool/header/flag invalidation without writing the immutable SDK.
     const headers = await digestFiles(plan.headers.map((name) => path.join(stage, name)));
     env.TITAN_PREFIX = path.join(buildRoot, "compiler-cache", hash(settings + headers));
-    // Relative staged inputs keep the serial Windows command below cmd's
-    // length bound without changing source ownership or the parsed graph.
+    // Relative staged inputs keep native argument vectors compact without
+    // changing source ownership or the parsed graph.
     const tree = forward(path.relative(directory, stage));
     const args = [...(test ? ["--test"] : []), "--source-first", "--incremental", "-j1"];
     const support = path.join(directory, "titan/test__test_support");
@@ -272,7 +294,7 @@ export async function buildWindows(target, {
       const stamp = hash(settings + await fileDigest(path.join(sdk, "share/titan/0.6/src/titan/test.titan")));
       if (previous.support !== stamp || !await allFiles(supportOutputs)) {
         await rm(supportOutputs[0], { force: true });
-        run(titanc, [...args, "-c", "--tree", tree, "titan.test"], directory);
+        compile([...args, "-c", "--tree", tree, "titan.test"], directory);
         assert(await allFiles(supportOutputs), "missing generated test support");
       }
       state.support = stamp;
@@ -285,7 +307,7 @@ export async function buildWindows(target, {
       if (previous.objects[name] !== stamp || !await allFiles(outputs)) {
         await rm(outputs[0], { force: true });
         if (!module.foreign) await rm(outputs[0].replace(/\.o$/, ".titan.h"), { force: true });
-        run(titanc, [...args, "-c", "--tree", tree, name], directory);
+        compile([...args, "-c", "--tree", tree, name], directory);
         assert(await allFiles(outputs), `missing generated companions for ${name}`);
       }
       state.objects[name] = stamp;
@@ -315,9 +337,9 @@ export async function buildWindows(target, {
     if (previous.link !== linkStamp || !await allFiles([executable, provider])) {
       // content_identity calls SHA256 directly; Windows imports that API from
       // the controlled native DLL instead of the Unix flattened static provider.
-      const linkFlags = [env.TITAN_EXTRA_LDFLAGS ?? "", compilerArgument(clock), compilerArgument(embedded),
-        compilerArgument(path.join(sdk, "lib/libcrypto.dll.a"))].join(" ");
-      run(titanc, [...args, ...(test ? ["--no-uv-bootstrap"] : ["--launcher-name", "titan-language-server"]),
+      const linkFlags = windowsApplicationLinkFlags({ test, extraFlags: env.TITAN_EXTRA_LDFLAGS ?? "",
+        inputs: [clock, embedded, path.join(sdk, "lib/libcrypto.dll.a")] });
+      compile([...args, ...(test ? ["--no-uv-bootstrap"] : ["--launcher-name", "titan-language-server"]),
         "--tree", tree, root], directory, { TITAN_EXTRA_LDFLAGS: linkFlags });
       assert(await allFiles([executable, provider]), "missing DLL application outputs");
     }

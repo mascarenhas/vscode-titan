@@ -2,6 +2,7 @@
 -- @module server.source_text
 
 local strings = import "string"
+local paths = import "path"
 foreign import "compiler_io_platform.h"
 
 -- ByteOffset uses the usual half-open, zero-based convention. Position is the
@@ -546,27 +547,6 @@ local function hex_value(byte: integer): integer
   return byte - 97 + 10
 end
 
-local function append_component(components: {string}, component: string)
-  if component == "" or component == "." then return end
-  if component == ".." then
-    if #components > 0 then components[#components] = nil end
-    return
-  end
-  components[#components + 1] = component
-end
-
--- Windows paths use one lexical separator internally. Keep this conversion out
--- of the Unix branch: a backslash is an ordinary Unix filename byte.
-local function windows_separators(path: string): string
-  local output = strings.writer()
-  for index = 1, #path do
-    local byte: integer = strings.byte(path, index)
-    if byte == 92 then byte = 47 end
-    output:write(strings.char(byte))
-  end
-  return output:drain()
-end
-
 local function valid_unc_authority(authority: string): boolean
   if authority == "" or authority == "." or authority == ".." then return false end
   for index = 1, #authority do
@@ -580,119 +560,97 @@ local function valid_unc_authority(authority: string): boolean
   return true
 end
 
-local function windows_root(path: string): string?
-  local first: integer = strings.byte(path, 1) or 0
+-- Project and URI identities deliberately keep forward slashes and uppercase
+-- drive letters. Titan owns native volume grammar; this boundary additionally
+-- rejects incomplete UNC roots and namespaces that cannot represent file URIs.
+local function windows_root(subject: string): string?
+  if not paths.is_absolute(subject) then return nil end
+  local volume = paths.to_slash(paths.volume(subject))
+  local first: integer = strings.byte(volume, 1) or 0
   local drive = false
   if first >= 65 and first <= 90 then drive = true end
   if first >= 97 and first <= 122 then drive = true end
-  if drive and strings.sub(path, 2, 3) == ":/" then
-    return strings.upper(strings.sub(path, 1, 1)) .. ":/"
+  if #volume == 2 and drive and strings.sub(volume, 2) == ":" then
+    return strings.upper(volume) .. "/"
   end
-  if strings.sub(path, 1, 2) ~= "//" then return nil end
-  local server_end? = strings.find(path, "/", 3)
+  if strings.sub(volume, 1, 2) ~= "//" then return nil end
+  local server_end? = strings.find(volume, "/", 3)
   if server_end == nil then return nil end
-  local server = strings.sub(path, 3, server_end - 1)
-  local share_end = strings.find(path, "/", server_end + 1) or (#path + 1)
-  local share = strings.sub(path, server_end + 1, share_end - 1)
-  if not valid_unc_authority(server) or
-     share == "" or share == "." or share == ".." then
+  local server = strings.sub(volume, 3, server_end - 1)
+  local share = strings.sub(volume, server_end + 1)
+  if not valid_unc_authority(server) or share == "" or
+     share == "." or share == ".." or strings.find(share, "/") ~= nil then
     return nil
   end
-  return "//" .. server .. "/" .. share
+  return volume
 end
 
-local function normalize_absolute_or_raise(path: string,
-                                            windows: boolean): string
+local function normalize_absolute_or_raise(subject: string): string
+  if strings.find(subject, "\0") ~= nil then
+    return fail<|string|>("path contains a NUL byte", nil)
+  end
   local root = "/"
-  if windows then
-    path = windows_separators(path)
-    local found? = windows_root(path)
+  if ffi.VSCODE_TITAN_WINDOWS ~= 0 then
+    local found? = windows_root(subject)
     if found == nil then
       return fail<|string|>("path must be a fully qualified drive or UNC path", nil)
     end
     root = found
-  elseif path == "" or strings.byte(path, 1) ~= 47 then
+  elseif not paths.is_absolute(subject) then
     return fail<|string|>("path must be absolute", nil)
   end
-  if strings.find(path, "\0") ~= nil then
-    return fail<|string|>("path contains a NUL byte", nil)
-  end
-
-  local components: {string} = {}
-  local start = #root + 1
-  local index = start
-  while index <= #path + 1 do
-    if index == #path + 1 or strings.byte(path, index) == 47 then
-      append_component(components, strings.sub(path, start, index - 1))
-      start = index + 1
+  local normalized = paths.to_slash(paths.normalize(subject))
+  if ffi.VSCODE_TITAN_WINDOWS ~= 0 then
+    local volume = paths.to_slash(paths.volume(subject))
+    if #volume == 2 then
+      normalized = root .. strings.sub(normalized, #volume + 2)
+    elseif strings.sub(normalized, -1) == "/" then
+      normalized = strings.sub(normalized, 1, -2)
     end
-    index = index + 1
   end
-
-  local output = strings.writer()
-  output:write(root)
-  for component_index = 1, #components do
-    if component_index > 1 or strings.sub(root, -1) ~= "/" then
-      output:write("/")
-    end
-    output:write(components[component_index])
-  end
-  return output:drain()
+  return normalized
 end
 
-function is_absolute_path(path: string): boolean
-  if ffi.VSCODE_TITAN_WINDOWS ~= 0 then
-    return windows_root(windows_separators(path)) ~= nil
-  end
-  return strings.sub(path, 1, 1) == "/"
+function is_absolute_path(subject: string): boolean
+  if ffi.VSCODE_TITAN_WINDOWS ~= 0 then return windows_root(subject) ~= nil end
+  return paths.is_absolute(subject)
 end
 
 function normalize_absolute_path(path: string): (string?, Error?)
   do
-    return normalize_absolute_or_raise(
-      path, ffi.VSCODE_TITAN_WINDOWS ~= 0), nil
+    return normalize_absolute_or_raise(path), nil
   catch
     if error is Error then return nil, error as Error end
     raise
   end
 end
 
-local function resolve_path_or_raise(base: string, path: string,
-                                      windows: boolean): string
-  local normalized_base = normalize_absolute_or_raise(base, windows)
-  if windows then
-    path = windows_separators(path)
-    if windows_root(path) ~= nil then
-      return normalize_absolute_or_raise(path, true)
-    end
-    -- Neither a current-drive root nor a drive-relative path has a stable
-    -- identity without process-global Windows drive state.
-    if strings.sub(path, 1, 1) == "/" or
-       strings.sub(path, 2, 2) == ":" then
+local function resolve_path_or_raise(base: string, subject: string): string
+  local normalized_base = normalize_absolute_or_raise(base)
+  if paths.is_absolute(subject) then return normalize_absolute_or_raise(subject) end
+  if ffi.VSCODE_TITAN_WINDOWS ~= 0 then
+    -- Current-drive roots and drive-relative names need process-global drive
+    -- state, which cannot participate in a stable project identity.
+    if strings.sub(paths.to_slash(subject), 1, 1) == "/" or
+       paths.volume(subject) ~= "" then
       return fail<|string|>("path must be a fully qualified drive or UNC path", nil)
     end
-  elseif path ~= "" and strings.byte(path, 1) == 47 then
-    return normalize_absolute_or_raise(path, false)
   end
-  local separator = "/"
-  if strings.sub(normalized_base, -1) == "/" then separator = "" end
-  return normalize_absolute_or_raise(normalized_base .. separator .. path,
-                                      windows)
+  return normalize_absolute_or_raise(paths.join(normalized_base, subject))
 end
 
 function resolve_path(base: string, path: string): (string?, Error?)
   do
-    return resolve_path_or_raise(base, path, ffi.VSCODE_TITAN_WINDOWS ~= 0), nil
+    return resolve_path_or_raise(base, path), nil
   catch
     if error is Error then return nil, error as Error end
     raise
   end
 end
 
-local function relative_path_or_raise(root: string, path: string,
-                                       windows: boolean): string?
-  local normalized_root = normalize_absolute_or_raise(root, windows)
-  local normalized_path = normalize_absolute_or_raise(path, windows)
+local function relative_path_or_raise(root: string, path: string): string?
+  local normalized_root = normalize_absolute_or_raise(root)
+  local normalized_path = normalize_absolute_or_raise(path)
   if normalized_path == normalized_root then return "" end
   local prefix = normalized_root
   if strings.sub(prefix, -1) ~= "/" then prefix = prefix .. "/" end
@@ -702,7 +660,7 @@ end
 
 function relative_path(root: string, path: string): string?
   do
-    return relative_path_or_raise(root, path, ffi.VSCODE_TITAN_WINDOWS ~= 0)
+    return relative_path_or_raise(root, path)
   catch
     if error is Error then return nil end
     raise
@@ -733,7 +691,8 @@ local function decode_uri_path(source: string): string
   return output:drain()
 end
 
-local function file_uri_to_path_or_raise(uri: string, windows: boolean): string
+local function file_uri_to_path_or_raise(uri: string): string
+  local windows = ffi.VSCODE_TITAN_WINDOWS ~= 0
   if strings.sub(uri, 1, 7) ~= "file://" then
     return fail<|string|>("URI must use the file scheme", nil)
   end
@@ -777,13 +736,13 @@ local function file_uri_to_path_or_raise(uri: string, windows: boolean): string
     -- drive path above is local; a share path retains the UNC host.
     path = "//" .. authority .. path
   end
-  return normalize_absolute_or_raise(path, windows)
+  return normalize_absolute_or_raise(path)
 end
 
 --- Decode and validate a local file URI into a normalized filesystem path.
 function file_uri_to_path(uri: string): (string?, Error?)
   do
-    return file_uri_to_path_or_raise(uri, ffi.VSCODE_TITAN_WINDOWS ~= 0), nil
+    return file_uri_to_path_or_raise(uri), nil
   catch
     if error is Error then return nil, error as Error end
     raise
@@ -806,8 +765,9 @@ local function hex_digit(nibble: integer): string
   return strings.sub("0123456789ABCDEF", nibble + 1, nibble + 1)
 end
 
-local function path_to_file_uri_or_raise(path: string, windows: boolean): string
-  local normalized = normalize_absolute_or_raise(path, windows)
+local function path_to_file_uri_or_raise(path: string): string
+  local windows = ffi.VSCODE_TITAN_WINDOWS ~= 0
+  local normalized = normalize_absolute_or_raise(path)
   local output = strings.writer()
   output:write("file://")
   if windows then
@@ -833,7 +793,7 @@ end
 --- Encode a normalized absolute filesystem path as a file URI.
 function path_to_file_uri(path: string): (string?, Error?)
   do
-    return path_to_file_uri_or_raise(path, ffi.VSCODE_TITAN_WINDOWS ~= 0), nil
+    return path_to_file_uri_or_raise(path), nil
   catch
     if error is Error then return nil, error as Error end
     raise

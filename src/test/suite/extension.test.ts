@@ -12,6 +12,10 @@ import { tmpdir } from "node:os";
 import * as path from "node:path";
 import * as vscode from "vscode";
 import {
+  ensureServerExecutable,
+  resolveServerExecutable
+} from "../../extension/clientConfig";
+import {
   createWorkspaceDocumentSelector,
   createWorkspaceMiddleware,
   createWorkspaceUriConverters
@@ -33,6 +37,11 @@ interface FixtureEvent {
   initializationOptions?: { insertCallSnippets: boolean };
   signal?: string;
 }
+
+// Windows child.kill() terminates the process without delivering a catchable
+// SIGTERM. The child PID must still disappear on every platform.
+const forcedTerminationEvents: FixtureEvent["event"][] =
+  process.platform === "win32" ? [] : ["terminate"];
 
 interface TraceFixtureEvent {
   event: "trace";
@@ -167,14 +176,14 @@ suite("Titan extension", () => {
       ["initialize"]
     );
     assert.notEqual(alphaInitial.pid, betaInitial.pid);
-    assertInitialization(
+    await assertInitialization(
       alphaInitial,
       alpha,
       "alpha",
       configuredLuaPath,
       configuredLuaCPath
     );
-    assertInitialization(
+    await assertInitialization(
       betaInitial,
       beta,
       "beta",
@@ -196,7 +205,7 @@ suite("Titan extension", () => {
       ["initialize", "shutdown", "exit", "initialize"]
     );
     assert.notEqual(betaReadded[3].pid, betaInitial.pid);
-    assertInitialization(
+    await assertInitialization(
       betaReadded[3],
       beta,
       "beta",
@@ -591,10 +600,8 @@ suite("Titan extension", () => {
         assert.deepEqual(initialization.initializationOptions, { insertCallSnippets: true });
         document = await vscode.workspace.openTextDocument(vscode.Uri.joinPath(alpha.uri, "sample.titan"));
         await replaceDocumentText(document, "method");
-        const result = await vscode.commands.executeCommand<vscode.CompletionList>(
-          "vscode.executeCompletionItemProvider", document.uri, new vscode.Position(0, 3));
-        const item = result.items.find((candidate) =>
-          (typeof candidate.label === "string" ? candidate.label : candidate.label.label) === "method");
+        const item = await waitForNamedCompletion(
+          document, new vscode.Position(0, 3), "method", 10_000);
         assert.ok(item, "call completion did not reach the editor");
         assert.ok(item.insertText instanceof vscode.SnippetString);
         assert.equal(item.insertText.value, "method(${1:count}, ${2:label})$0");
@@ -611,10 +618,8 @@ suite("Titan extension", () => {
         const optedOut = await waitForInitializationToken(alphaMarkerPath, "call-snippets", 10_000, initialization.pid);
         assert.notEqual(optedOut.pid, initialization.pid);
         assert.deepEqual(optedOut.initializationOptions, { insertCallSnippets: false });
-        const plain = await vscode.commands.executeCommand<vscode.CompletionList>(
-          "vscode.executeCompletionItemProvider", document.uri, new vscode.Position(0, 3));
-        const reference = plain.items.find((candidate) =>
-          (typeof candidate.label === "string" ? candidate.label : candidate.label.label) === "method");
+        const reference = await waitForNamedCompletion(
+          document, new vscode.Position(0, 3), "method", 10_000);
         assert.ok(reference, "name-only completion did not reach the editor");
         assert.equal(reference.insertText, "method");
         const betaAfter = (await readEvents(betaMarkerPath)).filter((event) => event.event === "initialize").at(-1);
@@ -898,27 +903,34 @@ suite("Titan extension", () => {
       ];
       let symlinkFolder: vscode.WorkspaceFolder | undefined;
 
-      await symlink(physicalRoot, lexicalRoot, "dir");
-      await mkdir(path.join(physicalRoot, ".vscode"), { recursive: true });
-      await writeFile(
-        path.join(physicalRoot, "sample.titan"),
-        "function linked(): integer\n  return 1\nend\n",
-        "utf8"
-      );
-      await writeFile(
-        path.join(physicalRoot, ".vscode", "settings.json"),
-        `${JSON.stringify({
-          "titan.languageServer.arguments": [
-            fakeServer,
-            lifecycleMarker,
-            "--fixture-token",
-            "symlink-bootstrap"
-          ]
-        }, null, 2)}\n`,
-        "utf8"
-      );
-
       try {
+        try {
+          await symlink(physicalRoot, lexicalRoot, "dir");
+        } catch (cause) {
+          if (process.platform === "win32" &&
+              (cause as NodeJS.ErrnoException).code === "EPERM") {
+            this.skip();
+          }
+          throw cause;
+        }
+        await mkdir(path.join(physicalRoot, ".vscode"), { recursive: true });
+        await writeFile(
+          path.join(physicalRoot, "sample.titan"),
+          "function linked(): integer\n  return 1\nend\n",
+          "utf8"
+        );
+        await writeFile(
+          path.join(physicalRoot, ".vscode", "settings.json"),
+          `${JSON.stringify({
+            "titan.languageServer.arguments": [
+              fakeServer,
+              lifecycleMarker,
+              "--fixture-token",
+              "symlink-bootstrap"
+            ]
+          }, null, 2)}\n`,
+          "utf8"
+        );
         await updateWorkspaceFolders(
           vscode.workspace.workspaceFolders?.length ?? 0,
           0,
@@ -928,7 +940,7 @@ suite("Titan extension", () => {
           vscode.workspace.workspaceFolders ?? [],
           "symlink"
         );
-        assert.equal(symlinkFolder.uri.fsPath, lexicalRoot);
+        assertNativePathEqual(symlinkFolder.uri.fsPath, lexicalRoot);
 
         await vscode.workspace.getConfiguration(
           "titan.languageServer",
@@ -944,10 +956,10 @@ suite("Titan extension", () => {
           10_000
         );
         const canonicalUri = vscode.Uri.file(canonicalRoot).toString();
-        assert.equal(initialization.cwd, canonicalRoot);
+        assertNativePathEqual(initialization.cwd, canonicalRoot);
         // vscode-languageclient keeps the deprecated rootPath lexical, but the
         // authoritative rootUri and every document URI use our converter.
-        assert.equal(initialization.rootPath, lexicalRoot);
+        assertNativePathEqual(initialization.rootPath, lexicalRoot);
         assert.equal(initialization.rootUri, canonicalUri);
         assert.deepEqual(initialization.workspaceFolders, [{
           uri: canonicalUri,
@@ -1027,13 +1039,11 @@ suite("Titan extension", () => {
 
       const failed = await waitForEventSequence(
         alphaMarkerPath,
-        ["shutdown", "exit", "initialize", "terminate"],
+        ["shutdown", "exit", "initialize", ...forcedTerminationEvents],
         10_000
       );
       const failedPid = failed[2].pid;
-      assert.equal(failed[3].pid, failedPid);
-      assert.equal(failed[3].signal, "SIGTERM");
-      await assertProcessExited(failedPid, 10_000);
+      await assertForcedTermination(failed, failedPid, 10_000);
 
       await vscode.workspace.getConfiguration(
         "titan.languageServer",
@@ -1051,9 +1061,10 @@ suite("Titan extension", () => {
 
       const retried = await assertStableEventSequence(
         alphaMarkerPath,
-        ["shutdown", "exit", "initialize", "terminate", "initialize"]
+        ["shutdown", "exit", "initialize", ...forcedTerminationEvents,
+          "initialize"]
       );
-      const retryPid = retried[4].pid;
+      const retryPid = retried.at(-1)!.pid;
       assert.notEqual(retryPid, failedPid);
       const livingPids = [...new Set(retried.map((event) => event.pid))]
         .filter(isProcessAlive);
@@ -1119,16 +1130,14 @@ suite("Titan extension", () => {
           "exit",
           "initialize",
           "shutdown",
-          "terminate",
+          ...forcedTerminationEvents,
           "initialize"
         ]
       );
       assert.equal(replaced[3].pid, ignoredShutdownPid);
-      assert.equal(replaced[4].pid, ignoredShutdownPid);
-      assert.equal(replaced[4].signal, "SIGTERM");
-      const replacementPid = replaced[5].pid;
+      const replacementPid = replaced.at(-1)!.pid;
       assert.notEqual(replacementPid, ignoredShutdownPid);
-      await assertProcessExited(ignoredShutdownPid, 10_000);
+      await assertForcedTermination(replaced, ignoredShutdownPid, 10_000);
 
       const livingPids = [...new Set(replaced.map((event) => event.pid))]
         .filter(isProcessAlive);
@@ -1143,12 +1152,18 @@ suite("Titan extension", () => {
   test("does not let a hanging workspace block another workspace",
     async function () {
       this.timeout(50_000);
+      const previousAlpha = (await readEvents(alphaMarkerPath))
+        .filter((event) => event.event === "initialize").at(-1);
+      assert.ok(previousAlpha, "alpha should have a running fixture server");
       await Promise.all([
         resetMarker(alphaMarkerPath),
         resetMarker(betaMarkerPath)
       ]);
 
-      process.env.TITAN_LSP_FIXTURE_HANG_ROOT = alpha.uri.fsPath;
+      const previousHangRoot = process.env.TITAN_LSP_FIXTURE_HANG_ROOT;
+      // The fake server compares this byte-for-byte with process.cwd(). Use
+      // its observed native spelling, including the Windows drive letter.
+      process.env.TITAN_LSP_FIXTURE_HANG_ROOT = previousAlpha.cwd;
       try {
         const globalLuaCPath = "/fixture/compiler/start-timeout/?.so";
         await vscode.workspace.getConfiguration("titan.compiler").update(
@@ -1177,20 +1192,24 @@ suite("Titan extension", () => {
           ["shutdown", "exit", "initialize"],
           "beta should start before alpha reaches its startup timeout"
         );
+        assert.equal(isProcessAlive(alphaBeforeTimeout[2].pid), true,
+          "hanging alpha should remain alive when beta becomes ready");
         assert.equal(betaStarted[2].luaCPath, globalLuaCPath);
       } finally {
-        delete process.env.TITAN_LSP_FIXTURE_HANG_ROOT;
+        if (previousHangRoot === undefined) {
+          delete process.env.TITAN_LSP_FIXTURE_HANG_ROOT;
+        } else {
+          process.env.TITAN_LSP_FIXTURE_HANG_ROOT = previousHangRoot;
+        }
       }
 
       const alphaTimedOut = await waitForEventSequence(
         alphaMarkerPath,
-        ["shutdown", "exit", "initialize", "terminate"],
+        ["shutdown", "exit", "initialize", ...forcedTerminationEvents],
         35_000
       );
       const hangingPid = alphaTimedOut[2].pid;
-      assert.equal(alphaTimedOut[3].pid, hangingPid);
-      assert.equal(alphaTimedOut[3].signal, "SIGTERM");
-      await assertProcessExited(hangingPid, 10_000);
+      await assertForcedTermination(alphaTimedOut, hangingPid, 35_000);
 
       await vscode.workspace.getConfiguration(
         "titan.languageServer",
@@ -1208,13 +1227,14 @@ suite("Titan extension", () => {
 
       const alphaRetried = await assertStableEventSequence(
         alphaMarkerPath,
-        ["shutdown", "exit", "initialize", "terminate", "initialize"]
+        ["shutdown", "exit", "initialize", ...forcedTerminationEvents,
+          "initialize"]
       );
       const betaStable = await assertStableEventSequence(
         betaMarkerPath,
         ["shutdown", "exit", "initialize"]
       );
-      const retryPid = alphaRetried[4].pid;
+      const retryPid = alphaRetried.at(-1)!.pid;
       const betaPid = betaStable[2].pid;
       assert.notEqual(retryPid, hangingPid);
 
@@ -1236,7 +1256,12 @@ suite("Titan extension", () => {
   test("connects VS Code to the packaged native server", async function () {
     this.timeout(60_000);
     const repositoryRoot = path.resolve(__dirname, "../../../..");
-    const server = path.join(repositoryRoot, "bin", "titan-language-server");
+    const server = resolveServerExecutable(
+      process.env.TITAN_LSP_TEST_SERVER ?? "",
+      repositoryRoot,
+      repositoryRoot
+    );
+    await ensureServerExecutable(server);
     const extension = vscode.extensions.getExtension(extensionIdentifier);
     assert.ok(extension, `${extensionIdentifier} should be installed`);
     const modulePrefix = path.join(extension.extensionPath, "dist", "titan");
@@ -1245,7 +1270,7 @@ suite("Titan extension", () => {
       path.join(modulePrefix, "share", "lua", "5.5", "?", "init.lua")
     ].join(";");
     const bundledLuaCPath = path.join(
-      modulePrefix, "lib", "lua", "5.5", "?.so"
+      modulePrefix, "lib", "lua", "5.5", process.platform === "win32" ? "?.dll" : "?.so"
     );
 
     await Promise.all([
@@ -1276,8 +1301,14 @@ suite("Titan extension", () => {
       10_000
     );
     const defaultedInitialization = defaulted[5];
-    assert.equal(defaultedInitialization.luaPath, bundledLuaPath);
-    assert.equal(defaultedInitialization.luaCPath, bundledLuaCPath);
+    const actualLuaTemplates = defaultedInitialization.luaPath?.split(";");
+    const expectedLuaTemplates = bundledLuaPath.split(";");
+    assert.ok(actualLuaTemplates, "bundled Lua path should be present");
+    assert.equal(actualLuaTemplates.length, expectedLuaTemplates.length);
+    for (const [index, expected] of expectedLuaTemplates.entries()) {
+      assertNativePathEqual(actualLuaTemplates[index], expected);
+    }
+    assertNativePathEqual(defaultedInitialization.luaCPath, bundledLuaCPath);
     assert.equal(defaultedInitialization.compilerCachePrefix, process.env.TITAN_PREFIX);
 
     await vscode.workspace.getConfiguration("titan.languageServer").update(
@@ -1347,14 +1378,37 @@ async function waitForBufferCompletion(
   assert.fail(`completion did not receive current dirty text; labels: ${labels}`);
 }
 
-function assertInitialization(
+async function waitForNamedCompletion(
+  document: vscode.TextDocument,
+  position: vscode.Position,
+  name: string,
+  timeoutMilliseconds: number
+): Promise<vscode.CompletionItem> {
+  const deadline = Date.now() + timeoutMilliseconds;
+  let labels: string[] = [];
+  while (Date.now() < deadline) {
+    const result = await vscode.commands.executeCommand<vscode.CompletionList>(
+      "vscode.executeCompletionItemProvider", document.uri, position);
+    const items = result?.items ?? [];
+    labels = items.map((item) =>
+      typeof item.label === "string" ? item.label : item.label.label);
+    const index = labels.indexOf(name);
+    if (index >= 0) return items[index];
+    await delay(50);
+  }
+  assert.fail(`completion ${name} did not reach the editor; labels: ${labels}`);
+}
+
+async function assertInitialization(
   event: FixtureEvent,
   folder: vscode.WorkspaceFolder,
   token: string,
   luaPath: string,
   luaCPath: string
-): void {
-  assert.equal(event.cwd, folder.uri.fsPath);
+): Promise<void> {
+  const physicalRoot = await realpath(folder.uri.fsPath);
+  const physicalUri = vscode.Uri.file(physicalRoot).toString();
+  assertNativePathEqual(event.cwd, physicalRoot);
   assert.deepEqual(event.arguments, ["--fixture-token", token]);
   assert.equal(event.luaPath, luaPath);
   assert.equal(event.luaCPath, luaCPath);
@@ -1363,12 +1417,26 @@ function assertInitialization(
   assert.equal(event.serverLogLevel, "info");
   assert.equal(event.trace, "off");
   assert.deepEqual(event.initializationOptions, { insertCallSnippets: true });
-  assert.equal(event.rootPath, folder.uri.fsPath);
-  assert.equal(event.rootUri, folder.uri.toString());
+  assertNativePathEqual(event.rootPath, folder.uri.fsPath);
+  assert.equal(event.rootUri, physicalUri);
   assert.deepEqual(event.workspaceFolders, [{
-    uri: folder.uri.toString(),
+    uri: physicalUri,
     name: folder.name
   }]);
+}
+
+function assertNativePathEqual(
+  actual: string | null | undefined,
+  expected: string
+): void {
+  assert.equal(typeof actual, "string");
+  const normalize = (value: string): string => {
+    const normalized = path.normalize(value);
+    return process.platform === "win32"
+      ? normalized.replace(/^[a-z]:/i, (drive) => drive.toUpperCase())
+      : normalized;
+  };
+  assert.equal(normalize(actual as string), normalize(expected));
 }
 
 async function resetMarker(markerPath: string): Promise<void> {
@@ -1622,6 +1690,20 @@ async function assertProcessExited(
     await delay(50);
   }
   assert.fail(`language-server process ${pid} remained alive after cleanup`);
+}
+
+async function assertForcedTermination(
+  events: FixtureEvent[],
+  pid: number,
+  timeoutMilliseconds: number
+): Promise<void> {
+  if (process.platform !== "win32") {
+    const termination = events.find((event) =>
+      event.event === "terminate" && event.pid === pid);
+    assert.ok(termination, "the fixture should receive forced SIGTERM");
+    assert.equal(termination.signal, "SIGTERM");
+  }
+  await assertProcessExited(pid, timeoutMilliseconds);
 }
 
 function isProcessAlive(pid: number): boolean {

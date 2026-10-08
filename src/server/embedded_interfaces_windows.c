@@ -6,6 +6,7 @@
 #include <psapi.h>
 #include <stdint.h>
 #include <string.h>
+#include <wchar.h>
 #include "lua.h"
 #include "lauxlib.h"
 #include "titan.h"
@@ -71,11 +72,129 @@ static WCHAR *ls_push_provider_path(lua_State *L, HMODULE module) {
     utf8 = lua_newuserdatauv(L, (size_t)size, 0);
     converted = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, wide, (int)length, utf8, size, NULL, NULL);
     if (converted != size) luaL_error(L, "cannot convert mapped Titan provider path (Win32 %d)", (int)GetLastError());
-    /* Preserve native extended-prefix/backslash semantics. _win_realpath below
-     * supplies the final OS-reported canonical spelling used by the compiler. */
+    /* Preserve the loader spelling for opening; the retained handle below
+     * supplies the final OS-reported canonical spelling. */
     lua_pushlstring(L, utf8, (size_t)size);
     lua_remove(L, -2);
     return wide;
+}
+
+/* This exceptional boundary observes the already-mapped, locked provider.
+ * Ordinary compiler I/O and Titan fs operations cannot supply that same handle.
+ * Final pathname, identity, size and timestamps must all describe its snapshot. */
+static void ls_push_final_path(lua_State *L, HANDLE file) {
+    WCHAR *wide = lua_newuserdatauv(L, LS_PATH_CAPACITY * sizeof(WCHAR), 0);
+    DWORD length = GetFinalPathNameByHandleW(file, wide, LS_PATH_CAPACITY,
+                                            FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
+    int size, converted;
+    char *utf8;
+    if (length == 0 || length >= LS_PATH_CAPACITY)
+        luaL_error(L, "cannot resolve retained Titan provider path (Win32 %d)", (int)GetLastError());
+    size = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, wide, (int)length, NULL, 0, NULL, NULL);
+    if (size <= 0) luaL_error(L, "cannot size retained Titan provider path (Win32 %d)", (int)GetLastError());
+    utf8 = lua_newuserdatauv(L, (size_t)size, 0);
+    converted = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, wide, (int)length, utf8, size, NULL, NULL);
+    if (converted != size) luaL_error(L, "cannot convert retained Titan provider path (Win32 %d)", (int)GetLastError());
+    lua_pushlstring(L, utf8, (size_t)size);
+    lua_remove(L, -2); /* UTF8 scratch; the resulting string owns its bytes. */
+    lua_remove(L, -2); /* UTF16 scratch */
+}
+
+static void ls_hex64(char *result, ULONGLONG value) {
+    static const char hex[] = "0123456789abcdef";
+    for (size_t index = 0; index < 16; ++index)
+        result[index] = hex[(value >> (4 * (15 - index))) & 15];
+    result[16] = '\0';
+}
+
+static int ls_guid_root(const WCHAR *path, DWORD length) {
+    if (length < 49 || wcsncmp(path, L"\\\\?\\Volume{", 11) != 0 ||
+        path[47] != L'}' || path[48] != L'\\') return 0;
+    for (size_t index = 0; index < 36; ++index) {
+        WCHAR character = path[11 + index];
+        if (index == 8 || index == 13 || index == 18 || index == 23) {
+            if (character != L'-') return 0;
+        } else if (!((character >= L'0' && character <= L'9') ||
+                     (character >= L'a' && character <= L'f') ||
+                     (character >= L'A' && character <= L'F'))) return 0;
+    }
+    return 1;
+}
+
+static void ls_push_native_identity(lua_State *L, HANDLE file) {
+    FILE_ID_INFO id;
+    char device[96], inode[64];
+    static const char hex[] = "0123456789abcdef";
+    if (GetFileInformationByHandleEx(file, FileIdInfo, &id, sizeof(id))) {
+        strcpy(device, "win32-volume:");
+        ls_hex64(device + strlen("win32-volume:"), id.VolumeSerialNumber);
+        strcpy(inode, "win32-file:");
+        for (size_t index = 0; index < sizeof(id.FileId.Identifier); ++index) {
+            unsigned char byte = id.FileId.Identifier[index];
+            inode[strlen("win32-file:") + 2 * index] = hex[byte >> 4];
+            inode[strlen("win32-file:") + 2 * index + 1] = hex[byte & 15];
+        }
+        inode[strlen("win32-file:") + 2 * sizeof(id.FileId.Identifier)] = '\0';
+    } else {
+        DWORD error = GetLastError(), length;
+        WCHAR filesystem[256];
+        WCHAR *root;
+        BY_HANDLE_FILE_INFORMATION legacy;
+        if (error != ERROR_INVALID_FUNCTION && error != ERROR_NOT_SUPPORTED &&
+            error != ERROR_INVALID_PARAMETER)
+            luaL_error(L, "cannot identify retained Titan provider (Win32 %d)", (int)error);
+        /* Preserve the previous narrowly approved VirtIO-FS fallback. Its zero
+         * volume serial is not an identity; use the handle's real volume GUID
+         * and full legacy file index only on this positively identified FS. */
+        if (!GetVolumeInformationByHandleW(file, NULL, 0, NULL, NULL, NULL, filesystem, 256))
+            luaL_error(L, "cannot identify Titan provider filesystem (Win32 %d)", (int)GetLastError());
+        if (wcscmp(filesystem, L"VirtIO-FS") != 0)
+            luaL_error(L, "Titan provider FileIdInfo is unavailable (Win32 %d)", (int)error);
+        if (!GetFileInformationByHandle(file, &legacy))
+            luaL_error(L, "cannot identify VirtIO-FS Titan provider (Win32 %d)", (int)GetLastError());
+        root = lua_newuserdatauv(L, LS_PATH_CAPACITY * sizeof(WCHAR), 0);
+        length = GetFinalPathNameByHandleW(file, root, LS_PATH_CAPACITY,
+                                          FILE_NAME_NORMALIZED | VOLUME_NAME_GUID);
+        if (length == 0 || length >= LS_PATH_CAPACITY || !ls_guid_root(root, length))
+            luaL_error(L, "cannot identify Titan provider volume GUID (Win32 %d)", (int)GetLastError());
+        strcpy(device, "win32-volume-guid:");
+        for (size_t index = 0; index < 49; ++index)
+            device[strlen("win32-volume-guid:") + index] = (char)root[index];
+        device[strlen("win32-volume-guid:") + 49] = '\0';
+        strcpy(inode, "win32-legacy-file:");
+        ls_hex64(inode + strlen("win32-legacy-file:"),
+                 ((ULONGLONG)legacy.nFileIndexHigh << 32) | legacy.nFileIndexLow);
+        lua_pop(L, 1);
+    }
+    lua_pushstring(L, device); lua_pushlstring(L, "\0", 1); lua_pushstring(L, inode);
+    lua_concat(L, 3);
+}
+
+static void ls_push_identity(lua_State *L, HANDLE file, int path_index) {
+    FILE_BASIC_INFO basic;
+    FILE_STANDARD_INFO standard;
+    FILE_ATTRIBUTE_TAG_INFO tag;
+    LONGLONG seconds, nanoseconds;
+    if (!GetFileInformationByHandleEx(file, FileAttributeTagInfo, &tag, sizeof(tag)) ||
+        !GetFileInformationByHandleEx(file, FileBasicInfo, &basic, sizeof(basic)) ||
+        !GetFileInformationByHandleEx(file, FileStandardInfo, &standard, sizeof(standard)))
+        luaL_error(L, "cannot observe retained Titan provider (Win32 %d)", (int)GetLastError());
+    if (tag.FileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT))
+        luaL_error(L, "retained Titan provider is not a resolved regular file");
+    if (standard.EndOfFile.QuadPart < 0 || basic.LastWriteTime.QuadPart < 0)
+        luaL_error(L, "retained Titan provider has negative size or FILETIME");
+    seconds = basic.LastWriteTime.QuadPart / 10000000LL - 11644473600LL;
+    nanoseconds = (basic.LastWriteTime.QuadPart % 10000000LL) * 100LL;
+    if (standard.EndOfFile.QuadPart > LUA_MAXINTEGER || seconds > LUA_MAXINTEGER ||
+        seconds < LUA_MININTEGER || nanoseconds > LUA_MAXINTEGER)
+        luaL_error(L, "retained Titan provider metadata exceeds Lua integer range");
+    lua_createtable(L, 0, 6);
+    lua_pushvalue(L, path_index); lua_setfield(L, -2, "path");
+    lua_pushliteral(L, "file"); lua_setfield(L, -2, "kind");
+    lua_pushinteger(L, (lua_Integer)standard.EndOfFile.QuadPart); lua_setfield(L, -2, "size");
+    lua_pushinteger(L, (lua_Integer)seconds); lua_setfield(L, -2, "modified_seconds");
+    lua_pushinteger(L, (lua_Integer)nanoseconds); lua_setfield(L, -2, "modified_nanoseconds");
+    ls_push_native_identity(L, file); lua_setfield(L, -2, "native_identity");
 }
 
 /* Cache has the immutable identity and a traced handle owner. Opening without
@@ -129,28 +248,10 @@ static void ls_push_cache(lua_State *L) {
     owner->module = module;
     lua_createtable(L, 0, 3); cache_index = lua_gettop(L);
     lua_pushvalue(L, owner_index); lua_setfield(L, cache_index, "owner");
+    ls_push_final_path(L, guard->file); lua_replace(L, path_index);
     lua_pushvalue(L, path_index); lua_setfield(L, cache_index, "path");
+    ls_push_identity(L, guard->file, path_index); lua_setfield(L, cache_index, "identity");
     open_support = titan_cast_func(lua_CFunction, ls_symbol(L, module, "luaopen_titan"));
-    lua_pushcfunction(L, open_support); lua_call(L, 0, 1);
-    lua_getfield(L, -1, "_win_realpath");
-    if (!lua_isfunction(L, -1)) luaL_error(L, "Titan provider lacks native Windows path support");
-    lua_pushvalue(L, path_index); lua_call(L, 1, 1); luaL_checktype(L, -1, LUA_TSTRING);
-    lua_replace(L, path_index);
-    lua_pushvalue(L, path_index); lua_setfield(L, cache_index, "path");
-    lua_getfield(L, -1, "_win_stat");
-    if (!lua_isfunction(L, -1)) luaL_error(L, "Titan provider lacks native Windows metadata support");
-    lua_pushvalue(L, path_index); lua_pushboolean(L, 1); lua_call(L, 2, 2);
-    if (!lua_istable(L, -2)) luaL_error(L, "cannot observe retained Titan provider: %s", lua_tostring(L, -1));
-    lua_pop(L, 1);
-    lua_getfield(L, -1, "device"); luaL_checktype(L, -1, LUA_TSTRING);
-    lua_pushlstring(L, "\0", 1);
-    lua_getfield(L, -3, "inode"); luaL_checktype(L, -1, LUA_TSTRING);
-    lua_concat(L, 3); lua_setfield(L, -2, "native_identity");
-    lua_pushnil(L); lua_setfield(L, -2, "device");
-    lua_pushnil(L); lua_setfield(L, -2, "inode");
-    lua_pushvalue(L, path_index); lua_setfield(L, -2, "path");
-    lua_setfield(L, cache_index, "identity");
-    lua_pop(L, 1); /* support table */
     lua_createtable(L, 0, LS_INTERFACE_COUNT);
     for (size_t index = 0; index < sizeof(titan_ls_windows_interfaces) / sizeof(titan_ls_windows_interfaces[0]); ++index) {
         const struct titan_ls_windows_interface *entry = &titan_ls_windows_interfaces[index];

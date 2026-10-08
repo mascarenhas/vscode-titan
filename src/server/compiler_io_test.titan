@@ -5,6 +5,7 @@ local lua = import "lua"
 local math = import "math"
 local system = import "os"
 local strings = import "string"
+local paths = import "path"
 local test = import "test"
 local compiler_io = import "server.compiler_io.titan"
 local logging = import "server.logging"
@@ -869,15 +870,37 @@ function test_compiler_io_cancelled_owned_mkdir_removes_directory(
   test_runtime.run(cancelled_owned_mkdir_removes_directory)
 end
 
-function test_compiler_io_temporary_leaf_uses_native_separators(
-    _context: test.Context)
-  test.assert(compiler_io.temporary_leaf("/tmp/reservation") == "reservation",
-              "temporary leaf lost slash separator")
-  local windows_path = "C:\\Users\\worker\\reservation"
-  local expected = windows_path
-  if ffi.VSCODE_TITAN_WINDOWS ~= 0 then expected = "reservation" end
-  test.assert(compiler_io.temporary_leaf(windows_path) == expected,
-              "temporary leaf changed native backslash semantics")
+local function atomic_sibling_path(filename: string, mixed: boolean)
+  local strategy = compiler_io.create()
+  local directory = temporary_root()
+  defer remove_path(directory)
+  local target = paths.join(directory, filename)
+  if mixed then target = directory .. "/" .. filename end
+  defer remove_path(target)
+  local first?, first_error? = strategy:write_file(target, "first\0contents")
+  required_mutation(first, first_error, "first atomic write")
+  local replaced?, replace_error? = strategy:write_file(target, "replacement\255contents")
+  required_mutation(replaced, replace_error, "replacement atomic write")
+  local contents?, read_error? = strategy:read_file(target)
+  test.assert(required_string(contents, read_error, "atomic read") == "replacement\255contents",
+              "atomic write changed native-path content bytes")
+  local entries = fs.list(directory)
+  test.assert(#entries == 1 and entries[1] == filename,
+              "atomic write leaked a sibling or changed filename bytes")
+end
+
+function test_compiler_io_atomic_siblings_preserve_native_names(context: test.Context)
+  context:run("spaces_and_unicode", function(_child: test.Context)
+    test_runtime.run(function() atomic_sibling_path("café Ω file.bin", false) end)
+  end)
+  context:run("mixed_windows_separators", function(_child: test.Context)
+    if ffi.VSCODE_TITAN_WINDOWS == 0 then test.skip("native Windows separators") end
+    test_runtime.run(function() atomic_sibling_path("café Ω file.bin", true) end)
+  end)
+  context:run("literal_posix_backslash", function(_child: test.Context)
+    if ffi.VSCODE_TITAN_WINDOWS ~= 0 then test.skip("POSIX filename bytes") end
+    test_runtime.run(function() atomic_sibling_path("literal\\filename.bin", false) end)
+  end)
 end
 
 function test_compiler_io_keeps_opaque_provider_identity_complete(_context: test.Context)

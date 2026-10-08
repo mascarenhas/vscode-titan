@@ -230,7 +230,6 @@ $(TITANC):
 	}
 	$(MAKE) -C "$(abspath $(TITAN_REPO))" lua PREFIX="$(TITAN_PREFIX)"
 	$(MAKE) -C "$(abspath $(TITAN_REPO))" luarocks PREFIX="$(TITAN_PREFIX)"
-	$(MAKE) -C "$(abspath $(TITAN_REPO))" libuv PREFIX="$(TITAN_PREFIX)"
 	+$(RECURSIVE_WRAPPER_GUARD) cd "$(abspath $(TITAN_REPO))" && \
 		PATH="$(TITAN_PREFIX)/bin:$$PATH" \
 		"$(LUAROCKS)" make --force "$(TITAN_ROCKSPEC)"
@@ -242,7 +241,6 @@ $(TITANC):
 toolchain-refresh: toolchain
 	$(MAKE) -C "$(abspath $(TITAN_REPO))" lua PREFIX="$(TITAN_PREFIX)"
 	$(MAKE) -C "$(abspath $(TITAN_REPO))" luarocks PREFIX="$(TITAN_PREFIX)"
-	$(MAKE) -C "$(abspath $(TITAN_REPO))" libuv PREFIX="$(TITAN_PREFIX)"
 	+$(RECURSIVE_WRAPPER_GUARD) cd "$(abspath $(TITAN_REPO))" && \
 		PATH="$(TITAN_PREFIX)/bin:$$PATH" \
 		"$(LUAROCKS)" make --force "$(TITAN_ROCKSPEC)"
@@ -352,6 +350,8 @@ server-test-sharded: server-test-build
 shard-runner-test:
 	node --test scripts/run-server-tests.test.mjs
 	node --test scripts/openssl-packaging.test.mjs
+	node --test scripts/build-windows.test.mjs scripts/inspect-windows-package.test.mjs \
+		scripts/compiler-rocks.test.mjs scripts/stage-lua-modules.test.mjs scripts/stage-notices.test.mjs
 
 incremental-build-test:
 	node scripts/test-incremental-build.mjs --prefix $(call shell_quote,$(TITAN_PREFIX))
@@ -381,17 +381,53 @@ extension-test: npm-ci
 	TITAN_PREFIX=$(call shell_quote,$(TITAN_PREFIX)) npm test
 
 extension-host-test: $(SERVER) npm-ci
-	TITAN_PREFIX=$(call shell_quote,$(TITAN_PREFIX)) npm run test:vscode
+	TITAN_PREFIX=$(call shell_quote,$(TITAN_PREFIX)) \
+	TITAN_LSP_TEST_SERVER=$(call shell_quote,$(SERVER)) npm run test:vscode
 
 test: server-test-sharded server-protocol-test codex-native-test extension-test shard-runner-test incremental-build-test
 
 package: $(SERVER) npm-ci
 	@mkdir -p "$(VSIX_DIR)"
 	TITAN_PREFIX=$(call shell_quote,$(TITAN_PREFIX)) npm run compile
-	TITAN_REPO="$(abspath $(TITAN_REPO))" \
-	TITAN_PREFIX="$(TITAN_PREFIX)" \
+	@selected_server=$(call shell_quote,$(SERVER)); \
+	packaged_server=$(call shell_quote,$(abspath bin/titan-language-server)); \
+	staged_server=; backup_dir=; restore_original=0; \
+	cleanup_package_server() { \
+	  status=$$?; trap - EXIT; \
+	  [[ -z "$$staged_server" ]] || rm -f -- "$$staged_server" || status=1; \
+	  staged_server=; \
+	  if [[ "$$restore_original" = 1 ]]; then \
+	    if [[ -e "$$backup_dir/server" || -L "$$backup_dir/server" ]]; then \
+	      if staged_server=$$(mktemp "$$packaged_server.tmp.XXXXXX") && \
+	        rm -f -- "$$staged_server" && \
+	        cp -pP "$$backup_dir/server" "$$staged_server" && \
+	        mv -f -- "$$staged_server" "$$packaged_server"; then :; \
+	      else \
+	        echo "Cannot restore package server; original retained at $$backup_dir/server" >&2; \
+	        rm -f -- "$$staged_server"; exit 1; \
+	      fi; \
+	    else rm -f -- "$$packaged_server" || status=1; fi; \
+	  fi; \
+	  [[ -z "$$staged_server" ]] || rm -f -- "$$staged_server" || status=1; \
+	  [[ -z "$$backup_dir" ]] || rm -rf -- "$$backup_dir" || status=1; \
+	  exit "$$status"; \
+	}; \
+	trap cleanup_package_server EXIT; \
+	if [[ "$$selected_server" != "$$packaged_server" ]]; then \
+	  mkdir -p -- "$$(dirname -- "$$packaged_server")" $(call shell_quote,$(abspath .build)); \
+	  backup_dir=$$(mktemp -d $(call shell_quote,$(abspath .build/package-server.XXXXXX))); \
+	  if [[ -e "$$packaged_server" || -L "$$packaged_server" ]]; then \
+	    cp -pP "$$packaged_server" "$$backup_dir/server"; \
+	  fi; \
+	  staged_server=$$(mktemp "$$packaged_server.tmp.XXXXXX"); \
+	  install -m 0755 "$$selected_server" "$$staged_server"; \
+	  restore_original=1; \
+	  mv -f -- "$$staged_server" "$$packaged_server"; \
+	fi; \
+	TITAN_REPO=$(call shell_quote,$(TITAN_REPO)) \
+	TITAN_PREFIX=$(call shell_quote,$(TITAN_PREFIX)) \
 	./node_modules/.bin/vsce package --no-dependencies \
-		--target "$(VSIX_TARGET)" --out "$(VSIX)"
+		--target $(call shell_quote,$(VSIX_TARGET)) --out $(call shell_quote,$(VSIX))
 
 inspect-server: $(SERVER)
 	TITAN_PREFIX=$(call shell_quote,$(TITAN_PREFIX)) ./scripts/inspect-server.sh "$(SERVER)"
@@ -432,6 +468,9 @@ install-server-test: $(SERVER)
 	test -f "$(SERVER_INSTALL_STAGE)/usr/local/share/doc/titan-language-server/Titan-LICENSE"
 	test -f "$(SERVER_INSTALL_STAGE)/usr/local/share/doc/titan-language-server/THIRD_PARTY_NOTICES.md"
 	test -f "$(SERVER_INSTALL_STAGE)/usr/local/share/doc/titan-language-server/LICENSES/libuv-LICENSE"
+	test -f "$(SERVER_INSTALL_STAGE)/usr/local/share/doc/titan-language-server/LICENSES/libuv-LICENSE-extra"
+	test -f "$(SERVER_INSTALL_STAGE)/usr/local/share/doc/titan-language-server/LICENSES/libuv-tree-LICENSE"
+	test -f "$(SERVER_INSTALL_STAGE)/usr/local/share/doc/titan-language-server/LICENSES/libuv-inet-LICENSE"
 	test -f "$(SERVER_INSTALL_STAGE)/usr/local/share/doc/titan-language-server/LICENSES/openssl-LICENSE"
 
 install-vsix: package
