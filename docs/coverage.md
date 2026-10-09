@@ -76,7 +76,10 @@ The actual server runs the stdio protocol, workspace-cache, unsaved-completion
 and Extension Host tests. Each category has a separate fresh counter directory
 and run receipt. Extension Host uses the selected measured server and validation
 compiler SDK, and waits for native child exit. The ordinary packaging gate
-continues to check packaged compiler discovery independently.
+continues to check packaged compiler discovery independently. Compiler-path
+changes await both workspace clients before resetting fixture markers; the host
+test exercises a slower beta restart and checks bundled discovery for both.
+Failed native lifecycle receipts are also copied into the retained run log.
 
 Preparation counters stay separate from test runs. Native children inherit only
 their run's counter prefix; the harness joins them before reporting. The pinned
@@ -123,7 +126,8 @@ executable lines across 39 explicitly selected production modules.
 Both captures use the fixed runner at the pin above, fresh images/counters and
 the same production source hashes and executable-line sets. The original scope
 retains every native test owner byte-for-byte from that source base; its only
-overlays prepare coverage and join the actual servers.
+overlays prepare coverage and join the actual servers. The expanded capture
+below was collected for vscode-titan `74e266f0427b2b831b0ea244ae14c11d7f231225`.
 
 | Test scope | Original tests | Expanded tests | Executable lines |
 | --- | ---: | ---: | ---: |

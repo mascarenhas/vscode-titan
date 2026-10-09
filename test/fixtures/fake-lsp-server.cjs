@@ -29,6 +29,8 @@ const semanticMarkerPath = argumentValue("--semantic-marker");
 const indexingDelayMs = Number(argumentValue("--indexing-delay-ms") ?? 0);
 const hangInitializeAndStayAlive =
   process.env.TITAN_LSP_FIXTURE_HANG_ROOT === process.cwd();
+const initializeDelayMilliseconds =
+  process.env.TITAN_LSP_FIXTURE_INITIALIZE_DELAY_ROOT === process.cwd() ? 500 : 0;
 let input = Buffer.alloc(0);
 
 for (const signal of ["SIGINT", "SIGTERM"]) {
@@ -74,8 +76,14 @@ function drainMessages() {
   }
 }
 
-function handleMessage(message) {
+function handleMessage(message, initializeDelayElapsed = false) {
   if (message.method === "initialize") {
+    if (initializeDelayMilliseconds > 0 && !initializeDelayElapsed) {
+      // Delay the marker as well as the response so the host test observes a
+      // pending workspace restart when another workspace has already started.
+      setTimeout(() => handleMessage(message, true), initializeDelayMilliseconds);
+      return;
+    }
     completionInitialization = message.params;
     recordEvent("initialize", {
       rootPath: message.params.rootPath,

@@ -1273,61 +1273,61 @@ suite("Titan extension", () => {
       modulePrefix, "lib", "lua", "5.5", process.platform === "win32" ? "?.dll" : "?.so"
     );
 
-    await Promise.all([
-      resetMarker(alphaMarkerPath),
-      resetMarker(betaMarkerPath)
-    ]);
-    await vscode.workspace.getConfiguration("titan.compiler").update(
-      "luaPath",
-      "",
-      vscode.ConfigurationTarget.Global
-    );
-    await waitForEventSequence(
-      alphaMarkerPath,
-      ["shutdown", "exit", "initialize"],
-      10_000
-    );
-    await vscode.workspace.getConfiguration("titan.compiler").update(
-      "luaCPath",
-      "",
-      vscode.ConfigurationTarget.Global
-    );
-    const defaulted = await waitForEventSequence(
-      alphaMarkerPath,
-      [
-        "shutdown", "exit", "initialize",
-        "shutdown", "exit", "initialize"
-      ],
-      10_000
-    );
-    const defaultedInitialization = defaulted[5];
-    const actualLuaTemplates = defaultedInitialization.luaPath?.split(";");
-    const expectedLuaTemplates = bundledLuaPath.split(";");
-    assert.ok(actualLuaTemplates, "bundled Lua path should be present");
-    assert.equal(actualLuaTemplates.length, expectedLuaTemplates.length);
-    for (const [index, expected] of expectedLuaTemplates.entries()) {
-      assertNativePathEqual(actualLuaTemplates[index], expected);
-    }
-    assertNativePathEqual(defaultedInitialization.luaCPath, bundledLuaCPath);
-    assert.equal(defaultedInitialization.compilerCachePrefix, process.env.TITAN_PREFIX);
-
     const lifecycle = process.env.TITAN_LSP_TEST_LIFECYCLE;
     const selectedLuaPath = process.env.TITAN_LSP_TEST_LUA_PATH;
     const selectedLuaCPath = process.env.TITAN_LSP_TEST_LUA_CPATH;
     assert.equal(selectedLuaPath === undefined, selectedLuaCPath === undefined,
       "selected native compiler discovery requires both Lua paths");
-    if (selectedLuaPath !== undefined) {
-      assert.ok(selectedLuaCPath !== undefined);
-      for (const [name, value] of [
-        ["luaPath", selectedLuaPath], ["luaCPath", selectedLuaCPath]
-      ]) {
-        await Promise.all([resetMarker(alphaMarkerPath), resetMarker(betaMarkerPath)]);
-        await vscode.workspace.getConfiguration("titan.compiler").update(
-          name, value, vscode.ConfigurationTarget.Global);
-        await Promise.all([
-          waitForEventSequence(alphaMarkerPath, ["shutdown", "exit", "initialize"], 10_000),
-          waitForEventSequence(betaMarkerPath, ["shutdown", "exit", "initialize"], 10_000)
-        ]);
+    const betaInitialization = (await readEvents(betaMarkerPath))
+      .filter((event) => event.event === "initialize").at(-1);
+    assert.ok(betaInitialization, "beta should have a running fixture server");
+    const previousInitializeDelayRoot = process.env.TITAN_LSP_FIXTURE_INITIALIZE_DELAY_ROOT;
+    // Exercise a slower beta restart. Every global configuration change affects
+    // both clients, so neither marker may be reset while beta is still starting.
+    process.env.TITAN_LSP_FIXTURE_INITIALIZE_DELAY_ROOT = betaInitialization.cwd;
+    try {
+      await Promise.all([resetMarker(alphaMarkerPath), resetMarker(betaMarkerPath)]);
+      await vscode.workspace.getConfiguration("titan.compiler").update(
+        "luaPath", "", vscode.ConfigurationTarget.Global);
+      await Promise.all([alphaMarkerPath, betaMarkerPath].map((marker) =>
+        waitForEventSequence(marker, ["shutdown", "exit", "initialize"], 10_000)));
+      await vscode.workspace.getConfiguration("titan.compiler").update(
+        "luaCPath", "", vscode.ConfigurationTarget.Global);
+      const defaulted = await Promise.all([alphaMarkerPath, betaMarkerPath].map((marker) =>
+        waitForEventSequence(marker, [
+          "shutdown", "exit", "initialize", "shutdown", "exit", "initialize"
+        ], 10_000)));
+      for (const events of defaulted) {
+        const initialization = events[5];
+        const actualLuaTemplates = initialization.luaPath?.split(";");
+        const expectedLuaTemplates = bundledLuaPath.split(";");
+        assert.ok(actualLuaTemplates, "bundled Lua path should be present");
+        assert.equal(actualLuaTemplates.length, expectedLuaTemplates.length);
+        for (const [index, expected] of expectedLuaTemplates.entries()) {
+          assertNativePathEqual(actualLuaTemplates[index], expected);
+        }
+        assertNativePathEqual(initialization.luaCPath, bundledLuaCPath);
+        assert.equal(initialization.compilerCachePrefix, process.env.TITAN_PREFIX);
+      }
+      if (selectedLuaPath !== undefined) {
+        assert.ok(selectedLuaCPath !== undefined);
+        for (const [name, value] of [
+          ["luaPath", selectedLuaPath], ["luaCPath", selectedLuaCPath]
+        ]) {
+          await Promise.all([resetMarker(alphaMarkerPath), resetMarker(betaMarkerPath)]);
+          await vscode.workspace.getConfiguration("titan.compiler").update(
+            name, value, vscode.ConfigurationTarget.Global);
+          await Promise.all([
+            waitForEventSequence(alphaMarkerPath, ["shutdown", "exit", "initialize"], 10_000),
+            waitForEventSequence(betaMarkerPath, ["shutdown", "exit", "initialize"], 10_000)
+          ]);
+        }
+      }
+    } finally {
+      if (previousInitializeDelayRoot === undefined) {
+        delete process.env.TITAN_LSP_FIXTURE_INITIALIZE_DELAY_ROOT;
+      } else {
+        process.env.TITAN_LSP_FIXTURE_INITIALIZE_DELAY_ROOT = previousInitializeDelayRoot;
       }
     }
     const nodeExecutable = process.env.npm_node_execpath;

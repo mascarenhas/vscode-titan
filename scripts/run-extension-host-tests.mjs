@@ -19,22 +19,39 @@ function lifecycleEvents(directory, workspace) {
   return contents.trim().split("\n").filter(Boolean).map((line) => JSON.parse(line));
 }
 
+function reportNativeServerLifecycles(directory) {
+  for (const workspace of ["alpha", "beta"]) {
+    const diagnostic = { workspace, nativeServerLifecycle: [] };
+    try { diagnostic.nativeServerLifecycle = lifecycleEvents(directory, workspace); }
+    catch (cause) { diagnostic.nativeServerLifecycleError = cause.message; }
+    // Failed-run evidence belongs in the already retained collection log.
+    // Neither a broken receipt nor a diagnostic write replaces the failure.
+    try { console.error(JSON.stringify(diagnostic)); } catch {}
+  }
+}
+
 export function terminateNativeServers(directory, signal) {
   const pending = [];
+  const errors = [];
   for (const workspace of ["alpha", "beta"]) {
     const active = new Set();
-    for (const event of lifecycleEvents(directory, workspace)) {
-      if (event.event === "spawn") active.add(event.pid);
-      else if (event.event === "close") active.delete(event.pid);
+    try {
+      for (const event of lifecycleEvents(directory, workspace)) {
+        if (event.event === "spawn") active.add(event.pid);
+        else if (event.event === "close") active.delete(event.pid);
+      }
+    } catch (cause) {
+      errors.push(new Error(`${workspace}: cannot read native lifecycle receipt`, { cause }));
+      continue;
     }
     for (const pid of active) {
       try {
         process.kill(pid, signal);
         pending.push(pid);
-      } catch (cause) { if (cause.code !== "ESRCH") throw cause; }
+      } catch (cause) { if (cause.code !== "ESRCH") errors.push(cause); }
     }
   }
-  return pending;
+  return { pending, errors };
 }
 
 async function awaitProcessExit(pid) {
@@ -106,17 +123,19 @@ if (invokedDirectly && process.argv[2] === "--native-server") {
     }
   });
   const handlers = new Map();
+  const cleanupErrors = [];
   for (const signal of ["SIGINT", "SIGTERM"]) {
     const handler = () => {
       // Retire measured children immediately even if an Electron descendant
       // outlives test-cli, before the coverage supervisor escalates its group.
-      terminateNativeServers(lifecycle, signal);
+      cleanupErrors.push(...terminateNativeServers(lifecycle, signal).errors);
       child.kill(signal);
     };
     handlers.set(signal, handler);
     process.once(signal, handler);
   }
   let completed = false;
+  let failure;
   try {
     const [code, signal] = await once(child, "close");
     assert.deepEqual({ code, signal }, { code: 0, signal: null },
@@ -132,12 +151,28 @@ if (invokedDirectly && process.argv[2] === "--native-server") {
       console.log(JSON.stringify({ workspace, nativeServerLifecycle: events }));
     }
     completed = true;
+  } catch (cause) {
+    failure = cause;
+    throw cause;
   } finally {
     for (const [signal, handler] of handlers) process.removeListener(signal, handler);
     // Failure cleanup is not successful measurement. Reap any native child
     // still listed by its proxy before the supervising coverage run completes.
-    await Promise.all(terminateNativeServers(lifecycle, "SIGKILL").map(awaitProcessExit));
-    if (completed) await rm(lifecycle, { recursive: true, force: true });
-    else console.error(`Native lifecycle evidence retained at ${lifecycle}`);
+    try {
+      const retirement = terminateNativeServers(lifecycle, "SIGKILL");
+      cleanupErrors.push(...retirement.errors);
+      const exits = await Promise.allSettled(retirement.pending.map(awaitProcessExit));
+      for (const exit of exits) if (exit.status === "rejected") cleanupErrors.push(exit.reason);
+      if (cleanupErrors.length) throw new AggregateError(cleanupErrors, "native server cleanup failed");
+      if (completed) await rm(lifecycle, { recursive: true, force: true });
+    } catch (cause) {
+      if (failure === undefined) throw cause;
+      console.error("Native server cleanup failed:", cause);
+    } finally {
+      if (!completed) {
+        reportNativeServerLifecycles(lifecycle);
+        console.error(`Native lifecycle evidence retained at ${lifecycle}`);
+      }
+    }
   }
 }
