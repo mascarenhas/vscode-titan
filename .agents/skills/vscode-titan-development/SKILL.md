@@ -201,6 +201,27 @@ parallel shards on the two-CPU runner. Maintain the module inventory in
 `scripts/run-server-tests.mjs` when adding a test owner, inspect positive test
 selection and both shard outcomes, and use `make verify` for the complete gate.
 
+## Native production line coverage
+
+Use `make server-coverage-build`, `server-coverage-run` and
+`server-coverage-report` for opt-in measurement with GCC 14+, matching gcov and
+pinned gcovr 8.4. Follow [coverage.md](../../../docs/coverage.md). The driver
+classifies every production/test/helper source explicitly and selects the same
+complete production inventory in native-test and actual-server images. Keep SDK
+stdlib and test support outside the language-server denominator. New sources
+must update the inventory; include wholly untested production modules.
+
+Coverage owns fresh stages, objects, notes, images and per-category counters.
+Do not put coverage flags into the ordinary incremental graphs, reuse run
+directories, combine incompatible revisions/platforms, or promote incomplete
+collection to success. Preserve test exit status and await native child closure,
+including Extension Host servers, before reporting. The detached shard and
+Codex adapter wrappers keep their ordinary gates. Local reports never upload;
+CI retains reports separately from shipping binaries. Establish native-only and
+combined honest executable-line baselines, then add behavior tests for useful
+uncovered paths in their existing owner. A line hit is not branch or behavior
+coverage; do not add tautological tests or arbitrary initial thresholds.
+
 ## Incremental native builds
 
 Read [native-build.md](../../../docs/native-build.md) before changing the Make

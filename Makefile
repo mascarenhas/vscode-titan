@@ -6,6 +6,7 @@ TITAN_REPO ?= ../titan
 # Choose a whole-invocation profile before generating either native graph.
 # Verification also exercises the ordinary server and disposable packaging.
 VALIDATION_GOALS := verify test server-test server-test-build server-test-objects server-test-run server-test-sharded \
+	server-coverage-build server-coverage-run server-coverage-report \
 	server-protocol-test completion-protocol-test codex-native-test extension-host-test incremental-build-test install-server-test
 BUILD_PROFILE ?= $(if $(TITAN_BUILD_PROFILE),$(TITAN_BUILD_PROFILE),$(if $(filter $(VALIDATION_GOALS),$(MAKECMDGOALS)),validation,production))
 ifneq ($(BUILD_PROFILE),validation)
@@ -42,6 +43,13 @@ SERVER_BUILD_OUTPUT := $(SERVER_BUILD_DIR)/titan_language_server
 SERVER := $(abspath bin/titan-language-server)
 override SERVER := $(abspath $(SERVER))
 SERVER_TEST := $(TEST_BUILD_DIR)/server/tests
+SERVER_COVERAGE_BUILD_DIR ?= $(abspath .build/coverage/build)
+SERVER_COVERAGE_RUN_DIR ?= $(abspath .build/coverage/run)
+SERVER_COVERAGE_REPORT_DIR ?= $(abspath .build/coverage/report)
+SERVER_COVERAGE_GCOV ?= gcov
+SERVER_COVERAGE_GCOVR ?= gcovr
+SERVER_COVERAGE_TIMEOUT ?= 1200
+SERVER_COVERAGE_SCOPE ?= all
 COMPILER_IO_CLOCK_SOURCE := src/server/compiler_io_clock.c
 COMPILER_IO_CLOCK_HEADER := src/server/compiler_io_clock.h
 COMPILER_IO_CLOCK_OBJECT := $(NATIVE_BUILD_DIR)/compiler_io_clock.o
@@ -101,6 +109,7 @@ VSIX := $(VSIX_DIR)/titan-$(VSIX_TARGET).vsix
 .DEFAULT_GOAL := all
 
 .PHONY: all help toolchain toolchain-refresh npm-ci server server-test \
+	server-coverage-build server-coverage-run server-coverage-report \
 	server-objects server-test-objects server-test-build server-test-run server-test-sharded shard-runner-test incremental-build-test \
 	server-protocol-test completion-protocol-test codex-native-test extension extension-test extension-host-test test package inspect-server \
 	plugin-validate verify inspect-vsix FORCE install-server install-server-test install-vsix clean clean-node
@@ -158,7 +167,7 @@ NATIVE_TEST_ENV = env -u TITAN_PATH_0_6 -u TITAN_PATH \
 FORCE:
 
 # Keep housekeeping and JavaScript-only goals usable without a native SDK.
-NON_NATIVE_GOALS := help clean clean-node toolchain toolchain-refresh npm-ci extension extension-test shard-runner-test incremental-build-test plugin-validate inspect-vsix server-test-run
+NON_NATIVE_GOALS := help clean clean-node toolchain toolchain-refresh npm-ci extension extension-test shard-runner-test incremental-build-test plugin-validate inspect-vsix server-test-run server-coverage-run server-coverage-report
 ifneq ($(filter-out $(NON_NATIVE_GOALS),$(if $(MAKECMDGOALS),$(MAKECMDGOALS),all)),)
 # Titan installs OpenSSL headers only for its bundled provider. System-provider
 # static consumers repeat the ordered pkg-config inputs after the archive.
@@ -208,6 +217,9 @@ help:
 	@echo "  server-test-build    compile the native test aggregate once"
 	@echo "  server-test-run      run the current native aggregate without rebuilding"
 	@echo "  server-test-sharded  compile once and run two native execution shards"
+	@echo "  server-coverage-build   build isolated measured server/test images (GCC 14+)"
+	@echo "  server-coverage-run     collect native and actual-server tests in fresh counters"
+	@echo "  server-coverage-report  render Titan line coverage with gcovr 8.4"
 	@echo "  completion-protocol-test  exercise unsaved completion through the native server"
 	@echo "  incremental-build-test exercise native invalidation and no-op builds"
 	@echo "  server-protocol-test exercise the native executable over framed stdio"
@@ -347,7 +359,37 @@ server-test-run:
 server-test-sharded: server-test-build
 	$(NATIVE_TEST_ENV) node scripts/run-server-tests.mjs $(call shell_quote,$(SERVER_TEST))
 
+# Coverage owns fresh source/object/image trees, outside both incremental DAGs.
+# Run/report must not rebuild or replace inputs already sealed by the build.
+server-coverage-build: extension $(COMPILER_IO_CLOCK_OBJECT) $(EMBEDDED_INTERFACES_OBJECT) $(COMPILER_IO_PROCESS_FIXTURE)
+	npm run compile-tests
+	$(NATIVE_COMPILER_ENV) \
+		VSCODE_TITAN_EXPORT_FLAGS=$(call shell_quote,$(EXPORT_LUA_LDFLAGS)) \
+		node scripts/server-coverage.mjs build \
+		--prefix $(call shell_quote,$(TITAN_PREFIX)) \
+		--build-dir $(call shell_quote,$(abspath $(SERVER_COVERAGE_BUILD_DIR))) \
+		--native-dir $(call shell_quote,$(NATIVE_BUILD_DIR)) \
+		--cc $(call shell_quote,$(CC)) --gcov $(call shell_quote,$(SERVER_COVERAGE_GCOV))
+
+server-coverage-run:
+	node scripts/server-coverage.mjs run \
+		--prefix $(call shell_quote,$(TITAN_PREFIX)) \
+		--build-dir $(call shell_quote,$(abspath $(SERVER_COVERAGE_BUILD_DIR))) \
+		--run-dir $(call shell_quote,$(abspath $(SERVER_COVERAGE_RUN_DIR))) \
+		--scope $(call shell_quote,$(SERVER_COVERAGE_SCOPE)) \
+		--timeout $(call shell_quote,$(SERVER_COVERAGE_TIMEOUT))
+
+server-coverage-report:
+	node scripts/server-coverage.mjs report \
+		--prefix $(call shell_quote,$(TITAN_PREFIX)) \
+		--build-dir $(call shell_quote,$(abspath $(SERVER_COVERAGE_BUILD_DIR))) \
+		--run-dir $(call shell_quote,$(abspath $(SERVER_COVERAGE_RUN_DIR))) \
+		--report-dir $(call shell_quote,$(abspath $(SERVER_COVERAGE_REPORT_DIR))) \
+		--scope $(call shell_quote,$(SERVER_COVERAGE_SCOPE)) \
+		--gcovr $(call shell_quote,$(SERVER_COVERAGE_GCOVR))
+
 shard-runner-test:
+	node --test scripts/server-coverage.test.mjs scripts/run-extension-host-tests.test.mjs
 	node --test scripts/run-server-tests.test.mjs
 	node --test scripts/openssl-packaging.test.mjs
 	node --test scripts/build-windows.test.mjs scripts/inspect-windows-package.test.mjs \

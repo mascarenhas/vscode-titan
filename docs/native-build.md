@@ -16,6 +16,12 @@ graph without linking its executable. `server` links and installs the native
 language server; `server-test-build` links the single test executable used by
 both execution shards. `server-test-run` runs an already built test executable.
 
+For opt-in production Titan line coverage, use the separate
+`server-coverage-build`, `server-coverage-run` and `server-coverage-report`
+workflow in [coverage.md](coverage.md). It measures the complete server source
+inventory in isolated native-test and actual-server images; it does not change
+the ordinary incremental graphs.
+
 On macOS, put GNU Make 4.4.1 first on `PATH` before building, including for
 recursive `make` invocations. With Homebrew's Make installed:
 
