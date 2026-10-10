@@ -1,129 +1,134 @@
 # Native language-server line coverage
 
-Coverage is opt-in and uses the native workflow from
-[Titan #210](https://github.com/mascarenhas/titan/issues/210), pinned to
-[Titan PR #213](https://github.com/mascarenhas/titan/pull/213) at
-`e9d3855e3429bb526cf3924eb32c5002fa99b0d0`. It measures executable lines in
-production Titan sources. A covered line does not establish branch, expression,
-function, or behavior coverage.
+Coverage is opt-in and tracks [Titan PR #217](https://github.com/mascarenhas/titan/pull/217)
+at `0bcdaeb8bc25bdd863cc39853f1af90ce178f503`. The compiler builds a covered
+native test executable; ordinary execution resets its counters, runs the tests,
+dumps counters and generates reports. It measures executable lines in production
+Titan sources. A covered line does not establish branch, expression, function or
+behavior coverage.
 
-## Prepare and build
+## Prepare and run
 
-Use the isolated validation SDK, GCC 14 or newer and matching gcov, Python 3,
-and `gcovr==8.4`. On macOS use Homebrew GCC and GNU Make; see
-[native-build.md](native-build.md) for the Make requirement. Windows CLANG64 is not supported by this
-coverage backend; ordinary Windows validation remains a separate gate.
+Use the isolated validation SDK, GCC 14 or newer and matching gcov. Basic
+reporting needs neither Python nor gcovr. On macOS use a prepared Homebrew GCC
+SDK and GNU Make; see [native-build.md](native-build.md). This consumer's coverage
+launcher currently targets Linux and macOS; platform validation remains a
+separate gate.
 
-Prepare the validation SDK from a Titan checkout at the exact pin above. A
-retained older SDK needs `toolchain-refresh`, rather than `toolchain`'s installed
-executable reuse check:
+Prepare the validation SDK from a checkout at the exact producer pin. A retained
+older SDK needs `toolchain-refresh`, since `toolchain` reuses an installed
+compiler:
 
 ```sh
 make -j2 toolchain-refresh BUILD_PROFILE=validation \
   TITAN_REPO=/path/to/pinned/titan
+make -j2 server-coverage BUILD_ROOT=.build/coverage-native \
+  CC=gcc-14 SERVER_COVERAGE_GCOV=gcov-14
 ```
+
+The two phases can also run separately:
+
+```sh
+make -j2 server-coverage-build BUILD_ROOT=.build/coverage-native \
+  CC=gcc-14 SERVER_COVERAGE_GCOV=gcov-14
+make server-coverage-run
+```
+
+The build copies authored sources into `.build/coverage/direct/src` and compiles
+there. Native helpers use the separately selected `BUILD_ROOT`. The compiler
+places generated C, headers, objects and counters in source-adjacent `.coverage`
+directories, separate from ordinary outputs. Release builds need no coverage
+cleanup or artifact swapping. A coverage build starts with a fresh
+`SERVER_COVERAGE_BUILD_DIR`; select another directory after changing inputs.
+Running the same built aggregate again is supported: the executable resets its
+own counters each time. Use independent build trees for concurrent sessions.
+Embedded paths are absolute, so keep the build tree available during execution.
+
+`scripts/server-coverage.mjs` discovers project module ownership from authored
+sources, including folder modules. The basenames `tests`, `test_*` and `*_test`
+are reserved for the aggregate, helpers and test owners. Other project modules
+become requested roots, including modules no test imports. Derived module
+selection keeps project test helpers outside the production count. Prebuilt
+stdlib modules and native dependencies are automatically unmeasured. The
+compiler automatically excludes every source
+module owning a top-level `test_` function, even under explicit selection. The
+launcher checks the resulting object metadata against discovered production
+roots so such an exclusion cannot silently reduce the server denominator. New
+production modules need no hardcoded coverage-list update. Uncalled bodies keep
+zero counts.
+
+The aggregate runs unfiltered and checks that every native test owner executed.
+Its normal test cleanup owns child lifetimes. The launcher preserves failures,
+rejects surviving children in its owned process group and applies `SERVER_COVERAGE_TIMEOUT`
+seconds (default 1200). There are no seal/run manifests, separate counter
+collections, or report-merging stages. Build and execution logs remain under the
+coverage build directory.
+
+## Reports
+
+Successful execution prints the compiler's executable-line summary and writes
+`report/coverage.gcov`. Set `SERVER_COVERAGE_REPORT_DIR` at build time to change
+that location. Basic reporting invokes only matching gcov; it works with gcovr
+unavailable.
+
+HTML, LCOV and Cobertura are optional. Request them at build time, since report
+settings are embedded in the executable:
 
 ```sh
 python3 -m venv /tmp/vscode-titan-coverage-tools
 /tmp/vscode-titan-coverage-tools/bin/pip install gcovr==8.4
-make -j2 server-coverage-build BUILD_ROOT=.build/coverage-native \
-  CC=gcc-14 SERVER_COVERAGE_GCOV=gcov-14
-```
-
-For Homebrew GCC, substitute its installed version in both tool names, for
-example `gmake -j2 server-coverage-build BUILD_ROOT=.build/coverage-native
-CC=gcc-16 SERVER_COVERAGE_GCOV=gcov-16`.
-
-The build owns fresh copied sources, objects, notes and images under
-`.build/coverage/build`. It never reuses ordinary server/test objects. Its
-validation native helpers live under the separately selected `BUILD_ROOT`.
-Reusing an existing coverage build directory is an error. Choose a new
-`SERVER_COVERAGE_BUILD_DIR` after changing sources, tests, compiler, SDK, native
-helpers, build settings or orchestration scripts.
-
-`scripts/server-coverage.mjs` declares all 39 production modules explicitly,
-including `titan_language_server` and modules no test imports. It separately
-classifies test owners and support; an added or removed Titan source fails the
-inventory check until classified. SDK standard-library code, Lua, native
-helpers, native dependencies, test owners and generated test support stay
-outside the denominator. Declaration-only contributors may have no executable
-lines. Uncalled functions retain zero counts.
-
-Both the native aggregate and the actual server select the same complete
-production inventory. Staged sources map back to tracked `src/` files; sealing
-checks their byte identity. Original/staged tests, native fixtures and execution
-scripts are hashed as unmeasured inputs. Keep the selected SDK programs,
-compiler/runtime modules, provider and sealed inputs unchanged through
-collection/reporting. The SDK's `var/cache/titan-probes` and per-project cache
-directories are mutable runtime state outside that seal; they are not coverage
-counters. Counter directories are always fresh and owned by one run.
-
-## Collect and report
-
-On headless Linux:
-
-```sh
-xvfb-run -a make server-coverage-run
-make server-coverage-report \
+make -j2 server-coverage BUILD_ROOT=.build/coverage-native-rich \
+  SERVER_COVERAGE_BUILD_DIR=.build/coverage/direct-rich \
+  CC=gcc-14 SERVER_COVERAGE_GCOV=gcov-14 \
+  SERVER_COVERAGE_FORMATS='html lcov cobertura' \
   SERVER_COVERAGE_GCOVR=/tmp/vscode-titan-coverage-tools/bin/gcovr
 ```
 
-On macOS, run `make server-coverage-run` from a graphical session, then use
-the same report command. The baseline below is Linux-specific.
+The compiler writes `coverage.html`, `coverage.info`, `coverage.xml` and the
+Titan-only `lines.json` trace when rich formats are requested. Paths describe the
+copied source tree: `src/...` relative to the coverage build root. There is no
+source-map or provenance-sealing API. Keep captures from different revisions,
+toolchains or runs separate. Local reporting requires no credentials or upload.
+CI requests rich formats and retains reports/logs without publishing server or
+VSIX binaries. Initial reporting has no arbitrary percentage threshold.
 
-The native aggregate runs unfiltered and checks that every test owner executed.
-The actual server runs the stdio protocol, workspace-cache, unsaved-completion
-and Extension Host tests. Each category has a separate fresh counter directory
-and run receipt. Extension Host uses the selected measured server and validation
-compiler SDK, and waits for native child exit. The ordinary packaging gate
-continues to check packaged compiler discovery independently. Compiler-path
-changes await both workspace clients before resetting fixture markers; the host
-test exercises a slower beta restart and checks bundled discovery for both.
-Failed native lifecycle receipts are also copied into the retained run log.
+Current measurement covers the native language-server tests. Protocol,
+workspace-cache, completion, Extension Host, Codex adapter and packaging tests
+continue through the ordinary validation gate. A covered standalone server
+would reset counters on each launch and append report output to stdout, which
+LSP reserves for framing; the producer supplies no external collection or merge
+command. The earlier combined captures below remain historical evidence from
+the retired workflow.
 
-Preparation counters stay separate from test runs. Native children inherit only
-their run's counter prefix; the harness joins them before reporting. The pinned
-runner uses schema-2 receipts and confirms that its POSIX process group is empty
-before accepting counters, including after a successful leader exits. Surviving
-children force retirement and an incomplete collection. Reports reject legacy
-receipts, unconfirmed groups and counters changed after collection. Receipts
-retain the leader and collection exit statuses, along with logs and counters.
-Missing or incomplete collection fails the workflow. Do not use incomplete
-diagnostic reports as a
-passing baseline. The detached Codex adapter and detached two-shard launcher are
-not placed inside a coverage process group; their ordinary gates still run.
+## Current direct-execution measurement
 
-Run/report do not rebuild. Each `SERVER_COVERAGE_RUN_DIR` must be new. Use
-`SERVER_COVERAGE_TIMEOUT` to set the per-category deadline in seconds (default
-1200). Select `SERVER_COVERAGE_SCOPE=native` for a native-only collection or
-report. To inspect native coverage separately after a complete run:
+The 2026-10-09 Linux x86_64 direct aggregate uses the pinned producer above,
+GCC/gcov 16.2.1 and a fresh validation SDK. Basic reporting passes with gcovr
+unavailable: 522 tests pass, 18 platform tests skip, and 11,357 of 12,740
+executable Titan lines are covered (89.14%). All 39 automatically discovered
+production modules pass the compiler-object inventory audit, including the
+uncalled entry module. Production Titan sources remain unchanged.
 
-```sh
-make server-coverage-report SERVER_COVERAGE_SCOPE=native \
-  SERVER_COVERAGE_REPORT_DIR=.build/coverage/native-report \
-  SERVER_COVERAGE_GCOVR=/tmp/vscode-titan-coverage-tools/bin/gcovr
-```
+An independent fresh build requesting HTML, LCOV and Cobertura with gcovr 8.4
+passes the same 522 tests with 18 skips and reports the same totals. These are
+separate captures; their counters are not merged. The optional formats retain
+the native test scope.
 
-Reports contain HTML, root-relative Titan LCOV, Cobertura XML, normalized line
-counts and source/tool/build/run provenance. Compatible image manifests merge
-only when the complete production inventory, source bytes, repository mapping,
-compiler and profiler match. Never combine different repository revisions or
-platform baselines to improve a percentage.
+Independent auditing finds identical production source hashes, executable-line
+sets and native hit sets between both current captures and the historical
+expanded native capture. JSON, LCOV, Cobertura and HTML agree on the rich
+capture's counts. The direct API introduces no denominator drift.
 
-Local reporting requires no credentials or upload. CI runs the same workflow
-and retains reports/logs as review artifacts, without publishing server or VSIX
-binaries. Initial reporting has no arbitrary percentage threshold. Add tests
-for useful uncovered behavior in the owning native/protocol layer, keeping
-ordinary optimized, incremental, packaging and platform checks separate.
+The historical comparison below is retained separately.
 
-## Measured before and after
+## Historical before and after (retired producer)
 
 The 2026-10-09 Linux x86_64 baseline uses GCC/gcov 16.2.1, gcovr 8.4 and the
-compiler pin above. Production sources are unchanged from vscode-titan
+retired Titan producer `e9d3855e3429bb526cf3924eb32c5002fa99b0d0`. Production sources are unchanged from vscode-titan
 `9ffaa2a12ef9c75141d7318a5082acab2511560b`. The complete denominator is 12,740
 executable lines across 39 explicitly selected production modules.
 
-Both captures use the fixed runner at the pin above, fresh images/counters and
+Both historical captures use that fixed runner, fresh images/counters and
 the same production source hashes and executable-line sets. The original scope
 retains every native test owner byte-for-byte from that source base; its only
 overlays prepare coverage and join the actual servers. The expanded capture
@@ -166,7 +171,7 @@ gains 100 lines and no longer observes one cancellation-handler line
 gain of 99. That baseline-only hit came from actual-server execution; both
 captures pass. This timing variation remains visible in the comparison.
 
-The largest remaining combined gaps are `compiler_bridge` (362 executable
+In the historical combined capture, the largest remaining gaps are `compiler_bridge` (362 executable
 lines), `project_service` (134), `application` (104), `compiler_io` (75),
 `semantic_index` (68) and `semantic_features` (66). They include Windows paths,
 defensive metadata validation, failed/cancelled operations and stale-result

@@ -203,24 +203,33 @@ selection and both shard outcomes, and use `make verify` for the complete gate.
 
 ## Native production line coverage
 
-Use `make server-coverage-build`, `server-coverage-run` and
-`server-coverage-report` for opt-in measurement with GCC 14+, matching gcov and
-pinned gcovr 8.4. Follow [coverage.md](../../../docs/coverage.md). The driver
-classifies every production/test/helper source explicitly and selects the same
-complete production inventory in native-test and actual-server images. Keep SDK
-stdlib and test support outside the language-server denominator. New sources
-must update the inventory; include wholly untested production modules.
+Use `make server-coverage`, or its `server-coverage-build` and
+`server-coverage-run` phases, with the exact pinned Titan compiler. Follow
+[coverage.md](../../../docs/coverage.md). `titanc --test --coverage` embeds its
+source inventory; ordinary aggregate execution resets counters and reports after
+successful tests and cleanup. Basic annotated reports need only matching GCC
+14+ and gcov. HTML, LCOV and Cobertura optionally use gcovr 8.4.
 
-Coverage owns fresh stages, objects, notes, images and per-category counters.
-Do not put coverage flags into the ordinary incremental graphs, reuse run
-directories, combine incompatible revisions/platforms, or promote incomplete
-collection to success. Preserve test exit status and await native child closure,
-including Extension Host servers, before reporting. The detached shard and
-Codex adapter wrappers keep their ordinary gates. Local reports never upload;
-CI retains reports separately from shipping binaries. Establish native-only and
-combined honest executable-line baselines, then add behavior tests for useful
-uncovered paths in their existing owner. A line hit is not branch or behavior
-coverage; do not add tautological tests or arbitrary initial thresholds.
+Discover project production roots from authored modules, including unused roots
+and folder contributors. Reserve `tests`, `test_*` and `*_test` basenames for
+test owners/support. The compiler automatically excludes source modules owning
+top-level `test_` functions; prebuilt stdlib modules and native dependencies are
+unmeasured. Check selected object metadata against discovered production roots
+so a skipped production module cannot silently shrink the denominator. Do not
+maintain a hardcoded list of production module names.
+
+Compile in a separate source/build tree. Compiler-owned `.coverage` outputs are
+separate from ordinary C/objects, so release builds need no artifact swapping or
+coverage cleanup. Repeated direct runs reset their own counters; independent
+concurrent sessions need separate trees. Preserve test exit status, run the
+native aggregate unfiltered, and join test-owned children before reporting.
+There is no separate seal/run/report coordinator or report merger. Measure
+native tests; actual-server protocol, Extension Host and packaging gates remain
+ordinary validation because automatic standalone reports write to stdout.
+Local reporting never uploads. CI retains reports/logs without shipping
+binaries. Add behavior tests for useful uncovered paths in their existing owner;
+line coverage is not branch or behavior coverage and needs no arbitrary initial
+percentage threshold.
 
 ## Incremental native builds
 

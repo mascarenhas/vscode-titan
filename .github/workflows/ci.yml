@@ -39,7 +39,7 @@ jobs:
         uses: actions/checkout@v7.0.1
         with:
           repository: mascarenhas/titan
-          ref: e9d3855e3429bb526cf3924eb32c5002fa99b0d0
+          ref: 0bcdaeb8bc25bdd863cc39853f1af90ce178f503
           path: titan
           submodules: recursive
           persist-credentials: false
@@ -183,30 +183,23 @@ jobs:
         working-directory: vscode-titan
         run: make -j1 inspect-vsix inspect-server plugin-validate install-server-test TITAN_REPO="$GITHUB_WORKSPACE/titan"
 
-      - name: Prepare the pinned line coverage reporter
+      - name: Prepare optional rich coverage formats
         working-directory: vscode-titan
         run: |
           python3 -m venv "$RUNNER_TEMP/titan-coverage-tools"
           "$RUNNER_TEMP/titan-coverage-tools/bin/pip" install gcovr==8.4
 
-      - name: Build isolated measured server and native test images
+      - name: Build the isolated covered native test aggregate
         working-directory: vscode-titan
         run: |
           make -j2 server-coverage-build BUILD_ROOT=.build/coverage-native \
-            CC=gcc-14 SERVER_COVERAGE_GCOV=gcov-14
-
-      - name: Collect native and actual-server line coverage
-        working-directory: vscode-titan
-        run: xvfb-run -a make server-coverage-run
-
-      - name: Render server line coverage
-        working-directory: vscode-titan
-        run: |
-          make server-coverage-report \
+            CC=gcc-14 SERVER_COVERAGE_GCOV=gcov-14 \
+            SERVER_COVERAGE_FORMATS='html lcov cobertura' \
             SERVER_COVERAGE_GCOVR="$RUNNER_TEMP/titan-coverage-tools/bin/gcovr"
-          make server-coverage-report SERVER_COVERAGE_SCOPE=native \
-            SERVER_COVERAGE_REPORT_DIR=.build/coverage/native-report \
-            SERVER_COVERAGE_GCOVR="$RUNNER_TEMP/titan-coverage-tools/bin/gcovr"
+
+      - name: Run covered native tests and generate reports
+        working-directory: vscode-titan
+        run: make server-coverage-run
 
       - name: Retain coverage reports and collection logs
         if: always()
@@ -215,13 +208,9 @@ jobs:
           name: titan-language-server-line-coverage
           include-hidden-files: true
           path: |
-            vscode-titan/.build/coverage/report
-            vscode-titan/.build/coverage/native-report
-            vscode-titan/.build/coverage/build/logs
-            vscode-titan/.build/coverage/build/*-image/build.json
-            vscode-titan/.build/coverage/run/*.log
-            vscode-titan/.build/coverage/run/*/run.json
-            vscode-titan/.build/coverage/run/coverage-runs.json
+            vscode-titan/.build/coverage/direct/report
+            vscode-titan/.build/coverage/direct/logs
+            vscode-titan/.build/coverage/direct/coverage-build.json
           if-no-files-found: ignore
           retention-days: 7
 

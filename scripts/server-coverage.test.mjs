@@ -1,13 +1,12 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 import { serverTestShards } from "./run-server-tests.mjs";
-import { buildCoverage, execute, parseArguments, productionModules, reportCoverage, runCoverage,
-  validateNativeOwners, validateSourceInventory } from "./server-coverage.mjs";
+import { buildCoverage, discoverProductionModules, execute, parseArguments, runCoverage, validateNativeOwners } from "./server-coverage.mjs";
 
 const repository = fileURLToPath(new URL("..", import.meta.url));
 const ownersOutput = () => serverTestShards.flat().map((name) => `[ RUN      ] ${name}.test_case`).join("\n");
@@ -16,380 +15,329 @@ async function fixture(context) {
   const root = await mkdtemp(path.join(os.tmpdir(), "vscode-titan-coverage-test-"));
   context.after(() => rm(root, { recursive: true, force: true }));
   const options = { repository: path.join(root, "repository"), prefix: path.join(root, "sdk"),
-    nativeDir: path.join(root, "native"), buildDir: path.join(root, "build"), runDir: path.join(root, "runs"),
-    reportDir: path.join(root, "report"), cc: "gcc-14", gcov: "gcov-14", gcovr: "private-gcovr", timeout: 30, scope: "all" };
+    nativeDir: path.join(root, "native"), buildDir: path.join(root, "build"), reportDir: path.join(root, "report"),
+    cc: "gcc-14", gcov: "gcov-14", gcovr: "private-gcovr", formats: [], timeout: 30 };
   const put = async (filename, contents = "fixture\n") => {
     await mkdir(path.dirname(filename), { recursive: true });
     await writeFile(filename, contents);
   };
-  for (const name of [...productionModules, ...serverTestShards.flat(), "server.tests", "server.test_links",
-    "server.test_paths", "server.test_runtime", "server.test_service"]) {
-    await put(path.join(options.repository, "src", name.replaceAll(".", "/") + ".titan"), "-- build orchestration fixture\n");
-  }
-  for (const name of ["compiler_io_clock.h", "compiler_io_clock.c", "embedded_interfaces_native.h"])
-    await put(path.join(options.repository, "src/server", name));
-  for (const name of ["Makefile", "scripts/server-coverage.mjs", "scripts/run-server-tests.mjs",
-    "scripts/test-server-protocol.mjs", "scripts/test-workspace-cache.mjs", "scripts/test-completion-protocol.mjs",
-    "scripts/generate-embedded-interfaces.lua", "test/fixtures/compiler-io-process.c", "scripts/run-extension-host-tests.mjs",
-    "src/test/suite/extension.test.ts", ".vscode-test.js", "package.json", "package-lock.json", "dist/extension.js",
-    "dist-test/src/test/suite/extension.test.js", "dist-test/src/extension/clientConfig.js", "node_modules/@vscode/test-cli/out/bin.mjs"])
-    await put(path.join(options.repository, name));
-  for (const name of ["compiler_io_clock.o", "embedded_interfaces_native.o", "embedded_interfaces_native.c", "compiler_io_process_fixture"])
+  for (const name of ["server/used.titan", "server/unimported.titan", "titan_language_server.titan", "server/tests.titan",
+    "server/used_test.titan", "server/test_paths.titan", "server/clock.h", "server/clock.c", "server/clock.ffi.h", "server/clock.o",
+    "server/.coverage/stale.titan"]) await put(path.join(options.repository, "src", name));
+  for (const name of ["compiler_io_clock.o", "embedded_interfaces_native.o", "compiler_io_process_fixture"])
     await put(path.join(options.nativeDir, name));
-  for (const name of ["titanc", "titan-coverage", "lua"]) await put(path.join(options.prefix, "bin", name));
+  for (const name of ["titanc", "lua"]) await put(path.join(options.prefix, "bin", name));
   await put(path.join(options.prefix, "lib/titan/0.6/titan.a"));
-  await put(path.join(options.prefix, "share/lua/5.5/titan-compiler/driver.lua"));
-  await put(path.join(options.prefix, "lib/lua/5.5/lfs.so"));
-  await put(path.join(options.prefix, "lib/luarocks/rocks-5.5/titan/0.6.0-1/bin/titanc"));
-  await put(path.join(options.prefix, "lib/luarocks/rocks-5.5/titan/0.6.0-1/bin/titan-coverage"));
   const calls = [];
   const run = async (command, args, execution) => {
     calls.push({ command, args, execution });
-    if (path.basename(command) === "lua") return args[2].includes("cpath") ? "selected-cpath" : "selected-path";
     if (path.basename(command) === "titanc") {
-      const image = args[args.indexOf("--coverage") + 1];
-      await put(path.join(image, "build.json"), "{}\n");
-      return "compiled";
+      const stage = args[args.indexOf("--tree") + 1];
+      const selected = args.flatMap((arg, index) => arg === "--coverage-module" ? [args[index + 1]] : []);
+      for (const name of selected) {
+        const main = path.join(stage, name.replaceAll(".", "/") + ".titan");
+        const stem = path.join(path.dirname(main), ".coverage", path.basename(main, ".titan"));
+        for (const extension of [".o", ".gcno", ".c"]) await put(stem + extension);
+      }
+      await put(path.join(execution.cwd, "server/tests"));
+      return "compiled\n";
     }
-    if (args[0] === "run") {
-      const directory = args[args.indexOf("--run") + 1];
-      await put(path.join(directory, "run.json"), JSON.stringify({ state: "complete", exit_status: 0 }));
-      return ownersOutput();
+    if (path.basename(command) === "lua") {
+      if (args[1] === "-e") return args[2].includes("cpath") ? "selected-cpath" : "selected-path";
+      const names = [];
+      for (let index = 2; index < args.length; index += 4 + Number(args[index + 3])) names.push(args[index]);
+      return names.join("\n") + "\n";
     }
-    if (args[0] === "report") {
-      const directory = args[args.indexOf("--output") + 1];
-      await mkdir(directory);
-      await put(path.join(directory, "summary.json"), JSON.stringify({ complete: true, tests_passed: true }));
+    if (command === path.join(options.buildDir, "server/tests")) {
+      await put(path.join(options.reportDir, "coverage.gcov"), "native gcov output\n");
+      for (const [format, filename] of Object.entries({ html: "coverage.html", lcov: "coverage.info", cobertura: "coverage.xml" })) {
+        if (options.formats.includes(format)) await put(path.join(options.reportDir, filename));
+      }
+      return ownersOutput() + "\nTitan executable lines: 12/20 (60.0%)\nCoverage report: " + path.join(options.reportDir, "coverage.gcov") + "\n";
     }
-    return "sealed";
+    assert.fail(`unexpected command: ${command} ${args.join(" ")}`);
   };
-  const environment = { TITAN_EXTRA_CPPFLAGS: "-DSOURCE_FLAG=1", VSCODE_TITAN_OPENSSL_CPPFLAGS: "-DSSL_FLAG=1",
+  const environment = { TITAN_EXTRA_CPPFLAGS: "-DSOURCE_FLAG=1", TITAN_EXTRA_LDFLAGS: "-lcaller", VSCODE_TITAN_OPENSSL_CPPFLAGS: "-DSSL_FLAG=1",
     VSCODE_TITAN_OPENSSL_LDFLAGS: "-lssl -lcrypto", LUA_PATH: "ambient-path", TITAN_PATH: "ambient-provider",
     GCOV_PREFIX: "ambient-counter-directory", TITAN_FILTER: "drop-most-tests" };
   return { root, options, calls, run, environment, put };
 }
 
-test("complete production source inventory includes entry and modules without direct test owners", async () => {
-  const sourceFiles = [];
-  const visit = async (directory, relative = "") => {
-    const { readdir } = await import("node:fs/promises");
-    for (const entry of await readdir(path.join(directory, relative), { withFileTypes: true })) {
-      const name = path.join(relative, entry.name);
-      if (entry.isDirectory()) await visit(directory, name);
-      else sourceFiles.push(name);
-    }
-  };
-  await visit(path.join(repository, "src"));
-  assert.equal(validateSourceInventory(sourceFiles).length, 39);
-  assert.ok(productionModules.includes("titan_language_server"));
-  assert.ok(productionModules.includes("server.response_queue"));
-  assert.throws(() => validateSourceInventory([...sourceFiles, "server/unimported.titan"]), /inventory changed/);
-  assert.throws(() => validateSourceInventory(sourceFiles.filter((name) => name !== "server/response_queue.titan")), /inventory changed/);
+async function sourceFiles(directory, relative = "") {
+  const result = [];
+  for (const entry of await readdir(path.join(directory, relative), { withFileTypes: true })) {
+    const filename = path.join(relative, entry.name);
+    if (entry.isDirectory()) result.push(...await sourceFiles(directory, filename));
+    else result.push(filename);
+  }
+  return result;
+}
+
+test("authored production discovery includes current entry, unused modules, and new modules automatically", async () => {
+  const authored = await sourceFiles(path.join(repository, "src"));
+  const names = discoverProductionModules(authored).map((module) => module.name);
+  assert.ok(names.includes("titan_language_server"));
+  assert.ok(names.includes("server.response_queue"));
+  assert.ok(!names.some((name) => name.endsWith("_test") || name === "server.tests" || name.startsWith("server.test_")));
+  assert.ok(discoverProductionModules([...authored, "server/future_unused.titan"]).some((module) => module.name === "server.future_unused"));
 });
 
-test("options select an explicit prefix and reject unsupported or incomplete commands", () => {
-  const parsed = parseArguments(["run", "--build-dir", "/tmp/build", "--run-dir", "/tmp/run", "--scope", "native"],
-    { TITAN_PREFIX: "/tmp/selected-sdk", CC: "gcc-14", GCOV: "gcov-14" });
-  assert.equal(parsed.prefix, "/tmp/selected-sdk");
-  assert.equal(parsed.scope, "native");
+test("discovery reserves exact test naming and ignores only generated .coverage trees", () => {
+  const modules = discoverProductionModules(["tests.titan", "test_helper.titan", "thing_test.titan", "testable.titan", "contest.titan",
+    "server/test.titan", "server/tests_more.titan", "server/.coverage/generated.titan", "server/.scratch/authored.titan"]);
+  assert.deepEqual(modules.map((module) => module.name), ["contest", "server..scratch.authored", "server.test", "server.tests_more", "testable"]);
+  assert.throws(() => discoverProductionModules(["tests.titan", "test_helper.titan"]), /no production/);
+});
+
+test("folder mains own all immediate contributors and shadow flat alternatives", () => {
+  const modules = discoverProductionModules(["server/parser.titan", "server/parser/parser.titan", "server/parser/tokens.titan",
+    "server/parser/contributor_test.titan", "server/parser/deep/node.titan", "server/test_support/test_support.titan",
+    "server/test_support/helpers.titan", "entry.titan"]);
+  assert.deepEqual(modules, [
+    { name: "entry", main: "entry.titan", sources: ["entry.titan"] },
+    { name: "server.parser", main: "server/parser/parser.titan", sources: ["server/parser/contributor_test.titan", "server/parser/parser.titan", "server/parser/tokens.titan"] },
+    { name: "server.parser.deep.node", main: "server/parser/deep/node.titan", sources: ["server/parser/deep/node.titan"] }
+  ]);
+});
+
+test("build options select explicit SDK/toolchain and optional formats; run needs only build and timeout", () => {
+  const parsed = parseArguments(["build", "--build-dir", "/tmp/build", "--native-dir", "/tmp/native", "--format", "html", "--format", "lcov", "--format", "html"],
+    { TITAN_PREFIX: "/tmp/sdk", CC: "gcc-14", GCOV: "gcov-14" });
+  assert.equal(parsed.prefix, "/tmp/sdk");
+  assert.equal(parsed.reportDir, "/tmp/build/report");
+  assert.deepEqual(parsed.formats, ["html", "lcov"]);
+  assert.equal(parsed.cc, "gcc-14");
+  const run = parseArguments(["run", "--build-dir", "/tmp/build", "--timeout", "45"], {});
+  assert.equal(run.timeout, 45);
+  assert.throws(() => parseArguments(["report"]), /build\|run/);
   assert.throws(() => parseArguments(["build", "--prefix", "/tmp/sdk", "--build-dir", "/tmp/build"]), /native-dir is required/);
-  assert.throws(() => parseArguments(["run", "--prefix", "/tmp/sdk", "--build-dir", "/tmp/build", "--run-dir", "/tmp/run", "--timeout", "0"]), /positive seconds/);
-  assert.throws(() => parseArguments(["report", "--unknown", "x"]), /invalid coverage option/);
+  assert.throws(() => parseArguments(["build", "--prefix", "/tmp/sdk", "--build-dir", "/tmp/build", "--native-dir", "/tmp/native", "--format", "json"]), /format must be/);
+  assert.throws(() => parseArguments(["run", "--build-dir", "/tmp/build", "--timeout", "0"]), /positive seconds/);
+  assert.throws(() => parseArguments(["run", "--build-dir", "/tmp/build", "--scope", "all"]), /invalid coverage option/);
 });
 
-test("real subprocess failures preserve their status and complete diagnostic log", async (context) => {
-  const root = await mkdtemp(path.join(os.tmpdir(), "vscode-titan-coverage-exec-"));
-  context.after(() => rm(root, { recursive: true, force: true }));
-  const log = path.join(root, "failed.log");
-  const env = { ...process.env };
-  delete env.NODE_TEST_CONTEXT;
-  await assert.rejects(execute(process.execPath, ["-e", "console.log('child output'); console.error('child error'); process.exitCode = 17"],
-    { cwd: root, env, quiet: true, log }), (error) => error.exitCode === 17);
-  const output = await readFile(log, "utf8");
-  assert.match(output, /child output/);
-  assert.match(output, /child error/);
+test("single direct test build roots every discovered production module and isolates source-adjacent artifacts", async (context) => {
+  const { options, calls, run, environment } = await fixture(context);
+  const build = await buildCoverage(options, { run, environment });
+  const compilations = calls.filter((call) => path.basename(call.command) === "titanc");
+  assert.equal(compilations.length, 1);
+  const { args, execution } = compilations[0];
+  const selected = args.flatMap((arg, index) => arg === "--coverage-module" ? [args[index + 1]] : []);
+  assert.deepEqual(selected, ["server.unimported", "server.used", "titan_language_server"]);
+  assert.deepEqual(args.slice(args.indexOf("--tree") + 2), ["server.tests", ...selected]);
+  assert.ok(args.includes("--test") && args.includes("--coverage") && args.includes("--no-uv-bootstrap"));
+  assert.ok(!args.includes("--coverage-source-map") && !args.includes("--coverage-gcovr") && !args.includes("--incremental"));
+  assert.equal(execution.cwd, options.buildDir);
+  assert.equal(execution.env.TITAN_BUILD_PROFILE, "validation");
+  for (const name of ["LUA_PATH", "GCOV_PREFIX", "GCOV_PREFIX_STRIP", "TITAN_FILTER"]) assert.equal(execution.env[name], undefined);
+  assert.equal(execution.env.TITAN_EXTRA_CPPFLAGS, "-DSOURCE_FLAG=1");
+  assert.match(execution.env.TITAN_EXTRA_LDFLAGS, /compiler_io_clock\.o/);
+  assert.match(execution.env.TITAN_EXTRA_LDFLAGS, /titan\.a/);
+  assert.equal(build.runtimeEnvironment.TITAN_EXTRA_LDFLAGS, "-lcaller", "fixture child builds do not receive final-image payload flags");
+  assert.equal(build.executable, path.join(options.buildDir, "server/tests"));
+  assert.equal(await readFile(path.join(options.buildDir, "src/server/clock.c"), "utf8"), "fixture\n");
+  await assert.rejects(stat(path.join(options.buildDir, "src/server/clock.ffi.h")), { code: "ENOENT" });
+  await assert.rejects(stat(path.join(options.buildDir, "src/server/clock.o")), { code: "ENOENT" });
+  await assert.rejects(stat(path.join(options.buildDir, "src/server/.coverage/stale.titan")), { code: "ENOENT" });
+  assert.ok(calls.every((call) => path.basename(call.command) !== "titan-coverage"));
+  await assert.rejects(buildCoverage(options, { run, environment }), { code: "EEXIST" });
+});
+
+test("optional richer formats are passed to the compiler only when requested", async (context) => {
+  const { options, calls, run, environment } = await fixture(context);
+  options.formats = ["html", "lcov", "cobertura"];
+  await buildCoverage(options, { run, environment });
+  const { args } = calls.find((call) => path.basename(call.command) === "titanc");
+  assert.deepEqual(args.flatMap((arg, index) => arg === "--coverage-format" ? [args[index + 1]] : []), options.formats);
+  assert.equal(args[args.indexOf("--coverage-gcovr") + 1], "private-gcovr");
+  await runCoverage(options, { run, environment });
+});
+
+test("metadata inventory audit rejects omitted production coverage and absent notes before execution", async (context) => {
+  const { options, calls, run, environment } = await fixture(context);
+  await assert.rejects(buildCoverage(options, { environment, run: async (command, args, execution) => {
+    const output = await run(command, args, execution);
+    return path.basename(args[1] ?? "") === "inspect-coverage.lua" ? output.replace("server.unimported\n", "") : output;
+  } }), /inventory audit incomplete/);
+  assert.equal(calls.filter((call) => call.command.endsWith("/server/tests")).length, 0);
+  const other = { ...options, buildDir: options.buildDir + "-other" };
+  const build = await buildCoverage(other, { run, environment });
+  await rm(build.modules[0].object.replace(/\.o$/, ".gcno"));
+  await assert.rejects(runCoverage(other, { run, environment }), { code: "ENOENT" });
+});
+
+test("colocated test exclusion from compiler metadata propagates a useful build failure", async (context) => {
+  const { options, run, environment } = await fixture(context);
+  const failure = new Error("server.unimported: production module was not instrumented (colocated test_ functions are excluded)");
+  await assert.rejects(buildCoverage(options, { environment, run: (command, args, execution) => {
+    if (path.basename(args[1] ?? "") === "inspect-coverage.lua") throw failure;
+    return run(command, args, execution);
+  } }), (error) => error === failure);
+  await assert.rejects(stat(path.join(options.buildDir, "coverage-build.json")), { code: "ENOENT" });
+});
+
+test("direct execution uses selected runtime paths, ignores ambient filters, and reports producer totals", async (context) => {
+  const { options, calls, run, environment } = await fixture(context);
+  await buildCoverage(options, { run, environment });
+  assert.deepEqual(await runCoverage(options, { run, environment }), { covered: 12, total: 20, reportDir: options.reportDir });
+  const invocation = calls.find((call) => call.command.endsWith("/server/tests"));
+  assert.deepEqual(invocation.args, []);
+  assert.equal(invocation.execution.timeout, 30);
+  assert.equal(invocation.execution.cwd, options.repository);
+  assert.equal(invocation.execution.env.LUA_PATH_5_5, "selected-path");
+  assert.equal(invocation.execution.env.LUA_CPATH_5_5, "selected-cpath");
+  assert.equal(invocation.execution.env.TITAN_COMPILER_IO_PROCESS_FIXTURE, path.join(options.nativeDir, "compiler_io_process_fixture"));
+  assert.equal(invocation.execution.env.TITAN_EXTRA_LDFLAGS, "-lcaller");
+  assert.equal(invocation.execution.env.TITAN_FILTER, undefined);
+  assert.equal(invocation.execution.env.GCOV_PREFIX, undefined);
+  await runCoverage(options, { run, environment }); // direct executable resets its own counters on each run
+});
+
+test("failed rerun removes old owned reports, retains unrelated files, and preserves the test failure", async (context) => {
+  const { options, run, environment, put } = await fixture(context);
+  await buildCoverage(options, { run, environment });
+  await runCoverage(options, { run, environment });
+  await put(path.join(options.reportDir, "coverage.html"), "stale richer report");
+  await put(path.join(options.reportDir, "unrelated.txt"), "keep");
+  const failure = Object.assign(new Error("native tests failed"), { exitCode: 9 });
+  await assert.rejects(runCoverage(options, { environment, run: (command, args, execution) => {
+    if (command.endsWith("/server/tests")) throw failure;
+    return run(command, args, execution);
+  } }), (error) => error === failure);
+  await assert.rejects(stat(path.join(options.reportDir, "coverage.gcov")), { code: "ENOENT" });
+  await assert.rejects(stat(path.join(options.reportDir, "coverage.html")), { code: "ENOENT" });
+  assert.equal(await readFile(path.join(options.reportDir, "unrelated.txt"), "utf8"), "keep");
+});
+
+test("incomplete test-owner execution, missing totals, and absent report reject successful child status", async (context) => {
+  const { options, run, environment } = await fixture(context);
+  await buildCoverage(options, { run, environment });
+  await assert.rejects(runCoverage(options, { environment, run: async (command, args, execution) => {
+    const output = await run(command, args, execution);
+    return command.endsWith("/server/tests") ? output.replace(/^\[ RUN[^\n]+\n/, "") : output;
+  } }), /every test owner/);
+  await assert.rejects(runCoverage(options, { environment, run: async (command, args, execution) => {
+    const output = await run(command, args, execution);
+    return command.endsWith("/server/tests") ? ownersOutput() : output;
+  } }), /valid Titan line totals/);
+  await assert.rejects(runCoverage(options, { environment, run: async (command, args, execution) => {
+    const output = await run(command, args, execution);
+    if (command.endsWith("/server/tests")) await rm(path.join(options.reportDir, "coverage.gcov"));
+    return output;
+  } }), { code: "ENOENT" });
+});
+
+test("a failed rerun inventory audit also clears the preceding successful report", async (context) => {
+  const { options, run, environment } = await fixture(context);
+  const build = await buildCoverage(options, { run, environment });
+  await runCoverage(options, { run, environment });
+  await rm(build.modules[0].object.replace(/\.o$/, ".gcno"));
+  await assert.rejects(runCoverage(options, { run, environment }), { code: "ENOENT" });
+  await assert.rejects(stat(path.join(options.reportDir, "coverage.gcov")), { code: "ENOENT" });
+});
+
+test("native owner audit requires the unfiltered aggregate", () => {
+  validateNativeOwners(ownersOutput());
+  assert.throws(() => validateNativeOwners("[ RUN      ] server.source_text_test.test_case"), /every test owner/);
 });
 
 async function waitForFile(filename) {
   const deadline = Date.now() + 5_000;
   while (Date.now() < deadline) {
-    const contents = await readFile(filename, "utf8").catch((error) => {
-      if (error.code !== "ENOENT") throw error;
-    });
+    const contents = await readFile(filename, "utf8").catch((error) => { if (error.code !== "ENOENT") throw error; });
     if (contents) return contents;
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
   assert.fail(`subprocess never became ready: ${filename}`);
 }
 
-test("cancellation rejects a zero-exit leader and retires its signal-ignoring descendant", {
-  skip: process.platform === "win32" ? "POSIX process groups" : false, timeout: 10_000
-}, async (context) => {
-  const root = await mkdtemp(path.join(os.tmpdir(), "vscode-titan-coverage-cancel-"));
+async function processFixture(context) {
+  const root = await mkdtemp(path.join(os.tmpdir(), "vscode-titan-coverage-process-"));
   context.after(() => rm(root, { recursive: true, force: true }));
-  const ready = path.join(root, "ready.json");
-  const nativeReady = path.join(root, "descendant.ready");
   const env = { ...process.env };
   delete env.NODE_TEST_CONTEXT;
-  const controller = new AbortController();
-  const running = execute(process.execPath, ["-e", `
-    const {spawn}=require('node:child_process');
-    const fs=require('node:fs');
-    process.on('SIGTERM',()=>process.exit(0));
-    const descendant=spawn(process.execPath,['-e',${JSON.stringify(`
-      process.on('SIGTERM',()=>{});
-      require('node:fs').writeFileSync(${JSON.stringify(nativeReady)},'ready');
-      setInterval(()=>{},1000);
-    `)}],{stdio:'ignore'});
-    const timer=setInterval(()=>{
-      if(fs.existsSync(${JSON.stringify(nativeReady)})) {
-        fs.writeFileSync(${JSON.stringify(ready)},JSON.stringify({leader:process.pid,descendant:descendant.pid}));
-        clearInterval(timer);
-      }
-    },10);
-  `], { cwd: root, env, signal: controller.signal, quiet: true });
-  const outcome = running.catch((error) => error);
-  const pids = JSON.parse(await waitForFile(ready));
-  context.after(() => {
-    try { process.kill(-pids.leader, "SIGKILL"); }
-    catch (error) { if (error.code !== "ESRCH") throw error; }
-  });
-  controller.abort();
-  const error = await outcome;
-  assert.match(error.message, /canceled/);
-  assert.equal(error.exitCode, 130, "a zero child exit after cancellation must still fail");
-  assert.throws(() => process.kill(pids.leader, 0), { code: "ESRCH" });
-  const deadline = Date.now() + 2_000;
-  while (Date.now() < deadline) {
-    const status = spawnSync("ps", ["-o", "stat=", "-p", String(pids.descendant)], { encoding: "utf8" }).stdout.trim();
-    if (!status || status.startsWith("Z")) return; // an adopted zombie cannot execute or write counters
-    await new Promise((resolve) => setTimeout(resolve, 10));
-  }
-  assert.fail("signal-ignoring compiler descendant survived owned process-group cleanup");
-});
+  return { root, env };
+}
 
-test("cancellation lets the upstream run supervisor handle SIGINT and still rejects its zero exit", {
-  skip: process.platform === "win32" ? "POSIX signals" : false, timeout: 10_000
-}, async (context) => {
-  const root = await mkdtemp(path.join(os.tmpdir(), "vscode-titan-coverage-delegate-"));
-  context.after(() => rm(root, { recursive: true, force: true }));
-  const ready = path.join(root, "ready");
-  const receipt = path.join(root, "signal");
-  const env = { ...process.env };
-  delete env.NODE_TEST_CONTEXT;
-  const controller = new AbortController();
-  const running = execute(process.execPath, ["-e", `
-    const fs=require('node:fs');
-    process.on('SIGINT',()=>{fs.writeFileSync(${JSON.stringify(receipt)},'SIGINT');process.exit(0);});
-    fs.writeFileSync(${JSON.stringify(ready)},'ready');
-    setInterval(()=>{},1000);
-  `], { cwd: root, env, signal: controller.signal, delegateCleanup: true, quiet: true });
-  const outcome = running.catch((error) => error);
-  await waitForFile(ready);
-  controller.abort();
-  assert.match((await outcome).message, /canceled/);
-  assert.equal(await readFile(receipt, "utf8"), "SIGINT");
-});
-
-test("cancellation escalates when the owned command ignores SIGTERM", {
-  skip: process.platform === "win32" ? "POSIX signals" : false, timeout: 8_000
-}, async (context) => {
-  const root = await mkdtemp(path.join(os.tmpdir(), "vscode-titan-coverage-escalate-"));
-  context.after(() => rm(root, { recursive: true, force: true }));
-  const ready = path.join(root, "ready");
-  const env = { ...process.env };
-  delete env.NODE_TEST_CONTEXT;
-  const controller = new AbortController();
-  const running = execute(process.execPath, ["-e", `
-    process.on('SIGTERM',()=>{});
-    require('node:fs').writeFileSync(${JSON.stringify(ready)},String(process.pid));
-    setInterval(()=>{},1000);
-  `], { cwd: root, env, signal: controller.signal, quiet: true });
-  const outcome = running.catch((error) => error);
-  const pid = Number(await waitForFile(ready));
+function retire(context, pid) {
   context.after(() => {
     try { process.kill(-pid, "SIGKILL"); }
     catch (error) { if (error.code !== "ESRCH") throw error; }
   });
+}
+
+async function assertRetired(pid) {
+  const deadline = Date.now() + 2_000;
+  while (Date.now() < deadline) {
+    const status = spawnSync("ps", ["-o", "stat=", "-p", String(pid)], { encoding: "utf8" }).stdout.trim();
+    if (!status || status.startsWith("Z")) return; // adopted zombies cannot write counters
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.fail(`owned subprocess survived cleanup: ${pid}`);
+}
+
+test("real subprocess failure preserves exit status and pipe-backed diagnostic output", async (context) => {
+  const { root, env } = await processFixture(context);
+  const log = path.join(root, "failed.log");
+  await assert.rejects(execute(process.execPath, ["-e", "console.log('child output'); console.error('child error'); process.exitCode = 17"],
+    { cwd: root, env, quiet: true, log }), (error) => error.exitCode === 17 && /child error/.test(error.message));
+  assert.match(await readFile(log, "utf8"), /child output[\s\S]*child error/);
+});
+
+test("cancellation rejects a zero-exit leader and retires its signal-ignoring descendant", {
+  skip: process.platform === "win32" ? "POSIX process groups" : false, timeout: 10_000
+}, async (context) => {
+  const { root, env } = await processFixture(context);
+  const ready = path.join(root, "ready.json");
+  const descendantReady = path.join(root, "descendant.ready");
+  const controller = new AbortController();
+  const running = execute(process.execPath, ["-e", `
+    const {spawn}=require('node:child_process'), fs=require('node:fs');
+    process.on('SIGTERM',()=>process.exit(0));
+    const child=spawn(process.execPath,['-e',${JSON.stringify(`process.on('SIGTERM',()=>{});require('node:fs').writeFileSync(${JSON.stringify(descendantReady)},'ready');setInterval(()=>{},1000);`)}],{stdio:'ignore'});
+    const timer=setInterval(()=>{if(fs.existsSync(${JSON.stringify(descendantReady)})){fs.writeFileSync(${JSON.stringify(ready)},JSON.stringify({leader:process.pid,child:child.pid}));clearInterval(timer);}},10);
+  `], { cwd: root, env, signal: controller.signal, quiet: true });
+  const outcome = running.catch((error) => error);
+  const pids = JSON.parse(await waitForFile(ready));
+  retire(context, pids.leader);
   controller.abort();
-  assert.match((await outcome).message, /canceled/);
+  const error = await outcome;
+  assert.equal(error.exitCode, 130);
+  assert.match(error.message, /canceled/);
+  assert.throws(() => process.kill(pids.leader, 0), { code: "ESRCH" });
+  await assertRetired(pids.child);
+});
+
+test("direct-run timeout escalates against a command ignoring SIGTERM", {
+  skip: process.platform === "win32" ? "POSIX signals" : false, timeout: 8_000
+}, async (context) => {
+  const { root, env } = await processFixture(context);
+  const ready = path.join(root, "ready");
+  const running = execute(process.execPath, ["-e", `process.on('SIGTERM',()=>{});require('node:fs').writeFileSync(${JSON.stringify(ready)},String(process.pid));setInterval(()=>{},1000);`],
+    { cwd: root, env, quiet: true, timeout: 1 });
+  const outcome = running.catch((error) => error);
+  const pid = Number(await waitForFile(ready));
+  retire(context, pid);
+  const error = await outcome;
+  assert.equal(error.exitCode, 124);
+  assert.match(error.message, /timed out/);
   assert.throws(() => process.kill(pid, 0), { code: "ESRCH" });
 });
 
-test("build isolates both images, maps every selected source, and binds support sources before compile", async (context) => {
-  const { options, calls, run, environment } = await fixture(context);
-  const build = await buildCoverage(options, { run, environment });
-  const compilations = calls.filter((call) => path.basename(call.command) === "titanc");
-  assert.equal(compilations.length, 2);
-  for (const call of compilations) {
-    assert.equal(call.args.filter((arg) => arg === "--coverage-module").length, 39);
-    assert.ok(call.args.includes("titan_language_server"));
-    assert.ok(!call.args.includes("--incremental"));
-    assert.equal(call.execution.env.TITAN_BUILD_PROFILE, "validation");
-    assert.equal(call.execution.env.LUA_PATH, undefined);
-    assert.notEqual(call.execution.env.GCOV_PREFIX, environment.GCOV_PREFIX);
-    assert.equal(call.execution.env.TITAN_FILTER, undefined);
-    assert.equal(call.execution.env.TITAN_EXTRA_CPPFLAGS, "-DSOURCE_FLAG=1");
-    assert.ok(call.execution.env.TITAN_EXTRA_LDFLAGS.endsWith("-lssl -lcrypto"));
-  }
-  assert.ok(compilations[0].args.includes("--no-uv-bootstrap"));
-  assert.ok(compilations[1].args.includes("--static"));
-  assert.notEqual(compilations[0].args[compilations[0].args.indexOf("--coverage-source-map") + 1],
-    compilations[1].args[compilations[1].args.indexOf("--coverage-source-map") + 1]);
-  const seals = calls.filter((call) => call.args[0] === "seal");
-  assert.equal(seals.length, 2);
-  for (const call of seals) {
-    assert.ok(call.args.includes(path.join(options.repository, "src/server/compiler_io_clock.c")));
-    assert.ok(call.args.includes(path.join(options.repository, "src/server/test_runtime.titan")));
-    assert.ok(call.args.includes(path.join(options.nativeDir, "embedded_interfaces_native.c")));
-    assert.ok(call.args.includes(path.join(options.repository, "test/fixtures/compiler-io-process.c")));
-    assert.ok(call.args.includes(path.join(options.repository, "dist-test/src/extension/clientConfig.js")));
-    assert.ok(call.args.includes(path.join(options.prefix, "share/lua/5.5/titan-compiler/driver.lua")));
-    assert.ok(call.args.includes(path.join(options.prefix, "lib/lua/5.5/lfs.so")));
-    assert.ok(call.args.includes(path.join(options.prefix, "lib/titan/0.6/titan.a")));
-    for (const name of ["titanc", "titan-coverage", "lua"]) assert.ok(call.args.includes(path.join(options.prefix, "bin", name)));
-  }
-  assert.equal(build.images[0], path.join(options.buildDir, "tests-image/bin/server/tests"));
-  await assert.rejects(buildCoverage(options, { run, environment }), { code: "EEXIST" });
+test("a zero-exit leader with a live same-group descendant fails and retires the descendant", {
+  skip: process.platform === "win32" ? "POSIX process groups" : false, timeout: 8_000
+}, async (context) => {
+  const { root, env } = await processFixture(context);
+  const ready = path.join(root, "ready");
+  const running = execute(process.execPath, ["-e", `
+    const {spawn}=require('node:child_process'),fs=require('node:fs');
+    const child=spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{stdio:'ignore'});
+    fs.writeFileSync(${JSON.stringify(ready)},JSON.stringify({leader:process.pid,child:child.pid}));
+    child.unref();
+  `], { cwd: root, env, quiet: true });
+  const outcome = running.catch((error) => error);
+  const pids = JSON.parse(await waitForFile(ready));
+  retire(context, pids.leader);
+  assert.match((await outcome).message, /surviving subprocesses/);
+  await assertRetired(pids.child);
 });
-
-test("a support source changed during compilation cannot be sealed as the compiled input", async (context) => {
-  const { options, run, environment, put } = await fixture(context);
-  const changing = async (command, args, execution) => {
-    const result = await run(command, args, execution);
-    if (path.basename(command) === "titanc") await put(path.join(options.repository, "src/server/test_runtime.titan"), "-- changed\n");
-    return result;
-  };
-  await assert.rejects(buildCoverage(options, { run: changing, environment }), /build inputs changed/);
-});
-
-test("runs the complete aggregate directly and joined protocol scripts with fresh counter roots", async (context) => {
-  const { options, calls, run, environment } = await fixture(context);
-  await buildCoverage(options, { run, environment });
-  const directories = await runCoverage(options, { run, environment });
-  assert.deepEqual(directories.map((directory) => path.basename(directory)), ["native", "server-protocol", "workspace-cache", "completion-protocol", "extension-host"]);
-  const executions = calls.filter((call) => call.args[0] === "run");
-  assert.equal(executions.length, 5);
-  assert.equal(executions[0].args.at(-1), path.join(options.buildDir, "tests-image/bin/server/tests"));
-  assert.ok(executions.every((call) => !call.args.some((arg) => arg.includes("run-server-tests.mjs"))));
-  assert.equal(executions[0].execution.env.TITAN_PATH, undefined);
-  assert.equal(executions[0].execution.env.GCOV_PREFIX, undefined);
-  assert.equal(executions[0].execution.env.LUA_PATH_5_5, "selected-path");
-  assert.equal(executions[0].execution.env.LUA_CPATH_5_5, "selected-cpath");
-  assert.equal(executions[0].execution.env.TITAN_EXTRA_LDFLAGS, "");
-  assert.ok(!executions[0].execution.env.TITAN_EXTRA_LDFLAGS.includes("compiler_io_clock.o"));
-  await assert.rejects(runCoverage(options, { run, environment }), { code: "EEXIST" });
-});
-
-test("incomplete collection fails even when upstream run returns a zero test status", async (context) => {
-  const { options, run, environment, put } = await fixture(context);
-  await buildCoverage(options, { run, environment });
-  const incomplete = async (command, args, execution) => {
-    const output = await run(command, args, execution);
-    if (args[0] === "run") await put(path.join(args[args.indexOf("--run") + 1], "run.json"),
-      JSON.stringify({ state: "incomplete", exit_status: 0, missing_counters: ["missing.gcda"] }));
-    return output;
-  };
-  await assert.rejects(runCoverage(options, { run: incomplete, environment }), /collection incomplete/);
-  await assert.rejects(readFile(path.join(options.runDir, "coverage-runs.json")), { code: "ENOENT" });
-});
-
-test("a successful zero-owner run is rejected and a child failure remains the primary error", async (context) => {
-  validateNativeOwners(ownersOutput());
-  assert.throws(() => validateNativeOwners("[ PASSED ] 0 tests"), /every test owner/);
-  const { options, run, environment } = await fixture(context);
-  await buildCoverage(options, { run, environment });
-  const failure = new Error("native child exited 17");
-  failure.exitCode = 17;
-  await assert.rejects(runCoverage(options, { environment, run: (command, args, execution) => {
-    if (args[0] === "run") throw failure;
-    return run(command, args, execution);
-  } }), (error) => error === failure);
-});
-
-test("report retains both manifests and provides a separate native-only baseline", async (context) => {
-  const { options, calls, run, environment } = await fixture(context);
-  await buildCoverage(options, { run, environment });
-  await runCoverage(options, { run, environment });
-  await reportCoverage(options, { run, environment });
-  let report = calls.filter((call) => call.args[0] === "report").at(-1);
-  assert.equal(report.args.filter((arg) => arg === "--manifest").length, 2);
-  assert.equal(report.args.filter((arg) => arg === "--run").length, 5);
-  assert.ok(!report.args.includes("--allow-incomplete"));
-  await reportCoverage({ ...options, scope: "native", reportDir: options.reportDir + "-native" }, { run, environment });
-  report = calls.filter((call) => call.args[0] === "report").at(-1);
-  assert.equal(report.args.filter((arg) => arg === "--manifest").length, 1);
-  assert.equal(report.args.filter((arg) => arg === "--run").length, 1);
-});
-
-test("edits to unmeasured helper sources invalidate run and report", async (context) => {
-  const { options, run, environment, put } = await fixture(context);
-  await buildCoverage(options, { run, environment });
-  await put(path.join(options.repository, "src/server/test_service.titan"), "-- changed after build\n");
-  await assert.rejects(runCoverage(options, { run, environment }), /build inputs changed/);
-  await assert.rejects(reportCoverage(options, { run, environment }), /build inputs changed/);
-});
-
-test("fixture runtime markers may change while original fixture sources remain sealed", async (context) => {
-  const { options, calls, run, environment, put } = await fixture(context);
-  const source = path.join(options.repository, "test/fixtures/project/main.titan");
-  const marker = path.join(options.repository, "test/fixtures/project/.titan-lsp-test/events.jsonl");
-  const cache = path.join(options.repository, "test/fixtures/project/.titan-ls/cache.json");
-  await put(source, "-- original fixture source\n");
-  await put(marker, "old marker\n");
-  await put(cache, "old cache\n");
-  await buildCoverage(options, { run, environment });
-  for (const seal of calls.filter((call) => call.args[0] === "seal")) {
-    assert.ok(seal.args.includes(source));
-    assert.ok(!seal.args.includes(marker));
-    assert.ok(!seal.args.includes(cache));
-  }
-  await put(marker, "new marker\n");
-  await put(cache, "new cache\n");
-  await put(path.join(path.dirname(marker), "new-runtime-output.json"));
-  await runCoverage({ ...options, scope: "native" }, { run, environment });
-  await reportCoverage({ ...options, scope: "native" }, { run, environment });
-  await put(source, "-- changed fixture source\n");
-  await assert.rejects(runCoverage({ ...options, runDir: options.runDir + "-changed" }, { run, environment }), /build inputs changed/);
-  await assert.rejects(reportCoverage(options, { run, environment }), /build inputs changed/);
-});
-
-for (const change of ["added", "removed"]) {
-  test(`fixture inventory rejects ${change} sources after sealing`, async (context) => {
-    const { options, run, environment, put } = await fixture(context);
-    const source = path.join(options.repository, "test/fixtures/project/main.titan");
-    await put(source, "-- original fixture source\n");
-    await buildCoverage(options, { run, environment });
-    await runCoverage({ ...options, scope: "native" }, { run, environment });
-    if (change === "added") await put(path.join(path.dirname(source), "extra.titan"));
-    else await rm(source);
-    await assert.rejects(runCoverage({ ...options, runDir: options.runDir + "-changed" }, { run, environment }), /fixture inventory changed/);
-    await assert.rejects(reportCoverage({ ...options, scope: "native" }, { run, environment }), /fixture inventory changed/);
-  });
-}
-
-test("new unmeasured test inputs cannot enter a sealed run and native-only runs cannot claim all-scope coverage", async (context) => {
-  const { options, run, environment, put } = await fixture(context);
-  await buildCoverage(options, { run, environment });
-  await runCoverage({ ...options, scope: "native" }, { run, environment });
-  await assert.rejects(reportCoverage(options, { run, environment }), /all-scope coverage requires/);
-  await put(path.join(options.repository, "dist-test/src/test/suite/added.test.js"));
-  await assert.rejects(runCoverage({ ...options, runDir: options.runDir + "-new" }, { run, environment }), /test inventory changed/);
-});
-
-for (const change of ["modified-lua", "modified-native", "provider", "added", "removed", "tool-titanc", "tool-titan-coverage", "tool-lua", "frontend"]) {
-  test(`selected runtime compiler modules reject ${change} inputs after sealing`, async (context) => {
-    const { options, run, environment, put } = await fixture(context);
-    await buildCoverage(options, { run, environment });
-    if (change === "modified-lua") await put(path.join(options.prefix, "share/lua/5.5/titan-compiler/driver.lua"), "changed Lua\n");
-    if (change === "modified-native") await put(path.join(options.prefix, "lib/lua/5.5/lfs.so"), "changed native module\n");
-    if (change === "provider") await put(path.join(options.prefix, "lib/titan/0.6/titan.a"), "changed static provider\n");
-    if (change === "added") await put(path.join(options.prefix, "share/lua/5.5/added.lua"));
-    if (change === "removed") await rm(path.join(options.prefix, "lib/lua/5.5/lfs.so"));
-    if (change.startsWith("tool-")) await put(path.join(options.prefix, "bin", change.slice(5)), "changed tool\n");
-    if (change === "frontend") await put(path.join(options.prefix, "lib/luarocks/rocks-5.5/titan/0.6.0-1/bin/titanc"), "changed frontend\n");
-    const expected = /build inputs changed|runtime module inventory changed/;
-    await assert.rejects(runCoverage(options, { run, environment }), expected);
-    await assert.rejects(reportCoverage(options, { run, environment }), expected);
-  });
-}
