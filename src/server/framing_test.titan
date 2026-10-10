@@ -123,3 +123,47 @@ function test_framing_rejects_oversized_content_before_body_accumulation(
     reader:next()
   end, "16777216")
 end
+
+local function expect_header_limit_error(reader: framing.FrameReader)
+  local rejected = false
+  do
+    reader:next()
+  catch
+    rejected = true
+    test.assert(error is framing.FrameError,
+                "oversized headers raised a non-framing error")
+    local failure = error as framing.FrameError
+    test.assert(failure.message == "LSP header block exceeds 65536 bytes",
+                "oversized headers did not retain their exact limit error")
+  end
+  test.assert(rejected, "oversized headers were accepted before any body arrived")
+end
+
+function test_framing_bounds_header_bytes_before_body_accumulation(
+    context: test.Context)
+  local prefix = "Content-Length: 0\r\nX-Pad: "
+  local headers = prefix .. strings.rep("a", 65536 - #prefix)
+  context:run("exact header limit", function (_child: test.Context)
+    local reader = framing.reader()
+    reader:feed(headers)
+    test.assert(reader:next() == nil and reader:pending_bytes() == 65536,
+                "exact header limit was rejected before its terminator arrived")
+    reader:feed("\r\n\r\n")
+    test.assert(reader:next() == "" and reader:pending_bytes() == 0,
+                "exact header limit did not produce its empty body")
+  end)
+  context:run("incomplete header overflow", function (_child: test.Context)
+    local reader = framing.reader()
+    reader:feed(headers)
+    test.assert(reader:next() == nil,
+                "incomplete headers were rejected at the permitted limit")
+    reader:feed("a")
+    expect_header_limit_error(reader)
+  end)
+  context:run("terminated header overflow", function (_child: test.Context)
+    local reader = framing.reader()
+    -- No body bytes are supplied in either overflow case.
+    reader:feed(headers .. "a\r\n\r\n")
+    expect_header_limit_error(reader)
+  end)
+end

@@ -1792,6 +1792,105 @@ function test_project_service_tracks_contextual_owner_provider_replacement(
     invalidates_a_compiled_facade_when_its_contextual_owner_moves)
 end
 
+local function restats_a_metadata_only_contextual_owner_without_ordinary_lookup()
+  with_fixture(function (fixture: Fixture)
+    fixture:mkdir("src")
+    fixture:mkdir("src/app")
+    fixture:mkdir("binary-modules")
+    configure_source_root(fixture)
+    fixture:write("src/app/main.titan", "-- compiled facade consumer\n")
+    fixture:write("src/other.titan", "-- unrelated project\n")
+    fixture:write("binary-modules/facade.so", "compiled facade")
+    fixture:write("binary-modules/owner.so", "original owner provider")
+
+    local facade = fixture:path("binary-modules/facade.so")
+    local owner = fixture:path("binary-modules/owner.so")
+    local analyzer = new_analyzer()
+    analyzer.binary_file = facade
+    analyzer.contextual_owner_file = owner
+    local metadata_owner_observations = 0
+    local analyze: project_service.Analyzer =
+      function (request: project_service.AnalysisRequest): compiler_bridge.Analysis
+        for index = 1, #request.external_fingerprints do
+          local fingerprint = request.external_fingerprints[index]
+          if fingerprint.module_name == "vendor.owner" then
+            metadata_owner_observations = metadata_owner_observations + 1
+            test.assert(not fingerprint.topology_resolved,
+              "metadata-only owner acquired an ordinary lookup fingerprint")
+          end
+        end
+        local analysis = analyzer:analyze(request)
+        test.assert(#analysis.contextual_resolutions == 1,
+          "fixture did not expose its contextual owner")
+        analysis.contextual_resolutions[1].ordinary_lookup = false
+        return analysis
+      end
+    local resolver = new_resolver()
+    resolver.provenance["vendor.binary"] =
+      compiler_bridge.Provenance.dynamic_binary(facade)
+    local resolve: project_service.ExternalResolver =
+      function (config: project_config.ProjectConfig, projects: {string},
+                requests: {compiler_bridge.ExternalResolutionRequest}):
+          {compiler_bridge.ExternalResolution}
+        for index = 1, #requests do
+          test.assert(requests[index].module_name ~= "vendor.owner",
+            "metadata-only contextual owner entered ordinary resolution")
+        end
+        return resolver:resolve(config, projects, requests)
+      end
+    local service?, load_error? = test_service.load {
+      project_root = fixture.root,
+      installed_binary_modules_root = test_paths.sdk_binary_root(),
+      analyzer = analyze,
+      external_resolver = resolve,
+      header_restater = restat_test_headers,
+    }
+    if service ~= nil then fixture.services[#fixture.services + 1] = service end
+    test.assert(service ~= nil and load_error == nil,
+      "metadata-only contextual owner fixture did not load")
+    local before = service:counters()
+    local unchanged?, unchanged_error? = service:refresh()
+    test.assert(unchanged ~= nil and unchanged_error == nil and
+                not unchanged.stale and #unchanged.committed_modules == 0 and
+                service:counters().analysis_runs == before.analysis_runs,
+      "unchanged metadata-only owner scheduled redundant compiler work")
+
+    -- Its physical path stays fixed. Only the contextual owner's bytes change;
+    -- neither the compiled facade nor either project source is rewritten.
+    fixture:write("binary-modules/owner.so", "replacement owner provider bytes")
+    local report?, failure? = service:refresh()
+    local after = service:counters()
+    test.assert(report ~= nil and failure == nil and not report.stale and
+                #report.committed_modules == 1 and
+                report.committed_modules[1] == "app.main" and
+                after.analysis_runs == before.analysis_runs + 1 and
+                after.project_modules_submitted ==
+                  before.project_modules_submitted + 1 and
+                after.file_reads == before.file_reads and
+                metadata_owner_observations == 1 and
+                analyzer.last_cached_count == 0,
+      "owner byte replacement did not narrowly recheck the unchanged facade consumer")
+    local imports = service:direct_imports("vendor.binary")
+    test.assert(#imports == 1 and imports[1].module_name == "vendor.owner" and
+                service:external_module("vendor.binary") ~= nil and
+                service:external_module("vendor.owner") == nil and
+                service:project_ast("vendor.binary") == nil and
+                service:project_ast("vendor.owner") == nil,
+      "metadata-only contextual owner retained an external body or cache entry")
+    local stable?, stable_error? = service:refresh()
+    test.assert(stable ~= nil and stable_error == nil and not stable.stale and
+                #stable.committed_modules == 0 and
+                service:counters().analysis_runs == after.analysis_runs,
+      "accepted contextual owner bytes remained dirty after rechecking")
+  end)
+end
+
+function test_project_service_restats_metadata_only_contextual_owner(
+    _context: test.Context)
+  test_runtime.run(
+    restats_a_metadata_only_contextual_owner_without_ordinary_lookup)
+end
+
 local function missing_provider_appearance_recovers_failed_revision()
   with_fixture(function (fixture: Fixture)
     fixture:mkdir("src")

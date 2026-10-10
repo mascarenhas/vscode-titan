@@ -49,6 +49,7 @@ return function(mode, contextual_provider_file, workspace_root, headers_root, sd
     "titan-compiler.types",
     "titan-compiler.driver",
     "titan-compiler.completion",
+    "titan-compiler.documentation",
   }
   local old_path, old_cpath = package.path, package.cpath
   local old_loaded = {}
@@ -453,6 +454,21 @@ return function(mode, contextual_provider_file, workspace_root, headers_root, sd
         ast[3]._type.flexrettype = false
       elseif mode == "false-optional-adjustment" then
         cast._adjustment = false
+      elseif mode == "nonpositive-location" then
+        declaration.loc.line = 0
+      elseif mode == "structure-without-start" then
+        ast[3].loc = nil
+        ast[3]._end_loc = {
+          filename = workspace_root .. "/fixture.titan", line = 5, col = 1,
+        }
+      elseif mode == "structure-across-files" then
+        ast[3]._end_loc = {
+          filename = workspace_root .. "/other.titan", line = 5, col = 1,
+        }
+      elseif mode == "structure-before-start" then
+        ast[3]._end_loc = {
+          filename = workspace_root .. "/fixture.titan", line = 2, col = 1,
+        }
       end
       local header_dependencies = {}
       if mode == "header-false" then
@@ -713,6 +729,9 @@ return function(mode, contextual_provider_file, workspace_root, headers_root, sd
     [names[3]] = types,
     [names[4]] = driver,
     [names[5]] = completion,
+    -- AST fixtures carry no documentation. Supply the entire lazy boundary
+    -- so a cold filtered run does not depend on another case loading it first.
+    [names[6]] = { for_node = function() return nil end },
   }
   if mode == "missing-parser" then replacements[names[1]] = nil end
   package.path, package.cpath = "", ""
@@ -870,6 +889,43 @@ function test_compiler_bridge_rejects_malformed_compiler_results(
   end)
 end
 
+local function invalid_location_case(context: test.Context, mode: string,
+                                     expected: string)
+  context:run(mode, function (_child: test.Context)
+    run_bridge(function ()
+      with_fixture(mode, function ()
+        local compiler = bridge.load()
+        local rejected = false
+        do
+          compiler:analyze("fixture", {bridge.ProjectModule.new(
+            "fixture", {bridge.SourceFile.new(
+              test_paths.workspace_root() .. "/fixture.titan", "saved fixture")})})
+        catch
+          rejected = true
+          test.assert(error is bridge.BridgeError,
+            "invalid compiler coordinates raised an untyped error")
+          local failure = error as bridge.BridgeError
+          test.assert(failure.module_name == "titan-compiler.driver" and
+            failure.message == expected, failure.message)
+        end
+        test.assert(rejected, "invalid compiler coordinates were accepted")
+      end)
+    end)
+  end)
+end
+
+function test_compiler_bridge_rejects_invalid_semantic_and_structural_locations(
+    context: test.Context)
+  invalid_location_case(context, "nonpositive-location",
+    "Ast.TopLevelVar.loc must use positive line and column values")
+  invalid_location_case(context, "structure-without-start",
+    "Ast.TopLevelFunc has _end_loc without a structural start")
+  invalid_location_case(context, "structure-across-files",
+    "Ast.TopLevelFunc structural span crosses source files")
+  invalid_location_case(context, "structure-before-start",
+    "Ast.TopLevelFunc structural span finishes before it starts")
+end
+
 function test_compiler_bridge_scopes_one_c_header_analysis_to_all_root_attempts(
     _context: test.Context)
   with_fixture("c-header-analysis-lifetime", function ()
@@ -922,14 +978,16 @@ function test_compiler_bridge_accepts_parse_and_check_source_profile_fields(
   defer logging.configure(previous_level)
   test.assert(logging.configure("trace"),
               "source-profile fixture could not enable trace logging")
-  with_fixture("source-profiling", function ()
-    local compiler = bridge.load()
-    local analysis = compiler:analyze("fixture", {
-      bridge.ProjectModule.new("fixture", {bridge.SourceFile.new(
-        test_paths.workspace_root() .. "/fixture.titan", "saved fixture")}),
-    })
-    test.assert(#analysis.diagnostics == 0,
-                "source-profile callback changed compiler analysis")
+  run_bridge(function ()
+    with_fixture("source-profiling", function ()
+      local compiler = bridge.load()
+      local analysis = compiler:analyze("fixture", {
+        bridge.ProjectModule.new("fixture", {bridge.SourceFile.new(
+          test_paths.workspace_root() .. "/fixture.titan", "saved fixture")}),
+      })
+      test.assert(#analysis.diagnostics == 0,
+                  "source-profile callback changed compiler analysis")
+    end)
   end)
 end
 
@@ -982,24 +1040,26 @@ end
 
 function test_compiler_bridge_accepts_missing_manifest_after_dependency_error(
     _context: test.Context)
-  with_fixture("dependency-diagnostic", function ()
-    local compiler = bridge.load()
-    local analysis = compiler:analyze("fixture", {
-      bridge.ProjectModule.new("fixture", {bridge.SourceFile.new(
-        test_paths.workspace_root() .. "/fixture.titan", "saved fixture")}),
-      bridge.ProjectModule.new("fixture.dependency", {bridge.SourceFile.new(
-        test_paths.workspace_root() .. "/dependency.titan", "invalid dependency")}),
-    })
-    local root? = analysis:find_module("fixture")
-    local dependency? = analysis:find_module("fixture.dependency")
-    test.assert(#analysis.diagnostics == 1 and root ~= nil and
-                dependency ~= nil,
-                "dependency error did not produce failed project snapshots")
-    test.assert(root.manifest == nil and dependency.manifest == nil,
-                "failed dependency closure acquired a valid manifest")
-    test.assert(not compiler:has_project_entry("fixture") and
-                not compiler:has_project_entry("fixture.dependency"),
-                "failed dependency closure entered the incremental cache")
+  run_bridge(function ()
+    with_fixture("dependency-diagnostic", function ()
+      local compiler = bridge.load()
+      local analysis = compiler:analyze("fixture", {
+        bridge.ProjectModule.new("fixture", {bridge.SourceFile.new(
+          test_paths.workspace_root() .. "/fixture.titan", "saved fixture")}),
+        bridge.ProjectModule.new("fixture.dependency", {bridge.SourceFile.new(
+          test_paths.workspace_root() .. "/dependency.titan", "invalid dependency")}),
+      })
+      local root? = analysis:find_module("fixture")
+      local dependency? = analysis:find_module("fixture.dependency")
+      test.assert(#analysis.diagnostics == 1 and root ~= nil and
+                  dependency ~= nil,
+                  "dependency error did not produce failed project snapshots")
+      test.assert(root.manifest == nil and dependency.manifest == nil,
+                  "failed dependency closure acquired a valid manifest")
+      test.assert(not compiler:has_project_entry("fixture") and
+                  not compiler:has_project_entry("fixture.dependency"),
+                  "failed dependency closure entered the incremental cache")
+    end)
   end)
 end
 
@@ -2347,6 +2407,117 @@ end
 function test_compiler_bridge_rechecks_source_required_external_dependencies_of_cached_projects(
     _context: test.Context)
   test_runtime.run(reparses_source_required_external_for_cached_project)
+end
+
+local function assert_external_chain_snapshot(
+    compiler: bridge.Compiler, analysis: bridge.Analysis,
+    module_name: string, filename: string, phase: string): bridge.ModuleSnapshot
+  local messages = strings.writer()
+  for index = 1, #analysis.diagnostics do
+    messages:write(analysis.diagnostics[index].message .. "\n")
+  end
+  test.assert(#analysis.diagnostics == 0,
+    phase .. " external chain failed: " .. messages:drain())
+  local module? = analysis:find_module(module_name)
+  test.assert(module ~= nil,
+    phase .. " external chain lost snapshot " .. module_name)
+  test.assert(module.manifest ~= nil and
+    module.manifest.source_serialized ~= nil,
+    phase .. " external chain lost its public or source manifest")
+  test.assert(#module.nodes == 0 and #module.symbols == 0 and
+    not compiler:has_project_entry(module_name),
+    phase .. " external chain retained project semantic state")
+  case module.provenance
+  when external_source{main_file, source_files} then
+    test.assert(main_file == filename and #source_files == 1 and
+      source_files[1] == filename,
+      phase .. " external module lost its physical source provenance")
+  else test.assert(false, phase .. " external module used non-source provenance")
+  end
+  return module
+end
+
+local function assert_external_chain_import(
+    parent: bridge.ModuleSnapshot, parent_file: string, phase: string)
+  test.assert(#parent.imports == 1,
+    phase .. " external dependency edge count changed")
+  local edge = parent.imports[1]
+  test.assert(edge.alias == "lower" and
+    edge.module_name == "bridge_external_chain_leaf" and
+    not edge.source_required,
+    phase .. " external import lost its alias, module or source mode")
+  test.assert(edge.location.filename == parent_file and
+    edge.location.line == 1 and edge.location.column == 7,
+    phase .. " external import used location " .. edge.location.filename ..
+      ":" .. strings.tostring(edge.location.line) ..
+      ":" .. strings.tostring(edge.location.column))
+end
+
+local function preserves_external_dependency_edges_after_cache_restore()
+  preload_real_compiler()
+  local external_root = test_paths.temporary_name()
+  fs.unlink(external_root)
+  fs.mkdir(external_root)
+  defer fs.rmdir(external_root)
+  local parent_file = external_root .. "/bridge_external_chain_parent.titan"
+  local leaf_file = external_root .. "/bridge_external_chain_leaf.titan"
+  fs.write_file(parent_file,
+    "local lower = import \"bridge_external_chain_leaf\"\n" ..
+    "function answer(): integer return lower.seed() end\n")
+  defer fs.unlink(parent_file)
+  fs.write_file(leaf_file, "function seed(): integer return 41 end\n")
+  defer fs.unlink(leaf_file)
+  local consumer = bridge.ProjectModule.new("bridge_external_chain_consumer", {
+    bridge.SourceFile.new(
+      test_paths.workspace_root() .. "/bridge_external_chain_consumer.titan",
+      "local upper = import \"bridge_external_chain_parent\"\n" ..
+      "function answer(): integer return upper.answer() + 1 end\n"),
+  })
+  local compiler = bridge.load()
+  compiler:configure(bridge.CompilerConfiguration.new { source_roots = {external_root} })
+  local fresh = compiler:analyze("bridge_external_chain_consumer", {consumer})
+  local parent = assert_external_chain_snapshot(
+    compiler, fresh, "bridge_external_chain_parent", parent_file, "fresh")
+  local leaf = assert_external_chain_snapshot(
+    compiler, fresh, "bridge_external_chain_leaf", leaf_file, "fresh")
+  assert_external_chain_import(parent, parent_file, "fresh")
+  test.assert(#leaf.imports == 0, "fresh external leaf gained a dependency")
+  local parent_manifest: bridge.Manifest = parent.manifest
+  local leaf_manifest: bridge.Manifest = leaf.manifest
+  local cached = {
+    bridge.CachedSourceInterface.new(
+      parent.module_name, parent_manifest.serialized,
+      parent_manifest.source_serialized, parent_file, {parent_file},
+      parent.imports, parent.c_header_dependencies),
+    bridge.CachedSourceInterface.new(
+      leaf.module_name, leaf_manifest.serialized,
+      leaf_manifest.source_serialized, leaf_file, {leaf_file},
+      leaf.imports, leaf.c_header_dependencies),
+  }
+  -- Neither external source may be reparsed. The cached parent's public
+  -- integer signature satisfies this consumer without loading the leaf, but
+  -- its dependency edge must survive for saved dependency tracking.
+  fs.write_file(parent_file, "function broken(: integer) end\n")
+  fs.write_file(leaf_file, "function broken(: integer) end\n")
+  local restored_compiler = bridge.load()
+  restored_compiler:configure(bridge.CompilerConfiguration.new { source_roots = {external_root} })
+  local restored = restored_compiler:analyze_incremental(
+    {consumer}, {"bridge_external_chain_consumer"}, cached)
+  local restored_parent = assert_external_chain_snapshot(
+    restored_compiler, restored,
+    "bridge_external_chain_parent", parent_file, "restored")
+  assert_external_chain_import(restored_parent, parent_file, "restored")
+  test.assert(restored:find_module("bridge_external_chain_leaf") == nil and
+    not restored_compiler:has_project_entry("bridge_external_chain_leaf"),
+    "cached public manifest unnecessarily loaded the external leaf")
+  test.assert(restored_parent.manifest.serialized == parent_manifest.serialized and
+    restored_parent.manifest.source_serialized == parent_manifest.source_serialized,
+    "cache restoration changed an external chain manifest")
+end
+
+function test_compiler_bridge_preserves_external_dependency_edges_after_cache_restore(
+    _context: test.Context)
+  run_bridge(preserves_external_dependency_edges_after_cache_restore)
 end
 
 local function uses_analysis_local_ffi_configuration()
@@ -5066,6 +5237,22 @@ end
       "completion lost declared names or multiple result types: " .. candidate.detail)
     test.assert(candidate.call_snippet == "choose(${1:first}, ${2:second})$0",
       "completion placeholders do not use declared names")
+  end)
+end
+
+function test_compiler_bridge_completion_variadic_function_without_fixed_arguments(
+    _context: test.Context)
+  run_bridge(function ()
+    local candidate = completion_named_candidate([[
+function choose(...: integer): (...: integer)
+  return ...
+end
+function use(): integer return cho end
+]], "return cho", "choose")
+    test.assert(candidate.detail == "choose(...: integer): (...: integer)",
+      "completion lost the variadic input or flexible results: " .. candidate.detail)
+    test.assert(candidate.call_snippet == "choose($1)$0",
+      "variadic completion did not leave an editable argument position")
   end)
 end
 

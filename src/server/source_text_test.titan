@@ -85,6 +85,131 @@ function test_source_text_rejects_split_scalars_surrogates_and_crlf(
               "coordinate after malformed UTF-8 did not retain decoder error")
 end
 
+local record Utf8Boundary
+  name: string
+  bytes: string
+  units: integer
+end
+
+function test_source_text_roundtrips_utf8_scalar_boundaries(context: test.Context)
+  local cases: {Utf8Boundary} = {
+    Utf8Boundary("smallest two-byte scalar", strings.char(0xc2, 0x80), 1),
+    Utf8Boundary("largest two-byte scalar", strings.char(0xdf, 0xbf), 1),
+    Utf8Boundary("smallest three-byte scalar", strings.char(0xe0, 0xa0, 0x80), 1),
+    Utf8Boundary("before surrogate range", strings.char(0xed, 0x9f, 0xbf), 1),
+    Utf8Boundary("after surrogate range", strings.char(0xee, 0x80, 0x80), 1),
+    Utf8Boundary("largest BMP scalar", strings.char(0xef, 0xbf, 0xbf), 1),
+    Utf8Boundary("smallest astral scalar", strings.char(0xf0, 0x90, 0x80, 0x80), 2),
+    Utf8Boundary("middle astral plane", strings.char(0xf1, 0x80, 0x80, 0x80), 2),
+    Utf8Boundary("largest Unicode scalar", strings.char(0xf4, 0x8f, 0xbf, 0xbf), 2),
+  }
+  for index = 1, #cases do
+    local candidate = cases[index]
+    context:run(candidate.name, function(_child: test.Context)
+      local source = "x" .. candidate.bytes .. "y"
+      expect_position(source, 1, 0, 1)
+      expect_position(source, 1 + #candidate.bytes, 0, 1 + candidate.units)
+      expect_position(source, #source, 0, 2 + candidate.units)
+      for offset = 2, #candidate.bytes do
+        local position?, failure? = source_text.position_for_offset(source, offset)
+        test.assert(position == nil and failure ~= nil and
+                    failure.message == "byte offset splits a UTF-8 scalar" and
+                    failure.byte_offset == offset,
+                    "interior byte acquired a source position")
+      end
+    end)
+  end
+end
+
+local record InvalidUtf8
+  name: string
+  bytes: string
+  message: string
+  offset: integer
+end
+
+function test_source_text_retains_precise_malformed_utf8_errors(
+    context: test.Context)
+  local cases: {InvalidUtf8} = {
+    InvalidUtf8("truncated two-byte", strings.char(0xc2), "truncated UTF-8 sequence", 2),
+    InvalidUtf8("bad two-byte continuation", strings.char(0xc2, 0x20), "invalid UTF-8 continuation byte", 3),
+    InvalidUtf8("truncated three-byte", strings.char(0xe0, 0xa0), "truncated UTF-8 sequence", 2),
+    InvalidUtf8("bad third byte", strings.char(0xe1, 0x80, 0x20), "invalid UTF-8 continuation byte", 4),
+    InvalidUtf8("overlong three-byte", strings.char(0xe0, 0x9f, 0x80), "invalid UTF-8 sequence", 2),
+    InvalidUtf8("encoded surrogate", strings.char(0xed, 0xa0, 0x80), "UTF-8 cannot encode a surrogate", 2),
+    InvalidUtf8("bad three-byte second", strings.char(0xe1, 0x20, 0x80), "invalid UTF-8 continuation byte", 3),
+    InvalidUtf8("truncated four-byte", strings.char(0xf0, 0x90, 0x80), "truncated UTF-8 sequence", 2),
+    InvalidUtf8("bad four-byte third", strings.char(0xf0, 0x90, 0x20, 0x80), "invalid UTF-8 continuation byte", 4),
+    InvalidUtf8("overlong four-byte", strings.char(0xf0, 0x8f, 0x80, 0x80), "invalid UTF-8 sequence", 2),
+    InvalidUtf8("above Unicode maximum", strings.char(0xf4, 0x90, 0x80, 0x80), "UTF-8 scalar is above U+10FFFF", 2),
+    InvalidUtf8("bad four-byte second", strings.char(0xf1, 0x20, 0x80, 0x80), "invalid UTF-8 continuation byte", 3),
+    InvalidUtf8("overlong leading byte", strings.char(0xc0, 0x80), "invalid UTF-8 leading byte", 2),
+    InvalidUtf8("out-of-range leading byte", strings.char(0xf5, 0x80, 0x80, 0x80), "invalid UTF-8 leading byte", 2),
+  }
+  for index = 1, #cases do
+    local candidate = cases[index]
+    context:run(candidate.name, function(_child: test.Context)
+      local source = "ok" .. candidate.bytes
+      expect_position(source, 2, 0, 2)
+      local position?, failure? = source_text.position_for_offset(source, #source)
+      test.assert(position == nil and failure ~= nil and
+                  failure.message == candidate.message and
+                  failure.byte_offset == candidate.offset,
+                  "malformed UTF-8 lost its precise byte error")
+      local offset?, reverse_failure? = source_text.offset_for_position(
+        source, source_text.Position(0, 3))
+      test.assert(offset == nil and reverse_failure ~= nil and
+                  reverse_failure.message == candidate.message and
+                  reverse_failure.byte_offset == candidate.offset,
+                  "reverse coordinates crossed malformed UTF-8")
+    end)
+  end
+  context:run("bad fourth continuation", function(_child: test.Context)
+    local source = "ok" .. strings.char(0xf0, 0x90, 0x80, 0x20)
+    local position?, failure? = source_text.position_for_offset(source, #source)
+    local offset?, reverse_failure? = source_text.offset_for_position(
+      source, source_text.Position(0, 3))
+    test.assert(position == nil and failure ~= nil and
+                failure.message == "invalid UTF-8 continuation byte" and
+                offset == nil and reverse_failure ~= nil and
+                reverse_failure.message == failure.message,
+                "fourth byte of a UTF-8 sequence was not validated")
+  end)
+end
+
+function test_source_text_rejects_invalid_span_endpoints(_context: test.Context)
+  local coordinates = source_text.coordinate_index("a😀b\nc")
+  local invalid_bytes: {source_text.ByteSpan} = {
+    source_text.ByteSpan(2, 5), source_text.ByteSpan(1, 2),
+    source_text.ByteSpan(5, 1), source_text.ByteSpan(-1, 1),
+    source_text.ByteSpan(1, 99),
+  }
+  for index = 1, #invalid_bytes do
+    local bytes = invalid_bytes[index]
+    local span?, failure? = coordinates:span_for_offsets(bytes.start, bytes.finish)
+    test.assert(span == nil and failure ~= nil,
+                "invalid byte endpoint produced a partial LSP span")
+  end
+  local invalid_positions: {source_text.Position} = {
+    source_text.Position(-1, 0), source_text.Position(0, -1),
+    source_text.Position(9, 0), source_text.Position(0, 2),
+  }
+  for index = 1, #invalid_positions do
+    local position = invalid_positions[index]
+    local start_span = source_text.Span(position, source_text.Position(1, 0))
+    local end_span = source_text.Span(source_text.Position(0, 0), position)
+    local start?, start_error? = coordinates:offsets_for_span(start_span)
+    local finish?, finish_error? = coordinates:offsets_for_span(end_span)
+    test.assert(start == nil and start_error ~= nil and
+                finish == nil and finish_error ~= nil,
+                "invalid LSP endpoint produced a partial byte span")
+  end
+  local reversed?, reversed_error? = coordinates:offsets_for_span(
+    source_text.Span(source_text.Position(1, 0), source_text.Position(0, 0)))
+  test.assert(reversed == nil and reversed_error ~= nil and
+              reversed_error.message == "span finish precedes its start")
+end
+
 function test_source_text_normalizes_file_uris_and_paths(
     _context: test.Context)
   if ffi.VSCODE_TITAN_WINDOWS ~= 0 then test.skip("Unix path semantics") end
@@ -138,6 +263,61 @@ function test_source_text_rejects_malformed_or_nonlocal_file_uris(
     test.assert(remote == nil and remote_error ~= nil,
                 "non-local file URI authority was accepted")
   end
+end
+
+function test_source_text_handles_percent_escape_boundaries(context: test.Context)
+  context:run("lowercase escapes have canonical uppercase identities",
+    function (_child: test.Context)
+      if ffi.VSCODE_TITAN_WINDOWS ~= 0 then test.skip("Unix path semantics") end
+      local path?, decode_error? = source_text.file_uri_to_path(
+        "file:///workspace/caf%c3%a9%23%3f.titan")
+      test.assert(decode_error == nil and path == "/workspace/café#?.titan",
+                  "lowercase escapes lost exact file path bytes")
+      local uri?, encode_error? = source_text.path_to_file_uri(path)
+      test.assert(encode_error == nil and
+                  uri == "file:///workspace/caf%C3%A9%23%3F.titan",
+                  "decoded file identity did not use canonical uppercase escapes")
+    end)
+  context:run("terminal percent", function (_child: test.Context)
+    local path?, failure? = source_text.file_uri_to_path("file:///workspace/bad%")
+    test.assert(path == nil and failure ~= nil and
+                failure.message == "malformed percent escape in file URI" and
+                failure.byte_offset == 14,
+                "terminal percent escape did not retain its exact byte error")
+  end)
+  context:run("terminal percent digit", function (_child: test.Context)
+    local path?, failure? = source_text.file_uri_to_path("file:///workspace/bad%2")
+    test.assert(path == nil and failure ~= nil and
+                failure.message == "malformed percent escape in file URI" and
+                failure.byte_offset == 14,
+                "one-digit percent escape did not retain its exact byte error")
+  end)
+end
+
+function test_source_text_rejects_unrepresentable_file_uri_identity(
+    _context: test.Context)
+  local invalid_uris: {string} = {
+    "https://localhost/workspace/main.titan",
+    "file://localhost",
+    "file:///workspace/main.titan?version=1",
+    "file:///workspace/main.titan#definition",
+    "file:///workspace/bad%00name.titan",
+  }
+  for index = 1, #invalid_uris do
+    local uri = invalid_uris[index]
+    local path?, failure? = source_text.file_uri_to_path(uri)
+    test.assert(path == nil and failure ~= nil,
+                "invalid URI acquired a filesystem identity: " .. uri)
+  end
+  local path?, path_error? = source_text.normalize_absolute_path("relative.titan")
+  local uri?, uri_error? = source_text.path_to_file_uri("relative.titan")
+  local resolved?, resolve_error? = source_text.resolve_path("relative", "main.titan")
+  test.assert(path == nil and path_error ~= nil and
+              uri == nil and uri_error ~= nil and
+              resolved == nil and resolve_error ~= nil,
+              "relative base acquired an absolute path or URI identity")
+  test.assert(source_text.relative_path("relative", "also-relative") == nil,
+              "relative paths were accepted as project containment")
 end
 
 function test_source_text_coordinate_index_has_bounded_lookup_work(

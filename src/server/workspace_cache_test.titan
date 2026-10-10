@@ -137,6 +137,69 @@ function test_content_identity_hashes_arbitrary_saved_bytes(_context: test.Conte
   end)
 end
 
+function test_content_identity_missing_and_saved_files_have_stable_distinct_identities(
+    _context: test.Context)
+  test_runtime.run(function ()
+    local root = new_root()
+    defer cleanup(root)
+    local path = root .. "/saved.titan"
+    local absent = identity.stat_identity(path)
+    test.assert(identity.observe(path) == nil and
+      identity.stat_identity(path) == absent,
+      "missing saved input did not retain a stable absent observation")
+
+    local contents = "saved\0bytes\255"
+    fs.write_file(path, contents)
+    local present = identity.stat_identity(path)
+    local saved = identity.file(path, contents)
+    local observed? = identity.observe(path)
+    test.assert(observed ~= nil and observed.kind == "file" and
+      observed.size == #contents and present ~= absent,
+      "creating a saved input did not change its filesystem identity")
+    test.assert(identity.stat_identity(path) == present and
+      identity.file(path, contents) == saved and
+      identity.same_observation(observed, identity.observe(path)),
+      "unchanged saved bytes or metadata changed their accepted identity")
+    test.assert(identity.file(path, "saved\0bytes\254") ~= saved,
+      "saved input identity ignored exact supplied content bytes")
+
+    fs.unlink(path)
+    test.assert(identity.observe(path) == nil and
+      identity.stat_identity(path) == absent and
+      identity.file(path, contents) ~= saved,
+      "removing a saved input retained its previous physical identity")
+  end)
+end
+
+local function changed_observation_case(context: test.Context, name: string,
+                                        changed: identity.FileObservation)
+  context:run(name, function (_child: test.Context)
+    local original = identity.FileObservation.new("file", 123, 456, 7, "physical")
+    test.assert(not identity.same_observation(original, changed),
+      "saved observation ignored changed " .. name)
+  end)
+end
+
+function test_content_identity_compares_every_saved_observation_field(
+    context: test.Context)
+  context:run("equal", function (_child: test.Context)
+    local original = identity.FileObservation.new("file", 123, 456, 7, "physical")
+    local equal = identity.FileObservation.new("file", 123, 456, 7, "physical")
+    test.assert(identity.same_observation(original, equal),
+      "equal saved observations compared their record identities")
+  end)
+  changed_observation_case(context, "kind",
+    identity.FileObservation.new("directory", 123, 456, 7, "physical"))
+  changed_observation_case(context, "modified_seconds",
+    identity.FileObservation.new("file", 124, 456, 7, "physical"))
+  changed_observation_case(context, "modified_nanoseconds",
+    identity.FileObservation.new("file", 123, 457, 7, "physical"))
+  changed_observation_case(context, "size",
+    identity.FileObservation.new("file", 123, 456, 8, "physical"))
+  changed_observation_case(context, "physical_identity",
+    identity.FileObservation.new("file", 123, 456, 7, "replacement"))
+end
+
 function test_workspace_cache_publishes_binary_payloads_and_preserves_warm_projects(
     _context: test.Context)
   test_runtime.run(function ()

@@ -122,6 +122,45 @@ function test_diagnostics_map_saved_compiler_byte_locations_to_lsp(
               "LSP diagnostic notification lost compiler metadata")
 end
 
+function test_diagnostics_anchor_location_free_compiler_failures_to_first_constituent(
+    _context: test.Context)
+  local first_filename = test_paths.workspace_root() .. "/z-first.titan"
+  local second_filename = test_paths.workspace_root() .. "/a-second.titan"
+  local message = "compiler boundary failed"
+  local failure = bridge.Diagnostic.new(
+    bridge.DiagnosticKind.compiler(), message, nil)
+  local saved = snapshot(first_filename, "first\n", {failure})
+  local second_contents = "second\n"
+  local second = project_service.SourceFileSnapshot.new(
+    second_filename, second_contents,
+    project_graph.FileStamp.new(second_filename, 1, 2, #second_contents))
+  local module = project_service.ProjectModule.new(
+    "main", {saved.project_modules[1].source_files[1], second}, nil, {failure},
+    project_service.ProjectAnalysisState.failed())
+  local multiple = project_service.Snapshot.new(
+    saved.generation, saved.config, saved.discovery_issues,
+    saved.project_directories, {module}, saved.external_modules, saved.dirty_modules)
+  local publications = diagnostics.from_snapshot(multiple)
+  test.assert(#publications == 1 and #publications[1].items == 1 and
+              publications[1].uri == test_paths.workspace_uri() .. "/z-first.titan",
+              "location-free compiler failure did not select only the first saved constituent")
+  local item = publications[1].items[1]
+  test.assert(item.message == message and
+              item.range.start.line == 0 and item.range.start.character == 0 and
+              item.range.finish.line == 0 and item.range.finish.character == 0,
+              "location-free compiler failure lost its zero-width document anchor")
+
+  local envelope? = wire.as_object(wire.decode(
+    diagnostics.notification(publications[1])))
+  local params? = wire.as_object(envelope["params"])
+  local values? = wire.as_array(params["diagnostics"])
+  local diagnostic? = wire.as_object(values[1])
+  test.assert(wire.as_integer(diagnostic["severity"]) == 1 and
+              wire.as_string(diagnostic["code"]) == "compiler" and
+              wire.as_string(diagnostic["message"]) == message,
+              "location-free compiler failure lost its published severity or code")
+end
+
 function test_diagnostics_filter_external_locations_and_clear_stale_files(
     _context: test.Context)
   local filename = test_paths.workspace_root() .. "/main.titan"

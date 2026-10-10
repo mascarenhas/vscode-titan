@@ -201,6 +201,36 @@ parallel shards on the two-CPU runner. Maintain the module inventory in
 `scripts/run-server-tests.mjs` when adding a test owner, inspect positive test
 selection and both shard outcomes, and use `make verify` for the complete gate.
 
+## Native production line coverage
+
+Use `make server-coverage`, or its `server-coverage-build` and
+`server-coverage-run` phases, with the exact pinned Titan compiler. Follow
+[coverage.md](../../../docs/coverage.md). `titanc --test --coverage` embeds its
+source inventory; ordinary aggregate execution resets counters and reports after
+successful tests and cleanup. Basic annotated reports need only matching GCC
+14+ and gcov. HTML, LCOV and Cobertura optionally use gcovr 8.4.
+
+Discover project production roots from authored modules, including unused roots
+and folder contributors. Reserve `tests`, `test_*` and `*_test` basenames for
+test owners/support. The compiler automatically excludes source modules owning
+top-level `test_` functions; prebuilt stdlib modules and native dependencies are
+unmeasured. Check selected object metadata against discovered production roots
+so a skipped production module cannot silently shrink the denominator. Do not
+maintain a hardcoded list of production module names.
+
+Compile in a separate source/build tree. Compiler-owned `.coverage` outputs are
+separate from ordinary C/objects, so release builds need no artifact swapping or
+coverage cleanup. Repeated direct runs reset their own counters; independent
+concurrent sessions need separate trees. Preserve test exit status, run the
+native aggregate unfiltered, and join test-owned children before reporting.
+There is no separate seal/run/report coordinator or report merger. Measure
+native tests; actual-server protocol, Extension Host and packaging gates remain
+ordinary validation because automatic standalone reports write to stdout.
+Local reporting never uploads. CI retains reports/logs without shipping
+binaries. Add behavior tests for useful uncovered paths in their existing owner;
+line coverage is not branch or behavior coverage and needs no arbitrary initial
+percentage threshold.
+
 ## Incremental native builds
 
 Read [native-build.md](../../../docs/native-build.md) before changing the Make

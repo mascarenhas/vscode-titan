@@ -1253,8 +1253,8 @@ suite("Titan extension", () => {
     }
   );
 
-  test("connects VS Code to the packaged native server", async function () {
-    this.timeout(60_000);
+  test("connects VS Code to the selected native server and closes it", async function () {
+    this.timeout(90_000);
     const repositoryRoot = path.resolve(__dirname, "../../../..");
     const server = resolveServerExecutable(
       process.env.TITAN_LSP_TEST_SERVER ?? "",
@@ -1273,69 +1273,184 @@ suite("Titan extension", () => {
       modulePrefix, "lib", "lua", "5.5", process.platform === "win32" ? "?.dll" : "?.so"
     );
 
-    await Promise.all([
-      resetMarker(alphaMarkerPath),
-      resetMarker(betaMarkerPath)
-    ]);
-    await vscode.workspace.getConfiguration("titan.compiler").update(
-      "luaPath",
-      "",
-      vscode.ConfigurationTarget.Global
-    );
-    await waitForEventSequence(
-      alphaMarkerPath,
-      ["shutdown", "exit", "initialize"],
-      10_000
-    );
-    await vscode.workspace.getConfiguration("titan.compiler").update(
-      "luaCPath",
-      "",
-      vscode.ConfigurationTarget.Global
-    );
-    const defaulted = await waitForEventSequence(
-      alphaMarkerPath,
-      [
-        "shutdown", "exit", "initialize",
-        "shutdown", "exit", "initialize"
-      ],
-      10_000
-    );
-    const defaultedInitialization = defaulted[5];
-    const actualLuaTemplates = defaultedInitialization.luaPath?.split(";");
-    const expectedLuaTemplates = bundledLuaPath.split(";");
-    assert.ok(actualLuaTemplates, "bundled Lua path should be present");
-    assert.equal(actualLuaTemplates.length, expectedLuaTemplates.length);
-    for (const [index, expected] of expectedLuaTemplates.entries()) {
-      assertNativePathEqual(actualLuaTemplates[index], expected);
+    const lifecycle = process.env.TITAN_LSP_TEST_LIFECYCLE;
+    const selectedLuaPath = process.env.TITAN_LSP_TEST_LUA_PATH;
+    const selectedLuaCPath = process.env.TITAN_LSP_TEST_LUA_CPATH;
+    assert.equal(selectedLuaPath === undefined, selectedLuaCPath === undefined,
+      "selected native compiler discovery requires both Lua paths");
+    const betaInitialization = (await readEvents(betaMarkerPath))
+      .filter((event) => event.event === "initialize").at(-1);
+    assert.ok(betaInitialization, "beta should have a running fixture server");
+    const previousInitializeDelayRoot = process.env.TITAN_LSP_FIXTURE_INITIALIZE_DELAY_ROOT;
+    // Exercise a slower beta restart. Every global configuration change affects
+    // both clients, so neither marker may be reset while beta is still starting.
+    process.env.TITAN_LSP_FIXTURE_INITIALIZE_DELAY_ROOT = betaInitialization.cwd;
+    try {
+      await Promise.all([resetMarker(alphaMarkerPath), resetMarker(betaMarkerPath)]);
+      await vscode.workspace.getConfiguration("titan.compiler").update(
+        "luaPath", "", vscode.ConfigurationTarget.Global);
+      await Promise.all([alphaMarkerPath, betaMarkerPath].map((marker) =>
+        waitForEventSequence(marker, ["shutdown", "exit", "initialize"], 10_000)));
+      await vscode.workspace.getConfiguration("titan.compiler").update(
+        "luaCPath", "", vscode.ConfigurationTarget.Global);
+      const defaulted = await Promise.all([alphaMarkerPath, betaMarkerPath].map((marker) =>
+        waitForEventSequence(marker, [
+          "shutdown", "exit", "initialize", "shutdown", "exit", "initialize"
+        ], 10_000)));
+      for (const events of defaulted) {
+        const initialization = events[5];
+        const actualLuaTemplates = initialization.luaPath?.split(";");
+        const expectedLuaTemplates = bundledLuaPath.split(";");
+        assert.ok(actualLuaTemplates, "bundled Lua path should be present");
+        assert.equal(actualLuaTemplates.length, expectedLuaTemplates.length);
+        for (const [index, expected] of expectedLuaTemplates.entries()) {
+          assertNativePathEqual(actualLuaTemplates[index], expected);
+        }
+        assertNativePathEqual(initialization.luaCPath, bundledLuaCPath);
+        assert.equal(initialization.compilerCachePrefix, process.env.TITAN_PREFIX);
+      }
+      if (selectedLuaPath !== undefined) {
+        assert.ok(selectedLuaCPath !== undefined);
+        for (const [name, value] of [
+          ["luaPath", selectedLuaPath], ["luaCPath", selectedLuaCPath]
+        ]) {
+          await Promise.all([resetMarker(alphaMarkerPath), resetMarker(betaMarkerPath)]);
+          await vscode.workspace.getConfiguration("titan.compiler").update(
+            name, value, vscode.ConfigurationTarget.Global);
+          await Promise.all([
+            waitForEventSequence(alphaMarkerPath, ["shutdown", "exit", "initialize"], 10_000),
+            waitForEventSequence(betaMarkerPath, ["shutdown", "exit", "initialize"], 10_000)
+          ]);
+        }
+      }
+    } finally {
+      if (previousInitializeDelayRoot === undefined) {
+        delete process.env.TITAN_LSP_FIXTURE_INITIALIZE_DELAY_ROOT;
+      } else {
+        process.env.TITAN_LSP_FIXTURE_INITIALIZE_DELAY_ROOT = previousInitializeDelayRoot;
+      }
     }
-    assertNativePathEqual(defaultedInitialization.luaCPath, bundledLuaCPath);
-    assert.equal(defaultedInitialization.compilerCachePrefix, process.env.TITAN_PREFIX);
+    const nodeExecutable = process.env.npm_node_execpath;
+    assert.ok(nodeExecutable, "npm_node_execpath should identify Node");
+    const previousArguments = [alpha, beta].map((folder) =>
+      vscode.workspace.getConfiguration("titan.languageServer", folder.uri)
+        .inspect<string[]>("arguments")?.workspaceFolderValue);
+    try {
+      if (lifecycle !== undefined) {
+        // Coverage keeps the selected executable in its own immutable build.
+        // The proxy records native close after its counters flush; it forwards
+        // stdio directly and does not replace the LSP transport.
+        for (const folder of [alpha, beta]) {
+          await vscode.workspace.getConfiguration("titan.languageServer", folder.uri)
+            .update("arguments", [
+              path.join(repositoryRoot, "scripts", "run-extension-host-tests.mjs"),
+              "--native-server", server, path.join(lifecycle, `${folder.name}.jsonl`)
+            ], vscode.ConfigurationTarget.WorkspaceFolder);
+        }
+        for (const folder of [alpha, beta]) {
+          await waitForNativeServerStart(path.join(lifecycle, `${folder.name}.jsonl`),
+            server, 10_000);
+        }
+      } else {
+        await vscode.workspace.getConfiguration("titan.languageServer").update(
+          "path", server, vscode.ConfigurationTarget.Global);
+      }
 
-    await vscode.workspace.getConfiguration("titan.languageServer").update(
-      "path",
-      server,
-      vscode.ConfigurationTarget.Global
-    );
-
-    const document = await vscode.workspace.openTextDocument(
-      vscode.Uri.joinPath(alpha.uri, "sample.titan")
-    );
-    const useOffset = document.getText().lastIndexOf("render");
-    assert.ok(useOffset >= 0, "native-server fixture has no render use");
-    const definitions = await waitForDefinitions(
-      document.uri,
-      document.positionAt(useOffset + 1),
-      20_000
-    );
-    assert.equal(definitions.length, 1);
-    const definition = definitions[0];
-    assert.ok(definition instanceof vscode.Location);
-    assert.equal(definition.uri.toString(), document.uri.toString());
-    assert.equal(definition.range.start.line, 13);
-    assert.equal(definition.range.start.character, 15);
-    assert.equal(definition.range.end.character, 21);
+      const document = await vscode.workspace.openTextDocument(
+        vscode.Uri.joinPath(alpha.uri, "sample.titan")
+      );
+      const useOffset = document.getText().lastIndexOf("render");
+      assert.ok(useOffset >= 0, "native-server fixture has no render use");
+      const definitions = await waitForDefinitions(
+        document.uri, document.positionAt(useOffset + 1), 20_000);
+      assert.equal(definitions.length, 1);
+      const definition = definitions[0];
+      assert.ok(definition instanceof vscode.Location);
+      assert.equal(definition.uri.toString(), document.uri.toString());
+      assert.equal(definition.range.start.line, 13);
+      assert.equal(definition.range.start.character, 15);
+      assert.equal(definition.range.end.character, 21);
+    } finally {
+      // Starting the ordinary fixtures again negotiates shutdown/exit with both
+      // native servers while the Extension Host is still alive. Do not rely on
+      // Electron teardown to flush coverage from a detached native process.
+      await Promise.all([resetMarker(alphaMarkerPath), resetMarker(betaMarkerPath)]);
+      if (lifecycle !== undefined) {
+        for (const [index, folder] of [alpha, beta].entries()) {
+          await vscode.workspace.getConfiguration("titan.languageServer", folder.uri)
+            .update("arguments", previousArguments[index],
+              vscode.ConfigurationTarget.WorkspaceFolder);
+        }
+      } else {
+        await vscode.workspace.getConfiguration("titan.languageServer").update(
+          "path", nodeExecutable, vscode.ConfigurationTarget.Global);
+      }
+      await Promise.all([
+        waitForEventSequence(alphaMarkerPath, ["initialize"], 10_000),
+        waitForEventSequence(betaMarkerPath, ["initialize"], 10_000)
+      ]);
+      if (lifecycle !== undefined) {
+        for (const folder of [alpha, beta]) {
+          await assertNativeServerClosed(path.join(lifecycle, `${folder.name}.jsonl`),
+            server, 10_000);
+        }
+      }
+    }
   });
 });
+
+async function nativeServerEvents(receipt: string): Promise<Array<{
+  event: string; pid: number; server?: string; code?: number; signal?: string | null;
+}>> {
+  const contents = await readFile(receipt, "utf8").catch((cause: NodeJS.ErrnoException) => {
+    if (cause.code !== "ENOENT") throw cause;
+    return "";
+  });
+  return contents.trim().split("\n").filter(Boolean)
+    .map((line) => JSON.parse(line));
+}
+
+async function waitForNativeServerStart(
+  receipt: string,
+  server: string,
+  timeoutMilliseconds: number
+): Promise<void> {
+  const deadline = Date.now() + timeoutMilliseconds;
+  while (Date.now() < deadline) {
+    const events = await nativeServerEvents(receipt);
+    if (events.length > 0) {
+      assert.equal(events[0].event, "spawn");
+      assert.equal(events[0].server, server);
+      assert.equal(events.length, 1, "native server exited during startup");
+      return;
+    }
+    await delay(50);
+  }
+  assert.fail(`native server did not start: ${receipt}`);
+}
+
+async function assertNativeServerClosed(
+  receipt: string,
+  server: string,
+  timeoutMilliseconds: number
+): Promise<void> {
+  const deadline = Date.now() + timeoutMilliseconds;
+  while (Date.now() < deadline) {
+    const events = await nativeServerEvents(receipt);
+    if (events.some((event) => event.event === "close")) {
+      assert.equal(events.length, 2, "native server lifecycle has extra events");
+      assert.equal(events[0].event, "spawn");
+      assert.equal(events[0].server, server);
+      assert.deepEqual(events[1], {
+        event: "close", pid: events[0].pid, code: 0, signal: null
+      }, "native server was terminated before graceful exit");
+      await assertProcessExited(events[0].pid, timeoutMilliseconds);
+      return;
+    }
+    await delay(50);
+  }
+  assert.fail(`native server did not close: ${receipt}`);
+}
 
 function findWorkspaceFolder(
   folders: readonly vscode.WorkspaceFolder[],
