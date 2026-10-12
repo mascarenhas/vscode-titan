@@ -6,6 +6,21 @@ The exact compiler revision is pinned in [the CI workflow](../.github/workflows/
 Make owns the dependency graph and rebuild decisions; Titan restores source
 metadata from current objects while compiling dependents and linking.
 
+The build consumes an installed Titan SDK. `TITAN_PREFIX` selects its prefix;
+otherwise `titanc` on `PATH` reports it with `--print-prefix`, using the
+compiler's existing `package.cpath` provider discovery. The selected SDK supplies
+the compiler, Lua interpreter, compiler dependencies, headers and providers.
+No Titan checkout or project-owned compiler installation is required. For example:
+
+```sh
+make -j2 server TITAN_PREFIX="$HOME/.local/titan"
+```
+
+The SDK is immutable during consumer builds. Compiler C probes use
+`BUILD_ROOT/compiler-cache`, rather than writing to the SDK. The compiler's
+`TITAN_ROCKS_ROOT` selects its installed assets; the child-only `TITAN_PREFIX`
+selects this writable probe-cache directory.
+
 ```sh
 make -j2 server server-test-build
 make server-test-sharded
@@ -65,14 +80,14 @@ carries the OpenSSL archive payload. System SDKs omit the directory. Set
 Effective system include/link flags and OpenSSL headers participate in native
 build invalidation, including inputs outside the SDK tree.
 
-Production compilation and linking use `--static --source-first`. Test objects
-have their own consistent `--test --source-first` policy. The test graph first
-builds shared support at `.build/tests/titan/test__test_support.o`; the final
-`--test --no-uv-bootstrap` command discovers cases from the current objects and
-produces the runner. The test graph follows Titan's stdlib test policy without
-`--static`: the source-backed `titan.test` support overrides that provider member,
-so other stdlib imports use the corresponding DSO bindings. Production objects
-and test objects are not interchangeable.
+Production compilation and linking use `--static --source-first`; test objects
+and their final link add `--test` consistently. Both graphs use the ordinary
+installed standard-library provider, including compiled `titan.test`. The SDK
+does not need to supply Titan test sources, and the consumer builds no special
+test-support module. The final `--test --no-uv-bootstrap` command discovers cases
+from the current objects and produces the runner. Production and test graphs
+remain separate so their source stages, flags and generated outputs can change
+independently.
 
 Lua derives default module paths from its executable's installation tree. Native
 test executables live under `.build/tests`, outside the SDK's `bin` directory.
@@ -100,34 +115,34 @@ not validate flags, dependency objects or header contents; the Make rules own
 those inputs. Missing generated companions are repaired through their producer
 rules rather than accepted as a complete build.
 
-Ordinary `server`, `package`, `toolchain` and installation builds use
+Ordinary `server`, `package` and installation builds use
 `BUILD_PROFILE=production`, with `-O3` and the compiler's platform LTO defaults
 (fat LTO on Linux). Validation entry points (`test`, `verify`, native test,
 protocol, extension-host and installation-smoke targets) automatically select
-`BUILD_PROFILE=validation`: `-O0` without LTO for Titan SDK providers, the server,
-test modules, native helpers and final links. The SDK keeps Lua and its compiler
-dependencies (including LPegLabel and LuaFileSystem) optimized so compiler
-execution remains fast. The whole Make invocation uses one profile,
+`BUILD_PROFILE=validation`: `-O0` without LTO for the server, test modules, native
+helpers and final links. The selected SDK's already compiled providers, Lua and
+compiler dependencies are unchanged. The whole Make invocation uses one profile,
 including the ordinary server exercised by transcripts and disposable packages.
-The validation SDK lives in `.titan-validation/`; `.titan/` remains the optimized
-installation. Each prefix has its own compiled standard-library providers.
 To build the server alone for quick iteration:
 
 ```sh
 make -j2 server BUILD_PROFILE=validation
 ```
 
-To refresh a validation SDK after compiler changes, use
-`make toolchain-refresh BUILD_PROFILE=validation`. This also reconciles Lua and
-native dependency build settings before reinstalling compiler/stdlib artifacts,
-so an existing SDK cannot retain stale host optimization flags. Explicit `TITAN_PREFIX`
-selects a caller-owned SDK; it must match the requested profile. Extra compiler
-and linker flags remain explicit overrides and follow the profile defaults.
+To validate standard-library providers with the same profile, prepare a separate
+validation SDK with Titan's own installation workflow and select it with
+`TITAN_PREFIX`. A production SDK is also supported for consumer validation; the
+project's profile does not require the SDK to have been built with that profile.
+Extra compiler and linker flags remain explicit overrides and follow the profile
+defaults.
 The configuration stamp includes the profile, compiler/SDK and flag inputs, so
 switching either way rebuilds both graphs. The incremental gate also runs its
 small fixture under production defaults and verifies the return to validation.
 
-Routine CI runs the complete validation profile and builds a disposable VSIX
+Routine CI explicitly prepares a validation SDK from the exact pinned Titan
+commit before invoking the consumer build. It caches only that installation,
+including its installed licenses, by commit, build policy and prefix identity.
+It runs the complete validation profile and builds a disposable VSIX
 only to inspect packaging. It uploads no VSIX or language-server binaries,
 including on manual runs. A future release job must run only on `main` after
 tests pass, use a separate production SDK/cache and rebuild the complete server
@@ -198,8 +213,15 @@ Prepare that SDK with Titan's consolidated `Makefile.win` and ordinary
 LuaRocks source-rock installation, following the upstream
 [Windows build guide](https://github.com/mascarenhas/titan/blob/master/doc/implementation/windows-build.md).
 Its standard provider includes `titan.path`; compiler dependencies include
-the stock `luv` rock for native Windows process handling. Keep production
-and validation SDKs in separate prefixes and build directories.
+the stock `luv` rock for native Windows process handling. Use separate SDK
+prefixes and producer build directories when different provider profiles are
+needed.
+
+Windows uses the same prefix selection: `--sdk` or `TITAN_PREFIX` overrides
+discovery from `titanc` on `PATH`. The selected compiler's `--print-prefix`
+discovers its provider through `package.cpath`; it does not embed an installation
+prefix in the compiler or runtime. An SDK whose prefix contains spaces or Unicode
+characters is supported.
 
 For example, from a normal PowerShell prompt with native Node on the process PATH:
 

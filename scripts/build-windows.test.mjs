@@ -194,11 +194,11 @@ test("profile identity invalidates a graph even when explicit flags coincide", (
 
 
 test("Windows compilation invokes the installed LuaRocks script directly", () => {
-  const sdk = path.resolve("SDK space 路径");
+  const sdk = "C:\\SDK space 路径";
   const arguments_ = ["--tree", "source space", "server.root"];
   assert.deepEqual(windowsCompilerCommand(sdk, arguments_), {
-    command: path.join(sdk, "bin", "lua.exe"),
-    args: ["-E", path.join(sdk, "lib", "luarocks", "rocks-5.5", "titan", "0.6.0-1", "bin", "titanc"), ...arguments_]
+    command: path.win32.join(sdk, "bin", "lua.exe"),
+    args: ["-E", path.win32.join(sdk, "lib", "luarocks", "rocks-5.5", "titan", "0.6.0-1", "bin", "titanc"), ...arguments_]
   });
   assert.deepEqual(arguments_, ["--tree", "source space", "server.root"]);
 });

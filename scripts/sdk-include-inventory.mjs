@@ -8,7 +8,7 @@ const windowsBacktraceHeaders = ["backtrace.h", "backtrace-supported.h"];
 export function validateSdkIncludeInventory(entries, platform = process.platform) {
   const actual = [...entries].sort();
   const expected = [...includeRoot];
-  if (actual.includes("openssl:directory")) expected.push("openssl:directory");
+  if (actual.some((entry) => entry.startsWith("openssl:"))) expected.push("openssl:directory");
   // Makefile.win's runtime installer copies both libbacktrace headers. Older
   // seeded SDKs omit them; accept either layout, never a partial/irregular pair.
   if (platform === "win32" && actual.some((entry) =>
@@ -16,8 +16,13 @@ export function validateSdkIncludeInventory(entries, platform = process.platform
     expected.push(...windowsBacktraceHeaders.map((name) => `${name}:file`));
   }
   expected.sort();
-  if (JSON.stringify(actual) !== JSON.stringify(expected)) {
+  // A general SDK may contain headers for other installed packages. Validate
+  // and return the reviewed roots, without shipping those unrelated inputs.
+  const selectedNames = new Set(expected.map((entry) => entry.split(":")[0]));
+  const selected = actual.filter((entry) => selectedNames.has(entry.split(":")[0]));
+  if (JSON.stringify(selected) !== JSON.stringify(expected)) {
     throw new Error(`Titan SDK include tree inventory changed: expected ${
-      JSON.stringify(expected)}, found ${JSON.stringify(actual)}`);
+      JSON.stringify(expected)}, found ${JSON.stringify(selected)}`);
   }
+  return expected;
 }

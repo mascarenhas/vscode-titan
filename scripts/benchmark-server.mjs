@@ -8,6 +8,7 @@ import * as path from "node:path";
 import { performance } from "node:perf_hooks";
 import { StringDecoder } from "node:string_decoder";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { compilerDiscoveryEnvironment, resolveTitanSdk } from "./titan-sdk.mjs";
 
 const MAX_FRAME_BYTES = 64 * 1024 * 1024;
 const DEFAULT_TIMEOUT_MS = 300_000;
@@ -53,18 +54,6 @@ const REPOSITORY_ROOT = path.resolve(
   path.dirname(fileURLToPath(import.meta.url)),
   ".."
 );
-const DEVELOPMENT_LUA_ROOT = path.join(
-  REPOSITORY_ROOT, ".titan", "share", "lua", "5.5"
-);
-const DEVELOPMENT_C_ROOT = path.join(
-  REPOSITORY_ROOT, ".titan", "lib", "lua", "5.5"
-);
-const DEVELOPMENT_LUA_PATH = [
-  path.join(DEVELOPMENT_LUA_ROOT, "?.lua"),
-  path.join(DEVELOPMENT_LUA_ROOT, "?", "init.lua")
-].join(";");
-const DEVELOPMENT_LUA_CPATH = path.join(DEVELOPMENT_C_ROOT, "?.so");
-
 class BenchmarkError extends Error {}
 
 function profileString(record, field, event, allowEmpty = false) {
@@ -1376,16 +1365,25 @@ function collectStderr(stream, maximumBytes = 64 * 1024) {
 }
 
 async function startServer(options) {
+  const environment = { ...process.env };
+  if (environment.TITAN_LS_LUA_PATH === undefined ||
+      environment.TITAN_LS_LUA_CPATH === undefined) {
+    // Benchmarks reserve TITAN_PREFIX for their probe cache, independently of
+    // the installed compiler selected by TITAN_ROCKS_ROOT or PATH discovery.
+    const prefix = resolveTitanSdk({ prefix: environment.TITAN_ROCKS_ROOT,
+      environment: compilerDiscoveryEnvironment(environment) });
+    const luaRoot = path.join(prefix, "share", "lua", "5.5");
+    environment.TITAN_ROCKS_ROOT ??= prefix;
+    environment.TITAN_LS_LUA_PATH ??= [
+      path.join(luaRoot, "?.lua"), path.join(luaRoot, "?", "init.lua")
+    ].join(";");
+    environment.TITAN_LS_LUA_CPATH ??= path.join(prefix, "lib", "lua", "5.5",
+      process.platform === "win32" ? "?.dll" : "?.so");
+  }
+  environment.TITAN_LANGUAGE_SERVER_LOG_LEVEL = options.logLevel;
   const child = spawn(options.server, [], {
     cwd: options.root,
-    env: {
-      ...process.env,
-      TITAN_LS_LUA_PATH:
-        process.env.TITAN_LS_LUA_PATH ?? DEVELOPMENT_LUA_PATH,
-      TITAN_LS_LUA_CPATH:
-        process.env.TITAN_LS_LUA_CPATH ?? DEVELOPMENT_LUA_CPATH,
-      TITAN_LANGUAGE_SERVER_LOG_LEVEL: options.logLevel
-    },
+    env: environment,
     stdio: ["pipe", "pipe", "pipe"]
   });
   const spawned = new Promise((resolve, reject) => {

@@ -8,7 +8,7 @@ fi
 
 server=$1
 repository_root=$(CDPATH= cd "$(dirname "$0")/.." && pwd -P)
-titan_prefix=${TITAN_PREFIX:-$repository_root/.titan}
+titan_prefix=$(node "$repository_root/scripts/titan-sdk.mjs" --print-prefix)
 if [[ ! -d "$titan_prefix/include" ]]; then
   echo "selected Titan SDK include tree is missing: $titan_prefix/include" >&2
   exit 1

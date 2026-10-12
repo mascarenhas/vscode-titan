@@ -59,14 +59,19 @@ Titan is not publicly released. Keep its language-server API version at `1`
 until the first public release; update the compiler and its consumers together
 without incrementing that API version during prerelease development.
 
-The project owns isolated Titan installations at `.titan/` for production and
-`.titan-validation/` for testing; both are ignored by Git. Prefer their selected
-`bin/titanc`, `bin/lua`, and `bin/luarocks` over ambient installations.
-Test/verify entry points use `BUILD_PROFILE=validation` (`-O0`, no LTO) for Titan
-providers, the server and tests. Lua and its compiler dependencies stay optimized
-to run the compiler and parser efficiently. Regular server/package/installation builds use
-production (`-O3`, platform LTO defaults), with minimal optimized smoke coverage
-in the incremental gate. Routine CI publishes no VSIX or server binaries;
+The build consumes an installed Titan SDK: `TITAN_PREFIX` overrides the prefix,
+otherwise the `titanc` on `PATH` reports it with `--print-prefix`. Use that SDK's
+compiler, Lua interpreter, modules, headers and providers together. Do not
+bootstrap a compiler or require `TITAN_REPO` in consumer builds. The SDK remains
+immutable; compiler probes use `BUILD_ROOT/compiler-cache`. Packaging retains the
+compiler's LuaRocks-installed dependencies and omits LuaRocks's own modules and
+unrelated packages. Licenses come from the installation.
+Test/verify entry points use `BUILD_PROFILE=validation` (`-O0`, no LTO) for the
+server, tests and native helpers; the SDK's prebuilt providers remain unchanged.
+Regular server/package/installation builds use production (`-O3`, platform LTO
+defaults), with minimal optimized smoke coverage in the incremental gate.
+CI explicitly prepares and caches a validation SDK at the exact compiler pin
+before the consumer build. Routine CI publishes no VSIX or server binaries;
 future main-only release jobs must rebuild production after tests pass.
 Keep the package lockfile
 checked in and use `npm ci` for reproducible JavaScript installs.
@@ -74,7 +79,9 @@ checked in and use `npm ci` for reproducible JavaScript installs.
 Native compilation uses persistent production and test object graphs. See
 `docs/native-build.md` for dependency ownership and `make -j2 server
 server-test-build` for the parallel build. Keep source/provider policy consistent
-within each graph, and run the incremental build regression gate when changing
+within each graph. Use the ordinary installed provider, including compiled
+`titan.test`, without special test-support compilation or installed test sources.
+Run the incremental build regression gate when changing
 Make rules or the compiler pin. Independent concurrent builds need separate
 `BUILD_ROOT` values and, when linking servers, separate `SERVER` destinations.
 
@@ -102,7 +109,8 @@ acceptance criteria pass. Leave the PR open for maintainer review. Do not merge
 it or commit or push directly to `main` unless the maintainer explicitly
 authorizes that exact action.
 
-If compiler changes become necessary, make them in a new branch in `../titan`;
+If compiler changes become necessary, make them in a new branch in `../titan`
+(use a separate worktree when that checkout is in use);
 do not mix them into this repository, and open the Titan PR only after the
 extension/server work is wrapped and locally verified. Leave that PR open for
 maintainer review as well; opening it does not authorize merging it.

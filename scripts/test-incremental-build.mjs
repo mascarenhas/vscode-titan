@@ -6,15 +6,17 @@ import { readFile, writeFile, mkdir, mkdtemp, readdir, stat, unlink, chmod } fro
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { performance } from "node:perf_hooks";
+import { resolveTitanSdk } from "./titan-sdk.mjs";
 
 const repository = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const options = { prefix: path.join(repository, ".titan") };
+const options = {};
 for (let index = 2; index < process.argv.length; index += 2) {
   const flag = process.argv[index];
   assert.ok(["--prefix", "--output"].includes(flag), `unknown argument ${flag}`);
   assert.ok(process.argv[index + 1], `${flag} requires a pathname`);
   options[flag.slice(2)] = path.resolve(process.argv[index + 1]);
 }
+options.prefix = resolveTitanSdk({ prefix: options.prefix });
 await mkdir(path.join(repository, ".build"), { recursive: true });
 const output = options.output ?? await mkdtemp(path.join(repository, ".build", "incremental-check-"));
 if (options.output) await mkdir(output);
@@ -131,9 +133,11 @@ async function noOp(label, options) {
 
 const app = (dependency, expression = "extra()") => `local leaf = import "fixture.${dependency}"
 local strings = import "string"
+local test = import "test"
 -- This literal must never enter the build import graph.
 local example = 'local bogus = import "missing.fixture"'
 function answer(): integer return leaf.value() + ${expression} end
+function testing(): boolean return test.testing() end
 `;
 const leaf = (adjustment) => `foreign import "value.h"
 foreign function native_value(): int return ffi.incremental_header_value() end
@@ -148,7 +152,7 @@ const appTests = (name, extra = "") => `local test = import "test"
 local app = import "fixture.app"
 local leaf = import "fixture.leaf.titan"
 function ${name}(context: test.Context)
-  test.assert(test.testing() and app.answer() > 0 and leaf.native_value() > 0)
+  test.assert(test.testing() and app.testing() and app.answer() > 0 and leaf.native_value() > 0)
 end
 ${extra}`;
 let names = ["fixture.app_test.test_initial", "fixture.other_test.test_unrelated"];
@@ -196,7 +200,10 @@ local second = import "fixture.other_test"
 `);
   await put("titan_language_server.titan", `local app = import "fixture.app"
 local unrelated = import "fixture.unrelated"
-function main(args: {string}): integer return app.answer() + unrelated.value() end
+function main(args: {string}): integer
+  if app.testing() then raise "test runner active during ordinary application execution" end
+  return app.answer() + unrelated.value()
+end
 `);
   for (const header of ["compiler_io_clock.h", "embedded_interfaces_native.h"]) {
     await put(`server/${header}`, await readFile(path.join(repository, "src/server", header)));
@@ -249,14 +256,20 @@ if(stdout) process.stdout.write(stdout+'\\n');
   const initial = await make("initial");
   assert.ok(initial.calls.length > 0 && initial.calls.every(call => call.profile === "validation"),
     "all compiler phases must use the validation profile");
+  assert.ok(initial.calls.every(call => !call.args.includes("titan.test")),
+    "native tests must use the installed titan.test provider without compiling its source");
+  assert.ok(Object.keys(await observedFiles()).every(filename => !filename.includes("__test_support")),
+    "native tests must not create a private titan.test support object");
   await runtime("initial", 5, names);
   // CI starts without a Titan search path. Also reject a developer's unrelated
   // SDK: both version-specific and fallback runtime variables must be pinned.
   environment.TITAN_PATH_0_6 = path.join(output, "unrelated-versioned-sdk");
   environment.TITAN_PATH = path.join(output, "unrelated-fallback-sdk");
+  environment.TITAN_ROCKS_ROOT = path.join(output, "unrelated-compiler-sdk");
   environment.LUA_PATH_5_5 = path.join(output, "unrelated-lua/?.lua");
   environment.LUA_CPATH_5_5 = path.join(output, "unrelated-c/?.so");
   await runtime("hostile-runtime-paths", 5, names);
+  environment.TITAN_ROCKS_ROOT = options.prefix;
   delete environment.LUA_PATH_5_5;
   delete environment.LUA_CPATH_5_5;
   await noOp("initial-noop");

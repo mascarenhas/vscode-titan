@@ -2,7 +2,6 @@ SHELL := /bin/bash
 .SHELLFLAGS := -eu -o pipefail -c
 .DELETE_ON_ERROR:
 
-TITAN_REPO ?= ../titan
 # Choose a whole-invocation profile before generating either native graph.
 # Verification also exercises the ordinary server and disposable packaging.
 VALIDATION_GOALS := verify test server-test server-test-build server-test-objects server-test-run server-test-sharded \
@@ -16,14 +15,19 @@ endif
 endif
 export BUILD_PROFILE
 # BUILD_PROFILE owns this invocation even if the compiler knob was supplied
-# on Make's command line; children must receive the same profile as the SDK.
+# on Make's command line; children must receive the same project profile.
 override export TITAN_BUILD_PROFILE := $(BUILD_PROFILE)
-TITAN_PREFIX ?= $(abspath $(if $(filter validation,$(BUILD_PROFILE)),.titan-validation,.titan))
+SDK_FREE_GOALS := help clean clean-node npm-ci extension-test shard-runner-test plugin-validate
+ifneq ($(strip $(TITAN_PREFIX)),)
 override TITAN_PREFIX := $(abspath $(TITAN_PREFIX))
+else ifneq ($(filter-out $(SDK_FREE_GOALS),$(if $(MAKECMDGOALS),$(MAKECMDGOALS),all)),)
+override TITAN_PREFIX := $(shell node scripts/titan-sdk.mjs --print-prefix)
+ifneq ($(.SHELLSTATUS),0)
+$(error cannot select an installed Titan SDK; set TITAN_PREFIX or put titanc on PATH)
+endif
+endif
 TITANC := $(TITAN_PREFIX)/bin/titanc
 TITAN_LUA := $(TITAN_PREFIX)/bin/lua
-LUAROCKS := $(TITAN_PREFIX)/bin/luarocks
-TITAN_ROCKSPEC := titan-0.6.0-1.rockspec
 TITAN_STANDARD_PROVIDER := $(TITAN_PREFIX)/lib/titan/0.6/titan.a
 DEVELOPMENT_LUA_PATH := $(TITAN_PREFIX)/share/lua/5.5/?.lua;$(TITAN_PREFIX)/share/lua/5.5/?/init.lua
 DEVELOPMENT_LUA_CPATH := $(TITAN_PREFIX)/lib/lua/5.5/?.so
@@ -107,7 +111,7 @@ VSIX := $(VSIX_DIR)/titan-$(VSIX_TARGET).vsix
 
 .DEFAULT_GOAL := all
 
-.PHONY: all help toolchain toolchain-refresh npm-ci server server-test \
+.PHONY: all help npm-ci server server-test \
 	server-coverage server-coverage-build server-coverage-run \
 	server-objects server-test-objects server-test-build server-test-run server-test-sharded shard-runner-test incremental-build-test \
 	server-protocol-test completion-protocol-test codex-native-test extension extension-test extension-host-test test package inspect-server \
@@ -117,17 +121,11 @@ VSIX := $(VSIX_DIR)/titan-$(VSIX_TARGET).vsix
 # imported objects, native headers, SDK/compiler inputs and effective settings.
 # The graph generator finishes both source stages before parallel recipes start.
 shell_quote = '$(subst ','"'"',$(1))'
-# LuaRocks launches nested Make processes and needs the recursive jobserver.
-# Recursive recipes still run under -n/-t/-q; inspect only Make's short flags.
-RECURSIVE_WRAPPER_GUARD = flags=$${MAKEFLAGS%% *}; case "$$flags" in -*) ;; *q*) exit 1 ;; *n*|*t*) exit 0 ;; esac;
 NATIVE_BUILD_GENERATOR := scripts/generate-native-build.lua
 NATIVE_BUILD_GRAPH := $(BUILD_ROOT)/native-modules.mk
 NATIVE_CONFIG_STAMP := $(BUILD_ROOT)/native.config
 NATIVE_BUILD_INPUTS = Makefile $(NATIVE_BUILD_GENERATOR) $(TITANC) $(TITAN_LUA) \
 	$(NATIVE_SDK_INPUTS) $(BUILD_ROOT)/native-inputs/sdk
-TEST_SUPPORT_STEM := $(TEST_BUILD_DIR)/titan/test__test_support
-TEST_SUPPORT_OUTPUTS := $(addprefix $(TEST_SUPPORT_STEM),.o .c .ffi.h)
-TEST_SUPPORT_SOURCE := $(TITAN_PREFIX)/share/titan/0.6/src/titan/test.titan
 SERVER_LINK_OUTPUTS := $(SERVER_BUILD_OUTPUT) \
 	$(SERVER_BUILD_DIR)/titan_language_server__entrypoint.c \
 	$(SERVER_BUILD_DIR)/titan_language_server__entrypoint.o
@@ -135,13 +133,13 @@ TEST_LINK_OUTPUTS := $(SERVER_TEST) $(addprefix $(SERVER_TEST)__test_runner,.c .
 	$(addprefix $(SERVER_TEST)__test_entrypoint,.c .o)
 
 # --tree selects each staged source root; compiled fallback is the explicit SDK.
-# The test DAG uses the stdlib's dynamic-provider preference. Source-backed
-# titan.test otherwise changes a static dependency's binding at the final link.
+# Both graphs use the ordinary installed static provider, including titan.test.
 NATIVE_COMPILER_ENV = env -u LUA_PATH -u LUA_CPATH -u LUA_PATH_5_5 -u LUA_CPATH_5_5 -u TITAN_SOURCE_PATH \
 	TITAN_BUILD_PROFILE=$(call shell_quote,$(BUILD_PROFILE)) \
 	CC=$(call shell_quote,$(CC)) AR=$(call shell_quote,$(AR)) RANLIB=$(call shell_quote,$(RANLIB)) \
 	CCACHE_DISABLE=$(call shell_quote,$(CCACHE_DISABLE)) \
 	TITAN_ROCKS_ROOT=$(call shell_quote,$(TITAN_PREFIX)) \
+	TITAN_PREFIX=$(call shell_quote,$(BUILD_ROOT)/compiler-cache) \
 	TITAN_PATH_0_6=$(call shell_quote,$(TITAN_PREFIX)/lib/titan/0.6) \
 	TITAN_PATH=$(call shell_quote,$(TITAN_PREFIX)/lib/titan/0.6) \
 	TITAN_EXTRA_CPPFLAGS=$(call shell_quote,$(strip $(TITAN_EXTRA_CPPFLAGS) $(NATIVE_OPENSSL_CPPFLAGS))) \
@@ -154,19 +152,27 @@ NATIVE_COMPILER_ENV = env -u LUA_PATH -u LUA_CPATH -u LUA_PATH_5_5 -u LUA_CPATH_
 	VSCODE_TITAN_OPENSSL_INCLUDEDIR=$(call shell_quote,$(NATIVE_OPENSSL_INCLUDEDIR))
 NATIVE_LINK_ENV = $(NATIVE_COMPILER_ENV) \
 	TITAN_EXTRA_LDFLAGS=$(call shell_quote,$(strip $(TITAN_EXTRA_LDFLAGS) $(EXPORT_LUA_LDFLAGS) $(COMPILER_IO_CLOCK_OBJECT) $(EMBEDDED_INTERFACES_OBJECT) $(TITAN_STANDARD_PROVIDER) $(NATIVE_OPENSSL_LDFLAGS)))
-# Tests retain dynamic stdlib bindings but live outside the SDK's bin directory.
+# Tests load compiler Lua dependencies outside the SDK's bin directory.
 # Ask its Lua executable for its own relocatable paths, as Titan's test harness
 # does. Ambient Titan paths must not replace that selected SDK at execution.
 NATIVE_TEST_ENV = env -u TITAN_PATH_0_6 -u TITAN_PATH \
+	TITAN_ROCKS_ROOT=$(call shell_quote,$(TITAN_PREFIX)) \
+	TITAN_PREFIX=$(call shell_quote,$(BUILD_ROOT)/compiler-cache) \
 	TITAN_COMPILER_IO_PROCESS_FIXTURE=$(call shell_quote,$(COMPILER_IO_PROCESS_FIXTURE)) \
 	CCACHE_DISABLE=$(call shell_quote,$(CCACHE_DISABLE)) \
 	LUA_PATH_5_5="$$( $(call shell_quote,$(TITAN_LUA)) -E -e 'io.write(package.path)' )" \
 	LUA_CPATH_5_5="$$( $(call shell_quote,$(TITAN_LUA)) -E -e 'io.write(package.cpath)' )"
 
+# The server selects its workspace probe cache; TITAN_PREFIX here selects the SDK.
+SERVER_TEST_ENV = env -u TITAN_PREFIX -u TITAN_PATH_0_6 -u TITAN_PATH -u TITAN_SOURCE_PATH \
+	TITAN_ROCKS_ROOT=$(call shell_quote,$(TITAN_PREFIX)) \
+	TITAN_LS_LUA_PATH=$(call shell_quote,$(DEVELOPMENT_LUA_PATH)) \
+	TITAN_LS_LUA_CPATH=$(call shell_quote,$(DEVELOPMENT_LUA_CPATH))
+
 FORCE:
 
 # Keep housekeeping and JavaScript-only goals usable without a native SDK.
-NON_NATIVE_GOALS := help clean clean-node toolchain toolchain-refresh npm-ci extension extension-test shard-runner-test incremental-build-test plugin-validate inspect-vsix server-test-run server-coverage-run
+NON_NATIVE_GOALS := help clean clean-node npm-ci extension extension-test shard-runner-test incremental-build-test plugin-validate inspect-vsix server-test-run server-coverage-run
 ifneq ($(filter-out $(NON_NATIVE_GOALS),$(if $(MAKECMDGOALS),$(MAKECMDGOALS),all)),)
 # Titan installs OpenSSL headers only for its bundled provider. System-provider
 # static consumers repeat the ordered pkg-config inputs after the archive.
@@ -207,11 +213,10 @@ all: server extension
 
 help:
 	@echo "vscode-titan targets:"
-	@echo "  toolchain            build the selected project-local SDK ($(BUILD_PROFILE))"
-	@echo "  toolchain-refresh    reinstall the sibling Titan checkout into the selected SDK"
+	@echo "  SDK selection        TITAN_PREFIX override, otherwise titanc --print-prefix from PATH"
 	@echo "  server               build bin/titan-language-server as one native executable"
 	@echo "  server-objects       compile production modules without linking"
-	@echo "  server-test-objects  compile test/support modules without linking"
+	@echo "  server-test-objects  compile test modules without linking"
 	@echo "  server-test          compile and run the native Titan protocol tests"
 	@echo "  server-test-build    compile the native test aggregate once"
 	@echo "  server-test-run      run the current native aggregate without rebuilding"
@@ -232,29 +237,9 @@ help:
 	@echo "  install-server-test  stage and inspect a server-only installation"
 	@echo "  install-vsix         install the development VSIX with the VS Code CLI"
 
-toolchain: $(TITANC)
-
 $(TITANC):
-	@test -f "$(abspath $(TITAN_REPO))/$(TITAN_ROCKSPEC)" || { \
-		echo "Titan checkout not found at $(abspath $(TITAN_REPO))" >&2; \
-		exit 1; \
-	}
-	$(MAKE) -C "$(abspath $(TITAN_REPO))" lua PREFIX="$(TITAN_PREFIX)"
-	$(MAKE) -C "$(abspath $(TITAN_REPO))" luarocks PREFIX="$(TITAN_PREFIX)"
-	+$(RECURSIVE_WRAPPER_GUARD) cd "$(abspath $(TITAN_REPO))" && \
-		PATH="$(TITAN_PREFIX)/bin:$$PATH" \
-		"$(LUAROCKS)" make --force "$(TITAN_ROCKSPEC)"
-	@# Re-read SDK-dependent preflight even when a retained graph is unchanged.
-	@if test -f $(call shell_quote,$(NATIVE_BUILD_GRAPH)); then \
-		touch $(call shell_quote,$(NATIVE_BUILD_GRAPH)); \
-	fi
-
-toolchain-refresh: toolchain
-	$(MAKE) -C "$(abspath $(TITAN_REPO))" lua PREFIX="$(TITAN_PREFIX)"
-	$(MAKE) -C "$(abspath $(TITAN_REPO))" luarocks PREFIX="$(TITAN_PREFIX)"
-	+$(RECURSIVE_WRAPPER_GUARD) cd "$(abspath $(TITAN_REPO))" && \
-		PATH="$(TITAN_PREFIX)/bin:$$PATH" \
-		"$(LUAROCKS)" make --force "$(TITAN_ROCKSPEC)"
+	@echo "Titan compiler is missing at $@; install Titan or select another TITAN_PREFIX" >&2
+	@exit 1
 
 npm-ci: node_modules/.package-lock.json
 
@@ -323,24 +308,10 @@ $(SERVER): $(SERVER_BUILD_OUTPUT)
 server-test: server-test-build
 	$(MAKE) server-test-run
 
-$(TEST_SUPPORT_STEM).o: FORCE $(TEST_SUPPORT_SOURCE) $(NATIVE_BUILD_INPUTS) $(NATIVE_CONFIG_STAMP)
-	@set -e; stale=0; newer=$(call shell_quote,$(filter-out FORCE,$?)); \
-	test -z "$$newer" || stale=1; \
-	for output in $(foreach output,$(TEST_SUPPORT_OUTPUTS),$(call shell_quote,$(output))); do test -f "$$output" || stale=1; done; \
-	if test "$$stale" = 1; then \
-	  rm -f $(call shell_quote,$@); \
-	  cd $(call shell_quote,$(TEST_BUILD_DIR)); \
-	  $(NATIVE_COMPILER_ENV) $(call shell_quote,$(TITANC)) --test --source-first --incremental -j1 -c \
-	    --tree $(call shell_quote,$(TEST_SOURCE_STAGE)) titan.test; \
-	fi
-
-$(filter-out $(TEST_SUPPORT_STEM).o,$(TEST_SUPPORT_OUTPUTS)): $(TEST_SUPPORT_STEM).o
-	@test -f $(call shell_quote,$@)
-
-server-test-objects: $(TEST_MODULE_OBJECTS) $(TEST_SUPPORT_OUTPUTS)
+server-test-objects: $(TEST_MODULE_OBJECTS)
 server-test-build: $(SERVER_TEST) $(COMPILER_IO_PROCESS_FIXTURE)
 
-$(SERVER_TEST): FORCE $(TEST_MODULE_OBJECTS) $(TEST_SUPPORT_OUTPUTS) $(COMPILER_IO_CLOCK_OBJECT) \
+$(SERVER_TEST): FORCE $(TEST_MODULE_OBJECTS) $(COMPILER_IO_CLOCK_OBJECT) \
 	$(EMBEDDED_INTERFACES_OBJECT) $(NATIVE_BUILD_INPUTS) $(NATIVE_CONFIG_STAMP)
 	@set -e; stale=0; newer=$(call shell_quote,$(filter-out FORCE,$?)); \
 	test -z "$$newer" || stale=1; \
@@ -348,7 +319,7 @@ $(SERVER_TEST): FORCE $(TEST_MODULE_OBJECTS) $(TEST_SUPPORT_OUTPUTS) $(COMPILER_
 	test -x $(call shell_quote,$(SERVER_TEST)) || stale=1; \
 	if test "$$stale" = 1; then \
 	  cd $(call shell_quote,$(TEST_BUILD_DIR)); \
-	  $(NATIVE_LINK_ENV) $(call shell_quote,$(TITANC)) --test --source-first --incremental -j1 --no-uv-bootstrap \
+	  $(NATIVE_LINK_ENV) $(call shell_quote,$(TITANC)) --static --test --source-first --incremental -j1 --no-uv-bootstrap \
 	    --tree $(call shell_quote,$(TEST_SOURCE_STAGE)) server.tests; \
 	fi
 
@@ -381,6 +352,7 @@ server-coverage: server-coverage-build
 	+$(MAKE) server-coverage-run
 
 shard-runner-test:
+	node --test scripts/titan-sdk.test.mjs
 	node --test scripts/server-coverage.test.mjs scripts/run-extension-host-tests.test.mjs
 	node --test scripts/run-server-tests.test.mjs
 	node --test scripts/openssl-packaging.test.mjs
@@ -391,28 +363,20 @@ incremental-build-test:
 	node scripts/test-incremental-build.mjs --prefix $(call shell_quote,$(TITAN_PREFIX))
 
 server-protocol-test: $(SERVER) completion-protocol-test
-	TITAN_LS_LUA_PATH='$(DEVELOPMENT_LUA_PATH)' \
-	TITAN_LS_LUA_CPATH='$(DEVELOPMENT_LUA_CPATH)' \
-		node scripts/test-server-protocol.mjs "$(SERVER)"
-	TITAN_LS_LUA_PATH='$(DEVELOPMENT_LUA_PATH)' \
-	TITAN_LS_LUA_CPATH='$(DEVELOPMENT_LUA_CPATH)' \
-		node scripts/test-workspace-cache.mjs "$(SERVER)"
+	$(SERVER_TEST_ENV) node scripts/test-server-protocol.mjs "$(SERVER)"
+	$(SERVER_TEST_ENV) node scripts/test-workspace-cache.mjs "$(SERVER)"
 
 completion-protocol-test: $(SERVER)
-	TITAN_LS_LUA_PATH='$(DEVELOPMENT_LUA_PATH)' \
-	TITAN_LS_LUA_CPATH='$(DEVELOPMENT_LUA_CPATH)' \
-		node scripts/test-completion-protocol.mjs "$(SERVER)"
+	$(SERVER_TEST_ENV) node scripts/test-completion-protocol.mjs "$(SERVER)"
 
 codex-native-test: $(SERVER)
-	TITAN_LS_LUA_PATH='$(DEVELOPMENT_LUA_PATH)' \
-	TITAN_LS_LUA_CPATH='$(DEVELOPMENT_LUA_CPATH)' \
-		node scripts/test-codex-native.mjs "$(SERVER)"
+	$(SERVER_TEST_ENV) node scripts/test-codex-native.mjs "$(SERVER)"
 
 extension: npm-ci | $(TITANC)
 	TITAN_PREFIX=$(call shell_quote,$(TITAN_PREFIX)) npm run compile
 
 extension-test: npm-ci
-	TITAN_PREFIX=$(call shell_quote,$(TITAN_PREFIX)) npm test
+	npm test
 
 extension-host-test: $(SERVER) npm-ci
 	TITAN_PREFIX=$(call shell_quote,$(TITAN_PREFIX)) \
@@ -458,7 +422,6 @@ package: $(SERVER) npm-ci
 	  restore_original=1; \
 	  mv -f -- "$$staged_server" "$$packaged_server"; \
 	fi; \
-	TITAN_REPO=$(call shell_quote,$(TITAN_REPO)) \
 	TITAN_PREFIX=$(call shell_quote,$(TITAN_PREFIX)) \
 	./node_modules/.bin/vsce package --no-dependencies \
 		--target $(call shell_quote,$(VSIX_TARGET)) --out $(call shell_quote,$(VSIX))
@@ -484,7 +447,7 @@ install-server: $(SERVER)
 	install -d "$(DESTDIR)$(INSTALL_PREFIX)/share/doc/titan-language-server/LICENSES"
 	install -m 0644 LICENSE \
 		"$(DESTDIR)$(INSTALL_PREFIX)/share/doc/titan-language-server/LICENSE"
-	install -m 0644 "$(abspath $(TITAN_REPO))/LICENSE" \
+	install -m 0644 "$(TITAN_PREFIX)/share/titan/LICENSE" \
 		"$(DESTDIR)$(INSTALL_PREFIX)/share/doc/titan-language-server/Titan-LICENSE"
 	install -m 0644 "$(TITAN_PREFIX)/share/titan/THIRD_PARTY_NOTICES.md" \
 		"$(DESTDIR)$(INSTALL_PREFIX)/share/doc/titan-language-server/THIRD_PARTY_NOTICES.md"

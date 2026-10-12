@@ -1,11 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { spawnSync } from "node:child_process";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { nativeRootInventory, requiredShareFiles } from "./stage-lua-modules.mjs";
+import { nativeRootInventory, requiredShareFiles, stageLuaModules, validateStagedLuaModules } from "./stage-lua-modules.mjs";
 import { validateSdkIncludeInventory } from "./sdk-include-inventory.mjs";
 
 test("Windows SDK headers permit only the complete regular libbacktrace pair", () => {
@@ -17,14 +17,15 @@ test("Windows SDK headers permit only the complete regular libbacktrace pair", (
   validateSdkIncludeInventory([...base, ...pair], "win32");
   validateSdkIncludeInventory([...base, ...pair, "openssl:directory"], "win32");
   for (const extra of [[pair[0]], [pair[1]],
-    ["backtrace.h:symbolic link", pair[1]], [pair[0], "backtrace-supported.h:directory"],
-    [...pair, "unreviewed.h:file"]]) {
+    ["backtrace.h:symbolic link", pair[1]], [pair[0], "backtrace-supported.h:directory"]]) {
     assert.throws(() => validateSdkIncludeInventory([...base, ...extra], "win32"),
       /SDK include tree inventory changed/);
   }
   validateSdkIncludeInventory(base, "linux");
-  assert.throws(() => validateSdkIncludeInventory([...base, ...pair], "linux"),
-    /SDK include tree inventory changed/);
+  assert.deepEqual(validateSdkIncludeInventory([...base, ...pair, "unreviewed.h:file"], "linux"),
+    [...base].sort());
+  assert.deepEqual(validateSdkIncludeInventory([...base, ...pair, "unreviewed.h:file"], "win32"),
+    [...base, ...pair].sort());
 });
 
 test("native compiler payload includes Windows luv with the existing controlled Lua modules", () => {
@@ -47,7 +48,6 @@ test("staging requires and copies the portable compiler path helper", async (con
   await put("share/lua/5.5/titan-compiler/driver.lua", "driver.LANGUAGE_SERVER_API_VERSION = 1\n");
   await put("share/lua/5.5/argparse.lua");
   await mkdir(path.join(sdk, "share/lua/5.5/titan"));
-  if (process.platform !== "win32") await mkdir(path.join(sdk, "share/lua/5.5/luarocks"));
   for (const member of nativeRootInventory()) await put(`lib/lua/5.5/${member.split(":")[0]}`);
   for (const file of ["lauxlib.h", "llhttp.h", "luaconf.h", "lua.h", "lua.hpp", "lualib.h", "minicoro.h",
     "sqlite3.h", "titan.h", "uv.h"]) await put(`include/${file}`);
@@ -65,4 +65,58 @@ test("staging requires and copies the portable compiler path helper", async (con
   assert.equal(staged.status, 0, staged.stderr);
   assert.equal(await readFile(path.join(root, "dist/titan/share/lua/5.5/titan-compiler/path.lua"), "utf8"),
     "return { portable = true }\n");
+
+  // The installed compiler tree can contain LuaRocks itself and other packages;
+  // only the reviewed compiler and SDK roots belong in the delivered payload.
+  for (const extra of ["share/lua/5.5/luarocks/core/cfg.lua", "share/lua/5.5/unrelated.lua",
+    "lib/lua/5.5/unrelated.so", "include/unrelated.h", "src/unrelated/source.c"]) await put(extra);
+  const destination = path.join(root, "selected");
+  await stageLuaModules({ sdk, destination });
+  await validateStagedLuaModules(sdk, destination);
+  const inspect = (entry = script) => spawnSync(process.execPath, [entry, "--check-payload", sdk, destination], {
+    cwd: root, env: { ...process.env, TITAN_PREFIX: sdk }, encoding: "utf8", shell: false
+  });
+  const inspected = inspect();
+  assert.equal(inspected.status, 0, inspected.stderr);
+  for (const extra of ["share/lua/5.5/luarocks", "share/lua/5.5/unrelated.lua",
+    "lib/lua/5.5/unrelated.so", "include/unrelated.h", "src/unrelated"]) {
+    await assert.rejects(readFile(path.join(destination, extra)), { code: "ENOENT" });
+  }
+  await writeFile(path.join(destination, "share/lua/5.5/unrelated.lua"), "unrelated\n");
+  await assert.rejects(validateStagedLuaModules(sdk, destination), /does not exactly match selected inputs/);
+  await rm(path.join(destination, "share/lua/5.5/unrelated.lua"));
+  await writeFile(path.join(destination, "share/lua/5.5/titan-compiler/path.lua"), "changed\n");
+  await assert.rejects(validateStagedLuaModules(sdk, destination), /does not exactly match selected inputs/);
+  const changed = inspect();
+  assert.notEqual(changed.status, 0);
+  assert.match(changed.stderr, /does not exactly match selected inputs/);
+  await context.test("payload CLI follows an absolute script symlink", async (aliasContext) => {
+    const alias = path.join(root, "stage-alias.mjs");
+    try { await symlink(script, alias); }
+    catch (error) {
+      if (["EACCES", "EPERM", "ENOSYS"].includes(error.code)) {
+        aliasContext.skip("file symlink fixture creation is unavailable"); return;
+      }
+      throw error;
+    }
+    const rejected = inspect(alias);
+    assert.notEqual(rejected.status, 0);
+    assert.match(rejected.stderr, /does not exactly match selected inputs/);
+    await writeFile(path.join(destination, "share/lua/5.5/titan-compiler/path.lua"),
+      await readFile(path.join(sdk, "share/lua/5.5/titan-compiler/path.lua")));
+    const accepted = inspect(alias);
+    assert.equal(accepted.status, 0, accepted.stderr);
+  });
+  await context.test("staging rejects a selected SDK file symlink", async (linkContext) => {
+    await rm(path.join(sdk, "share/lua/5.5/titan-compiler/path.lua"));
+    try {
+      await symlink(path.join(sdk, "share/lua/5.5/inspect.lua"), path.join(sdk, "share/lua/5.5/titan-compiler/path.lua"));
+    } catch (error) {
+      if (["EACCES", "EPERM", "ENOSYS"].includes(error.code)) {
+        linkContext.skip("file symlink fixture creation is unavailable"); return;
+      }
+      throw error;
+    }
+    await assert.rejects(stageLuaModules({ sdk, destination }), /not a regular file/);
+  });
 });

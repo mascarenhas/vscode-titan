@@ -190,7 +190,7 @@ for _, name in ipairs(names) do
 end
 
 local sdk_files = {}
-for _, directory in ipairs({"bin", "lib", "include", "src", "share/lua", "share/titan/0.6/src"}) do
+for _, directory in ipairs({"bin", "lib", "include", "src", "share/lua"}) do
     if lfs.attributes(filepath.join(sdk_root, directory), "mode") == "directory" then
         local members = {}
         scan(filepath.join(sdk_root, directory), "", members)
@@ -303,8 +303,7 @@ local function graph(stage, variable, selected, test_mode)
             for _, value in ipairs(module_outputs(stage, dependency)) do prerequisites[#prerequisites + 1] = value end
         end
         emit(make_path(outputs[1]) .. ": FORCE " .. paths(prerequisites) ..
-            " $(NATIVE_BUILD_INPUTS) $(NATIVE_CONFIG_STAMP)" ..
-            (test_mode and " $(TEST_SUPPORT_OUTPUTS)" or ""))
+            " $(NATIVE_BUILD_INPUTS) $(NATIVE_CONFIG_STAMP)")
         if module.parse_error then
             local diagnostic = module.parse_error:gsub("[\r\n]", " "):gsub("%$", "$$$$")
             emit("\t@printf '%s\\n' " .. shell_quote(diagnostic) .. " >&2; exit 1")
@@ -317,7 +316,7 @@ local function graph(stage, variable, selected, test_mode)
         if not module.foreign then emit("\t  rm -f " .. shell_quote(outputs[1]:gsub("%.o$", ".titan.h")) .. "; \\") end
         emit("\t  cd $(call shell_quote," .. (test_mode and "$(TEST_BUILD_DIR)" or "$(SERVER_BUILD_DIR)") .. "); \\")
         emit("\t  $(NATIVE_COMPILER_ENV) $(call shell_quote,$(TITANC)) " ..
-            (test_mode and "--test" or "--static") .. " --source-first --incremental -j1 -c --tree " ..
+            (test_mode and "--static --test" or "--static") .. " --source-first --incremental -j1 -c --tree " ..
             shell_quote(filepath.join(build_root, stage)) .. " " .. shell_quote(name) .. "; \\")
         emit("\t  for output in " .. table.concat(quoted, " ") .. "; do test -f \"$$output\" || { echo \"missing generated output $$output\" >&2; exit 1; }; done; fi")
         end

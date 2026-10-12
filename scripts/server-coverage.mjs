@@ -217,9 +217,11 @@ export async function buildCoverage(options, { run = execute, environment = proc
     await copyFile(path.join(root, "src", relative), destination);
   }
   const env = cleanEnvironment(environment);
+  // SDK discovery and writable compiler probes use separate prefixes.
   Object.assign(env, {
     BUILD_PROFILE: "validation", TITAN_BUILD_PROFILE: "validation", CC: options.cc, CCACHE_DISABLE: "1",
-    TITAN_ROCKS_ROOT: prefix, TITAN_PATH_0_6: path.join(prefix, "lib/titan/0.6"), TITAN_PATH: path.join(prefix, "lib/titan/0.6"),
+    TITAN_ROCKS_ROOT: prefix, TITAN_PREFIX: path.join(buildDir, "compiler-cache"),
+    TITAN_PATH_0_6: path.join(prefix, "lib/titan/0.6"), TITAN_PATH: path.join(prefix, "lib/titan/0.6"),
     TITAN_EXTRA_CPPFLAGS: env.TITAN_EXTRA_CPPFLAGS || env.VSCODE_TITAN_OPENSSL_CPPFLAGS || "",
     TITAN_EXTRA_LDFLAGS: [env.TITAN_EXTRA_LDFLAGS, process.platform === "darwin" ? "-Wl,-export_dynamic" : "-Wl,-E",
       ...nativeFiles.slice(0, 2).map(quote), quote(provider), env.VSCODE_TITAN_OPENSSL_LDFLAGS].filter(Boolean).join(" ")
@@ -227,7 +229,7 @@ export async function buildCoverage(options, { run = execute, environment = proc
   const formats = options.formats ?? [];
   const reportDir = path.resolve(options.reportDir ?? path.join(buildDir, "report"));
   const selected = production.map((module) => module.name);
-  await run(titanc, ["--test", "--no-uv-bootstrap", "--source-first", "-j2", "--coverage", "--coverage-root", buildDir,
+  await run(titanc, ["--static", "--test", "--no-uv-bootstrap", "--source-first", "-j2", "--coverage", "--coverage-root", buildDir,
     "--coverage-gcov", options.gcov, "--coverage-output", reportDir,
     ...formats.flatMap((format) => ["--coverage-format", format]), ...(formats.length ? ["--coverage-gcovr", options.gcovr] : []),
     ...selected.flatMap((name) => ["--coverage-module", name]), "--tree", stage, "server.tests", ...selected],
@@ -262,8 +264,8 @@ export async function runCoverage(options, { run = execute, environment = proces
   await mkdir(build.reportDir, { recursive: true });
   for (const name of reportFiles) await rm(path.join(build.reportDir, name), { force: true });
   const env = { ...cleanEnvironment(environment), ...build.runtimeEnvironment, BUILD_PROFILE: "validation", TITAN_BUILD_PROFILE: "validation",
-    TITAN_ROCKS_ROOT: build.prefix, CCACHE_DISABLE: "1", TITAN_COMPILER_IO_PROCESS_FIXTURE: build.processFixture };
-  delete env.TITAN_PREFIX;
+    TITAN_ROCKS_ROOT: build.prefix, TITAN_PREFIX: path.join(build.buildDir, "compiler-cache"),
+    CCACHE_DISABLE: "1", TITAN_COMPILER_IO_PROCESS_FIXTURE: build.processFixture };
   await auditModules(build, run, env);
   env.LUA_PATH_5_5 = await run(build.lua, ["-E", "-e", "io.write(package.path)"], { cwd: build.root, env, quiet: true });
   env.LUA_CPATH_5_5 = await run(build.lua, ["-E", "-e", "io.write(package.cpath)"], { cwd: build.root, env, quiet: true });

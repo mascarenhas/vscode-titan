@@ -6,7 +6,7 @@ import path from "node:path";
 import { inspectPackage, validateImports, packageImages } from "./inspect-windows-package.mjs";
 
 const pe = "Format: COFF-x86-64\nArch: x86_64\n";
-test("Windows package inspection validates the bounded SDK header inventory before opening the VSIX", async (context) => {
+test("Windows package inspection validates required SDK headers and permits unrelated installed headers", async (context) => {
   const root = await mkdtemp(path.join(tmpdir(), "titan-vsix-headers-"));
   context.after(() => rm(root, { recursive: true, force: true }));
   const sdk = path.join(root, "sdk"), include = path.join(sdk, "include");
@@ -22,7 +22,7 @@ test("Windows package inspection validates the bounded SDK header inventory befo
   await rm(path.join(include, "backtrace-supported.h"));
   await assert.rejects(inspect(), { code: "ENOENT" });
   await writeFile(path.join(include, "unreviewed.h"), "unreviewed\n");
-  await assert.rejects(inspect(), /SDK include tree inventory changed/);
+  await assert.rejects(inspect(), { code: "ENOENT" });
 });
 
 test("delivered images use the controlled Lua/native DLLs and Windows APIs", () => {
