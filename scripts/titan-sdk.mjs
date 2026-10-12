@@ -17,7 +17,7 @@ export function compilerDiscoveryEnvironment(environment = process.env) {
 // Windows LuaRocks installs a batch wrapper with installation-specific paths.
 // Use its adjacent Lua and deployed script so native argv and relocation work.
 export function titanCompilerCommand(prefix, args = [], platform = process.platform) {
-  const paths = platform === "win32" ? path.win32 : path;
+  const paths = platform === "win32" ? path.win32 : path.posix;
   return platform === "win32" ? {
     command: paths.join(prefix, "bin", "lua.exe"),
     args: ["-E", paths.join(prefix, "lib", "luarocks", "rocks-5.5", "titan", "0.6.0-1", "bin", "titanc"), ...args]
@@ -40,7 +40,7 @@ export function findWindowsCompiler(environment, executable = (filename) => {
 
 export function resolveTitanSdk({ prefix, environment = process.env, platform = process.platform,
   run = spawnSync, findCompiler = findWindowsCompiler, realpath = realpathSync } = {}) {
-  const paths = platform === "win32" ? path.win32 : path;
+  const paths = platform === "win32" ? path.win32 : path.posix;
   const override = prefix ?? environmentValue(environment, "TITAN_PREFIX", platform);
   if (override) return paths.resolve(override);
   const env = compilerDiscoveryEnvironment(environment);

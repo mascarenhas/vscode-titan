@@ -4,14 +4,14 @@ import { compilerDiscoveryEnvironment, findWindowsCompiler, resolveTitanSdk } fr
 
 test("explicit SDK overrides PATH without invoking a compiler", () => {
   const run = () => assert.fail("explicit SDK must not query PATH");
-  assert.equal(resolveTitanSdk({ prefix: "/opt/titan", environment: { TITAN_PREFIX: "/other" }, run }), "/opt/titan");
+  assert.equal(resolveTitanSdk({ platform: "linux", prefix: "/opt/titan", environment: { TITAN_PREFIX: "/other" }, run }), "/opt/titan");
   assert.equal(resolveTitanSdk({ platform: "win32", environment: { Titan_Prefix: "C:\\Titan SDK" }, run }), "C:\\Titan SDK");
 });
 
 test("PATH compiler reports its SDK independently of Lua and probe overrides", () => {
   const environment = { PATH: "/selected/bin", TITAN_PREFIX: "", TITAN_ROCKS_ROOT: "/wrong",
     LUA_PATH: "/wrong", LUA_CPATH_5_5: "/wrong", LUA_INIT_5_5: "wrong", TITAN_PATH_0_6: "/wrong", CC: "cc" };
-  const prefix = resolveTitanSdk({ environment, run(command, args, options) {
+  const prefix = resolveTitanSdk({ platform: "linux", environment, run(command, args, options) {
     assert.equal(command, "titanc");
     assert.deepEqual(args, ["--print-prefix"]);
     assert.deepEqual(options.env, { PATH: "/selected/bin", CC: "cc" });
@@ -45,10 +45,10 @@ test("Windows batch discovery uses relocated adjacent Lua with native arguments"
 
 test("discovery failures are actionable and malformed output is rejected", () => {
   const environment = {};
-  assert.throws(() => resolveTitanSdk({ environment, run: () => ({ error: new Error("ENOENT") }) }), /set TITAN_PREFIX/);
-  assert.throws(() => resolveTitanSdk({ environment, run: () => ({ status: 2, stderr: "unknown option" }) }), /unknown option/);
+  assert.throws(() => resolveTitanSdk({ platform: "linux", environment, run: () => ({ error: new Error("ENOENT") }) }), /set TITAN_PREFIX/);
+  assert.throws(() => resolveTitanSdk({ platform: "linux", environment, run: () => ({ status: 2, stderr: "unknown option" }) }), /unknown option/);
   for (const stdout of ["", "relative\n", "/sdk\nnoise\n", "/sdk\0\n"]) {
-    assert.throws(() => resolveTitanSdk({ environment, run: () => ({ status: 0, stdout }) }), /one absolute/);
+    assert.throws(() => resolveTitanSdk({ platform: "linux", environment, run: () => ({ status: 0, stdout }) }), /one absolute/);
   }
   assert.deepEqual(compilerDiscoveryEnvironment({ Path: "selected", tItAn_RoCkS_rOoT: "wrong" }), { Path: "selected" });
 });
