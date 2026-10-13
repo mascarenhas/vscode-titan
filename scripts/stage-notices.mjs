@@ -6,19 +6,13 @@ import {
   rm,
   writeFile
 } from "node:fs/promises";
+import { existsSync, realpathSync } from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { verifyCompilerRocks } from "./compiler-rocks.mjs";
+import { resolveTitanSdk } from "./titan-sdk.mjs";
 
 const repositoryRoot = process.cwd();
-const titanRepository = path.resolve(
-  repositoryRoot,
-  process.env.TITAN_REPO ?? "../titan"
-);
-const titanPrefix = path.resolve(
-  repositoryRoot,
-  process.env.TITAN_PREFIX ?? ".titan"
-);
 const outputRoot = path.join(repositoryRoot, "dist", "notices");
 
 const runtimePackages = [
@@ -66,22 +60,21 @@ async function copyRequired(source, destination, description) {
   }
 }
 
-async function stageTitanNotices() {
-  const destination = path.join(outputRoot, "titan");
+export async function stageTitanNotices({ sdk, destination = outputRoot } = {}) {
+  sdk ??= resolveTitanSdk();
+  const titanDestination = path.join(destination, "titan");
   await copyRequired(
-    process.platform === "win32"
-      ? path.join(titanPrefix, "share", "titan", "LICENSE")
-      : path.join(titanRepository, "LICENSE"),
-    path.join(destination, "LICENSE"),
+    path.join(sdk, "share", "titan", "LICENSE"),
+    path.join(titanDestination, "LICENSE"),
     "Titan license"
   );
   await copyRequired(
-    path.join(titanPrefix, "share", "titan", "THIRD_PARTY_NOTICES.md"),
-    path.join(destination, "THIRD_PARTY_NOTICES.md"),
+    path.join(sdk, "share", "titan", "THIRD_PARTY_NOTICES.md"),
+    path.join(titanDestination, "THIRD_PARTY_NOTICES.md"),
     "Titan third-party notices"
   );
 
-  const sourceLicenses = path.join(titanPrefix, "share", "titan", "LICENSES");
+  const sourceLicenses = path.join(sdk, "share", "titan", "LICENSES");
   const entries = (await readdir(sourceLicenses, { withFileTypes: true }))
     .filter((entry) => entry.isFile())
     .sort((left, right) => left.name.localeCompare(right.name));
@@ -91,58 +84,16 @@ async function stageTitanNotices() {
   for (const entry of entries) {
     await copyRequired(
       path.join(sourceLicenses, entry.name),
-      path.join(destination, "LICENSES", entry.name),
+      path.join(titanDestination, "LICENSES", entry.name),
       `Titan dependency license ${entry.name}`
     );
   }
 }
 
-export async function stageLuaNotices({ sdk = titanPrefix, destination = outputRoot,
+export async function stageLuaNotices({ sdk, destination = outputRoot,
   platform = process.platform, manifestReader } = {}) {
+  sdk ??= resolveTitanSdk();
   const versions = [];
-  // Standalone Windows LuaRocks manages the installed rocks but does not ship
-  // its own Lua module tree. Only Unix includes those LuaRocks source modules.
-  if (platform !== "win32") {
-    const luaRocksVersion = "3.13.0";
-    const installedConfig = path.join(sdk, "share", "lua", "5.5", "luarocks", "core", "cfg.lua");
-    const sourceRoot = path.join(titanRepository, `luarocks-${luaRocksVersion}`);
-    const sourceConfig = path.join(sourceRoot, "src", "luarocks", "core", "cfg.lua");
-    const luaRocksLicense = path.join(sourceRoot, "COPYING");
-    for (const [source, description] of [
-      [installedConfig, "installed LuaRocks version metadata"],
-      [sourceConfig, "LuaRocks license-source version metadata"]
-    ]) {
-      const contents = await readRequired(source, description);
-      requireContent(
-        contents,
-        `local program_version = "${luaRocksVersion}"`,
-        source,
-        "LuaRocks version metadata"
-      );
-    }
-    const luaRocksLicenseContents = await readRequired(
-      luaRocksLicense,
-      `LuaRocks ${luaRocksVersion} license`
-    );
-    requireContent(
-      luaRocksLicenseContents,
-      "Copyright 2011-2022, the LuaRocks project authors.",
-      luaRocksLicense,
-      "LuaRocks license source"
-    );
-    const luaRocksDestination = path.join("lua", "luarocks", "COPYING");
-    await copyRequired(
-      luaRocksLicense,
-      path.join(destination, luaRocksDestination),
-      `LuaRocks ${luaRocksVersion} license`
-    );
-    versions.push({
-      name: "LuaRocks",
-      version: luaRocksVersion,
-      notice: luaRocksDestination
-    });
-
-  }
 
   for (const component of await verifyCompilerRocks(sdk, { platform, manifestReader })) {
     const notice = path.join(destination, component.notice);
@@ -211,10 +162,11 @@ async function stageJavaScriptNotices() {
 }
 
 export async function stageNotices() {
+  const sdk = resolveTitanSdk();
   await rm(outputRoot, { recursive: true, force: true });
   await mkdir(path.join(outputRoot, "javascript"), { recursive: true });
-  await stageTitanNotices();
-  const luaVersions = await stageLuaNotices();
+  await stageTitanNotices({ sdk });
+  const luaVersions = await stageLuaNotices({ sdk });
   const javaScriptVersions = await stageJavaScriptNotices();
   await writeFile(
     path.join(outputRoot, "README.md"),
@@ -254,6 +206,6 @@ export async function stageNotices() {
 
 }
 
-if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+if (process.argv[1] && existsSync(process.argv[1]) && realpathSync(process.argv[1]) === fileURLToPath(import.meta.url)) {
   await stageNotices();
 }

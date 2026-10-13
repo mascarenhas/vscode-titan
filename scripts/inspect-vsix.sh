@@ -9,7 +9,7 @@ fi
 vsix=$1
 target=$2
 repository_root=$(CDPATH= cd "$(dirname "$0")/.." && pwd -P)
-titan_prefix=${TITAN_PREFIX:-$repository_root/.titan}
+titan_prefix=$(node "$repository_root/scripts/titan-sdk.mjs" --print-prefix)
 bundled_openssl=0
 if [[ -L "$titan_prefix/include/openssl" ||
       ( -e "$titan_prefix/include/openssl" && ! -d "$titan_prefix/include/openssl" ) ]]; then
@@ -47,7 +47,6 @@ for required in \
   extension/dist/notices/lua/inspect/LICENSE \
   extension/dist/notices/lua/lpeglabel/LICENSE \
   extension/dist/notices/lua/luafilesystem/LICENSE.html \
-  extension/dist/notices/lua/luarocks/COPYING \
   extension/dist/notices/javascript/semver/LICENSE \
   extension/dist/notices/javascript/vscode-languageclient/License.txt \
   extension/dist/titan/share/lua/5.5/c-parser/cdriver.lua \
@@ -154,54 +153,8 @@ if [[ ! -x "$extract_root/extension/bin/titan-language-server" ]]; then
   exit 1
 fi
 
-compare_packaged_tree() {
-  local relative_tree=$1
-  local source_tree="$titan_prefix/$relative_tree"
-  local packaged_tree="$extract_root/extension/dist/titan/$relative_tree"
-  local source_inventory="$extract_root/source-inventory"
-  local packaged_inventory="$extract_root/packaged-inventory"
-
-  if [[ ! -d "$source_tree" ]]; then
-    echo "source compiler module or SDK tree is missing: $source_tree" >&2
-    exit 1
-  fi
-  if [[ ! -d "$packaged_tree" ]]; then
-    echo "packaged compiler module or SDK tree is missing: $packaged_tree" >&2
-    exit 1
-  fi
-  if find "$packaged_tree" ! -type d ! -type f -print -quit |
-      grep -q .; then
-    echo "packaged tree contains a non-regular entry: $relative_tree" >&2
-    exit 1
-  fi
-
-  (
-    cd "$source_tree"
-    find . -type f -print | LC_ALL=C sort
-  ) >"$source_inventory"
-  (
-    cd "$packaged_tree"
-    find . -type f -print | LC_ALL=C sort
-  ) >"$packaged_inventory"
-  if ! diff -u "$source_inventory" "$packaged_inventory"; then
-    echo "packaged inventory differs from $source_tree" >&2
-    exit 1
-  fi
-
-  while IFS= read -r relative_file; do
-    if ! cmp -s \
-        "$source_tree/$relative_file" \
-        "$packaged_tree/$relative_file"; then
-      echo "packaged file differs from source: $relative_tree/$relative_file" >&2
-      exit 1
-    fi
-  done <"$source_inventory"
-}
-
-compare_packaged_tree share/lua/5.5
-compare_packaged_tree lib/lua/5.5
-compare_packaged_tree include
-compare_packaged_tree src
+node "$repository_root/scripts/stage-lua-modules.mjs" --check-payload \
+  "$titan_prefix" "$extract_root/extension/dist/titan"
 
 inspect_native_module() {
   local module=$1

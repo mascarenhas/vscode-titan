@@ -1,8 +1,10 @@
 import { createHash } from "node:crypto";
+import { existsSync, realpathSync } from "node:fs";
 import { cp, lstat, mkdir, readFile, readdir, rm } from "node:fs/promises";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { validateSdkIncludeInventory } from "./sdk-include-inventory.mjs";
+import { resolveTitanSdk } from "./titan-sdk.mjs";
 
 const LUA_VERSION = "5.5";
 const LUA_SOURCE_VERSION = "5.5.1";
@@ -16,7 +18,6 @@ const EXPECTED_SHARE_ROOT = [
   "argparse.lua:file",
   "c-parser:directory",
   "inspect.lua:file",
-  ...(process.platform === "win32" ? [] : ["luarocks:directory"]),
   "relabel.lua:file",
   "titan:directory",
   "titan-compiler:directory"
@@ -26,7 +27,6 @@ export function nativeRootInventory(platform = process.platform) {
   return [`lfs.${suffix}:file`, `lpeglabel.${suffix}:file`,
     ...(platform === "win32" ? ["luv.dll:file"] : [])];
 }
-const EXPECTED_NATIVE_ROOT = nativeRootInventory();
 export const requiredShareFiles = [
   "c-parser/cdriver.lua",
   "inspect.lua",
@@ -42,44 +42,35 @@ export const requiredShareFiles = [
   "titan-compiler/types.lua",
   "titan-compiler/version.lua"
 ];
-const repositoryRoot = process.cwd();
-const titanPrefix = path.resolve(
-  repositoryRoot,
-  process.env.TITAN_PREFIX ?? ".titan"
-);
-let bundledOpenSSL = false;
-try {
-  bundledOpenSSL = (await lstat(path.join(titanPrefix, "include", "openssl"))).isDirectory();
-} catch (cause) {
-  if (cause.code !== "ENOENT") throw cause;
-}
-const outputPrefix = path.join(repositoryRoot, "dist", "titan");
-const trees = [
-  {
-    description: "Lua source module tree",
-    source: path.join(titanPrefix, "share", "lua", LUA_VERSION),
-    destination: path.join(outputPrefix, "share", "lua", LUA_VERSION),
-    expectedRoot: EXPECTED_SHARE_ROOT
-  },
-  {
-    description: "Lua native module tree",
-    source: path.join(titanPrefix, "lib", "lua", LUA_VERSION),
-    destination: path.join(outputPrefix, "lib", "lua", LUA_VERSION),
-    expectedRoot: EXPECTED_NATIVE_ROOT
-  },
-  {
-    description: "Titan SDK include tree",
-    source: path.join(titanPrefix, "include"),
-    destination: path.join(outputPrefix, "include"),
-    validateInventory: validateSdkIncludeInventory
-  },
-  {
-    description: "Lua native source tree",
-    source: path.join(titanPrefix, "src"),
-    destination: path.join(outputPrefix, "src"),
-    expectedRoot: [`lua-${LUA_SOURCE_VERSION}:directory`]
+export async function sdkPayloadTrees(sdk, { platform = process.platform } = {}) {
+  const trees = [
+    {
+      description: "Lua source module tree",
+      relative: `share/lua/${LUA_VERSION}`,
+      expectedRoot: EXPECTED_SHARE_ROOT
+    },
+    {
+      description: "Lua native module tree",
+      relative: `lib/lua/${LUA_VERSION}`,
+      expectedRoot: nativeRootInventory(platform)
+    },
+    {
+      description: "Titan SDK include tree",
+      relative: "include",
+      validateInventory: (entries) => validateSdkIncludeInventory(entries, platform)
+    },
+    {
+      description: "Lua native source tree",
+      relative: "src",
+      expectedRoot: [`lua-${LUA_SOURCE_VERSION}:directory`]
+    }
+  ];
+  for (const tree of trees) {
+    tree.source = path.join(sdk, tree.relative);
+    tree.selectedRoot = await validateRootInventory(tree);
   }
-];
+  return trees;
+}
 
 function entryKind(entry) {
   if (entry.isDirectory()) return "directory";
@@ -101,17 +92,19 @@ async function validateRootInventory(tree) {
     .map((entry) => `${entry.name}:${entryKind(entry)}`)
     .sort();
   if (tree.validateInventory) {
-    tree.validateInventory(actual);
-    return;
+    return tree.validateInventory(actual);
   }
   const expected = [...tree.expectedRoot].sort();
-  if (JSON.stringify(actual) !== JSON.stringify(expected)) {
+  const selectedNames = new Set(expected.map((entry) => entry.split(":")[0]));
+  const selected = actual.filter((entry) => selectedNames.has(entry.split(":")[0]));
+  if (JSON.stringify(selected) !== JSON.stringify(expected)) {
     throw new Error(
       `${tree.description} inventory changed: expected ${
         JSON.stringify(expected)
-      }, found ${JSON.stringify(actual)}`
+      }, found ${JSON.stringify(selected)}`
     );
   }
+  return expected;
 }
 
 async function requireRegularFile(root, relativePath, description) {
@@ -175,15 +168,17 @@ async function validateCompilerVersion(shareRoot) {
   }
 }
 
-async function inventory(root, relativeRoot = "") {
+async function inventory(root, relativeRoot = "", selectedRoot) {
   const directory = relativeRoot.length === 0
     ? root
     : path.join(root, ...relativeRoot.split("/"));
   const entries = await readdir(directory, { withFileTypes: true });
   entries.sort((left, right) => left.name.localeCompare(right.name));
+  const selectedNames = selectedRoot && new Set(selectedRoot.map((member) => member.split(":")[0]));
 
   const result = [];
   for (const entry of entries) {
+    if (relativeRoot.length === 0 && selectedNames && !selectedNames.has(entry.name)) continue;
     const relativePath = relativeRoot.length === 0
       ? entry.name
       : `${relativeRoot}/${entry.name}`;
@@ -218,12 +213,7 @@ function compareInventories(tree, sourceInventory, stagedInventory) {
   }
 }
 
-export async function stageLuaModules() {
-  await rm(outputPrefix, { recursive: true, force: true });
-
-  for (const tree of trees) {
-    await validateRootInventory(tree);
-  }
+async function validateRequiredPayload(trees) {
   for (const relativePath of requiredShareFiles) {
     await requireRegularFile(
       trees[0].source,
@@ -232,26 +222,60 @@ export async function stageLuaModules() {
     );
   }
   await validateCompilerVersion(trees[0].source);
-  if (bundledOpenSSL) {
+  if (trees[2].selectedRoot.includes("openssl:directory")) {
     for (const header of ["ssl.h", "crypto.h", "opensslv.h"]) {
       await requireRegularFile(
         trees[2].source, `openssl/${header}`, `bundled OpenSSL header ${header}`
       );
     }
   }
+}
+
+export async function sdkPayloadInventory(sdk, options) {
+  const trees = await sdkPayloadTrees(sdk, options);
+  await validateRequiredPayload(trees);
+  const result = [];
+  for (const tree of trees) {
+    for (const entry of await inventory(tree.source, "", tree.selectedRoot)) {
+      result.push({ ...entry, path: `${tree.relative}/${entry.path}` });
+    }
+  }
+  return result;
+}
+
+export async function validateStagedLuaModules(sdk, destination, options) {
+  const expected = (await sdkPayloadInventory(sdk, options)).filter((entry) => entry.type === "file");
+  const actual = (await inventory(destination)).filter((entry) => entry.type === "file");
+  if (JSON.stringify(actual.sort((a, b) => a.path.localeCompare(b.path))) !==
+      JSON.stringify(expected.sort((a, b) => a.path.localeCompare(b.path)))) {
+    throw new Error(`staged compiler module and SDK payload does not exactly match selected inputs from ${sdk}`);
+  }
+}
+
+export async function stageLuaModules({ sdk, destination, platform = process.platform } = {}) {
+  sdk ??= resolveTitanSdk();
+  const repositoryRoot = process.cwd();
+  const outputPrefix = destination ?? path.join(repositoryRoot, "dist", "titan");
+  const trees = await sdkPayloadTrees(sdk, { platform });
+  await validateRequiredPayload(trees);
+  await rm(outputPrefix, { recursive: true, force: true });
 
   let fileCount = 0;
   let byteCount = 0;
   for (const tree of trees) {
-    const sourceInventory = await inventory(tree.source);
-    await mkdir(path.dirname(tree.destination), { recursive: true });
-    await cp(tree.source, tree.destination, {
-      errorOnExist: true,
-      force: false,
-      preserveTimestamps: true,
-      recursive: true
-    });
-    const stagedInventory = await inventory(tree.destination);
+    const sourceInventory = await inventory(tree.source, "", tree.selectedRoot);
+    const treeDestination = path.join(outputPrefix, tree.relative);
+    await mkdir(treeDestination, { recursive: true });
+    for (const member of tree.selectedRoot) {
+      const name = member.split(":")[0];
+      await cp(path.join(tree.source, name), path.join(treeDestination, name), {
+        errorOnExist: true,
+        force: false,
+        preserveTimestamps: true,
+        recursive: true
+      });
+    }
+    const stagedInventory = await inventory(treeDestination);
     compareInventories(tree, sourceInventory, stagedInventory);
     for (const entry of stagedInventory) {
       if (entry.type !== "file") continue;
@@ -268,6 +292,12 @@ export async function stageLuaModules() {
 
 }
 
-if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  await stageLuaModules();
+if (process.argv[1] && existsSync(process.argv[1]) && realpathSync(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  if (process.argv[2] === "--check-payload") {
+    const [, , , sdk, destination] = process.argv;
+    if (!sdk || !destination) throw new Error("usage: stage-lua-modules.mjs --check-payload SDK DIRECTORY");
+    await validateStagedLuaModules(sdk, destination);
+  } else {
+    await stageLuaModules();
+  }
 }

@@ -76,15 +76,20 @@ messages; stderr carries logs.
 
 The Makefile owns the cross-language build:
 
-1. compile the Titan server with the project-local `.titan/bin/titanc`, static
+1. compile the Titan server with an installed SDK selected by `TITAN_PREFIX` or
+   `titanc --print-prefix` on `PATH`, static
    Titan-provider preference, and the complete metadata-only standard-interface
    inventory;
 2. compile/bundle the extension and run its JavaScript tests;
 3. assemble a platform-specific VSIX containing the native executable, private
    `dist/titan/share/lua/5.5` and `dist/titan/lib/lua/5.5` trees, and the reviewed
    SDK inventory under `dist/titan/include` and `dist/titan/src`; exclude the
-   `lib/titan` provider tree and Titan provider archive;
-4. provide focused and complete test targets.
+   `lib/titan` provider tree, Titan provider archive, LuaRocks's own modules and
+   unrelated installed packages while retaining the compiler's dependencies;
+4. provide focused and complete test targets using the ordinary installed
+   standard provider, including compiled `titan.test`, without requiring SDK test
+   sources or a consumer-built support module. Keep the project's production and
+   test source/object graphs separate.
 
 Initialized statically selected Titan runtime modules register their openers in
 `package.preload`; the VSIX does not copy their provider archive to disk. This
@@ -240,6 +245,11 @@ issue. A source root not selected by `include` remains external and unwatched.
 ## Implementation phases and gates
 
 ### Phase 0 — repository and toolchain bootstrap
+
+This phase records the initial bootstrap. The current build consumes an
+installed Titan SDK, keeps it immutable and needs no compiler checkout. CI
+explicitly prepares its SDK from an exact pinned Titan commit before invoking
+the consumer build.
 
 - Add `AGENTS.md`, this plan, the repository-local agent skill, and `.titan/`
   ignore rule.

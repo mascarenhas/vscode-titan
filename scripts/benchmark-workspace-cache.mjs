@@ -14,6 +14,7 @@ import { finished } from "node:stream/promises";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { aggregateColdProfile } from "./benchmark-server.mjs";
 import { FrameReader, exitOf, frame, withTimeout } from "./test-server-protocol.mjs";
+import { compilerDiscoveryEnvironment, resolveTitanSdk } from "./titan-sdk.mjs";
 
 const REPOSITORY = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const PREFIX = "titan-language-server ";
@@ -122,7 +123,11 @@ async function futureRealpath(filename) {
 async function probeCacheConfiguration(options, inherited = process.env) {
   assert.notEqual(inherited.TITAN_PROBE_CACHE_DISABLE, "1",
     "TITAN_PROBE_CACHE_DISABLE=1 prevents a cache-enabled benchmark; unset it before measuring");
-  const rocksRoot = await realpath(inherited.TITAN_ROCKS_ROOT || path.join(REPOSITORY, ".titan"));
+  // TITAN_PREFIX selects probe storage in benchmark invocations. Discover the
+  // actual SDK separately unless the caller already selected its rocks root.
+  const rocksRoot = await realpath(inherited.TITAN_ROCKS_ROOT || resolveTitanSdk({
+    environment: compilerDiscoveryEnvironment(inherited)
+  }));
   assert.ok((await stat(rocksRoot)).isDirectory(), "the actual Titan installation must be a directory");
   const prefix = path.join(options.output, "probe-prefix");
   assert.ok(path.isAbsolute(prefix), "the private probe prefix must be absolute");
@@ -143,7 +148,8 @@ function benchmarkEnvironment(probeCache, inherited = process.env) {
   const environment = { ...inherited,
     TITAN_PREFIX: probeCache.prefix, TITAN_ROCKS_ROOT: probeCache.rocksRoot,
     TITAN_LS_LUA_PATH: inherited.TITAN_LS_LUA_PATH ?? `${luaRoot}/?.lua;${luaRoot}/?/init.lua`,
-    TITAN_LS_LUA_CPATH: inherited.TITAN_LS_LUA_CPATH ?? path.join(probeCache.rocksRoot, "lib/lua/5.5/?.so"),
+    TITAN_LS_LUA_CPATH: inherited.TITAN_LS_LUA_CPATH ?? path.join(probeCache.rocksRoot,
+      "lib", "lua", "5.5", process.platform === "win32" ? "?.dll" : "?.so"),
     TITAN_LANGUAGE_SERVER_LOG_LEVEL: "trace" };
   // Raw-source probe keys have no namespace. The supported prefix changes only
   // the disk-cache location and must not replace compiler installation discovery.

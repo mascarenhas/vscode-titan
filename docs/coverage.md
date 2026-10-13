@@ -9,20 +9,21 @@ behavior coverage.
 
 ## Prepare and run
 
-Use the isolated validation SDK, GCC 14 or newer and matching gcov. Basic
+Use a compatible installed Titan SDK, GCC 14 or newer and matching gcov. Basic
 reporting needs neither Python nor gcovr. On macOS use a prepared Homebrew GCC
 SDK and GNU Make; see [native-build.md](native-build.md). This consumer's coverage
 launcher currently targets Linux and macOS; platform validation remains a
 separate gate.
 
-Prepare the validation SDK from a checkout at the exact producer pin. A retained
-older SDK needs `toolchain-refresh`, since `toolchain` reuses an installed
-compiler:
+Select the SDK with `TITAN_PREFIX`, or put its `titanc` on `PATH` for
+`titanc --print-prefix` discovery. The consumer build does not prepare or refresh
+that installation. CI prepares a validation SDK from the exact producer pin
+through Titan's own build workflow; local coverage can also use a production SDK
+because prebuilt providers are unmeasured:
 
 ```sh
-make -j2 toolchain-refresh BUILD_PROFILE=validation \
-  TITAN_REPO=/path/to/pinned/titan
 make -j2 server-coverage BUILD_ROOT=.build/coverage-native \
+  TITAN_PREFIX="$HOME/.local/titan" \
   CC=gcc-14 SERVER_COVERAGE_GCOV=gcov-14
 ```
 

@@ -9,6 +9,7 @@ import yauzl from "yauzl";
 import { runtimeDlls } from "./build-windows.mjs";
 import { verifyCompilerRocks } from "./compiler-rocks.mjs";
 import { validateSdkIncludeInventory } from "./sdk-include-inventory.mjs";
+import { sdkPayloadInventory } from "./stage-lua-modules.mjs";
 
 const hash = (bytes) => createHash("sha256").update(bytes).digest("hex");
 export const packageImages = [
@@ -91,14 +92,13 @@ export async function inspectPackage(filename, sdk, readobj, repository) {
   }
   const actualImages = [...files.keys()].filter((name) => /[.](dll|exe)$/i.test(name)).map((name) => name.replace(/^extension\//, "")).sort();
   assert.deepEqual(actualImages, packageImages, "VSIX executable/DLL inventory differs");
-  for (const relative of ["share/lua/5.5", "lib/lua/5.5", "include", "src/lua-5.5.1"]) {
-    const expected = await tree(path.join(sdk, relative));
-    const prefix = `extension/dist/titan/${relative}/`;
-    assert.deepEqual([...files.keys()].filter((name) => name.startsWith(prefix)).map((name) => name.slice(prefix.length)).sort(), expected,
-      `VSIX compiler inventory differs: ${relative}`);
-    for (const name of expected) assert.equal(hash(files.get(prefix + name)), hash(await readFile(path.join(sdk, relative, name))),
-      `VSIX compiler bytes differ: ${relative}/${name}`);
-  }
+  const payload = (await sdkPayloadInventory(sdk, { platform: "win32" })).filter((entry) => entry.type === "file");
+  const payloadPrefix = "extension/dist/titan/";
+  assert.deepEqual([...files.keys()].filter((name) => name.startsWith(payloadPrefix))
+    .map((name) => name.slice(payloadPrefix.length)).sort(), payload.map((entry) => entry.path).sort(),
+  "VSIX compiler inventory differs from selected SDK payload");
+  for (const entry of payload) assert.equal(hash(files.get(payloadPrefix + entry.path)), entry.sha256,
+    `VSIX compiler bytes differ: ${entry.path}`);
   for (const name of await tree(path.join(repository, "dist/notices"))) {
     assert.equal(hash(files.get(`extension/dist/notices/${name}`)), hash(await readFile(path.join(repository, "dist/notices", name))), `VSIX notice differs: ${name}`);
   }

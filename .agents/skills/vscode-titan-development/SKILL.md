@@ -13,9 +13,14 @@ contract. Use GitHub Project 2 as the live Kanban record.
 
 Read the sibling `../titan/.agents/skills/titan-programmer/SKILL.md` before any
 Titan source work. Add `titan-tester`, `titan-async`, `titan-ffi`, or
-`titan-pegs` when their boundaries apply. Use this repository's `.titan/bin`
-toolchain (`.titan-validation/bin` for validation) and its installed Lua paths; do not silently compile with an ambient
-Titan installation. Packaging checks an exact production SDK inventory. Keep
+`titan-pegs` when their boundaries apply. Use the installed SDK selected by
+`TITAN_PREFIX`, or by `titanc --print-prefix` on `PATH`, and its installed Lua
+paths. Prefix discovery is portable across Unix and Windows and uses the
+compiler's provider lookup through `package.cpath`. Consumer builds must not
+bootstrap Titan or require its checkout. Treat the SDK as immutable and keep
+compiler probes under `BUILD_ROOT/compiler-cache`. Packaging checks the required
+compiler/SDK inventory byte for byte, includes compiler dependencies installed
+with LuaRocks, and omits LuaRocks's own modules and unrelated packages. Keep
 upstream compiler test tools such as Busted and coverage modules in a separate
 test prefix; they are not part of the extension's compiler payload.
 
@@ -141,9 +146,9 @@ it.
 
 ## Compiler syntax updates and architecture review
 
-Use the exact requested compiler commit in CI and the isolated development
-installation. During prerelease development the compiler/server API stays at
-`1`; update both consumers and fixtures against the pinned metadata contract.
+Use the exact requested compiler commit in CI; select a compatible installed
+SDK for local development. During prerelease development the compiler/server
+API stays at `1`; update both consumers and fixtures against the pinned metadata contract.
 Treat source syntax, saved-source fixture strings, hover text, semantic spans,
 TextMate scopes and editor bracket/indent rules as separate migration surfaces.
 Assert scopes for each newly introduced identifier position, including contextual
@@ -189,13 +194,14 @@ cache state, diagnostic success, warm work avoided, full background restoration,
 compiler/source revisions and host-load limits; an early READY notification is
 not full restoration. Keep failed runs as failed evidence.
 
-CI builds and caches the complete validation compiler installation at
-`.titan-validation` by its exact commit, O0/no-LTO Titan profile with optimized
-Lua/compiler dependencies, platform/build policy and absolute installation prefix. It builds disposable packages for inspection
+CI explicitly builds and caches the complete validation compiler installation at
+`.titan-validation` with Titan's upstream installation workflow before invoking
+the consumer build. Select it with `TITAN_PREFIX`. Cache by exact commit,
+O0/no-LTO Titan profile with optimized Lua/compiler dependencies, platform/build
+policy and absolute installation prefix. It builds disposable packages for inspection
 and uploads no VSIX/server artifacts. Future main-only release jobs must rebuild
-all inputs in production after tests pass. Include the unpacked
-LuaRocks COPYING and core/cfg.lua licensing inputs used by stage-notices.mjs; a
-fresh compiler checkout does not contain those generated dependency directories.
+all inputs in production after tests pass. Cache only the installed SDK;
+packaging reads licenses from that installation, including `share/titan/LICENSE`.
 No fallback cache may supply a different compiler. Native tests compile once and execute in two
 parallel shards on the two-CPU runner. Maintain the module inventory in
 `scripts/run-server-tests.mjs` when adding a test owner, inspect positive test
@@ -244,9 +250,12 @@ Use `make -j2 server server-test-build` for parallel object compilation. Each
 object recipe uses `-c --incremental -j1`; final links reuse those objects.
 `server-objects` and `server-test-objects` stop before linking. Keep production
 and test graphs separate with consistent flags and source/provider selection in
-every phase. Production uses `--static`; tests follow the compiler stdlib test
-policy and build shared `titan.test` support before test owners. Never reuse a
-production object in the test graph. Native payloads, exported Lua symbols and
+every phase. Production and Unix tests use `--static`; test compilation and
+linking consistently add `--test`. Use the ordinary installed standard provider,
+including compiled `titan.test`; do not require installed test sources or build a
+special support module. Keep production and test source/object graphs separate
+for independent flags and generated-output ownership. Native payloads, exported
+Lua symbols and
 bootstrap flags belong at the final link.
 
 Verify unchanged builds preserve all generated companions and executables, and
@@ -255,8 +264,10 @@ invalidate the expected closure. Preserve two execution shards independently of
 object compilation. Run incremental build regressions and the complete gate
 before delivery. Ordinary server/package/installation builds use the production
 profile (O3 and Linux fat LTO). Test/verify entry points select validation for
-the Titan provider/server/test graphs (O0, no LTO), using an isolated
-`.titan-validation` SDK with optimized Lua and compiler dependencies. Keep the minimal production-profile fixture smoke in
+the server/test graphs and native helpers (O0, no LTO). The selected SDK's
+prebuilt providers, Lua and compiler dependencies remain unchanged; select a
+separately prepared validation SDK when provider-level validation is wanted.
+Keep the minimal production-profile fixture smoke in
 the incremental gate and the compiler's optimization-default regressions;
 routine testing need not rebuild the full optimized stdlib/server. Explicit
 flags follow profile defaults at compilation and linking. Use one Make process per

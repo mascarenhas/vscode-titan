@@ -30,7 +30,6 @@ async function fixture(context) {
 async function compilerSDK(context) {
   const result = await fixture(context);
   const directories = ["share/lua/5.5/c-parser", "share/lua/5.5/titan", "share/lua/5.5/titan-compiler", "include/titan", "include/uv"];
-  if (process.platform !== "win32") directories.push("share/lua/5.5/luarocks");
   for (const directory of directories) await mkdir(path.join(result.sdk, directory), { recursive: true });
   for (const member of ["argparse.lua", "inspect.lua", "relabel.lua", "c-parser/cdriver.lua", "titan-compiler/checker.lua",
     "titan-compiler/checker/completion.lua", "titan-compiler/completion.lua", "titan-compiler/maybe3.lua", "titan-compiler/documentation.lua",
@@ -104,12 +103,12 @@ test("incomplete bundled OpenSSL headers fail staging", async (context) => {
   assert.match(result.stderr, /bundled OpenSSL header crypto[.]h/);
 });
 
-test("system SDK staging still rejects unreviewed header roots and symlinked OpenSSL", async (context) => {
+test("system SDK staging omits unrelated headers and rejects symlinked OpenSSL", async (context) => {
   const state = await compilerSDK(context);
   await state.put("sdk/include/unreviewed.h");
   let result = stage(state);
-  assert.notEqual(result.status, 0);
-  assert.match(result.stderr, /SDK include tree inventory changed/);
+  assert.equal(result.status, 0, result.stderr);
+  await assert.rejects(lstat(path.join(state.root, "dist/titan/include/unreviewed.h")), { code: "ENOENT" });
   await rm(path.join(state.sdk, "include/unreviewed.h"));
   await mkdir(path.join(state.root, "host-openssl"));
   await symlink(path.join(state.root, "host-openssl"), path.join(state.sdk, "include/openssl"), "dir");
@@ -189,151 +188,76 @@ for (const layout of ["file", "link"]) {
 
 for (const mode of ["system", "bundled"]) {
   for (const retained of [false, true]) {
-    test(`${mode} SDK bootstrap refreshes OpenSSL inputs with a ${retained ? "retained" : "fresh"} native graph`,
+    test(`${mode} installed SDK uses current OpenSSL inputs with a ${retained ? "retained" : "fresh"} native graph`,
       { skip: process.platform === "win32" }, async (context) => {
         const state = await fixture(context);
         const build = path.join(state.root, "build");
         const graph = path.join(build, "native-modules.mk");
-        const stableGraph = "# Stable bootstrap fixture graph\nNATIVE_SDK_INPUTS :=\n";
-        const generator = await state.put("generate-graph.mjs", `import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import path from "node:path";
-const build = process.argv[3];
+        const observed = path.join(build, "environment.json");
+        const stableGraph = "# Installed SDK fixture graph\nNATIVE_SDK_INPUTS :=\n";
+        const generator = await state.put("generator.mjs", `import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+const build = ${JSON.stringify(build)}, graph = ${JSON.stringify(graph)}, contents = ${JSON.stringify(stableGraph)};
 mkdirSync(build, { recursive: true });
-const graph = path.join(build, "native-modules.mk");
-const contents = ${JSON.stringify(stableGraph)};
-let previous;
-try { previous = readFileSync(graph, "utf8"); } catch (error) { if (error.code !== "ENOENT") throw error; }
+let previous; try { previous = readFileSync(graph, "utf8"); } catch (error) { if (error.code !== "ENOENT") throw error; }
 if (previous !== contents) writeFileSync(graph, contents);
+writeFileSync(${JSON.stringify(observed)}, JSON.stringify({ sdk: process.env.TITAN_ROCKS_ROOT,
+  probe: process.env.TITAN_PREFIX, profile: process.env.TITAN_BUILD_PROFILE }));
 `);
-        const bootstrap = await state.put("bootstrap-sdk.mjs", `import { chmodSync, mkdirSync, writeFileSync } from "node:fs";
-import path from "node:path";
-const sdk = ${JSON.stringify(state.sdk)};
-mkdirSync(path.join(sdk, "bin"), { recursive: true });
-writeFileSync(path.join(sdk, "bin", "titanc"), "#!/bin/sh\\nexit 0\\n");
-chmodSync(path.join(sdk, "bin", "titanc"), 0o755);
-${mode === "bundled" ? 'mkdirSync(path.join(sdk, "include", "openssl"), { recursive: true });' : ""}
-`);
-        const lua = await state.put("lua", `#!/bin/sh\nexec ${shellQuote(process.execPath)} "$@"\n`, true);
-        const rocks = await state.put("luarocks", `#!/bin/sh\nexec ${shellQuote(process.execPath)} ${shellQuote(bootstrap)} "$@"\n`, true);
-        const titanRepo = path.join(state.root, "titan");
-        await state.put("titan/titan-0.6.0-1.rockspec");
-        await state.put("titan/Makefile", `.PHONY: lua luarocks libuv
-lua:
-\tmkdir -p "$(PREFIX)/bin"
-\tcp ${shellQuote(lua)} "$(PREFIX)/bin/lua"
-luarocks:
-\tmkdir -p "$(PREFIX)/bin"
-\tcp ${shellQuote(rocks)} "$(PREFIX)/bin/luarocks"
-libuv:
-\t@true
-`);
-        const queries = path.join(state.root, "pkg-config-queries");
-        const pkgConfig = mode === "system"
-          ? await state.put("pkg-config", `#!/bin/sh
+        await state.put("sdk/bin/titanc", "#!/bin/sh\nexit 0\n", true);
+        await state.put("sdk/bin/lua", `#!/bin/sh\nexec ${shellQuote(process.execPath)} "$@"\n`, true);
+        if (mode === "bundled") await mkdir(path.join(state.sdk, "include/openssl"), { recursive: true });
+        const queries = path.join(state.root, "openssl-queries");
+        const pkgConfig = await state.put("pkg-config", `#!/bin/sh
 printf '%s\\n' "$*" >> ${shellQuote(queries)}
 case "$1" in
   --atleast-version=3.0.0) exit 0 ;;
-  --cflags) printf '%s\\n' '-I/bootstrap/openssl' ;;
+  --cflags) printf '%s\\n' '-I/installed/openssl' ;;
   --libs) printf '%s\\n' '-lssl -lcrypto' ;;
-  --variable=includedir) printf '%s\\n' '/bootstrap/include' ;;
+  --variable=includedir) printf '%s\\n' '/installed/include' ;;
   *) exit 1 ;;
 esac
-`, true)
-          : path.join(state.root, "pkg-config-must-not-be-used");
+`, true);
         if (retained) {
           await mkdir(build, { recursive: true });
           await writeFile(graph, stableGraph);
         }
-        const env = { ...process.env, OPENSSL_MODE: mode };
-        for (const name of ["MAKEFLAGS", "MFLAGS", "MAKELEVEL"]) delete env[name];
-        const probe = "bootstrap-review: ; @printf '%s\\n' 'BOOTSTRAP:$(NATIVE_OPENSSL_MODE)|$(NATIVE_OPENSSL_LDFLAGS)|$(NATIVE_OPENSSL_CPPFLAGS)|$(MAKE_RESTARTS)'";
+        const env = { ...process.env };
+        for (const name of ["MAKEFLAGS", "MFLAGS", "MAKELEVEL", "BUILD_PROFILE", "TITAN_BUILD_PROFILE"]) delete env[name];
+        env.TITAN_ROCKS_ROOT = "/unrelated/SDK";
+        const runtimeProbe = 'console.log("RUNTIME:" + JSON.stringify({sdk:process.env.TITAN_ROCKS_ROOT,probe:process.env.TITAN_PREFIX}))';
+        const probe = "sdk-review:\n\t@printf '%s\\n' 'SDK:$(NATIVE_OPENSSL_MODE)|$(NATIVE_OPENSSL_LDFLAGS)|$(NATIVE_OPENSSL_CPPFLAGS)'\n" +
+          `\t@$(SERVER_TEST_ENV) ${shellQuote(process.execPath)} -e ${shellQuote(runtimeProbe)}`;
         const result = spawnSync("make", ["--no-print-directory", "-j1", "-f", repositoryMakefile,
-          `TITAN_PREFIX=${state.sdk}`, `TITAN_REPO=${titanRepo}`, `BUILD_ROOT=${build}`,
-          `NATIVE_BUILD_GENERATOR=${generator}`, `OPENSSL_PKG_CONFIG=${pkgConfig}`,
-          `--eval=${probe}`, "bootstrap-review"], {
-          cwd: state.root, env, encoding: "utf8", timeout: 30_000
-        });
+          `TITAN_PREFIX=${state.sdk}`, "TITAN_REPO=/nonexistent/compiler-checkout", `BUILD_ROOT=${build}`,
+          "BUILD_PROFILE=validation", "TITAN_BUILD_PROFILE=production",
+          `NATIVE_BUILD_GENERATOR=${generator}`, `OPENSSL_PKG_CONFIG=${pkgConfig}`, `--eval=${probe}`, "sdk-review"],
+        { cwd: state.root, env, encoding: "utf8", timeout: 30_000 });
         assert.equal(result.status, 0, result.error?.message ?? result.stderr);
-        const expected = mode === "system"
-          ? "BOOTSTRAP:system|-lssl -lcrypto|-I/bootstrap/openssl|1"
-          : "BOOTSTRAP:bundled|||1";
-        assert.ok(result.stdout.split("\n").includes(expected), result.stdout);
+        assert.ok(result.stdout.split("\n").includes(mode === "system"
+          ? "SDK:system|-lssl -lcrypto|-I/installed/openssl" : "SDK:bundled||"), result.stdout);
+        assert.ok(result.stdout.split("\n").includes(`RUNTIME:${JSON.stringify({ sdk: state.sdk })}`), result.stdout);
+        assert.deepEqual(JSON.parse(await readFile(observed, "utf8")), {
+          sdk: state.sdk, probe: path.join(build, "compiler-cache"), profile: "validation"
+        });
         assert.equal(await readFile(graph, "utf8"), stableGraph);
-        if (mode === "system") {
-          assert.deepEqual((await readFile(queries, "utf8")).trim().split("\n"), [
-            "--atleast-version=3.0.0 openssl", "--cflags openssl", "--libs openssl", "--variable=includedir openssl"
-          ]);
-        } else {
-          await assert.rejects(lstat(queries), { code: "ENOENT" });
-        }
+        if (mode === "system") assert.match(await readFile(queries, "utf8"), /--libs openssl/);
+        else await assert.rejects(lstat(queries), { code: "ENOENT" });
       });
   }
 }
 
-async function luaRocksMakeFixture(context, goal) {
+test("missing installed compiler fails without bootstrapping or changing the SDK", {
+  skip: process.platform === "win32"
+}, async (context) => {
   const state = await fixture(context);
-  const titanRepo = path.join(state.root, "titan");
-  const invoked = path.join(state.root, "luarocks-invoked");
-  const profile = path.join(state.root, "luarocks-profile");
-  const nestedMakefile = await state.put("nested.mk", `.PHONY: all
-all:
-\t@printf '%s\\n' 'JOBSERVER:$(MAKEFLAGS)'
-`);
-  const rocks = await state.put("luarocks", `#!/bin/bash
-set -e
-printf '%s\\n' invoked >> ${shellQuote(invoked)}
-printf '%s\\n' "\${TITAN_BUILD_PROFILE:-unset}" > ${shellQuote(profile)}
-make --no-print-directory -f ${shellQuote(nestedMakefile)}
-mkdir -p ${shellQuote(path.join(state.sdk, "bin"))}
-printf '#!/bin/sh\\nexit 0\\n' > ${shellQuote(path.join(state.sdk, "bin", "titanc"))}
-chmod 755 ${shellQuote(path.join(state.sdk, "bin", "titanc"))}
-`, true);
-  // Keep the wrapper available for dry runs, independently of Make's bootstrap.
-  await state.put("sdk/bin/luarocks", await readFile(rocks, "utf8"), true);
-  if (goal === "toolchain-refresh") await state.put("sdk/bin/titanc", "#!/bin/sh\nexit 0\n", true);
-  await state.put("titan/titan-0.6.0-1.rockspec");
-  // The SDK prerequisites are ready; only compiler installation is missing.
-  for (const name of ["lua", "luarocks", "libuv"]) await state.put(`titan/${name}`);
-  await state.put("titan/Makefile", "lua luarocks libuv:\n");
-  const env = { ...process.env };
-  for (const name of ["MAKEFLAGS", "MFLAGS", "MAKELEVEL", "BUILD_PROFILE", "TITAN_BUILD_PROFILE"]) delete env[name];
-  const makeHelp = spawnSync("make", ["--help"], { env, encoding: "utf8" }).stdout ?? "";
-  const pipeStyle = makeHelp.includes("--jobserver-style") ? ["--jobserver-style=pipe"] : [];
-  const run = (flags = []) => spawnSync("make", ["--no-print-directory", "-j2", ...pipeStyle,
-    ...flags, "-f", repositoryMakefile, `TITAN_PREFIX=${state.sdk}`, `TITAN_REPO=${titanRepo}`, goal],
-  { cwd: state.root, env, encoding: "utf8", timeout: 30_000 });
-  return { ...state, invoked, profile, run };
-}
-
-for (const goal of ["toolchain", "toolchain-refresh"]) {
-  test(`${goal} LuaRocks wrapper preserves the pipe jobserver`,
-    { skip: process.platform === "win32" }, async (context) => {
-      const state = await luaRocksMakeFixture(context, goal);
-      const result = state.run();
-      assert.equal(result.status, 0, result.error?.message ?? result.stderr);
-      assert.doesNotMatch(result.stderr, /jobserver unavailable/, result.stderr);
-      assert.match(result.stdout, /JOBSERVER:.*--jobserver-auth=\d+,\d+/);
-      assert.equal(await readFile(state.invoked, "utf8"), "invoked\n");
-      assert.equal(await readFile(state.profile, "utf8"), "production\n");
-    });
-  test(`${goal} carries the validation profile through LuaRocks`,
-    { skip: process.platform === "win32" }, async (context) => {
-      const state = await luaRocksMakeFixture(context, goal);
-      const result = state.run(["BUILD_PROFILE=validation", "TITAN_BUILD_PROFILE=production"]);
-      assert.equal(result.status, 0, result.error?.message ?? result.stderr);
-      assert.equal(await readFile(state.profile, "utf8"), "validation\n");
-    });
-  for (const flag of ["-n", "-t", "-q"]) {
-    test(`${goal} does not invoke LuaRocks under ${flag}`,
-      { skip: process.platform === "win32" }, async (context) => {
-        const state = await luaRocksMakeFixture(context, goal);
-        const result = state.run([flag]);
-        assert.equal(result.status, flag === "-q" ? 1 : 0, result.error?.message ?? result.stderr);
-        await assert.rejects(lstat(state.invoked), { code: "ENOENT" });
-        assert.doesNotMatch(result.stdout, /^JOBSERVER:/m);
-        if (goal === "toolchain" && flag !== "-t") {
-          await assert.rejects(lstat(path.join(state.sdk, "bin", "titanc")), { code: "ENOENT" });
-        }
-      });
-  }
-}
+  const generator = await state.put("generator.lua");
+  const result = spawnSync("make", ["--no-print-directory", "-f", repositoryMakefile,
+    `TITAN_PREFIX=${state.sdk}`, `BUILD_ROOT=${path.join(state.root, "build")}`,
+    `NATIVE_BUILD_GENERATOR=${generator}`, "--eval=sdk-review: ; @:", "sdk-review"], {
+    cwd: state.root, env: process.env, encoding: "utf8", timeout: 10000
+  });
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /Titan compiler is missing/);
+  await assert.rejects(lstat(path.join(state.sdk, "bin/titanc")), { code: "ENOENT" });
+  await assert.rejects(lstat(path.join(state.root, ".titan")), { code: "ENOENT" });
+});

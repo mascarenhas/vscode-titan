@@ -4,6 +4,7 @@ import { spawnSync } from "node:child_process";
 import { copyFile, lstat, mkdir, open, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
+import { resolveTitanSdk, titanCompilerCommand } from "./titan-sdk.mjs";
 
 export const runtimeDlls = [
   "lua55.dll", "libuv-1.dll", "libllhttp-9.4.dll", "libsqlite3-0.dll",
@@ -17,10 +18,7 @@ const hash = (value) => createHash("sha256").update(value).digest("hex");
 // Invoke the installed script with its selected Lua to retain native argv and
 // relocated SDK support without entering cmd.exe.
 export function windowsCompilerCommand(sdk, args = []) {
-  return {
-    command: path.join(sdk, "bin", "lua.exe"),
-    args: ["-E", path.join(sdk, "lib", "luarocks", "rocks-5.5", "titan", "0.6.0-1", "bin", "titanc"), ...args]
-  };
+  return titanCompilerCommand(sdk, args, "win32");
 }
 
 export function orderedModules(plan, selected) {
@@ -205,9 +203,10 @@ export async function assertBuildRootOutsideSdk(sdk, buildRoot) {
 export async function buildWindows(target, {
   sdk, buildRoot = path.join(repository, ".build", "windows"), sourceRoot = path.join(repository, "src"),
   clang, ar, ranlib, filter, buildProfile
-}) {
+} = {}) {
   assert(process.platform === "win32" && process.arch === "x64", "Windows x64 native tools are required");
-  assert(sdk && clang && ar && ranlib, "supply --sdk, --clang, --ar and --ranlib absolute executable paths");
+  sdk = resolveTitanSdk({ prefix: sdk });
+  assert(clang && ar && ranlib, "supply --clang, --ar and --ranlib absolute executable paths");
   for (const value of [sdk, clang, ar, ranlib, buildRoot, sourceRoot]) {
     assert(path.isAbsolute(value), `an absolute path is required: ${value}`);
   }
@@ -288,20 +287,9 @@ export async function buildWindows(target, {
     // changing source ownership or the parsed graph.
     const tree = forward(path.relative(directory, stage));
     const args = [...(test ? ["--test"] : []), "--source-first", "--incremental", "-j1"];
-    const support = path.join(directory, "titan/test__test_support");
-    const supportOutputs = [".o", ".c", ".ffi.h"].map((suffix) => support + suffix);
-    if (test) {
-      const stamp = hash(settings + await fileDigest(path.join(sdk, "share/titan/0.6/src/titan/test.titan")));
-      if (previous.support !== stamp || !await allFiles(supportOutputs)) {
-        await rm(supportOutputs[0], { force: true });
-        compile([...args, "-c", "--tree", tree, "titan.test"], directory);
-        assert(await allFiles(supportOutputs), "missing generated test support");
-      }
-      state.support = stamp;
-    }
     for (const name of orderedModules(plan, test ? plan.tests : plan.server)) {
       const module = plan.modules[name], outputs = moduleOutputs(stage, module);
-      const stamp = hash(JSON.stringify({ settings, headers, support: state.support,
+      const stamp = hash(JSON.stringify({ settings, headers,
         module, sources: await digestFiles(module.sources.map((file) => path.join(stage, file))),
         dependencies: module.imports.map((dependency) => state.objects[dependency]) }));
       if (previous.objects[name] !== stamp || !await allFiles(outputs)) {
@@ -333,7 +321,7 @@ export async function buildWindows(target, {
     const root = test ? "server.tests" : "titan_language_server";
     const executable = path.join(directory, "bin", test ? "server.tests.exe" : "titan-language-server.exe");
     const provider = path.join(directory, "lib/titan/0.6", ...root.split(".")) + ".dll";
-    const linkStamp = hash(JSON.stringify({ settings, nativeStamp, objects: state.objects, support: state.support }));
+    const linkStamp = hash(JSON.stringify({ settings, nativeStamp, objects: state.objects }));
     if (previous.link !== linkStamp || !await allFiles([executable, provider])) {
       // content_identity calls SHA256 directly; Windows imports that API from
       // the controlled native DLL instead of the Unix flattened static provider.

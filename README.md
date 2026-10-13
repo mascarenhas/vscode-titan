@@ -37,9 +37,10 @@ navigation and rename plus completion in unsaved buffers.
 
 ## Prerequisites
 
-- A sibling Titan checkout at `../titan` (override with `TITAN_REPO=...`).
-  Initialize its pinned submodules with
-  `git -C ../titan submodule update --init --recursive` before building.
+- A compatible installed Titan SDK. Put its `titanc` on `PATH`, or set
+  `TITAN_PREFIX` to its installation prefix, such as `$HOME/.local/titan`.
+  Discovery uses `titanc --print-prefix`, which locates the installed provider
+  through `package.cpath` on Unix and Windows.
 - A C toolchain and the native prerequisites used by Titan.
 - Node.js 24 and npm.
 - VS Code 1.106 or newer for extension development and installation.
@@ -49,9 +50,10 @@ x64 workflow uses a native CLANG64/UCRT Titan SDK, a DLL application and control
 shared Lua. See [Windows native builds](docs/native-build.md#experimental-windows-dll-build)
 for setup, validation gates, and documented limitations.
 
-The repository owns an ignored Titan installation in `.titan/` (override with
-`TITAN_PREFIX=...`); build commands do not rely on an ambient `titanc` or Lua
-installation. These prerequisites are for building the repository.
+Builds use the selected SDK's compiler, Lua interpreter, modules, headers and
+standard-library providers together. They do not install a compiler or require
+a Titan checkout. The SDK must include Titan's installed license at
+`share/titan/LICENSE`. These prerequisites are for building the repository.
 Installing its target-specific VSIX does not
 require that development toolchain.
 
@@ -70,34 +72,44 @@ checks. The local macOS validation used Intel x86_64; it does not establish
 Apple Silicon runtime coverage.
 
 ```sh
-make toolchain
 make npm-ci
 make -j2
 make test
 ```
 
 On Linux and macOS, `make` produces `bin/titan-language-server` and `dist/extension.js`, and stages
-the project-local Lua source and native-module trees under
+the selected compiler's Lua source and native modules under
 `dist/titan/share/lua/5.5` and `dist/titan/lib/lua/5.5`, together with the SDK
-include tree and matching Lua sources. Packaging checks compare all four trees
-byte-for-byte with the installation. It does not stage a `lib/titan` tree or a
+include tree and matching Lua sources. Packaging checks compare the required
+files byte-for-byte with the installation. Compiler dependencies installed with
+LuaRocks remain included; LuaRocks's own modules and unrelated installed packages
+are omitted. It does not stage a `lib/titan` tree or a
 Titan provider archive. The server build uses Titan's static-provider path and,
 on ELF systems, exports the embedded Lua API so compiler dependencies loaded from
 `package.cpath` bind to that same Lua state.
 
-If `.titan/` already exists after the sibling Titan checkout changes, run
-`make toolchain-refresh` before rebuilding so the isolated compiler modules and
-static providers match that checkout.
+To select a specific installation for a build and package:
+
+```sh
+make -j2 TITAN_PREFIX="$HOME/.local/titan"
+make package TITAN_PREFIX="$HOME/.local/titan"
+```
+
+Update the installed SDK using Titan's own installation workflow when compiler
+changes are needed; this repository treats it as an immutable input.
 
 Native modules now have separate object targets and final executable links.
 `make -j2 server server-test-build` schedules incremental object compilation;
 `make server-objects` and `make server-test-objects` stop before linking.
+Native tests use the ordinary installed standard provider, including compiled
+`titan.test`, without requiring test sources in the SDK or a special support build.
 See [incremental native builds](docs/native-build.md) for dependency ownership,
 configuration invalidation, separate production/test objects and LTO settings.
 
-The complete local gate uses `-O0` without LTO and a separate
-`.titan-validation/` SDK. It builds the server and extension, runs Titan and
-JavaScript tests plus the Extension Host smoke test, queries the native server
+The complete local gate uses `-O0` without LTO for this project's compiled code.
+It uses the same selected SDK, including its already compiled providers. It
+builds the server and extension, runs Titan and JavaScript tests plus the
+Extension Host smoke test, queries the native server
 through the Codex adapter, checks incremental native rebuilds, packages the VSIX,
 checks its contents, validates the Codex plugin metadata, and inspects native linkage:
 
@@ -111,24 +123,32 @@ On a headless Linux machine, run the Extension Host under a virtual display:
 xvfb-run -a make verify
 ```
 
-GitHub CI runs the same validation profile as separate toolchain, build, test,
+GitHub CI runs the same validation profile as separate SDK preparation, build, test,
 disposable packaging and inspection steps on Ubuntu 24.04 `ubicloud-standard-2`
 runners. It publishes no VSIX or server binaries. The completed
-`.titan-validation` installation and the two LuaRocks licensing inputs required
-by packaging are cached by the exact pinned Titan commit, build profile and
-installation identity. A cache hit
+`.titan-validation` installation is prepared explicitly by Titan's upstream
+build and cached by the exact pinned Titan commit, build profile and installation
+identity. CI selects that prefix explicitly, including validation-built providers.
+A cache hit
 reuses the compiler and SDK; a miss builds them once before
 server compilation. Make schedules module object recipes across two CPUs, then
 links one native test executable that runs in two parallel execution shards.
-Regular `make`, `make server`, `make package` and compiler installation retain
-optimized production defaults using `.titan/`. A future main-only release job
-must rebuild that complete optimized SDK/server after validation passes.
+Regular `make`, `make server`, `make package` and server installation retain
+optimized production defaults for this project's compiled code. A future
+main-only release job must rebuild that complete optimized SDK/server after
+validation passes.
 Because both repositories are
 private, the vscode-titan repository must define an Actions secret named
 `SSH_PRIVATE_KEY`; its public half must be registered as a read-only deploy key
 in `mascarenhas/titan`.
 
-Titan #211 uses ordinary LuaRocks deployment. On Linux, provide Readline development headers (`libreadline-dev` on Debian/Ubuntu or `readline-devel` on Fedora), or select `LUA_PLATFORM=linux` to omit Readline. LuaRocks owns compiler dependencies and native provider preparation. Use separate Titan source/build checkouts when preparing production and validation SDKs; upstream callers own cleanup when tools, flags, profiles or OpenSSL mode change.
+Titan uses ordinary LuaRocks deployment. SDK preparation belongs to Titan's
+installation workflow. On Linux, that workflow needs Readline development
+headers (`libreadline-dev` on Debian/Ubuntu or `readline-devel` on Fedora), or
+`LUA_PLATFORM=linux` to omit Readline. LuaRocks owns compiler dependency and native
+provider installation. Use separate Titan source/build checkouts when preparing
+production and validation SDKs; upstream callers own cleanup when tools, flags,
+profiles or OpenSSL mode change.
 
 Use `make help` for focused targets. In particular, `make server-test` runs the
 native Titan suite serially; `make server-test-sharded` runs the same suite in two
@@ -163,8 +183,8 @@ the lower bound without structured-log overhead.
 
 For a controlled persistent-cache fill/warm comparison, set `TITAN_PREFIX` to
 a fresh absolute directory and reuse it for the consecutive server processes.
-Keep `TITAN_ROCKS_ROOT` pointed at the actual compiler installation, normally
-this repository's `.titan` directory. The private prefix holds ordinary
+Keep `TITAN_ROCKS_ROOT` pointed at the actual selected compiler installation.
+The private prefix holds ordinary
 source-only probe records under `var/cache/titan-probes/2`; it does not change
 their raw-source keys or delete ordinary developer cache entries. The workspace
 cache benchmark below manages this isolation automatically.
