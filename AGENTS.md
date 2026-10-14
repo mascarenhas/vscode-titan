@@ -70,7 +70,7 @@ Test/verify entry points use `BUILD_PROFILE=validation` (`-O0`, no LTO) for the
 server, tests and native helpers; the SDK's prebuilt providers remain unchanged.
 Regular server/package/installation builds use production (`-O3`, platform LTO
 defaults), with minimal optimized smoke coverage in the incremental gate.
-CI explicitly prepares and caches a validation SDK at the exact compiler pin
+CI explicitly installs the Titan release source rock and caches a validation SDK
 before the consumer build. Routine CI publishes no VSIX or server binaries;
 future main-only release jobs must rebuild production after tests pass.
 Keep the package lockfile
@@ -82,7 +82,7 @@ server-test-build` for the parallel build. Keep source/provider policy consisten
 within each graph. Use the ordinary installed provider, including compiled
 `titan.test`, without special test-support compilation or installed test sources.
 Run the incremental build regression gate when changing
-Make rules or the compiler pin. Independent concurrent builds need separate
+Make rules or the compiler release. Independent concurrent builds need separate
 `BUILD_ROOT` values and, when linking servers, separate `SERVER` destinations.
 
 Tests live with their implementation:

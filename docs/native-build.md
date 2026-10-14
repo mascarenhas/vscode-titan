@@ -2,7 +2,7 @@
 
 The server and native test executable use [Titan PR #164](https://github.com/mascarenhas/titan/pull/164)'s
 opt-in object mode plus [the cached-binding fix](https://github.com/mascarenhas/titan/pull/165).
-The exact compiler revision is pinned in [the CI workflow](../.github/workflows/ci.yml).
+The compiler release is selected in [the CI workflow](../.github/workflows/ci.yml).
 Make owns the dependency graph and rebuild decisions; Titan restores source
 metadata from current objects while compiling dependents and linking.
 
@@ -139,9 +139,10 @@ The configuration stamp includes the profile, compiler/SDK and flag inputs, so
 switching either way rebuilds both graphs. The incremental gate also runs its
 small fixture under production defaults and verifies the return to validation.
 
-Routine CI explicitly prepares a validation SDK from the exact pinned Titan
-commit before invoking the consumer build. It caches only that installation,
-including its installed licenses, by commit, build policy and prefix identity.
+Routine CI installs tagged Lua 5.5.1 and LuaRocks 3.13.0, then prepares a
+validation SDK with `luarocks install titan-0.6.0-1.src.rock` from the Titan v0.6
+release before invoking the consumer build. It caches only that installation,
+including its installed licenses, by release versions, build policy and prefix identity.
 It runs the complete validation profile and builds a disposable VSIX
 only to inspect packaging. It uploads no VSIX or language-server binaries,
 including on manual runs. A future release job must run only on `main` after

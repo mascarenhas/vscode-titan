@@ -146,7 +146,7 @@ it.
 
 ## Compiler syntax updates and architecture review
 
-Use the exact requested compiler commit in CI; select a compatible installed
+Use the requested compiler release in CI; select a compatible installed
 SDK for local development. During prerelease development the compiler/server
 API stays at `1`; update both consumers and fixtures against the pinned metadata contract.
 Treat source syntax, saved-source fixture strings, hover text, semantic spans,
@@ -195,8 +195,9 @@ compiler/source revisions and host-load limits; an early READY notification is
 not full restoration. Keep failed runs as failed evidence.
 
 CI explicitly builds and caches the complete validation compiler installation at
-`.titan-validation` with Titan's upstream installation workflow before invoking
-the consumer build. Select it with `TITAN_PREFIX`. Cache by exact commit,
+`.titan-validation` by installing tagged Lua 5.5.1, LuaRocks 3.13.0 and the
+Titan v0.6 source rock with `luarocks install` before invoking
+the consumer build. Select it with `TITAN_PREFIX`. Cache by release versions,
 O0/no-LTO Titan profile with optimized Lua/compiler dependencies, platform/build
 policy and absolute installation prefix. It builds disposable packages for inspection
 and uploads no VSIX/server artifacts. Future main-only release jobs must rebuild

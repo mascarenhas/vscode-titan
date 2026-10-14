@@ -126,9 +126,13 @@ xvfb-run -a make verify
 GitHub CI runs the same validation profile as separate SDK preparation, build, test,
 disposable packaging and inspection steps on Ubuntu 24.04 `ubicloud-standard-2`
 runners. It publishes no VSIX or server binaries. The completed
-`.titan-validation` installation is prepared explicitly by Titan's upstream
-build and cached by the exact pinned Titan commit, build profile and installation
-identity. CI selects that prefix explicitly, including validation-built providers.
+`.titan-validation` installation builds Lua 5.5.1 from the
+[`v5.5.1-1` archive](https://github.com/mascarenhas/lua-5.5.1/archive/refs/tags/v5.5.1-1.tar.gz),
+installs LuaRocks 3.13.0 using its [source installation](https://luarocks.org/#quick-start),
+then downloads the [Titan 0.6 source rock](https://github.com/mascarenhas/titan/releases/download/v0.6/titan-0.6.0-1.src.rock)
+and runs `luarocks install titan-0.6.0-1.src.rock` with `TITAN_BUILD_PROFILE=validation`.
+It caches the SDK by release versions, build profile and installation identity.
+CI selects that prefix explicitly, including validation-built providers.
 A cache hit
 reuses the compiler and SDK; a miss builds them once before
 server compilation. Make schedules module object recipes across two CPUs, then
@@ -137,10 +141,10 @@ Regular `make`, `make server`, `make package` and server installation retain
 optimized production defaults for this project's compiled code. A future
 main-only release job must rebuild that complete optimized SDK/server after
 validation passes.
-Because both repositories are
-private, the vscode-titan repository must define an Actions secret named
-`SSH_PRIVATE_KEY`; its public half must be registered as a read-only deploy key
-in `mascarenhas/titan`.
+CI needs no Titan checkout or deploy key. While Titan is private, set the
+`TITAN_RELEASE_TOKEN` repository secret to a token with read access to Titan's
+contents; CI uses it with `gh release download`. Without the secret, CI downloads
+the source rock directly from its public release URL.
 
 Titan uses ordinary LuaRocks deployment. SDK preparation belongs to Titan's
 installation workflow. On Linux, that workflow needs Readline development
