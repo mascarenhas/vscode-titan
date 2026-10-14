@@ -27,6 +27,10 @@ jobs:
       TITAN_MAX_GLIBC_VERSION: "2.39"
       TITAN_JOBS: "2"
       BUILD_PROFILE: validation
+      LUA_RELEASE: v5.5.1-1
+      LUAROCKS_VERSION: "3.13.0"
+      TITAN_RELEASE: v0.6
+      TITAN_ROCK: titan-0.6.0-1.src.rock
 
     steps:
       - name: Check out vscode-titan
@@ -34,16 +38,6 @@ jobs:
         with:
           path: vscode-titan
           persist-credentials: false
-
-      - name: Check out pinned Titan compiler and standard library
-        uses: actions/checkout@v7.0.1
-        with:
-          repository: mascarenhas/titan
-          ref: 2d4918a52ba41bc445c2a9c347ccb3f1e21c154e
-          path: titan
-          submodules: recursive
-          persist-credentials: false
-          ssh-key: ${{ secrets.SSH_PRIVATE_KEY }}
 
       - name: Set up Node.js
         uses: actions/setup-node@v7.0.0
@@ -63,6 +57,7 @@ jobs:
             cmake \
             curl \
             file \
+            gh \
             git \
             libasound2t64 \
             libatk-bridge2.0-0t64 \
@@ -95,7 +90,6 @@ jobs:
         id: compiler-identity
         working-directory: vscode-titan
         run: |
-          echo "commit=$(git -C "$GITHUB_WORKSPACE/titan" rev-parse HEAD)" >> "$GITHUB_OUTPUT"
           # Runtime lookup is relocatable, but LuaRocks build configuration still
           # records its install prefix. Keep build caches specific to that layout.
           node --input-type=module -e '
@@ -108,22 +102,56 @@ jobs:
             appendFileSync(process.env.GITHUB_ENV, `TITAN_PREFIX=${prefix}\n`);
           '
 
-      - name: Restore the pinned Titan compiler installation
+      - name: Restore the Titan release installation
         id: compiler-cache
         uses: ubicloud/cache/restore@v4
         with:
           path: vscode-titan/.titan-validation
-          # No fallback keys: another compiler revision is never a valid hit.
+          # No fallback keys: another release is never a valid hit.
           # Bump the format when compiler build policy changes.
-          key: titan-sdk-v7-installed-license-validation-titan-o0-lua-deps-optimized-ubuntu24.04-${{ runner.arch }}-readline-system-openssl-system-${{ steps.compiler-identity.outputs.commit }}-${{ steps.compiler-identity.outputs.prefix }}
+          key: titan-sdk-v8-source-rock-validation-titan-o0-lua-deps-optimized-ubuntu24.04-${{ runner.arch }}-readline-system-openssl-system-${{ env.LUA_RELEASE }}-${{ env.LUAROCKS_VERSION }}-${{ env.TITAN_RELEASE }}-${{ env.TITAN_ROCK }}-${{ steps.compiler-identity.outputs.prefix }}
 
-      - name: Build the pinned Titan compiler and standard library
+      - name: Download, build and install Lua 5.5.1
         if: steps.compiler-cache.outputs.cache-hit != 'true'
-        working-directory: titan
         run: |
-          make -j2 lua luarocks PREFIX="$TITAN_PREFIX" TITAN_BUILD_PROFILE=validation
+          mkdir -p "$RUNNER_TEMP/titan-sdk-sources/lua"
+          cd "$RUNNER_TEMP/titan-sdk-sources"
+          curl -fL --retry 3 -o lua.tar.gz \
+            "https://github.com/mascarenhas/lua-5.5.1/archive/refs/tags/$LUA_RELEASE.tar.gz"
+          tar -xzf lua.tar.gz --strip-components=1 -C lua
+          make -C lua -j2 linux-readline PREFIX="$TITAN_PREFIX" \
+            TITAN_LIBRARY_VERSION=0.6 CC=cc \
+            MYCFLAGS='-fPIC -O2 -fno-lto' MYLDFLAGS='-O2 -fno-lto'
+          make -C lua install PREFIX="$TITAN_PREFIX" TITAN_LIBRARY_VERSION=0.6
+
+      - name: Download, build and install LuaRocks
+        if: steps.compiler-cache.outputs.cache-hit != 'true'
+        run: |
+          cd "$RUNNER_TEMP/titan-sdk-sources"
+          curl -fL --retry 3 -o luarocks.tar.gz \
+            "https://luarocks.org/releases/luarocks-$LUAROCKS_VERSION.tar.gz"
+          tar -xzf luarocks.tar.gz
+          cd "luarocks-$LUAROCKS_VERSION"
+          ./configure --prefix="$TITAN_PREFIX" --rocks-tree="$TITAN_PREFIX" \
+            --with-lua="$TITAN_PREFIX" --force-config
+          make LUA_DIR="$TITAN_PREFIX"
+          make install LUA_DIR="$TITAN_PREFIX"
+
+      - name: Download and install the Titan release source rock
+        if: steps.compiler-cache.outputs.cache-hit != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.TITAN_RELEASE_TOKEN }}
+        run: |
+          cd "$RUNNER_TEMP/titan-sdk-sources"
+          if [ -n "$GH_TOKEN" ]; then
+            gh release download "$TITAN_RELEASE" --repo mascarenhas/titan \
+              --pattern "$TITAN_ROCK"
+          else
+            curl -fL --retry 3 -o "$TITAN_ROCK" \
+              "https://github.com/mascarenhas/titan/releases/download/$TITAN_RELEASE/$TITAN_ROCK"
+          fi
           PATH="$TITAN_PREFIX/bin:$PATH" TITAN_BUILD_PROFILE=validation \
-            "$TITAN_PREFIX/bin/luarocks" make --force titan-0.6.0-1.rockspec
+            "$TITAN_PREFIX/bin/luarocks" install "$TITAN_ROCK"
 
       - name: Validate the compiler installation
         working-directory: vscode-titan
