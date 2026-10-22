@@ -52,7 +52,7 @@ captured active module and the committed dependency descriptors. An editor
 buffer for a dependency does not override that dependency's saved
 documentation. Hover after completion uses the same session, version,
 contributor and saved-generation identity as its other facts. Editing a
-comment retires that context, and saving never promotes TEMP facts.
+comment retires that context.
 
 `src/server/documentation_test.titan` covers Markdown and link rendering.
 Bridge, store and stdio protocol tests cover typed rejection, persistent and

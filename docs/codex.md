@@ -17,22 +17,18 @@ make install-server INSTALL_PREFIX="$HOME/.local"
 command -v titan-language-server
 ```
 
-Put `$HOME/.local/bin` on the `PATH` that Codex inherits. `install-server`
-installs the executable and its notices, but not the compiler modules that the
-VSIX carries; see the [README](../README.md#standalone-server). Without
-`TITAN_LS_LUA_PATH` and `TITAN_LS_LUA_CPATH`, the server searches only `./?.lua`
-and `./?.so`. Unless compatible modules are in the project root, start Codex
-with complete templates for the same Titan installation the server was built
-against:
+Put `$HOME/.local/bin` on the `PATH` that Codex inherits. A standalone server
+carries no compiler modules; see the
+[README](../README.md#standalone-server) for its default search paths. Unless
+compatible modules are in the project root, start Codex with complete
+templates for the same Titan installation the server was built against:
 
 ```sh
 export TITAN_LS_LUA_PATH='/opt/titan/share/lua/5.5/?.lua;/opt/titan/share/lua/5.5/?/init.lua'
 export TITAN_LS_LUA_CPATH='/opt/titan/lib/lua/5.5/?.so'
 ```
 
-The server assigns these values to `package.path` and `package.cpath`
-verbatim. Ambient `LUA_PATH`, `LUA_CPATH` and the terminal-`;;` expansion are
-not used.
+The server uses these values verbatim, without `;;` expansion.
 
 ## Install the repository plugin
 
@@ -80,10 +76,25 @@ node plugins/titan-lsp/skills/titan-lsp-query/scripts/titan-lsp-query.mjs \
   `WorkspaceEdit` with `applied: false` and never changes files.
 - `--timeout-ms` bounds each wait for startup, a protocol frame or exit
   (default 300,000 ms, between 100 and 600,000 ms).
-- Failures print `{"ok": false, "error": {"code": ..., "message": ...}}`.
-  The codes are `invalid_arguments`, `timeout`, `protocol_error`,
-  `interrupted` and `query_failed`. SIGINT and SIGTERM stop the server and
-  report `interrupted`.
+- A failure prints `{"ok": false, "error": {"code": ..., "message": ...}}` and
+  exits nonzero, with exit code 1 unless noted. These are all the codes that
+  `titan-lsp-query.mjs` raises:
+  - `invalid_arguments` (exit 2): malformed command-line arguments.
+  - `invalid_input` (exit 2): an inaccessible or invalid root, file, position
+    or new name.
+  - `server_start`: the server could not be spawned.
+  - `server_exit`: writing to the server failed, or it exited with a nonzero
+    code or a signal.
+  - `timeout`: a startup, frame or exit wait exceeded `--timeout-ms`.
+  - `protocol_error`: a malformed or oversized frame, invalid JSON, an
+    unexpected message or response id, or an invalid `titan/indexingStatus`
+    sequence.
+  - `indexing_failed`: the server reported failed indexing.
+  - `lsp_error`: the server answered with an LSP error. The JSON object adds
+    `lspCode` when the server supplied an integer code.
+  - `interrupted` (exit 130 for SIGINT, 143 for SIGTERM): the client stopped
+    the server after a signal.
+  - `query_failed`: any other unexpected failure.
 
 Answers come from saved files on disk, so save files before you query them.
 Server logs go to stderr. The client consumes the server's framed stdout and

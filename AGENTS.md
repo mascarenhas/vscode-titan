@@ -31,7 +31,7 @@ Each fact has one home. Elsewhere, link to it in one line.
 | Make object graph, build profiles, test execution, staging, CI, Windows driver | `docs/native-build.md` |
 | Configuration inputs, compiler compatibility, loader and Service composition | `docs/server-data-flow.md` |
 | SQLite schema, cache compatibility, header provenance, startup revalidation | `docs/sqlite-backend-storage.md` |
-| Completion, hover after completion, TEMP storage and bounds | `docs/completion.md` and `.agents/plans/unsaved-completion.md` |
+| Completion, hover after completion, TEMP storage and bounds | `docs/completion.md` |
 | Declaration documentation | `docs/documentation.md` |
 | Multi-part unions and server data-model rules | `docs/union-payload-parts.md` |
 | Native line coverage | `docs/coverage.md` |
@@ -89,9 +89,8 @@ Consume an installed Titan SDK, selected by `TITAN_PREFIX` or by
 `titanc --print-prefix`, and use its compiler, Lua, modules, headers and
 providers together. Do not bootstrap a compiler or require a Titan checkout in
 consumer builds, and never modify the SDK. Keep the package lockfile checked in
-and use `npm ci`. `docs/native-build.md` owns the build profiles, staging rules
-and CI. Future main-only release jobs must rebuild production after the tests
-pass.
+and use `npm ci`. `docs/native-build.md` owns the build profiles, staging rules,
+CI and the release-job requirements.
 
 Before changing Make rules or the compiler release, read
 `docs/native-build.md` and run `make incremental-build-test`. Keep

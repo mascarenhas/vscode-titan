@@ -101,7 +101,7 @@ exceeding a contributor's buffer budget, retires its context. Reopening the
 active path queues analysis for the new session, which cannot borrow old
 occurrences. A save keeps the accepted hover while the watcher prepares saved
 facts. The committed saved publication then queues reanalysis against the new
-baseline. Saving never promotes TEMP facts.
+baseline.
 
 Hover returns no result for dirty text before completion activates analysis,
 and at an occurrence without a safe mapping. Clean text and closed documents

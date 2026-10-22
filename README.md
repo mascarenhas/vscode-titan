@@ -98,7 +98,8 @@ validation profile; `make`, `make server`, `make package` and installation use
 the optimized production profile.
 
 Run `make help` for the focused targets. `make server-test` runs the native
-suite serially, `make server-test-sharded` runs it in two parallel shards, and
+suite serially, while `make server-test-sharded` runs it in two parallel
+shards; `make test` and `make verify` use the sharded runner.
 `make extension-test` runs the JavaScript unit tests. A successful compile is
 not a successful test run.
 
@@ -230,7 +231,9 @@ closure publish no reusable interfaces, but independently valid modules still
 form the semantic view. Repairing or deleting a file, changing the source roots or
 stopping the client clears stale entries. A known compiler or configuration
 failure stays authoritative for its saved state, so unchanged read-only
-requests do not retry it; a later saved change does. Rename always waits for
+requests do not retry it. A later saved change retries it, and meanwhile
+read-only requests use the preceding generation; a rename joins or starts an
+explicit refresh instead (`Application:fresh_view`). Rename always waits for
 the newest stable generation and rechecks the disk after its preflight.
 
 ## Logging and tracing
@@ -246,8 +249,9 @@ restarts the server, then set the channel to Trace.
 
 Indexing always logs a paired `indexing.chain.start` and
 `indexing.chain.complete` record with the trigger, pass count, generation, wall
-time and CPU time. Starts and successful completions are Info, and failed
-completions are Error. Debug adds scan and analysis phase records, plus one
+time and CPU time. The generation counts project-graph changes, not refresh
+passes. Starts and successful completions are Info, and failed completions
+are Error. Debug adds scan and analysis phase records, plus one
 `compiler.module.complete` record per fully published source module.
 
 Protocol tracing is separate and does not restart the server. Set
@@ -320,8 +324,8 @@ make install-server INSTALL_PREFIX="$HOME/.local"
 This installs the executable, plus this project's license and the Titan and
 native notices under `share/doc/titan-language-server`. It does not install
 the compiler modules. Without `TITAN_LS_LUA_PATH` and `TITAN_LS_LUA_CPATH`, a
-standalone server searches only `./?.lua` and `./?.so`. For setup, see
-[Codex setup](docs/codex.md).
+standalone server searches only `./?.lua` and `./?.so` (`./?.dll` on Windows).
+For setup, see [Codex setup](docs/codex.md).
 
 The server reserves stdout for `Content-Length`-framed JSON-RPC and writes all
 logs to stderr. Without the extension, its log level comes from

@@ -19,7 +19,7 @@ input.
 
 | Input | Owner and interpretation |
 | --- | --- |
-| Compiler Lua and native Lua module paths | The extension sets `TITAN_LS_LUA_PATH` and `TITAN_LS_LUA_CPATH` from its packaged trees or explicit settings (`readCompilerDiscoveryConfiguration` in `src/extension/clientConfig.ts`). `lua_paths.configure` installs them, or `./?.lua` and `./?.so` (`./?.dll` on Windows), before compiler modules load. It ignores `LUA_PATH` and `LUA_CPATH`. These paths are separate from Titan source and provider paths. |
+| Compiler Lua and native Lua module paths | The extension sets `TITAN_LS_LUA_PATH` and `TITAN_LS_LUA_CPATH` from its packaged trees or explicit settings (`readCompilerDiscoveryConfiguration` in `src/extension/clientConfig.ts`). `lua_paths.configure` assigns them, or the [standalone defaults](../README.md#standalone-server), to `package.path` and `package.cpath` before compiler modules load. These paths are separate from Titan source and provider paths. |
 | Saved project discovery and watching | `project_config` loads `include` and `exclude` and resolves them against the workspace root. `project_discovery` scans `include`; `exclude` narrows only the watcher set. |
 | Titan source module roots | `source_module_roots` is an ordered array in `ProjectConfig` and `CompilerConfiguration`. Only `Compiler:configure` joins it with `;` into the driver's `TITAN_SOURCE_PATH`. It also determines logical module names. |
 | Titan binary providers | `binary_modules_root` defaults to the compiler's installed root (`Compiler:installed_binary_modules_root`). It is independent of the Lua native-module path. |
@@ -40,8 +40,8 @@ the cache.
 `COMPILER_LANGUAGE_SERVER_API` (`1`). A matching ABI alone is rejected. The
 bridge then checks every driver entry point it calls (`checked_function`).
 Examples are `restat_c_header_dependencies`, `split_shell_words`, and the
-project-entry codecs. The API version stays `1` until Titan's first public
-release, so the compiler and server change together without incrementing it.
+project-entry codecs. `AGENTS.md` states the rule for keeping the API version
+at `1`.
 
 The embedded metadata-only interface provider is generated at build time by
 `scripts/generate-embedded-interfaces.lua` from the SDK's
@@ -110,8 +110,9 @@ when they become Service failures.
 `protocol.run` reads stdin and writes stdout, which carries only
 `Content-Length`-framed JSON-RPC. `logging` writes structured records to stderr.
 `framing` limits the header block to 64 KiB and a message body to 16 MiB. It
-rejects duplicate headers and any `Content-Type` other than
-`application/vscode-jsonrpc` with a `utf-8` (or legacy `utf8`) charset. `wire`
+rejects duplicate `Content-Length` or `Content-Type` headers. An optional
+`Content-Type` must be `application/vscode-jsonrpc`, and may add only a
+`charset` parameter of `utf-8` (or the legacy `utf8`). `wire`
 decodes and encodes JSON with `titan.json`, using native Maps and Arrays, an
 explicit null sentinel (`wire.null`) and a nesting limit of 128. `dispatcher`
 turns request IDs into the nominal `RequestId` union and routes semantic

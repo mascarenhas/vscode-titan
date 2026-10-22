@@ -51,8 +51,9 @@ Part declarations, named constructor labels and named pattern selectors share
 one identity within their variant. A same-named part in another variant is
 independent. A pattern alias has its own local binding identity.
 
-Rename preserves shorthand semantics (`Features:rename` in
-`src/server/semantic_features.titan`):
+Rename preserves shorthand semantics. Each shorthand occurrence carries a
+`semantic_index.SharedCaseName`, and `edited_file` in
+`src/server/semantic_features.titan` expands it into `alias = part`:
 
 - Renaming the local `left` in `when pair{left}` to `first` produces
   `when pair{first = left}`.

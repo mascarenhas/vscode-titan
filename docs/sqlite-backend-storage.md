@@ -15,23 +15,28 @@ Project discovery and the watchers always skip `.titan-ls`. The same directory
 is the default compiler probe-cache prefix; see
 [server data flow](server-data-flow.md#where-compiler-inputs-come-from).
 
-`workspace_cache.open` accepts an existing file only when all of these hold:
+Startup opens the file with `workspace_cache.open_for_inventory`, and
+`open_compatible` decides whether to keep it:
 
-- `PRAGMA user_version` equals `SCHEMA_VERSION` (currently 7);
-- the stored `compatibility` entry in `cache_meta` matches;
-- `PRAGMA quick_check` returns `ok`.
+- `PRAGMA user_version` must be `0` (an empty file, initialized in place) or
+  `SCHEMA_VERSION` (currently 7).
+- A versioned file must have a `compatibility` entry in `cache_meta`, and all
+  `cache_meta` keys and values must be BLOBs.
+- A file with a `compatibility` entry must pass `PRAGMA quick_check`.
 
-The compatibility key digests the physical root with
-`Compiler:cache_identity` and `ProjectConfig:semantic_identity`. The first
-fingerprints the compiler Lua trees, their native Lua dependencies and the
-server executable. The second covers the project configuration, except watcher
-policy. `project_loader` then requires the stored `native_context` to match
-`Compiler:native_cache_identity`; on a mismatch it calls `Cache:rebuild`.
-A mismatched file, or one that SQLite reports as corrupt (`SQLITE_CORRUPT` or
+`project_loader` then calls `Cache:validate_inventory` with a compatibility
+key. The key digests the physical root with `Compiler:cache_identity` and
+`ProjectConfig:semantic_identity`. The first fingerprints the compiler Lua
+trees, their native Lua dependencies and the server executable. The second
+covers the project configuration, except watcher policy. A missing key is
+recorded, and a different stored key triggers `Cache:rebuild`.
+`Cache:accept_native_context` likewise compares the stored `native_context`
+with `Compiler:native_cache_identity` and rebuilds on a mismatch. A rejected
+file, or one that SQLite reports as corrupt (`SQLITE_CORRUPT` or
 `SQLITE_NOTADB`), is deleted and recreated. Any other open failure logs
 `cache.memory_fallback` and uses the same schema in an in-memory database.
-Tables are created with `CREATE TABLE IF NOT EXISTS` on every open, so a missing
-table is recreated empty.
+Tables are created with `CREATE TABLE IF NOT EXISTS` on every open, so a
+missing table is recreated empty.
 
 Changing the compiler, the server image or the configuration therefore costs
 one cold index. The cache version number does not change for these cases.

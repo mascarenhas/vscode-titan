@@ -171,11 +171,13 @@ afterward. Run packaging jobs one at a time in a checkout. `make clean` removes
 - `include`;
 - `src/lua-5.5.1`.
 
-It then checks the copies byte for byte against the SDK. The allowlist keeps
-the compiler and its LuaRocks-installed dependencies (`scripts/compiler-rocks.mjs`)
-and leaves out LuaRocks's own modules and unrelated packages. No `lib/titan`
-tree or provider archive is staged. `scripts/stage-notices.mjs` collects
-licenses from the installation. `scripts/inspect-vsix.sh` and
+It then checks the copies byte for byte against the SDK. The allowlist
+(`EXPECTED_SHARE_ROOT` and `nativeRootInventory` in
+`scripts/stage-lua-modules.mjs`) keeps the compiler and its LuaRocks-installed
+dependencies and leaves out LuaRocks's own modules and unrelated packages. No
+`lib/titan` tree or provider archive is staged. `scripts/stage-notices.mjs`
+collects licenses from the installation, using the rock versions and license
+files in `compilerRocks` (`scripts/compiler-rocks.mjs`). `scripts/inspect-vsix.sh` and
 `scripts/inspect-server.sh` check the package and the executable's native
 linkage. `inspect-server` enforces `TITAN_MAX_GLIBC_VERSION` when it is set.
 

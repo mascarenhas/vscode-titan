@@ -19,8 +19,8 @@ workspace-cache, Codex, VSIX/SDK, native-linkage, plugin and staged-install chec
 Evidence is retained in `.build/parser-overhaul/verify-r2.log`; current source
 was compared byte-for-byte with the validated source stage before resuming.
 
-The final [performance report](../../docs/parser-overhaul-performance.md) and
-[compact data](../../docs/parser-overhaul-performance.json) separate ordinary
+The final [performance report](https://github.com/mascarenhas/vscode-titan/blob/02d0fdff0678e8437da49a211c820d8f94b8796b/docs/parser-overhaul-performance.md) and
+[compact data](https://github.com/mascarenhas/vscode-titan/blob/02d0fdff0678e8437da49a211c820d8f94b8796b/docs/parser-overhaul-performance.json) separate ordinary
 unchanged restarts from restored-database replay trials. Four post-reboot CPU-0
 pairs and twelve clean replay trials passed strict reuse/diagnostic checks.
 Current final cold/unchanged-restart times are 42.255/0.903 seconds for vscode-titan
