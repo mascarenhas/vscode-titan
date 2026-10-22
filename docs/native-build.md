@@ -217,7 +217,7 @@ the matching `BUILD_ROOT`, `SERVER` and compiler flags.
    hit. On a miss, build Lua 5.5.1 from the
    [`v5.5.1-1` archive](https://github.com/mascarenhas/lua-5.5.1/archive/refs/tags/v5.5.1-1.tar.gz)
    and [LuaRocks](https://luarocks.org/#quick-start) 3.13.0. Then download the
-   [Titan 0.6 source rock](https://github.com/mascarenhas/titan/releases/download/v0.6/titan-0.6.0-1.src.rock)
+   [Titan 0.6 source rock](https://github.com/mascarenhas/titan/releases/download/v0.6.0/titan-0.6.0-1.src.rock)
    and install it with `TITAN_BUILD_PROFILE=validation`. If the
    `TITAN_RELEASE_TOKEN` secret is set, the download uses
    `gh release download` with it; otherwise it uses the public release URL.
