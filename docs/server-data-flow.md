@@ -1,91 +1,121 @@
 # Server configuration and data flow
 
-The extension launches one native server per workspace folder. The native process fixes
-its physical workspace root at startup; an LSP `initialize` message does not
-retarget that process. The extension translates remote and symlinked workspace
-URIs at the protocol boundary.
+The extension launches one native server per workspace folder. The process
+takes its workspace root from its working directory at startup (`main` in
+`src/titan_language_server.titan` calls `fs.pwd()`); an LSP `initialize`
+message does not retarget it. The extension translates remote and symlinked
+workspace URIs at the protocol boundary (`src/extension/workspaceUris.ts`).
 
 Completion has a separate [unsaved input and TEMP publication path](completion.md).
-Its captured dependency baseline is the committed saved publication; existing
-saved features continue to read `main` semantic facts.
+Its dependency baseline is the committed saved publication. The saved-file
+features read the `main` semantic facts described in
+[workspace storage](sqlite-backend-storage.md).
 
 ## Where compiler inputs come from
 
+The [README](../README.md#project-configuration) describes what each
+`titan-config.lua` field means to users. This table gives the owner of each
+input.
+
 | Input | Owner and interpretation |
 | --- | --- |
-| Compiler Lua and native Lua module paths | The extension supplies `TITAN_LS_LUA_PATH` and `TITAN_LS_LUA_CPATH` from its packaged trees or explicit settings. `server.lua_paths` installs them before loading compiler modules. These are separate from Titan source/provider paths. |
-| Saved project discovery and watching | `titan-config.lua` supplies `include` and `exclude`; `ProjectConfig` resolves their paths relative to the workspace. `include` selects saved project files; `exclude` only narrows watcher coverage and does not remove discovered modules. |
-| Titan source module roots | `source_module_roots` is an ordered array in `ProjectConfig` and the bridge configuration. Only the compiler boundary serializes it to the driver's semicolon-separated source path. It also determines logical module names. |
-| Titan binary providers | `binary_modules_root` is resolved by `ProjectConfig`, defaulting to the compatible compiler installation supplied by the loader. It is independent of the Lua native-module path. |
-| C include directories | `extra_ffi_include_dirs` is an ordered, normalized project array. Resolver contexts receive it from the accepted bridge configuration in addition to the compiler's explicit SDK roots. There is no parent-directory SDK search. |
-| Compilation flags | The compiler captures inherited `TITAN_EXTRA_CPPFLAGS`, `TITAN_EXTRA_CFLAGS`, and `TITAN_EXTRA_LDFLAGS`. Project `extra_ffi_cppflags` adds shell-parsed preprocessing words after inherited preprocessing flags. The project file does not override C or linker flags. |
-| C probe cache | Native startup defaults an absent or empty `TITAN_PREFIX` to `workspace_cache.directory(root)`, currently `.titan-ls`. The extension leaves this policy to the server. A nonempty inherited override changes only the probe prefix, not compiler/provider/SDK discovery or the database location. |
+| Compiler Lua and native Lua module paths | The extension sets `TITAN_LS_LUA_PATH` and `TITAN_LS_LUA_CPATH` from its packaged trees or explicit settings (`readCompilerDiscoveryConfiguration` in `src/extension/clientConfig.ts`). `lua_paths.configure` installs them, or `./?.lua` and `./?.so` (`./?.dll` on Windows), before compiler modules load. It ignores `LUA_PATH` and `LUA_CPATH`. These paths are separate from Titan source and provider paths. |
+| Saved project discovery and watching | `project_config` loads `include` and `exclude` and resolves them against the workspace root. `project_discovery` scans `include`; `exclude` narrows only the watcher set. |
+| Titan source module roots | `source_module_roots` is an ordered array in `ProjectConfig` and `CompilerConfiguration`. Only `Compiler:configure` joins it with `;` into the driver's `TITAN_SOURCE_PATH`. It also determines logical module names. |
+| Titan binary providers | `binary_modules_root` defaults to the compiler's installed root (`Compiler:installed_binary_modules_root`). It is independent of the Lua native-module path. |
+| C include directories | `extra_ffi_include_dirs` is an ordered, normalized array. Resolver contexts receive it from the accepted compiler configuration, in addition to the compiler's explicit SDK roots. There is no parent-directory SDK search. |
+| Compilation flags | The compiler driver captures the inherited `TITAN_EXTRA_CPPFLAGS`, `TITAN_EXTRA_CFLAGS` and `TITAN_EXTRA_LDFLAGS`. `Compiler:configure` splits `extra_ffi_cppflags` with the driver's `split_shell_words` and appends the words after the inherited preprocessing flags. The project file cannot change C or linker flags. |
+| C probe cache | If `TITAN_PREFIX` is absent or empty, `main` sets it to `workspace_cache.directory(root)` before the compiler loads. The extension passes its environment through unchanged. A nonempty inherited value changes only the probe prefix, not compiler, provider or SDK discovery, and not the database location. |
 
-The resulting default paths are `.titan-ls/index.sqlite3` and
-`.titan-ls/var/cache/titan-probes/2`. Probe keys remain hashes of raw C source.
-Removing the directory clears both stores; deleting only the database retains
-probe results. A deliberately overridden probe prefix must be cleared separately.
+With the default prefix, the compiler stores probe results under
+`.titan-ls/var/cache/titan-probes/2`, beside `.titan-ls/index.sqlite3`. Probe
+keys are hashes of the raw C source. The README's
+[workspace cache](../README.md#workspace-cache) section explains how to clear
+the cache.
+
+## Compiler compatibility
+
+`compiler_bridge.load` requires the driver's `TITAN_ABI_VERSION` to equal
+`COMPILER_ABI` (`"2"`) and its `LANGUAGE_SERVER_API_VERSION` to equal
+`COMPILER_LANGUAGE_SERVER_API` (`1`). A matching ABI alone is rejected. The
+bridge then checks every driver entry point it calls (`checked_function`).
+Examples are `restat_c_header_dependencies`, `split_shell_words`, and the
+project-entry codecs. The API version stays `1` until Titan's first public
+release, so the compiler and server change together without incrementing it.
+
+The embedded metadata-only interface provider is generated at build time by
+`scripts/generate-embedded-interfaces.lua` from the SDK's
+`lib/titan/0.6/titan.a`. It covers the 23 canonical standard modules listed in
+`EXPECTED_MODULES` and includes the build target's C type profile. The
+compiler can therefore typecheck standard-library imports, including
+reflection, without a C compiler or SDK. The generated C registers only the
+compiler's bare `titan` support table in `package.preload`. It does not
+register or initialize the native `titan.*` modules. On Windows,
+`src/server/embedded_interfaces_windows.c` reads interfaces from the loaded
+standard-provider DLL; see
+[native builds](native-build.md#windows-embedded-interfaces).
 
 ## One production composition path
 
-`project_loader` loads the compiler and one normalized project configuration,
-validates workspace cache compatibility, and constructs the Service from that
-accepted configuration. It constructs the real compiler callbacks, persisted
-cache and restoration callbacks. Application owns the background restoration
-Task lifecycle and the transaction that publishes the completed semantic view.
-Service owns discovery, graph state and graph commits, invalidation and the
-publication hooks used by that composition. Test fixtures inject callbacks through the same
-Service constructor; tests requiring a real compiler use the production loader.
+`project_loader.load` loads the compiler and one normalized project
+configuration. It validates workspace-cache compatibility and wires the real
+compiler callbacks, the persisted cache and the `Restoration` callbacks.
+`project_service.create` builds the Service from that accepted
+configuration. `Application` owns the background restoration Task and the
+transaction that publishes the completed semantic view. Service owns
+discovery, graph state and commits, invalidation and the publication hooks.
+Test fixtures inject callbacks through the same constructor. Tests that need a
+real compiler use the production loader.
 
-Initial Service construction copies the accepted configuration before discovery
-can yield, then consumes that discovery once. Later scans reload configuration.
-The rescan after watcher registration remains deliberate: it covers changes
-between the initial scan and registration. `ProjectConfig:copy()` owns defensive
-copying for published snapshots; consumers cannot mutate Service settings by
-editing a returned snapshot.
+Service construction copies the accepted configuration with `ProjectConfig:copy`
+before discovery can yield, then consumes that discovery once. Later scans
+reload the configuration. The rescan after watcher registration is
+deliberate: it covers changes between the initial scan and registration.
+Snapshots that the Service publishes are defensive copies, so consumers cannot
+change Service settings by editing one.
 
-The loader and independent rename preflight explicitly map normalized project
-settings into the bridge's named `CompilerConfiguration` fields. The Compiler
-owns the accepted copy and its effective driver values. Unchanged configuration
-is compared before flag parsing or path conversion; changed configuration is
-prepared once. Compiler operations install and restore driver globals under the
-existing scheduler permit. Analysis, external resolution and native cache
-identity derive resolver options from that same accepted state.
+The loader and the independent rename preflight map normalized settings into
+the named `CompilerConfiguration` fields. The Compiler owns the accepted copy
+and its effective driver values. `Compiler:configure` compares unchanged
+configuration before it parses flags or converts paths, and prepares changed
+configuration once. Compiler operations apply and restore the driver globals
+(`DriverConfiguration:apply`) under the `compiler_scheduler` permit. Analysis,
+external resolution and native cache identity all derive resolver options
+from that same accepted state.
 
-`ProjectModule:compiler_input()` converts saved module/source snapshots for the
-loader's cache restoration/export and Application's snapshot preparation. Each
-caller still selects its own module set. Service's incremental preparation uses
-its mutable ProjectState through `bridge_project`, a separate work-state
-boundary. These conversions do not retain compiler bodies or add another
+`ProjectModule:compiler_input` converts saved module and source snapshots for
+the loader's cache restoration and export, and for Application's snapshot
+preparation. Each caller selects its own module set. Service's incremental
+preparation uses its mutable state through `bridge_project`, a separate
+work-state boundary. These conversions keep no compiler bodies and add no
 cached representation.
 
-## Boundaries retained by the refactor
+## Compiler boundary
 
-Compiler Lua tables are normalized in `compiler_bridge`; ordinary server layers
-use typed records. Ordinary optional AST/type metadata uses `nil`; a legacy
-`false` in a node, name, list, or type position is malformed metadata. Actual
-boolean flags retain both values. Array constness is a closed tagged value
-(`no`, `yes`, or `maybe`), rendered through the compiler for both fresh and
-restored declarations. The compiler's computed `Maybe3` annotations remain
-inside the compiler and are not traversed as lexical AST children. Packaged Lua
-modules include their shared `titan-compiler.maybe3` helper. Existing compiler
-and server content identities invalidate incompatible saved metadata without
-changing prerelease API or cache version numbers.
+`compiler_bridge` normalizes compiler Lua tables into typed records. The other
+server layers never traverse untyped `value` maps. The AST walker visits only
+the lexical child fields in `AST_CHILD_FIELDS`, in order, and excludes DAG
+backreferences such as `Ast.ExpSpreadIndex.spread`. Changes to the compiler or
+server content identity invalidate incompatible saved metadata, without
+changing API or cache version numbers; see
+[workspace storage](sqlite-backend-storage.md#location-and-opening).
 
-The AST walker retains lexical child order and excludes DAG
-backreferences. Its shared child-field inventory avoids allocating the same
-array for every visited node. Declaration-summary sorting shares one local
-algorithm while preserving stable ordering and cooperative checkpoints.
+Compilation and semantic extraction stay outside the short SQL publication
+transactions. Cancellation still drains owned work and restoration before
+stores close. Structured SQLite, compiler and async errors keep useful detail
+when they become Service failures.
 
-Compilation and semantic extraction stay outside short SQL publication
-transactions. Accepted publication releases transient checked bodies; unchanged
-modules retain their SQL facts. Cancellation still drains owned work and
-restoration before stores close. Structured SQLite, compiler and async errors
-retain useful detail when converted to Service failures.
+## Protocol boundary
 
-The persisted compiler kinds are `c-header-v6` and `ffi-conversion-v7` for the
-pinned parser-overhaul compiler. A regression reads the installed compiler's
-protocol identifiers and verifies publication/readback through SQLite, so a
-future pin cannot silently discard a new artifact kind. API version `1` remains
-unchanged during prerelease development; matching it alone is not a substitute
-for the exact compiler pin.
+`protocol.run` reads stdin and writes stdout, which carries only
+`Content-Length`-framed JSON-RPC. `logging` writes structured records to stderr.
+`framing` limits the header block to 64 KiB and a message body to 16 MiB. It
+rejects duplicate headers and any `Content-Type` other than
+`application/vscode-jsonrpc` with a `utf-8` (or legacy `utf8`) charset. `wire`
+decodes and encodes JSON with `titan.json`, using native Maps and Arrays, an
+explicit null sentinel (`wire.null`) and a nesting limit of 128. `dispatcher`
+turns request IDs into the nominal `RequestId` union and routes semantic
+requests, completion and document notifications. `lifecycle` owns the
+`initialize`/`shutdown`/`exit` states and the advertised capabilities. The
+custom `titan/indexingStatus` notification (`indexing_status`) drives the
+extension's language-status item.

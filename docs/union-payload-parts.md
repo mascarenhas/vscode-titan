@@ -1,9 +1,8 @@
 # Multiple named union payload parts
 
-The extension supports the union syntax introduced by
-[Titan PR #169](https://github.com/mascarenhas/titan/pull/169). Build with the exact
-compiler revision pinned in the CI workflow and refresh the complete local SDK
-when changing that revision. Language-server API 1 remains the prerelease API.
+Titan union variants can carry several named parts. Titan's
+[unions manual](https://github.com/mascarenhas/titan/blob/master/doc/language/unions.md)
+defines the language rules. This page covers editor and server behavior.
 
 ```titan
 union Result
@@ -28,56 +27,76 @@ function describe(result: Result): string
 end
 ```
 
-Each part has its own name and type. The earlier `item(string)` spelling means
-`item(value: string)`, and `empty()` still carries no data. Positional
-construction follows ordinary call adjustment. A direct named constructor uses
-the declared part names, regardless of their written order.
-
-Patterns can select a positional prefix (`when pair(first)`) or any named
-subset (`when pair{label = right}`). In a named alias, the local name is on the
-left and the declared part is on the right. The shorthand `when pair{left}`
-binds a local named `left` from the part also named `left`. Omitted parts do not
-create local bindings. A reserved-word part needs an alias in a named pattern.
+`item(string)` means `item(value: string)`. In a named pattern the local name
+is on the left of `=` and the declared part on the right. The shorthand
+`when pair{left}` binds a local `left` from the part `left`.
 
 ## Editor behavior
 
-Highlighting recognizes declarations, constructors and both pattern forms.
-Variant names, declared part names and named constructor labels have distinct
-scopes, including contextual names such as `end`. Nested payload types retain
-their type coloring; constructor values retain expression coloring. TextMate
-tokenization is line based: an `end` variant separated from its opening `(` by
-a comment or newline can still be read as the union terminator.
-Saved-file analysis retains references to every part's type and every case
-binding. Variant hover signatures show all declared part names and types.
+The TextMate grammar (`syntaxes/titan.tmLanguage.json`) scopes variant names as
+`entity.name.tag.titan` and declared part names as `variable.parameter.titan`.
+Contextual names such as `end` are included, and nested payload types keep type
+coloring. Tokenization is line based, so an `end` variant separated from its
+opening `(` by a comment or a newline can be read as the union terminator.
+
+Saved-file analysis records references to every part's type and every case
+binding. Variant hover signatures show every declared part name and type.
+Generic constructor hover keeps the applied payload types: for
+`Packet<|integer|>.moved`, a part declared as `x: T` shows as `x: integer`. The
+compiler's analysis-only mode keeps the checked source expression from before
+runtime generic erasure; module-signature metadata remains a separate
+interface.
+
 Part declarations, named constructor labels and named pattern selectors share
-one identity within their variant; a same-named part in another variant is
+one identity within their variant. A same-named part in another variant is
 independent. A pattern alias has its own local binding identity.
 
-Generic constructor hover preserves applied payload types: for
-`Packet<|integer|>.moved`, a payload declared as `x: T` displays as `x: integer`.
-The compiler's analysis-only mode retains the checked source expression before
-runtime generic erasure; module-signature metadata remains a separate interface.
+Rename preserves shorthand semantics (`Features:rename` in
+`src/server/semantic_features.titan`):
 
-Rename preserves shorthand semantics. Renaming the local `left` in
-`when pair{left}` to `first` produces `when pair{first = left}`. Renaming the
-declared part to `first` instead produces `when pair{left = first}`, leaving
-the local binding and its uses unchanged.
+- Renaming the local `left` in `when pair{left}` to `first` produces
+  `when pair{first = left}`.
+- Renaming the declared part to `first` produces `when pair{left = first}`. The
+  local binding and its uses are unchanged.
 
-Diagnostics, navigation, references and rename continue to use saved
-files. Completion uses captured unsaved buffers, including constructor
-members and case-arm locals, and prepares the bounded ephemeral hover context
-described in [completion behavior](completion.md). Its provisional-result policy is unchanged; the
-compiler remains the authority for validity.
+Diagnostics, navigation, references and rename use saved files. Completion
+uses captured unsaved buffers, including constructor members and case-arm
+locals, and prepares the hover context described in
+[completion](completion.md). The compiler remains the authority for validity.
 
 ## Server implementation
 
-The compiler boundary reads union `parts`, case-arm `bindings` and constructor
-`values` from the pinned AST and type metadata. It converts compiler-owned
-tables to typed server facts before publication. Persisted semantic facts
-distinguish part selection from a local shorthand binding, and incompatible
-workspace caches are rebuilt.
+`compiler_bridge` walks union `parts`, case-arm `bindings` and constructor
+`values` from the compiler's AST and type metadata (`AST_CHILD_FIELDS`). It
+converts them to typed server facts before publication. A shorthand binding is
+both a part selection and a local declaration at the same span.
+`semantic_index.SharedCaseName` records that dual role, and
+`semantic_occurrences.case_part_id` persists the selected part. Workspaces with
+an incompatible cache are rebuilt; see
+[workspace storage](sqlite-backend-storage.md#location-and-opening).
 
-The [server payload audit](union-payload-audit.md) records which wrapper records
-were replaced and which records retain an independent role. Named parts suit
-data owned solely by a variant. Records remain useful for reusable domain
-values, methods and shared mutable ownership.
+## Server data models
+
+The server's own unions follow one rule. Use named parts for data that only a
+variant owns. Keep a record when the data has an independent typed API, is a
+reusable domain value, has methods, or shares a mutable lifetime. Examples of
+kept records:
+
+- `application.View`, the published feature snapshot;
+- `dispatcher.DispatchResult`, `SemanticRequest` and `CompletionRequest`, used
+  outside routing;
+- `lsp_types.OpenDocument`, `ChangeDocument` and `TextDocument`, which are
+  precise parser results;
+- `protocol.InputDelivery`, a mutable owner whose methods manage
+  acknowledgement;
+- `compiler_bridge.AdjustmentInfo`, the common shape of all six adjustment
+  variants.
+
+A named variant is not a type, so flattening a record into parts helps only
+when consumers need the union and its selected parts, never the record on its
+own.
+
+The reflection boundary is `wire`. `wire.as_array` matches
+`reflect.inspect(subject)` against `is_array{array = value}` and returns the
+original array. JSON-RPC encodes explicit map and array envelopes and never
+encodes server model unions.

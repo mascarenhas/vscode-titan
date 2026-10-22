@@ -1,230 +1,262 @@
-# Incremental native builds
+# Native builds
 
-The server and native test executable use [Titan PR #164](https://github.com/mascarenhas/titan/pull/164)'s
-opt-in object mode plus [the cached-binding fix](https://github.com/mascarenhas/titan/pull/165).
-The compiler release is selected in [the CI workflow](../.github/workflows/ci.yml).
-Make owns the dependency graph and rebuild decisions; Titan restores source
-metadata from current objects while compiling dependents and linking.
+This page owns the build system: SDK selection, the Make object graph, build
+profiles, test execution, packaging inputs, CI and the experimental Windows
+driver. For the user-facing commands, see the
+[README](../README.md#build-and-test). `make help` lists the main targets.
 
-The build consumes an installed Titan SDK. `TITAN_PREFIX` selects its prefix;
-otherwise `titanc` on `PATH` reports it with `--print-prefix`, using the
-compiler's existing `package.cpath` provider discovery. The selected SDK supplies
-the compiler, Lua interpreter, compiler dependencies, headers and providers.
-No Titan checkout or project-owned compiler installation is required. For example:
+## SDK selection
+
+The build consumes an installed Titan SDK. `TITAN_PREFIX` selects its prefix.
+Otherwise `scripts/titan-sdk.mjs` runs `titanc --print-prefix` from `PATH`; the
+compiler finds its installed provider through `package.cpath` on both Unix and
+Windows. The selected SDK supplies the compiler, the Lua interpreter, the
+compiler's LuaRocks dependencies, headers, the standard-library providers and
+`share/titan/LICENSE`. No Titan checkout or project-owned compiler installation
+is needed:
 
 ```sh
 make -j2 server TITAN_PREFIX="$HOME/.local/titan"
 ```
 
-The SDK is immutable during consumer builds. Compiler C probes use
-`BUILD_ROOT/compiler-cache`, rather than writing to the SDK. The compiler's
-`TITAN_ROCKS_ROOT` selects its installed assets; the child-only `TITAN_PREFIX`
-selects this writable probe-cache directory.
+The SDK is immutable during consumer builds. In the compiler's environment
+(`NATIVE_COMPILER_ENV` in the `Makefile`), `TITAN_ROCKS_ROOT` selects the
+installed SDK assets. A child-only `TITAN_PREFIX` points C probes at the
+writable `BUILD_ROOT/compiler-cache`. Prepare and update SDKs with Titan's own
+installation workflow. On Linux that workflow needs Readline development
+headers, or `LUA_PLATFORM=linux` to omit Readline. Use separate prefixes and
+Titan build checkouts for production and validation SDKs.
 
-```sh
-make -j2 server server-test-build
-make server-test-sharded
-```
+Titan's system OpenSSL mode needs the host's OpenSSL 3 development files and
+`pkg-config`. Set `OPENSSL_PKG_CONFIG` to use another pkg-config command. An
+SDK with an `include/openssl` directory is a bundled-OpenSSL SDK: its provider
+already carries the OpenSSL archive, and system SDKs omit that directory. For
+a system SDK, Make repeats the ordered OpenSSL libraries after the native
+objects and the standard archive at both final links. The effective OpenSSL
+include and link flags, and the OpenSSL headers, take part in invalidation,
+including inputs outside the SDK tree.
 
-Use `server-objects` or `server-test-objects` to build the corresponding object
-graph without linking its executable. `server` links and installs the native
-language server; `server-test-build` links the single test executable used by
-both execution shards. `server-test-run` runs an already built test executable.
-
-For opt-in production Titan line coverage, use the separate
-`server-coverage` workflow in [coverage.md](coverage.md), or its separate
-`server-coverage-build` and `server-coverage-run` phases. The covered native test
-executable resets and reports its own counters. Compiler-owned `.coverage`
-outputs stay separate from ordinary objects, so later production builds need no
-coverage cleanup. Project module discovery includes unused production roots.
-
-On macOS, put GNU Make 4.4.1 first on `PATH` before building, including for
-recursive `make` invocations. With Homebrew's Make installed:
+On macOS, put GNU Make 4.4.1 first on `PATH`, including for recursive `make`
+invocations. Apple Make 3.81 can keep a stale generated include graph during
+incremental checks. The Makefile does not check the Make version. With
+Homebrew:
 
 ```sh
 export PATH="$(brew --prefix make)/libexec/gnubin:$PATH"
-make --version
 ```
 
-Apple Make 3.81 can retain a stale generated include graph during incremental
-checks. The local macOS validation used Intel x86_64; it does not establish
-Apple Silicon runtime coverage.
+macOS validation so far has used Intel x86_64; it does not establish Apple
+Silicon runtime coverage.
 
 ## Object and link ownership
 
-Authored source remains under `src/`. Persistent `.build/server-src` and
-`.build/test-src` trees hold staged source plus generated C, objects and headers.
-Only changed staged inputs are replaced. The build does not clear these trees
-on every invocation and does not generate files beside authored sources.
+Authored sources stay under `src/`. The persistent stage trees
+`BUILD_ROOT/server-src` and `BUILD_ROOT/test-src` (default `.build/`) hold the
+staged sources plus generated C, objects and headers. Only changed staged
+inputs are replaced. The build never clears these trees on its own and never
+writes beside authored sources.
 
-`scripts/generate-native-build.lua` reads the compiler's parsed top-level
-imports and module constituents to produce `.build/native-modules.mk`. Fixture
-strings containing Titan source are not imports of their enclosing test module.
-Direct module dependencies determine which object recipes can run in parallel.
-Make also tracks project C headers, generated producer companions, compiler and
-SDK/provider inputs, configuration, and source inventory changes.
+`scripts/generate-native-build.lua` parses each module with
+`titan-compiler.parser` and reads its top-level imports and folder-module
+constituents. It writes `BUILD_ROOT/native-modules.mk`. Titan source inside
+fixture strings is therefore not an import of the enclosing test module.
+Direct module dependencies decide which object recipes can run in parallel.
+Make also tracks project C headers, generated producer companions, compiler
+and SDK inputs, the configuration stamp `BUILD_ROOT/native.config` and the
+source inventory.
 
-Each object recipe invokes `titanc -c --incremental -j1`. Make controls object
-parallelism, so `make -j2` uses two compilation slots rather than starting two
-multithreaded compiler pipelines. The final commands use `--incremental` to reuse
-the objects and perform the normal standalone/test link. Native payloads,
-exported Lua API flags, the standard-library archive and bootstrap options
-remain final-link inputs.
+Each object recipe runs `titanc --static --source-first --incremental -j1 -c`;
+test objects add `--test`. Make owns the parallelism, so `make -j2` means two
+compilation slots, not two multithreaded compiler pipelines. The final links
+reuse the objects with `--incremental`:
 
-Titan's system OpenSSL provider needs the selected host's OpenSSL 3 development
-files and `pkg-config`. Make repeats its ordered OpenSSL libraries after the
-native objects and standard archive at both final links. The installed SDK's
-`include/openssl` directory identifies a bundled provider; that provider already
-carries the OpenSSL archive payload. System SDKs omit the directory. Set
-`OPENSSL_PKG_CONFIG` to select another pkg-config command when required.
-Effective system include/link flags and OpenSSL headers participate in native
-build invalidation, including inputs outside the SDK tree.
+- `server` links `titan_language_server` with `--static --source-first` and
+  installs it at `SERVER` (default `bin/titan-language-server`).
+- `server-test-build` links `server.tests` with
+  `--static --test --source-first --no-uv-bootstrap`. The compiler discovers
+  test cases from the current objects.
 
-Production compilation and linking use `--static --source-first`; test objects
-and their final link add `--test` consistently. Both graphs use the ordinary
-installed standard-library provider, including compiled `titan.test`. The SDK
-does not need to supply Titan test sources, and the consumer builds no special
-test-support module. The final `--test --no-uv-bootstrap` command discovers cases
-from the current objects and produces the runner. Production and test graphs
-remain separate so their source stages, flags and generated outputs can change
-independently.
+`server-objects` and `server-test-objects` stop before linking. Native payloads
+belong only at the final links: the exported Lua API flag (`-Wl,-E` on Linux,
+`-Wl,-export_dynamic` on macOS), `compiler_io_clock.o`, the generated
+embedded-interface object and the standard-library archive. Both graphs use
+the ordinary installed provider, including compiled `titan.test`. The SDK needs
+no Titan test sources, and the build compiles no special test-support module.
+The production and test graphs stay separate, so their source stages, flags
+and generated outputs can change independently.
 
-Lua derives default module paths from its executable's installation tree. Native
-test executables live under `.build/tests`, outside the SDK's `bin` directory.
-Both execution targets follow Titan's own test harness: query the selected
-`$(TITAN_LUA)` with `-E` for `package.path` and `package.cpath`, then pass those
-values as `LUA_PATH_5_5` and `LUA_CPATH_5_5` to the aggregate or its shards. The
-launcher clears ambient `TITAN_PATH_0_6` and `TITAN_PATH` so an unrelated provider
-cannot override the selected SDK. No SDK pathname is embedded in the executable
-or fabricated from its build directory. Use the Make targets to run the tests;
-direct execution outside the SDK tree needs the same queried Lua paths.
+## Build profiles
 
-## Rebuild behavior
+`BUILD_PROFILE` covers the whole Make invocation. `TITAN_BUILD_PROFILE` from
+the environment supplies a default, and Make exports the result to children:
 
-An unchanged build preserves generated-object, header and executable timestamps.
-Changing a module rebuilds that module and its importing closure; unrelated
-branches remain reusable. A changed authored C header conservatively invalidates
-all project objects; module edits still invalidate only the importing closure.
-Added or removed constituents and changed imports update the build graph.
-Changed test cases rebuild their owner and regenerate the final runner.
+- `production`, the default for `all`, `server`, `package` and
+  `install-server`: `-O3` with the compiler's platform LTO defaults, adding
+  `-flto=auto -ffat-lto-objects` on Linux.
+- `validation`, selected automatically by the goals in `VALIDATION_GOALS`
+  (`test`, `verify`, the `server-test*`, `server-coverage*` and protocol targets,
+  `extension-host-test`, `incremental-build-test` and `install-server-test`):
+  `-O0 -fno-lto` for the server, test modules, native helpers and final links.
 
-Compiler, SDK/provider and effective build-setting changes invalidate the
-relevant configuration. In particular, use consistent `CC`, preprocessing,
-C and linker flags for each graph. Titan's object timestamp check alone does
-not validate flags, dependency objects or header contents; the Make rules own
-those inputs. Missing generated companions are repaired through their producer
-rules rather than accepted as a complete build.
-
-Ordinary `server`, `package` and installation builds use
-`BUILD_PROFILE=production`, with `-O3` and the compiler's platform LTO defaults
-(fat LTO on Linux). Validation entry points (`test`, `verify`, native test,
-protocol, extension-host and installation-smoke targets) automatically select
-`BUILD_PROFILE=validation`: `-O0` without LTO for the server, test modules, native
-helpers and final links. The selected SDK's already compiled providers, Lua and
-compiler dependencies are unchanged. The whole Make invocation uses one profile,
-including the ordinary server exercised by transcripts and disposable packages.
-To build the server alone for quick iteration:
+Because the profile covers the whole invocation, `make verify` also packages a
+validation-built server. To iterate on the server alone:
 
 ```sh
 make -j2 server BUILD_PROFILE=validation
 ```
 
-To validate standard-library providers with the same profile, prepare a separate
-validation SDK with Titan's own installation workflow and select it with
-`TITAN_PREFIX`. A production SDK is also supported for consumer validation; the
-project's profile does not require the SDK to have been built with that profile.
-Extra compiler and linker flags remain explicit overrides and follow the profile
-defaults.
-The configuration stamp includes the profile, compiler/SDK and flag inputs, so
-switching either way rebuilds both graphs. The incremental gate also runs its
-small fixture under production defaults and verifies the return to validation.
+The profile never changes the SDK's prebuilt providers, Lua or compiler
+dependencies. To validate standard-library providers with the same flags,
+prepare a separate validation SDK and select it with `TITAN_PREFIX`. A
+production SDK also works for consumer validation. Explicit `TITAN_EXTRA_*`
+flags follow the profile defaults. The configuration stamp records the
+profile, compiler and SDK paths and the flag inputs, so switching profiles
+rebuilds both graphs.
 
-Routine CI installs tagged Lua 5.5.1 and LuaRocks 3.13.0, then prepares a
-validation SDK with `luarocks install titan-0.6.0-1.src.rock` from the Titan v0.6
-release before invoking the consumer build. It caches only that installation,
-including its installed licenses, by release versions, build policy and prefix identity.
-It runs the complete validation profile and builds a disposable VSIX
-only to inspect packaging. It uploads no VSIX or language-server binaries,
-including on manual runs. A future release job must run only on `main` after
-tests pass, use a separate production SDK/cache and rebuild the complete server
-with full optimization; validation binaries cannot become release artifacts.
+## Test execution
+
+Lua derives its default module paths from its executable's location, and the
+test executable lives under `BUILD_ROOT/tests`, outside the SDK's `bin`. The
+execution targets (`NATIVE_TEST_ENV`) therefore follow Titan's own test harness:
+
+1. Ask the selected `$(TITAN_LUA)` with `-E` for `package.path` and
+   `package.cpath`.
+2. Pass the answers as `LUA_PATH_5_5` and `LUA_CPATH_5_5`.
+3. Unset `TITAN_PATH_0_6` and `TITAN_PATH`, so an unrelated provider cannot
+   override the selected SDK.
+
+The executable embeds no SDK path. Run the tests through the Make targets;
+running them directly needs the same queried paths.
+
+`server-test` runs the aggregate serially. `server-test-sharded` runs the
+same executable in two parallel shards through `scripts/run-server-tests.mjs`.
+`serverTestShards` there assigns each test module to exactly one shard.
+`validateShards` fails when a module imported by `src/server/tests.titan` is
+unassigned or assigned twice. Per-shard logs and `summary.json` go to
+`.build/test-shards`. `server-test-run` runs the current aggregate without
+rebuilding it.
+
+## Rebuild behavior
+
+An unchanged build keeps the timestamps of generated objects, headers and
+executables. Changing a module rebuilds it and its importing closure;
+unrelated branches stay reusable. A changed authored C header conservatively
+invalidates all project objects. Added or removed constituents and changed
+imports update the graph. Changed test cases rebuild their owner and regenerate
+the runner.
+
+The compiler's `--incremental` check compares only source and object
+timestamps. The Make rules own flags, dependency objects, header contents and
+compiler and SDK inputs, so use consistent `CC`, preprocessing, C and linker
+flags within each graph. Missing generated companions are repaired through
+their producer rules, not accepted as a complete build.
+
+## Concurrent builds and packaging
 
 One Make invocation owns a build directory. Independent concurrent builds in
-one checkout need separate `BUILD_ROOT` values and separate `SERVER` destinations
-(the default is `bin/titan-language-server`). Object-only and test-only builds
-need only separate build roots. Do not run multiple Make processes against the
-same staged trees. Packaging temporarily stages the selected `SERVER` at
-`bin/titan-language-server` for the VSIX, then restores the preceding file; run
-packaging jobs sequentially in one checkout. `make clean` removes generated
-state. Native test execution
-remains split into the existing two shards, independently of object scheduling.
+one checkout need separate `BUILD_ROOT` values and, when they link servers,
+separate `SERVER` destinations. Object-only and test-only builds need only
+separate build roots.
+
+`package` temporarily installs the selected `SERVER` at
+`bin/titan-language-server` for `vsce` and restores the previous file
+afterward. Run packaging jobs one at a time in a checkout. `make clean` removes
+`BUILD_ROOT`, `SERVER`, `dist` and `dist-test`.
+
+`npm run compile`, used by `extension` and `package`, runs
+`scripts/stage-lua-modules.mjs`. That script copies four SDK trees under
+`dist/titan/`:
+
+- `share/lua/5.5` and `lib/lua/5.5`, restricted to an exact root allowlist;
+- `include`;
+- `src/lua-5.5.1`.
+
+It then checks the copies byte for byte against the SDK. The allowlist keeps
+the compiler and its LuaRocks-installed dependencies (`scripts/compiler-rocks.mjs`)
+and leaves out LuaRocks's own modules and unrelated packages. No `lib/titan`
+tree or provider archive is staged. `scripts/stage-notices.mjs` collects
+licenses from the installation. `scripts/inspect-vsix.sh` and
+`scripts/inspect-server.sh` check the package and the executable's native
+linkage. `inspect-server` enforces `TITAN_MAX_GLIBC_VERSION` when it is set.
 
 ## Build regressions
 
-`make incremental-build-test` builds small real Titan/C fixtures through this
-Makefile in a private source/build tree. It checks unchanged timestamps and zero
-compiler invocations, importing-closure rebuilds, folder/import changes, header
-and flag invalidation, changed test discovery, and missing generated companions.
-It also runs the native tests with absent and unrelated ambient Titan paths to
-check that execution uses the selected SDK.
-The fixture uses the validation profile for most checks, then exercises a small
-production build and switches back. `make verify` builds and tests the full
-server in validation; optimized defaults retain focused smoke coverage.
+`make incremental-build-test` (`scripts/test-incremental-build.mjs`) builds
+small real Titan and C fixtures through this Makefile in a private source and
+build tree. It checks:
 
-`make completion-protocol-test` exercises full document synchronization and
-completion through the actual stdio server, including unsaved folder members,
-saved dependency isolation, UTF-16 edits, and saved navigation. It reports cold
-preparation and warm SQL selection timings separately, using an 800-field dirty
-module and a competing saved refresh. This focused gate is also a prerequisite
-of `server-protocol-test`, so CI and `make verify` include it. Pass matching
-`BUILD_ROOT`, `SERVER`, and compiler flags when testing a separate development
-build.
+- that unchanged builds keep timestamps and invoke the compiler zero times;
+- importing-closure rebuilds and folder and import changes;
+- header, OpenSSL, compile-flag and link-flag invalidation;
+- changed test discovery and repair of missing generated companions;
+- native test execution with absent and with unrelated ambient Titan paths;
+- a production build, then the return to validation.
 
-## Experimental Windows CompilerIO
+Run it when you change Make rules or the compiler release.
 
-The Windows CompilerIO path launches the compiler executable directly with
-child-only `os.with_env("LANG", "C")` and `os.with_env("LC_ALL", "C")` options.
-Unix retains its existing `/usr/bin/env` path. A Windows launch failure has
-`started=false` without a fabricated child exit code; a successfully launched
-program exiting with 126 or 127 remains `started=true`.
+`make completion-protocol-test` drives completion through the real stdio
+server. It covers unsaved folder members, isolation of saved dependencies,
+UTF-16 edits, saved navigation, and a competing saved refresh against an
+800-field dirty module. It is a prerequisite of `server-protocol-test`, which
+then runs `scripts/test-server-protocol.mjs` and
+`scripts/test-workspace-cache.mjs`. To test a separate development build, pass
+the matching `BUILD_ROOT`, `SERVER` and compiler flags.
 
-The source-private target constant also selects Windows path separators.
-The existing native wall-clock boundary uses QueryPerformanceCounter on Windows;
-public `os.clock` measures CPU time and `timer` has no monotonic clock query.
-Linux and macOS retain their previous native clock implementations.
+## Continuous integration
 
-The portable `test/fixtures/compiler-io-process.c` executable supplies Windows
-locale, binary-output, nonzero-exit, delayed/large-output, and cancellation
-fixtures. Windows keeps the cancellation marker pathname in UTF-16 through
-`wmain` and `_wfopen`; the CLANG64 fixture link uses `-municode`. Test execution
-supplies its exact path through `TITAN_COMPILER_IO_PROCESS_FIXTURE`. Linux retains its existing shell-process
-assertions. These source adaptations do not by themselves validate the complete
-Windows language server, extension package, or interactive F5 workflow.
+`.github/workflows/ci.yml` runs the single job `verify-linux-x64` on
+`ubicloud-standard-2` (Ubuntu 24.04), with `BUILD_PROFILE=validation`,
+`OPENSSL_MODE=system` and `TITAN_MAX_GLIBC_VERSION=2.39`. It runs on pushes to
+`main`, on pull requests and on manual dispatch.
 
-## Experimental Windows DLL build
+1. **SDK.** Restore `.titan-validation` from the cache. The cache key covers the
+   Lua, LuaRocks and Titan release versions, the build policy and a hash of the
+   absolute prefix. There are no fallback keys, so another release is never a
+   hit. On a miss, build Lua 5.5.1 from the
+   [`v5.5.1-1` archive](https://github.com/mascarenhas/lua-5.5.1/archive/refs/tags/v5.5.1-1.tar.gz)
+   and [LuaRocks](https://luarocks.org/#quick-start) 3.13.0. Then download the
+   [Titan 0.6 source rock](https://github.com/mascarenhas/titan/releases/download/v0.6/titan-0.6.0-1.src.rock)
+   and install it with `TITAN_BUILD_PROFILE=validation`. If the
+   `TITAN_RELEASE_TOKEN` secret is set, the download uses
+   `gh release download` with it; otherwise it uses the public release URL.
+   Before caching, check the installation's files, its recorded build profile
+   and `titanc --print-prefix`.
+2. **Build and test.** Run `make -j2 server server-test-build`, then
+   `server-test-sharded`, `incremental-build-test`, `server-protocol-test`,
+   `codex-native-test`, `extension-test`, `shard-runner-test` and
+   `xvfb-run -a make extension-host-test`.
+3. **Package.** Build a disposable VSIX with `make package`, then run
+   `inspect-vsix`, `inspect-server`, `plugin-validate` and
+   `install-server-test`.
+4. **Coverage.** Build and run the [covered aggregate](coverage.md) with
+   `CC=gcc-14`, gcov 14 and gcovr 8.4 in HTML, LCOV and Cobertura formats. Upload
+   the reports and logs as the `titan-language-server-line-coverage` artifact
+   for 7 days.
 
-Windows x64 uses native Node.js 24, the MSYS2 CLANG64/UCRT tools, and a separately
-prepared Windows Titan SDK with the complete ABI-2 standard provider. It does
-not use the Unix Make recipes. Supply an immutable SDK copy; the build writes
-only its own source stages, outputs, and the extension's packaged payload.
-Install JavaScript dependencies using native Windows npm in this checkout; do
-not reuse a Linux `node_modules` tree.
+CI needs no Titan checkout or deploy key. It publishes no VSIX or server
+binaries, including on manual runs. A future release job must run only on
+`main` after the tests pass. It must use a separate production SDK and cache
+and rebuild the complete server with full optimization; validation binaries
+must never become release artifacts. Release artifacts must be built on the
+oldest supported Linux baseline, because packages inherit the build host's
+glibc requirement.
 
-Prepare that SDK with Titan's consolidated `Makefile.win` and ordinary
-LuaRocks source-rock installation, following the upstream
+## Experimental Windows build
+
+Windows x64 builds use native Node.js 24, the MSYS2 CLANG64/UCRT tools and a
+separately prepared Windows Titan SDK with the complete ABI-2 standard
+provider. They do not use the Unix Make recipes. Prepare the SDK with Titan's
+`Makefile.win` and an ordinary LuaRocks source-rock installation, following
+the upstream
 [Windows build guide](https://github.com/mascarenhas/titan/blob/master/doc/implementation/windows-build.md).
-Its standard provider includes `titan.path`; compiler dependencies include
-the stock `luv` rock for native Windows process handling. Use separate SDK
-prefixes and producer build directories when different provider profiles are
-needed.
+Its standard provider includes `titan.path`, and its compiler dependencies
+include the stock `luv` rock for native process handling. Install the
+JavaScript dependencies with native Windows npm in this checkout; do not reuse
+a Linux `node_modules` tree.
 
-Windows uses the same prefix selection: `--sdk` or `TITAN_PREFIX` overrides
-discovery from `titanc` on `PATH`. The selected compiler's `--print-prefix`
-discovers its provider through `package.cpath`; it does not embed an installation
-prefix in the compiler or runtime. An SDK whose prefix contains spaces or Unicode
-characters is supported.
-
-For example, from a normal PowerShell prompt with native Node on the process PATH:
+`scripts/build-windows.mjs` accepts the targets `plan`, `server`,
+`server-test-build`, `server-test-run`, `stage` and `package`. From PowerShell,
+with native Node on `PATH`:
 
 ```powershell
 $sdk = 'C:\TitanSDK'
@@ -238,112 +270,126 @@ node scripts/build-windows.mjs server-test-run @native
 node scripts/build-windows.mjs package @native
 ```
 
-The example locations must refer to the actual prepared SDK and tool prefix.
-The driver starts native executables directly without a command shell. Compiler
-commands invoke the selected SDK's `bin/lua.exe -E` with its installed
-`lib/luarocks/rocks-5.5/titan/0.6.0-1/bin/titanc` script and native argument vector.
-LuaRocks' installation-specific batch wrapper is not needed. The controlled Lua
-runtime finds its compiler modules relative to the executable after relocation.
-The driver inherits the parent environment, clears conflicting Lua/Titan search
-overrides, and sets compiler paths only for its children. It neither installs
-tools nor changes global PATH, accounts, privileges, or execution policy.
+`--sdk` or `TITAN_PREFIX` overrides discovery through `titanc` on `PATH`. SDK
+prefixes with spaces or Unicode characters are supported. The resource
+compiler is the `llvm-rc.exe` beside `--clang`. `--build-root` (default
+`.build\windows`) and `--source-root` accept absolute paths.
+`server-test-run --filter PATTERN` runs an existing aggregate with Titan's
+test filter.
 
-`server-test-build` and `server-test-run` default to the `validation` build
-profile; `server`, `stage`, and `package` default to `production`. Validation
-uses `-O0 -fno-lto` for generated Titan code and native helpers, with no LTO at
-link time. Production retains the compiler's normal optimized defaults and
-builds the native helpers at `-O3`. Select a profile explicitly with
-`--build-profile validation|production` or `VSCODE_TITAN_BUILD_PROFILE`; the
-shared `TITAN_BUILD_PROFILE` environment setting is also honored. Explicit
-inherited `TITAN_EXTRA_CPPFLAGS`, `TITAN_EXTRA_CFLAGS`, and
-`TITAN_EXTRA_LDFLAGS` follow profile defaults, preserving sanitizer and other
-overrides. Native helper flags use the compiler's argument parser.
+The driver starts native executables directly, without a shell. Each compiler
+command runs the SDK's `bin/lua.exe -E` on the installed
+`lib/luarocks/rocks-5.5/titan/0.6.0-1/bin/titanc` script (`windowsCompilerCommand`
+in `scripts/build-windows.mjs`), so LuaRocks' batch wrapper is not needed. The
+driver inherits the parent environment, removes conflicting Lua and Titan
+search overrides and sets compiler paths only for its children. It installs
+nothing and never changes the global `PATH`, accounts, privileges or execution
+policy. The build writes only its own stages and outputs and the extension's
+packaged payload.
 
-The Windows test aggregate also reserves an 8 MiB executable stack, matching
-Titan's stdlib test harness. Its unbootstrapped validation tests round-trip
-protocol JSON through 128 nested containers with unoptimized native frames.
-Explicit `TITAN_EXTRA_LDFLAGS` follow this test-only reserve and can override it.
-The server retains Titan's ordinary executable and Task stack policy; the stdio
-transcript separately checks input at the same depth boundary on its Task.
+`server-test-build` and `server-test-run` default to the `validation`
+profile: `-O0 -fno-lto` for generated Titan code and native helpers, with no
+LTO at link time. `server`, `stage` and `package` default to `production`,
+which keeps the compiler's optimized defaults and builds the helpers at `-O3`.
+The selection order is `--build-profile`, then `VSCODE_TITAN_BUILD_PROFILE`,
+then `TITAN_BUILD_PROFILE`. Explicit `TITAN_EXTRA_CPPFLAGS`, `TITAN_EXTRA_CFLAGS`
+and `TITAN_EXTRA_LDFLAGS` follow the profile defaults, and the driver splits
+them with the compiler's own argument parser. The test aggregate reserves an
+8 MiB stack (`-Wl,--stack,8388608` in `windowsApplicationLinkFlags`), which
+matches Titan's stdlib harness: the unoptimized validation tests round-trip
+protocol JSON through 128 nested containers. Explicit `TITAN_EXTRA_LDFLAGS`
+come after that reserve and can override it.
 
-The profile participates in object and compiler-probe identities. Test execution
-uses the existing aggregate; build it with the selected profile first. The SDK
-stays immutable: choose a separately prepared validation SDK when its standard
-provider should also use validation flags, and a production SDK for packaging.
-
-`--build-root` and `--source-root` accept absolute alternate paths;
-`server-test-run --filter PATTERN` runs an existing aggregate with Titan's normal
-test filter. A build-directory lock prevents two drivers from mutating the same
-state. The compiler graph comes from the same parsed-import generator as Unix;
-Windows executes the selected graph serially and hashes source constituents,
-headers, compiler/SDK inputs, dependency fingerprints and effective settings.
-Compiler probes live under the build directory in a configuration-keyed cache;
-SDK/header/tool/flag changes select a fresh cache. Native test execution disables
-persistent probe records because independent fixtures may reuse header names.
-Missing generated companions force rebuilding. Production and test objects use
-separate stages and separate native-helper directories. The default Unix graph
-and recipes retain their existing static production behavior.
+The profile is part of the object and compiler-probe identities. A
+`build.lock` file keeps two drivers from mutating the same build root. The
+compiler graph comes from the same `generate-native-build.lua` plan as on Unix.
+Windows builds the graph serially (`TITAN_JOBS=1`) and hashes source
+constituents, headers, compiler and SDK inputs, dependency fingerprints and
+effective settings. Compiler probes live under the build root in a
+configuration-keyed cache. Test execution sets `TITAN_PROBE_CACHE_DISABLE=1`,
+because independent fixtures may reuse header names. Production and test
+objects use separate stages and native-helper directories.
 
 The application is `bin/titan-language-server.exe` plus
 `lib/titan/0.6/titan_language_server.dll` and `lib/titan/0.6/titan.dll`.
-The controlled Lua DLL and five native runtime DLLs live in `bin`; `lfs.dll`,
-`lpeglabel.dll`, and `luv.dll` live in the compiler's `dist/titan/lib/lua/5.5` tree. Windows
-never packages a static Titan provider archive. The build still stages the
-compiler's Lua sources, SDK analysis headers, and matching Lua internal sources.
-The tiny launcher can be renamed within `bin` without changing logical module
-identity.
+`lua55.dll` and five native runtime DLLs (`libuv-1.dll`, `libllhttp-9.4.dll`,
+`libsqlite3-0.dll`, `libssl-3-x64.dll`, `libcrypto-3-x64.dll`) live in `bin`.
+`lfs.dll`, `lpeglabel.dll` and `luv.dll` live in `dist/titan/lib/lua/5.5`.
+Windows never packages a static Titan provider archive. The launcher can be
+renamed within `bin` without changing logical module identity. Staging also
+copies the compiler's Lua sources, the SDK headers and the matching Lua
+sources. Staging and package inspection accept the libbacktrace header pair
+`backtrace.h` and `backtrace-supported.h` only as a complete pair of regular
+files, or both absent (`windowsBacktraceHeaders` in
+`scripts/sdk-include-inventory.mjs`). They reject partial pairs, links and
+unknown root entries.
 
-Fresh Windows runtime installations also include the paired libbacktrace SDK
-headers, `backtrace.h` and `backtrace-supported.h`. Staging and package inspection
-accept the complete regular-file pair or an older SDK that omits both, and
-reject partial pairs, links, and unknown root entries. The packaged header tree
-must still match the selected SDK byte for byte.
+### Windows CompilerIO
 
-The Windows embedded-interface boundary reads callable metadata from the
-**canonical, actually loaded standard provider**. All 23 plain-C ABI values are
-checked before invoking any Lua metadata callback. The generated source contains
-the C type profile, not a second serialized copy of the provider interfaces.
-Provider path and identity use the retained native handle's canonical spelling,
-complete volume/file identifiers and exact 100 ns timestamps. The handle denies
-write/delete sharing and makes that transient identity snapshot immutable. The
-boundary also verifies that this handle still names the mapped provider image.
-Later Task-path revalidation compares
-the full opaque identity and normalized provider pathname without synchronous
-filesystem calls. Ordinary filesystem observations retain their existing async
-path; the opaque field is not stored in SQLite and changes no cache schema.
-Failed construction closes the handle immediately. Restart the server before
-updating or replacing its loaded standard provider on Windows.
+`src/server/compiler_io.titan` launches the compiler directly on Windows,
+with child-only `os.with_env("LANG", "C")` and `os.with_env("LC_ALL", "C")`
+options. A Windows launch failure reports `started=false` without an invented
+exit code. A program that does launch and exits with 126 or 127 still reports
+`started=true`. Unix launches through `/usr/bin/env LANG=C LC_ALL=C` instead and
+treats exit codes 126 and 127 as "not started". `VSCODE_TITAN_WINDOWS` in
+`compiler_io_platform.h` also selects Windows path separators. The wall clock
+in `compiler_io_clock.c` uses `QueryPerformanceCounter` on Windows.
 
-Compiler dependency notices come from the ordinary installed LuaRocks rockspecs,
-`rock_manifest` ownership/checksums, and license files in the selected SDK.
-Staging verifies the selected versions and deployed module/license bytes.
-Windows `luv` 1.52.1-0 carries its Apache 2.0 license; its statically bundled
-libuv notices are also included in Titan's `LICENSES/libuv-LICENSE`,
-`libuv-LICENSE-extra`, `libuv-tree-LICENSE`, and `libuv-inet-LICENSE`. The unsigned
-package target preserves these notices, then verifies the `win32-x64` VSIX
-target, exact DLL/EXE inventory including `luv.dll`, compiler/SDK bytes and PE
-imports. Its explicit Windows system imports include libuv's
+`test/fixtures/compiler-io-process.c` supplies the locale, binary-output,
+nonzero-exit, delayed and large output, and cancellation fixtures. On Windows
+it keeps the cancellation marker path in UTF-16 through `wmain` and `_wfopen`,
+and the CLANG64 link uses `-municode`. Test execution passes the fixture's path
+in `TITAN_COMPILER_IO_PROCESS_FIXTURE`.
+
+### Windows embedded interfaces
+
+On Windows the generator emits only the C type profile
+(`--windows-profile`). `src/server/embedded_interfaces_windows.c` reads the
+callable metadata from the standard-provider DLL that is actually loaded. It
+checks every interface's ABI value before it invokes any Lua metadata callback.
+It opens the provider with `FILE_SHARE_READ` only, which denies write and delete
+sharing, and it confirms that the handle names the mapped provider image. The
+provider's identity is built from the handle's canonical path, its volume and
+file identifiers and its 100 ns timestamps. If construction fails, the handle
+is closed immediately. Restart the server before you update or replace its
+loaded standard provider.
+
+### Windows packaging
+
+Compiler dependency notices come from the installed LuaRocks rockspecs,
+`rock_manifest` ownership and checksums, and license files in the selected SDK
+(`compilerRocks` in `scripts/compiler-rocks.mjs`). Staging verifies the
+selected versions and the deployed module and license bytes. Windows `luv`
+1.52.1-0 carries its Apache 2.0 license. The notices for its statically bundled
+libuv are Titan's `LICENSES/libuv-LICENSE`, `libuv-LICENSE-extra`,
+`libuv-tree-LICENSE` and `libuv-inet-LICENSE`.
+
+`scripts/inspect-windows-package.mjs` verifies the `win32-x64` VSIX target,
+the exact DLL and EXE inventory, the compiler and SDK bytes and the PE
+imports. The system-import allowlist (`systemDlls`) includes libuv's
 `api-ms-win-core-synch-l1-2-0.dll` synchronization contract, documented by
 [Microsoft's WaitOnAddress reference](https://learn.microsoft.com/en-us/windows/win32/api/synchapi/nf-synchapi-waitonaddress).
-The core API-set allowance uses that exact name; unreviewed contracts and
-compiler runtime DLLs fail inspection. Signing and publishing are separate
-operations.
+Unreviewed API sets and compiler runtime DLLs fail inspection. Signing and
+publishing are separate operations.
 
-Shared-folder notifications are best effort. Live file access is required, but
-watcher correctness on a guest-local NTFS workspace is the supported validation
-boundary; a shared folder may require an explicit refresh. Native process tests,
-SQLite/cache reopen tests, stdio protocol tests, package inspection, and an actual
-interactive Extension Host/F5 session are separate gates. A successful plan,
-DLL helper test, or SSH-launched Code command does not establish those gates.
+### Windows validation gates
 
-For F5, the interactive account needs read/execute access to the validated SDK
-and the compiler tool prefix, plus its own writable workspace, build output,
-Node dependencies, VS Code user state, and analysis cache. Use ordinary protected
-shared tool installation or independent per-user copies. Do not broaden another
-account's profile permissions. Set `TITAN_PREFIX`, `CC`, `AR`, `RANLIB`, `RC`, and the
-native Node/tool PATH in the process launching Code; the existing F5 task then
-stages the selected SDK's compiler payload. Its Windows debug-launch override
-clears `TITAN_PREFIX` only in the Extension Host so the server selects its
-normal project-owned `.titan-ls` cache; the prelaunch staging task retains the
-selected SDK input. Keep the workspace on writable guest-local NTFS. Build the native
-server first.
+Native process tests, SQLite cache reopen tests, stdio protocol tests, package
+inspection and an interactive Extension Host (F5) session are separate gates. A
+successful plan, a DLL helper test or an SSH-launched `code` command does not
+establish them. Symlink checks skip when the account lacks symlink privilege.
+
+For F5, the interactive account needs read and execute access to the SDK and
+the tool prefix. It also needs its own writable workspace, build output, Node
+dependencies, VS Code user state and analysis cache. Use a protected shared
+tool installation or per-user copies; do not broaden another account's profile
+permissions. Set `TITAN_PREFIX`, `CC`, `AR`, `RANLIB`, `RC` and the native Node
+and tool `PATH` in the process that launches Code. The `npm: compile`
+pre-launch task then stages the selected SDK's compiler payload. The Windows
+launch configuration in `.vscode/launch.json` clears `TITAN_PREFIX` only in the
+Extension Host, so the server uses its normal `.titan-ls` probe cache. Keep the
+workspace on writable guest-local NTFS, and build the native server first.
+
+Notifications on shared folders are best effort. Live file access is required,
+but watcher correctness is validated only on guest-local NTFS, and a shared
+folder may need an explicit refresh.
