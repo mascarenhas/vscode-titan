@@ -21,6 +21,33 @@ Use the repository-local `.agents/skills/vscode-titan-development/SKILL.md` for
 work that changes the server, extension, protocol, build, tests, packaging, or
 project workflow.
 
+## Documentation map
+
+Each fact has one home. Elsewhere, link to it in one line.
+
+| Topic | Home |
+| --- | --- |
+| Users: features, build commands, settings, `titan-config.lua`, workspace cache, logging, packaging, Windows limits | `README.md` |
+| Make object graph, build profiles, test execution, staging, CI, Windows driver | `docs/native-build.md` |
+| Configuration inputs, compiler compatibility, loader and Service composition | `docs/server-data-flow.md` |
+| SQLite schema, cache compatibility, header provenance, startup revalidation | `docs/sqlite-backend-storage.md` |
+| Completion, hover after completion, TEMP storage and bounds | `docs/completion.md` |
+| Declaration documentation | `docs/documentation.md` |
+| Multi-part unions and server data-model rules | `docs/union-payload-parts.md` |
+| Native line coverage | `docs/coverage.md` |
+| Benchmark scripts, measured conclusions, retired evidence records | `docs/benchmarks.md` |
+| Codex plugin and query client | `docs/codex.md` |
+
+Documentation rules:
+
+- Describe current behavior, and update the owning page in the same change as
+  the code.
+- Point to code by path and symbol, never by line number.
+- Do not add measurement, audit or research records under `docs/`. Fold their
+  durable conclusions into the owning page, and list the record in
+  `docs/benchmarks.md#retired-evidence-records` with a permalink.
+- Keep every relative Markdown link and anchor valid.
+
 ## Product invariants
 
 - The language server is written in Titan and runs out of process over stdio.
@@ -35,17 +62,16 @@ project workflow.
 - Stdout is exclusively for LSP framing. Diagnostics and debug logs go to
   stderr.
 - Definition, references, rename, folding and diagnostics use saved disk files.
-  Completion uses captured editor buffers. After completion activates private
-  analysis, hover refreshes on debounced edits and may retain safely mapped
-  untouched occurrences from the preceding accepted TEMP snapshot. Follow
-  `docs/completion.md` and `.agents/plans/unsaved-completion.md`.
+  Completion uses captured editor buffers, and hover follows them only after
+  completion activates private analysis; follow `docs/completion.md`.
 - FFI-definition navigation, external-source navigation, and watching external
   source trees remain out of scope.
 - Completion captures sessions, versions, contributors and the committed saved
-  generation before deferred work. Private preparation reads baseline descriptors
-  fenced by that generation without awaiting shared restoration; the compiler
-  permit still serializes Lua state. SQL selection reads only qualified scalar
-  facts. Only the watcher writes saved facts/caches; never promote TEMP data on save.
+  generation before deferred work. Private preparation reads baseline
+  descriptors fenced by that generation without awaiting shared restoration;
+  the compiler permit still serializes Lua state. SQL selection reads only
+  qualified scalar facts. Only the watcher writes saved facts and caches; never
+  promote TEMP data on save.
 - Convert compiler-owned Lua tables into typed Titan records/unions at a narrow
   boundary. Do not spread untyped `value` maps through the server.
 - Retain declared top-level member/type manifests and exact provenance for
@@ -56,34 +82,24 @@ project workflow.
 ## Toolchain and verification
 
 Titan is not publicly released. Keep its language-server API version at `1`
-until the first public release; update the compiler and its consumers together
-without incrementing that API version during prerelease development.
+until the first public release, and update the compiler and its consumers
+together without incrementing it.
 
-The build consumes an installed Titan SDK: `TITAN_PREFIX` overrides the prefix,
-otherwise the `titanc` on `PATH` reports it with `--print-root`. Use that SDK's
-compiler, Lua interpreter, modules, headers and providers together. Do not
-bootstrap a compiler or require `TITAN_REPO` in consumer builds. The SDK remains
-immutable; compiler probes use `BUILD_ROOT/compiler-cache`. Packaging retains the
-compiler's LuaRocks-installed dependencies and omits LuaRocks's own modules and
-unrelated packages. Licenses come from the installation.
-Test/verify entry points use `BUILD_PROFILE=validation` (`-O0`, no LTO) for the
-server, tests and native helpers; the SDK's prebuilt providers remain unchanged.
-Regular server/package/installation builds use production (`-O3`, platform LTO
-defaults), with minimal optimized smoke coverage in the incremental gate.
-CI explicitly installs the Titan release source rock and caches a validation SDK
-before the consumer build. Routine CI publishes no VSIX or server binaries;
-future main-only release jobs must rebuild production after tests pass.
-Keep the package lockfile
-checked in and use `npm ci` for reproducible JavaScript installs.
+Consume an installed Titan SDK, selected by `TITAN_PREFIX` or by
+`titanc --print-root`, and use its compiler, Lua, modules, headers and
+providers together. Do not bootstrap a compiler or require a Titan checkout in
+consumer builds, and never modify the SDK. Keep the package lockfile checked in
+and use `npm ci`. `docs/native-build.md` owns the build profiles, staging rules,
+CI and the release-job requirements.
 
-Native compilation uses persistent production and test object graphs. See
-`docs/native-build.md` for dependency ownership and `make -j2 server
-server-test-build` for the parallel build. Keep source/provider policy consistent
-within each graph. Use the ordinary installed provider, including compiled
-`titan.test`, without special test-support compilation or installed test sources.
-Run the incremental build regression gate when changing
-Make rules or the compiler release. Independent concurrent builds need separate
-`BUILD_ROOT` values and, when linking servers, separate `SERVER` destinations.
+Before changing Make rules or the compiler release, read
+`docs/native-build.md` and run `make incremental-build-test`. Keep
+source/provider policy consistent within each object graph. Use the ordinary
+installed provider, including compiled `titan.test`, without special
+test-support compilation or installed test sources. Independent concurrent
+builds need separate `BUILD_ROOT` values and, when linking servers, separate
+`SERVER` destinations. Add each new native test module to `serverTestShards`
+in `scripts/run-server-tests.mjs`.
 
 Tests live with their implementation:
 
@@ -92,8 +108,8 @@ Tests live with their implementation:
 - JavaScript unit tests exercise extension configuration and process launch.
 - Extension-host smoke tests exercise activation and client/server wiring.
 
-Run the focused tests while iterating and the complete documented gate before
-committing. A passing compile alone is not a passing test.
+Run the focused tests while iterating and `make verify` before committing. A
+passing compile alone is not a passing test.
 
 ## Work tracking and delivery
 
@@ -102,12 +118,10 @@ Create board-sized issues rather than treating each broad feature as one task;
 record dependencies and acceptance criteria in each issue. Keep item status,
 priority, and size current with `gh project` commands.
 
-The direct-commit allowance applied only during the repository's initial
-development and is now retired. Work in a focused branch, inspect the worktree,
-stage exact paths, verify the intended commit, and open a PR after the owned
-acceptance criteria pass. Leave the PR open for maintainer review. Do not merge
-it or commit or push directly to `main` unless the maintainer explicitly
-authorizes that exact action.
+Work in a focused branch, inspect the worktree, stage exact paths, verify the
+intended commit, and open a PR after the owned acceptance criteria pass. Leave
+the PR open for maintainer review. Do not merge it or commit or push directly
+to `main` unless the maintainer explicitly authorizes that exact action.
 
 If compiler changes become necessary, make them in a new branch in `../titan`
 (use a separate worktree when that checkout is in use);

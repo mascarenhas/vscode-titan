@@ -1,75 +1,78 @@
 # Titan for VS Code
 
-This repository contains the VS Code extension and standalone language server
-for the [Titan programming language](https://github.com/mascarenhas/titan).
-Version 1 provides syntax highlighting and saved-file language intelligence for
-Titan projects. The server is an ordinary LSP process over stdio. A bundled
-skills-only Codex plugin queries that same executable for read-only saved-file
-code intelligence.
+This repository contains the VS Code extension and the standalone language
+server for the [Titan programming language](https://github.com/mascarenhas/titan).
+The server is written in Titan and runs as an ordinary LSP process over stdio.
+A bundled, skills-only Codex plugin queries the same executable; see
+[Codex setup](docs/codex.md).
 
-On Linux and macOS, the native executable statically links the selected Titan
-standard-library runtime modules, the embedded Lua interpreter, libuv, llhttp,
-and SQLite. OpenSSL follows the selected Titan SDK: the default uses system
-OpenSSL 3 libraries, while bundled mode carries its archive payload.
-Initialized statically linked modules register their runtime
-openers in `package.preload`. Separately, the executable carries a metadata-only
-inventory of all SDK-selected canonical Titan standard-module interfaces;
-compiler language-server API 1 validates and decodes those serialized interfaces and
-their build target's C type profile for project typechecking. The inventory
-contains no standard-module implementation, provider archive, header, or SDK
-payload.
+On Linux and macOS, the native executable statically links the Titan
+standard-library runtime, an embedded Lua interpreter, libuv, llhttp and
+SQLite. OpenSSL follows the selected Titan SDK: by default it uses the
+system's OpenSSL 3 libraries, while a bundled-OpenSSL SDK links its own archive.
+The executable also embeds
+metadata-only interfaces for all SDK-selected canonical Titan standard
+modules, so ordinary project typechecking needs no SDK at run time.
 
-The Titan compiler itself is not embedded in that executable: its Lua state
-loads the ordinary `titan-compiler` modules through `package.path` and their
-native Lua dependencies through `package.cpath`. A target-specific VSIX carries
-compatible module trees under `dist/titan/share/lua/5.5` and
-`dist/titan/lib/lua/5.5`, plus the installed SDK headers under
-`dist/titan/include` and matching Lua sources under `dist/titan/src/lua-5.5.1`.
-The extension does not require a separate system Titan compiler installation.
+The Titan compiler is not linked into the executable. The embedded Lua state
+loads the ordinary `titan-compiler` modules through `package.path`, and their
+native dependencies through `package.cpath`. The executable exports its Lua C
+API so those dependencies bind to the same Lua state. A target-specific VSIX
+carries compatible compiler module trees, the SDK headers and the matching Lua
+sources, so installing it requires no separate Titan compiler.
 
-JSON-RPC messages and structured stderr logs use `titan.json` through the
-`server.wire` boundary, with native Maps and Arrays and explicit JSON nulls.
-Request IDs and parsed LSP parameters retain their nominal types.
+## Features
 
-The extension supports [multiple named union payload parts](docs/union-payload-parts.md),
-including named constructors and selective case bindings, with saved-file
-navigation and rename plus completion in unsaved buffers.
+- Syntax highlighting for `.titan` files.
+- Definition, references, rename, folding, hover and diagnostics for saved
+  files.
+- Completion from unsaved editor buffers, triggered by `.` and `:` or the
+  usual completion command, including after `foreign` in a type annotation.
+  Callable candidates show named signatures and insert parameter-name call
+  placeholders. After a completion request, hover follows edits to the active
+  module. See [completion](docs/completion.md).
+- Hover shows named declaration signatures for functions, methods, associated
+  functions and supported foreign callables. Function-valued variables keep
+  their bare function type. Record, union and interface hovers summarize the
+  members visible at that occurrence. Module hovers summarize visible
+  top-level members without expanding nominal types recursively.
+- LDoc-style declaration and module comments in hover and completion, with
+  links into the Titan manual. See [declaration documentation](docs/documentation.md).
+- Multiple named union payload parts, including named constructors, selective
+  case bindings and shorthand-preserving rename. See
+  [union payload parts](docs/union-payload-parts.md).
+
+C imports use `foreign import "header.h"` and contribute, in declaration order,
+to the module's builtin `ffi` namespace. Explicit `.titan` source imports also
+contribute their C environment through the compiler's generated `.ffi.h`
+headers. Written `ffi` roots and C value members support hover and references
+within their module, but they have no definition or rename target. Foreign
+types use their own unqualified namespace (`foreign int`, `foreign *Name`,
+`foreign type Name = ...`) and are not selected through the `ffi` value.
+
+Navigation to FFI definitions or to external source, and watching external
+source trees, are out of scope for version 1.
 
 ## Prerequisites
 
-- A compatible installed Titan SDK. Put its `titanc` on `PATH`, or set
-  `TITAN_PREFIX` to its installation prefix, such as `$HOME/.local/titan`.
-  Discovery uses `titanc --print-root`, which locates the installed provider
-  through `package.cpath` on Unix and Windows.
-- A C toolchain and the native prerequisites used by Titan.
-- Node.js 24 and npm.
-- VS Code 1.106 or newer for extension development and installation.
+To build this repository you need:
 
-Version 1 builds native packages on Linux and macOS. The experimental Windows
-x64 workflow uses a native CLANG64/UCRT Titan SDK, a DLL application and controlled
-shared Lua. See [Windows native builds](docs/native-build.md#experimental-windows-dll-build)
-for setup, validation gates, and documented limitations.
+- an installed Titan SDK. Put its `titanc` on `PATH`, or set `TITAN_PREFIX` to
+  its installation prefix, such as `$HOME/.local/titan`;
+- a C toolchain and the native prerequisites that Titan needs;
+- Node.js 24 and npm;
+- VS Code 1.106 or newer.
 
 Builds use the selected SDK's compiler, Lua interpreter, modules, headers and
-standard-library providers together. They do not install a compiler or require
-a Titan checkout. The SDK must include Titan's installed license at
-`share/titan/LICENSE`. These prerequisites are for building the repository.
-Installing its target-specific VSIX does not
-require that development toolchain.
+standard-library providers together, and they never modify it. The SDK must
+include Titan's installed license at `share/titan/LICENSE`. Installing a
+packaged VSIX needs none of this toolchain.
+
+Native packages build on Linux and macOS. On macOS, put GNU Make 4.4.1 first
+on `PATH`; see [native builds](docs/native-build.md#sdk-selection). Windows is
+[experimental](#windows).
 
 ## Build and test
-
-On macOS, put GNU Make 4.4.1 first on `PATH` before building, including for
-recursive `make` invocations. With Homebrew's Make installed:
-
-```sh
-export PATH="$(brew --prefix make)/libexec/gnubin:$PATH"
-make --version
-```
-
-Apple Make 3.81 can retain a stale generated include graph during incremental
-checks. macOS validation includes a native Apple Silicon M1 run; use an SDK
-built for the host architecture.
 
 ```sh
 make npm-ci
@@ -77,353 +80,81 @@ make -j2
 make test
 ```
 
-On Linux and macOS, `make` produces `bin/titan-language-server` and `dist/extension.js`, and stages
-the selected compiler's Lua source and native modules under
-`dist/titan/share/lua/5.5` and `dist/titan/lib/lua/5.5`, together with the SDK
-include tree and matching Lua sources. Packaging checks compare the required
-files byte-for-byte with the installation. Compiler dependencies installed with
-LuaRocks remain included; LuaRocks's own modules and unrelated installed packages
-are omitted. It does not stage a `lib/titan` tree or a
-Titan provider archive. The server build uses Titan's static-provider path and,
-on ELF systems, exports the embedded Lua API so compiler dependencies loaded from
-`package.cpath` bind to that same Lua state.
-
-To select a specific installation for a build and package:
+`make` builds `bin/titan-language-server` and `dist/extension.js`. It also
+stages the SDK's compiler modules under `dist/titan/share/lua/5.5` and
+`dist/titan/lib/lua/5.5`, the SDK include tree under `dist/titan/include`, and
+the matching Lua sources under `dist/titan/src`. To use a specific SDK:
 
 ```sh
 make -j2 TITAN_PREFIX="$HOME/.local/titan"
-make package TITAN_PREFIX="$HOME/.local/titan"
 ```
 
-Update the installed SDK using Titan's own installation workflow when compiler
-changes are needed; this repository treats it as an immutable input.
+`make verify` is the complete local gate. It runs the native, protocol, Codex
+adapter and JavaScript suites and the Extension Host smoke test. It also
+checks incremental rebuilds, packages a VSIX, inspects it and the
+executable's native linkage, validates the Codex plugin metadata and tests a
+server-only installation. On a headless Linux machine, run it as
+`xvfb-run -a make verify`. Test and verify targets build with the unoptimized
+validation profile; `make`, `make server`, `make package` and installation use
+the optimized production profile.
 
-Native modules now have separate object targets and final executable links.
-`make -j2 server server-test-build` schedules incremental object compilation;
-`make server-objects` and `make server-test-objects` stop before linking.
-Native tests use the ordinary installed standard provider, including compiled
-`titan.test`, without requiring test sources in the SDK or a special support build.
-See [incremental native builds](docs/native-build.md) for dependency ownership,
-configuration invalidation, separate production/test objects and LTO settings.
+Run `make help` for the focused targets. `make server-test` runs the native
+suite serially, while `make server-test-sharded` runs it in two parallel
+shards; `make test` and `make verify` use the sharded runner.
+`make extension-test` runs the JavaScript unit tests. A successful compile is
+not a successful test run.
 
-The complete local gate uses `-O0` without LTO for this project's compiled code.
-It uses the same selected SDK, including its already compiled providers. It
-builds the server and extension, runs Titan and JavaScript tests plus the
-Extension Host smoke test, queries the native server
-through the Codex adapter, checks incremental native rebuilds, packages the VSIX,
-checks its contents, validates the Codex plugin metadata, and inspects native linkage:
+More build documentation:
 
-```sh
-make verify
-```
-
-On a headless Linux machine, run the Extension Host under a virtual display:
-
-```sh
-xvfb-run -a make verify
-```
-
-GitHub CI runs the same validation profile as separate SDK preparation, build, test,
-disposable packaging and inspection steps on Ubuntu 24.04 `ubicloud-standard-2`
-runners. It publishes no VSIX or server binaries. The completed
-`.titan-validation` installation builds Lua 5.5.1 from the
-[`v5.5.1-1` archive](https://github.com/mascarenhas/lua-5.5.1/archive/refs/tags/v5.5.1-1.tar.gz),
-installs LuaRocks 3.13.0 using its [source installation](https://luarocks.org/#quick-start),
-then downloads the [Titan 0.6 source rock](https://github.com/mascarenhas/titan/releases/download/v0.6/titan-0.6.0-1.src.rock)
-and runs `luarocks install titan-0.6.0-1.src.rock` with `TITAN_BUILD_PROFILE=validation`.
-It caches the SDK by release versions, build profile and installation identity.
-CI selects that prefix explicitly, including validation-built providers.
-A cache hit
-reuses the compiler and SDK; a miss builds them once before
-server compilation. Make schedules module object recipes across two CPUs, then
-links one native test executable that runs in two parallel execution shards.
-Regular `make`, `make server`, `make package` and server installation retain
-optimized production defaults for this project's compiled code. A future
-main-only release job must rebuild that complete optimized SDK/server after
-validation passes.
-CI needs no Titan checkout or deploy key. While Titan is private, set the
-`TITAN_RELEASE_TOKEN` repository secret to a token with read access to Titan's
-contents; CI uses it with `gh release download`. Without the secret, CI downloads
-the source rock directly from its public release URL.
-
-Titan uses ordinary LuaRocks deployment. SDK preparation belongs to Titan's
-installation workflow. On Linux, that workflow needs Readline development
-headers (`libreadline-dev` on Debian/Ubuntu or `readline-devel` on Fedora), or
-`LUA_PLATFORM=linux` to omit Readline. LuaRocks owns compiler dependency and native
-provider installation. Use separate Titan source/build checkouts when preparing
-production and validation SDKs; upstream callers own cleanup when tools, flags,
-profiles or OpenSSL mode change.
-
-Use `make help` for focused targets. In particular, `make server-test` runs the
-native Titan suite serially; `make server-test-sharded` runs the same suite in two
-parallel shards. `make server-test-build` incrementally builds and links the
-aggregate, and
-`make server-test-run` executes the current aggregate without rebuilding it.
-`make test` and `make verify` use the two-shard runner. Each test module belongs
-to exactly one shard in `scripts/run-server-tests.mjs`; its inventory check
-requires newly imported test modules to be assigned. Per-shard logs and timings
-are written under `.build/test-shards`. `make extension-test` runs the extension
-unit tests. `make incremental-build-test` exercises Make's rebuild decisions with
-small native fixtures. A successful compilation by itself is not a successful test run.
-
-To measure the production server against this repository's saved Titan source,
-including startup and cold-index wall/CPU time, peak RSS, request responsiveness,
-and an unchanged hover/definition pair that must not start indexing, run:
-
-```sh
-node scripts/benchmark-server.mjs --server bin/titan-language-server
-```
-
-`startup.wallMs` measures process launch through receipt of the `initialize`
-reply, including native module initialization. On Linux, `startup.childCpuMs`
-reports cumulative server process CPU sampled immediately after that reply,
-and `startup.peakRssKiB` reports peak resident memory at that point. CPU and RSS
-fields are omitted on other platforms. `coldIndex` begins with the subsequent
-`initialized` notification, so its wall and CPU times exclude startup.
-
-The benchmark defaults to the extension's `debug` server-emission level so its
-numbers represent normal VS Code use. Pass `--log-level off` only when measuring
-the lower bound without structured-log overhead.
-
-For a controlled persistent-cache fill/warm comparison, set `TITAN_PREFIX` to
-a fresh absolute directory and reuse it for the consecutive server processes.
-Keep `TITAN_ROCKS_ROOT` pointed at the actual selected compiler installation.
-The private prefix holds ordinary
-source-only probe records under `var/cache/titan-probes/2`; it does not change
-their raw-source keys or delete ordinary developer cache entries. The workspace
-cache benchmark below manages this isolation automatically.
-
-An alternate saved target and additional ready-state probes can exercise a
-larger workspace in the same persistent server session. Probe positions are
-zero-based LSP line/character coordinates. The benchmark canonicalizes the
-workspace root and requires target files to be direct regular files below it;
-target paths that traverse symlinks are rejected, matching project discovery.
-
-```sh
-node scripts/benchmark-server.mjs \
-  --server bin/titan-language-server --root ../titan \
-  --file titan/timer.titan --marker 'uv.sleep(milliseconds)' --symbol sleep \
-  --probe hover:titan/async.titan:7:16 \
-  --probe definition:titan/os.titan:196:15
-```
-
-The per-file cold-start breakdown requires compiler trace records:
-
-```sh
-node scripts/benchmark-server.mjs \
-  --server bin/titan-language-server --root ../titan \
-  --file titan/timer.titan --marker 'uv.sleep(milliseconds)' --symbol sleep \
-  --log-level trace
-```
-
-With trace logging enabled, `coldProfile.modules` reports each module's own
-compiler CPU plus language-server normalization without charging recursive
-dependencies to its importer. A row's `inclusiveCpuMs` retains recursive timing
-context, but those overlapping values are deliberately not added to the module
-totals. Within `selfCpuMs`, `parseCpuMs` and `checkCpuMs` attribute the
-compiler's parsing and checking work, while `otherCpuMs` is the remaining
-direct compiler work; apart from displayed rounding, those three fields sum to
-`selfCpuMs`. Structurally impossible trace records whose parse and check work
-exceeds self-time are rejected instead of concealing overlap. Per-identity
-`firstCallCpuMs`, `reuseTotalCpuMs`, `reuseCalls`,
-`reuseAverageCpuMs`, and `reuseMaxCpuMs` separate the first observed attributed
-operation from later reuse work. Source self-time and normalization are separate
-streams, as are complete header processing and downstream FFI conversion: the
-first value combines the first record from each stream, while reuse statistics
-combine every remaining record. `reuseCalls` counts those remaining attributable
-records, and the average and maximum use that same set. The trace has no call ID,
-so these fields do not claim that a source record is correlated with a particular
-normalization record or that a header request is correlated with a particular
-conversion record.
-
-`coldProfile.headers` attributes only each header's complete processing time
-plus downstream FFI conversion. Component header phases remain visible for
-diagnosis but are not added again. `coldProfile.probeCaches` summarizes
-completed-result disk-cache lookups by their real `baseline` or `candidate`
-probe stage; hit rates are fractions from zero to one. Its backward-compatible
-`persistentSuccess` section also ranks the modules responsible for those disk
-lookups, including misses which may become persisted deterministic rejections.
-
-`coldProfile.probeTraces.logical` counts semantic requests and unique keys by
-eventual success, compiler rejection, or infrastructure outcome; cache tier;
-first/repeated use; publication result; requesting module; and readable header
-context. `coldProfile.probeTraces.physical` separately counts execution attempts,
-children which actually started, launches with a valid monotonic duration, and
-their child wall time by outcome, single/batch kind, persistent lookup result,
-publication, module, and header context. A fully warm cache can therefore retain
-logical success and rejection requests while reporting zero physical attempts,
-zero compiler launches, and zero child wall time. These aggregates preserve the
-distinction without retaining source, command arguments, or diagnostics in the
-benchmark process.
-
-Module and header durations are process-CPU attribution, not Task-exclusive
-clocks. An async suspension can therefore let unrelated server Task CPU enter an
-active interval. The benchmark sends only its intentional empty immediate-hover
-responsiveness probe before the index is ready; all data-bearing semantic probes
-wait for readiness, so the cold-start rows principally isolate compiler work.
+- [Native builds](docs/native-build.md): the object graph, build profiles,
+  test execution, CI and the Windows driver.
+- [Line coverage](docs/coverage.md).
+- [Performance measurement](docs/benchmarks.md).
 
 ## Run the extension during development
 
 1. Open this repository in VS Code.
 2. Run `make server npm-ci` in a terminal.
 3. Press F5 and choose **Run Titan Extension**.
-4. In the Extension Development Host, open a folder containing saved `.titan`
-   files.
+4. In the Extension Development Host, open a folder that contains saved
+   `.titan` files.
 
-By default the extension launches its packaged `bin/titan-language-server` once
-per workspace folder. These settings can override discovery:
+## Settings
 
-- `titan.languageServer.path`: absolute path, or a path relative to the
-  workspace folder.
-- `titan.languageServer.arguments`: extra process arguments.
-- `titan.languageServer.logLevel`: structured server diagnostics written to
-  stderr (`off`, `error`, `info`, `debug`, or `trace`; default `debug`).
-- `titan.compiler.luaPath`: optional `TITAN_LS_LUA_PATH` override for compiler
-  modules.
-- `titan.compiler.luaCPath`: optional `TITAN_LS_LUA_CPATH` override for native
-  Lua dependencies.
+The extension starts one server per workspace folder, by default the packaged
+`bin/titan-language-server`. Untrusted and virtual workspaces are not
+supported.
 
-When these settings are empty, the extension supplies absolute search templates
-for its own `dist/titan/share/lua/5.5` and `dist/titan/lib/lua/5.5` trees. The
-VSIX is therefore self-contained for compiler discovery and does not inherit
-ambient `LUA_PATH` or `LUA_CPATH` defaults. Configured values replace the
-corresponding packaged template verbatim, so an override must be a complete Lua
-search path. Compatibility still requires both the matching Titan ABI and
-`titan-compiler.driver.LANGUAGE_SERVER_API_VERSION == 1`; API 1 includes the
-compiler's typed semantic metadata, incremental-analysis hooks, C-header
-dependency restat contract, checked-project graph codecs, completed C-header
-and FFI conversion cache transport with separately refreshed timestamp observations,
-the module-local builtin `ffi` namespace and source-imported C header contexts,
-resolver-scoped I/O strategy with named completed-module yield checkpoints,
-bounded graph decoding and cooperative registry assembly, and the validated metadata-only embedded
-interface provider used before disk-backed compiled providers. The provider's
-validated build target profile describes portable C types in those interfaces
-and their numeric conversions, allowing reflection imports and ordinary
-semantic analysis without a C compiler or Titan SDK. C header imports still
-require a configured C toolchain; the VSIX supplies Titan and Lua SDK headers
-and the bundled libuv, llhttp, and SQLite headers. A Titan SDK built with
-`OPENSSL_MODE=bundled` also supplies its OpenSSL headers. The default system
-OpenSSL build requires OpenSSL 3 runtime libraries; its headers come from the
-configured C toolchain, including explicit project include paths when needed.
-Additional libraries' headers must be supplied through the project configuration.
-Native compilation requires a full Titan installation. The ABI
-alone is not the language-server API contract.
+| Setting | Default | Meaning |
+| --- | --- | --- |
+| `titan.languageServer.path` | packaged server | Executable path, absolute or relative to the workspace folder |
+| `titan.languageServer.arguments` | `[]` | Extra server arguments |
+| `titan.languageServer.logLevel` | `debug` | Server log emission: `off`, `error`, `info`, `debug` or `trace`. Changing it restarts the server |
+| `titan.trace.server` | `off` | LSP protocol tracing: `off`, `messages` or `verbose` |
+| `titan.compiler.luaPath` | packaged tree | Compiler module search path, passed as `TITAN_LS_LUA_PATH` |
+| `titan.compiler.luaCPath` | packaged tree | Native Lua module search path, passed as `TITAN_LS_LUA_CPATH` |
+| `titan.completion.insertCallSnippets` | `true` | Insert call placeholders when completing callables. Changing it restarts the server |
 
-Titan is not publicly released; its language-server API version remains `1`
-until the first public release. Prerelease compiler and server changes are
-developed together against the exact pinned compiler revision.
+With the Lua path settings empty, the extension passes absolute templates for
+its own `dist/titan/share/lua/5.5` and `dist/titan/lib/lua/5.5` trees. A
+configured value replaces the template verbatim, so it must be a complete Lua
+search path. The server never uses ambient `LUA_PATH` or `LUA_CPATH`. Disable
+`titan.completion.insertCallSnippets` to insert plain names when you take
+function references.
 
-Compiler checking and source-interface serialization failures appear as
-diagnostics on the owning saved source. Failed modules and their dependency
-closures do not publish reusable interfaces; a later successful analysis
-clears the diagnostics and restores semantic results.
+The bundled compiler must report Titan ABI `2` and
+`LANGUAGE_SERVER_API_VERSION == 1`; a matching ABI alone is not enough. See
+[compiler compatibility](docs/server-data-flow.md#compiler-compatibility).
+Ordinary semantic analysis needs no C compiler. Importing C headers needs a
+configured C toolchain. The VSIX supplies the Titan and Lua SDK headers and the
+bundled libuv, llhttp and SQLite headers; a bundled-OpenSSL SDK also supplies
+OpenSSL's headers. With system OpenSSL, its headers come from the C toolchain.
+Supply headers of other libraries through the project configuration.
 
-C imports use `foreign import "header.h"` and contribute, in declaration order,
-to the module's builtin `ffi` namespace. Explicit `.titan` source imports also
-contribute their C environment through the compiler's generated `.ffi.h`
-headers. The separate `.titan.h` header declares source-defined foreign
-functions; source-private visibility follows the usual explicit source-import
-rules. The server retains the complete physical C-header dependency closure
-for invalidation, including inherited headers, and keeps external source ASTs
-out of its project cache. Written `ffi` roots and C value members support hover and
-references within their module; they have no project definition or rename
-target. The readonly builtin `ffi` can be shadowed by an ordinary binding.
-Foreign types use a separate unqualified namespace: write `foreign int`,
-`foreign *Name`, or an always-local `foreign type Name = ...` declaration.
-They are not selected through the value binding `ffi`.
-
-Persisted compiler artifacts use `c-header-v6` and `ffi-conversion-v7` for
-extracted C definitions. Project entries retain declared member/type manifests,
-including trusted source visibility and generic schemes. SQLite schema 7 shares
-ordered header provenance across cache owners and stores fixed-size graph
-comparison hashes. It also retains the selected-part identity of shorthand union
-case bindings so rename preserves their meaning. Incompatible old publications
-are rebuilt.
-
-The bundled compiler modules and SDK files remain outside the executable.
-They contain no `lib/titan` provider tree or provider archive. Initialized Titan
-standard-library runtime modules are instead statically linked into the
-executable and registered for `require` through `package.preload`. Project
-typechecking uses the executable's separate, validated metadata-only inventory
-for `titan.async`, `titan.coroutine`, `titan.fs`, `titan.gc`, `titan.http`,
-`titan.io`, `titan.iteration`, `titan.json`, `titan.lua`, `titan.math`, `titan.net`,
-`titan.os`, `titan.peg`, `titan.reflect`, `titan.sqlite3`, `titan.ssl`,
-`titan.string`, `titan.test`, `titan.timer`, `titan.url`, `titan.uv`, and
-`titan.websocket`.
-
-The server defaults the compiler probe-cache prefix to the directory containing
-its SQLite database: `<workspace>/.titan-ls`. Accepted and rejected probes live
-under `.titan-ls/var/cache/titan-probes/2`, alongside `index.sqlite3`. The
-extension uses this same server default. A nonempty inherited `TITAN_PREFIX`
-explicitly overrides the probe prefix for either extension or standalone
-launches; it does not relocate the workspace database. With the default
-prefix, removing `.titan-ls` clears both caches; removing only `index.sqlite3`
-retains probe results. An overridden probe directory must be cleared separately.
-Probe keys remain based on raw C source; clear their directory when a changed
-native environment makes a cached result stale.
-
-In Remote SSH, WSL, or container workspaces, the workspace extension and native
-server run on that remote host. The client maps the workspace's remote URI
-scheme to that host's `file:` paths at the stdio boundary and maps returned
-project locations back to the original remote scheme and authority.
-
-A workspace root opened through a directory symlink is resolved once for the
-server's working directory and protocol paths; returned project locations are
-mapped back to the lexical workspace URI. In a nested multi-root workspace,
-VS Code's most-specific workspace folder exclusively owns semantic requests for
-its documents.
-
-While the server builds or refreshes saved-file project state, VS Code shows a
-busy **Titan indexing N/M files** language-status item for that workspace
-folder once the active saved-file workset is known. It disappears when the
-generation is ready. An indexing failure remains visible as an error and opens
-the language-server output when selected. Read-only language features stay
-responsive during indexing and return their ordinary empty result until an
-initial generation is available.
-
-Compiler errors from each completed saved-file generation appear in VS Code's
-**Problems** view. Their locations are converted from compiler byte columns
-using the saved source text; unsaved editor contents are not diagnostic input.
-Repairing or deleting a file, changing the configured source roots, or stopping
-the workspace language client clears the corresponding stale entries.
-
-### Language-server diagnostics and protocol tracing
-
-Run **Titan: Show Language Server Output** from the Command Palette to reveal
-the shared log. Every server and client record is prefixed with its workspace
-folder in a multi-root window. Server stderr is structured and routed at its
-declared severity; malformed or unstructured stderr remains an error. The
-extension launches the server with `debug` emission by default, so the **Titan
-Language Server** output channel's VS Code log-level selector is the only
-control needed to switch between normal and debug output. The channel still
-filters records without restarting the server. To collect trace records, first
-set
-`titan.languageServer.logLevel` to `trace`, which restarts each affected server,
-then set the output channel to Trace. Explicit `off`, `error`, `info`, `debug`,
-and `trace` emission overrides remain available when reducing server-side work
-or collecting deeper diagnostics.
-
-Indexing always emits an `indexing.chain.start` record and a paired
-`indexing.chain.complete` record, including the trigger, pass count, generation,
-wall time, and CPU time. Starts and successful terminals are Info; failed
-terminals are Error. Debug adds scan/analysis phase records and one bounded
-`compiler.module.complete` checkpoint after each source module the compiler has
-fully published. A graph generation counts project-graph changes; it is not a
-refresh-pass counter.
-
-Client/server protocol tracing is separately opt-in and does not restart the
-server. Set `titan.trace.server` to `messages` for message summaries, or
-to `verbose` for full payloads. Both modes write to the same per-workspace-
-prefixed output channel; `verbose` traces can include source text and other
-workspace data. Restore the setting to `off` after collecting a trace.
-
-### Project configuration
-
-See [server configuration and data flow](docs/server-data-flow.md) for input
-provenance, compiler scope ownership, and the production loader/cache boundary.
+## Project configuration
 
 An optional `titan-config.lua` at the workspace root assigns configuration
-values as globals. Relative paths are resolved from that root:
+values as globals. Relative paths resolve from the workspace root:
 
 ```lua
 include = { "./titan", "./spec/stdlib/titan" }
@@ -434,203 +165,194 @@ extra_ffi_include_dirs = { "include", "vendor/include" }
 extra_ffi_cppflags = "-DPROJECT_FFI=1 '-Ivendor path/include'"
 ```
 
-All fields are optional. `include` and `source_module_roots` each independently
-default to `{ "./src" }`, `exclude` defaults to an empty list, the binary root
-defaults to the compatible compiler installation, and the FFI include list
-defaults to empty. `include` selects the roots recursively scanned for saved
-project `.titan` files and watched for `.titan` changes. `exclude` removes
-files or directory subtrees from that watch set without removing their saved
-modules from project discovery. `source_module_roots` is the compiler's
-complete ordered source-module search path and determines the logical names of
-the project files selected by `include`. It normally starts with the project
-roots and may append external source folders that should not be watched. Its
-normalized entries are joined with `;` and installed as `TITAN_SOURCE_PATH`.
-A normalized source-module root therefore cannot contain `;`; watcher-only
-include roots do not have that restriction.
-`extra_ffi_cppflags` is parsed with the
-compiler's existing `TITAN_EXTRA_CPPFLAGS` shell-word rules and appended to
-the value inherited by the workspace-isolated server process. It accepts the
-same ordered `-I`/`-D` preprocessing arguments used by `titanc`. Unknown fields
-and returned values are rejected. Configuration runs in an otherwise empty
-Lua environment, so it can assign these values but cannot write unframed bytes
-to the language server's stdout or mutate compiler state.
+Every field is optional:
 
-This setting controls language-server analysis only. Keep the normal build's
-`TITAN_EXTRA_CPPFLAGS` equivalent when invoking `titanc`; otherwise editor
-semantics and command-line compilation can intentionally see different C
-preprocessing environments.
+- `include` (default `{ "./src" }`) selects the roots that are scanned
+  recursively for saved project `.titan` files and watched for `.titan`
+  changes.
+- `exclude` (default empty) removes files or directory subtrees from the
+  watch set only. Their saved modules stay in the project, and their changes
+  become visible on the next refresh triggered by another watched input.
+  Changing only `exclude` does not invalidate cached semantics.
+- `source_module_roots` (default `{ "./src" }`) is the compiler's complete,
+  ordered source-module search path, and it determines logical module names.
+  It normally starts with the project roots and may add external source
+  folders that should not be watched. Its entries cannot contain `;`.
+- `binary_modules_root` defaults to the bundled compiler's installed provider
+  root.
+- `extra_ffi_include_dirs` (default empty) adds C include directories.
+- `extra_ffi_cppflags` takes `-I` and `-D` preprocessing arguments in the same
+  shell-word syntax as `TITAN_EXTRA_CPPFLAGS`. They are appended to the
+  inherited value. This affects editor analysis only: keep the matching
+  `TITAN_EXTRA_CPPFLAGS` when you run `titanc`, or the editor and the command
+  line will see different preprocessing environments.
 
-`include` controls project membership and watching only. Each selected file's
-logical name is relative to its most-specific containing
-`source_module_roots` entry, so overlapping source roots still give one saved
-file one canonical project identity. The server checks that identity against
-the compiler's declared-root order and per-root folder-before-flat rules. A
-shadowed, blocked, or overlap-ambiguous project provider is reported as a
-configuration issue instead of being submitted under an identity that differs
-from `titanc`. Each included `.titan` file outside every source root gets an
-`unmapped-source` warning in Problems. These files are excluded from compilation,
-indexing, navigation, and source watching. Their creation, modification, or
-deletion does not trigger a refresh. Warnings are updated or cleared during the
-next ordinary discovery pass, such as one triggered by a mapped source save or
-configuration change; adding the missing source root brings its files into the
-project.
+Unknown fields and returned values are rejected. The file runs in an otherwise
+empty Lua environment, so it cannot write to the server's stdout or change
+compiler state.
 
-Project discovery intentionally ignores symlinked files and directories below
-the configured include roots in version 1. This keeps project identity and the
-watch set inside the resolved source trees; use ordinary files/directories for
-project modules. A file or directory listed in `exclude` remains part of the
-recursive saved-source scan but is not watched. Its changes become visible on
-the next refresh triggered by another watched input. Conversely, a path listed
-only in `source_module_roots` is compiler-resolved external source: it is not
-watched, indexed, or a navigation target in version 1. This restriction does
-not prohibit opening the workspace root itself through a symlink, as described
-above.
+A file's logical name is relative to the most specific `source_module_roots`
+entry that contains it. Overlapping roots therefore still give a saved file one
+identity. The server checks that identity against the compiler's root order and
+its folder-before-flat rule. It reports a shadowed, blocked or ambiguous
+provider as a configuration issue instead of analyzing the file under an
+identity that `titanc` would not use. An included file outside every source
+root gets an `unmapped-source` warning. Such a file is excluded from
+compilation, indexing, navigation and watching. The next ordinary discovery
+pass updates the warning, for example after a mapped source is saved or the
+configuration changes.
 
-The server stores its saved index and dependency metadata in
-`.titan-ls/index.sqlite3` inside the resolved workspace root. It also stores
-compiler-owned project declaration manifests and extracted C definitions there,
-allowing a compatible restart to reuse work. Function and method bodies are
-transient: fresh checking extracts semantic facts into SQL, publication retains
-unchanged module facts, and then the server releases the checked bodies. The directory excludes itself from Git and
-is always omitted from source discovery and watchers. If it cannot be created
-or opened, the server logs that persistence is unavailable and uses the same
-SQLite backend in memory.
+Project discovery ignores symlinked files and directories below the include
+roots; use ordinary files and directories for project modules. Opening the
+workspace root itself through a symlink works. A path listed only in
+`source_module_roots` is external source: the compiler resolves it, but it is
+not watched, indexed or a navigation target.
 
-Startup checks saved source, header and compiler-input metadata, search inputs,
-configuration and the native target before publishing reused answers. Matching
-precise timestamps and physical metadata reuse stored content and hashes without
-rereading files. A timestamp change reads and hashes the file; unchanged content
-updates only the observation. Replacements, symlink changes and new earlier
-search candidates still invalidate affected inputs. Deliberate byte changes that
-preserve all trusted metadata are outside this policy.
+For how each input reaches the compiler, see
+[server data flow](docs/server-data-flow.md).
 
-Validated SQL answers become available before declaration manifests finish
-restoring. Restoration runs in an owned background task with frequent yields; saved edits and
-compiler-verified rename coordinate with that task. Incompatible or damaged
-cache data rebuilds through the ordinary indexing path.
-Changing only `exclude` changes watcher policy without invalidating compatible
-semantics. The cache is disposable: close the server before removing
-`.titan-ls` to force a fresh index.
+## Indexing and diagnostics
 
-See [workspace SQLite measurements](docs/sqlite-backend-benchmarks.md) for
-restart and saved-edit timings, memory and disk usage, and reproduction commands.
-The [storage breakdown](docs/sqlite-backend-storage.md) profiles the completed
-single-FFI baseline and records the compact-cache changes.
+While the server builds or refreshes its saved-file state, a busy
+**Titan indexing N/M files** language-status item appears for that workspace
+folder. It disappears when the generation is ready. An indexing failure stays
+visible as an error, and selecting it opens the language-server output.
+Read-only features stay responsive during indexing. Until the first generation
+is ready they return their ordinary empty result. Afterward an unchanged
+request uses the most recent completed generation without rescanning, also
+while a refresh runs. A watcher event for a saved project change starts one
+coalesced refresh. Unwatched external inputs are revalidated by the next
+saved-project refresh or by rename's strict refresh.
+
+Compiler errors from each completed saved generation appear in the
+**Problems** view, with columns converted from compiler bytes using the saved
+text. Unsaved editor contents are not diagnostic input. A module the compiler
+rejects has no semantic data for that generation; it and its dependency
+closure publish no reusable interfaces, but independently valid modules still
+form the semantic view. Repairing or deleting a file, changing the source roots or
+stopping the client clears stale entries. A known compiler or configuration
+failure stays authoritative for its saved state, so unchanged read-only
+requests do not retry it. A later saved change retries it, and meanwhile
+read-only requests use the preceding generation; a rename joins or starts an
+explicit refresh instead (`Application:fresh_view`). Rename always waits for
+the newest stable generation and rechecks the disk after its preflight.
+
+## Logging and tracing
+
+Run **Titan: Show Language Server Output** to open the **Titan Language
+Server** output channel. Every record is prefixed with its workspace folder's
+name. The server writes structured records to stderr, and the channel shows
+them at their declared level; unstructured stderr shows as an error. Because
+the extension launches servers at `debug` emission, the channel's own
+log-level selector is enough to switch between normal and debug output. To
+collect trace records, set `titan.languageServer.logLevel` to `trace`, which
+restarts the server, then set the channel to Trace.
+
+Indexing always logs a paired `indexing.chain.start` and
+`indexing.chain.complete` record with the trigger, pass count, generation, wall
+time and CPU time. The generation counts project-graph changes, not refresh
+passes. Starts and successful completions are Info, and failed completions
+are Error. Debug adds scan and analysis phase records, plus one
+`compiler.module.complete` record per fully published source module.
+
+Protocol tracing is separate and does not restart the server. Set
+`titan.trace.server` to `messages` for summaries or `verbose` for full
+payloads. `verbose` traces can include source text, so reset the setting to
+`off` afterward.
+
+## Workspace cache
+
+The server stores its index in `.titan-ls/index.sqlite3` inside the resolved
+workspace root. The directory includes a `.gitignore` and is never scanned or
+watched. By default the compiler's C probe cache lives in the same directory,
+under `.titan-ls/var/cache/titan-probes/2`. A nonempty inherited `TITAN_PREFIX`
+moves only the probe cache; clear an overridden probe directory separately.
+If the database cannot be created or opened, the server logs that persistence
+is unavailable and keeps the index in memory.
+
+A compatible restart answers from the stored index first and restores compiler
+declarations in the background. A different compiler, server build or project
+configuration rebuilds the cache automatically. Startup trusts unchanged file
+timestamps and physical metadata, so a byte change that preserves all of them
+is not detected. Probe results are keyed by raw C source; clear the probe
+directory when a changed native environment makes a cached result stale. To
+force a fresh index, close the server and delete `.titan-ls`. Deleting only
+`index.sqlite3` keeps the probe results.
+
+See [workspace storage](docs/sqlite-backend-storage.md) for the schema and
+validation rules.
+
+## Remote and multi-root workspaces
+
+In Remote SSH, WSL and container workspaces, the extension and the native
+server run on the remote host. The client maps the workspace's remote URI
+scheme to that host's `file:` paths and maps returned locations back. A
+workspace root opened through a directory symlink is resolved once, and
+returned locations map back to the lexical workspace URI. In nested multi-root
+workspaces, VS Code's most specific workspace folder owns each document's
+requests.
 
 ## Package and install the VSIX
 
 ```sh
 make package
 make install-vsix
-# Equivalent direct VS Code CLI installation:
+# The equivalent VS Code CLI command:
 code --install-extension .build/vsix/titan-linux-x64.vsix --force
 ```
 
-The package is named for and tagged with its native target, for example
-`.build/vsix/titan-linux-x64.vsix`. Build it separately on each target platform;
-this repository does not cross-compile native server binaries. The Makefile
-rejects a `VSIX_TARGET` that would merely relabel the host-built executable.
-Linux packages also inherit the build host's glibc baseline. Build distributable
-artifacts on the oldest supported Linux baseline. `make inspect-server` reports
-the maximum imported GLIBC symbol version; release CI additionally sets
-`TITAN_MAX_GLIBC_VERSION` so a newer requirement cannot silently raise the
-supported baseline.
+The package is named and tagged for its native target, for example
+`.build/vsix/titan-linux-x64.vsix`. Build it separately on each platform: the
+repository does not cross-compile, and the Makefile rejects a `VSIX_TARGET`
+that would only relabel the host-built executable. Linux packages inherit the
+build host's glibc baseline. `make inspect-server` reports the newest
+required GLIBC symbol version, and fails when it exceeds
+`TITAN_MAX_GLIBC_VERSION` if that is set.
 
-To install only the server under a custom prefix:
+The VSIX contains the native server and the private compiler module trees
+under `dist/titan`. It also has the SDK headers, the Lua sources, this
+project's license and the Titan, native, Lua-module and bundled JavaScript
+notices. It contains no Titan provider archive or `lib/titan` tree. Smoke
+tests on the extracted package verify semantic analysis without a C compiler,
+and SDK-backed C imports from an unrelated working directory.
+
+## Standalone server
 
 ```sh
 make install-server INSTALL_PREFIX="$HOME/.local"
 ```
 
-The VSIX includes the native server, the private compiler module trees under
-`dist/titan/share/lua/5.5` and `dist/titan/lib/lua/5.5`, SDK headers and Lua
-sources under `dist/titan/include` and `dist/titan/src`, this project's license,
-and Titan/native, Lua-module, and bundled JavaScript dependency notices. It does
-not include a Titan provider/archive or `lib/titan` tree, and does not depend on
-a system compiler module tree. Extracted-package smoke tests verify both
-ordinary semantic analysis without a C compiler and SDK-backed C imports from
-an unrelated working directory.
+This installs the executable, plus this project's license and the Titan and
+native notices under `share/doc/titan-language-server`. It does not install
+the compiler modules. Without `TITAN_LS_LUA_PATH` and `TITAN_LS_LUA_CPATH`, a
+standalone server searches only `./?.lua` and `./?.so` (`./?.dll` on Windows).
+For setup, see [Codex setup](docs/codex.md).
 
-A server-only installation includes the executable plus this project's license
-and the Titan/native notices under `share/doc/titan-language-server` in the
-selected prefix. It does not install the VSIX's private compiler module trees or
-bundled JavaScript dependencies. A standalone server therefore uses
-`TITAN_LS_LUA_PATH` and `TITAN_LS_LUA_CPATH` when its compiler modules are not
-available as `./?.lua` and `./?.so`; see [the Codex setup guide](docs/codex.md).
+The server reserves stdout for `Content-Length`-framed JSON-RPC and writes all
+logs to stderr. Without the extension, its log level comes from
+`TITAN_LANGUAGE_SERVER_LOG_LEVEL` and defaults to `info`.
 
-## Version 1 behavior
+## Windows
 
-Definition, references, rename, folding and diagnostics use saved files. Hover
-can additionally reuse an ephemeral context after completion activates private
-analysis. Further edits refresh it after a 200 ms debounce, retaining mapped
-untouched occurrences during preparation and saving. Post-V1 completion analyzes current editor text for the active logical module
-against a committed saved dependency baseline. Type `.` or `:`, or use the usual
-editor completion command, including after `foreign` in a type annotation.
-Callable candidates show named signatures and insert parameter-name call
-placeholders. Disable `titan.completion.insertCallSnippets` for function references.
-See [completion behavior and ownership](docs/completion.md) for supported contexts,
-hover freshness, retained-context behavior and limits. Foreign-definition navigation, external-source navigation and
-watching external source trees remain outside the first-version scope.
-
-Hover presents a named declaration signature, including parameter names, for
-functions, methods, associated functions, and supported foreign callables.
-Function-valued variables retain their bare function type. Record, union, and
-interface hovers summarize the members visible at that occurrence; module
-hovers summarize visible top-level members without recursively expanding
-nominal types. These summaries, hover types, and folding ranges are materialized
-in the completed SQLite view during indexing. Individual feature queries read
-that view without traversing compiler ASTs or writing saved rows.
-
-LDoc-style declaration and module comments appear in hover and completion
-extra information, including links to the corresponding Titan manual pages.
-See [declaration documentation](docs/documentation.md) for metadata, rendering
-and saved versus unsaved behavior.
-
-An unchanged read-only request uses the immutable completed generation without
-rescanning the project. Before the initial index is ready it returns the
-feature's ordinary empty result. A watcher hint classified as a saved-project
-change starts one coalesced refresh; read-only requests keep using the preceding
-immutable generation while that work runs. Intentionally unwatched external
-inputs are revalidated by the next saved-project refresh or strict rename
-refresh. A known compiler/configuration failure remains authoritative for its
-exact saved epoch and is not retried by unchanged read-only requests. A later
-saved hint supersedes that failure while its repair refresh runs, allowing
-read-only requests to use the preceding immutable generation; a strict rename
-instead joins its explicit retry. Rename always waits for the stable newest
-generation and revalidates disk state after preflight.
-
-A saved module rejected by the compiler has no semantic data for that
-generation, but it does not prevent independently valid project modules from
-forming the immutable semantic view.
-
-Server stdout is reserved exclusively for `Content-Length`-framed JSON-RPC.
-Diagnostics and debug logs go to stderr.
-
-For the repository-local Codex skill, its deterministic query command, and
-compiler search-path setup, see [docs/codex.md](docs/codex.md). Development
-scope and milestones are recorded in
-[the bootstrap plan](https://github.com/mascarenhas/vscode-titan/blob/main/.agents/plans/bootstrap.md).
-
-## Experimental Windows validation
-
-The Windows port is experimental. The extension uses `.exe` language-server
-names and `.dll` compiler modules. Native compiler/server, SDK staging, protocol,
-and interactive Extension Host validation are separate from the JavaScript unit
-and bundle checks.
-
-Node's Windows process termination cannot deliver a catchable POSIX `SIGTERM`
-to the query adapter. Forced termination therefore cannot promise its structured
-interruption JSON; the language server must exit when parent-owned stdio closes.
-Ordinary protocol shutdown and bounded timeout cleanup retain their own tests.
-Symlink fixture checks skip when the Windows account lacks symlink privileges;
-no Developer Mode or privilege change is required to run the remaining tests.
+Windows x64 support is experimental. It uses a native CLANG64/UCRT Titan SDK,
+a DLL application and a controlled shared Lua DLL. The extension looks for
+`titan-language-server.exe` and `.dll` compiler modules. See
+[Windows builds](docs/native-build.md#experimental-windows-build) for setup,
+validation gates and limitations.
 
 Windows source paths must be fully qualified drive paths (`C:/project`,
 including a mapped share such as `W:/project`) or UNC paths
-(`//server/share/project`). Drive-relative, current-drive-rooted, and device
-namespace paths are rejected. UNC server names use bounded ASCII hostname
-spelling. Drive letters are normalized; whole pathnames are not case-folded.
+(`//server/share/project`). Drive-relative, current-drive-rooted and device
+namespace paths are rejected. UNC server names must be bounded ASCII host
+names. Drive letters are normalized, but whole paths are not case-folded.
 
-File notifications on shared folders are best effort. Guest-local NTFS folders
-are the supported watcher test location; shared source bytes must remain live,
-but absent shared-folder notifications are an acceptable documented limitation.
+File notifications on shared folders are best effort. The supported watcher
+location is a guest-local NTFS folder.
+
+## Project scope
+
+Titan issue [mascarenhas/titan#91](https://github.com/mascarenhas/titan/issues/91)
+defines the first version's scope, and
+[the bootstrap plan](https://github.com/mascarenhas/vscode-titan/blob/main/.agents/plans/bootstrap.md)
+records its milestones. Contributor and agent rules are in
+[AGENTS.md](AGENTS.md).

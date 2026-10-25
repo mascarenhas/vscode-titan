@@ -101,21 +101,11 @@ server instead uses those environment variables or its `./?.lua` and `./?.so`
 defaults. On ELF systems the server link must export the embedded Lua API (for
 example with `-Wl,-E`) so native Lua modules bind to the same Lua state.
 
-Project typechecking does not discover Titan standard-module interfaces through
-an on-disk provider. API 1 validates and decodes the executable's metadata-only
-23- or 26-entry inventory before considering disk-backed compiled providers. The
-inventory covers `titan.async`, `titan.coroutine`, `titan.fs`, `titan.gc`,
-`titan.http`, `titan.io`, `titan.iteration`, `titan.json`, `titan.lua`,
-`titan.math`, `titan.net`, `titan.os`, `titan.path`, `titan.peg`, `titan.reflect`,
-`titan.sqlite3`, `titan.ssl`, `titan.string`, `titan.test`, `titan.timer`,
-`titan.url`, `titan.uv`, and `titan.websocket`; it carries serialized ABI/type data,
-not implementations or link inputs. Current master SDKs additionally supply
-`titan.protobuf`, `titan.thread`, and `titan.transfer` (26 entries); the older
-release SDK supplies the original 23. The provider also carries a validated
-build target profile describing portable C types and numeric conversions, so
-ordinary semantic analysis can consume reflection metadata without a C compiler
-or Titan SDK. C header imports and native compilation still require the
-configured C toolchain and SDK.
+Project typechecking consumes the executable's metadata-only standard-module
+interfaces and target C type profile before disk-backed compiled providers.
+[Compiler compatibility](../../docs/server-data-flow.md#compiler-compatibility)
+owns the SDK-selected inventory and validation contract. C header imports and
+native compilation still require the configured C toolchain and SDK.
 
 ### Server layers
 
