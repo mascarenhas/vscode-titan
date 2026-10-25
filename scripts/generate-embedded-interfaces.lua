@@ -16,15 +16,23 @@ local EXPECTED_MODULES = {
     "titan.os",
     "titan.path",
     "titan.peg",
+    "titan.protobuf",
     "titan.reflect",
     "titan.sqlite3",
     "titan.ssl",
     "titan.string",
     "titan.test",
+    "titan.thread",
     "titan.timer",
+    "titan.transfer",
     "titan.url",
     "titan.uv",
     "titan.websocket"
+}
+local MODERN_MODULES = {
+    ["titan.protobuf"] = true,
+    ["titan.thread"] = true,
+    ["titan.transfer"] = true,
 }
 
 local function script_error(message)
@@ -45,11 +53,22 @@ local function validate_inventory(entries)
         return nil, "archive scanner returned no metadata entry table"
     end
 
-    local expected = {}
-    for _, name in ipairs(EXPECTED_MODULES) do expected[name] = true end
+    -- The published 0.6 source rock has 23 modules. Master adds this complete
+    -- three-module group; a partial group is an incomplete SDK, not a profile.
+    local modern = false
+    for name in pairs(MODERN_MODULES) do
+        if entries[name] ~= nil then modern = true end
+    end
+    local selected, expected = {}, {}
+    for _, name in ipairs(EXPECTED_MODULES) do
+        if modern or not MODERN_MODULES[name] then
+            selected[#selected + 1] = name
+            expected[name] = true
+        end
+    end
 
     local missing = {}
-    for _, name in ipairs(EXPECTED_MODULES) do
+    for _, name in ipairs(selected) do
         if entries[name] == nil then missing[#missing + 1] = name end
     end
 
@@ -67,12 +86,12 @@ local function validate_inventory(entries)
         if #unexpected ~= 0 then
             parts[#parts + 1] = "unexpected " .. join_quoted(unexpected)
         end
-        return nil, "expected the exact " .. #EXPECTED_MODULES ..
+        return nil, "expected the exact " .. #selected ..
             "-module Titan interface inventory (" ..
             table.concat(parts, "; ") .. ")"
     end
 
-    for _, name in ipairs(EXPECTED_MODULES) do
+    for _, name in ipairs(selected) do
         local entry = entries[name]
         if type(entry) ~= "table" or entry.module ~= name then
             return nil, "metadata entry " .. string.format("%q", name) ..
@@ -87,7 +106,7 @@ local function validate_inventory(entries)
         end
     end
 
-    return EXPECTED_MODULES
+    return selected
 end
 
 local function byte_initializer(value, indent)
@@ -712,7 +731,25 @@ local function self_test()
     local no_profile, profile_error = render_source(entries)
     assert(no_profile == nil and profile_error == "missing build target profile")
 
-    for _, name in ipairs({ "titan.json", "titan.reflect", "titan.sqlite3" }) do
+    local additions = { "titan.protobuf", "titan.thread", "titan.transfer" }
+    local saved = {}
+    for _, name in ipairs(additions) do
+        saved[name], entries[name] = entries[name], nil
+    end
+    assert(#assert(validate_inventory(entries)) == 23)
+    assert(render_source(entries, profile))
+    for mask = 1, 6 do
+        for index, name in ipairs(additions) do
+            entries[name] = mask & (1 << (index - 1)) ~= 0 and saved[name] or nil
+        end
+        local partial, partial_error = validate_inventory(entries)
+        assert(partial == nil and partial_error:find("missing", 1, true))
+    end
+    for _, name in ipairs(additions) do entries[name] = saved[name] end
+    assert(#assert(validate_inventory(entries)) == 26)
+
+    for _, name in ipairs({ "titan.json", "titan.protobuf", "titan.reflect",
+            "titan.sqlite3", "titan.thread", "titan.transfer" }) do
         local entry = entries[name]
         entries[name] = nil
         local old_inventory, missing_error = render_source(entries, profile)
@@ -763,16 +800,21 @@ if windows then
     for _, name in ipairs(EXPECTED_MODULES) do
         local symbol = driver.mangle_module_name(name) .. "_abi_value"
         local abi, error = support._abivalue(archive, symbol)
-        if abi ~= EXPECTED_ABI then
+        if abi == nil and MODERN_MODULES[name] then
+            -- The exact legacy/modern group is checked after all probes.
+        elseif abi ~= EXPECTED_ABI then
             script_error(name .. " ABI mismatch: " .. tostring(abi or error))
+        else
+            provider.entries[name] = { module = name, abi = abi }
         end
-        provider.entries[name] = { module = name, abi = abi }
     end
     for _, name in ipairs(EXPECTED_MODULES) do
-        local symbol = driver.mangle_module_name(name) .. "_types"
-        local query, error = support._loadlib(archive, symbol)
-        if not query then script_error(tostring(error)) end
-        provider.entries[name].types = query()
+        if provider.entries[name] then
+            local symbol = driver.mangle_module_name(name) .. "_types"
+            local query, error = support._loadlib(archive, symbol)
+            if not query then script_error(tostring(error)) end
+            provider.entries[name].types = query()
+        end
     end
 else
     provider, scan_error = staticmetadata.scan_archive(archive, { expected_abi = EXPECTED_ABI })

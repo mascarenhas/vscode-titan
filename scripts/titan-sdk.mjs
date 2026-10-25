@@ -44,25 +44,34 @@ export function resolveTitanSdk({ prefix, environment = process.env, platform = 
   const override = prefix ?? environmentValue(environment, "TITAN_PREFIX", platform);
   if (override) return paths.resolve(override);
   const env = compilerDiscoveryEnvironment(environment);
-  let invocation = { command: "titanc", args: ["--print-prefix"] };
+  let invocation = { command: "titanc", args: [] };
   if (platform === "win32") {
     const compiler = findCompiler(env);
     if (/\.(bat|cmd)$/i.test(compiler)) {
       const installed = realpath(compiler);
-      invocation = titanCompilerCommand(paths.dirname(paths.dirname(installed)), ["--print-prefix"], platform);
+      invocation = titanCompilerCommand(paths.dirname(paths.dirname(installed)), [], platform);
     } else invocation.command = compiler;
   }
-  const result = run(invocation.command, invocation.args, {
+  const queryOptions = {
     env, encoding: "utf8", shell: false, windowsHide: true, timeout: 10000
-  });
+  };
+  let queryFlag = "--print-root";
+  let result = run(invocation.command, [...invocation.args, queryFlag], queryOptions);
+  // Titan 0.6's release predates the installation-root option rename. Retry
+  // only that CLI rejection, preserving real discovery and startup failures.
+  if (!result.error && result.status !== 0 &&
+      /(?:^|\r?\n)Error: unknown option '--print-root'(?:\r?\n|$)/.test(result.stderr ?? "")) {
+    queryFlag = "--print-prefix";
+    result = run(invocation.command, [...invocation.args, queryFlag], queryOptions);
+  }
   if (result.error || result.status !== 0) {
     const reason = result.error?.message ?? result.stderr?.trim() ?? `exit status ${result.status}`;
-    throw new Error(`cannot discover the Titan SDK with titanc --print-prefix: ${reason}. ` +
-      "Install a compiler supporting --print-prefix or set TITAN_PREFIX");
+    throw new Error(`cannot discover the Titan SDK with titanc ${queryFlag}: ${reason}. ` +
+      "Install a compiler supporting --print-root or set TITAN_PREFIX");
   }
   const discovered = (result.stdout ?? "").replace(/\r?\n$/, "");
   if (!discovered || /[\0\r\n]/.test(discovered) || !paths.isAbsolute(discovered)) {
-    throw new Error("titanc --print-prefix did not return one absolute installation prefix");
+    throw new Error(`titanc ${queryFlag} did not return one absolute installation prefix`);
   }
   // Extended Windows paths preserve literal components, including `..`.
   return platform === "win32" && discovered.startsWith("\\\\?\\") ? discovered : paths.normalize(discovered);

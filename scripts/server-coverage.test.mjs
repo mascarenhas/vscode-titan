@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, writeFile } from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { test } from "node:test";
@@ -12,7 +12,7 @@ const repository = fileURLToPath(new URL("..", import.meta.url));
 const ownersOutput = () => serverTestShards.flat().map((name) => `[ RUN      ] ${name}.test_case`).join("\n");
 
 async function fixture(context) {
-  const root = await mkdtemp(path.join(os.tmpdir(), "vscode-titan-coverage-test-"));
+  const root = await realpath(await mkdtemp(path.join(os.tmpdir(), "vscode-titan-coverage-test-")));
   context.after(() => rm(root, { recursive: true, force: true }));
   const options = { repository: path.join(root, "repository"), prefix: path.join(root, "sdk"),
     nativeDir: path.join(root, "native"), buildDir: path.join(root, "build"), reportDir: path.join(root, "report"),

@@ -39,7 +39,8 @@ export function orderedModules(plan, selected) {
   return result;
 }
 
-export function moduleOutputs(stage, module) {
+export function moduleOutputs(stage, module, inventory) {
+  if (inventory) return inventory.map((relative) => path.join(stage, relative));
   const stem = path.join(stage, module.main.replace(/\.titan$/, ""));
   return [".o", ".c", ".ffi.h", ...(module.foreign ? [".titan.h"] : [])]
     .map((suffix) => stem + suffix);
@@ -102,7 +103,7 @@ export function nativeBuildFlags(profile, { cppflags = [], cflags = [], ldflags 
 }
 
 export function selectedBuildEnvironment(environment) {
-  const keys = ["CC", "AR", "RANLIB", "RC", "PATH", "CCACHE_DISABLE", "TITAN_JOBS",
+  const keys = ["CC", "AR", "RANLIB", "RC", "PATH", "CCACHE_DISABLE", "TITAN_JOBS", "TITAN_C_PARTS",
     "VSCODE_TITAN_BUILD_PROFILE", "TITAN_BUILD_PROFILE",
     "TITAN_ROCKS_ROOT", "TITAN_EXTRA_CPPFLAGS", "TITAN_EXTRA_CFLAGS", "TITAN_EXTRA_LDFLAGS",
     "TITAN_NO_LINE_DIRECTIVES", "CPATH", "C_INCLUDE_PATH", "CPLUS_INCLUDE_PATH",
@@ -288,11 +289,13 @@ export async function buildWindows(target, {
     const tree = forward(path.relative(directory, stage));
     const args = [...(test ? ["--test"] : []), "--source-first", "--incremental", "-j1"];
     for (const name of orderedModules(plan, test ? plan.tests : plan.server)) {
-      const module = plan.modules[name], outputs = moduleOutputs(stage, module);
+      const module = plan.modules[name], inventory = plan.outputs[name];
+      const outputs = moduleOutputs(stage, module, inventory.stable);
+      const owned = moduleOutputs(stage, module, inventory[mode]);
       const stamp = hash(JSON.stringify({ settings, headers,
         module, sources: await digestFiles(module.sources.map((file) => path.join(stage, file))),
         dependencies: module.imports.map((dependency) => state.objects[dependency]) }));
-      if (previous.objects[name] !== stamp || !await allFiles(outputs)) {
+      if (previous.objects[name] !== stamp || !await allFiles(owned)) {
         await rm(outputs[0], { force: true });
         if (!module.foreign) await rm(outputs[0].replace(/\.o$/, ".titan.h"), { force: true });
         compile([...args, "-c", "--tree", tree, name], directory);

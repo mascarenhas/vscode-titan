@@ -60,7 +60,7 @@ until the first public release; update the compiler and its consumers together
 without incrementing that API version during prerelease development.
 
 The build consumes an installed Titan SDK: `TITAN_PREFIX` overrides the prefix,
-otherwise the `titanc` on `PATH` reports it with `--print-prefix`. Use that SDK's
+otherwise the `titanc` on `PATH` reports it with `--print-root`. Use that SDK's
 compiler, Lua interpreter, modules, headers and providers together. Do not
 bootstrap a compiler or require `TITAN_REPO` in consumer builds. The SDK remains
 immutable; compiler probes use `BUILD_ROOT/compiler-cache`. Packaging retains the

@@ -34,7 +34,7 @@ const launcher = path.join(output, "titanc");
 const environment = { ...process.env, CCACHE_DISABLE: "1", TITAN_ROCKS_ROOT: options.prefix };
 for (const name of ["C_INCLUDE_PATH", "LUA_PATH", "LUA_CPATH", "LUA_PATH_5_5", "LUA_CPATH_5_5",
   "TITAN_PREFIX", "TITAN_PATH", "TITAN_PATH_0_6", "TITAN_EXTRA_CPPFLAGS", "TITAN_EXTRA_CFLAGS", "TITAN_EXTRA_LDFLAGS",
-  "BUILD_PROFILE", "TITAN_BUILD_PROFILE"]) {
+  "BUILD_PROFILE", "TITAN_BUILD_PROFILE", "TITAN_C_PARTS"]) {
   delete environment[name];
 }
 const policy = {
@@ -92,7 +92,7 @@ async function observedFiles() {
     for (const entry of await readdir(directory, { withFileTypes: true })) {
       const filename = path.join(directory, entry.name);
       if (entry.isDirectory()) await visit(filename);
-      else if (/\.(?:o|c|ffi\.h|titan\.h)$/.test(entry.name)) {
+      else if (/\.(?:o|c|ffi\.h|titan\.h|priv\.h|parts)$/.test(entry.name)) {
         const info = await stat(filename, { bigint: true });
         result[path.relative(build, filename)] = `${info.mtimeNs}:${info.size}`;
       }
@@ -309,7 +309,7 @@ if(stdout) process.stdout.write(stdout+'\\n');
   await unlink(path.join(source, "fixture/alternate.titan"));
   await make("module-removal");
   for (const mode of ["server-src", "test-src"]) {
-    for (const suffix of [".titan", ".c", ".o", ".ffi.h", ".titan.h"]) {
+    for (const suffix of [".titan", ".c", ".o", ".ffi.h", ".titan.h", ".parts"]) {
       await assert.rejects(stat(path.join(build, mode, `fixture/alternate${suffix}`)), { code: "ENOENT" });
     }
   }
@@ -319,7 +319,7 @@ if(stdout) process.stdout.write(stdout+'\\n');
   await make("folder-to-flat-layout");
   for (const mode of ["server-src", "test-src"]) {
     assert.ok((await stat(path.join(build, mode, "fixture/app.o"))).isFile());
-    for (const suffix of [".titan", ".c", ".o", ".ffi.h", ".titan.h"]) {
+    for (const suffix of [".titan", ".c", ".o", ".ffi.h", ".titan.h", ".parts"]) {
       await assert.rejects(stat(path.join(build, mode, `fixture/app/app${suffix}`)), { code: "ENOENT" });
     }
   }
@@ -449,6 +449,53 @@ end
   assert.ok((await stat(linkedServer)).size > 0);
   await runtime("empty-output-recovery", 15, names);
   await noOp("final-noop");
+  const splitSupport = await command("split-support", path.join(options.prefix, "bin", "lua"),
+    ["-E", "-e", 'io.write(require("titan-compiler.driver").parse_parts_companion and "yes" or "no")']);
+  if (splitSupport.output === "yes") {
+    // Exceed the compiler's normal split threshold without changing compiler
+    // policy or relying on the platform's default part count.
+    const functions = Array.from({ length: 1600 }, (_, index) =>
+      `function item_${index}(): string return "${"x".repeat(1024)}" end`);
+    await put("fixture/split.titan", functions.join("\n") + "\nfunction value(): integer return #item_0() end\n");
+    await put("titan_language_server.titan", 'local split = import "fixture.split"\nfunction main(args: {string}): integer return split.value() // 1024 end\n');
+    environment.TITAN_C_PARTS = "3";
+    const serverOnly = { goals: ["server"] };
+    await make("split-build", serverOnly);
+    const stem = path.join(build, "server-src", "fixture", "split");
+    const companion = await readFile(`${stem}.parts`, "utf8");
+    assert.match(companion, /^titan-parts-v1 [23]\n/, "large fixture did not split");
+    await command("split-runtime", server, [], 1);
+    await noOp("split-noop", serverOnly);
+    for (const suffix of [".part1.c", ".part1.o", ".priv.h", ".parts"]) {
+      await unlink(`${stem}${suffix}`);
+      const repaired = await make(`missing-split-${suffix.slice(1).replaceAll(".", "-")}`, serverOnly);
+      assert.ok(repaired.calls.some(call => call.args.includes("-c") && call.args.includes("fixture.split")),
+        `missing ${suffix} did not rebuild its owner`);
+      assert.ok((await stat(`${stem}${suffix}`)).isFile());
+      await command("repaired-split-runtime", server, [], 1);
+    }
+    environment.TITAN_C_PARTS = "1";
+    await make("split-policy-single-part", serverOnly);
+    assert.match(await readFile(`${stem}.parts`, "utf8"), /^titan-parts-v1 1\n/);
+    await assert.rejects(stat(`${stem}.part1.o`), { code: "ENOENT" });
+    await noOp("split-policy-single-noop", serverOnly);
+    environment.TITAN_C_PARTS = "3";
+    await make("split-policy-restored", serverOnly);
+    assert.ok((await stat(`${stem}.part1.o`)).isFile());
+    await command("restored-split-runtime", server, [], 1);
+    await put("fixture/split.titan", "function value(): integer return 1 end\n");
+    await make("split-to-single-part", serverOnly);
+    for (const suffix of [".part1.c", ".part1.o", ".priv.h"]) {
+      await assert.rejects(stat(`${stem}${suffix}`), { code: "ENOENT" });
+    }
+    await noOp("single-part-noop", serverOnly);
+    await put("titan_language_server.titan", "function main(args: {string}): integer return 1 end\n");
+    await unlink(path.join(source, "fixture/split.titan"));
+    await make("split-module-removal", serverOnly);
+    for (const suffix of [".c", ".o", ".ffi.h", ".parts"]) {
+      await assert.rejects(stat(`${stem}${suffix}`), { code: "ENOENT" });
+    }
+  }
   report.completed = true;
 } catch (error) {
   report.error = error.stack ?? String(error);

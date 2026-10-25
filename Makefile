@@ -165,6 +165,8 @@ NATIVE_TEST_ENV = env -u TITAN_PATH_0_6 -u TITAN_PATH \
 
 # The server selects its workspace probe cache; TITAN_PREFIX here selects the SDK.
 SERVER_TEST_ENV = env -u TITAN_PREFIX -u TITAN_PATH_0_6 -u TITAN_PATH -u TITAN_SOURCE_PATH \
+	CC=$(call shell_quote,$(CC)) CCACHE_DISABLE=$(call shell_quote,$(CCACHE_DISABLE)) \
+	TITAN_EXTRA_CPPFLAGS=$(call shell_quote,$(strip $(TITAN_EXTRA_CPPFLAGS) $(NATIVE_OPENSSL_CPPFLAGS))) \
 	TITAN_ROCKS_ROOT=$(call shell_quote,$(TITAN_PREFIX)) \
 	TITAN_LS_LUA_PATH=$(call shell_quote,$(DEVELOPMENT_LUA_PATH)) \
 	TITAN_LS_LUA_CPATH=$(call shell_quote,$(DEVELOPMENT_LUA_CPATH))
@@ -213,7 +215,7 @@ all: server extension
 
 help:
 	@echo "vscode-titan targets:"
-	@echo "  SDK selection        TITAN_PREFIX override, otherwise titanc --print-prefix from PATH"
+	@echo "  SDK selection        TITAN_PREFIX override, otherwise titanc --print-root from PATH"
 	@echo "  server               build bin/titan-language-server as one native executable"
 	@echo "  server-objects       compile production modules without linking"
 	@echo "  server-test-objects  compile test modules without linking"

@@ -16,7 +16,7 @@ launcher currently targets Linux and macOS; platform validation remains a
 separate gate.
 
 Select the SDK with `TITAN_PREFIX`, or put its `titanc` on `PATH` for
-`titanc --print-prefix` discovery. The consumer build does not prepare or refresh
+`titanc --print-root` discovery. The consumer build does not prepare or refresh
 that installation. CI prepares a validation SDK from the Titan v0.6 release
 source rock; local coverage can also use a production SDK
 because prebuilt providers are unmeasured:

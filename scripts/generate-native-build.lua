@@ -3,6 +3,7 @@ local lfs = require "lfs"
 local parser = require "titan-compiler.parser"
 local util = require "titan-compiler.util"
 local filepath = require "titan-compiler.path"
+local driver = require "titan-compiler.driver"
 
 local source_root, build_root, sdk_root, format = ...
 assert(source_root and build_root and sdk_root and
@@ -150,15 +151,33 @@ end
 
 local server_modules = closure("titan_language_server")
 local test_modules = closure("server.tests")
-local generated_outputs = {}
-for _, name in ipairs(names) do
+local function module_outputs(stage, name, include_parts)
     local module = modules[name]
     local stem = module.main:gsub("%.titan$", "")
-    for _, suffix in ipairs({".o", ".c", ".ffi.h"}) do generated_outputs[stem .. suffix] = true end
-    if module.foreign then generated_outputs[stem .. ".titan.h"] = true end
+    local outputs = {stem .. ".o", stem .. ".c", stem .. ".ffi.h"}
+    if module.foreign then outputs[#outputs + 1] = stem .. ".titan.h" end
+    -- New compilers publish the complete split-C inventory even for one part.
+    -- Older release SDKs have no companion API and retain their original graph.
+    if driver.parse_parts_companion then
+        outputs[#outputs + 1] = stem .. ".parts"
+        local companion = filepath.join(build_root, stage, stem .. ".parts")
+        if include_parts and lfs.attributes(companion, "mode") == "file" then
+            local count = assert(driver.parse_parts_companion(read(companion), stem))
+            if count > 1 then outputs[#outputs + 1] = stem .. ".priv.h" end
+            for index = 1, count - 1 do
+                outputs[#outputs + 1] = stem .. ".part" .. index .. ".c"
+                outputs[#outputs + 1] = stem .. ".part" .. index .. ".o"
+            end
+        end
+    end
+    return outputs
 end
 mkdir(build_root)
 for _, stage in ipairs({"server-src", "test-src"}) do
+    local generated_outputs = {}
+    for _, name in ipairs(names) do
+        for _, relative in ipairs(module_outputs(stage, name, true)) do generated_outputs[relative] = true end
+    end
     local directory = filepath.join(build_root, stage)
     mkdir(directory)
     local previous = {}
@@ -166,11 +185,12 @@ for _, stage in ipairs({"server-src", "test-src"}) do
     for _, relative in ipairs(previous) do
         local authored_output = relative:match("%.titan$") or
             (relative:match("%.h$") and not relative:match("%.ffi%.h$")
-                and not relative:match("%.titan%.h$"))
+                and not relative:match("%.titan%.h$") and not relative:match("%.priv%.h$"))
         local generated_output = relative:match("%.o$") or relative:match("%.c$")
             or relative:match("%.ffi%.h$") or relative:match("%.titan%.h$")
+            or relative:match("%.priv%.h$") or relative:match("%.parts$")
         if authored_output and not contents[relative]
-                or generated_output and not generated_outputs[relative] then
+                or generated_output and not generated_outputs[relative] and not contents[relative] then
             assert(os.remove(filepath.join(directory, relative)))
         end
     end
@@ -224,7 +244,7 @@ end
 write_changed(filepath.join(input_root, "sdk"), table.concat(sdk_files, "\n") .. "\n")
 local configuration = {source_root, build_root, sdk_root}
 for _, variable in ipairs({"CC", "AR", "RANLIB", "PATH", "TITANC", "TITAN_LUA", "TITAN_BUILD_PROFILE",
-        "TITAN_EXTRA_CPPFLAGS", "TITAN_EXTRA_CFLAGS", "TITAN_EXTRA_LDFLAGS",
+        "TITAN_EXTRA_CPPFLAGS", "TITAN_EXTRA_CFLAGS", "TITAN_EXTRA_LDFLAGS", "TITAN_C_PARTS",
         "TITAN_NO_LINE_DIRECTIVES", "VSCODE_TITAN_EXPORT_FLAGS",
         "VSCODE_TITAN_OPENSSL_MODE", "VSCODE_TITAN_OPENSSL_CPPFLAGS",
         "VSCODE_TITAN_OPENSSL_LDFLAGS", "VSCODE_TITAN_OPENSSL_INCLUDEDIR",
@@ -267,6 +287,13 @@ if format == "--windows-plan" then
             ',"foreign":' .. tostring(module.foreign) ..
             ',"parseError":' .. (module.parse_error and json_string(module.parse_error) or "null") .. '}'
     end
+    result[#result + 1] = '},"outputs":{'
+    for index, name in ipairs(names) do
+        result[#result + 1] = (index == 1 and "" or ",") .. json_string(name) ..
+            ':{"stable":' .. array(module_outputs("server-src", name, false)) ..
+            ',"server":' .. array(module_outputs("server-src", name, true)) ..
+            ',"tests":' .. array(module_outputs("test-src", name, true)) .. '}'
+    end
     result[#result + 1] = "}}\n"
     write_changed(filepath.join(build_root, "native-plan.json"), table.concat(result))
     return
@@ -280,27 +307,24 @@ local function paths(values)
     return table.concat(escaped, " ")
 end
 emit("NATIVE_SDK_INPUTS := " .. paths(sdk_files))
-local function module_outputs(stage, name)
-    local module = modules[name]
-    local relative_stem = module.main:gsub("%.titan$", "")
-    local stem = filepath.join(build_root, stage, relative_stem)
-    local outputs = {stem .. ".o", stem .. ".c", stem .. ".ffi.h"}
-    if module.foreign then outputs[#outputs + 1] = stem .. ".titan.h" end
+local function stage_outputs(stage, name, include_parts)
+    local outputs = module_outputs(stage, name, include_parts)
+    for index, relative in ipairs(outputs) do outputs[index] = filepath.join(build_root, stage, relative) end
     return outputs
 end
 local function graph(stage, variable, selected, test_mode)
     local objects = {}
-    for _, name in ipairs(selected) do objects[#objects + 1] = module_outputs(stage, name)[1] end
+    for _, name in ipairs(selected) do objects[#objects + 1] = stage_outputs(stage, name)[1] end
     emit(variable .. " := " .. paths(objects))
     for _, name in ipairs(selected) do
         local module = modules[name]
-        local outputs = module_outputs(stage, name)
+        local outputs = stage_outputs(stage, name)
         local prerequisites = {filepath.join(input_root, name),
             filepath.join(input_root, "headers"), filepath.join(input_root, "sdk")}
         for _, source in ipairs(module.sources) do prerequisites[#prerequisites + 1] = filepath.join(build_root, stage, source) end
         for _, header in ipairs(headers) do prerequisites[#prerequisites + 1] = filepath.join(build_root, stage, header) end
         for _, dependency in ipairs(module.imports) do
-            for _, value in ipairs(module_outputs(stage, dependency)) do prerequisites[#prerequisites + 1] = value end
+            for _, value in ipairs(stage_outputs(stage, dependency)) do prerequisites[#prerequisites + 1] = value end
         end
         emit(make_path(outputs[1]) .. ": FORCE " .. paths(prerequisites) ..
             " $(NATIVE_BUILD_INPUTS) $(NATIVE_CONFIG_STAMP)")
@@ -310,8 +334,12 @@ local function graph(stage, variable, selected, test_mode)
         else
         emit("\t@set -e; stale=0; newer=$(call shell_quote,$(filter-out FORCE,$?)); test -z \"$$newer\" || stale=1; \\")
         local quoted = {}
-        for index, value in ipairs(outputs) do quoted[index] = shell_quote(value) end
+        for index, value in ipairs(stage_outputs(stage, name, true)) do quoted[index] = shell_quote(value) end
         emit("\tfor output in " .. table.concat(quoted, " ") .. "; do test -f \"$$output\" || stale=1; done; \\")
+        -- A recompile may shrink the part inventory. Only stable companions
+        -- participate in Make prerequisites and postcompile checks.
+        quoted = {}
+        for index, value in ipairs(outputs) do quoted[index] = shell_quote(value) end
         emit("\tif test \"$$stale\" = 1; then rm -f $(call shell_quote,$@); \\")
         if not module.foreign then emit("\t  rm -f " .. shell_quote(outputs[1]:gsub("%.o$", ".titan.h")) .. "; \\") end
         emit("\t  cd $(call shell_quote," .. (test_mode and "$(TEST_BUILD_DIR)" or "$(SERVER_BUILD_DIR)") .. "); \\")

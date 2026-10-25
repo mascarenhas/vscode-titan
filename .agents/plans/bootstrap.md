@@ -26,7 +26,7 @@ The executable statically selects the Titan standard-library runtime modules
 needed by the server, together with the embedded Lua interpreter and configured
 native dependencies. Initialized statically linked modules register their
 runtime openers in `package.preload`. The executable separately embeds a
-metadata-only inventory of all 23 canonical standard-module interfaces;
+metadata-only inventory of all SDK-selected canonical standard-module interfaces;
 compiler language-server API 1 validates and decodes it and its build target's
 C type profile for project typechecking. This inventory is analysis data, not
 module implementation or a linkable provider.
@@ -77,7 +77,7 @@ messages; stderr carries logs.
 The Makefile owns the cross-language build:
 
 1. compile the Titan server with an installed SDK selected by `TITAN_PREFIX` or
-   `titanc --print-prefix` on `PATH`, static
+   `titanc --print-root` on `PATH`, static
    Titan-provider preference, and the complete metadata-only standard-interface
    inventory;
 2. compile/bundle the extension and run its JavaScript tests;
@@ -103,13 +103,15 @@ example with `-Wl,-E`) so native Lua modules bind to the same Lua state.
 
 Project typechecking does not discover Titan standard-module interfaces through
 an on-disk provider. API 1 validates and decodes the executable's metadata-only
-23-entry inventory before considering disk-backed compiled providers. The
+23- or 26-entry inventory before considering disk-backed compiled providers. The
 inventory covers `titan.async`, `titan.coroutine`, `titan.fs`, `titan.gc`,
 `titan.http`, `titan.io`, `titan.iteration`, `titan.json`, `titan.lua`,
 `titan.math`, `titan.net`, `titan.os`, `titan.path`, `titan.peg`, `titan.reflect`,
 `titan.sqlite3`, `titan.ssl`, `titan.string`, `titan.test`, `titan.timer`,
 `titan.url`, `titan.uv`, and `titan.websocket`; it carries serialized ABI/type data,
-not implementations or link inputs. The provider also carries a validated
+not implementations or link inputs. Current master SDKs additionally supply
+`titan.protobuf`, `titan.thread`, and `titan.transfer` (26 entries); the older
+release SDK supplies the original 23. The provider also carries a validated
 build target profile describing portable C types and numeric conversions, so
 ordinary semantic analysis can consume reflection metadata without a C compiler
 or Titan SDK. C header imports and native compilation still require the
@@ -357,7 +359,7 @@ has evidence before moving to Done.
   and package checks aligned.
 - No `lib/titan` provider tree or Titan provider/archive in the VSIX.
 - Initialized statically linked standard modules use `package.preload`; the
-  complete 23-entry embedded inventory is validated metadata-only analysis
+  complete SDK-selected embedded inventory is validated metadata-only analysis
   input, not runtime code or a linkable provider.
 - Native compiler dependencies can bind to the exported embedded Lua API.
 - No server logging on stdout.

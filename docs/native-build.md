@@ -7,9 +7,11 @@ Make owns the dependency graph and rebuild decisions; Titan restores source
 metadata from current objects while compiling dependents and linking.
 
 The build consumes an installed Titan SDK. `TITAN_PREFIX` selects its prefix;
-otherwise `titanc` on `PATH` reports it with `--print-prefix`, using the
-compiler's existing `package.cpath` provider discovery. The selected SDK supplies
-the compiler, Lua interpreter, compiler dependencies, headers and providers.
+otherwise `titanc` on `PATH` reports it with `--print-root`, using the
+compiler's existing `package.cpath` provider discovery. Discovery retries
+`--print-prefix` for the older 0.6 release SDK when it rejects `--print-root`.
+The selected SDK supplies the compiler, Lua interpreter, compiler dependencies,
+headers and providers.
 No Titan checkout or project-owned compiler installation is required. For example:
 
 ```sh
@@ -47,8 +49,8 @@ make --version
 ```
 
 Apple Make 3.81 can retain a stale generated include graph during incremental
-checks. The local macOS validation used Intel x86_64; it does not establish
-Apple Silicon runtime coverage.
+checks. macOS validation includes a native Apple Silicon M1 run, including
+the arm64 VSIX and Extension Host smoke tests.
 
 ## Object and link ownership
 
@@ -61,8 +63,18 @@ on every invocation and does not generate files beside authored sources.
 imports and module constituents to produce `.build/native-modules.mk`. Fixture
 strings containing Titan source are not imports of their enclosing test module.
 Direct module dependencies determine which object recipes can run in parallel.
+Split-C compilers publish `.parts` inventories. The graph preserves each owned
+`.partN.c`, `.partN.o` and `.priv.h`, checks their presence before accepting an
+object, and prunes them when their module disappears. Changing `TITAN_C_PARTS`
+invalidates the graph configuration. Older SDKs retain their single-object graph.
+
 Make also tracks project C headers, generated producer companions, compiler and
 SDK/provider inputs, configuration, and source inventory changes.
+
+Protocol and Codex test servers receive the native build's selected `CC` and
+effective preprocessing flags, including system OpenSSL's pkg-config includes.
+This lets live analysis of this repository resolve headers from nondefault
+installations such as Homebrew without changing project configuration.
 
 Each object recipe invokes `titanc -c --incremental -j1`. Make controls object
 parallelism, so `make -j2` uses two compilation slots rather than starting two
@@ -219,7 +231,7 @@ prefixes and producer build directories when different provider profiles are
 needed.
 
 Windows uses the same prefix selection: `--sdk` or `TITAN_PREFIX` overrides
-discovery from `titanc` on `PATH`. The selected compiler's `--print-prefix`
+discovery from `titanc` on `PATH`. The selected compiler's `--print-root`
 discovers its provider through `package.cpath`; it does not embed an installation
 prefix in the compiler or runtime. An SDK whose prefix contains spaces or Unicode
 characters is supported.
@@ -280,7 +292,9 @@ headers, compiler/SDK inputs, dependency fingerprints and effective settings.
 Compiler probes live under the build directory in a configuration-keyed cache;
 SDK/header/tool/flag changes select a fresh cache. Native test execution disables
 persistent probe records because independent fixtures may reuse header names.
-Missing generated companions force rebuilding. Production and test objects use
+Missing generated companions, including split outputs declared by `.parts`,
+force rebuilding. `TITAN_C_PARTS` changes invalidate the build configuration.
+Production and test objects use
 separate stages and separate native-helper directories. The default Unix graph
 and recipes retain their existing static production behavior.
 
@@ -300,9 +314,10 @@ reject partial pairs, links, and unknown root entries. The packaged header tree
 must still match the selected SDK byte for byte.
 
 The Windows embedded-interface boundary reads callable metadata from the
-**canonical, actually loaded standard provider**. All 23 plain-C ABI values are
-checked before invoking any Lua metadata callback. The generated source contains
-the C type profile, not a second serialized copy of the provider interfaces.
+**canonical, actually loaded standard provider**. All SDK-selected plain-C ABI
+values are checked before invoking any Lua metadata callback. The generated
+source contains the C type profile, not a second serialized copy of the provider
+interfaces.
 Provider path and identity use the retained native handle's canonical spelling,
 complete volume/file identifiers and exact 100 ns timestamps. The handle denies
 write/delete sharing and makes that transient identity snapshot immutable. The

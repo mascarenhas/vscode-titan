@@ -41,7 +41,7 @@ async function compilerSDK(context) {
   const extension = process.platform === "win32" ? "dll" : "so";
   for (const member of ["lfs", "lpeglabel"]) await result.put(`sdk/lib/lua/5.5/${member}.${extension}`);
   if (process.platform === "win32") await result.put("sdk/lib/lua/5.5/luv.dll");
-  for (const header of ["lauxlib.h", "llhttp.h", "luaconf.h", "lua.h", "lua.hpp", "lualib.h", "minicoro.h", "sqlite3.h", "titan.h", "uv.h"]) {
+  for (const header of ["lauxlib.h", "llhttp.h", "luaconf.h", "lua.h", "lua.hpp", "lualib.h", "minicoro.h", "sqlite3.h", "titan.h", "transfer.h", "uv.h"]) {
     await result.put(`sdk/include/${header}`);
   }
   if (process.platform === "win32") {

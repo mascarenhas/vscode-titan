@@ -13,8 +13,8 @@ and SQLite. OpenSSL follows the selected Titan SDK: the default uses system
 OpenSSL 3 libraries, while bundled mode carries its archive payload.
 Initialized statically linked modules register their runtime
 openers in `package.preload`. Separately, the executable carries a metadata-only
-inventory of all 23 canonical Titan standard-module interfaces; compiler
-language-server API 1 validates and decodes those serialized interfaces and
+inventory of all SDK-selected canonical Titan standard-module interfaces;
+compiler language-server API 1 validates and decodes those serialized interfaces and
 their build target's C type profile for project typechecking. The inventory
 contains no standard-module implementation, provider archive, header, or SDK
 payload.
@@ -39,7 +39,7 @@ navigation and rename plus completion in unsaved buffers.
 
 - A compatible installed Titan SDK. Put its `titanc` on `PATH`, or set
   `TITAN_PREFIX` to its installation prefix, such as `$HOME/.local/titan`.
-  Discovery uses `titanc --print-prefix`, which locates the installed provider
+  Discovery uses `titanc --print-root`, which locates the installed provider
   through `package.cpath` on Unix and Windows.
 - A C toolchain and the native prerequisites used by Titan.
 - Node.js 24 and npm.
@@ -68,8 +68,8 @@ make --version
 ```
 
 Apple Make 3.81 can retain a stale generated include graph during incremental
-checks. The local macOS validation used Intel x86_64; it does not establish
-Apple Silicon runtime coverage.
+checks. macOS validation includes a native Apple Silicon M1 run; use an SDK
+built for the host architecture.
 
 ```sh
 make npm-ci

@@ -2277,6 +2277,103 @@ function test_compiler_bridge_joins_source_imported_local_function_definition_id
   test_runtime.run(joins_source_imported_local_function_definition_identity)
 end
 
+local function preserves_foreign_function_visibility()
+  preload_real_compiler()
+  local compiler = bridge.load()
+  local parse = compiler.parser["parse"] as function (string, string): (value, value)
+  local public_source = "foreign function visible(input: int): int return input end\n"
+  local parsed: value, _ = parse("foreign_visibility.titan", public_source)
+  local declarations = parsed as {integer: value}
+  local declaration = declarations[1] as {string: value}
+  local modern = declaration["islocal"] ~= nil
+  local root = test_paths.temporary_name()
+  fs.unlink(root)
+  fs.mkdir(root)
+  defer fs.rmdir(root)
+  local provider_file = root .. "/foreign_visibility_provider.titan"
+  local consumer_file = root .. "/foreign_visibility_consumer.titan"
+  local ordinary_file = root .. "/foreign_visibility_ordinary.titan"
+  local provider_source = public_source .. (modern and "local " or "") ..
+    "foreign function hidden(input: int): int return input + 1 end\n"
+  local consumer_source = [[local provider = import "foreign_visibility_provider.titan"
+function answer(): integer
+  return provider.visible(1) + provider.hidden(2)
+end
+]]
+  local projects = {
+    bridge.ProjectModule.new("foreign_visibility_provider", {
+      bridge.SourceFile.new(provider_file, provider_source),
+    }),
+    bridge.ProjectModule.new("foreign_visibility_consumer", {
+      bridge.SourceFile.new(consumer_file, consumer_source),
+    }),
+  }
+  if modern then
+    projects[#projects + 1] = bridge.ProjectModule.new("foreign_visibility_ordinary", {
+      bridge.SourceFile.new(ordinary_file,
+        "local provider = import \"foreign_visibility_provider\"\n" ..
+        "function answer(): integer return provider.visible(3) end\n"),
+    })
+  end
+  local analysis = compiler:analyze("foreign_visibility_consumer", projects)
+  local diagnostics = strings.writer()
+  for index = 1, #analysis.diagnostics do
+    diagnostics:write(analysis.diagnostics[index].message .. "\n")
+  end
+  test.assert(#analysis.diagnostics == 0,
+              "compiler rejected foreign visibility fixture: " .. diagnostics:drain())
+  local visible_id = (modern and "export:" or "source:") ..
+    "foreign_visibility_provider:value:visible"
+  local hidden_id = "source:foreign_visibility_provider:value:hidden"
+  local seen_visible = 0
+  local seen_hidden = 0
+  for module_index = 1, #analysis.modules do
+    local snapshot = analysis.modules[module_index]
+    for index = 1, #snapshot.symbols do
+      local symbol = snapshot.symbols[index]
+      if symbol.name == "visible" or symbol.name == "hidden" then
+        local is_visible = symbol.name == "visible"
+        test.assert(symbol.declaration_id == (is_visible and visible_id or hidden_id) and
+                    symbol.is_local == (not is_visible or not modern),
+                    "foreign function lost its declared visibility or cross-module identity")
+        if is_visible then seen_visible = seen_visible + 1 else seen_hidden = seen_hidden + 1 end
+        if snapshot.module_name == "foreign_visibility_provider" then
+          test.assert(symbol.exact_span == nil,
+                      "foreign function declaration became a navigation anchor")
+        end
+      end
+    end
+  end
+  test.assert(seen_visible == (modern and 3 or 2) and seen_hidden == 2,
+              "foreign function fixture lost its declarations or calls")
+  local model = features.build(projects, analysis.modules)
+  defer model:close()
+  local visible_position = marked_name_position(consumer_source, "provider.visible", "visible")
+  local hidden_position = marked_name_position(consumer_source, "provider.hidden", "hidden")
+  local visible_hover? = model:hover(consumer_file, visible_position)
+  local hidden_hover? = model:hover(consumer_file, hidden_position)
+  test.assert(visible_hover ~= nil and hidden_hover ~= nil and
+              visible_hover.callable_signature ~= nil and
+              hidden_hover.callable_signature ~= nil and
+              visible_hover.callable_signature.display ==
+                "foreign_visibility_provider.visible(input: foreign int): foreign int" and
+              hidden_hover.callable_signature.display ==
+                "foreign_visibility_provider.hidden(input: foreign int): foreign int" and
+              strings.find(visible_hover:markdown(), "Visibility: " ..
+                (modern and "exported" or "module")) ~= nil and
+              strings.find(hidden_hover:markdown(), "Visibility: module") ~= nil,
+              "foreign function hover lost its canonical owner or compiler visibility")
+  local renamed?, rename_error? = model:rename(consumer_file, visible_position, "renamed")
+  test.assert(model:definition(consumer_file, visible_position) == nil and
+              model:definition(consumer_file, hidden_position) == nil and
+              renamed == nil and rename_error ~= nil,
+              "foreign function became a definition or rename target")
+end
+
+function test_compiler_bridge_preserves_foreign_function_visibility(_context: test.Context)
+  run_bridge(preserves_foreign_function_visibility)
+end
+
 local function reports_dirty_saved_file_progress()
   with_fixture("progress", function ()
     local compiler = bridge.load()

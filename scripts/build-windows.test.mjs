@@ -94,6 +94,16 @@ test("folder modules own one source stem and foreign companion", () => {
   assert.deepEqual(outputs, [".o", ".c", ".ffi.h", ".titan.h"].map((suffix) => path.join("stage", "owner", "owner") + suffix));
 });
 
+test("compiler output inventories preserve stage-owned split companions", () => {
+  const module = { main: "owner/owner.titan", foreign: false };
+  const stable = [".o", ".c", ".ffi.h", ".parts"].map((suffix) => "owner/owner" + suffix);
+  const split = [...stable, "owner/owner.priv.h", "owner/owner.part1.c", "owner/owner.part1.o"];
+  assert.deepEqual(moduleOutputs("server-stage", module, split),
+    split.map((relative) => path.join("server-stage", relative)));
+  assert.deepEqual(moduleOutputs("test-stage", module, stable),
+    stable.map((relative) => path.join("test-stage", relative)));
+});
+
 test("configured compiler arguments retain spaces and Unicode without a command shell", () => {
   assert.equal(compilerArgument("C:\\Program Files\\路径\\clang.exe"), '"C:/Program Files/路径/clang.exe"');
   assert.throws(() => compilerArgument('C:/bad"argument'), /cannot contain/);
@@ -116,6 +126,14 @@ test("build fingerprints retain explicit compiler controls and exclude unrelated
   for (const [key, value] of Object.entries(controls)) assert.equal(selected[key], value);
   assert(!Object.hasOwn(selected, "UNRELATED_BUILD_NOTE"));
   assert.deepEqual(selected, selectedBuildEnvironment({ ...controls, UNRELATED_BUILD_NOTE: "changed unrelated input" }));
+});
+
+test("split generation policy invalidates the Windows build fingerprint", () => {
+  const single = selectedBuildEnvironment({ TITAN_C_PARTS: "1" });
+  const split = selectedBuildEnvironment({ Titan_C_Parts: "3" });
+  assert.equal(single.TITAN_C_PARTS, "1");
+  assert.equal(split.TITAN_C_PARTS, "3");
+  assert.notDeepEqual(single, split);
 });
 
 test("Windows test targets select validation while deliverables select production", () => {
