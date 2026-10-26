@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
-import { appendFile, copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { appendFile, copyFile, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -11,6 +11,7 @@ import { terminateNativeServers } from "./run-extension-host-tests.mjs";
 const proxy = fileURLToPath(new URL("./run-extension-host-tests.mjs", import.meta.url));
 
 async function failedHost(context, root, receipts) {
+  root = await realpath(root);
   const runner = path.join(root, "scripts", "run-extension-host-tests.mjs");
   const testCli = path.join(root, "node_modules", "@vscode", "test-cli", "out", "bin.mjs");
   await mkdir(path.dirname(runner), { recursive: true });

@@ -8,12 +8,13 @@ driver. For the user-facing commands, see the
 ## SDK selection
 
 The build consumes an installed Titan SDK. `TITAN_PREFIX` selects its prefix.
-Otherwise `scripts/titan-sdk.mjs` runs `titanc --print-prefix` from `PATH`; the
-compiler finds its installed provider through `package.cpath` on both Unix and
-Windows. The selected SDK supplies the compiler, the Lua interpreter, the
-compiler's LuaRocks dependencies, headers, the standard-library providers and
-`share/titan/LICENSE`. No Titan checkout or project-owned compiler installation
-is needed:
+Otherwise `scripts/titan-sdk.mjs` runs `titanc --print-root` from `PATH`. It
+retries `--print-prefix` only when an older 0.6 release SDK rejects the new
+option. The compiler finds its installed provider through `package.cpath` on
+both Unix and Windows. The selected SDK supplies the compiler, the Lua
+interpreter, the compiler's LuaRocks dependencies, headers, the standard-library
+providers and `share/titan/LICENSE`. No Titan checkout or project-owned compiler
+installation is needed:
 
 ```sh
 make -j2 server TITAN_PREFIX="$HOME/.local/titan"
@@ -45,8 +46,8 @@ Homebrew:
 export PATH="$(brew --prefix make)/libexec/gnubin:$PATH"
 ```
 
-macOS validation so far has used Intel x86_64; it does not establish Apple
-Silicon runtime coverage.
+macOS validation includes a native Apple Silicon M1 run, including the arm64
+VSIX and Extension Host smoke tests. Use an SDK built for the host architecture.
 
 ## Object and link ownership
 
@@ -64,6 +65,13 @@ Direct module dependencies decide which object recipes can run in parallel.
 Make also tracks project C headers, generated producer companions, compiler
 and SDK inputs, the configuration stamp `BUILD_ROOT/native.config` and the
 source inventory.
+
+Compilers with `driver.parse_parts_companion` publish a `.parts` inventory.
+The graph preserves its `.partN.c`, `.partN.o` and `.priv.h` outputs, checks
+them before reusing an object, and prunes them when the module disappears.
+Changing `TITAN_C_PARTS` invalidates the configuration. Older SDKs keep their
+single-object graph. Only stable companions participate in Make prerequisites
+and postcompile checks, because recompilation may shrink the part inventory.
 
 Each object recipe runs `titanc --static --source-first --incremental -j1 -c`;
 test objects add `--test`. Make owns the parallelism, so `make -j2` means two
@@ -128,6 +136,11 @@ execution targets (`NATIVE_TEST_ENV`) therefore follow Titan's own test harness:
 The executable embeds no SDK path. Run the tests through the Make targets;
 running them directly needs the same queried paths.
 
+Protocol and Codex test servers receive the native build's selected `CC` and
+effective preprocessing flags through `SERVER_TEST_ENV`, including system
+OpenSSL's pkg-config includes. Live analysis can therefore resolve headers
+from installations such as Homebrew without changing project configuration.
+
 `server-test` runs the aggregate serially. `server-test-sharded` runs the
 same executable in two parallel shards through `scripts/run-server-tests.mjs`.
 `serverTestShards` there assigns each test module to exactly one shard.
@@ -191,6 +204,8 @@ build tree. It checks:
 - importing-closure rebuilds and folder and import changes;
 - header, OpenSSL, compile-flag and link-flag invalidation;
 - changed test discovery and repair of missing generated companions;
+- split-output repair, part-count changes, source shrinkage and module removal
+  when the selected compiler supports `.parts`;
 - native test execution with absent and with unrelated ambient Titan paths;
 - a production build, then the return to validation.
 
@@ -311,6 +326,11 @@ effective settings. Compiler probes live under the build root in a
 configuration-keyed cache. Test execution sets `TITAN_PROBE_CACHE_DISABLE=1`,
 because independent fixtures may reuse header names. Production and test
 objects use separate stages and native-helper directories.
+
+The driver checks each stage's split companions from the generated plan's
+`outputs` inventory before reusing an object. Missing files force the owner to
+rebuild, and `TITAN_C_PARTS` changes invalidate its configuration. Postcompile
+checks use only the stable inventory, allowing part counts to shrink.
 
 The application is `bin/titan-language-server.exe` plus
 `lib/titan/0.6/titan_language_server.dll` and `lib/titan/0.6/titan.dll`.

@@ -22,7 +22,7 @@ local wire = import "server.wire"
 local logging = import "server.logging"
 local project_config = import "server.project_config"
 local project_graph = import "server.project_graph"
-local project_watcher = import "server.project_watcher"
+local project_watcher = import "server.project_watcher.titan"
 local project_service = import "server.project_service"
 local project_loader = import "server.project_loader"
 local semantic_features = import "server.semantic_features"
@@ -484,6 +484,36 @@ local function wait_until(predicate: function (): boolean, message: string)
   test.assert(false, message)
 end
 
+-- Manual-hint policy cases retain the production registration/reconciliation
+-- owner while excluding duplicate or delayed kernel events from their oracle.
+local function use_manual_watch_delivery(app: application.Application)
+  app:stop_watching_for_testing()
+  local watching: {string: boolean} = {}
+  local backend = project_watcher.Backend.new(
+    function (path: string): string
+      local canonical = test_paths.canonical_path(path)
+      local metadata? = fs.stat(canonical)
+      test.assert(metadata ~= nil and metadata.kind == "directory",
+                  "manual watcher registration is not a directory")
+      return canonical
+    end,
+    function (path: string) watching[path] = true end,
+    function (path: string) watching[path] = nil end,
+    function (path: string): boolean return watching[path] == true end,
+    function () watching = {} end,
+    function (): {project_watcher.BackendEvent}
+      -- Reconciliation/close owns cancellation and joins the parked poll Task.
+      async.suspend(async.ResumeToken.new("application manual watcher"))
+      return {}
+    end)
+  local snapshot? = app:snapshot_for_testing()
+  local scope = project_watcher.DirectoryScope.new({}, {app.project_root})
+  if snapshot ~= nil then scope = application.watcher_scope(snapshot) end
+  app.watcher = project_watcher.start_with_backend(
+    backend, scope,
+    function (batch: project_watcher.RediscoveryBatch) app:watch_callback(batch) end)
+end
+
 local function contains_string(items: {string}, expected: string): boolean
   for index = 1, #items do
     if items[index] == expected then return true end
@@ -706,7 +736,7 @@ function test_application_accepted_hover_survives_save_and_watcher_publication(_
 
     -- Native watcher timing is excluded from this regression. didSave only
     -- records editor lifecycle; the explicit saved hint owns the publication.
-    app:stop_watching_for_testing()
+    use_manual_watch_delivery(app)
     fs.write_file(filename, accepted)
     app:on_document(lsp.DocumentNotification.saved(document))
     assert_accepted_hover()
@@ -1097,6 +1127,7 @@ local function coalesces_continuous_hints_after_publishing_one_pass()
   with_unindexed_application(function (
       filename: string, analyzer: YieldingAnalyzer,
       app: application.Application)
+    use_manual_watch_delivery(app)
     local statuses: {indexing_status.Status} = {}
     app:set_indexing_listener(function (status: indexing_status.Status)
       statuses[#statuses + 1] = status
@@ -1137,6 +1168,7 @@ local function keeps_progress_on_the_active_pass_epoch()
   with_unindexed_application(function (
       filename: string, analyzer: YieldingAnalyzer,
       app: application.Application)
+    use_manual_watch_delivery(app)
     local statuses: {indexing_status.Status} = {}
     app:set_indexing_listener(function (status: indexing_status.Status)
       statuses[#statuses + 1] = status
@@ -1185,6 +1217,7 @@ local function retries_failure_when_a_later_epoch_is_pending()
   with_unindexed_application(function (
       filename: string, analyzer: YieldingAnalyzer,
       app: application.Application)
+    use_manual_watch_delivery(app)
     local statuses: {indexing_status.Status} = {}
     app:set_indexing_listener(function (status: indexing_status.Status)
       statuses[#statuses + 1] = status
@@ -1222,7 +1255,7 @@ end
 local function filters_irrelevant_watcher_hints()
   with_application(function (filename: string, _analyzer: YieldingAnalyzer,
                              app: application.Application)
-    app:stop_watching_for_testing()
+    use_manual_watch_delivery(app)
     local snapshot? = app:snapshot_for_testing()
     test.assert(snapshot ~= nil, "watch filtering fixture has no snapshot")
     local saved = snapshot as project_service.Snapshot
@@ -1387,10 +1420,6 @@ local function filters_irrelevant_watcher_hints()
                "watch-set retirement did not refresh")
     test.assert(app:indexing_metrics().refresh_passes == before + 2,
                 "relevant watcher hints did not start bounded refreshes")
-    -- Both injected refreshes reconcile and restart the native watcher. Keep
-    -- directory creation below owned by the explicit batch under test.
-    app:stop_watching_for_testing()
-
     fs.mkdir(package_directory)
     fs.mkdir(build_directory)
     fs.mkdir(temp_directory)
@@ -1524,7 +1553,7 @@ local function refreshes_unmapped_warnings_only_during_ordinary_discovery()
   }, {}, false))
   wait_until(function (): boolean
     local metrics = app:indexing_metrics()
-    return metrics.refresh_passes == before.refresh_passes + 1 and
+    return metrics.refresh_passes >= before.refresh_passes + 1 and
            not metrics.refresh_chain_active
   end, "ordinary saved-file discovery did not finish")
   app:stop_watching_for_testing()
@@ -1535,6 +1564,7 @@ local function refreshes_unmapped_warnings_only_during_ordinary_discovery()
               service:latest().generation == saved.generation,
               "ordinary discovery did not replace warnings without recompiling")
 
+  local before_mapping = app:indexing_metrics().refresh_passes
   fs.write_file(config,
     "include = { '.' }\nsource_module_roots = { 'src', 'loose' }\n")
   app:watch_callback(project_watcher.RediscoveryBatch.new({
@@ -1542,8 +1572,9 @@ local function refreshes_unmapped_warnings_only_during_ordinary_discovery()
   }, {}, false))
   wait_until(function (): boolean
     local metrics = app:indexing_metrics()
-    return metrics.refresh_passes == before.refresh_passes + 2 and
-           not metrics.refresh_chain_active
+    return metrics.refresh_passes >= before_mapping + 1 and
+           not metrics.refresh_chain_active and
+           #service:latest().project_modules == 2
   end, "source-root mapping refresh did not finish")
   test.assert(#publications[created_uri].items == 0 and
               #publications[loose_uri].items == 1 and
@@ -1553,6 +1584,7 @@ local function refreshes_unmapped_warnings_only_during_ordinary_discovery()
               "configured source root did not clear its warning and enter project scope")
   app:stop_watching_for_testing()
 
+  local before_include = app:indexing_metrics().refresh_passes
   fs.write_file(config,
     "include = { 'src' }\nsource_module_roots = { 'src' }\n")
   app:watch_callback(project_watcher.RediscoveryBatch.new({
@@ -1560,8 +1592,9 @@ local function refreshes_unmapped_warnings_only_during_ordinary_discovery()
   }, {}, false))
   wait_until(function (): boolean
     local metrics = app:indexing_metrics()
-    return metrics.refresh_passes == before.refresh_passes + 3 and
-           not metrics.refresh_chain_active
+    return metrics.refresh_passes >= before_include + 1 and
+           not metrics.refresh_chain_active and
+           #service:latest().discovery_issues == 0
   end, "include-scope replacement did not finish")
   test.assert(#publications[loose_uri].items == 0 and
               #service:latest().discovery_issues == 0,
@@ -1974,7 +2007,7 @@ local function ignores_extensionless_temporary_during_active_refresh()
   with_application(function (
       filename: string, analyzer: YieldingAnalyzer,
       app: application.Application)
-    app:stop_watching_for_testing()
+    use_manual_watch_delivery(app)
     local snapshot? = app:snapshot_for_testing()
     test.assert(snapshot ~= nil,
                 "active temporary-file fixture has no snapshot")
@@ -2166,17 +2199,18 @@ local function watches_canonical_targets_of_lexically_mapped_include_symlinks()
   }, {}, false))
   wait_until(function (): boolean
     local metrics = app:indexing_metrics()
-    return metrics.refresh_passes == before + 1 and
+    return metrics.refresh_passes >= before + 1 and
            not metrics.refresh_chain_active
   end, "canonical source modification did not refresh its lexical project")
   app:stop_watching_for_testing()
+  local before_directory = app:indexing_metrics().refresh_passes
   fs.mkdir(nested)
   app:watch_callback(project_watcher.RediscoveryBatch.new({
     project_watcher.PathChange.created(canonical_nested),
   }, {}, false))
   wait_until(function (): boolean
     local metrics = app:indexing_metrics()
-    return metrics.refresh_passes == before + 2 and
+    return metrics.refresh_passes >= before_directory + 1 and
            not app:directory_probe_active_for_testing() and
            not metrics.refresh_chain_active
   end, "canonical directory creation did not refresh its lexical project")
@@ -2214,10 +2248,16 @@ local function probes_source_ancestors_with_titan_suffix()
     app:note_saved_change()
     wait_until(function (): boolean
       local metrics = app:indexing_metrics()
-      return metrics.refresh_passes == before + 1 and
-             not metrics.refresh_chain_active
+      local snapshot? = app:snapshot_for_testing()
+      return metrics.refresh_passes >= before + 1 and
+             not metrics.refresh_chain_active and snapshot ~= nil and
+             #snapshot.config.source_module_roots == 2 and
+             snapshot.config.source_module_roots[2] == ancestor .. "/src"
     end, "future source-root configuration did not refresh")
     app:stop_watching_for_testing()
+    -- Native backends may deliver the configuration save after reconciliation.
+    -- The settled baseline still proves that the regular-file hint does no work.
+    local configured_passes = app:indexing_metrics().refresh_passes
     local epoch = app:change_epoch_for_testing()
     local runs = analyzer.runs
 
@@ -2229,7 +2269,7 @@ local function probes_source_ancestors_with_titan_suffix()
       return not app:directory_probe_active_for_testing()
     end, "source-shaped ancestor kind probe did not finish")
     test.assert(app:change_epoch_for_testing() == epoch and
-                app:indexing_metrics().refresh_passes == before + 1 and
+                app:indexing_metrics().refresh_passes == configured_passes and
                 analyzer.runs == runs,
                 "unmapped regular file at a source-root ancestor triggered refresh")
 
@@ -2240,7 +2280,7 @@ local function probes_source_ancestors_with_titan_suffix()
     }, {}, false))
     wait_until(function (): boolean
       local metrics = app:indexing_metrics()
-      return metrics.refresh_passes == before + 2 and
+      return metrics.refresh_passes >= configured_passes + 1 and
              not app:directory_probe_active_for_testing() and
              not metrics.refresh_chain_active
     end, "directory with Titan suffix did not reveal the future source-root path")
@@ -2482,7 +2522,7 @@ end
 local function rejects_fallback_after_refresh_failure()
   with_application(function (filename: string, analyzer: YieldingAnalyzer,
                              app: application.Application)
-    app:stop_watching_for_testing()
+    use_manual_watch_delivery(app)
     local statuses: {indexing_status.Status} = {}
     app:set_indexing_listener(function (status: indexing_status.Status)
       statuses[#statuses + 1] = status

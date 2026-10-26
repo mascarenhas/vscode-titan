@@ -6,12 +6,13 @@ The server is written in Titan and runs as an ordinary LSP process over stdio.
 A bundled, skills-only Codex plugin queries the same executable; see
 [Codex setup](docs/codex.md).
 
-The native executable statically links the Titan standard-library runtime, an
-embedded Lua interpreter, libuv, llhttp and SQLite. OpenSSL follows the
-selected Titan SDK: by default it uses the system's OpenSSL 3 libraries, while
-a bundled-OpenSSL SDK links its own archive. The executable also embeds
-metadata-only interfaces for the 23 canonical Titan standard modules, so
-ordinary project typechecking needs no SDK at run time.
+On Linux and macOS, the native executable statically links the Titan
+standard-library runtime, an embedded Lua interpreter, libuv, llhttp and
+SQLite. OpenSSL follows the selected Titan SDK: by default it uses the
+system's OpenSSL 3 libraries, while a bundled-OpenSSL SDK links its own archive.
+The executable also embeds
+metadata-only interfaces for all SDK-selected canonical Titan standard
+modules, so ordinary project typechecking needs no SDK at run time.
 
 The Titan compiler is not linked into the executable. The embedded Lua state
 loads the ordinary `titan-compiler` modules through `package.path`, and their

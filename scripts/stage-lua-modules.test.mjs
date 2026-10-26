@@ -10,7 +10,7 @@ import { validateSdkIncludeInventory } from "./sdk-include-inventory.mjs";
 
 test("Windows SDK headers permit only the complete regular libbacktrace pair", () => {
   const base = ["lauxlib.h", "llhttp.h", "luaconf.h", "lua.h", "lua.hpp", "lualib.h",
-    "minicoro.h", "sqlite3.h", "titan.h", "uv.h"].map((name) => `${name}:file`)
+    "minicoro.h", "sqlite3.h", "titan.h", "transfer.h", "uv.h"].map((name) => `${name}:file`)
     .concat(["titan:directory", "uv:directory"]);
   validateSdkIncludeInventory(base, "win32");
   const pair = ["backtrace.h:file", "backtrace-supported.h:file"];
@@ -26,6 +26,12 @@ test("Windows SDK headers permit only the complete regular libbacktrace pair", (
     [...base].sort());
   assert.deepEqual(validateSdkIncludeInventory([...base, ...pair, "unreviewed.h:file"], "win32"),
     [...base, ...pair].sort());
+  for (const platform of ["linux", "darwin", "win32"]) {
+    const withoutTransfer = base.filter((entry) => entry !== "transfer.h:file");
+    assert.deepEqual(validateSdkIncludeInventory(withoutTransfer, platform), [...withoutTransfer].sort());
+    assert.throws(() => validateSdkIncludeInventory([...withoutTransfer, "transfer.h:symbolic link"], platform),
+      /SDK include tree inventory changed/);
+  }
 });
 
 test("native compiler payload includes Windows luv with the existing controlled Lua modules", () => {
@@ -50,7 +56,7 @@ test("staging requires and copies the portable compiler path helper", async (con
   await mkdir(path.join(sdk, "share/lua/5.5/titan"));
   for (const member of nativeRootInventory()) await put(`lib/lua/5.5/${member.split(":")[0]}`);
   for (const file of ["lauxlib.h", "llhttp.h", "luaconf.h", "lua.h", "lua.hpp", "lualib.h", "minicoro.h",
-    "sqlite3.h", "titan.h", "uv.h"]) await put(`include/${file}`);
+    "sqlite3.h", "titan.h", "transfer.h", "uv.h"]) await put(`include/${file}`);
   for (const directory of ["include/titan", "include/uv", "src/lua-5.5.1"])
     await mkdir(path.join(sdk, directory), { recursive: true });
   const script = fileURLToPath(new URL("./stage-lua-modules.mjs", import.meta.url));
@@ -65,6 +71,13 @@ test("staging requires and copies the portable compiler path helper", async (con
   assert.equal(staged.status, 0, staged.stderr);
   assert.equal(await readFile(path.join(root, "dist/titan/share/lua/5.5/titan-compiler/path.lua"), "utf8"),
     "return { portable = true }\n");
+  assert.equal(await readFile(path.join(root, "dist/titan/include/transfer.h"), "utf8"), "fixture\n");
+  await rm(path.join(sdk, "include/transfer.h"));
+  const legacyDestination = path.join(root, "legacy");
+  await stageLuaModules({ sdk, destination: legacyDestination });
+  await validateStagedLuaModules(sdk, legacyDestination);
+  await assert.rejects(readFile(path.join(legacyDestination, "include/transfer.h")), { code: "ENOENT" });
+  await put("include/transfer.h");
 
   // The installed compiler tree can contain LuaRocks itself and other packages;
   // only the reviewed compiler and SDK roots belong in the delivered payload.

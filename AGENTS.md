@@ -86,7 +86,7 @@ until the first public release, and update the compiler and its consumers
 together without incrementing it.
 
 Consume an installed Titan SDK, selected by `TITAN_PREFIX` or by
-`titanc --print-prefix`, and use its compiler, Lua, modules, headers and
+`titanc --print-root`, and use its compiler, Lua, modules, headers and
 providers together. Do not bootstrap a compiler or require a Titan checkout in
 consumer builds, and never modify the SDK. Keep the package lockfile checked in
 and use `npm ci`. `docs/native-build.md` owns the build profiles, staging rules,

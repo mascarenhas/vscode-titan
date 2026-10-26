@@ -81,17 +81,18 @@ changed, failed and removed modules replace only their own rows. External
 source and binary modules keep manifests and provenance only
 (`external_records`).
 
-C-header and FFI conversion artifacts use the compiler kinds `c-header-v6` and
-`ffi-conversion-v7`. `artifact_table` and `artifact_scope` in
-`workspace_cache.titan` map them to their tables.
+C-header artifacts accept the compiler kinds `c-header-v6` and `c-header-v7`;
+FFI conversion artifacts accept `ffi-conversion-v7` and `ffi-conversion-v8`.
+`artifact_table` and `artifact_scope` in `workspace_cache.titan` map these
+reviewed namespace pairs to their tables. `Store:read_saved_cache` in
+`completion_store.titan` accepts the same sets for private preparation.
 `test_workspace_cache_accepts_installed_compiler_artifact_namespaces` in
 `src/server/workspace_cache_test.titan` reads both kinds from the installed
-compiler. A compiler update that renames a kind therefore fails that test
-instead of silently missing the cache. `Store:read_saved_cache` in
-`completion_store.titan` repeats the mapping, and that test does not cover the
-copy ([#113](https://github.com/mascarenhas/vscode-titan/issues/113)). The
-relational store never interprets payload contents; the compiler's
-envelope and version checks govern them.
+compiler and exercises saved lookup and private reads, including their saved
+generation fence. A compiler update that renames a kind therefore fails that
+test instead of silently missing the cache. Unknown kinds remain cache misses.
+The relational store never interprets payload contents; the compiler's envelope
+and version checks govern them.
 
 Mutable preprocessor contexts for forced `-include` and `-imacros` inputs are
 not persisted. A fresh process preprocesses them again before validating

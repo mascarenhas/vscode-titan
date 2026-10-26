@@ -14,7 +14,7 @@ contract. Use GitHub Project 2 as the live Kanban record.
 Read the sibling `../titan/.agents/skills/titan-programmer/SKILL.md` before any
 Titan source work. Add `titan-tester`, `titan-async`, `titan-ffi`, or
 `titan-pegs` when their boundaries apply. Use the installed SDK selected by
-`TITAN_PREFIX`, or by `titanc --print-prefix` on `PATH`, and its installed Lua
+`TITAN_PREFIX`, or by `titanc --print-root` on `PATH`, and its installed Lua
 paths. Prefix discovery is portable across Unix and Windows and uses the
 compiler's provider lookup through `package.cpath`. Consumer builds must not
 bootstrap Titan or require its checkout. Treat the SDK as immutable and keep

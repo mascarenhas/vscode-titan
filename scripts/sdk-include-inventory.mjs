@@ -8,6 +8,9 @@ const windowsBacktraceHeaders = ["backtrace.h", "backtrace-supported.h"];
 export function validateSdkIncludeInventory(entries, platform = process.platform) {
   const actual = [...entries].sort();
   const expected = [...includeRoot];
+  // The published 0.6 rock predates transfer storage. Newer SDKs expose it
+  // through titan.h, so preserve the header whenever that installation has it.
+  if (actual.some((entry) => entry.startsWith("transfer.h:"))) expected.push("transfer.h:file");
   if (actual.some((entry) => entry.startsWith("openssl:"))) expected.push("openssl:directory");
   // Makefile.win's runtime installer copies both libbacktrace headers. Older
   // seeded SDKs omit them; accept either layout, never a partial/irregular pair.

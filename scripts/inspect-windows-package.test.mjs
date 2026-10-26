@@ -12,7 +12,7 @@ test("Windows package inspection validates required SDK headers and permits unre
   const sdk = path.join(root, "sdk"), include = path.join(sdk, "include");
   for (const name of ["titan", "uv"]) await mkdir(path.join(include, name), { recursive: true });
   for (const name of ["lauxlib.h", "llhttp.h", "luaconf.h", "lua.h", "lua.hpp", "lualib.h",
-    "minicoro.h", "sqlite3.h", "titan.h", "uv.h", "backtrace.h", "backtrace-supported.h"]) {
+    "minicoro.h", "sqlite3.h", "titan.h", "transfer.h", "uv.h", "backtrace.h", "backtrace-supported.h"]) {
     await writeFile(path.join(include, name), `/* ${name} */\n`);
   }
   const inspect = () => inspectPackage(path.join(root, "missing.vsix"), sdk, "unused", root);

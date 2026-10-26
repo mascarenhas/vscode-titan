@@ -43,14 +43,18 @@ Examples are `restat_c_header_dependencies`, `split_shell_words`, and the
 project-entry codecs. `AGENTS.md` states the rule for keeping the API version
 at `1`.
 
-The embedded metadata-only interface provider is generated at build time by
-`scripts/generate-embedded-interfaces.lua` from the SDK's
-`lib/titan/0.6/titan.a`. It covers the 23 canonical standard modules listed in
-`EXPECTED_MODULES` and includes the build target's C type profile. The
-compiler can therefore typecheck standard-library imports, including
-reflection, without a C compiler or SDK. The generated C registers only the
-compiler's bare `titan` support table in `package.preload`. It does not
-register or initialize the native `titan.*` modules. On Windows,
+`scripts/generate-embedded-interfaces.lua` accepts two exact standard-module
+inventories: the published 0.6 SDK's original 23 modules, or the current master
+SDK's 26, which add `titan.protobuf`, `titan.thread` and `titan.transfer`.
+`EXPECTED_MODULES` and `validate_inventory` define the reviewed sets; partial
+additional groups and unexpected modules are rejected.
+
+On Unix, the script generates the embedded metadata-only interface provider
+from the SDK's `lib/titan/0.6/titan.a`, including the build target's C type
+profile. The compiler can therefore typecheck standard-library imports,
+including reflection, without a C compiler or SDK. The generated C registers
+only the compiler's bare `titan` support table in `package.preload`. It does
+not register or initialize the native `titan.*` modules. On Windows,
 `src/server/embedded_interfaces_windows.c` reads interfaces from the loaded
 standard-provider DLL; see
 [native builds](native-build.md#windows-embedded-interfaces).
