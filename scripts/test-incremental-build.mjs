@@ -2,505 +2,67 @@
 
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { readFile, writeFile, mkdir, mkdtemp, readdir, stat, unlink, chmod } from "node:fs/promises";
+import { mkdir, mkdtemp, stat, writeFile } from "node:fs/promises";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
-import { performance } from "node:perf_hooks";
 import { resolveTitanSdk } from "./titan-sdk.mjs";
 
-const repository = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const repository = fileURLToPath(new URL("..", import.meta.url));
 const options = {};
 for (let index = 2; index < process.argv.length; index += 2) {
-  const flag = process.argv[index];
-  assert.ok(["--prefix", "--output"].includes(flag), `unknown argument ${flag}`);
-  assert.ok(process.argv[index + 1], `${flag} requires a pathname`);
-  options[flag.slice(2)] = path.resolve(process.argv[index + 1]);
+  assert(["--prefix", "--output"].includes(process.argv[index]) && process.argv[index + 1], "expected --prefix/--output PATH");
+  options[process.argv[index].slice(2)] = path.resolve(process.argv[index + 1]);
 }
-options.prefix = resolveTitanSdk({ prefix: options.prefix });
+const prefix = resolveTitanSdk({ prefix: options.prefix });
 await mkdir(path.join(repository, ".build"), { recursive: true });
-const output = options.output ?? await mkdtemp(path.join(repository, ".build", "incremental-check-"));
+const output = options.output ?? await mkdtemp(path.join(repository, ".build", "incremental-smoke-"));
 if (options.output) await mkdir(output);
-const source = path.join(output, "source");
-const build = path.join(output, "build");
-const server = path.join(output, "titan-language-server");
-const tests = path.join(build, "tests", "server", "tests");
-const callsFile = path.join(output, "compiler-calls.jsonl");
-const failureMarker = path.join(output, "fail-next-server-link");
-const opensslFlagsFile = path.join(output, "openssl-flags.json");
-const opensslLauncher = path.join(output, "pkg-config-openssl");
-const linkedServer = path.join(build, "server", "titan_language_server");
-const compiler = path.join(options.prefix, "bin", "titanc");
-const launcher = path.join(output, "titanc");
-const environment = { ...process.env, CCACHE_DISABLE: "1", TITAN_ROCKS_ROOT: options.prefix };
-for (const name of ["C_INCLUDE_PATH", "LUA_PATH", "LUA_CPATH", "LUA_PATH_5_5", "LUA_CPATH_5_5",
-  "TITAN_PREFIX", "TITAN_PATH", "TITAN_PATH_0_6", "TITAN_EXTRA_CPPFLAGS", "TITAN_EXTRA_CFLAGS", "TITAN_EXTRA_LDFLAGS",
-  "BUILD_PROFILE", "TITAN_BUILD_PROFILE", "TITAN_C_PARTS"]) {
-  delete environment[name];
+const source = path.join(output, "src"), build = path.join(output, "build");
+const server = path.join(output, "titan-language-server"), tests = path.join(build, "tests/server/tests");
+await mkdir(path.join(source, "fixture"), { recursive: true });
+await mkdir(path.join(source, "server"));
+await writeFile(path.join(source, "fixture/leaf.titan"), "function answer(): integer return 7 end\n");
+await writeFile(path.join(source, "titan_language_server.titan"), `local leaf = import "fixture.leaf"
+function main(args: {string}): integer return leaf.answer() end
+`);
+await writeFile(path.join(source, "server/tests.titan"), `local test = import "test"
+local leaf = import "fixture.leaf"
+function test_answer(context: test.Context) test.assert(leaf.answer() == 7) end
+`);
+const env = { ...process.env };
+for (const name of ["MAKEFLAGS", "MFLAGS", "MAKELEVEL", "LUA_PATH", "LUA_CPATH", "LUA_PATH_5_5", "LUA_CPATH_5_5",
+  "TITAN_SOURCE_PATH", "TITAN_PATH", "TITAN_PATH_0_6", "TITAN_FILTER"]) delete env[name];
+function run(label, command, args, expected = 0) {
+  const result = spawnSync(command, args, { cwd: repository, env, encoding: "utf8", timeout: 600_000, maxBuffer: 32 * 1024 * 1024 });
+  assert.equal(result.status, expected, `${label}: ${result.error?.message ?? result.stderr}`);
+  return (result.stdout ?? "") + (result.stderr ?? "");
 }
-const policy = {
-  BUILD_PROFILE: "validation",
-  TITAN_EXTRA_CPPFLAGS: "",
-  TITAN_EXTRA_CFLAGS: "",
-  TITAN_EXTRA_LDFLAGS: ""
-};
-const report = { completed: false, source, build, compiler, steps: [] };
-let commandNumber = 0;
-
-async function put(relative, contents) {
-  const filename = path.join(source, relative);
-  await mkdir(path.dirname(filename), { recursive: true });
-  await writeFile(filename, contents);
+async function make(label) {
+  const log = run(label, "make", ["--no-print-directory", "-j2", `TITAN_PREFIX=${prefix}`, `SOURCE_ROOT=${source}`,
+    `BUILD_ROOT=${build}`, `SERVER=${server}`, "BUILD_PROFILE=validation", "TITAN_FLAGS=-v", "server", "server-test-build"]);
+  await writeFile(path.join(output, label + ".log"), log);
+  assert.equal(run(label + " server", server, [], 7), "");
+  const native = run(label + " tests", "make", ["--no-print-directory", `TITAN_PREFIX=${prefix}`, `BUILD_ROOT=${build}`, "server-test-run"]);
+  assert.match(native, /\[  PASSED  \] 1 test\./);
+  return log;
 }
-
-async function command(label, executable, args, expectedStatus = 0) {
-  const started = performance.now();
-  const result = spawnSync(executable, args, {
-    cwd: repository, env: environment, encoding: "utf8", maxBuffer: 32 * 1024 * 1024,
-    timeout: 600_000
-  });
-  const log = `${String(++commandNumber).padStart(2, "0")}-${label}.log`;
-  await writeFile(path.join(output, log), (result.stdout ?? "") + (result.stderr ?? ""));
-  assert.equal(result.status, expectedStatus,
-    `${label} exited ${result.status}: ${result.error?.message ?? result.stderr ?? ""}\nSee ${log}`);
-  return { output: result.stdout, wallMs: Math.round(performance.now() - started), log };
+const tracked = [server, tests, ...["server", "tests"].flatMap((mode) => ["fixture/leaf.o", mode === "server" ? "titan_language_server.o" : "server/tests.o"]
+  .map((name) => path.join(build, mode, name)))];
+async function snapshot() {
+  return Promise.all(tracked.map(async (name) => String((await stat(name, { bigint: true })).mtimeNs)));
 }
-
-async function calls() {
-  try {
-    return (await readFile(callsFile, "utf8")).trim().split("\n").filter(Boolean).map(JSON.parse);
-  } catch (error) {
-    if (error.code === "ENOENT") return [];
-    throw error;
-  }
-}
-
-async function make(label, { relativeBuildRoot = false, goals = ["server", "server-test-build"], expectedStatus = 0 } = {}) {
-  const before = (await calls()).length;
-  const result = await command(label, "make", ["--no-print-directory", "-j2",
-    `SOURCE_ROOT=${source}`, `BUILD_ROOT=${relativeBuildRoot ? path.relative(repository, build) : build}`, `SERVER=${server}`,
-    `TITAN_PREFIX=${options.prefix}`, `TITANC=${launcher}`,
-    ...Object.entries(policy).map(([name, value]) => `${name}=${value}`),
-    ...goals], expectedStatus);
-  result.calls = (await calls()).slice(before);
-  report.steps.push({ label, wallMs: result.wallMs, compilerCalls: result.calls.length, log: result.log });
-  return result;
-}
-
-async function observedFiles() {
-  const result = {};
-  async function visit(directory) {
-    for (const entry of await readdir(directory, { withFileTypes: true })) {
-      const filename = path.join(directory, entry.name);
-      if (entry.isDirectory()) await visit(filename);
-      else if (/\.(?:o|c|ffi\.h|titan\.h|priv\.h|parts)$/.test(entry.name)) {
-        const info = await stat(filename, { bigint: true });
-        result[path.relative(build, filename)] = `${info.mtimeNs}:${info.size}`;
-      }
-    }
-  }
-  await visit(build);
-  for (const [name, filename] of [["server-executable", server], ["test-executable", tests]]) {
-    const info = await stat(filename, { bigint: true });
-    result[name] = `${info.mtimeNs}:${info.size}`;
-  }
-  return result;
-}
-
-function changed(before, after, filename) {
-  assert.ok(before[filename] && after[filename], `missing tracked output ${filename}`);
-  assert.notEqual(after[filename], before[filename], `${filename} was not rebuilt`);
-}
-
-function unchanged(before, after, filename) {
-  assert.ok(before[filename] && after[filename], `missing tracked output ${filename}`);
-  assert.equal(after[filename], before[filename], `${filename} rebuilt outside the changed import closure`);
-}
-
-async function runtime(label, expected, names) {
-  await command(`${label}-server`, server, [], expected);
-  const result = await make(`${label}-tests`, { goals: ["server-test-run"] });
-  assert.ok(result.output.includes(`[  PASSED  ] ${names.length} tests.`), "test discovery count changed");
-  for (const name of names) assert.ok(result.output.includes(`[ RUN      ] ${name}`), `missing case ${name}`);
-  return result.output;
-}
-
-async function noOp(label, options) {
-  const before = await observedFiles();
-  const result = await make(label, options);
-  assert.equal(result.calls.length, 0, `${label} invoked Titan during a no-op build`);
-  assert.deepEqual(await observedFiles(), before, `${label} rewrote native outputs`);
-}
-
-const app = (dependency, expression = "extra()") => `local leaf = import "fixture.${dependency}"
-local strings = import "string"
-local test = import "test"
--- This literal must never enter the build import graph.
-local example = 'local bogus = import "missing.fixture"'
-function answer(): integer return leaf.value() + ${expression} end
-function testing(): boolean return test.testing() end
-`;
-const leaf = (adjustment) => `foreign import "value.h"
-foreign function native_value(): int return ffi.incremental_header_value() end
-foreign function native_digest_ok(): int return ffi.incremental_digest_ok() end
-local function hidden(): integer return ${adjustment} end
-function value(): integer
-  if native_digest_ok() == 0 then raise "OpenSSL SHA256 consumer failed" end
-  return native_value() + hidden() - 1
-end
-`;
-const appTests = (name, extra = "") => `local test = import "test"
-local app = import "fixture.app"
-local leaf = import "fixture.leaf.titan"
-function ${name}(context: test.Context)
-  test.assert(test.testing() and app.testing() and app.answer() > 0 and leaf.native_value() > 0)
-end
-${extra}`;
-let names = ["fixture.app_test.test_initial", "fixture.other_test.test_unrelated"];
-
 try {
-  await put("fixture/leaf.titan", leaf(1));
-  await put("fixture/detail.h", "#define INCREMENTAL_HEADER_VALUE 3\n");
-  await put("fixture/value.h", `#ifndef INCREMENTAL_VALUE_H
-#define INCREMENTAL_VALUE_H
-#include "detail.h"
-#include <openssl/sha.h>
-#include <string.h>
-#ifndef INCREMENTAL_BIAS
-#define INCREMENTAL_BIAS 0
-#endif
-#ifndef INCREMENTAL_OPENSSL_BIAS
-#define INCREMENTAL_OPENSSL_BIAS 0
-#endif
-static inline int incremental_header_value(void) {
-  return INCREMENTAL_HEADER_VALUE + INCREMENTAL_BIAS + INCREMENTAL_OPENSSL_BIAS;
-}
-static inline int incremental_digest_ok(void) {
-  unsigned char digest[SHA256_DIGEST_LENGTH];
-  const unsigned char expected[SHA256_DIGEST_LENGTH] = {
-    0xba, 0x78, 0x16, 0xbf, 0x8f, 0x01, 0xcf, 0xea,
-    0x41, 0x41, 0x40, 0xde, 0x5d, 0xae, 0x22, 0x23,
-    0xb0, 0x03, 0x61, 0xa3, 0x96, 0x17, 0x7a, 0x9c,
-    0xb4, 0x10, 0xff, 0x61, 0xf2, 0x00, 0x15, 0xad
-  };
-  return SHA256((const unsigned char *)"abc", 3, digest) != NULL &&
-    memcmp(digest, expected, sizeof(expected)) == 0;
-}
-#endif
-`);
-  await put("fixture/app/app.titan", app("leaf"));
-  await put("fixture/app/extra.titan", 'local function extra(): integer return #strings.upper("ok") end\n');
-  await put("fixture/unrelated.titan", "function value(): integer return 0 end\n");
-  await put("fixture/app_test.titan", appTests("test_initial"));
-  await put("fixture/other_test.titan", `local test = import "test"
-local unrelated = import "fixture.unrelated"
-function test_unrelated(context: test.Context) test.assert(unrelated.value() == 0) end
-`);
-  await put("server/tests.titan", `local first = import "fixture.app_test"
-local second = import "fixture.other_test"
-`);
-  await put("titan_language_server.titan", `local app = import "fixture.app"
-local unrelated = import "fixture.unrelated"
-function main(args: {string}): integer
-  if app.testing() then raise "test runner active during ordinary application execution" end
-  return app.answer() + unrelated.value()
-end
-`);
-  for (const header of ["compiler_io_clock.h", "embedded_interfaces_native.h"]) {
-    await put(`server/${header}`, await readFile(path.join(repository, "src/server", header)));
-  }
-  const wrapper = path.join(output, "record-compiler.mjs");
-  await writeFile(wrapper, `import {appendFileSync, existsSync, unlinkSync, writeFileSync, chmodSync} from 'node:fs';
-import {spawnSync} from 'node:child_process';
-const args=process.argv.slice(2);
-appendFileSync(${JSON.stringify(callsFile)},JSON.stringify({args,profile:process.env.TITAN_BUILD_PROFILE})+'\\n');
-if (!args.includes('-c') && !args.includes('--test') && args.includes('titan_language_server') && existsSync(${JSON.stringify(failureMarker)})) {
-  unlinkSync(${JSON.stringify(failureMarker)});
-  writeFileSync(${JSON.stringify(linkedServer)}, '');
-  chmodSync(${JSON.stringify(linkedServer)}, 0o755);
-  console.error('injected failure after the linker created its output');
-  process.exit(91);
-}
-const child=spawnSync(${JSON.stringify(compiler)},args,{stdio:'inherit',env:process.env});
-if(child.error) console.error(child.error.message);
-process.exit(child.status ?? 1);
-`);
-  const quote = (text) => `'${text.replaceAll("'", "'\\''")}'`;
-  await writeFile(launcher, `#!/bin/sh\nexec ${quote(process.execPath)} ${quote(wrapper)} "$@"\n`);
-  await chmod(launcher, 0o755);
-
-  try {
-    await stat(path.join(options.prefix, "include", "openssl"));
-    report.opensslFlagInvalidation = { skipped: "bundled provider carries its OpenSSL objects" };
-  } catch (error) {
-    if (error.code !== "ENOENT") throw error;
-    report.opensslFlagInvalidation = { mode: "system" };
-    const pkgConfigWrapper = path.join(output, "pkg-config-openssl.mjs");
-    await writeFile(opensslFlagsFile, JSON.stringify({ cppflags: "", ldflags: "" }));
-    await writeFile(pkgConfigWrapper, `import {readFileSync} from 'node:fs';
-import {spawnSync} from 'node:child_process';
-const args=process.argv.slice(2);
-const child=spawnSync('pkg-config',args,{encoding:'utf8',env:process.env});
-if(child.error) console.error(child.error.message);
-if(child.stderr) process.stderr.write(child.stderr);
-if(child.status !== 0) process.exit(child.status ?? 1);
-const flags=JSON.parse(readFileSync(${JSON.stringify(opensslFlagsFile)},'utf8'));
-const extra=args.includes('--cflags') ? flags.cppflags : args.includes('--libs') ? flags.ldflags : '';
-const stdout=[child.stdout.trim(),extra].filter(Boolean).join(' ');
-if(stdout) process.stdout.write(stdout+'\\n');
-`);
-    await writeFile(opensslLauncher, `#!/bin/sh\nexec ${quote(process.execPath)} ${quote(pkgConfigWrapper)} "$@"\n`);
-    await chmod(opensslLauncher, 0o755);
-    policy.OPENSSL_PKG_CONFIG = opensslLauncher;
-  }
-
-  const initial = await make("initial");
-  assert.ok(initial.calls.length > 0 && initial.calls.every(call => call.profile === "validation"),
-    "all compiler phases must use the validation profile");
-  assert.ok(initial.calls.every(call => !call.args.includes("titan.test")),
-    "native tests must use the installed titan.test provider without compiling its source");
-  assert.ok(Object.keys(await observedFiles()).every(filename => !filename.includes("__test_support")),
-    "native tests must not create a private titan.test support object");
-  await runtime("initial", 5, names);
-  // CI starts without a Titan search path. Also reject a developer's unrelated
-  // SDK: both version-specific and fallback runtime variables must be pinned.
-  environment.TITAN_PATH_0_6 = path.join(output, "unrelated-versioned-sdk");
-  environment.TITAN_PATH = path.join(output, "unrelated-fallback-sdk");
-  environment.TITAN_ROCKS_ROOT = path.join(output, "unrelated-compiler-sdk");
-  environment.LUA_PATH_5_5 = path.join(output, "unrelated-lua/?.lua");
-  environment.LUA_CPATH_5_5 = path.join(output, "unrelated-c/?.so");
-  await runtime("hostile-runtime-paths", 5, names);
-  environment.TITAN_ROCKS_ROOT = options.prefix;
-  delete environment.LUA_PATH_5_5;
-  delete environment.LUA_CPATH_5_5;
-  await noOp("initial-noop");
-  await noOp("relative-build-root-noop", { relativeBuildRoot: true });
-
-  await put("fixture/app_test.titan", "function unfinished(");
-  await noOp("server-ignores-malformed-test", { goals: ["server"] });
-  await put("fixture/app_test.titan", appTests("test_initial"));
-  await make("restore-test-source");
-
-  let before = await observedFiles();
-  await put("fixture/leaf.titan", leaf(2));
-  await make("leaf-change");
-  let after = await observedFiles();
-  for (const mode of ["server-src", "test-src"]) {
-    changed(before, after, `${mode}/fixture/leaf.o`);
-    changed(before, after, `${mode}/fixture/app/app.o`);
-    unchanged(before, after, `${mode}/fixture/unrelated.o`);
-  }
-  await runtime("leaf-change", 6, names);
-
-  await put("fixture/alternate.titan", "function value(): integer return 12 end\n");
-  await put("fixture/app/app.titan", app("alternate"));
-  await make("import-change");
-  after = await observedFiles();
-  for (const mode of ["server-src", "test-src"]) assert.ok(after[`${mode}/fixture/alternate.o`]);
-  await runtime("import-change", 14, names);
-
-  await put("fixture/app/app.titan", app("leaf", '#strings.upper("ok")'));
-  await unlink(path.join(source, "fixture/app/extra.titan"));
-  await make("folder-member-removal");
-  for (const mode of ["server-src", "test-src"]) {
-    await assert.rejects(stat(path.join(build, mode, "fixture/app/extra.titan")), { code: "ENOENT" });
-  }
-  await runtime("folder-member-removal", 6, names);
-
-  await unlink(path.join(source, "fixture/alternate.titan"));
-  await make("module-removal");
-  for (const mode of ["server-src", "test-src"]) {
-    for (const suffix of [".titan", ".c", ".o", ".ffi.h", ".titan.h", ".parts"]) {
-      await assert.rejects(stat(path.join(build, mode, `fixture/alternate${suffix}`)), { code: "ENOENT" });
-    }
-  }
-
-  await put("fixture/app.titan", app("leaf", '#strings.upper("ok")'));
-  await unlink(path.join(source, "fixture/app/app.titan"));
-  await make("folder-to-flat-layout");
-  for (const mode of ["server-src", "test-src"]) {
-    assert.ok((await stat(path.join(build, mode, "fixture/app.o"))).isFile());
-    for (const suffix of [".titan", ".c", ".o", ".ffi.h", ".titan.h", ".parts"]) {
-      await assert.rejects(stat(path.join(build, mode, `fixture/app/app${suffix}`)), { code: "ENOENT" });
-    }
-  }
-  await runtime("folder-to-flat-layout", 6, names);
-
-  before = await observedFiles();
-  await put("fixture/detail.h", "#define INCREMENTAL_HEADER_VALUE 8\n");
-  await make("transitive-header-change");
-  after = await observedFiles();
-  for (const mode of ["server-src", "test-src"]) {
-    changed(before, after, `${mode}/fixture/leaf.o`);
-  }
-  await runtime("transitive-header-change", 11, names);
-
-  policy.TITAN_EXTRA_CPPFLAGS = "-DINCREMENTAL_BIAS=4";
-  before = await observedFiles();
-  await make("preprocessor-flags-change");
-  after = await observedFiles();
-  for (const mode of ["server-src", "test-src"]) changed(before, after, `${mode}/fixture/leaf.o`);
-  await runtime("preprocessor-flags-change", 15, names);
-  await noOp("flags-noop");
-
-  if (report.opensslFlagInvalidation.mode === "system") {
-    // Keep the SDK and pkg-config executable unchanged. Only its effective
-    // metadata changes, so cached objects must follow the resulting inputs.
-    before = await observedFiles();
-    await writeFile(opensslFlagsFile, JSON.stringify({ cppflags: "-DINCREMENTAL_OPENSSL_BIAS=2", ldflags: "" }));
-    await make("system-openssl-preprocessor-change");
-    after = await observedFiles();
-    for (const mode of ["server-src", "test-src"]) {
-      changed(before, after, `${mode}/fixture/leaf.o`);
-      changed(before, after, `${mode}/fixture/unrelated.o`);
-    }
-    await runtime("system-openssl-preprocessor-change", 17, names);
-
-    before = await observedFiles();
-    const libraryDirectory = path.join(output, "openssl-library-search");
-    await mkdir(libraryDirectory);
-    await writeFile(opensslFlagsFile, JSON.stringify({
-      cppflags: "-DINCREMENTAL_OPENSSL_BIAS=2", ldflags: `-L${quote(libraryDirectory)}`
-    }));
-    await make("system-openssl-link-flags-change");
-    after = await observedFiles();
-    changed(before, after, "server-executable");
-    changed(before, after, "test-executable");
-    await runtime("system-openssl-link-flags-change", 17, names);
-    await noOp("system-openssl-flags-noop");
-
-    await writeFile(opensslFlagsFile, JSON.stringify({ cppflags: "", ldflags: "" }));
-    await make("system-openssl-flags-restored");
-    await runtime("system-openssl-flags-restored", 15, names);
-    await noOp("system-openssl-restored-noop");
-  }
-
-  // A profile-only change must rebuild both graphs and native helpers, even
-  // without an explicit extra flag. Use the tiny fixture for optimized smoke.
-  policy.BUILD_PROFILE = "production";
-  before = await observedFiles();
-  const optimized = await make("production-profile");
-  after = await observedFiles();
-  assert.ok(optimized.calls.length > 0 && optimized.calls.every(call => call.profile === "production"));
-  for (const mode of ["server-src", "test-src"]) changed(before, after, `${mode}/fixture/unrelated.o`);
-  changed(before, after, "server-executable");
-  changed(before, after, "test-executable");
-  await runtime("production-profile", 15, names);
-  await noOp("production-profile-noop");
-  policy.BUILD_PROFILE = "validation";
-  await make("validation-profile-restored");
-  await runtime("validation-profile-restored", 15, names);
-  await noOp("validation-profile-noop");
-
-  policy.TITAN_EXTRA_CFLAGS += " -fno-omit-frame-pointer";
-  before = await observedFiles();
-  await make("compile-flags-change");
-  after = await observedFiles();
-  for (const mode of ["server-src", "test-src"]) changed(before, after, `${mode}/fixture/unrelated.o`);
-  policy.TITAN_EXTRA_LDFLAGS += " -O1";
-  before = await observedFiles();
-  await make("link-flags-change");
-  after = await observedFiles();
-  changed(before, after, "server-executable");
-  changed(before, after, "test-executable");
-  await runtime("link-flags-change", 15, names);
-
-  before = await observedFiles();
-  await writeFile(launcher, `${await readFile(launcher, "utf8")}# changed compiler launcher input\n`);
-  await make("compiler-change");
-  after = await observedFiles();
-  for (const mode of ["server-src", "test-src"]) changed(before, after, `${mode}/fixture/unrelated.o`);
-
-  before = await observedFiles();
-  await put("fixture/app_test.titan", appTests("test_renamed", `function test_added(context: test.Context)
-  test.assert(test.testing())
-end
-`));
-  await make("test-discovery-change");
-  after = await observedFiles();
-  unchanged(before, after, "server-executable");
-  changed(before, after, "test-executable");
-  names = ["fixture.app_test.test_renamed", "fixture.app_test.test_added", "fixture.other_test.test_unrelated"];
-  const execution = await runtime("test-discovery-change", 15, names);
-  assert.ok(!execution.includes("fixture.app_test.test_initial"), "removed test remained in the cached runner");
-
-  await unlink(path.join(build, "test-src", "fixture", "leaf.titan.h"));
-  await make("missing-generated-header");
-  assert.ok((await stat(path.join(build, "test-src", "fixture", "leaf.titan.h"))).isFile());
-  await runtime("missing-generated-header", 15, names);
-
-  // A failed linker can leave an empty executable newer than every input.
-  // Make must delete the failed target and retry the unchanged link next time.
-  await unlink(linkedServer);
-  await writeFile(failureMarker, "fail one final link\n");
-  const failedLink = await make("failed-link", { goals: ["server"], expectedStatus: 2 });
-  assert.equal(failedLink.calls.length, 1, "failed-link fixture unexpectedly compiled modules");
-  await assert.rejects(stat(linkedServer), { code: "ENOENT" });
-  const retriedLink = await make("failed-link-retry", { goals: ["server"] });
-  assert.equal(retriedLink.calls.length, 1, "failed link was not retried exactly once");
-  assert.ok(!retriedLink.calls[0].args.includes("-c"), "link retry rebuilt a module object");
-  await runtime("failed-link-retry", 15, names);
-
-  // Completeness checks also recover an interrupted output without a failed
-  // Make process available to remove it.
-  await writeFile(linkedServer, "");
-  await chmod(linkedServer, 0o755);
-  const recoveredLink = await make("empty-output-recovery", { goals: ["server"] });
-  assert.equal(recoveredLink.calls.length, 1, "an empty executable was accepted as complete");
-  assert.ok((await stat(linkedServer)).size > 0);
-  await runtime("empty-output-recovery", 15, names);
-  await noOp("final-noop");
-  const splitSupport = await command("split-support", path.join(options.prefix, "bin", "lua"),
-    ["-E", "-e", 'io.write(require("titan-compiler.driver").parse_parts_companion and "yes" or "no")']);
-  if (splitSupport.output === "yes") {
-    // Exceed the compiler's normal split threshold without changing compiler
-    // policy or relying on the platform's default part count.
-    const functions = Array.from({ length: 1600 }, (_, index) =>
-      `function item_${index}(): string return "${"x".repeat(1024)}" end`);
-    await put("fixture/split.titan", functions.join("\n") + "\nfunction value(): integer return #item_0() end\n");
-    await put("titan_language_server.titan", 'local split = import "fixture.split"\nfunction main(args: {string}): integer return split.value() // 1024 end\n');
-    environment.TITAN_C_PARTS = "3";
-    const serverOnly = { goals: ["server"] };
-    await make("split-build", serverOnly);
-    const stem = path.join(build, "server-src", "fixture", "split");
-    const companion = await readFile(`${stem}.parts`, "utf8");
-    assert.match(companion, /^titan-parts-v1 [23]\n/, "large fixture did not split");
-    await command("split-runtime", server, [], 1);
-    await noOp("split-noop", serverOnly);
-    for (const suffix of [".part1.c", ".part1.o", ".priv.h", ".parts"]) {
-      await unlink(`${stem}${suffix}`);
-      const repaired = await make(`missing-split-${suffix.slice(1).replaceAll(".", "-")}`, serverOnly);
-      assert.ok(repaired.calls.some(call => call.args.includes("-c") && call.args.includes("fixture.split")),
-        `missing ${suffix} did not rebuild its owner`);
-      assert.ok((await stat(`${stem}${suffix}`)).isFile());
-      await command("repaired-split-runtime", server, [], 1);
-    }
-    environment.TITAN_C_PARTS = "1";
-    await make("split-policy-single-part", serverOnly);
-    assert.match(await readFile(`${stem}.parts`, "utf8"), /^titan-parts-v1 1\n/);
-    await assert.rejects(stat(`${stem}.part1.o`), { code: "ENOENT" });
-    await noOp("split-policy-single-noop", serverOnly);
-    environment.TITAN_C_PARTS = "3";
-    await make("split-policy-restored", serverOnly);
-    assert.ok((await stat(`${stem}.part1.o`)).isFile());
-    await command("restored-split-runtime", server, [], 1);
-    await put("fixture/split.titan", "function value(): integer return 1 end\n");
-    await make("split-to-single-part", serverOnly);
-    for (const suffix of [".part1.c", ".part1.o", ".priv.h"]) {
-      await assert.rejects(stat(`${stem}${suffix}`), { code: "ENOENT" });
-    }
-    await noOp("single-part-noop", serverOnly);
-    await put("titan_language_server.titan", "function main(args: {string}): integer return 1 end\n");
-    await unlink(path.join(source, "fixture/split.titan"));
-    await make("split-module-removal", serverOnly);
-    for (const suffix of [".c", ".o", ".ffi.h", ".parts"]) {
-      await assert.rejects(stat(`${stem}${suffix}`), { code: "ENOENT" });
-    }
-  }
-  report.completed = true;
+  await make("cold");
+  const before = await snapshot();
+  await make("noop");
+  assert.deepEqual(await snapshot(), before, "no-op rewrote a module or executable");
+  await writeFile(path.join(source, "fixture/leaf.titan"), "function answer(): integer return 7 + 0 end\n");
+  await make("body-edit");
+  const after = await snapshot();
+  for (const index of [2, 4]) assert.notEqual(after[index], before[index], "edited leaf was not rebuilt");
+  for (const index of [3, 5]) assert.equal(after[index], before[index], "implementation-only edit recompiled a consumer");
+  console.log(`Incremental application smoke passed; verbose logs: ${output}`);
 } catch (error) {
-  report.error = error.stack ?? String(error);
-  process.exitCode = 1;
-} finally {
-  await writeFile(path.join(output, "summary.json"), JSON.stringify(report, null, 2) + "\n");
-  console.log(JSON.stringify({ completed: report.completed, evidence: output, error: report.error }));
+  console.error(`Incremental application smoke failed; logs: ${output}`);
+  throw error;
 }

@@ -34,9 +34,9 @@ test("Windows SDK headers permit only the complete regular libbacktrace pair", (
   }
 });
 
-test("native compiler payload includes Windows luv with the existing controlled Lua modules", () => {
+test("native compiler payload includes luv on every supported platform", () => {
   assert.deepEqual(nativeRootInventory("win32"), ["lfs.dll:file", "lpeglabel.dll:file", "luv.dll:file"]);
-  assert.deepEqual(nativeRootInventory("linux"), ["lfs.so:file", "lpeglabel.so:file"]);
+  assert.deepEqual(nativeRootInventory("linux"), ["lfs.so:file", "lpeglabel.so:file", "luv.so:file"]);
 });
 
 test("staging requires and copies the portable compiler path helper", async (context) => {

@@ -101,20 +101,18 @@ export async function stageLuaNotices({ sdk, destination = outputRoot,
     await writeFile(notice, component.license, "utf8");
     versions.push({ name: component.name, version: component.version, notice: component.notice });
   }
-  if (platform === "win32") {
-    // Stock luv statically includes libuv. Its bundled license is byte-identical
-    // to the libuv license already installed by Titan and staged with its SDK.
-    const licenses = [
-      ["libuv-LICENSE", "Copyright (c) 2015-present libuv project contributors."],
-      ["libuv-LICENSE-extra", "Copyright Joyent, Inc. and other Node contributors."],
-      ["libuv-tree-LICENSE", "Copyright 2002 Niels Provos"],
-      ["libuv-inet-LICENSE", "Copyright (c) 2004 by Internet Systems Consortium, Inc."]
-    ];
-    for (const [name, marker] of licenses) {
-      const license = path.join(sdk, "share", "titan", "LICENSES", name);
-      const contents = await readRequired(license, "luv bundled libuv license");
-      requireContent(contents, marker, license, "luv bundled libuv license");
-    }
+  // Stock luv statically includes libuv on every supported platform. Its
+  // licenses are already installed by Titan and staged with its SDK.
+  const licenses = [
+    ["libuv-LICENSE", "Copyright (c) 2015-present libuv project contributors."],
+    ["libuv-LICENSE-extra", "Copyright Joyent, Inc. and other Node contributors."],
+    ["libuv-tree-LICENSE", "Copyright 2002 Niels Provos"],
+    ["libuv-inet-LICENSE", "Copyright (c) 2004 by Internet Systems Consortium, Inc."]
+  ];
+  for (const [name, marker] of licenses) {
+    const license = path.join(sdk, "share", "titan", "LICENSES", name);
+    const contents = await readRequired(license, "luv bundled libuv license");
+    requireContent(contents, marker, license, "luv bundled libuv license");
   }
 
   return versions;

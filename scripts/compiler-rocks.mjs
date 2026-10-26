@@ -24,10 +24,10 @@ export function compilerRocks(platform = process.platform) {
         ["share/lua/5.5/relabel.lua", "lua/relabel.lua"]],
       license: "doc/LICENSE", notice: "lua/lpeglabel/LICENSE",
       markers: ["The MIT License (MIT)", "Sérgio Medeiros"] },
-    ...(platform === "win32" ? [{ name: "luv", rockName: "luv", version: "1.52.1-0",
-      payloads: [["lib/lua/5.5/luv.dll", "lib/luv.dll"]],
+    { name: "luv", rockName: "luv", version: "1.52.1-0",
+      payloads: [[`lib/lua/5.5/luv.${suffix}`, `lib/luv.${suffix}`]],
       license: "doc/LICENSE.txt", notice: "lua/luv/LICENSE.txt",
-      markers: ["Apache License", "Version 2.0, January 2004"] }] : [])
+      markers: ["Apache License", "Version 2.0, January 2004"] }
   ];
 }
 

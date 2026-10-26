@@ -33,14 +33,14 @@ async function compilerSDK(context) {
   for (const directory of directories) await mkdir(path.join(result.sdk, directory), { recursive: true });
   for (const member of ["argparse.lua", "inspect.lua", "relabel.lua", "c-parser/cdriver.lua", "titan-compiler/checker.lua",
     "titan-compiler/checker/completion.lua", "titan-compiler/completion.lua", "titan-compiler/maybe3.lua", "titan-compiler/documentation.lua",
-    "titan-compiler/parser.lua", "titan-compiler/path.lua", "titan-compiler/types.lua"]) {
+    "titan-compiler/parser.lua", "titan-compiler/path.lua", "titan-compiler/types.lua",
+    "titan-compiler/build.lua", "titan-compiler/build_worker.lua", "titan-compiler/process.lua"]) {
     await result.put(`sdk/share/lua/5.5/${member}`);
   }
   await result.put("sdk/share/lua/5.5/titan-compiler/driver.lua", "driver.LANGUAGE_SERVER_API_VERSION = 1\n");
   await result.put("sdk/share/lua/5.5/titan-compiler/version.lua", 'LUA_VERSION = "5.5"\nTITAN_ABI_VERSION = "2"\nTITAN_VERSION = "0.6.0"\n');
   const extension = process.platform === "win32" ? "dll" : "so";
-  for (const member of ["lfs", "lpeglabel"]) await result.put(`sdk/lib/lua/5.5/${member}.${extension}`);
-  if (process.platform === "win32") await result.put("sdk/lib/lua/5.5/luv.dll");
+  for (const member of ["lfs", "lpeglabel", "luv"]) await result.put(`sdk/lib/lua/5.5/${member}.${extension}`);
   for (const header of ["lauxlib.h", "llhttp.h", "luaconf.h", "lua.h", "lua.hpp", "lualib.h", "minicoro.h", "sqlite3.h", "titan.h", "transfer.h", "uv.h"]) {
     await result.put(`sdk/include/${header}`);
   }
@@ -187,73 +187,59 @@ for (const layout of ["file", "link"]) {
 }
 
 for (const mode of ["system", "bundled"]) {
-  for (const retained of [false, true]) {
-    test(`${mode} installed SDK uses current OpenSSL inputs with a ${retained ? "retained" : "fresh"} native graph`,
-      { skip: process.platform === "win32" }, async (context) => {
-        const state = await fixture(context);
-        const build = path.join(state.root, "build");
-        const graph = path.join(build, "native-modules.mk");
-        const observed = path.join(build, "environment.json");
-        const stableGraph = "# Installed SDK fixture graph\nNATIVE_SDK_INPUTS :=\n";
-        const generator = await state.put("generator.mjs", `import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
-const build = ${JSON.stringify(build)}, graph = ${JSON.stringify(graph)}, contents = ${JSON.stringify(stableGraph)};
-mkdirSync(build, { recursive: true });
-let previous; try { previous = readFileSync(graph, "utf8"); } catch (error) { if (error.code !== "ENOENT") throw error; }
-if (previous !== contents) writeFileSync(graph, contents);
-writeFileSync(${JSON.stringify(observed)}, JSON.stringify({ sdk: process.env.TITAN_ROCKS_ROOT,
-  probe: process.env.TITAN_PREFIX, profile: process.env.TITAN_BUILD_PROFILE }));
-`);
-        await state.put("sdk/bin/titanc", "#!/bin/sh\nexit 0\n", true);
-        await state.put("sdk/bin/lua", `#!/bin/sh\nexec ${shellQuote(process.execPath)} "$@"\n`, true);
-        if (mode === "bundled") await mkdir(path.join(state.sdk, "include/openssl"), { recursive: true });
-        const queries = path.join(state.root, "openssl-queries");
-        const pkgConfig = await state.put("pkg-config", `#!/bin/sh
+  test(`${mode} installed SDK uses explicit OpenSSL switches and child-only SDK selection`,
+    { skip: process.platform === "win32" }, async (context) => {
+      const state = await fixture(context);
+      const build = path.join(state.root, "build");
+      await state.put("sdk/bin/titanc", "#!/bin/sh\nexit 0\n", true);
+      if (mode === "bundled") await mkdir(path.join(state.sdk, "include/openssl"), { recursive: true });
+      const queries = path.join(state.root, "openssl-queries");
+      const pkgConfig = await state.put("pkg-config", `#!/bin/sh
 printf '%s\\n' "$*" >> ${shellQuote(queries)}
 case "$1" in
   --atleast-version=3.0.0) exit 0 ;;
   --cflags) printf '%s\\n' '-I/installed/openssl' ;;
   --libs) printf '%s\\n' '-lssl -lcrypto' ;;
-  --variable=includedir) printf '%s\\n' '/installed/include' ;;
   *) exit 1 ;;
 esac
 `, true);
-        if (retained) {
-          await mkdir(build, { recursive: true });
-          await writeFile(graph, stableGraph);
-        }
-        const env = { ...process.env };
-        for (const name of ["MAKEFLAGS", "MFLAGS", "MAKELEVEL", "BUILD_PROFILE", "TITAN_BUILD_PROFILE"]) delete env[name];
-        env.TITAN_ROCKS_ROOT = "/unrelated/SDK";
-        const runtimeProbe = 'console.log("RUNTIME:" + JSON.stringify({sdk:process.env.TITAN_ROCKS_ROOT,probe:process.env.TITAN_PREFIX}))';
-        const probe = "sdk-review:\n\t@printf '%s\\n' 'SDK:$(NATIVE_OPENSSL_MODE)|$(NATIVE_OPENSSL_LDFLAGS)|$(NATIVE_OPENSSL_CPPFLAGS)'\n" +
-          `\t@$(SERVER_TEST_ENV) ${shellQuote(process.execPath)} -e ${shellQuote(runtimeProbe)}`;
-        const result = spawnSync("make", ["--no-print-directory", "-j1", "-f", repositoryMakefile,
-          `TITAN_PREFIX=${state.sdk}`, "TITAN_REPO=/nonexistent/compiler-checkout", `BUILD_ROOT=${build}`,
-          "BUILD_PROFILE=validation", "TITAN_BUILD_PROFILE=production",
-          `NATIVE_BUILD_GENERATOR=${generator}`, `OPENSSL_PKG_CONFIG=${pkgConfig}`, `--eval=${probe}`, "sdk-review"],
-        { cwd: state.root, env, encoding: "utf8", timeout: 30_000 });
-        assert.equal(result.status, 0, result.error?.message ?? result.stderr);
-        assert.ok(result.stdout.split("\n").includes(mode === "system"
-          ? "SDK:system|-lssl -lcrypto|-I/installed/openssl" : "SDK:bundled||"), result.stdout);
-        assert.ok(result.stdout.split("\n").includes(`RUNTIME:${JSON.stringify({ sdk: state.sdk })}`), result.stdout);
-        assert.deepEqual(JSON.parse(await readFile(observed, "utf8")), {
-          sdk: state.sdk, probe: path.join(build, "compiler-cache"), profile: "validation"
-        });
-        assert.equal(await readFile(graph, "utf8"), stableGraph);
-        if (mode === "system") assert.match(await readFile(queries, "utf8"), /--libs openssl/);
-        else await assert.rejects(lstat(queries), { code: "ENOENT" });
-      });
-  }
+      const env = { ...process.env };
+      for (const name of ["MAKEFLAGS", "MFLAGS", "MAKELEVEL", "BUILD_PROFILE", "TITAN_BUILD_PROFILE"]) delete env[name];
+      env.TITAN_ROCKS_ROOT = "/unrelated/SDK";
+      const runtimeProbe = 'console.log("RUNTIME:" + JSON.stringify({sdk:process.env.TITAN_ROCKS_ROOT,probe:process.env.TITAN_PREFIX}))';
+      const compilerProbe = 'console.log("COMPILER:" + JSON.stringify({sdk:process.env.TITAN_ROCKS_ROOT,probe:process.env.TITAN_PREFIX,profile:process.env.TITAN_BUILD_PROFILE}))';
+      const probe = "sdk-review: | $(TITANC)\n" +
+        "\t@printf '%s\\n' 'SDK:$(OPENSSL_MODE)|$(OPENSSL_LDFLAGS)|$(OPENSSL_CPPFLAGS)'\n" +
+        "\t@printf '%s\\n' \"FLAGS:$(TITAN_COMPILE_FLAGS) $(TITAN_LINK_FLAGS)\"\n" +
+        `\t@$(COMPILER_ENV) ${shellQuote(process.execPath)} -e ${shellQuote(compilerProbe)}\n` +
+        `\t@$(SERVER_TEST_ENV) ${shellQuote(process.execPath)} -e ${shellQuote(runtimeProbe)}`;
+      const result = spawnSync("make", ["--no-print-directory", "-j1", "-f", repositoryMakefile,
+        `TITAN_PREFIX=${state.sdk}`, "TITAN_REPO=/nonexistent/compiler-checkout", `BUILD_ROOT=${build}`,
+        "BUILD_PROFILE=validation", "TITAN_BUILD_PROFILE=production",
+        `OPENSSL_PKG_CONFIG=${pkgConfig}`, `--eval=${probe}`, "sdk-review"],
+      { cwd: state.root, env, encoding: "utf8", timeout: 30_000 });
+      assert.equal(result.status, 0, result.error?.message ?? result.stderr);
+      assert.ok(result.stdout.split("\n").includes(mode === "system"
+        ? "SDK:system|-lssl -lcrypto|-I/installed/openssl" : "SDK:bundled||"), result.stdout);
+      assert.ok(result.stdout.split("\n").includes(`RUNTIME:${JSON.stringify({ sdk: state.sdk })}`), result.stdout);
+      assert.ok(result.stdout.split("\n").includes(`COMPILER:${JSON.stringify({
+        sdk: state.sdk, probe: path.join(build, "compiler-cache"), profile: "validation"
+      })}`), result.stdout);
+      if (mode === "system") {
+        assert.match(result.stdout, /--cflag='-I\/installed\/openssl'/);
+        assert.match(result.stdout, /--ldflag='-lssl' --ldflag='-lcrypto'/);
+        assert.match(await readFile(queries, "utf8"), /--libs openssl/);
+      } else await assert.rejects(lstat(queries), { code: "ENOENT" });
+    });
 }
 
 test("missing installed compiler fails without bootstrapping or changing the SDK", {
   skip: process.platform === "win32"
 }, async (context) => {
   const state = await fixture(context);
-  const generator = await state.put("generator.lua");
   const result = spawnSync("make", ["--no-print-directory", "-f", repositoryMakefile,
     `TITAN_PREFIX=${state.sdk}`, `BUILD_ROOT=${path.join(state.root, "build")}`,
-    `NATIVE_BUILD_GENERATOR=${generator}`, "--eval=sdk-review: ; @:", "sdk-review"], {
+    "server-objects"], {
     cwd: state.root, env: process.env, encoding: "utf8", timeout: 10000
   });
   assert.notEqual(result.status, 0);

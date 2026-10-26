@@ -28,7 +28,7 @@ Each fact has one home. Elsewhere, link to it in one line.
 | Topic | Home |
 | --- | --- |
 | Users: features, build commands, settings, `titan-config.lua`, workspace cache, logging, packaging, Windows limits | `README.md` |
-| Make object graph, build profiles, test execution, staging, CI, Windows driver | `docs/native-build.md` |
+| Compiler-owned native builds, build profiles, test execution, output trees, CI, Windows driver | `docs/native-build.md` |
 | Configuration inputs, compiler compatibility, loader and Service composition | `docs/server-data-flow.md` |
 | SQLite schema, cache compatibility, header provenance, startup revalidation | `docs/sqlite-backend-storage.md` |
 | Completion, hover after completion, TEMP storage and bounds | `docs/completion.md` |
@@ -89,12 +89,12 @@ Consume an installed Titan SDK, selected by `TITAN_PREFIX` or by
 `titanc --print-root`, and use its compiler, Lua, modules, headers and
 providers together. Do not bootstrap a compiler or require a Titan checkout in
 consumer builds, and never modify the SDK. Keep the package lockfile checked in
-and use `npm ci`. `docs/native-build.md` owns the build profiles, staging rules,
+and use `npm ci`. `docs/native-build.md` owns the build profiles, output rules,
 CI and the release-job requirements.
 
 Before changing Make rules or the compiler release, read
 `docs/native-build.md` and run `make incremental-build-test`. Keep
-source/provider policy consistent within each object graph. Use the ordinary
+source/provider policy consistent within each compiler invocation. Use the ordinary
 installed provider, including compiled `titan.test`, without special
 test-support compilation or installed test sources. Independent concurrent
 builds need separate `BUILD_ROOT` values and, when linking servers, separate

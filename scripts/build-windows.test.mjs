@@ -3,9 +3,9 @@ import test from "node:test";
 import path from "node:path";
 import { lstat, mkdir, mkdtemp, readdir, readlink, realpath, rm, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { orderedModules, moduleOutputs, compilerArgument, runtimeDlls, childEnvironment, selectedBuildEnvironment,
-  windowsPathContains, assertBuildRootOutsideSdk, buildProfileEnvironment, nativeBuildFlags,
-  nativeBuildDirectory, windowsCompilerCommand, windowsApplicationLinkFlags } from "./build-windows.mjs";
+import { compilerArgument, runtimeDlls, childEnvironment, windowsPathContains, assertBuildRootOutsideSdk,
+  buildProfileEnvironment, nativeBuildFlags, nativeBuildDirectory, windowsCompilerCommand,
+  windowsApplicationArguments } from "./build-windows.mjs";
 
 test("SDK ownership recognizes Windows case variants without confusing sibling prefixes", () => {
   for (const candidate of ["c:\\sdk", "C:\\SDK\\build", "c:/Sdk/missing/child"]) {
@@ -75,33 +75,26 @@ test("SDK ownership rejects real directory aliases or preserves traversal failur
   assert.deepEqual(await readdir(sdk), []);
 });
 
-test("Windows scheduling follows parsed dependencies once and rejects cycles", () => {
-  const module = (imports = []) => ({ imports, parseError: null });
-  const plan = { modules: { root: module(["left", "right"]), left: module(["shared"]), right: module(["shared"]), shared: module() } };
-  assert.deepEqual(orderedModules(plan, ["root"]), ["shared", "left", "right", "root"]);
-  plan.modules.shared.imports.push("root");
-  assert.throws(() => orderedModules(plan, ["root"]), /cyclic source imports/);
-});
-
-test("an unrelated broken test does not prevent a production graph", () => {
-  const plan = { modules: { server: { imports: [], parseError: null }, tests: { imports: [], parseError: "broken test source" } } };
-  assert.deepEqual(orderedModules(plan, ["server"]), ["server"]);
-  assert.throws(() => orderedModules(plan, ["tests"]), /broken test source/);
-});
-
-test("folder modules own one source stem and foreign companion", () => {
-  const outputs = moduleOutputs("stage", { main: "owner/owner.titan", foreign: true });
-  assert.deepEqual(outputs, [".o", ".c", ".ffi.h", ".titan.h"].map((suffix) => path.join("stage", "owner", "owner") + suffix));
-});
-
-test("compiler output inventories preserve stage-owned split companions", () => {
-  const module = { main: "owner/owner.titan", foreign: false };
-  const stable = [".o", ".c", ".ffi.h", ".parts"].map((suffix) => "owner/owner" + suffix);
-  const split = [...stable, "owner/owner.priv.h", "owner/owner.part1.c", "owner/owner.part1.o"];
-  assert.deepEqual(moduleOutputs("server-stage", module, split),
-    split.map((relative) => path.join("server-stage", relative)));
-  assert.deepEqual(moduleOutputs("test-stage", module, stable),
-    stable.map((relative) => path.join("test-stage", relative)));
+test("Windows applications delegate source and native graphs to one compiler invocation", () => {
+  for (const testBuild of [false, true]) {
+    const directory = path.resolve("build space", testBuild ? "tests" : "server");
+    const sourceRoot = path.resolve("source space");
+    const embeddedSource = path.resolve("generated", "embedded.c"), sdk = path.resolve("sdk");
+    const args = windowsApplicationArguments({ sourceRoot, directory, embeddedSource, sdk, test: testBuild });
+    assert.equal(args[args.indexOf("--tree") + 1], sourceRoot.replaceAll("\\", "/"));
+    assert.equal(args[args.indexOf("--output") + 1], directory.replaceAll("\\", "/"));
+    assert.equal(args[args.indexOf("--exe") + 1],
+      path.join(directory, "bin", testBuild ? "server.tests.exe" : "titan-language-server.exe").replaceAll("\\", "/"));
+    assert(args.includes("--source-first") && args.includes("--incremental"));
+    assert(!args.includes("--static") && !args.includes("-c"));
+    assert.equal(args.filter((arg) => arg === "--c-source").length, 2);
+    assert(args.includes(embeddedSource.replaceAll("\\", "/")));
+    assert.equal(args.at(-1), testBuild ? "server.tests" : "titan_language_server");
+    assert.equal(args.includes("--test"), testBuild);
+    assert.equal(args.includes("--no-uv-bootstrap"), testBuild);
+    assert.equal(args.includes("--ldflag=-Wl,--stack,8388608"), testBuild);
+    assert(args.includes("-lcrypto"));
+  }
 });
 
 test("configured compiler arguments retain spaces and Unicode without a command shell", () => {
@@ -119,30 +112,13 @@ test("child build environment overrides all Windows spellings and leaves its par
   assert.deepEqual(parent, snapshot);
 });
 
-test("build fingerprints retain explicit compiler controls and exclude unrelated environment", () => {
-  const controls = { CC: "chosen-clang", AR: "chosen-ar", RANLIB: "chosen-ranlib", RC: "chosen-rc",
-    TITAN_EXTRA_CPPFLAGS: "-DTEST=1", TITAN_EXTRA_CFLAGS: "-O0", TITAN_EXTRA_LDFLAGS: "-s" };
-  const selected = selectedBuildEnvironment({ ...controls, UNRELATED_BUILD_NOTE: "exclude this" });
-  for (const [key, value] of Object.entries(controls)) assert.equal(selected[key], value);
-  assert(!Object.hasOwn(selected, "UNRELATED_BUILD_NOTE"));
-  assert.deepEqual(selected, selectedBuildEnvironment({ ...controls, UNRELATED_BUILD_NOTE: "changed unrelated input" }));
-});
-
-test("split generation policy invalidates the Windows build fingerprint", () => {
-  const single = selectedBuildEnvironment({ TITAN_C_PARTS: "1" });
-  const split = selectedBuildEnvironment({ Titan_C_Parts: "3" });
-  assert.equal(single.TITAN_C_PARTS, "1");
-  assert.equal(split.TITAN_C_PARTS, "3");
-  assert.notDeepEqual(single, split);
-});
-
 test("Windows test targets select validation while deliverables select production", () => {
   for (const target of ["server-test-build", "server-test-run"]) {
     const environment = buildProfileEnvironment(target, {});
     assert.equal(environment.VSCODE_TITAN_BUILD_PROFILE, "validation");
     assert.equal(environment.TITAN_BUILD_PROFILE, "validation");
   }
-  for (const target of ["plan", "server", "stage", "package"]) {
+  for (const target of ["server", "stage", "package"]) {
     assert.equal(buildProfileEnvironment(target, {}).TITAN_BUILD_PROFILE, "production");
   }
 });
@@ -201,15 +177,6 @@ test("production and test native helpers have separate graph ownership", () => {
   }
 });
 
-test("profile identity invalidates a graph even when explicit flags coincide", () => {
-  const inherited = { TITAN_EXTRA_CFLAGS: "-O1", TITAN_EXTRA_LDFLAGS: "-fno-lto" };
-  const validation = selectedBuildEnvironment(buildProfileEnvironment("server", inherited, "validation"));
-  const production = selectedBuildEnvironment(buildProfileEnvironment("server", inherited, "production"));
-  assert.equal(validation.TITAN_EXTRA_CFLAGS, production.TITAN_EXTRA_CFLAGS);
-  assert.equal(validation.TITAN_EXTRA_LDFLAGS, production.TITAN_EXTRA_LDFLAGS);
-  assert.notDeepEqual(validation, production);
-});
-
 
 test("Windows compilation invokes the installed LuaRocks script directly", () => {
   const sdk = "C:\\SDK space 路径";
@@ -221,13 +188,3 @@ test("Windows compilation invokes the installed LuaRocks script directly", () =>
   assert.deepEqual(arguments_, ["--tree", "source space", "server.root"]);
 });
 
-test("the Windows test aggregate reserves its own stack before explicit caller overrides", () => {
-  const inputs = ["C:\\build space\\native.o", "C:\\sdk\\libcrypto.dll.a"];
-  const extraFlags = "-Wl,--stack,16777216 -fsanitize=address";
-  const nativeInputs = inputs.map(compilerArgument).join(" ");
-  assert.equal(windowsApplicationLinkFlags({ test: true, extraFlags, inputs }),
-    `-Wl,--stack,8388608 ${extraFlags} ${nativeInputs}`);
-  assert.equal(windowsApplicationLinkFlags({ extraFlags, inputs }), `${extraFlags} ${nativeInputs}`);
-  assert.equal(windowsApplicationLinkFlags({ test: true }), "-Wl,--stack,8388608");
-  assert.equal(windowsApplicationLinkFlags(), "");
-});

@@ -127,9 +127,9 @@ Keep tests beside the layer they prove:
 - extension-host smoke tests for activation and process lifecycle.
 
 Use focused gates during development and the Makefile's complete gate before
-delivery. For a direct focused `titanc` invocation, copy `src/` to a temporary
-source stage first; using the working tree itself as `--tree` can emit generated
-`.c`/`.o` files beside the authored Titan modules. Inspect the VSIX contents and
+delivery. For a direct focused `titanc` invocation, use `--tree src` with an
+owned `--output` directory; generated C/objects must not go beside authored
+Titan modules. Inspect the VSIX contents and
 the executable's native dependencies.
 Update Project status/priority/size with `gh`, then work in a focused branch,
 stage exact paths, and open a PR only when the owned acceptance criteria are
@@ -240,40 +240,30 @@ percentage threshold.
 
 ## Incremental native builds
 
-Read [native-build.md](../../../docs/native-build.md) before changing the Make
-object graph. Make owns dependency and configuration invalidation; the compiler's
-`--incremental` check only validates source timestamps. Keep generated outputs in
-persistent build stages, and discover imports with the compiler parser so Titan
-fixture strings do not become build dependencies. Folder contributors form one
-logical module and object.
+Read [native-build.md](../../../docs/native-build.md) before changing native
+build commands. One `titanc --tree src --output ... --source-first --incremental`
+invocation owns the requested module graph, object and link certification,
+folder membership and parallel scheduling. Make owns custom embedding
+generation, the pure-C process-fixture executable, packaging and test execution,
+not module dependencies or SDK/header/configuration inventories.
 
-Use `make -j2 server server-test-build` for parallel object compilation. Each
-object recipe uses `-c --incremental -j1`; final links reuse those objects.
-`server-objects` and `server-test-objects` stop before linking. Keep production
-and test graphs separate with consistent flags and source/provider selection in
-every phase. Production and Unix tests use `--static`; test compilation and
-linking consistently add `--test`. Use the ordinary installed standard provider,
-including compiled `titan.test`; do not require installed test sources or build a
-special support module. Keep production and test source/object graphs separate
-for independent flags and generated-output ownership. Native payloads, exported
-Lua symbols and
-bootstrap flags belong at the final link.
+Use `make -j2 server server-test-build`; `TITAN_JOBS` or `TITAN_FLAGS=--jobs=N`
+bounds the compiler, which joins supported parent Make jobservers.
+`server-objects` and `server-test-objects` stop before linking. Unix builds use
+`--static`; test builds add `--test --no-uv-bootstrap`. Use the ordinary
+installed provider, including compiled `titan.test`, without installed test
+sources or a special support module. Pass native C helpers with `--c-source`
+and link-only policy through explicit compiler switches.
 
-Verify unchanged builds preserve all generated companions and executables, and
-that module, import, folder inventory, C header, compiler/SDK and flag changes
-invalidate the expected closure. Preserve two execution shards independently of
-object compilation. Run incremental build regressions and the complete gate
-before delivery. Ordinary server/package/installation builds use the production
-profile (O3 and Linux fat LTO). Test/verify entry points select validation for
-the server/test graphs and native helpers (O0, no LTO). The selected SDK's
-prebuilt providers, Lua and compiler dependencies remain unchanged; select a
-separately prepared validation SDK when provider-level validation is wanted.
-Keep the minimal production-profile fixture smoke in
-the incremental gate and the compiler's optimization-default regressions;
-routine testing need not rebuild the full optimized stdlib/server. Explicit
-flags follow profile defaults at compilation and linking. Use one Make process per
-`BUILD_ROOT`; independent concurrent builds need separate roots and, when
-linking servers, separate `SERVER` destinations.
+Keep server and test output trees separate, and keep test execution's two
+shards independent of compilation. The small incremental application smoke
+checks a no-op and leaf-body edit; exhaustive compiler certification contracts
+belong in Titan. Run the smoke and complete application gate before delivery.
+Ordinary server/package/installation builds default to production; test/verify
+goals select validation for the whole invocation. Ambient `TITAN_EXTRA_*` inputs
+remain supported. Independent Make processes need separate `BUILD_ROOT` values
+and server destinations because Make-owned generators/packaging are outside
+compiler locks.
 
 The SQLite directory is also the native server's default C probe-cache prefix.
 Use the shared workspace-cache directory helper and set this default before

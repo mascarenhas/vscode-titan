@@ -91,7 +91,7 @@ make -j2 TITAN_PREFIX="$HOME/.local/titan"
 
 `make verify` is the complete local gate. It runs the native, protocol, Codex
 adapter and JavaScript suites and the Extension Host smoke test. It also
-checks incremental rebuilds, packages a VSIX, inspects it and the
+checks the incremental-build smoke, packages a VSIX, inspects it and the
 executable's native linkage, validates the Codex plugin metadata and tests a
 server-only installation. On a headless Linux machine, run it as
 `xvfb-run -a make verify`. Test and verify targets build with the unoptimized
@@ -106,7 +106,7 @@ not a successful test run.
 
 More build documentation:
 
-- [Native builds](docs/native-build.md): the object graph, build profiles,
+- [Native builds](docs/native-build.md): compiler-owned builds, build profiles,
   test execution, CI and the Windows driver.
 - [Line coverage](docs/coverage.md).
 - [Performance measurement](docs/benchmarks.md).

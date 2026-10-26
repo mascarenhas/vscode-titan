@@ -4,12 +4,14 @@ import path from "node:path";
 import { compilerRocks, parseManifestOutput, readRockManifest, verifyCompilerRocks } from "./compiler-rocks.mjs";
 import { installedRocks } from "./fixtures/compiler-rocks.mjs";
 
-test("installed compiler dependencies use ordinary rock versions and Windows luv", () => {
-  assert.equal(compilerRocks("linux").length, 4);
+test("installed compiler dependencies include portable luv and ordinary rock versions", () => {
+  assert.equal(compilerRocks("linux").length, 5);
   const luv = compilerRocks("win32").find((component) => component.rockName === "luv");
   assert.equal(luv.version, "1.52.1-0");
   assert.equal(luv.license, "doc/LICENSE.txt");
   assert.deepEqual(luv.payloads, [["lib/lua/5.5/luv.dll", "lib/luv.dll"]]);
+  assert.deepEqual(compilerRocks("linux").find((component) => component.rockName === "luv").payloads,
+    [["lib/lua/5.5/luv.so", "lib/luv.so"]]);
 });
 
 test("manifest decoding rejects unsafe ownership paths and invalid checksums", () => {
