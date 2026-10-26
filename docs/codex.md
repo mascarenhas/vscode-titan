@@ -1,84 +1,65 @@
 # Connect Codex to the Titan language server
 
-Codex and the VS Code extension use the same native language-server executable.
-The repository exposes saved-file queries to Codex through the repo-local
-`vscode-titan` marketplace and the skills-only `titan-lsp` plugin. Its bundled
-`titan-lsp-query` skill runs a deterministic stdio client instead of relying on
-an unsupported plugin-manifest language-server registration.
+Codex and the VS Code extension use the same native language-server
+executable. The repository exposes saved-file queries to Codex through the
+repository marketplace `vscode-titan` (`.agents/plugins/marketplace.json`) and
+the skills-only plugin `titan-lsp` (`plugins/titan-lsp`). Its bundled
+`titan-lsp-query` skill runs a deterministic stdio client instead of relying
+on plugin-manifest language-server registration.
 
-## Build and install the executable
+## Install the executable
 
 From this repository:
 
 ```sh
-make server-test server
+make server
 make install-server INSTALL_PREFIX="$HOME/.local"
-```
-
-Ensure `$HOME/.local/bin` is on the `PATH` inherited by Codex, then verify:
-
-```sh
 command -v titan-language-server
 ```
 
-The executable contains the selected statically linked Titan runtime modules,
-embedded Lua interpreter, and selected native dependencies. Each initialized
-statically linked module registers its runtime opener in `package.preload`.
-Separately, the executable embeds a metadata-only inventory of all 23 canonical
-Titan standard-module interfaces. Compiler language-server API 1 validates and
-decodes this inventory and its build target's C type profile for project
-typechecking; it is not module code, a Titan provider archive, headers, or an
-SDK payload.
-
-The executable does **not** contain the Titan compiler. The embedded Lua state
-loads the ordinary `titan-compiler` Lua modules through `package.path` and native
-compiler dependencies through `package.cpath`.
-
-`make install-server` installs the standalone executable and its notices, not
-the VSIX's private compiler module trees. At startup the server replaces ambient
-Lua discovery with `./?.lua` and `./?.so`. Unless compatible modules are in its
-working directory, start Codex with complete `TITAN_LS_LUA_PATH` and
-`TITAN_LS_LUA_CPATH` templates, for example:
+Put `$HOME/.local/bin` on the `PATH` that Codex inherits. A standalone server
+carries no compiler modules; see the
+[README](../README.md#standalone-server) for its default search paths. Unless
+compatible modules are in the project root, start Codex with complete
+templates for the same Titan installation the server was built against:
 
 ```sh
 export TITAN_LS_LUA_PATH='/opt/titan/share/lua/5.5/?.lua;/opt/titan/share/lua/5.5/?/init.lua'
 export TITAN_LS_LUA_CPATH='/opt/titan/lib/lua/5.5/?.so'
 ```
 
-Replace `5.5` with the Lua ABI version used to build the server. These variables
-are passed directly to `package.path` and `package.cpath`; they do not use the
-ambient `LUA_PATH`/`LUA_CPATH` defaults or terminal-`;;` expansion.
-
-The target-specific VSIX handles this automatically: it carries
-`dist/titan/share/lua/5.5` and `dist/titan/lib/lua/5.5`, and the extension passes
-absolute templates for those private trees to its server process. That
-self-contained VSIX behavior does not change the standalone installation
-contract above. Those exact trees are the complete bundled compiler-module
-payload: the VSIX does not add `lib/titan`, a provider archive, Titan headers,
-or any other native SDK content.
+The server uses these values verbatim, without `;;` expansion.
 
 ## Install the repository plugin
 
-The marketplace file is `.agents/plugins/marketplace.json`. Because this is a
-repository marketplace rather than Codex's implicit personal marketplace, add
-the repository root explicitly:
+The marketplace lives in this repository rather than in Codex's implicit
+personal marketplace, so add the repository root explicitly:
 
 ```sh
 codex plugin marketplace add /absolute/path/to/vscode-titan
 codex plugin add titan-lsp@vscode-titan
 ```
 
-Start a new Codex thread after installation so the bundled skill is discovered.
-See OpenAI's
-[Build plugins](https://developers.openai.com/plugins/build/plugins)
-documentation for the current Codex plugin workflow.
+Start a new Codex thread after installation so the skill is discovered. See
+OpenAI's [Build plugins](https://developers.openai.com/plugins/build/plugins)
+documentation for the current plugin workflow. `make plugin-validate`
+(`scripts/validate-plugin.mjs`) checks the marketplace, plugin and skill
+metadata.
 
-When a definition, reference, hover, folding, or rename-preview request applies
-to saved Titan source, Codex can use the skill's
-`scripts/titan-lsp-query.mjs`. The script launches `titan-language-server` from
-`PATH`, waits for the initial saved-file index, performs one query, shuts it
-down, and emits one JSON object on stdout.
-For direct development testing from this checkout:
+To remove the integration:
+
+```sh
+codex plugin remove titan-lsp@vscode-titan
+codex plugin marketplace remove vscode-titan
+```
+
+## Query client
+
+`plugins/titan-lsp/skills/titan-lsp-query/scripts/titan-lsp-query.mjs`
+launches `titan-language-server` from `PATH`, or the executable named by
+`--server`, with extra `--server-arg` values. It waits for the initial
+saved-file index, performs one query, shuts the server down and writes one JSON
+object to stdout. To test it directly from this checkout:
 
 ```sh
 node plugins/titan-lsp/skills/titan-lsp-query/scripts/titan-lsp-query.mjs \
@@ -86,51 +67,51 @@ node plugins/titan-lsp/skills/titan-lsp-query/scripts/titan-lsp-query.mjs \
   --line 12 --character 8
 ```
 
-On managed Codex hosts, an agent must run this read-only command with
-`sandbox_permissions: "require_escalated"` on its first attempt. Node presents
-child stdio as Unix socket pairs, while the workspace sandbox blocks the
-socket-kind inspection libuv uses to distinguish protocol pipes from
-unsupported handles; the server would otherwise fail with
-`stdio.parent.kind` before LSP startup. It should not retry inside the sandbox.
-This is a command-sandbox compatibility requirement and does not authorize
-source-file writes.
+- `--root` is the Titan project root. The client uses it as the LSP workspace
+  and the server's working directory.
+- `definition`, `references` and `hover` need `--line` and `--character`:
+  zero-based LSP coordinates, with characters counted in UTF-16 code units.
+  `folding` needs only `--root` and `--file`.
+- `rename-preview` also needs `--new-name`. It returns the server's
+  `WorkspaceEdit` with `applied: false` and never changes files.
+- `--timeout-ms` bounds each wait for startup, a protocol frame or exit
+  (default 300,000 ms, between 100 and 600,000 ms).
+- A failure prints `{"ok": false, "error": {"code": ..., "message": ...}}` and
+  exits nonzero, with exit code 1 unless noted. These are all the codes that
+  `titan-lsp-query.mjs` raises:
+  - `invalid_arguments` (exit 2): malformed command-line arguments.
+  - `invalid_input` (exit 2): an inaccessible or invalid root, file, position
+    or new name.
+  - `server_start`: the server could not be spawned.
+  - `server_exit`: writing to the server failed, or it exited with a nonzero
+    code or a signal.
+  - `timeout`: a startup, frame or exit wait exceeded `--timeout-ms`.
+  - `protocol_error`: a malformed or oversized frame, invalid JSON, an
+    unexpected message or response id, or an invalid `titan/indexingStatus`
+    sequence.
+  - `indexing_failed`: the server reported failed indexing.
+  - `lsp_error`: the server answered with an LSP error. The JSON object adds
+    `lspCode` when the server supplied an integer code.
+  - `interrupted` (exit 130 for SIGINT, 143 for SIGTERM): the client stopped
+    the server after a signal.
+  - `query_failed`: any other unexpected failure.
 
-Line and character values use zero-based LSP coordinates; characters count
-UTF-16 code units. The `rename-preview` operation requires `--new-name` and
-returns a `WorkspaceEdit` with `applied: false`. It never changes source files.
+Answers come from saved files on disk, so save files before you query them.
+Server logs go to stderr. The client consumes the server's framed stdout and
+reserves its own stdout for the final JSON result.
 
-## Protocol and workspace expectations
+On managed Codex hosts, run the read-only client with
+`sandbox_permissions: "require_escalated"` on the first attempt. Node gives the
+child Unix socket pairs for stdio, and the workspace sandbox blocks the
+socket-kind inspection that libuv uses to tell protocol pipes from unsupported
+handles. Inside the sandbox, Titan's runtime fails with `stdio.parent.kind`
+before LSP startup, so do not retry there. The escalation covers only the
+query command; it does not authorize source changes.
 
-- Pass the Titan project root as `--root`; the script uses it as the LSP
-  workspace and server working directory.
-- Stdout belongs exclusively to `Content-Length`-framed JSON-RPC; server logs
-  go to stderr internally. The adapter consumes those frames and reserves its
-  own stdout for the final JSON result.
-- Version 1 derives semantic answers from saved files on disk. Save a file
-  before expecting updated definitions, references, rename previews, hover, or
-  folding.
-- The compiler modules and any native Lua dependencies must be ABI-compatible
-  with the embedded Lua/Titan runtime in the executable. The compiler driver
-  must also export `LANGUAGE_SERVER_API_VERSION = 1`; API 1 includes the typed
-  metadata, checked-project and C-header graph codecs, FFI conversion reuse,
-  incremental-analysis hooks, timestamp observations and C-header dependency
-  restat contract, resolver-scoped I/O strategy with checked-module yield sequencing,
-  bounded graph decoding and cooperative registry assembly, and the
-  validated metadata-only embedded-interface resolver used here. The provider's
-  validated build target profile supports portable C types and their numeric
-  conversions without requiring a C compiler or Titan SDK for reflection
-  imports and ordinary semantic analysis. C header imports and native
-  compilation still require the configured C toolchain and SDK. The complete
-  23-entry inventory covers `titan.async`, `titan.coroutine`, `titan.fs`,
-  `titan.gc`, `titan.http`, `titan.io`, `titan.iteration`, `titan.json`, `titan.lua`,
-  `titan.math`, `titan.net`, `titan.os`, `titan.path`, `titan.peg`, `titan.reflect`,
-  `titan.sqlite3`, `titan.ssl`, `titan.string`, `titan.test`, `titan.timer`,
-  `titan.url`, `titan.uv`, and `titan.websocket`.
-  The Titan ABI alone does not promise that surface.
+On Windows, Node cannot deliver a catchable `SIGTERM` to the client. A forced
+termination therefore cannot promise the `interrupted` JSON result. The server
+still exits when its parent-owned stdio closes.
 
-To remove the integration, use the ordinary Codex plugin commands:
-
-```sh
-codex plugin remove titan-lsp@vscode-titan
-codex plugin marketplace remove vscode-titan
-```
+`make codex-native-test` (`scripts/test-codex-native.mjs`) runs the client
+against the built server. `src/test/unit/codexAdapter.test.ts` covers argument
+validation, timeouts, interruption and cleanup.
