@@ -14,16 +14,18 @@ local bridge = import "server.compiler_bridge"
 function create(connection: sqlite3.Connection)
   local statements = {
     "CREATE TABLE IF NOT EXISTS main.header_dependencies(" ..
-      "id INTEGER PRIMARY KEY,kind INTEGER NOT NULL CHECK(kind IN (0,1))," ..
+      "id INTEGER PRIMARY KEY,kind INTEGER NOT NULL CHECK(kind IN (0,1,2))," ..
       "path BLOB NOT NULL CHECK(typeof(path)='blob')," ..
       "identity BLOB NOT NULL CHECK(typeof(identity)='blob')," ..
       "observed_seconds INTEGER,observed_nanos INTEGER,physical_identity BLOB," ..
+      "precision TEXT,size INTEGER,changed_seconds INTEGER,changed_nanos INTEGER," ..
       "CHECK((observed_seconds IS NULL AND observed_nanos IS NULL AND physical_identity IS NULL) OR " ..
         "(typeof(observed_seconds)='integer' AND typeof(observed_nanos)='integer' AND typeof(physical_identity)='blob')))",
     "CREATE UNIQUE INDEX IF NOT EXISTS main.header_dependencies_absent " ..
       "ON header_dependencies(kind,path,identity) WHERE observed_seconds IS NULL",
     "CREATE UNIQUE INDEX IF NOT EXISTS main.header_dependencies_observed " ..
-      "ON header_dependencies(kind,path,identity,observed_seconds,observed_nanos,physical_identity) " ..
+      "ON header_dependencies(kind,path,identity,observed_seconds,observed_nanos,physical_identity," ..
+        "COALESCE(precision,''),COALESCE(size,''),COALESCE(changed_seconds,''),COALESCE(changed_nanos,'')) " ..
       "WHERE observed_seconds IS NOT NULL",
     "CREATE TABLE IF NOT EXISTS main.header_owners(" ..
       "id INTEGER PRIMARY KEY,scope INTEGER NOT NULL CHECK(scope IN (0,1,2,3))," ..
@@ -39,7 +41,11 @@ function create(connection: sqlite3.Connection)
 end
 
 local function kind_code(input: bridge.CHeaderDependency): integer
-  case input.kind when file() then return 0 when search() then return 1 end
+  case input.kind
+  when file() then return 0
+  when search() then return 1
+  when origin() then return 2
+  end
 end
 
 --- Read the ordered header closure for one scope and metadata key.
@@ -51,7 +57,8 @@ function read(connection: sqlite3.Connection, scope: integer,
   if #owners ~= 1 then return nil end
   local owner: integer = owners[1]:get(1)
   local rows = sql.rows(connection,
-    "SELECT d.kind,d.path,d.identity,d.observed_seconds,d.observed_nanos,d.physical_identity,i.ordinal " ..
+    "SELECT d.kind,d.path,d.identity,d.observed_seconds,d.observed_nanos,d.physical_identity,i.ordinal," ..
+      "d.precision,d.size,d.changed_seconds,d.changed_nanos " ..
     "FROM main.header_inputs i LEFT JOIN main.header_dependencies d ON d.id=i.dependency_id " ..
     "WHERE i.owner_id=? ORDER BY i.ordinal", owner)
   local inputs: {bridge.CHeaderDependency} = {}
@@ -65,6 +72,7 @@ function read(connection: sqlite3.Connection, scope: integer,
        not (digest is sqlite3.Blob) or ordinal ~= index then return nil end
     local kind = bridge.CHeaderDependencyKind.file()
     if code == 1 then kind = bridge.CHeaderDependencyKind.search()
+    elseif code == 2 then kind = bridge.CHeaderDependencyKind.origin()
     elseif code ~= 0 then return nil end
     local observation: bridge.HeaderObservation?
     local seconds: value = row:get(4)
@@ -74,7 +82,7 @@ function read(connection: sqlite3.Connection, scope: integer,
       if not (seconds is integer) or not (nanos is integer) or
          not (physical is sqlite3.Blob) then return nil end
       observation = bridge.HeaderObservation.new(seconds, nanos,
-        (physical as sqlite3.Blob).bytes)
+        (physical as sqlite3.Blob).bytes, row:get(8), row:get(9), row:get(10), row:get(11))
     end
     inputs[index] = bridge.CHeaderDependency.new(kind,
       (path as sqlite3.Blob).bytes, (digest as sqlite3.Blob).bytes, observation)
@@ -88,13 +96,21 @@ end
 local function incoming(inputs: {bridge.CHeaderDependency}, first: integer,
                         last: integer): (string, {value})
   local query = strings.writer()
-  query:write("WITH incoming(ordinal,kind,path,identity,observed_seconds,observed_nanos,physical_identity) AS (VALUES")
+  query:write("WITH incoming(ordinal,kind,path,identity,observed_seconds,observed_nanos,physical_identity,precision,size,changed_seconds,changed_nanos) AS (VALUES")
   local parameters: {value} = {}
   for index = first, last do
     if index > first then query:write(",") end
     local input = inputs[index]
-    if input.observation == nil then query:write("(?,?,?,?,NULL,NULL,NULL)")
-    else query:write("(?,?,?,?,?,?,?)") end
+    if input.observation == nil then
+      query:write("(?,?,?,?,NULL,NULL,NULL,NULL,NULL,NULL,NULL)")
+    else
+      query:write("(?,?,?,?,?,?,?")
+      if input.observation.precision == nil then query:write(",NULL") else query:write(",?") end
+      if input.observation.size == nil then query:write(",NULL") else query:write(",?") end
+      if input.observation.changed_seconds == nil then query:write(",NULL") else query:write(",?") end
+      if input.observation.changed_nanoseconds == nil then query:write(",NULL") else query:write(",?") end
+      query:write(")")
+    end
     parameters[#parameters + 1] = index
     parameters[#parameters + 1] = kind_code(input)
     parameters[#parameters + 1] = sqlite3.Blob.new(input.path)
@@ -103,6 +119,10 @@ local function incoming(inputs: {bridge.CHeaderDependency}, first: integer,
       parameters[#parameters + 1] = input.observation.modified_seconds
       parameters[#parameters + 1] = input.observation.modified_nanoseconds
       parameters[#parameters + 1] = sqlite3.Blob.new(input.observation.physical_identity)
+      if input.observation.precision ~= nil then parameters[#parameters + 1] = input.observation.precision end
+      if input.observation.size ~= nil then parameters[#parameters + 1] = input.observation.size end
+      if input.observation.changed_seconds ~= nil then parameters[#parameters + 1] = input.observation.changed_seconds end
+      if input.observation.changed_nanoseconds ~= nil then parameters[#parameters + 1] = input.observation.changed_nanoseconds end
     end
   end
   query:write(") ")
@@ -118,13 +138,13 @@ function replace(connection: sqlite3.Connection, scope: integer, key: string,
   local owner = sql.scalar_integer(connection,
     "SELECT id FROM main.header_owners WHERE scope=? AND key=?", scope, sqlite3.Blob.new(key))
   sql.execute(connection, "DELETE FROM main.header_inputs WHERE owner_id=?", owner)
-  for first = 1, #inputs, 20 do
-    local last = first + 19
+  for first = 1, #inputs, 16 do
+    local last = first + 15
     if last > #inputs then last = #inputs end
     local prefix, parameters = incoming(inputs, first, last)
     sql.execute(connection, prefix ..
-      "INSERT INTO main.header_dependencies(kind,path,identity,observed_seconds,observed_nanos,physical_identity) " ..
-      "SELECT kind,path,identity,observed_seconds,observed_nanos,physical_identity FROM incoming " ..
+      "INSERT INTO main.header_dependencies(kind,path,identity,observed_seconds,observed_nanos,physical_identity,precision,size,changed_seconds,changed_nanos) " ..
+      "SELECT kind,path,identity,observed_seconds,observed_nanos,physical_identity,precision,size,changed_seconds,changed_nanos FROM incoming " ..
       "WHERE true ON CONFLICT DO NOTHING", ...parameters)
     parameters[#parameters + 1] = owner
     sql.execute(connection, prefix ..
@@ -137,6 +157,8 @@ function replace(connection: sqlite3.Connection, scope: integer, key: string,
         "ON d.kind=i.kind AND d.path=i.path AND d.identity=i.identity " ..
         "AND d.observed_seconds=i.observed_seconds AND d.observed_nanos=i.observed_nanos " ..
         "AND d.physical_identity=i.physical_identity " ..
+        "AND d.precision IS i.precision AND d.size IS i.size " ..
+        "AND d.changed_seconds IS i.changed_seconds AND d.changed_nanos IS i.changed_nanos " ..
         "WHERE i.observed_seconds IS NOT NULL AND d.observed_seconds IS NOT NULL) AS resolved",
       ...parameters)
   end

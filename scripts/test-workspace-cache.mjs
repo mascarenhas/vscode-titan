@@ -236,8 +236,12 @@ function assertWarmInitial(records) {
     "unchanged restart rebuilt a completed header graph");
   assert.equal(stats.conversion_misses, 0,
     "unchanged restart rebuilt an FFI conversion graph");
-  assert.equal(stats.header_file_reads, 0, "warm header validation read unchanged content");
-  assert.equal(stats.header_file_hashes, 0, "warm header validation hashed unchanged content");
+  // titan.fs.Stat supplies precise mtimes but no change time. The compiler
+  // therefore validates bytes even when it can retain the parsed graphs.
+  assert.ok(stats.header_file_reads > 0,
+    "warm header validation trusted metadata without a change timestamp");
+  assert.ok(stats.header_file_hashes > 0,
+    "warm header validation did not fingerprint freshly read bytes");
   assert.equal(records.some((record) =>
     record.event === "compiler.c_header.phase" &&
     (record.phase === "preprocessing" || record.phase === "c_parse" ||
@@ -318,8 +322,8 @@ try {
   assert.ok(cacheStats(warmPhases.later).header_hits > 0);
   assert.ok(cacheStats(warmPhases.later).conversion_hits > 0);
   for (const field of ["header_file_reads","header_file_hashes"]) {
-    assert.equal(cacheStats(warm.records)[field],0,
-      `restoration or importer-only editing performed ${field}`);
+    assert.ok(cacheStats(warm.records)[field] > warmInitialCache[field],
+      `restoration and importer editing skipped safe fresh validation: ${field}`);
   }
 
   await writeFile(headerFile, fixtureHeader("typedef long fixture_int;\n"));
@@ -327,13 +331,16 @@ try {
   const headerAfter = await stat(headerFile);
   assert.equal(headerAfter.size, headerBefore.size);
   assert.equal(headerAfter.mtimeMs, headerBefore.mtimeMs);
-  const trustedHeader = await withServer("trusted-header-mtime", featureSnapshot);
-  assert.deepEqual(trustedHeader.result, cold.result);
-  assertWarmInitial(initialRecords(trustedHeader.records).initial);
-  assert.equal(cacheStats(trustedHeader.records).header_file_reads,0);
-  assert.equal(cacheStats(trustedHeader.records).header_file_hashes,0);
-  assert.deepEqual(checkedModules(trustedHeader.records), [],
-    "unchanged header timestamp caused a content check");
+  const preservedHeader = await withServer("preserved-mtime-header", featureSnapshot);
+  assert.deepEqual(preservedHeader.result, cold.result);
+  assert.ok(checkedModules(preservedHeader.records).includes("consumer"),
+    "same-size header edit with a preserved mtime retained stale semantics");
+  assert.ok(cacheStats(preservedHeader.records).header_misses > 0,
+    "preserved-mtime header edit reused a stale preprocessor graph");
+  assert.ok(cacheStats(preservedHeader.records).conversion_misses > 0,
+    "preserved-mtime header type edit reused a stale FFI conversion");
+  // A third type has no earlier content-addressed conversion to reuse.
+  await writeFile(headerFile, fixtureHeader("typedef short fixture_int;\n"));
   await utimes(headerFile, headerTimestamp, new Date(headerTimestamp.getTime() + 1000));
   const explicitProbePrefix = path.join(root, ".titan-ls", "explicit-probe-prefix");
   const changedHeader = await withServer("changed-header", featureSnapshot,
@@ -542,8 +549,6 @@ try {
     copiedEnvironment);
   assert.deepEqual(compilerWarm.result, cold.result);
   const compilerWarmCache = assertWarmInitial(initialRecords(compilerWarm.records).initial);
-  assert.equal(cacheStats(compilerWarm.records).header_file_reads,0);
-  assert.equal(cacheStats(compilerWarm.records).header_file_hashes,0);
   await writeFile(copiedDriver, Buffer.concat([originalDriver, suffix("B")]));
   await utimes(copiedDriver, headerTimestamp, headerTimestamp);
   const compilerAfter = await stat(copiedDriver);
@@ -612,6 +617,7 @@ try {
     first_edit_checked: checkedModules(warmPhases.later),
     first_edit_encoded: firstEditEncodes,
     first_edit_cache: cacheStats(warmPhases.later),
+    preserved_mtime_header_cache: cacheStats(preservedHeader.records),
     changed_header_cache: cacheStats(changedHeader.records),
     compiler_identity: {
       warm_initial_cache: compilerWarmCache,
@@ -621,7 +627,8 @@ try {
     },
     verified: ["feature replay", "folder membership", "failure recovery",
       "configuration publication identity", "compiler content identity",
-      "unchanged-mtime source/header/compiler trust", "changed-mtime source/header/compiler invalidation",
+      "unchanged-mtime source/compiler trust", "preserved-mtime header invalidation",
+      "changed-mtime source/header/compiler invalidation",
       "ordered inherited C environment restart and header invalidation",
       "SQL readiness before background restoration", "include-search shadowing", "corrupt project payload",
       "invalid SQLite payload storage types",

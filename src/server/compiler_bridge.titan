@@ -238,16 +238,21 @@ end
 union CHeaderDependencyKind
   file()
   search()
+  origin()
 end
 
 -- `file` identities hash the exact bytes cdriver parsed. `search` identities
--- describe one exact include candidate (including a miss) so an earlier
--- shadow appearing later invalidates the owning module without scanning a
--- whole external include tree.
+-- describe one exact include candidate (including a miss). `origin` identities
+-- retain the realpath naming a C declaration's nominal scope, independently
+-- of that header's content identity.
 record HeaderObservation
   modified_seconds: integer
   modified_nanoseconds: integer
   physical_identity: string
+  precision: string?
+  size: integer?
+  changed_seconds: integer?
+  changed_nanoseconds: integer?
 end
 
 -- One validation pass shares physical observations without exposing compiler
@@ -426,7 +431,10 @@ local function completion_source_key(main_file: string, files: {string},
   for index = 1, #inputs do
     local input = inputs[index]
     local kind = "file"
-    case input.kind when search() then kind = "search" end
+    case input.kind
+    when search() then kind = "search"
+    when origin() then kind = "origin"
+    end
     output:write(kind .. ";" .. #input.path .. ":" .. input.path .. ";" ..
       #input.identity .. ":" .. input.identity .. ";")
   end
@@ -867,6 +875,8 @@ local function normalize_c_header_dependencies(
     local kind = CHeaderDependencyKind.file()
     if raw_kind == "search" then
       kind = CHeaderDependencyKind.search()
+    elseif raw_kind == "origin" then
+      kind = CHeaderDependencyKind.origin()
     elseif raw_kind ~= "file" then
       return fail<|{CHeaderDependency}|>(DRIVER_MODULE,
         subject .. "[" .. index .. "] has unknown kind '" ..
@@ -906,7 +916,38 @@ local function normalize_c_header_dependencies(
         return fail<|{CHeaderDependency}|>(DRIVER_MODULE,
           subject .. " has an invalid header observation")
       end
-      observation = HeaderObservation.new(seconds,nanoseconds,physical)
+      local precision? = optional_string(observed["precision"], DRIVER_MODULE,
+        subject .. " observation.precision")
+      local size?: integer
+      local changed_seconds?: integer
+      local changed_nanoseconds?: integer
+      local invalid = false
+      if precision ~= nil then
+        local present = precision
+        if present ~= "ns" and present ~= "coarse" then invalid = true end
+      end
+      if observed["size"] ~= nil then
+        local number = required_integer(observed["size"], DRIVER_MODULE,
+          subject .. " observation.size")
+        size = number
+        if number < 0 then invalid = true end
+      end
+      if observed["changed_seconds"] ~= nil then
+        changed_seconds = required_integer(observed["changed_seconds"], DRIVER_MODULE,
+          subject .. " observation.changed_seconds")
+      end
+      if observed["changed_nanoseconds"] ~= nil then
+        local number = required_integer(observed["changed_nanoseconds"], DRIVER_MODULE,
+          subject .. " observation.changed_nanoseconds")
+        changed_nanoseconds = number
+        if number < 0 or number >= 1000000000 then invalid = true end
+      end
+      if invalid or ((changed_seconds == nil) ~= (changed_nanoseconds == nil)) then
+        return fail<|{CHeaderDependency}|>(DRIVER_MODULE,
+          subject .. " has an invalid header observation")
+      end
+      observation = HeaderObservation.new(seconds,nanoseconds,physical,
+        precision,size,changed_seconds,changed_nanoseconds)
     end
     result[index] = CHeaderDependency.new(kind, path, identity, observation)
   end
@@ -921,6 +962,7 @@ local function raw_c_header_dependencies(
     local kind = "file"
     case dependency.kind
     when search() then kind = "search"
+    when origin() then kind = "origin"
     when file() then
     end
     local item: {string: value} = {}
@@ -933,6 +975,10 @@ local function raw_c_header_dependencies(
         ["modified_seconds"] = observation.modified_seconds,
         ["modified_nanoseconds"] = observation.modified_nanoseconds,
         ["physical_identity"] = observation.physical_identity,
+        ["precision"] = observation.precision,
+        ["size"] = observation.size,
+        ["changed_seconds"] = observation.changed_seconds,
+        ["changed_nanoseconds"] = observation.changed_nanoseconds,
       }
       item["observation"] = observed
     end
@@ -5391,10 +5437,7 @@ end
   end
   hash_compiler_tree(paths.dirname(compiler_path),output,fingerprint)
   hash_compiler_tree(paths.dirname(parser_path),output,fingerprint)
-  local dependencies = {"relabel","inspect","lfs","lpeglabel"}
-  -- The ordinary Windows compiler's native process transport is selected from
-  -- package.cpath too; its bytes must fence persisted compiler observations.
-  if ffi.VSCODE_TITAN_WINDOWS ~= 0 then dependencies[#dependencies + 1] = "luv" end
+  local dependencies = {"relabel","inspect","lfs","lpeglabel","luv"}
   for index = 1, #dependencies do
     local path?, path_error? = resolve(dependencies[index],index > 2)
     if path == nil then
