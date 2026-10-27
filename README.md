@@ -65,9 +65,10 @@ To build this repository you need:
 
 Builds use the selected SDK's compiler, Lua interpreter, modules, headers and
 standard-library providers together, and they never modify it. The SDK must
-include Titan's installed license at `share/titan/LICENSE`, compiler-owned
-incremental object/native/link reuse, native input switches, `--output`, and
-`--exe`. Installing a packaged VSIX needs none of this toolchain.
+include Titan's installed license at `share/titan/LICENSE`, and its compiler
+must provide compiler-owned incremental builds (certified object, native-C,
+and final-link reuse, native input switches, `--output`, and `--exe`).
+Installing a packaged VSIX needs none of this toolchain.
 
 Native packages build on Linux and macOS. On macOS, put GNU Make 4.4.1 first
 on `PATH`; see [native builds](docs/native-build.md#sdk-selection). Windows is
@@ -90,10 +91,10 @@ the matching Lua sources under `dist/titan/src`. To use a specific SDK:
 make -j2 TITAN_PREFIX="$HOME/.local/titan"
 ```
 
-Native image targets always invoke `titanc --incremental`; Make no longer
-maintains a Titan module graph or compiler/SDK/configuration stamps. The
-compiler discovers imports, schedules source misses, certifies native C helpers
-passed with `--c-source`, and reuses unchanged final links. Make still runs the
+Native image targets always invoke `titanc --incremental`; Make maintains no
+Titan module graph or compiler/SDK/configuration stamps. The compiler
+discovers imports, schedules source misses, certifies native C helpers passed
+with `--c-source`, and reuses unchanged final links. Make runs the
 embedded-interface generator, stages runtime files, packages the extension,
 and executes tests.
 
