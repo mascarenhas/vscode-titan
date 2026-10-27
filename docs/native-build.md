@@ -37,8 +37,10 @@ a system SDK, Make passes the ordered pkg-config flags as `--cflag` and
 `--ldflag` switches. Titan certifies their effective arguments, header inputs
 and linked libraries; Make maintains no SDK or OpenSSL header inventory.
 
-GNU Make 4.4 or newer allows the compiler to share a parent Make jobserver.
-Older pipe jobservers use Titan's local `--jobs` cap instead. On macOS, put
+GNU Make 4.4 or newer's FIFO jobserver lets the compiler share a parent Make
+jobserver, and on Linux the compiler also shares an older pipe jobserver by
+reopening it privately. Elsewhere, an older pipe jobserver (such as macOS's
+stock GNU Make 3.81) leaves Titan on its local `--jobs` cap. On macOS, put
 Homebrew GNU Make first on `PATH` to share the pool:
 
 ```sh
