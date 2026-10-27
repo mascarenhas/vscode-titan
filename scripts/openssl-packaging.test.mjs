@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { chmod, lstat, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, readFile, rm, symlink, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -232,6 +232,72 @@ esac
       } else await assert.rejects(lstat(queries), { code: "ENOENT" });
     });
 }
+
+test("embedded interface generation acknowledges unchanged output and keeps input invalidation", {
+  skip: process.platform === "win32"
+}, async (context) => {
+  const state = await fixture(context);
+  const build = path.join(state.root, "build");
+  const calls = path.join(state.root, "generator-calls");
+  const failure = path.join(state.root, "generator-failure");
+  const generator = await state.put("scripts/generate-embedded-interfaces.lua");
+  const provider = await state.put("sdk/lib/titan/0.6/titan.a", "metadata\n");
+  const output = await state.put("build/native/embedded_interfaces_native.c", "metadata\n");
+  await state.put("sdk/bin/titanc", "#!/bin/sh\nexit 0\n", true);
+  await mkdir(path.join(state.sdk, "include/openssl"), { recursive: true });
+  await state.put("sdk/bin/lua", `#!/bin/sh
+printf 'called\\n' >> ${shellQuote(calls)}
+test -f "$1" && test -f "$2"
+if test -f ${shellQuote(failure)}; then exit 1; fi
+if ! cmp -s "$2" "$3"; then cp "$2" "$3"; fi
+`, true);
+  const env = { ...process.env };
+  for (const name of ["MAKEFLAGS", "MFLAGS", "MAKELEVEL", "BUILD_PROFILE", "TITAN_BUILD_PROFILE"]) delete env[name];
+  const generate = () => spawnSync("make", ["--no-print-directory", "-j1", "-f", repositoryMakefile,
+    `TITAN_PREFIX=${state.sdk}`, `BUILD_ROOT=${build}`, "BUILD_PROFILE=validation", output], {
+    cwd: state.root, env, encoding: "utf8", timeout: 30_000
+  });
+  const count = async () => (await readFile(calls, "utf8")).trim().split("\n").length;
+  const older = new Date(Date.now() - 120_000);
+  const newer = new Date(Date.now() - 60_000);
+  await utimes(output, older, older);
+  await utimes(provider, newer, newer);
+  await utimes(generator, newer, newer);
+  let result = generate();
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(await readFile(output, "utf8"), "metadata\n");
+  assert.equal(await count(), 1);
+  assert((await lstat(output)).mtimeMs >= (await lstat(provider)).mtimeMs);
+  result = generate();
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(await count(), 1, "byte-identical output must not rerun its generator");
+
+  await writeFile(provider, "changed metadata\n");
+  await utimes(output, older, older);
+  result = generate();
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(await count(), 2, "changed provider must rerun generation");
+  assert.equal(await readFile(output, "utf8"), "changed metadata\n");
+  await writeFile(generator, "changed generator\n");
+  await utimes(output, older, older);
+  result = generate();
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(await count(), 3, "changed generator must rerun even when output bytes match");
+  result = generate();
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(await count(), 3);
+
+  await writeFile(failure, "");
+  await utimes(output, older, older);
+  const staleOutputTime = (await lstat(output)).mtimeMs;
+  result = generate();
+  assert.notEqual(result.status, 0, "failed generation must remain stale for retry");
+  assert.equal((await lstat(output)).mtimeMs, staleOutputTime);
+  await rm(failure);
+  result = generate();
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(await count(), 5);
+});
 
 test("missing installed compiler fails without bootstrapping or changing the SDK", {
   skip: process.platform === "win32"
