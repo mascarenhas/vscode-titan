@@ -61,6 +61,7 @@ for required in \
   extension/dist/titan/share/lua/5.5/titan-compiler/version.lua \
   extension/dist/titan/lib/lua/5.5/lfs.so \
   extension/dist/titan/lib/lua/5.5/lpeglabel.so \
+  extension/dist/titan/lib/lua/5.5/luv.so \
   extension/dist/titan/include/titan.h \
   extension/dist/titan/include/titan/ffi.h \
   extension/dist/titan/include/minicoro.h \
@@ -110,7 +111,8 @@ fi
 expected_native_modules=$(
   printf '%s\n' \
     extension/dist/titan/lib/lua/5.5/lfs.so \
-    extension/dist/titan/lib/lua/5.5/lpeglabel.so |
+    extension/dist/titan/lib/lua/5.5/lpeglabel.so \
+    extension/dist/titan/lib/lua/5.5/luv.so |
     LC_ALL=C sort
 )
 actual_native_modules=$(
@@ -219,6 +221,8 @@ inspect_native_module \
   "$extract_root/extension/dist/titan/lib/lua/5.5/lfs.so"
 inspect_native_module \
   "$extract_root/extension/dist/titan/lib/lua/5.5/lpeglabel.so"
+inspect_native_module \
+  "$extract_root/extension/dist/titan/lib/lua/5.5/luv.so"
 
 node_executable=$(command -v node)
 sdk_compiler=${CC:-cc}
