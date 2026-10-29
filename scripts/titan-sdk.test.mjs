@@ -23,20 +23,20 @@ test("PATH compiler reports its SDK independently of Lua and probe overrides", (
 
 test("Windows PATH lookup honors case-insensitive variables and PATHEXT order", () => {
   const tried = [];
-  const compiler = findWindowsCompiler({ Path: '"C:\\Other";C:\\Titan SDK\\bin', PathExt: ".EXE;.BAT" }, (filename) => {
+  const compiler = findWindowsCompiler({ Path: '"C:\\Other";C:\\Titan SDK\\bin', PathExt: ".BAT;.EXE" }, (filename) => {
     tried.push(filename);
-    return filename === "C:\\Titan SDK\\bin\\titanc.BAT";
+    return filename === "C:\\Titan SDK\\bin\\titanc.EXE";
   });
-  assert.equal(compiler, "C:\\Titan SDK\\bin\\titanc.BAT");
-  assert.equal(tried[0], "C:\\Other\\titanc.EXE");
+  assert.equal(compiler, "C:\\Titan SDK\\bin\\titanc.EXE");
+  assert.deepEqual(tried.slice(0, 2), ["C:\\Other\\titanc.BAT", "C:\\Other\\titanc.EXE"]);
 });
 
-test("Windows batch discovery uses relocated adjacent Lua with native arguments", () => {
+test("Windows PATH discovery runs the compiler program directly", () => {
   const prefix = resolveTitanSdk({ platform: "win32", environment: { Path: "C:\\Titan SDK\\bin" },
-    findCompiler: () => "C:\\Alias\\titanc.bat", realpath: () => "D:\\Moved Titan\\bin\\titanc.bat",
+    findCompiler: () => "D:\\Moved Titan\\bin\\titanc.EXE",
     run(command, args, options) {
-      assert.equal(command, "D:\\Moved Titan\\bin\\lua.exe");
-      assert.deepEqual(args, ["-E", "D:\\Moved Titan\\lib\\luarocks\\rocks-5.5\\titan\\0.6.0-1\\bin\\titanc", "--print-root"]);
+      assert.equal(command, "D:\\Moved Titan\\bin\\titanc.EXE");
+      assert.deepEqual(args, ["--print-root"]);
       assert.equal(options.shell, false);
       return { status: 0, stdout: "D:/Moved Titan\r\n" };
     } });
@@ -66,10 +66,10 @@ test("Titan 0.6 release discovery falls back after the renamed option is rejecte
   assert.deepEqual(calls, [["titanc", "--print-root"], ["titanc", "--print-prefix"]]);
 });
 
-test("Windows release fallback retains the adjacent Lua and deployed compiler arguments", () => {
+test("Windows release fallback queries the same compiler program", () => {
   const calls = [];
   const prefix = resolveTitanSdk({ platform: "win32", environment: {},
-    findCompiler: () => "C:\\Titan SDK\\bin\\titanc.bat", realpath: (filename) => filename,
+    findCompiler: () => "C:\\Titan SDK\\bin\\titanc.exe",
     run(command, args, options) {
       calls.push([command, ...args]);
       assert.equal(options.shell, false);
@@ -78,9 +78,10 @@ test("Windows release fallback retains the adjacent Lua and deployed compiler ar
         : { status: 0, stdout: "C:\\Titan SDK\r\n" };
     } });
   assert.equal(prefix, "C:\\Titan SDK");
-  const base = ["C:\\Titan SDK\\bin\\lua.exe", "-E",
-    "C:\\Titan SDK\\lib\\luarocks\\rocks-5.5\\titan\\0.6.0-1\\bin\\titanc"];
-  assert.deepEqual(calls, [[...base, "--print-root"], [...base, "--print-prefix"]]);
+  assert.deepEqual(calls, [
+    ["C:\\Titan SDK\\bin\\titanc.exe", "--print-root"],
+    ["C:\\Titan SDK\\bin\\titanc.exe", "--print-prefix"]
+  ]);
 });
 
 test("root-query startup errors and malformed successes do not invoke the legacy query", () => {

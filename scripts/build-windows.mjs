@@ -14,9 +14,9 @@ const repository = fileURLToPath(new URL("..", import.meta.url));
 const forward = (value) => value.replaceAll("\\", "/");
 const hash = (value) => createHash("sha256").update(value).digest("hex");
 
-// LuaRocks' Windows wrapper is a batch file with installation-specific paths.
-// Invoke the installed script with its selected Lua to retain native argv and
-// relocated SDK support without entering cmd.exe.
+// Run the installed native compiler program directly. titanc.exe resolves its
+// own installation root and frontend script, so native argv, relocation and
+// spaces in the SDK path all work without entering cmd.exe.
 export function windowsCompilerCommand(sdk, args = []) {
   return titanCompilerCommand(sdk, args, "win32");
 }

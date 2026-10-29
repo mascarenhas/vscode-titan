@@ -297,14 +297,14 @@ compiler is the `llvm-rc.exe` beside `--clang`. `--build-root` (default
 test filter.
 
 The driver starts native executables directly, without a shell. Each compiler
-command runs the SDK's `bin/lua.exe -E` on the installed
-`lib/luarocks/rocks-5.5/titan/0.6.0-1/bin/titanc` script (`windowsCompilerCommand`
-in `scripts/build-windows.mjs`), so LuaRocks' batch wrapper is not needed. The
-driver inherits the parent environment, removes conflicting Lua and Titan
-search overrides and sets compiler paths only for its children. It installs
-nothing and never changes the global `PATH`, accounts, privileges or execution
-policy. The build writes only its own stages and outputs and the extension's
-packaged payload.
+command runs the SDK's own `bin/titanc.exe` program (`windowsCompilerCommand` in
+`scripts/build-windows.mjs`), which locates its installation root and the
+`share/lua/5.5/titan-compiler/titanc.lua` frontend by itself; there is no batch
+wrapper, `lua.exe` preamble or retained rock script to name. The driver inherits
+the parent environment, removes conflicting Lua and Titan search overrides and
+sets compiler paths only for its children. It installs nothing and never
+changes the global `PATH`, accounts, privileges or execution policy. The build
+writes only its own stages and outputs and the extension's packaged payload.
 
 `server-test-build` and `server-test-run` default to the `validation`
 profile: `-O0 -fno-lto` for generated Titan code and native helpers, with no
