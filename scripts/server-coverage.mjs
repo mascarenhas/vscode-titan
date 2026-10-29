@@ -178,7 +178,14 @@ while index <= #arg do
     assert(#(native.coverage_test_functions or {}) == 0, name .. ": production module owns test_ functions")
     equal_paths(entry.source_files, expected, name)
     equal_paths(native.coverage.sources, expected, name)
-    equal_paths(native.coverage.files, { generated }, name)
+    -- Large modules compile as several C parts; coverage records each one.
+    local stem = assert(generated:match("^(.*)%.c$"), name .. ": generated C path")
+    local parts = {}
+    for offset, part in ipairs(assert(native.parts, name .. ": missing native parts")) do
+        parts[offset] = stem .. part.c_suffix
+    end
+    assert(parts[1] == generated, name .. ": primary generated C differs")
+    equal_paths(native.coverage.files, parts, name)
     io.write(name .. "\\n")
     index = index + 4 + count
 end
