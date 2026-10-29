@@ -11,17 +11,18 @@ function environmentValue(environment, name, platform) {
 
 export function compilerDiscoveryEnvironment(environment = process.env) {
   return Object.fromEntries(Object.entries(environment).filter(([name]) =>
-    !/^(LUA_(PATH|CPATH|INIT)(_[0-9_]+)?|TITAN_(PREFIX|ROCKS_ROOT|PATH(_[0-9_]+)?|SOURCE_PATH))$/i.test(name)));
+    !/^(LUA_(PATH|CPATH|INIT)(_[0-9_]+)?|TITAN_(PREFIX|ROOT|PATH(_[0-9_]+)?|SOURCE_PATH))$/i.test(name)));
 }
 
-// Windows LuaRocks installs a batch wrapper with installation-specific paths.
-// Use its adjacent Lua and deployed script so native argv and relocation work.
+// The installation's own compiler entry, run directly with native arguments.
+// Windows ships bin/titanc.exe; Unix deploys the extensionless titanc script.
+// Either entry resolves its installation root and compiler script itself.
 export function titanCompilerCommand(prefix, args = [], platform = process.platform) {
   const paths = platform === "win32" ? path.win32 : path.posix;
-  return platform === "win32" ? {
-    command: paths.join(prefix, "bin", "lua.exe"),
-    args: ["-E", paths.join(prefix, "lib", "luarocks", "rocks-5.5", "titan", "0.6.0-1", "bin", "titanc"), ...args]
-  } : { command: paths.join(prefix, "bin", "titanc"), args };
+  return {
+    command: paths.join(prefix, "bin", platform === "win32" ? "titanc.exe" : "titanc"),
+    args
+  };
 }
 
 export function findWindowsCompiler(environment, executable = (filename) => {
@@ -39,19 +40,12 @@ export function findWindowsCompiler(environment, executable = (filename) => {
 }
 
 export function resolveTitanSdk({ prefix, environment = process.env, platform = process.platform,
-  run = spawnSync, findCompiler = findWindowsCompiler, realpath = realpathSync } = {}) {
+  run = spawnSync, findCompiler = findWindowsCompiler } = {}) {
   const paths = platform === "win32" ? path.win32 : path.posix;
   const override = prefix ?? environmentValue(environment, "TITAN_PREFIX", platform);
   if (override) return paths.resolve(override);
   const env = compilerDiscoveryEnvironment(environment);
-  let invocation = { command: "titanc", args: [] };
-  if (platform === "win32") {
-    const compiler = findCompiler(env);
-    if (/\.(bat|cmd)$/i.test(compiler)) {
-      const installed = realpath(compiler);
-      invocation = titanCompilerCommand(paths.dirname(paths.dirname(installed)), [], platform);
-    } else invocation.command = compiler;
-  }
+  const invocation = { command: platform === "win32" ? findCompiler(env) : "titanc", args: [] };
   const queryOptions = {
     env, encoding: "utf8", shell: false, windowsHide: true, timeout: 10000
   };

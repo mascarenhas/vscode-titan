@@ -28,6 +28,7 @@ interface FixtureEvent {
   arguments: string[];
   luaPath?: string;
   luaCPath?: string;
+  titanRoot?: string;
   compilerCachePrefix?: string;
   serverLogLevel?: string;
   rootPath?: string | null;
@@ -63,8 +64,9 @@ interface CapturedSyntaxToken {
   t: string;
 }
 
+const extensionIdentifier = "mascarenhas.titan";
+
 suite("Titan extension", () => {
-  const extensionIdentifier = "mascarenhas.titan";
   const configuredLuaPath = "/fixture/compiler/?.lua";
   const configuredLuaCPath = "/fixture/compiler/?.so";
   let alpha: vscode.WorkspaceFolder;
@@ -1307,6 +1309,7 @@ suite("Titan extension", () => {
           assertNativePathEqual(actualLuaTemplates[index], expected);
         }
         assertNativePathEqual(initialization.luaCPath, bundledLuaCPath);
+        assertNativePathEqual(initialization.titanRoot, modulePrefix);
         assert.equal(initialization.compilerCachePrefix, process.env.TITAN_PREFIX);
       }
       if (selectedLuaPath !== undefined) {
@@ -1527,6 +1530,12 @@ async function assertInitialization(
   assert.deepEqual(event.arguments, ["--fixture-token", token]);
   assert.equal(event.luaPath, luaPath);
   assert.equal(event.luaCPath, luaCPath);
+  // A Lua path override never retargets the installation root, which the
+  // extension always derives from the packaged compiler payload.
+  const extension = vscode.extensions.getExtension(extensionIdentifier);
+  assert.ok(extension, `${extensionIdentifier} should be installed`);
+  assertNativePathEqual(event.titanRoot,
+    path.join(extension.extensionPath, "dist", "titan"));
   assert.equal(event.compilerCachePrefix, process.env.TITAN_PREFIX,
     "the native server owns the default probe-cache location");
   assert.equal(event.serverLogLevel, "info");

@@ -164,7 +164,10 @@ supported.
 With the Lua path settings empty, the extension passes absolute templates for
 its own `dist/titan/share/lua/5.5` and `dist/titan/lib/lua/5.5` trees. A
 configured value replaces the template verbatim, so it must be a complete Lua
-search path. The server never uses ambient `LUA_PATH` or `LUA_CPATH`. Disable
+search path. The server never uses ambient `LUA_PATH` or `LUA_CPATH`. The
+extension also passes the packaged `dist/titan` tree as `TITAN_ROOT`, because
+the compiler reads its SDK headers and Lua sources from an installation root
+rather than from a Lua search path. Disable
 `titan.completion.insertCallSnippets` to insert plain names when you take
 function references.
 
@@ -352,6 +355,8 @@ This installs the executable, plus this project's license and the Titan and
 native notices under `share/doc/titan-language-server`. It does not install
 the compiler modules. Without `TITAN_LS_LUA_PATH` and `TITAN_LS_LUA_CPATH`, a
 standalone server searches only `./?.lua` and `./?.so` (`./?.dll` on Windows).
+`TITAN_ROOT` names the installation whose SDK headers and Lua sources the
+compiler reads; otherwise it uses the parent of the executable's directory.
 For setup, see [Codex setup](docs/codex.md).
 
 The server reserves stdout for `Content-Length`-framed JSON-RPC and writes all

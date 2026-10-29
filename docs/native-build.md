@@ -10,11 +10,13 @@ driver. For the user-facing commands, see the
 The build consumes an installed Titan SDK. `TITAN_PREFIX` selects its prefix.
 Otherwise `scripts/titan-sdk.mjs` runs `titanc --print-root` from `PATH`. It
 retries `--print-prefix` only when an older 0.6 release SDK rejects the new
-option. The compiler finds its installed provider through `package.cpath` on
-both Unix and Windows. The selected SDK supplies the compiler, the Lua
-interpreter, the compiler's LuaRocks dependencies, headers, the standard-library
-providers and `share/titan/LICENSE`. No Titan checkout or project-owned compiler
-installation is needed:
+option. The selected SDK supplies the compiler, the Lua interpreter, the
+compiler's LuaRocks dependencies, headers, the standard-library providers, the
+runtime archive and `share/titan/LICENSE`. The compiler resolves Titan modules
+through its Titan path, never through `package.cpath`; Lua's own native-module
+path reaches only the SDK's `lib/lua/5.5`, where the `titan` support module is an
+ordinary Lua C module. No Titan checkout or project-owned compiler installation
+is needed:
 
 ```sh
 make -j2 server TITAN_PREFIX="$HOME/.local/titan"
@@ -22,7 +24,7 @@ make -j2 server TITAN_PREFIX="$HOME/.local/titan"
 
 The SDK must support compiler-owned incremental builds, `--output`, `--exe`
 and `--c-source`. It is immutable during consumer builds. In the compiler's
-environment (`COMPILER_ENV` in the `Makefile`), `TITAN_ROCKS_ROOT` selects the
+environment (`COMPILER_ENV` in the `Makefile`), `TITAN_ROOT` selects the
 installed SDK assets. A child-only `TITAN_PREFIX` points C probes at the
 writable `BUILD_ROOT/compiler-cache`. Prepare and update SDKs with Titan's own
 installation workflow. On Linux that workflow needs Readline development
@@ -69,9 +71,13 @@ titanc --tree src --output .build/server --source-first --incremental \
 
 Make supplies the selected SDK environment, exported Lua API linker flag
 (`-Wl,-E` on Linux, `-Wl,-export_dynamic` on macOS), explicit standard archive
-and applicable OpenSSL switches in addition to this sketch. `SERVER` can
-select another executable destination without a post-link move or copy.
-`TITAN_FLAGS=-v` exposes certification misses and native commands.
+and applicable OpenSSL switches in addition to this sketch. The embedded
+interface C refers to `luaopen_titan` directly, so the final link extracts the
+metadata-free support member from the SDK's `lib/titan/0.6/libtitan.a`; the
+server preloads that table as `require "titan"` and never loads it from
+`package.cpath`. `SERVER` can select another executable destination without a
+post-link move or copy. `TITAN_FLAGS=-v` exposes certification misses and
+native commands.
 
 `server-test-build` similarly invokes one compiler on `server.tests`, using
 `--test --no-uv-bootstrap --exe .build/tests/server/tests`. The existing
@@ -132,7 +138,9 @@ execution targets (`TEST_ENV`) therefore follow Titan's own test harness:
    `package.cpath`.
 2. Pass the answers as `LUA_PATH_5_5` and `LUA_CPATH_5_5`.
 3. Unset `TITAN_PATH_0_6` and `TITAN_PATH`, so an unrelated provider cannot
-   override the selected SDK.
+   override the selected SDK, and pass the selected SDK as `TITAN_ROOT`. The
+   runtime default then keeps the executable-relative roots and falls back to
+   `TITAN_ROOT`'s providers without starting a compiler.
 
 The executable embeds no SDK path. Run the tests through the Make targets;
 running them directly needs the same queried paths.
@@ -186,8 +194,9 @@ It then checks the copies byte for byte against the SDK. The allowlist
 (`EXPECTED_SHARE_ROOT` and `nativeRootInventory` in
 `scripts/stage-lua-modules.mjs`) keeps the compiler and its LuaRocks-installed
 dependencies, including `luv` on every platform, and leaves out LuaRocks's own
-modules and unrelated packages. No `lib/titan` tree or provider archive is
-staged. `scripts/stage-notices.mjs`
+modules and unrelated packages. The allowlist names no `share/lua/5.5/titan`
+tree: the standard modules are native providers, not Lua sources. No
+`lib/titan` tree or provider archive is staged. `scripts/stage-notices.mjs`
 collects licenses from the installation, using the rock versions and license
 files in `compilerRocks` (`scripts/compiler-rocks.mjs`). `scripts/inspect-vsix.sh` and
 `scripts/inspect-server.sh` check the package and the executable's native
@@ -230,8 +239,9 @@ the matching `BUILD_ROOT`, `SERVER` and compiler flags.
    and install it with `TITAN_BUILD_PROFILE=validation`. If the
    `TITAN_RELEASE_TOKEN` secret is set, the download uses
    `gh release download` with it; otherwise it uses the public release URL.
-   Before caching, check the installation's files, its recorded build profile
-   and `titanc --print-prefix`.
+   Before caching, check the installation's files (the compiler, the standard
+   provider, the runtime archive and the `lib/lua/5.5` support module), its
+   recorded build profile and `titanc --print-root`.
 2. **Build and test.** Run `make -j2 server server-test-build`, then
    `server-test-sharded`, `incremental-build-test`, `server-protocol-test`,
    `codex-native-test`, `extension-test`, `shard-runner-test` and
@@ -288,14 +298,14 @@ compiler is the `llvm-rc.exe` beside `--clang`. `--build-root` (default
 test filter.
 
 The driver starts native executables directly, without a shell. Each compiler
-command runs the SDK's `bin/lua.exe -E` on the installed
-`lib/luarocks/rocks-5.5/titan/0.6.0-1/bin/titanc` script (`windowsCompilerCommand`
-in `scripts/build-windows.mjs`), so LuaRocks' batch wrapper is not needed. The
-driver inherits the parent environment, removes conflicting Lua and Titan
-search overrides and sets compiler paths only for its children. It installs
-nothing and never changes the global `PATH`, accounts, privileges or execution
-policy. The build writes only its own stages and outputs and the extension's
-packaged payload.
+command runs the SDK's own `bin/titanc.exe` program (`windowsCompilerCommand` in
+`scripts/build-windows.mjs`), which locates its installation root and the
+`share/lua/5.5/titan-compiler/titanc.lua` frontend by itself; there is no batch
+wrapper, `lua.exe` preamble or retained rock script to name. The driver inherits
+the parent environment, removes conflicting Lua and Titan search overrides and
+sets compiler paths only for its children. It installs nothing and never
+changes the global `PATH`, accounts, privileges or execution policy. The build
+writes only its own stages and outputs and the extension's packaged payload.
 
 `server-test-build` and `server-test-run` default to the `validation`
 profile: `-O0 -fno-lto` for generated Titan code and native helpers, with no
@@ -327,6 +337,9 @@ layout.
 
 The application is `bin/titan-language-server.exe` plus
 `lib/titan/0.6/titan_language_server.dll` and `lib/titan/0.6/titan.dll`.
+The launcher is the generated executable; it preloads the application DLL and
+statically links the runtime archive for the same `luaopen_titan` support the
+Unix server links, so the payload needs no `lib/lua/5.5/titan.dll`.
 `lua55.dll` and five native runtime DLLs (`libuv-1.dll`, `libllhttp-9.4.dll`,
 `libsqlite3-0.dll`, `libssl-3-x64.dll`, `libcrypto-3-x64.dll`) live in `bin`.
 `lfs.dll`, `lpeglabel.dll` and `luv.dll` live in `dist/titan/lib/lua/5.5`.
@@ -366,7 +379,10 @@ It opens the provider with `FILE_SHARE_READ` only, which denies write and delete
 sharing, and it confirms that the handle names the mapped provider image. The
 provider's identity is built from the handle's canonical path, its volume and
 file identifiers and its 100 ns timestamps. If construction fails, the handle
-is closed immediately. Restart the server before you update or replace its
+is closed immediately. The support table itself does not come from that DLL:
+`src/server/embedded_interfaces_windows.c` refers to `luaopen_titan` directly,
+so the linker extracts the metadata-free support member from the SDK's
+`lib/titan/0.6/libtitan.a`. Restart the server before you update or replace its
 loaded standard provider.
 
 ### Windows packaging

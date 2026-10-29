@@ -37,7 +37,7 @@ aggregation logic of `scripts/benchmark-server.mjs` and runs in
 In both scripts `TITAN_PREFIX` means the server's probe-cache prefix, never the
 SDK. `benchmark-workspace-cache.mjs` creates a private one, and
 `benchmark-server.mjs` passes yours through (unset, the server uses
-`.titan-ls`). Both select the compiler from `TITAN_ROCKS_ROOT`, or else use
+`.titan-ls`). Both select the compiler from `TITAN_ROOT`, or else use
 [SDK discovery](native-build.md#sdk-selection) through `scripts/titan-sdk.mjs`.
 `TITAN_LS_LUA_PATH` and `TITAN_LS_LUA_CPATH`, when set, override the compiler
 module paths derived from that installation.
@@ -111,7 +111,7 @@ cold rows mostly isolate compiler work.
 
 For a persistent-cache fill and warm comparison, point `TITAN_PREFIX` at a
 fresh absolute directory and reuse it across the consecutive processes. Keep
-`TITAN_ROCKS_ROOT` on the real installation. The compiler stores probe
+`TITAN_ROOT` on the real installation. The compiler stores probe
 records under `var/cache/titan-probes/2` in that prefix.
 
 ## Restart and saved-edit workload: `scripts/benchmark-workspace-cache.mjs`

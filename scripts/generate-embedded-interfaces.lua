@@ -240,7 +240,8 @@ local function render_source(entries, profile)
         "#include \"lua.h\"",
         "#include \"embedded_interfaces_native.h\"",
         "",
-        "/* This direct reference extracts only metadata-free ltitanlib.o. */",
+        "/* This direct reference extracts only metadata-free ltitanlib.o from the",
+        " * installed runtime archive, which every Titan final link supplies. */",
         "extern int luaopen_titan(lua_State *L);",
         "",
         render_array("titan_ls_support_name", "titan"),
@@ -866,7 +867,8 @@ local contents, render_error
 if windows then
     local declarations, body = render_profile(profile)
     local lines = {
-        "/* Windows target profile only; runtime interfaces come from the canonical Titan DLL. */",
+        "/* Windows target profile only; interface metadata comes from the canonical",
+        " * Titan standard provider, while support is the linked runtime archive member. */",
         '#include "lua.h"', '#include "lauxlib.h"', declarations,
         [[static void titan_ls_push_bytes(lua_State *L,
                                           const unsigned char *bytes,

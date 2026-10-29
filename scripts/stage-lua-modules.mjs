@@ -14,12 +14,14 @@ const EXPECTED_COMPILER_VERSION = {
   TITAN_VERSION: "0.6.0"
 };
 const EXPECTED_LANGUAGE_SERVER_API_VERSION = 1;
+// The compiler modules, their packaged dependencies and nothing else. The
+// standard modules are native providers, so there is no share/lua/5.5/titan
+// tree; generated shims were removed with the provider rewrite.
 const EXPECTED_SHARE_ROOT = [
   "argparse.lua:file",
   "c-parser:directory",
   "inspect.lua:file",
   "relabel.lua:file",
-  "titan:directory",
   "titan-compiler:directory"
 ];
 export function nativeRootInventory(platform = process.platform) {

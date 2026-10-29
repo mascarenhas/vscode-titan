@@ -29,7 +29,7 @@ async function fixture(context) {
 
 async function compilerSDK(context) {
   const result = await fixture(context);
-  const directories = ["share/lua/5.5/c-parser", "share/lua/5.5/titan", "share/lua/5.5/titan-compiler", "include/titan", "include/uv"];
+  const directories = ["share/lua/5.5/c-parser", "share/lua/5.5/titan-compiler", "include/titan", "include/uv"];
   for (const directory of directories) await mkdir(path.join(result.sdk, directory), { recursive: true });
   for (const member of ["argparse.lua", "inspect.lua", "relabel.lua", "c-parser/cdriver.lua", "titan-compiler/checker.lua",
     "titan-compiler/checker/completion.lua", "titan-compiler/completion.lua", "titan-compiler/maybe3.lua", "titan-compiler/documentation.lua",
@@ -205,9 +205,9 @@ esac
 `, true);
       const env = { ...process.env };
       for (const name of ["MAKEFLAGS", "MFLAGS", "MAKELEVEL", "BUILD_PROFILE", "TITAN_BUILD_PROFILE"]) delete env[name];
-      env.TITAN_ROCKS_ROOT = "/unrelated/SDK";
-      const runtimeProbe = 'console.log("RUNTIME:" + JSON.stringify({sdk:process.env.TITAN_ROCKS_ROOT,probe:process.env.TITAN_PREFIX}))';
-      const compilerProbe = 'console.log("COMPILER:" + JSON.stringify({sdk:process.env.TITAN_ROCKS_ROOT,probe:process.env.TITAN_PREFIX,profile:process.env.TITAN_BUILD_PROFILE}))';
+      env.TITAN_ROOT = "/unrelated/SDK";
+      const runtimeProbe = 'console.log("RUNTIME:" + JSON.stringify({sdk:process.env.TITAN_ROOT,probe:process.env.TITAN_PREFIX}))';
+      const compilerProbe = 'console.log("COMPILER:" + JSON.stringify({sdk:process.env.TITAN_ROOT,probe:process.env.TITAN_PREFIX,profile:process.env.TITAN_BUILD_PROFILE}))';
       const probe = "sdk-review: | $(TITANC)\n" +
         "\t@printf '%s\\n' 'SDK:$(OPENSSL_MODE)|$(OPENSSL_LDFLAGS)|$(OPENSSL_CPPFLAGS)'\n" +
         "\t@printf '%s\\n' \"FLAGS:$(TITAN_COMPILE_FLAGS) $(TITAN_LINK_FLAGS)\"\n" +

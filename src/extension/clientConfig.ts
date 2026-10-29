@@ -9,6 +9,7 @@ export const LANGUAGE_SERVER_LUA_PATH_ENVIRONMENT_VARIABLE =
   "TITAN_LS_LUA_PATH";
 export const LANGUAGE_SERVER_LUA_CPATH_ENVIRONMENT_VARIABLE =
   "TITAN_LS_LUA_CPATH";
+export const LANGUAGE_SERVER_TITAN_ROOT_ENVIRONMENT_VARIABLE = "TITAN_ROOT";
 export const SERVER_LOG_LEVEL_ENVIRONMENT_VARIABLE =
   "TITAN_LANGUAGE_SERVER_LOG_LEVEL";
 
@@ -33,6 +34,8 @@ export interface ServerConfiguration {
 export interface CompilerDiscoveryConfiguration {
   luaPath: string;
   luaCPath: string;
+  /** Installation root whose headers and Lua sources accompany the modules. */
+  titanRoot: string;
 }
 
 export interface CompletionConfiguration {
@@ -128,7 +131,11 @@ export function readCompilerDiscoveryConfiguration(
         ].join(";"),
     luaCPath: configuredLuaCPath.length > 0
       ? configuredLuaCPath
-      : path.join(nativeRoot, platform === "win32" ? "?.dll" : "?.so")
+      : path.join(nativeRoot, platform === "win32" ? "?.dll" : "?.so"),
+    // The packaged payload is a complete compiler installation root: it holds
+    // the SDK headers and Lua sources that C imports and live analysis read.
+    // The compiler derives nothing from a Lua search path, so name it here.
+    titanRoot: prefix
   };
 }
 
@@ -206,7 +213,8 @@ export function createServerLaunchOptions(
   environment: NodeJS.ProcessEnv = process.env,
   compilerDiscovery: CompilerDiscoveryConfiguration = {
     luaPath: "./?.lua",
-    luaCPath: process.platform === "win32" ? "./?.dll" : "./?.so"
+    luaCPath: process.platform === "win32" ? "./?.dll" : "./?.so",
+    titanRoot: ""
   },
   logLevel: ServerLogLevel = DEFAULT_SERVER_LOG_LEVEL
 ): ServerLaunchOptions {
@@ -216,6 +224,12 @@ export function createServerLaunchOptions(
     compilerDiscovery.luaPath;
   childEnvironment[LANGUAGE_SERVER_LUA_CPATH_ENVIRONMENT_VARIABLE] =
     compilerDiscovery.luaCPath;
+  if (compilerDiscovery.titanRoot.length > 0) {
+    childEnvironment[LANGUAGE_SERVER_TITAN_ROOT_ENVIRONMENT_VARIABLE] =
+      compilerDiscovery.titanRoot;
+  } else {
+    delete childEnvironment[LANGUAGE_SERVER_TITAN_ROOT_ENVIRONMENT_VARIABLE];
+  }
   return {
     command,
     args: [...args],

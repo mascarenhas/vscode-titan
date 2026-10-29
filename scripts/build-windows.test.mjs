@@ -178,12 +178,12 @@ test("production and test native helpers have separate graph ownership", () => {
 });
 
 
-test("Windows compilation invokes the installed LuaRocks script directly", () => {
+test("Windows compilation invokes the installed compiler program directly", () => {
   const sdk = "C:\\SDK space 路径";
   const arguments_ = ["--tree", "source space", "server.root"];
   assert.deepEqual(windowsCompilerCommand(sdk, arguments_), {
-    command: path.win32.join(sdk, "bin", "lua.exe"),
-    args: ["-E", path.win32.join(sdk, "lib", "luarocks", "rocks-5.5", "titan", "0.6.0-1", "bin", "titanc"), ...arguments_]
+    command: path.win32.join(sdk, "bin", "titanc.exe"),
+    args: arguments_
   });
   assert.deepEqual(arguments_, ["--tree", "source space", "server.root"]);
 });

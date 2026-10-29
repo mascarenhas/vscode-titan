@@ -24,11 +24,15 @@ compatible modules are in the project root, start Codex with complete
 templates for the same Titan installation the server was built against:
 
 ```sh
+export TITAN_ROOT='/opt/titan'
 export TITAN_LS_LUA_PATH='/opt/titan/share/lua/5.5/?.lua;/opt/titan/share/lua/5.5/?/init.lua'
 export TITAN_LS_LUA_CPATH='/opt/titan/lib/lua/5.5/?.so'
 ```
 
-The server uses these values verbatim, without `;;` expansion.
+The server uses the Lua values verbatim, without `;;` expansion. `TITAN_ROOT`
+names the installation whose SDK headers and Lua sources C imports and live
+analysis read; without it the compiler root is the parent of the executable's
+directory.
 
 ## Install the repository plugin
 

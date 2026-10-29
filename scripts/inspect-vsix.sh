@@ -244,7 +244,7 @@ mkdir -p \
   export CCACHE_DISABLE=1
   export LUA_PATH=/ambient/must-not-be-used/?.lua
   export LUA_CPATH=/ambient/must-not-be-used/?.so
-  export TITAN_ROCKS_ROOT="$hostile_titan_root"
+  export TITAN_ROOT="$hostile_titan_root"
   export TITAN_PATH="$hostile_titan_root/lib/titan/0.6"
   export TITAN_PATH_0_6="$hostile_titan_root/lib/titan/0.6"
   export TITAN_SOURCE_PATH="$hostile_titan_root/source/?.titan"
@@ -257,9 +257,10 @@ mkdir -p \
 
   # C imports need a C compiler, with all Titan/Lua headers supplied by the
   # extracted package and no checkout-specific include configuration.
-  # TITAN_ROCKS_ROOT is an explicit SDK override; allow the packaged native
-  # module path to identify the installation for this check.
-  unset TITAN_ROCKS_ROOT
+  # The extracted compiler payload is a complete installation root, exactly as
+  # the extension names it at launch; SDK-backed C imports read its headers and
+  # Lua sources instead of deriving them from a Lua path.
+  export TITAN_ROOT="$extract_root/extension/dist/titan"
   export CC="$sdk_compiler"
   export TITAN_PROBE_CACHE_DISABLE=1
   if [[ "$bundled_openssl" == 0 ]]; then

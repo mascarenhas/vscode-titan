@@ -1367,13 +1367,16 @@ function collectStderr(stream, maximumBytes = 64 * 1024) {
 async function startServer(options) {
   const environment = { ...process.env };
   if (environment.TITAN_LS_LUA_PATH === undefined ||
-      environment.TITAN_LS_LUA_CPATH === undefined) {
+      environment.TITAN_LS_LUA_CPATH === undefined ||
+      environment.TITAN_ROOT === undefined) {
     // Benchmarks reserve TITAN_PREFIX for their probe cache, independently of
-    // the installed compiler selected by TITAN_ROCKS_ROOT or PATH discovery.
-    const prefix = resolveTitanSdk({ prefix: environment.TITAN_ROCKS_ROOT,
+    // the installed compiler selected by TITAN_ROOT or PATH discovery. The
+    // server needs TITAN_ROOT even when the Lua paths are explicit: header and
+    // Lua-source lookup comes from the installation root, not from a Lua path.
+    const prefix = resolveTitanSdk({ prefix: environment.TITAN_ROOT,
       environment: compilerDiscoveryEnvironment(environment) });
     const luaRoot = path.join(prefix, "share", "lua", "5.5");
-    environment.TITAN_ROCKS_ROOT ??= prefix;
+    environment.TITAN_ROOT ??= prefix;
     environment.TITAN_LS_LUA_PATH ??= [
       path.join(luaRoot, "?.lua"), path.join(luaRoot, "?", "init.lua")
     ].join(";");

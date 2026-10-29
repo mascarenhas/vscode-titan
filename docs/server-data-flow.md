@@ -20,6 +20,7 @@ input.
 | Input | Owner and interpretation |
 | --- | --- |
 | Compiler Lua and native Lua module paths | The extension sets `TITAN_LS_LUA_PATH` and `TITAN_LS_LUA_CPATH` from its packaged trees or explicit settings (`readCompilerDiscoveryConfiguration` in `src/extension/clientConfig.ts`). `lua_paths.configure` assigns them, or the [standalone defaults](../README.md#standalone-server), to `package.path` and `package.cpath` before compiler modules load. These paths are separate from Titan source and provider paths. |
+| Compiler installation root | The same function reports the packaged `dist/titan` payload, which `createServerLaunchOptions` passes as `TITAN_ROOT`. The compiler takes its SDK headers, Lua sources and library layout from that root and never from a Lua search path; the server links the runtime archive, so the payload carries no `lib/titan` providers. |
 | Saved project discovery and watching | `project_config` loads `include` and `exclude` and resolves them against the workspace root. `project_discovery` scans `include`; `exclude` narrows only the watcher set. |
 | Titan source module roots | `source_module_roots` is an ordered array in `ProjectConfig` and `CompilerConfiguration`. Only `Compiler:configure` joins it with `;` into the driver's `TITAN_SOURCE_PATH`. It also determines logical module names. |
 | Titan binary providers | `binary_modules_root` defaults to the compiler's installed root (`Compiler:installed_binary_modules_root`). It is independent of the Lua native-module path. |
