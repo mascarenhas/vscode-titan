@@ -23,15 +23,17 @@ test("Windows notices come from installed rocks with real MIT and Apache license
   await assert.rejects(readFile(path.join(destination, "lua/compiler-dependencies.tsv")), { code: "ENOENT" });
 });
 
-test("Windows luv staging requires notices for statically bundled libuv components", async (context) => {
-  const fixture = await installedRocks(context);
-  await rm(path.join(fixture.sdk, "share/titan/LICENSES/libuv-inet-LICENSE"));
-  const destination = await mkdtemp(path.join(tmpdir(), "titan-rock-notices-"));
-  context.after(() => rm(destination, { recursive: true, force: true }));
-  await assert.rejects(stageLuaNotices({ sdk: fixture.sdk, destination,
-    platform: "win32", manifestReader: fixture.manifestReader }),
-  /cannot read luv bundled libuv license.*libuv-inet-LICENSE/);
-});
+for (const platform of ["win32", "linux", "darwin"]) {
+  test(`${platform} luv staging requires notices for statically bundled libuv components`, async (context) => {
+    const fixture = await installedRocks(context, platform);
+    await rm(path.join(fixture.sdk, "share/titan/LICENSES/libuv-inet-LICENSE"));
+    const destination = await mkdtemp(path.join(tmpdir(), "titan-rock-notices-"));
+    context.after(() => rm(destination, { recursive: true, force: true }));
+    await assert.rejects(stageLuaNotices({ sdk: fixture.sdk, destination,
+      platform, manifestReader: fixture.manifestReader }),
+    /cannot read luv bundled libuv license.*libuv-inet-LICENSE/);
+  });
+}
 
 test("Unix compiler dependency notices need only installed rocks and omit LuaRocks itself", async (context) => {
   const fixture = await installedRocks(context, "linux");
@@ -39,9 +41,9 @@ test("Unix compiler dependency notices need only installed rocks and omit LuaRoc
   context.after(() => rm(destination, { recursive: true, force: true }));
   const versions = await stageLuaNotices({ sdk: fixture.sdk, destination,
     platform: "linux", manifestReader: fixture.manifestReader });
-  assert.equal(versions.length, 4);
+  assert.equal(versions.length, 5);
   assert.deepEqual(await readdir(path.join(destination, "lua")),
-    ["argparse", "inspect", "lpeglabel", "luafilesystem"]);
+    ["argparse", "inspect", "lpeglabel", "luafilesystem", "luv"]);
   await assert.rejects(readFile(path.join(destination, "lua/luarocks/COPYING")), { code: "ENOENT" });
 });
 

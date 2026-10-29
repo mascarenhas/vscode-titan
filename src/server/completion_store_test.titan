@@ -463,13 +463,29 @@ function test_completion_store_external_revision_requires_exact_provenance(_cont
     defer access:release()
     local old = completion.SavedDescriptor.new("library", 0, 2, "external", "/old/library.titan",
       "body-free", "public", "source", {"/old/library.titan"}, {},
-      {bridge.CHeaderDependency.new(bridge.CHeaderDependencyKind.file(), "/sdk/header.h", "first")}, {})
+      {bridge.CHeaderDependency.new(bridge.CHeaderDependencyKind.file(), "/sdk/header.h", "first",
+         bridge.HeaderObservation.new(1, 2, "physical", "ns", 12, 3, 4)),
+       bridge.CHeaderDependency.new(bridge.CHeaderDependencyKind.origin(), "/sdk/header.h", "first")}, {})
     completion.publish_saved(access.connection, {old}, {"library"}, bridge.CompilerConfiguration.new())
     test.assert(completion.descriptor_matches(access.connection, old),
       "unchanged external descriptor could not retain its detached payload")
+    local headers = completion.saved_headers(access.connection, "library")
+    case headers[2].kind
+    when origin() then
+    else test.assert(false, "detached completion lost the declaring-header origin")
+    end
+    test.assert(headers[1].observation.precision == "ns" and
+      headers[1].observation.size == 12 and headers[1].observation.changed_seconds == 3 and
+      headers[1].observation.changed_nanoseconds == 4,
+      "saved completion did not round-trip compiler validation observations")
+    local changed_kind = completion.SavedDescriptor.new("library", 0, 2, "external", "/old/library.titan",
+      nil, "public", "source", old.source_files, {},
+      {old.header_inputs[1], bridge.CHeaderDependency.new(bridge.CHeaderDependencyKind.file(), "/sdk/header.h", "first")}, {})
+    test.assert(not completion.descriptor_matches(access.connection, changed_kind),
+      "detached completion collapsed an origin input into an equal file input")
     local changed_header = completion.SavedDescriptor.new("library", 0, 2, "external", "/old/library.titan",
       nil, "public", "source", {"/old/library.titan"}, {},
-      {bridge.CHeaderDependency.new(bridge.CHeaderDependencyKind.file(), "/sdk/header.h", "second")}, {})
+      {bridge.CHeaderDependency.new(bridge.CHeaderDependencyKind.file(), "/sdk/header.h", "second"), old.header_inputs[2]}, {})
     test.assert(not completion.descriptor_matches(access.connection, changed_header),
       "equal external graph revision reused stale C header identities")
     local changed_root = completion.SavedDescriptor.new("library", 0, 2, "external", "/new/library.titan",

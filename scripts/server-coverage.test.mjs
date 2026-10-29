@@ -24,7 +24,8 @@ async function fixture(context) {
   for (const name of ["server/used.titan", "server/unimported.titan", "titan_language_server.titan", "server/tests.titan",
     "server/used_test.titan", "server/test_paths.titan", "server/clock.h", "server/clock.c", "server/clock.ffi.h", "server/clock.o",
     "server/.coverage/stale.titan"]) await put(path.join(options.repository, "src", name));
-  for (const name of ["compiler_io_clock.o", "embedded_interfaces_native.o", "compiler_io_process_fixture"])
+  await put(path.join(options.repository, "src/server/compiler_io_clock.c"));
+  for (const name of ["embedded_interfaces_native.c", "compiler_io_process_fixture"])
     await put(path.join(options.nativeDir, name));
   for (const name of ["titanc", "lua"]) await put(path.join(options.prefix, "bin", name));
   await put(path.join(options.prefix, "lib/titan/0.6/titan.a"));
@@ -35,7 +36,7 @@ async function fixture(context) {
       const stage = args[args.indexOf("--tree") + 1];
       const selected = args.flatMap((arg, index) => arg === "--coverage-module" ? [args[index + 1]] : []);
       for (const name of selected) {
-        const main = path.join(stage, name.replaceAll(".", "/") + ".titan");
+        const main = path.join(args[args.indexOf("--output") + 1], name.replaceAll(".", "/") + ".titan");
         const stem = path.join(path.dirname(main), ".coverage", path.basename(main, ".titan"));
         for (const extension of [".o", ".gcno", ".c"]) await put(stem + extension);
       }
@@ -57,8 +58,9 @@ async function fixture(context) {
     }
     assert.fail(`unexpected command: ${command} ${args.join(" ")}`);
   };
-  const environment = { TITAN_EXTRA_CPPFLAGS: "-DSOURCE_FLAG=1", TITAN_EXTRA_LDFLAGS: "-lcaller", VSCODE_TITAN_OPENSSL_CPPFLAGS: "-DSSL_FLAG=1",
-    VSCODE_TITAN_OPENSSL_LDFLAGS: "-lssl -lcrypto", LUA_PATH: "ambient-path", TITAN_PATH: "ambient-provider",
+  options.cflags = ["-DSSL_FLAG=1"];
+  options.ldflags = ["-lssl", "-lcrypto"];
+  const environment = { TITAN_EXTRA_CPPFLAGS: "-DSOURCE_FLAG=1", TITAN_EXTRA_LDFLAGS: "-lcaller", LUA_PATH: "ambient-path", TITAN_PATH: "ambient-provider",
     TITAN_PREFIX: "ambient-sdk-prefix", TITAN_ROCKS_ROOT: "ambient-sdk",
     GCOV_PREFIX: "ambient-counter-directory", TITAN_FILTER: "drop-most-tests" };
   return { root, options, calls, run, environment, put };
@@ -127,7 +129,7 @@ test("single direct test build roots every discovered production module and isol
   assert.deepEqual(selected, ["server.unimported", "server.used", "titan_language_server"]);
   assert.deepEqual(args.slice(args.indexOf("--tree") + 2), ["server.tests", ...selected]);
   assert.ok(args.includes("--static") && args.includes("--test") && args.includes("--coverage") && args.includes("--no-uv-bootstrap"));
-  assert.ok(!args.includes("--coverage-source-map") && !args.includes("--coverage-gcovr") && !args.includes("--incremental"));
+  assert.ok(!args.includes("--coverage-source-map") && !args.includes("--coverage-gcovr") && args.includes("--incremental"));
   assert.equal(execution.cwd, options.buildDir);
   assert.equal(execution.env.TITAN_BUILD_PROFILE, "validation");
   assert.equal(execution.env.TITAN_ROCKS_ROOT, options.prefix);
@@ -136,8 +138,10 @@ test("single direct test build roots every discovered production module and isol
   assert.equal(environment.TITAN_ROCKS_ROOT, "ambient-sdk");
   for (const name of ["LUA_PATH", "GCOV_PREFIX", "GCOV_PREFIX_STRIP", "TITAN_FILTER"]) assert.equal(execution.env[name], undefined);
   assert.equal(execution.env.TITAN_EXTRA_CPPFLAGS, "-DSOURCE_FLAG=1");
-  assert.match(execution.env.TITAN_EXTRA_LDFLAGS, /compiler_io_clock\.o/);
-  assert.match(execution.env.TITAN_EXTRA_LDFLAGS, /titan\.a/);
+  assert.deepEqual(args.flatMap((arg, index) => arg === "--c-source" ? [args[index + 1]] : []),
+    [path.join(options.repository, "src/server/compiler_io_clock.c"), path.join(options.nativeDir, "embedded_interfaces_native.c")]);
+  assert(args.includes("--ldflag=" + path.join(options.prefix, "lib/titan/0.6/titan.a")));
+  assert.equal(execution.env.TITAN_EXTRA_LDFLAGS, "-lcaller");
   assert.equal(build.runtimeEnvironment.TITAN_EXTRA_LDFLAGS, "-lcaller", "fixture child builds do not receive final-image payload flags");
   assert.equal(build.executable, path.join(options.buildDir, "server/tests"));
   assert.equal(await readFile(path.join(options.buildDir, "src/server/clock.c"), "utf8"), "fixture\n");

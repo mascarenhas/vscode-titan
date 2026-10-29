@@ -65,8 +65,10 @@ To build this repository you need:
 
 Builds use the selected SDK's compiler, Lua interpreter, modules, headers and
 standard-library providers together, and they never modify it. The SDK must
-include Titan's installed license at `share/titan/LICENSE`. Installing a
-packaged VSIX needs none of this toolchain.
+include Titan's installed license at `share/titan/LICENSE`, and its compiler
+must provide compiler-owned incremental builds (certified object, native-C,
+and final-link reuse, native input switches, `--output`, and `--exe`).
+Installing a packaged VSIX needs none of this toolchain.
 
 Native packages build on Linux and macOS. On macOS, put GNU Make 4.4.1 first
 on `PATH`; see [native builds](docs/native-build.md#sdk-selection). Windows is
@@ -89,9 +91,33 @@ the matching Lua sources under `dist/titan/src`. To use a specific SDK:
 make -j2 TITAN_PREFIX="$HOME/.local/titan"
 ```
 
+Native image targets always invoke `titanc --incremental`; Make maintains no
+Titan module graph or compiler/SDK/configuration stamps. The compiler
+discovers imports, schedules source misses, certifies native C helpers passed
+with `--c-source`, and reuses unchanged final links. Make runs the
+embedded-interface generator, stages runtime files, packages the extension,
+and executes tests.
+
+The server selects `src` with `--tree`, writes to `--output .build/server`,
+and uses `--exe bin/titan-language-server`; tests use `.build/tests` and
+`--exe .build/tests/server/tests` with the explicit `server.tests` root.
+`--exe` is relative to the working directory, not the output tree. Generated
+module files preserve the source hierarchy; each output tree also owns
+`.native/` for C helpers, `.titan-links/<key>/synthetic/` for target-specific
+runner/entrypoint files, and a disposable `.titan/digests` precise-stat cache.
+Missing or malformed digest data is ignored; inputs without matching precise
+observations are read again. Keep source-root spelling stable because changing
+it can change generated source locations and legitimately miss.
+
+Run `make server TITAN_FLAGS=-v` for native command echoes and object/native/link
+decisions on stderr; worker output and diagnostics use stderr too. Capture both
+streams for build logs. No-op certification performs no object compilation or
+final link; it is not a Make-only skip. See the native-build guide for profile,
+SDK, output-root, and jobserver policy.
+
 `make verify` is the complete local gate. It runs the native, protocol, Codex
 adapter and JavaScript suites and the Extension Host smoke test. It also
-checks incremental rebuilds, packages a VSIX, inspects it and the
+checks the incremental-build smoke, packages a VSIX, inspects it and the
 executable's native linkage, validates the Codex plugin metadata and tests a
 server-only installation. On a headless Linux machine, run it as
 `xvfb-run -a make verify`. Test and verify targets build with the unoptimized
@@ -106,7 +132,7 @@ not a successful test run.
 
 More build documentation:
 
-- [Native builds](docs/native-build.md): the object graph, build profiles,
+- [Native builds](docs/native-build.md): compiler-owned builds, build profiles,
   test execution, CI and the Windows driver.
 - [Line coverage](docs/coverage.md).
 - [Performance measurement](docs/benchmarks.md).

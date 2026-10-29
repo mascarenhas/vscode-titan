@@ -19,7 +19,7 @@ Startup opens the file with `workspace_cache.open_for_inventory`, and
 `open_compatible` decides whether to keep it:
 
 - `PRAGMA user_version` must be `0` (an empty file, initialized in place) or
-  `SCHEMA_VERSION` (currently 7).
+  `SCHEMA_VERSION` (currently 8).
 - A versioned file must have a `compatibility` entry in `cache_meta`, and all
   `cache_meta` keys and values must be BLOBs.
 - A file with a `compatibility` entry must pass `PRAGMA quick_check`.
@@ -81,11 +81,11 @@ changed, failed and removed modules replace only their own rows. External
 source and binary modules keep manifests and provenance only
 (`external_records`).
 
-C-header artifacts accept the compiler kinds `c-header-v6` and `c-header-v7`;
-FFI conversion artifacts accept `ffi-conversion-v7` and `ffi-conversion-v8`.
-`artifact_table` and `artifact_scope` in `workspace_cache.titan` map these
-reviewed namespace pairs to their tables. `Store:read_saved_cache` in
-`completion_store.titan` accepts the same sets for private preparation.
+C-header artifacts accept `c-header-v8`; FFI conversion artifacts accept
+`ffi-conversion-v8`. `artifact_table` and `artifact_scope` in
+`workspace_cache.titan` map these namespaces to their tables.
+`Store:read_saved_cache` in `completion_store.titan` accepts the same kinds for
+private preparation. Older namespaces are misses, not aliases.
 `test_workspace_cache_accepts_installed_compiler_artifact_namespaces` in
 `src/server/workspace_cache_test.titan` reads both kinds from the installed
 compiler and exercises saved lookup and private reads, including their saved
@@ -107,6 +107,16 @@ analyzed external module, 2 for a parsed header artifact and 3 for an FFI
 conversion. `header_inputs` lists each owner's dependencies in order,
 including duplicates. An owner may have an empty list.
 
+Header kinds remain distinct throughout saved and detached completion state:
+`file` certifies bytes, `search` certifies an exact include candidate, and
+`origin` certifies the realpath naming a C declaration's nominal scope.
+A file and origin input for the same pathname coexist; retargeting a symlink
+to identical bytes must still invalidate its nominal C origin. Physical
+observations also retain precision, size and optional change timestamps; those
+fields authorize the compiler's read fast path, not semantic equality.
+Schema 8 adds these observation fields and the origin kind. Older databases are rebuilt
+as disposable caches, without migration.
+
 Refreshing an owner replaces only that owner's inputs. Publication prunes
 dependency values that no owner references. A missing owner makes its artifact
 a cache miss.
@@ -122,13 +132,19 @@ the project payloads and `external_records`.
 ## Startup revalidation
 
 Before it publishes reused answers, startup validates the compiler inventory,
-the native context, then saved sources, headers and search inputs. An
-observation records `lstat` and `stat` kind, device, inode, size, mode and
-nanosecond mtime. An unchanged observation reuses the stored fingerprint
-without reading the file. A changed observation reads and hashes the file. If
-the content is unchanged, only the observation is updated. Replacements,
-symlink changes and new earlier include-search candidates still invalidate.
-A deliberate byte change that preserves all of that metadata goes undetected.
+the native context, then saved sources and compiler-owned header inputs.
+Saved-source observations record `lstat` and `stat` kind, device, inode, size,
+mode and nanosecond mtime. An unchanged source observation reuses the stored
+fingerprint without reading the file; a changed observation reads and hashes it.
+A deliberate source-byte change preserving all of that metadata goes undetected.
+
+Header validation follows the compiler's stronger contract: metadata-only
+reuse requires nanosecond precision and a change timestamp. The server's
+`titan.fs.Stat` strategy currently exposes no change time, so it rereads and
+hashes header bytes. Equal bytes still preserve semantic identity across a
+touch. Origin realpaths and exact search candidates remain independent inputs;
+symlink retargeting and newly eligible earlier include candidates invalidate
+even when another header's content is unchanged.
 
 Validated SQL answers are served before declaration manifests finish
 restoring. `Restoration` in `src/server/project_loader.titan` decodes them in an

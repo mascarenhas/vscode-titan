@@ -54,16 +54,18 @@ end
 local function saved_headers(connection: sqlite3.Connection,
                              module_name: string): {bridge.CHeaderDependency}
   local rows = sql.rows(connection,
-    "SELECT kind,path,identity,modified_seconds,modified_nanoseconds,physical_identity " ..
+    "SELECT kind,path,identity,modified_seconds,modified_nanoseconds,physical_identity,precision,size,changed_seconds,changed_nanoseconds " ..
     "FROM main.completion_header_inputs WHERE module_name=? ORDER BY position", blob(module_name))
   local result: {bridge.CHeaderDependency} = {}
   for index = 1, #rows do
     local row = rows[index]
     local kind = bridge.CHeaderDependencyKind.file()
-    if row:get(1) == 1 then kind = bridge.CHeaderDependencyKind.search() end
+    if row:get(1) == 1 then kind = bridge.CHeaderDependencyKind.search()
+    elseif row:get(1) == 2 then kind = bridge.CHeaderDependencyKind.origin() end
     local observation?: bridge.HeaderObservation
     if row:get(4) ~= nil then
-      observation = bridge.HeaderObservation.new(row:get(4), row:get(5), sql.bytes(row, 6))
+      observation = bridge.HeaderObservation.new(row:get(4), row:get(5), sql.bytes(row, 6),
+        row:get(7), row:get(8), row:get(9), row:get(10))
     end
     result[index] = bridge.CHeaderDependency.new(kind, sql.bytes(row, 2), sql.bytes(row, 3), observation)
   end
@@ -132,8 +134,8 @@ function descriptor_matches(connection: sqlite3.Connection,
   for index = 1, #inputs do
     local old, new = inputs[index], descriptor.header_inputs[index]
     local old_kind, new_kind = 0, 0
-    case old.kind when search() then old_kind = 1 end
-    case new.kind when search() then new_kind = 1 end
+    case old.kind when search() then old_kind = 1 when origin() then old_kind = 2 end
+    case new.kind when search() then new_kind = 1 when origin() then new_kind = 2 end
     if old_kind ~= new_kind or old.path ~= new.path or old.identity ~= new.identity then return false end
   end
   return true
@@ -236,9 +238,9 @@ function Store:read_saved_cache(expected_generation: integer,
     kind: string, key: string): (string?, {bridge.CHeaderDependency}?)
   local table = ""
   local scope = 0
-  if kind == "c-header-v6" or kind == "c-header-v7" then
+  if kind == "c-header-v8" then
     table, scope = "main.header_graphs", 2
-  elseif kind == "ffi-conversion-v7" or kind == "ffi-conversion-v8" then
+  elseif kind == "ffi-conversion-v8" then
     table, scope = "main.ffi_conversion_snapshots", 3
   else
     return nil, nil
@@ -295,7 +297,7 @@ function initialize_saved_schema(connection: sqlite3.Connection)
     "CREATE TABLE IF NOT EXISTS main.completion_descriptors(module_name BLOB PRIMARY KEY NOT NULL,revision INTEGER NOT NULL,state INTEGER NOT NULL,provenance TEXT NOT NULL,main_file BLOB NOT NULL,payload BLOB,public_interface BLOB NOT NULL,source_interface BLOB,documentation BLOB)",
     "CREATE TABLE IF NOT EXISTS main.completion_source_files(module_name BLOB NOT NULL REFERENCES completion_descriptors(module_name) ON DELETE CASCADE,position INTEGER NOT NULL,filename BLOB NOT NULL,PRIMARY KEY(module_name,position)) WITHOUT ROWID",
     "CREATE TABLE IF NOT EXISTS main.completion_imports(module_name BLOB NOT NULL REFERENCES completion_descriptors(module_name) ON DELETE CASCADE,position INTEGER NOT NULL,alias BLOB NOT NULL,dependency BLOB NOT NULL,source_required INTEGER NOT NULL,filename BLOB NOT NULL,line INTEGER NOT NULL,column INTEGER NOT NULL,PRIMARY KEY(module_name,position)) WITHOUT ROWID",
-    "CREATE TABLE IF NOT EXISTS main.completion_header_inputs(module_name BLOB NOT NULL REFERENCES completion_descriptors(module_name) ON DELETE CASCADE,position INTEGER NOT NULL,kind INTEGER NOT NULL,path BLOB NOT NULL,identity BLOB NOT NULL,modified_seconds INTEGER,modified_nanoseconds INTEGER,physical_identity BLOB,PRIMARY KEY(module_name,position)) WITHOUT ROWID",
+    "CREATE TABLE IF NOT EXISTS main.completion_header_inputs(module_name BLOB NOT NULL REFERENCES completion_descriptors(module_name) ON DELETE CASCADE,position INTEGER NOT NULL,kind INTEGER NOT NULL,path BLOB NOT NULL,identity BLOB NOT NULL,modified_seconds INTEGER,modified_nanoseconds INTEGER,physical_identity BLOB,precision TEXT,size INTEGER,changed_seconds INTEGER,changed_nanoseconds INTEGER,PRIMARY KEY(module_name,position)) WITHOUT ROWID",
     "CREATE TABLE IF NOT EXISTS main.completion_members(module_name BLOB NOT NULL REFERENCES completion_descriptors(module_name) ON DELETE CASCADE,ordinal INTEGER NOT NULL,label TEXT COLLATE BINARY NOT NULL,lookup_domain TEXT NOT NULL,lookup_key TEXT NOT NULL,kind INTEGER NOT NULL,detail BLOB NOT NULL,type_key BLOB NOT NULL,scope_id INTEGER NOT NULL,scope_depth INTEGER NOT NULL,declaration_order INTEGER NOT NULL,available INTEGER NOT NULL,visibility TEXT NOT NULL,owner_key TEXT NOT NULL,access_mode TEXT NOT NULL,call_snippet BLOB,documentation BLOB,PRIMARY KEY(module_name,ordinal)) WITHOUT ROWID",
     "CREATE INDEX IF NOT EXISTS main.completion_members_owner ON completion_members(module_name,owner_key,access_mode,label COLLATE BINARY)",
   }
@@ -430,22 +432,31 @@ local CANDIDATE_COLUMNS = "label,lookup_domain,lookup_key,kind,detail,type_key,s
 local function publish_header_inputs(connection: sqlite3.Connection,
                                      descriptor: SavedDescriptor)
   local insert = connection:prepare(
-    "INSERT INTO main.completion_header_inputs VALUES(?,?,?,?,?,?,?,?)")
+    "INSERT INTO main.completion_header_inputs VALUES(?,?,?,?,?,?,?,?,?,?,?,?)")
   defer insert:close()
   for index = 1, #descriptor.header_inputs do
     local input = descriptor.header_inputs[index]
     local kind = 0
-    case input.kind when search() then kind = 1 end
+    case input.kind when search() then kind = 1 when origin() then kind = 2 end
     local seconds?: integer
     local nanoseconds?: integer
     local physical?: string
+    local precision?: string
+    local size?: integer
+    local changed_seconds?: integer
+    local changed_nanoseconds?: integer
     if input.observation ~= nil then
       seconds = input.observation.modified_seconds
       nanoseconds = input.observation.modified_nanoseconds
       physical = input.observation.physical_identity
+      precision = input.observation.precision
+      size = input.observation.size
+      changed_seconds = input.observation.changed_seconds
+      changed_nanoseconds = input.observation.changed_nanoseconds
     end
     insert:execute(blob(descriptor.module_name), index, kind, blob(input.path),
-      blob(input.identity), seconds, nanoseconds, optional_blob(physical))
+      blob(input.identity), seconds, nanoseconds, optional_blob(physical),
+      precision, size, changed_seconds, changed_nanoseconds)
   end
 end
 

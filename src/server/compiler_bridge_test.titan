@@ -479,9 +479,12 @@ return function(mode, contextual_provider_file, workspace_root, headers_root, sd
             identity = "direct bytes", observation = {
               modified_seconds = 123, modified_nanoseconds = 456,
               physical_identity = "device:inode:target",
+              precision = "ns", size = 12, changed_seconds = 122, changed_nanoseconds = 7,
             } },
           { kind = "search", path = headers_root .. "/earlier.h",
             identity = "missing candidate" },
+          { kind = "origin", path = headers_root .. "/direct.h",
+            identity = "c-header-origin-v1;real=" .. headers_root .. "/direct.h" },
         }
       elseif mode == "header-relative-path" then
         header_dependencies = {
@@ -1452,7 +1455,7 @@ function test_compiler_bridge_normalizes_and_restats_c_header_dependencies(
         test_paths.workspace_root() .. "/fixture.titan", "saved fixture")}),
     })
     local module? = analysis:find_module("fixture")
-    test.assert(module ~= nil and #module.c_header_dependencies == 2,
+    test.assert(module ~= nil and #module.c_header_dependencies == 3,
                 "per-module C header metadata was not normalized")
     local snapshot: bridge.ModuleSnapshot = module
     case snapshot.c_header_dependencies[1].kind
@@ -1463,18 +1466,30 @@ function test_compiler_bridge_normalizes_and_restats_c_header_dependencies(
     when search() then
     else test.assert(false, "include candidate used file-input kind")
     end
+    case snapshot.c_header_dependencies[3].kind
+    when origin() then
+    else test.assert(false, "declaring header origin was collapsed into file content")
+    end
     local current, changed = compiler:restat_c_header_dependencies(
       snapshot.c_header_dependencies,bridge.header_validation())
     local observation = current[1].observation as bridge.HeaderObservation
     test.assert(changed and observation.modified_seconds == 123 and
       observation.modified_nanoseconds == 456 and
-      observation.physical_identity == "device:inode:target",
+      observation.physical_identity == "device:inode:target" and
+      observation.precision == "ns" and observation.size == 12 and
+      observation.changed_seconds == 122 and observation.changed_nanoseconds == 7,
       "header restat lost its observation or explicit change result")
     test.assert(current[1].path == fixture_headers_root() .. "/direct.h" and
                 current[1].identity == "direct bytes:restatted" and
                 current[2].path == fixture_headers_root() .. "/earlier.h" and
-                current[2].identity == "missing candidate:restatted",
+                current[2].identity == "missing candidate:restatted" and
+                current[3].path == current[1].path and
+                current[3].identity == snapshot.c_header_dependencies[3].identity .. ":restatted",
                 "typed restat changed ownership/order or lost identities")
+    case current[3].kind
+    when origin() then
+    else test.assert(false, "typed restat did not round-trip the origin input")
+    end
   end)
 end
 
@@ -4461,7 +4476,8 @@ local function overlays_current_header_observations_on_project_payloads()
     local observation? = input.observation
     if input.path == header and observation ~= nil then
       observation = bridge.HeaderObservation.new(observation.modified_seconds + 1,
-        observation.modified_nanoseconds,observation.physical_identity)
+        observation.modified_nanoseconds,observation.physical_identity,
+        observation.precision,observation.size,observation.changed_seconds,observation.changed_nanoseconds)
       expected = observation
     end
     current[index] = bridge.CHeaderDependency.new(
@@ -5638,14 +5654,13 @@ function test_compiler_bridge_completion_foreign_callable_signature(_context: te
   end)
 end
 
-function test_compiler_bridge_native_windows_process_dependency_fences_cache(
+function test_compiler_bridge_native_process_dependency_fences_cache(
     _context: test.Context)
-  if ffi.VSCODE_TITAN_WINDOWS == 0 then test.skip("native Windows process dependency") end
   run_bridge(function()
     preload_real_compiler()
     local resolve = lua.load([[
 return function() return assert(package.searchpath("luv", package.cpath)) end
-]], "=compiler_bridge_windows_process_dependency", nil)() as function (): string
+]], "=compiler_bridge_process_dependency", nil)() as function (): string
     local dependency = resolve()
     local compiler = bridge.load()
     local observed = false
@@ -5661,6 +5676,6 @@ return function() return assert(package.searchpath("luv", package.cpath)) end
     revision = "replacement native transport bytes"
     local replacement = compiler:cache_identity(fingerprint)
     test.assert(observed and first ~= replacement,
-                "changed native Windows process transport retained compatible workspace facts")
+                "changed native process transport retained compatible workspace facts")
   end)
 end

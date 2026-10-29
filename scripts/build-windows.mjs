@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
-import { copyFile, lstat, mkdir, open, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { copyFile, lstat, mkdir, open, readFile, realpath, rm } from "node:fs/promises";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { resolveTitanSdk, titanCompilerCommand } from "./titan-sdk.mjs";
@@ -21,31 +21,6 @@ export function windowsCompilerCommand(sdk, args = []) {
   return titanCompilerCommand(sdk, args, "win32");
 }
 
-export function orderedModules(plan, selected) {
-  const result = [], seen = new Set(), visiting = new Set();
-  function visit(name) {
-    if (seen.has(name)) return;
-    assert(!visiting.has(name), `cyclic source imports at ${name}`);
-    const module = plan.modules[name];
-    assert(module, `missing native module ${name}`);
-    if (module.parseError) throw new Error(module.parseError);
-    visiting.add(name);
-    for (const dependency of module.imports) visit(dependency);
-    visiting.delete(name);
-    seen.add(name);
-    result.push(name);
-  }
-  for (const name of selected) visit(name);
-  return result;
-}
-
-export function moduleOutputs(stage, module, inventory) {
-  if (inventory) return inventory.map((relative) => path.join(stage, relative));
-  const stem = path.join(stage, module.main.replace(/\.titan$/, ""));
-  return [".o", ".c", ".ffi.h", ...(module.foreign ? [".titan.h"] : [])]
-    .map((suffix) => stem + suffix);
-}
-
 export function nativeBuildDirectory(buildRoot, target) {
   return path.join(buildRoot,
     ["server-test-build", "server-test-run"].includes(target) ? "tests" : "server", "native");
@@ -58,12 +33,14 @@ export function compilerArgument(value) {
   return `"${forward(value)}"`;
 }
 
-export function windowsApplicationLinkFlags({ test = false, extraFlags = "", inputs = [] } = {}) {
-  // The unbootstrapped validation aggregate exercises the protocol's depth-128
-  // JSON round trips on the executable stack. Match Titan's Windows stdlib
-  // test harness reserve; explicit caller flags follow this test-only default.
-  return [...(test ? ["-Wl,--stack,8388608"] : []), extraFlags,
-    ...inputs.map(compilerArgument)].filter(Boolean).join(" ");
+export function windowsApplicationArguments({ sourceRoot, directory, embeddedSource, sdk, test = false }) {
+  return ["--tree", forward(sourceRoot), "--output", forward(directory), "--source-first", "--incremental",
+    "--exe", forward(path.join(directory, "bin", test ? "server.tests.exe" : "titan-language-server.exe")),
+    "-I", forward(path.join(repository, "src/server")),
+    "--c-source", forward(path.join(repository, "src/server/compiler_io_clock.c")),
+    "--c-source", forward(embeddedSource), "-L", forward(path.join(sdk, "lib")), "-lcrypto",
+    ...(test ? ["--test", "--no-uv-bootstrap", "--ldflag=-Wl,--stack,8388608"] : []),
+    test ? "server.tests" : "titan_language_server"];
 }
 
 export function childEnvironment(inherited, overrides, removed = []) {
@@ -78,14 +55,14 @@ export function childEnvironment(inherited, overrides, removed = []) {
 }
 
 export function buildProfileEnvironment(target, inherited, requestedProfile) {
-  const selected = selectedBuildEnvironment(inherited);
+  const selected = Object.fromEntries(Object.entries(inherited).map(([name, value]) => [name.toUpperCase(), value]));
   const profile = requestedProfile ?? selected.VSCODE_TITAN_BUILD_PROFILE ?? selected.TITAN_BUILD_PROFILE ??
     (["server-test-build", "server-test-run"].includes(target) ? "validation" : "production");
   assert(["validation", "production"].includes(profile),
     "build profile must be validation or production");
   const overrides = { VSCODE_TITAN_BUILD_PROFILE: profile, TITAN_BUILD_PROFILE: profile };
   for (const key of ["TITAN_EXTRA_CPPFLAGS", "TITAN_EXTRA_CFLAGS", "TITAN_EXTRA_LDFLAGS"]) {
-    if (selected[key] !== null) overrides[key] = selected[key];
+    if (selected[key] !== undefined) overrides[key] = selected[key];
   }
   return childEnvironment(inherited, overrides);
 }
@@ -100,16 +77,6 @@ export function nativeBuildFlags(profile, { cppflags = [], cflags = [], ldflags 
       "-Wall", "-Wextra", "-Werror", ...cflags],
     ldflags: [...(validation ? ["-fno-lto"] : []), ...ldflags]
   };
-}
-
-export function selectedBuildEnvironment(environment) {
-  const keys = ["CC", "AR", "RANLIB", "RC", "PATH", "CCACHE_DISABLE", "TITAN_JOBS", "TITAN_C_PARTS",
-    "VSCODE_TITAN_BUILD_PROFILE", "TITAN_BUILD_PROFILE",
-    "TITAN_ROCKS_ROOT", "TITAN_EXTRA_CPPFLAGS", "TITAN_EXTRA_CFLAGS", "TITAN_EXTRA_LDFLAGS",
-    "TITAN_NO_LINE_DIRECTIVES", "CPATH", "C_INCLUDE_PATH", "CPLUS_INCLUDE_PATH",
-    "OBJC_INCLUDE_PATH", "LIBRARY_PATH", "COMPILER_PATH", "GCC_EXEC_PREFIX", "SDKROOT"];
-  return Object.fromEntries(keys.map((key) => [key,
-    Object.entries(environment).find(([name]) => name.toUpperCase() === key)?.[1] ?? null]));
 }
 
 function nativeExtraFlags(lua, environment) {
@@ -141,15 +108,6 @@ function nativeExtraFlags(lua, environment) {
 async function fileDigest(filename) {
   assert((await lstat(filename)).isFile(), `expected regular input: ${filename}`);
   return hash(await readFile(filename));
-}
-async function digestFiles(files) {
-  const result = [];
-  for (const file of [...new Set(files)].sort()) result.push([file, await fileDigest(file)]);
-  return hash(JSON.stringify(result));
-}
-async function existingJson(filename, fallback) {
-  try { return JSON.parse(await readFile(filename, "utf8")); }
-  catch (error) { if (error.code === "ENOENT") return fallback; throw error; }
 }
 async function allFiles(files) {
   for (const file of files) {
@@ -213,14 +171,14 @@ export async function buildWindows(target, {
   }
   sdk = path.resolve(sdk); buildRoot = path.resolve(buildRoot); sourceRoot = path.resolve(sourceRoot);
   await assertBuildRootOutsideSdk(sdk, buildRoot);
-  const targets = ["plan", "server", "server-test-build", "server-test-run", "stage", "package"];
+  const targets = ["server", "server-test-build", "server-test-run", "stage", "package"];
   assert(targets.includes(target), `expected one of ${targets.join(", ")}`);
   const lua = path.join(sdk, "bin", "lua.exe");
   const inheritedPath = Object.entries(process.env).find(([key]) => key.toUpperCase() === "PATH")?.[1] ?? "";
   const env = childEnvironment(buildProfileEnvironment(target, process.env, buildProfile), {
     CC: compilerArgument(clang), AR: compilerArgument(ar), RANLIB: compilerArgument(ranlib),
     RC: compilerArgument(path.join(path.dirname(clang), "llvm-rc.exe")),
-    CCACHE_DISABLE: "1", TITAN_JOBS: "1", TITAN_ROCKS_ROOT: sdk, TITAN_PREFIX: path.join(buildRoot, "compiler-cache"),
+    CCACHE_DISABLE: "1", TITAN_ROCKS_ROOT: sdk, TITAN_PREFIX: path.join(buildRoot, "compiler-cache"),
     PATH: `${path.dirname(process.execPath)};${path.dirname(clang)};${path.join(sdk, "bin")};${inheritedPath}`,
     TITAN_PATH_0_6: forward(path.join(sdk, "lib/titan/0.6")),
     TITAN_PATH: forward(path.join(sdk, "lib/titan/0.6")),
@@ -257,87 +215,21 @@ export async function buildWindows(target, {
       assert.equal(result.status, 0, `native tests failed (${result.signal ?? result.status})`);
       return;
     }
-    run(lua, [path.join(repository, "scripts/generate-native-build.lua"),
-      forward(sourceRoot), forward(buildRoot), forward(sdk), "--windows-plan"]);
-    const plan = await existingJson(path.join(buildRoot, "native-plan.json"));
-    assert.equal(plan.version, 1);
-    if (target === "plan") {
-      console.log(JSON.stringify({ server: orderedModules(plan, plan.server).length,
-        tests: orderedModules(plan, plan.tests).length, sdkFiles: plan.sdkFiles.length }));
-      return;
-    }
-    const nativeFlags = nativeBuildFlags(env.TITAN_BUILD_PROFILE, nativeExtraFlags(lua, env));
     const test = target === "server-test-build";
-    const mode = test ? "tests" : "server", stage = path.join(buildRoot, test ? "test-src" : "server-src");
-    const directory = path.join(buildRoot, mode), native = nativeBuildDirectory(buildRoot, target);
-    await mkdir(directory, { recursive: true }); await mkdir(native, { recursive: true });
-    const stateFile = path.join(directory, "build-state.json");
-    const previous = await existingJson(stateFile, { objects: {} });
-    const state = { objects: {} };
-    const sdkDigest = await digestFiles(plan.sdkFiles);
-    const buildEnvironment = selectedBuildEnvironment(env);
-    const toolDigest = await digestFiles([clang, ar, ranlib,
-      path.join(path.dirname(clang), "llvm-rc.exe"), path.join(path.dirname(clang), "ld.lld.exe")]);
-    const settings = hash(JSON.stringify({ sdkDigest, clang, ar, ranlib, toolDigest, buildEnvironment, test,
-      driver: await digestFiles([fileURLToPath(import.meta.url), path.join(repository, "scripts/generate-native-build.lua")]) }));
-    // Probe records hash their source; the owning build configuration supplies
-    // tool/header/flag invalidation without writing the immutable SDK.
-    const headers = await digestFiles(plan.headers.map((name) => path.join(stage, name)));
-    env.TITAN_PREFIX = path.join(buildRoot, "compiler-cache", hash(settings + headers));
-    // Relative staged inputs keep native argument vectors compact without
-    // changing source ownership or the parsed graph.
-    const tree = forward(path.relative(directory, stage));
-    const args = [...(test ? ["--test"] : []), "--source-first", "--incremental", "-j1"];
-    for (const name of orderedModules(plan, test ? plan.tests : plan.server)) {
-      const module = plan.modules[name], inventory = plan.outputs[name];
-      const outputs = moduleOutputs(stage, module, inventory.stable);
-      const owned = moduleOutputs(stage, module, inventory[mode]);
-      const stamp = hash(JSON.stringify({ settings, headers,
-        module, sources: await digestFiles(module.sources.map((file) => path.join(stage, file))),
-        dependencies: module.imports.map((dependency) => state.objects[dependency]) }));
-      if (previous.objects[name] !== stamp || !await allFiles(owned)) {
-        await rm(outputs[0], { force: true });
-        if (!module.foreign) await rm(outputs[0].replace(/\.o$/, ".titan.h"), { force: true });
-        compile([...args, "-c", "--tree", tree, name], directory);
-        assert(await allFiles(outputs), `missing generated companions for ${name}`);
-      }
-      state.objects[name] = stamp;
-    }
-    const clock = path.join(native, "compiler_io_clock.o");
-    const embedded = path.join(native, "embedded_interfaces_windows.o");
+    const directory = path.join(buildRoot, test ? "tests" : "server");
+    const native = nativeBuildDirectory(buildRoot, target);
+    await mkdir(directory, { recursive: true });
+    await mkdir(native, { recursive: true });
     const embeddedSource = path.join(native, "embedded_interfaces_profile_windows.c");
-    const nativeSources = ["src/server/compiler_io_clock.c", "src/server/compiler_io_clock.h",
-      "src/server/embedded_interfaces_native.h", "scripts/generate-embedded-interfaces.lua",
-      "src/server/embedded_interfaces_windows.c", "test/fixtures/compiler-io-process.c"];
-    const nativeStamp = hash(settings + await digestFiles(nativeSources.map((file) => path.join(repository, file))));
-    if (previous.native !== nativeStamp || !await allFiles([clock, embedded, embeddedSource, fixture])) {
-      run(clang, [...nativeFlags.cppflags, ...nativeFlags.cflags, "-c",
-        "src/server/compiler_io_clock.c", "-o", clock]);
-      run(lua, ["scripts/generate-embedded-interfaces.lua", "--windows-profile", sdk, embeddedSource]);
-      run(clang, [...nativeFlags.cppflags, ...nativeFlags.cflags,
-        "-I", path.join(sdk, "include"), "-I", path.join(sdk, "src/lua-5.5.1"), "-I", path.join(repository, "src/server"),
-        "-c", embeddedSource, "-o", embedded]);
-      run(clang, [...nativeFlags.cppflags, ...nativeFlags.cflags, "-municode",
-        "test/fixtures/compiler-io-process.c", ...nativeFlags.ldflags, "-o", fixture]);
+    run(lua, ["scripts/generate-embedded-interfaces.lua", "--windows-profile", sdk, embeddedSource]);
+    if (test) {
+      const flags = nativeBuildFlags(env.TITAN_BUILD_PROFILE, nativeExtraFlags(lua, env));
+      run(clang, [...flags.cppflags, ...flags.cflags, "-municode",
+        "test/fixtures/compiler-io-process.c", ...flags.ldflags, "-o", fixture]);
     }
-    state.native = nativeStamp;
-    const root = test ? "server.tests" : "titan_language_server";
-    const executable = path.join(directory, "bin", test ? "server.tests.exe" : "titan-language-server.exe");
-    const provider = path.join(directory, "lib/titan/0.6", ...root.split(".")) + ".dll";
-    const linkStamp = hash(JSON.stringify({ settings, nativeStamp, objects: state.objects }));
-    if (previous.link !== linkStamp || !await allFiles([executable, provider])) {
-      // content_identity calls SHA256 directly; Windows imports that API from
-      // the controlled native DLL instead of the Unix flattened static provider.
-      const linkFlags = windowsApplicationLinkFlags({ test, extraFlags: env.TITAN_EXTRA_LDFLAGS ?? "",
-        inputs: [clock, embedded, path.join(sdk, "lib/libcrypto.dll.a")] });
-      compile([...args, ...(test ? ["--no-uv-bootstrap"] : ["--launcher-name", "titan-language-server"]),
-        "--tree", tree, root], directory, { TITAN_EXTRA_LDFLAGS: linkFlags });
-      assert(await allFiles([executable, provider]), "missing DLL application outputs");
-    }
-    state.link = linkStamp;
+    compile(windowsApplicationArguments({ sourceRoot, directory, embeddedSource, sdk, test }), repository);
     for (const name of runtimeDlls) await copyChanged(path.join(sdk, "bin", name), path.join(directory, "bin", name));
     await copyChanged(path.join(sdk, "lib/titan/0.6/titan.dll"), path.join(directory, "lib/titan/0.6/titan.dll"));
-    await writeFile(stateFile, JSON.stringify(state, null, 2) + "\n");
     if (test) return;
     // The extension's bin is the launcher's installation bin; DLL providers are
     // siblings under lib/titan/0.6, preserving Titan's normal runtime lookup.

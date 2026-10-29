@@ -24,16 +24,18 @@ const EXPECTED_SHARE_ROOT = [
 ];
 export function nativeRootInventory(platform = process.platform) {
   const suffix = platform === "win32" ? "dll" : "so";
-  return [`lfs.${suffix}:file`, `lpeglabel.${suffix}:file`,
-    ...(platform === "win32" ? ["luv.dll:file"] : [])];
+  return [`lfs.${suffix}:file`, `lpeglabel.${suffix}:file`, `luv.${suffix}:file`];
 }
 export const requiredShareFiles = [
   "c-parser/cdriver.lua",
   "inspect.lua",
   "relabel.lua",
   "titan-compiler/checker.lua",
+  "titan-compiler/build.lua",
+  "titan-compiler/build_worker.lua",
   "titan-compiler/checker/completion.lua",
   "titan-compiler/completion.lua",
+  "titan-compiler/process.lua",
   "titan-compiler/driver.lua",
   "titan-compiler/maybe3.lua",
   "titan-compiler/documentation.lua",

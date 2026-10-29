@@ -2,7 +2,7 @@ SHELL := /bin/bash
 .SHELLFLAGS := -eu -o pipefail -c
 .DELETE_ON_ERROR:
 
-# Choose a whole-invocation profile before generating either native graph.
+# Choose a whole-invocation profile for compiler-owned builds.
 # Verification also exercises the ordinary server and disposable packaging.
 VALIDATION_GOALS := verify test server-test server-test-build server-test-objects server-test-run server-test-sharded \
 	server-coverage server-coverage-build server-coverage-run \
@@ -38,12 +38,9 @@ override SOURCE_ROOT := $(abspath $(SOURCE_ROOT))
 override BUILD_ROOT := $(abspath $(BUILD_ROOT))
 SERVER_BUILD_DIR := $(BUILD_ROOT)/server
 TEST_BUILD_DIR := $(BUILD_ROOT)/tests
-SERVER_SOURCE_STAGE := $(BUILD_ROOT)/server-src
-TEST_SOURCE_STAGE := $(BUILD_ROOT)/test-src
 SERVER_INSTALL_STAGE := $(BUILD_ROOT)/install-root
 VSIX_DIR := $(BUILD_ROOT)/vsix
 NATIVE_BUILD_DIR := $(BUILD_ROOT)/native
-SERVER_BUILD_OUTPUT := $(SERVER_BUILD_DIR)/titan_language_server
 SERVER := $(abspath bin/titan-language-server)
 override SERVER := $(abspath $(SERVER))
 SERVER_TEST := $(TEST_BUILD_DIR)/server/tests
@@ -54,18 +51,15 @@ SERVER_COVERAGE_GCOVR ?= gcovr
 SERVER_COVERAGE_FORMATS ?=
 SERVER_COVERAGE_TIMEOUT ?= 1200
 COMPILER_IO_CLOCK_SOURCE := src/server/compiler_io_clock.c
-COMPILER_IO_CLOCK_HEADER := src/server/compiler_io_clock.h
-COMPILER_IO_CLOCK_OBJECT := $(NATIVE_BUILD_DIR)/compiler_io_clock.o
 COMPILER_IO_PROCESS_FIXTURE := $(NATIVE_BUILD_DIR)/compiler_io_process_fixture
 EMBEDDED_INTERFACES_GENERATOR := scripts/generate-embedded-interfaces.lua
-EMBEDDED_INTERFACES_HEADER := src/server/embedded_interfaces_native.h
 EMBEDDED_INTERFACES_SOURCE := $(NATIVE_BUILD_DIR)/embedded_interfaces_native.c
-EMBEDDED_INTERFACES_OBJECT := $(NATIVE_BUILD_DIR)/embedded_interfaces_native.o
 HOST_OS := $(shell uname -s)
 HOST_ARCH := $(shell uname -m)
 CC ?= cc
 AR ?= ar
 RANLIB ?= ranlib
+export CC AR RANLIB CCACHE_DISABLE
 OPENSSL_PKG_CONFIG ?= pkg-config
 CCACHE_DISABLE ?= 1
 NATIVE_OPTFLAGS := $(if $(filter validation,$(BUILD_PROFILE)),-O0 -fno-lto,-O3)
@@ -115,47 +109,28 @@ VSIX := $(VSIX_DIR)/titan-$(VSIX_TARGET).vsix
 	server-coverage server-coverage-build server-coverage-run \
 	server-objects server-test-objects server-test-build server-test-run server-test-sharded shard-runner-test incremental-build-test \
 	server-protocol-test completion-protocol-test codex-native-test extension extension-test extension-host-test test package inspect-server \
-	plugin-validate verify inspect-vsix FORCE install-server install-server-test install-vsix clean clean-node
+	plugin-validate verify inspect-vsix install-server install-server-test install-vsix clean clean-node
 
-# The compiler intentionally checks only source/object timestamps. Make owns
-# imported objects, native headers, SDK/compiler inputs and effective settings.
-# The graph generator finishes both source stages before parallel recipes start.
+# titanc owns module discovery, certification, scheduling and final outputs.
 shell_quote = '$(subst ','"'"',$(1))'
-NATIVE_BUILD_GENERATOR := scripts/generate-native-build.lua
-NATIVE_BUILD_GRAPH := $(BUILD_ROOT)/native-modules.mk
-NATIVE_CONFIG_STAMP := $(BUILD_ROOT)/native.config
-NATIVE_BUILD_INPUTS = Makefile $(NATIVE_BUILD_GENERATOR) $(TITANC) $(TITAN_LUA) \
-	$(NATIVE_SDK_INPUTS) $(BUILD_ROOT)/native-inputs/sdk
-SERVER_LINK_OUTPUTS := $(SERVER_BUILD_OUTPUT) \
-	$(SERVER_BUILD_DIR)/titan_language_server__entrypoint.c \
-	$(SERVER_BUILD_DIR)/titan_language_server__entrypoint.o
-TEST_LINK_OUTPUTS := $(SERVER_TEST) $(addprefix $(SERVER_TEST)__test_runner,.c .o .ffi.h) \
-	$(addprefix $(SERVER_TEST)__test_entrypoint,.c .o)
-
-# --tree selects each staged source root; compiled fallback is the explicit SDK.
-# Both graphs use the ordinary installed static provider, including titan.test.
-NATIVE_COMPILER_ENV = env -u LUA_PATH -u LUA_CPATH -u LUA_PATH_5_5 -u LUA_CPATH_5_5 -u TITAN_SOURCE_PATH \
-	TITAN_BUILD_PROFILE=$(call shell_quote,$(BUILD_PROFILE)) \
-	CC=$(call shell_quote,$(CC)) AR=$(call shell_quote,$(AR)) RANLIB=$(call shell_quote,$(RANLIB)) \
-	CCACHE_DISABLE=$(call shell_quote,$(CCACHE_DISABLE)) \
+COMPILER_ENV = env -u LUA_PATH -u LUA_CPATH -u LUA_PATH_5_5 -u LUA_CPATH_5_5 -u TITAN_SOURCE_PATH \
 	TITAN_ROCKS_ROOT=$(call shell_quote,$(TITAN_PREFIX)) \
 	TITAN_PREFIX=$(call shell_quote,$(BUILD_ROOT)/compiler-cache) \
 	TITAN_PATH_0_6=$(call shell_quote,$(TITAN_PREFIX)/lib/titan/0.6) \
-	TITAN_PATH=$(call shell_quote,$(TITAN_PREFIX)/lib/titan/0.6) \
-	TITAN_EXTRA_CPPFLAGS=$(call shell_quote,$(strip $(TITAN_EXTRA_CPPFLAGS) $(NATIVE_OPENSSL_CPPFLAGS))) \
-	TITAN_EXTRA_CFLAGS=$(call shell_quote,$(TITAN_EXTRA_CFLAGS)) \
-	TITAN_EXTRA_LDFLAGS=$(call shell_quote,$(TITAN_EXTRA_LDFLAGS)) \
-	TITAN_NO_LINE_DIRECTIVES=$(call shell_quote,$(TITAN_NO_LINE_DIRECTIVES)) \
-	VSCODE_TITAN_OPENSSL_MODE=$(call shell_quote,$(NATIVE_OPENSSL_MODE)) \
-	VSCODE_TITAN_OPENSSL_CPPFLAGS=$(call shell_quote,$(NATIVE_OPENSSL_CPPFLAGS)) \
-	VSCODE_TITAN_OPENSSL_LDFLAGS=$(call shell_quote,$(NATIVE_OPENSSL_LDFLAGS)) \
-	VSCODE_TITAN_OPENSSL_INCLUDEDIR=$(call shell_quote,$(NATIVE_OPENSSL_INCLUDEDIR))
-NATIVE_LINK_ENV = $(NATIVE_COMPILER_ENV) \
-	TITAN_EXTRA_LDFLAGS=$(call shell_quote,$(strip $(TITAN_EXTRA_LDFLAGS) $(EXPORT_LUA_LDFLAGS) $(COMPILER_IO_CLOCK_OBJECT) $(EMBEDDED_INTERFACES_OBJECT) $(TITAN_STANDARD_PROVIDER) $(NATIVE_OPENSSL_LDFLAGS)))
+	TITAN_PATH=$(call shell_quote,$(TITAN_PREFIX)/lib/titan/0.6)
+TITAN_FLAGS ?=
+TITAN_COMPILE_FLAGS = $(TITAN_FLAGS) --tree $(call shell_quote,$(SOURCE_ROOT)) --source-first --incremental --static \
+	-I $(call shell_quote,$(abspath src/server)) \
+	$(foreach flag,$(OPENSSL_CPPFLAGS),--cflag=$(call shell_quote,$(flag)))
+TITAN_LINK_FLAGS = --ldflag=$(call shell_quote,$(EXPORT_LUA_LDFLAGS)) \
+	--ldflag=$(call shell_quote,$(TITAN_STANDARD_PROVIDER)) \
+	$(foreach flag,$(OPENSSL_LDFLAGS),--ldflag=$(call shell_quote,$(flag))) \
+	--c-source $(call shell_quote,$(COMPILER_IO_CLOCK_SOURCE)) \
+	--c-source $(call shell_quote,$(EMBEDDED_INTERFACES_SOURCE))
 # Tests load compiler Lua dependencies outside the SDK's bin directory.
 # Ask its Lua executable for its own relocatable paths, as Titan's test harness
 # does. Ambient Titan paths must not replace that selected SDK at execution.
-NATIVE_TEST_ENV = env -u TITAN_PATH_0_6 -u TITAN_PATH \
+TEST_ENV = env -u TITAN_PATH_0_6 -u TITAN_PATH \
 	TITAN_ROCKS_ROOT=$(call shell_quote,$(TITAN_PREFIX)) \
 	TITAN_PREFIX=$(call shell_quote,$(BUILD_ROOT)/compiler-cache) \
 	TITAN_COMPILER_IO_PROCESS_FIXTURE=$(call shell_quote,$(COMPILER_IO_PROCESS_FIXTURE)) \
@@ -166,49 +141,33 @@ NATIVE_TEST_ENV = env -u TITAN_PATH_0_6 -u TITAN_PATH \
 # The server selects its workspace probe cache; TITAN_PREFIX here selects the SDK.
 SERVER_TEST_ENV = env -u TITAN_PREFIX -u TITAN_PATH_0_6 -u TITAN_PATH -u TITAN_SOURCE_PATH \
 	CC=$(call shell_quote,$(CC)) CCACHE_DISABLE=$(call shell_quote,$(CCACHE_DISABLE)) \
-	TITAN_EXTRA_CPPFLAGS=$(call shell_quote,$(strip $(TITAN_EXTRA_CPPFLAGS) $(NATIVE_OPENSSL_CPPFLAGS))) \
+	TITAN_EXTRA_CPPFLAGS=$(call shell_quote,$(strip $(TITAN_EXTRA_CPPFLAGS) $(OPENSSL_CPPFLAGS))) \
 	TITAN_ROCKS_ROOT=$(call shell_quote,$(TITAN_PREFIX)) \
 	TITAN_LS_LUA_PATH=$(call shell_quote,$(DEVELOPMENT_LUA_PATH)) \
 	TITAN_LS_LUA_CPATH=$(call shell_quote,$(DEVELOPMENT_LUA_CPATH))
-
-FORCE:
 
 # Keep housekeeping and JavaScript-only goals usable without a native SDK.
 NON_NATIVE_GOALS := help clean clean-node npm-ci extension extension-test shard-runner-test incremental-build-test plugin-validate inspect-vsix server-test-run server-coverage-run
 ifneq ($(filter-out $(NON_NATIVE_GOALS),$(if $(MAKECMDGOALS),$(MAKECMDGOALS),all)),)
 # Titan installs OpenSSL headers only for its bundled provider. System-provider
 # static consumers repeat the ordered pkg-config inputs after the archive.
-NATIVE_OPENSSL_MODE := $(if $(wildcard $(TITAN_PREFIX)/include/openssl),bundled,system)
+OPENSSL_MODE := $(if $(wildcard $(TITAN_PREFIX)/include/openssl),bundled,system)
 ifneq ($(wildcard $(TITANC)),)
-ifeq ($(NATIVE_OPENSSL_MODE),system)
-NATIVE_OPENSSL_READY := $(shell $(OPENSSL_PKG_CONFIG) --atleast-version=3.0.0 openssl && echo ready)
-ifneq ($(NATIVE_OPENSSL_READY),ready)
+ifeq ($(OPENSSL_MODE),system)
+OPENSSL_READY := $(shell $(OPENSSL_PKG_CONFIG) --atleast-version=3.0.0 openssl && echo ready)
+ifneq ($(OPENSSL_READY),ready)
 $(error system OpenSSL >= 3.0 development files and pkg-config are required for this Titan SDK)
 endif
-NATIVE_OPENSSL_CPPFLAGS := $(shell $(OPENSSL_PKG_CONFIG) --cflags openssl || echo __titan_openssl_query_failed__)
-NATIVE_OPENSSL_LDFLAGS := $(shell $(OPENSSL_PKG_CONFIG) --libs openssl || echo __titan_openssl_query_failed__)
-NATIVE_OPENSSL_INCLUDEDIR := $(shell $(OPENSSL_PKG_CONFIG) --variable=includedir openssl || echo __titan_openssl_query_failed__)
-ifneq ($(filter __titan_openssl_query_failed__,$(NATIVE_OPENSSL_CPPFLAGS) $(NATIVE_OPENSSL_LDFLAGS) $(NATIVE_OPENSSL_INCLUDEDIR)),)
+OPENSSL_CPPFLAGS := $(shell $(OPENSSL_PKG_CONFIG) --cflags openssl || echo __titan_openssl_query_failed__)
+OPENSSL_LDFLAGS := $(shell $(OPENSSL_PKG_CONFIG) --libs openssl || echo __titan_openssl_query_failed__)
+ifneq ($(filter __titan_openssl_query_failed__,$(OPENSSL_CPPFLAGS) $(OPENSSL_LDFLAGS)),)
 $(error cannot query system OpenSSL compiler/linker inputs with $(OPENSSL_PKG_CONFIG))
 endif
-ifeq ($(strip $(NATIVE_OPENSSL_LDFLAGS)),)
+ifeq ($(strip $(OPENSSL_LDFLAGS)),)
 $(error pkg-config returned no system OpenSSL libraries)
 endif
-ifeq ($(strip $(NATIVE_OPENSSL_INCLUDEDIR)),)
-$(error pkg-config returned no system OpenSSL include directory)
 endif
 endif
-endif
-$(NATIVE_BUILD_GRAPH): FORCE $(NATIVE_BUILD_GENERATOR) | $(TITANC)
-	@$(NATIVE_COMPILER_ENV) \
-		LUA_PATH=$(call shell_quote,$(DEVELOPMENT_LUA_PATH)) \
-		LUA_CPATH=$(call shell_quote,$(DEVELOPMENT_LUA_CPATH)) \
-		TITANC=$(call shell_quote,$(TITANC)) TITAN_LUA=$(call shell_quote,$(TITAN_LUA)) \
-		VSCODE_TITAN_EXPORT_FLAGS=$(call shell_quote,$(EXPORT_LUA_LDFLAGS)) \
-		$(call shell_quote,$(TITAN_LUA)) $(call shell_quote,$(NATIVE_BUILD_GENERATOR)) \
-		$(call shell_quote,$(abspath $(SOURCE_ROOT))) $(call shell_quote,$(abspath $(BUILD_ROOT))) \
-		$(call shell_quote,$(TITAN_PREFIX))
-include $(NATIVE_BUILD_GRAPH)
 endif
 
 all: server extension
@@ -227,7 +186,7 @@ help:
 	@echo "  server-coverage-build   build an isolated covered native aggregate (GCC 14+)"
 	@echo "  server-coverage-run     run the covered aggregate and generate its reports"
 	@echo "  completion-protocol-test  exercise unsaved completion through the native server"
-	@echo "  incremental-build-test exercise native invalidation and no-op builds"
+	@echo "  incremental-build-test smoke-test compiler-owned incremental builds"
 	@echo "  server-protocol-test exercise the native executable over framed stdio"
 	@echo "  codex-native-test    query the native executable through the Codex adapter"
 	@echo "  extension-test       compile and run the JavaScript unit tests"
@@ -250,15 +209,7 @@ node_modules/.package-lock.json: package.json package-lock.json
 
 server: $(SERVER)
 
-$(COMPILER_IO_CLOCK_OBJECT): $(COMPILER_IO_CLOCK_SOURCE) $(COMPILER_IO_CLOCK_HEADER) \
-	$(NATIVE_BUILD_INPUTS) $(NATIVE_CONFIG_STAMP)
-	@mkdir -p "$(dir $(COMPILER_IO_CLOCK_OBJECT))"
-	CCACHE_DISABLE="$(CCACHE_DISABLE)" $(CC) -std=c99 $(NATIVE_OPTFLAGS) $(TITAN_EXTRA_CFLAGS) \
-		-Wall -Wextra -Werror \
-		-c "$(COMPILER_IO_CLOCK_SOURCE)" \
-		-o "$(COMPILER_IO_CLOCK_OBJECT)"
-
-$(COMPILER_IO_PROCESS_FIXTURE): test/fixtures/compiler-io-process.c $(NATIVE_BUILD_INPUTS) $(NATIVE_CONFIG_STAMP)
+$(COMPILER_IO_PROCESS_FIXTURE): test/fixtures/compiler-io-process.c
 	@mkdir -p "$(dir $(COMPILER_IO_PROCESS_FIXTURE))"
 	CCACHE_DISABLE="$(CCACHE_DISABLE)" $(CC) -std=c99 $(NATIVE_OPTFLAGS) $(TITAN_EXTRA_CFLAGS) \
 		-Wall -Wextra -Werror "$<" $(TITAN_EXTRA_LDFLAGS) -o "$@"
@@ -269,8 +220,8 @@ $(TITAN_STANDARD_PROVIDER): | $(TITANC)
 		exit 1; \
 	}
 
-$(EMBEDDED_INTERFACES_SOURCE): $(EMBEDDED_INTERFACES_GENERATOR) \
-	$(TITAN_STANDARD_PROVIDER) $(NATIVE_BUILD_INPUTS) $(NATIVE_CONFIG_STAMP)
+# Equal generated bytes still need to acknowledge successfully checked inputs.
+$(EMBEDDED_INTERFACES_SOURCE): $(EMBEDDED_INTERFACES_GENERATOR) $(TITAN_STANDARD_PROVIDER)
 	@mkdir -p "$(dir $(EMBEDDED_INTERFACES_SOURCE))"
 	CCACHE_DISABLE="$(CCACHE_DISABLE)" CC="$(CC)" \
 		TITAN_ROCKS_ROOT="$(TITAN_PREFIX)" \
@@ -278,71 +229,50 @@ $(EMBEDDED_INTERFACES_SOURCE): $(EMBEDDED_INTERFACES_GENERATOR) \
 		LUA_CPATH="$(DEVELOPMENT_LUA_CPATH)" \
 		"$(TITAN_LUA)" "$(EMBEDDED_INTERFACES_GENERATOR)" \
 		"$(TITAN_STANDARD_PROVIDER)" "$@"
+	@touch "$@"
 
-$(EMBEDDED_INTERFACES_OBJECT): $(EMBEDDED_INTERFACES_SOURCE) \
-	$(EMBEDDED_INTERFACES_HEADER) $(TITAN_STANDARD_PROVIDER) \
-	$(NATIVE_BUILD_INPUTS) $(NATIVE_CONFIG_STAMP)
-	@mkdir -p "$(dir $(EMBEDDED_INTERFACES_OBJECT))"
-	CCACHE_DISABLE="$(CCACHE_DISABLE)" $(CC) -std=c99 $(NATIVE_OPTFLAGS) $(TITAN_EXTRA_CFLAGS) \
-		-Wall -Wextra -Werror \
-		-I "$(TITAN_PREFIX)/include" -I "$(abspath src/server)" \
-		-c "$(EMBEDDED_INTERFACES_SOURCE)" \
-		-o "$(EMBEDDED_INTERFACES_OBJECT)"
+server-objects: | $(TITANC)
+	+$(COMPILER_ENV) $(call shell_quote,$(TITANC)) $(TITAN_COMPILE_FLAGS) \
+		--output $(call shell_quote,$(SERVER_BUILD_DIR)) -c titan_language_server
 
-server-objects: $(SERVER_MODULE_OBJECTS)
+$(SERVER): server-build
 
-$(SERVER_BUILD_OUTPUT): FORCE $(SERVER_MODULE_OBJECTS) $(COMPILER_IO_CLOCK_OBJECT) \
-	$(EMBEDDED_INTERFACES_OBJECT) $(NATIVE_BUILD_INPUTS) $(NATIVE_CONFIG_STAMP)
-	@set -e; stale=0; newer=$(call shell_quote,$(filter-out FORCE,$?)); \
-	test -z "$$newer" || stale=1; \
-	for output in $(foreach output,$(SERVER_LINK_OUTPUTS),$(call shell_quote,$(output))); do test -s "$$output" || stale=1; done; \
-	test -x $(call shell_quote,$(SERVER_BUILD_OUTPUT)) || stale=1; \
-	if test "$$stale" = 1; then \
-	  cd $(call shell_quote,$(SERVER_BUILD_DIR)); \
-	  $(NATIVE_LINK_ENV) $(call shell_quote,$(TITANC)) --static --source-first --incremental -j1 \
-	    --tree $(call shell_quote,$(SERVER_SOURCE_STAGE)) titan_language_server; \
-	fi
-
-$(SERVER): $(SERVER_BUILD_OUTPUT)
-	@mkdir -p $(call shell_quote,$(dir $(SERVER)))
-	install -m 0755 $(call shell_quote,$(SERVER_BUILD_OUTPUT)) $(call shell_quote,$(SERVER))
+.PHONY: server-build
+server-build: $(EMBEDDED_INTERFACES_SOURCE) | $(TITANC)
+	+$(COMPILER_ENV) $(call shell_quote,$(TITANC)) $(TITAN_COMPILE_FLAGS) \
+		--output $(call shell_quote,$(SERVER_BUILD_DIR)) --exe $(call shell_quote,$(SERVER)) \
+		$(TITAN_LINK_FLAGS) titan_language_server
 
 server-test: server-test-build
-	$(MAKE) server-test-run
+	+$(MAKE) server-test-run
 
-server-test-objects: $(TEST_MODULE_OBJECTS)
-server-test-build: $(SERVER_TEST) $(COMPILER_IO_PROCESS_FIXTURE)
+server-test-objects: | $(TITANC)
+	+$(COMPILER_ENV) $(call shell_quote,$(TITANC)) $(TITAN_COMPILE_FLAGS) \
+		--output $(call shell_quote,$(TEST_BUILD_DIR)) --test -c server.tests
 
-$(SERVER_TEST): FORCE $(TEST_MODULE_OBJECTS) $(COMPILER_IO_CLOCK_OBJECT) \
-	$(EMBEDDED_INTERFACES_OBJECT) $(NATIVE_BUILD_INPUTS) $(NATIVE_CONFIG_STAMP)
-	@set -e; stale=0; newer=$(call shell_quote,$(filter-out FORCE,$?)); \
-	test -z "$$newer" || stale=1; \
-	for output in $(foreach output,$(TEST_LINK_OUTPUTS),$(call shell_quote,$(output))); do test -s "$$output" || stale=1; done; \
-	test -x $(call shell_quote,$(SERVER_TEST)) || stale=1; \
-	if test "$$stale" = 1; then \
-	  cd $(call shell_quote,$(TEST_BUILD_DIR)); \
-	  $(NATIVE_LINK_ENV) $(call shell_quote,$(TITANC)) --static --test --source-first --incremental -j1 --no-uv-bootstrap \
-	    --tree $(call shell_quote,$(TEST_SOURCE_STAGE)) server.tests; \
-	fi
+server-test-build: $(EMBEDDED_INTERFACES_SOURCE) $(COMPILER_IO_PROCESS_FIXTURE) | $(TITANC)
+	+$(COMPILER_ENV) $(call shell_quote,$(TITANC)) $(TITAN_COMPILE_FLAGS) \
+		--output $(call shell_quote,$(TEST_BUILD_DIR)) --exe $(call shell_quote,$(SERVER_TEST)) \
+		--test --no-uv-bootstrap $(TITAN_LINK_FLAGS) server.tests
 
 server-test-run:
-	$(NATIVE_TEST_ENV) $(call shell_quote,$(SERVER_TEST))
+	$(TEST_ENV) $(call shell_quote,$(SERVER_TEST))
 
 server-test-sharded: server-test-build
-	$(NATIVE_TEST_ENV) node scripts/run-server-tests.mjs $(call shell_quote,$(SERVER_TEST))
+	$(TEST_ENV) node scripts/run-server-tests.mjs $(call shell_quote,$(SERVER_TEST))
 
 # Coverage uses a separate source tree; the test executable resets and reports
 # its own counters through the compiler's embedded coverage inventory.
-server-coverage-build: $(COMPILER_IO_CLOCK_OBJECT) $(EMBEDDED_INTERFACES_OBJECT) $(COMPILER_IO_PROCESS_FIXTURE)
-	$(NATIVE_COMPILER_ENV) \
-		VSCODE_TITAN_EXPORT_FLAGS=$(call shell_quote,$(EXPORT_LUA_LDFLAGS)) \
-		node scripts/server-coverage.mjs build \
+server-coverage-build: $(EMBEDDED_INTERFACES_SOURCE) $(COMPILER_IO_PROCESS_FIXTURE)
+	+$(COMPILER_ENV) node scripts/server-coverage.mjs build \
 		--prefix $(call shell_quote,$(TITAN_PREFIX)) \
 		--build-dir $(call shell_quote,$(abspath $(SERVER_COVERAGE_BUILD_DIR))) \
 		--native-dir $(call shell_quote,$(NATIVE_BUILD_DIR)) \
 		--cc $(call shell_quote,$(CC)) --gcov $(call shell_quote,$(SERVER_COVERAGE_GCOV)) \
 		--report-dir $(call shell_quote,$(abspath $(SERVER_COVERAGE_REPORT_DIR))) \
 		--gcovr $(call shell_quote,$(SERVER_COVERAGE_GCOVR)) \
+		$(foreach flag,$(OPENSSL_CPPFLAGS),--cflag $(call shell_quote,$(flag))) \
+		$(foreach flag,$(OPENSSL_LDFLAGS),--ldflag $(call shell_quote,$(flag))) \
 		$(foreach format,$(SERVER_COVERAGE_FORMATS),--format $(call shell_quote,$(format)))
 
 server-coverage-run:

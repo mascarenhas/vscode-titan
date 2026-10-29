@@ -126,14 +126,15 @@ export function parseArguments(args, environment = process.env) {
   const [action, ...rest] = args;
   assert.ok(["build", "run"].includes(action), "usage: server-coverage.mjs build|run --build-dir DIR [options]");
   const options = { action, prefix: environment.TITAN_PREFIX, cc: environment.CC ?? "gcc", gcov: environment.GCOV ?? "gcov",
-    gcovr: environment.GCOVR ?? "gcovr", formats: [], timeout: 1200, repository };
-  const names = new Map((action === "build" ? ["prefix", "build-dir", "native-dir", "report-dir", "cc", "gcov", "gcovr", "format"] :
+    gcovr: environment.GCOVR ?? "gcovr", formats: [], cflags: [], ldflags: [], timeout: 1200, repository };
+  const names = new Map((action === "build" ? ["prefix", "build-dir", "native-dir", "report-dir", "cc", "gcov", "gcovr", "format", "cflag", "ldflag"] :
     ["build-dir", "timeout"]).map((name) => [`--${name}`, name.replace(/-([a-z])/g, (_, letter) => letter.toUpperCase())]));
   for (let index = 0; index < rest.length; index += 2) {
     const key = names.get(rest[index]);
     const value = rest[index + 1];
-    assert.ok(key && value !== undefined && !value.startsWith("--"), `invalid coverage option: ${rest[index]}`);
+    assert.ok(key && value !== undefined && (!value.startsWith("--") || ["cflag", "ldflag"].includes(key)), `invalid coverage option: ${rest[index]}`);
     if (key === "format") options.formats.push(value);
+    else if (key === "cflag" || key === "ldflag") options[key + "s"].push(value);
     else options[key] = value;
   }
   for (const key of action === "build" ? ["prefix", "buildDir", "nativeDir"] : ["buildDir"]) {
@@ -177,7 +178,14 @@ while index <= #arg do
     assert(#(native.coverage_test_functions or {}) == 0, name .. ": production module owns test_ functions")
     equal_paths(entry.source_files, expected, name)
     equal_paths(native.coverage.sources, expected, name)
-    equal_paths(native.coverage.files, { generated }, name)
+    -- Large modules compile as several C parts; coverage records each one.
+    local stem = assert(generated:match("^(.*)%.c$"), name .. ": generated C path")
+    local parts = {}
+    for offset, part in ipairs(assert(native.parts, name .. ": missing native parts")) do
+        parts[offset] = stem .. part.c_suffix
+    end
+    assert(parts[1] == generated, name .. ": primary generated C differs")
+    equal_paths(native.coverage.files, parts, name)
     io.write(name .. "\\n")
     index = index + 4 + count
 end
@@ -199,11 +207,13 @@ export async function buildCoverage(options, { run = execute, environment = proc
   const nativeDir = await realpath(options.nativeDir);
   const sourceFiles = await files(path.join(root, "src"));
   const production = discoverProductionModules(sourceFiles);
-  const nativeFiles = ["compiler_io_clock.o", "embedded_interfaces_native.o", "compiler_io_process_fixture"].map((name) => path.join(nativeDir, name));
+  const clock = path.join(root, "src/server/compiler_io_clock.c");
+  const embedded = path.join(nativeDir, "embedded_interfaces_native.c");
+  const processFixture = path.join(nativeDir, "compiler_io_process_fixture");
   const provider = path.join(prefix, "lib/titan/0.6/titan.a");
   const titanc = path.join(prefix, "bin/titanc");
   const lua = path.join(prefix, "bin/lua");
-  for (const filename of [...nativeFiles, provider, titanc, lua]) assert.ok((await stat(filename)).isFile(), `missing coverage build input: ${filename}`);
+  for (const filename of [clock, embedded, processFixture, provider, titanc, lua]) assert.ok((await stat(filename)).isFile(), `missing coverage build input: ${filename}`);
   // A fresh copied tree keeps source-adjacent .coverage files out of src and
   // independent of ordinary/instrumented builds in other directories.
   await mkdir(path.dirname(options.buildDir), { recursive: true });
@@ -221,26 +231,28 @@ export async function buildCoverage(options, { run = execute, environment = proc
   Object.assign(env, {
     BUILD_PROFILE: "validation", TITAN_BUILD_PROFILE: "validation", CC: options.cc, CCACHE_DISABLE: "1",
     TITAN_ROCKS_ROOT: prefix, TITAN_PREFIX: path.join(buildDir, "compiler-cache"),
-    TITAN_PATH_0_6: path.join(prefix, "lib/titan/0.6"), TITAN_PATH: path.join(prefix, "lib/titan/0.6"),
-    TITAN_EXTRA_CPPFLAGS: env.TITAN_EXTRA_CPPFLAGS || env.VSCODE_TITAN_OPENSSL_CPPFLAGS || "",
-    TITAN_EXTRA_LDFLAGS: [env.TITAN_EXTRA_LDFLAGS, process.platform === "darwin" ? "-Wl,-export_dynamic" : "-Wl,-E",
-      ...nativeFiles.slice(0, 2).map(quote), quote(provider), env.VSCODE_TITAN_OPENSSL_LDFLAGS].filter(Boolean).join(" ")
+    TITAN_PATH_0_6: path.join(prefix, "lib/titan/0.6"), TITAN_PATH: path.join(prefix, "lib/titan/0.6")
   });
   const formats = options.formats ?? [];
   const reportDir = path.resolve(options.reportDir ?? path.join(buildDir, "report"));
   const selected = production.map((module) => module.name);
-  await run(titanc, ["--static", "--test", "--no-uv-bootstrap", "--source-first", "-j2", "--coverage", "--coverage-root", buildDir,
+  await run(titanc, ["--static", "--test", "--no-uv-bootstrap", "--source-first", "--incremental", "--coverage", "--coverage-root", buildDir,
+    "--output", path.join(buildDir, "out"), "--exe", path.join(buildDir, "server/tests"),
+    "-I", path.join(root, "src/server"), "--c-source", clock, "--c-source", embedded,
+    "--ldflag=" + (process.platform === "darwin" ? "-Wl,-export_dynamic" : "-Wl,-E"), "--ldflag=" + provider,
+    ...(options.cflags ?? []).map((flag) => "--cflag=" + flag), ...(options.ldflags ?? []).map((flag) => "--ldflag=" + flag),
     "--coverage-gcov", options.gcov, "--coverage-output", reportDir,
     ...formats.flatMap((format) => ["--coverage-format", format]), ...(formats.length ? ["--coverage-gcovr", options.gcovr] : []),
     ...selected.flatMap((name) => ["--coverage-module", name]), "--tree", stage, "server.tests", ...selected],
   { cwd: buildDir, env, log: path.join(buildDir, "logs", "build.log") });
   // Runtime fixture compilers receive caller flags, not final-image payloads.
-  const runtimeEnvironment = Object.fromEntries(["AR", "RANLIB", "TITAN_EXTRA_CPPFLAGS", "TITAN_EXTRA_CFLAGS", "TITAN_EXTRA_LDFLAGS",
-    "VSCODE_TITAN_OPENSSL_CPPFLAGS", "VSCODE_TITAN_OPENSSL_LDFLAGS"].map((name) => [name, environment[name] ?? ""]));
+  const runtimeEnvironment = Object.fromEntries(["AR", "RANLIB", "TITAN_EXTRA_CPPFLAGS", "TITAN_EXTRA_CFLAGS", "TITAN_EXTRA_LDFLAGS"]
+    .map((name) => [name, environment[name] ?? ""]));
+  runtimeEnvironment.TITAN_EXTRA_CPPFLAGS = [runtimeEnvironment.TITAN_EXTRA_CPPFLAGS, ...(options.cflags ?? []).map(quote)].filter(Boolean).join(" ");
   Object.assign(runtimeEnvironment, { CC: options.cc, AR: runtimeEnvironment.AR || "ar", RANLIB: runtimeEnvironment.RANLIB || "ranlib" });
   const build = { root, prefix, buildDir, reportDir, formats, lua, executable: path.join(buildDir, "server/tests"),
-    processFixture: nativeFiles[2], runtimeEnvironment, modules: production.map((module) => {
-      const stem = path.join(stage, path.dirname(module.main), ".coverage", path.basename(module.main, ".titan"));
+    processFixture, runtimeEnvironment, modules: production.map((module) => {
+      const stem = path.join(buildDir, "out", path.dirname(module.main), ".coverage", path.basename(module.main, ".titan"));
       return { name: module.name, object: stem + ".o", generated: stem + ".c", sources: module.sources.map((source) => path.join(stage, source)) };
     }) };
   assert.ok((await stat(build.executable)).isFile(), "coverage test executable was not produced");

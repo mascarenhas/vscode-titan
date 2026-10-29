@@ -26,12 +26,19 @@ function test_header_store_shares_complete_values_and_preserves_ordered_namespac
       dependency(bridge.HeaderObservation.new(0, 0, "\0\255")),
       bridge.CHeaderDependency.new(bridge.CHeaderDependencyKind.search(),
         "header\0\255.h", "digest\0\255", nil),
+      bridge.CHeaderDependency.new(bridge.CHeaderDependencyKind.origin(),
+        "header\0\255.h", "digest\0\255", nil),
+      dependency(bridge.HeaderObservation.new(0, 0, "physical", "ns", 12, 100, 0)),
+      dependency(bridge.HeaderObservation.new(0, 0, "physical", "coarse", 12, 100, 0)),
+      dependency(bridge.HeaderObservation.new(0, 0, "physical", "ns", 13, 100, 0)),
+      dependency(bridge.HeaderObservation.new(0, 0, "physical", "ns", 12, 101, 0)),
+      dependency(bridge.HeaderObservation.new(0, 0, "physical", "ns", 12, 100, 1)),
     }
     local ordered: {bridge.CHeaderDependency} = {}
-    for index = 1, 45 do ordered[index] = values[(index - 1) % 4 + 1] end
+    for index = 1, 45 do ordered[index] = values[(index - 1) % 10 + 1] end
     for scope = 0, 3 do headers.replace(connection, scope, "same\0key", ordered) end
     headers.replace(connection, 0, "empty", {})
-    test.assert(sql.scalar_integer(connection, "SELECT count(*) FROM main.header_dependencies") == 4 and
+    test.assert(sql.scalar_integer(connection, "SELECT count(*) FROM main.header_dependencies") == 10 and
       sql.scalar_integer(connection, "SELECT count(*) FROM main.header_owners") == 5 and
       sql.scalar_integer(connection, "SELECT count(*) FROM main.header_inputs") == 180,
       "ordered duplicates or owner namespaces repeated shared values")
@@ -51,12 +58,17 @@ function test_header_store_shares_complete_values_and_preserves_ordered_namespac
         if actual.observation ~= nil then
           test.assert(actual.observation.modified_seconds == expected.observation.modified_seconds and
             actual.observation.modified_nanoseconds == expected.observation.modified_nanoseconds and
-            actual.observation.physical_identity == expected.observation.physical_identity,
-            "NULL observation aliased zero timestamps or a binary physical identity")
+            actual.observation.physical_identity == expected.observation.physical_identity and
+            actual.observation.precision == expected.observation.precision and
+            actual.observation.size == expected.observation.size and
+            actual.observation.changed_seconds == expected.observation.changed_seconds and
+            actual.observation.changed_nanoseconds == expected.observation.changed_nanoseconds,
+            "header observation fields changed across a packet boundary")
         end
         case actual.kind
-        when file() then test.assert(index % 4 ~= 0, "file input moved in the ordered closure")
-        when search() then test.assert(index % 4 == 0, "search input moved in the ordered closure")
+        when file() then test.assert(index % 10 ~= 4 and index % 10 ~= 5, "file input moved in the ordered closure")
+        when search() then test.assert(index % 10 == 4, "search input moved in the ordered closure")
+        when origin() then test.assert(index % 10 == 5, "origin input moved in the ordered closure")
         end
       end
     end

@@ -36,13 +36,15 @@ make server-coverage-run
 ```
 
 Coverage builds always use the validation profile. `server-coverage-build`
-copies the authored `.titan`, `.c` and `.h` sources into
-`SERVER_COVERAGE_BUILD_DIR/src` and compiles there. The directory defaults to
-`.build/coverage/direct` and must not already exist, so choose another one after
-inputs change. Native helpers come from the separately selected `BUILD_ROOT`.
-The compiler puts generated C, headers, objects and counters in `.coverage`
-directories beside the copied sources, apart from ordinary outputs, so
-production builds need no coverage cleanup. You can run the same aggregate
+copies authored `.titan`, `.c` and `.h` sources into
+`SERVER_COVERAGE_BUILD_DIR/src` for stable report attribution, then compiles with
+`--tree` on that snapshot and `--output SERVER_COVERAGE_BUILD_DIR/out`. The
+directory defaults to `.build/coverage/direct` and must not already exist, so
+choose another one after inputs change. The generated embedding C and process
+fixture come from the separately selected `BUILD_ROOT`; Titan compiles both
+the clock C and embedding C through `--c-source`. Generated C, headers, objects
+and counters live in `.coverage` directories under `out`, apart from ordinary
+outputs, so production builds need no coverage cleanup. You can run the same aggregate
 again, because the executable resets its own counters. Concurrent sessions need
 separate build directories. The embedded paths are absolute, so keep the build
 tree in place while it runs.

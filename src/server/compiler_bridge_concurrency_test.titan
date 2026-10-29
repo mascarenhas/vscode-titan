@@ -1018,7 +1018,7 @@ end
   return install(driver)
 end
 
-local function live_header_touch_uses_current_analysis_baselines()
+local function live_header_touch_rereads_without_change_time()
   local root = temporary_root()
   local header = root .. "/live_observed.h"
   fs.write_file(header,"typedef long live_observed_word;\n")
@@ -1055,6 +1055,7 @@ local function live_header_touch_uses_current_analysis_baselines()
       case input.kind
       when file() then
       when search() then kind = "search"
+      when origin() then kind = "origin"
       end
       local key = kind .. "\0" .. input.path
       if not seen[key] then seen[key] = true; inputs[#inputs + 1] = input end
@@ -1073,11 +1074,20 @@ local function live_header_touch_uses_current_analysis_baselines()
     result:find_module("live_observed_provider") == nil,
     "same-content header touch invalidated the retained source-private provider")
   local after_reads,after_hashes = counts()
-  test.assert(after_reads == before_reads and after_hashes == before_hashes,
-    "live importer edit reread or rehashed a header already validated after its touch")
+  -- titan.fs.Stat has no change timestamp. The compiler must not authorize
+  -- metadata-only reuse from a precise mtime alone.
+  test.assert(after_reads > before_reads and after_hashes > before_hashes,
+    "live importer edit reused header bytes without a change timestamp: reads " ..
+    before_reads .. " -> " .. after_reads .. ", hashes " ..
+    before_hashes .. " -> " .. after_hashes)
+  fs.write_file(header,"typedef int  live_observed_word;\n")
+  test.assert(ffi.utime(header,times) == 0,"cannot preserve modified header timestamp")
+  local _replacement, content_changed = compiler:restat_c_header_dependencies(current)
+  test.assert(content_changed,
+    "header bytes changed at the same size and mtime but retained a stale identity")
 end
 
-function test_compiler_bridge_live_header_touch_uses_current_analysis_baselines(
+function test_compiler_bridge_live_header_touch_rereads_without_change_time(
     _context: test.Context)
-  test_runtime.run(live_header_touch_uses_current_analysis_baselines)
+  test_runtime.run(live_header_touch_rereads_without_change_time)
 end
