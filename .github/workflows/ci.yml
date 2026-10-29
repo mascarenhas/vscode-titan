@@ -119,8 +119,9 @@ jobs:
         with:
           path: vscode-titan/.titan-validation
           # No fallback keys: another source rock is never a valid hit.
-          # Bump the format when compiler build policy changes.
-          key: titan-sdk-v8-source-rock-validation-titan-o0-lua-deps-optimized-ubuntu24.04-${{ runner.arch }}-readline-system-openssl-system-${{ env.LUA_RELEASE }}-${{ env.LUAROCKS_VERSION }}-rock-${{ steps.compiler-identity.outputs.rock }}-${{ steps.compiler-identity.outputs.prefix }}
+          # Bump the format when compiler build policy changes. The pinned
+          # bundled Lua components come from scripts/compiler-rocks.mjs.
+          key: titan-sdk-v8-source-rock-validation-titan-o0-lua-deps-optimized-ubuntu24.04-${{ runner.arch }}-readline-system-openssl-system-${{ env.LUA_RELEASE }}-${{ env.LUAROCKS_VERSION }}-rock-${{ steps.compiler-identity.outputs.rock }}-components-${{ hashFiles('vscode-titan/scripts/compiler-rocks.mjs') }}-${{ steps.compiler-identity.outputs.prefix }}
 
       - name: Download, build and install Lua 5.5.1
         if: steps.compiler-cache.outputs.cache-hit != 'true'
@@ -147,6 +148,22 @@ jobs:
             --with-lua="$TITAN_PREFIX" --force-config
           make LUA_DIR="$TITAN_PREFIX"
           make install LUA_DIR="$TITAN_PREFIX"
+
+      - name: Install the pinned bundled Lua components
+        if: steps.compiler-cache.outputs.cache-hit != 'true'
+        working-directory: vscode-titan
+        run: |
+          # The VSIX bundles these exact versions with their notices. Install
+          # them before the Titan rock so its dependency ranges resolve to them
+          # instead of the newest upstream releases.
+          node --input-type=module -e '
+            import { compilerRocks } from "./scripts/compiler-rocks.mjs";
+            for (const rock of compilerRocks("linux")) {
+              console.log(`${rock.directory ?? rock.rockName} ${rock.version}`);
+            }
+          ' | while read -r rock version; do
+            PATH="$TITAN_PREFIX/bin:$PATH" "$TITAN_PREFIX/bin/luarocks" install "$rock" "$version"
+          done
 
       - name: Download and install the Titan release source rock
         if: steps.compiler-cache.outputs.cache-hit != 'true'
