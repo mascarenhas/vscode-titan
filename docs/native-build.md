@@ -194,8 +194,9 @@ It then checks the copies byte for byte against the SDK. The allowlist
 (`EXPECTED_SHARE_ROOT` and `nativeRootInventory` in
 `scripts/stage-lua-modules.mjs`) keeps the compiler and its LuaRocks-installed
 dependencies, including `luv` on every platform, and leaves out LuaRocks's own
-modules and unrelated packages. No `lib/titan` tree or provider archive is
-staged. `scripts/stage-notices.mjs`
+modules and unrelated packages. The allowlist names no `share/lua/5.5/titan`
+tree: the standard modules are native providers, not Lua sources. No
+`lib/titan` tree or provider archive is staged. `scripts/stage-notices.mjs`
 collects licenses from the installation, using the rock versions and license
 files in `compilerRocks` (`scripts/compiler-rocks.mjs`). `scripts/inspect-vsix.sh` and
 `scripts/inspect-server.sh` check the package and the executable's native

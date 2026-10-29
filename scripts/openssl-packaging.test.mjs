@@ -29,7 +29,7 @@ async function fixture(context) {
 
 async function compilerSDK(context) {
   const result = await fixture(context);
-  const directories = ["share/lua/5.5/c-parser", "share/lua/5.5/titan", "share/lua/5.5/titan-compiler", "include/titan", "include/uv"];
+  const directories = ["share/lua/5.5/c-parser", "share/lua/5.5/titan-compiler", "include/titan", "include/uv"];
   for (const directory of directories) await mkdir(path.join(result.sdk, directory), { recursive: true });
   for (const member of ["argparse.lua", "inspect.lua", "relabel.lua", "c-parser/cdriver.lua", "titan-compiler/checker.lua",
     "titan-compiler/checker/completion.lua", "titan-compiler/completion.lua", "titan-compiler/maybe3.lua", "titan-compiler/documentation.lua",
