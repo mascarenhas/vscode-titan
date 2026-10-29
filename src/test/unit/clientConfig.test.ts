@@ -15,6 +15,7 @@ import {
   DEFAULT_SERVER_LOG_LEVEL,
   LANGUAGE_SERVER_LUA_CPATH_ENVIRONMENT_VARIABLE,
   LANGUAGE_SERVER_LUA_PATH_ENVIRONMENT_VARIABLE,
+  LANGUAGE_SERVER_TITAN_ROOT_ENVIRONMENT_VARIABLE,
   SERVER_BASENAME,
   SERVER_LOG_LEVEL_ENVIRONMENT_VARIABLE,
   ServerConfigurationError,
@@ -101,7 +102,7 @@ describe("server configuration", () => {
     );
   });
 
-  test("reads compiler Lua discovery paths without rewriting them", () => {
+  test("reads compiler paths verbatim and names the packaged installation root", () => {
     assert.deepEqual(
       readCompilerDiscoveryConfiguration(
         "./compiler/?.lua",
@@ -110,7 +111,8 @@ describe("server configuration", () => {
       ),
       {
         luaPath: "./compiler/?.lua",
-        luaCPath: "./compiler/?.so"
+        luaCPath: "./compiler/?.so",
+        titanRoot: path.join("/extension", "dist", "titan")
       }
     );
   });
@@ -132,7 +134,8 @@ describe("server configuration", () => {
         luaCPath: path.join(
           extensionRoot, "dist", "titan", "lib", "lua", "5.5",
           process.platform === "win32" ? "?.dll" : "?.so"
-        )
+        ),
+        titanRoot: path.join(extensionRoot, "dist", "titan")
       }
     );
   });
@@ -310,7 +313,10 @@ describe("server launch validation", () => {
   });
 
   test("constructs isolated process options with the workspace as cwd", () => {
-    const sourceEnvironment = { TITAN_TEST_ENV: "configured" };
+    const sourceEnvironment = {
+      TITAN_ROOT: "inherited-titan-root",
+      TITAN_TEST_ENV: "configured"
+    };
     const args = ["--stdio"];
     const launch = createServerLaunchOptions(
       "/bin/titan-language-server",
@@ -342,6 +348,7 @@ describe("server launch validation", () => {
       LUA_CPATH: "inherited-lua-cpath",
       TITAN_LS_LUA_PATH: "inherited-server-lua-path",
       TITAN_LS_LUA_CPATH: "inherited-server-lua-cpath",
+      TITAN_ROOT: "inherited-titan-root",
       TITAN_PREFIX: "inherited-cache-prefix",
       TITAN_TEST_ENV: "preserved"
     };
@@ -363,6 +370,8 @@ describe("server launch validation", () => {
         bundledDiscovery.luaPath,
       [LANGUAGE_SERVER_LUA_CPATH_ENVIRONMENT_VARIABLE]:
         bundledDiscovery.luaCPath,
+      [LANGUAGE_SERVER_TITAN_ROOT_ENVIRONMENT_VARIABLE]:
+        bundledDiscovery.titanRoot,
       TITAN_LANGUAGE_SERVER_LOG_LEVEL: "debug"
     });
 
@@ -373,7 +382,8 @@ describe("server launch validation", () => {
       sourceEnvironment,
       {
         luaPath: "/opt/titan/compiler/?.lua",
-        luaCPath: "/opt/titan/compiler/?.so"
+        luaCPath: "/opt/titan/compiler/?.so",
+        titanRoot: "/opt/titan"
       },
       "debug"
     );
@@ -382,6 +392,7 @@ describe("server launch validation", () => {
       LUA_CPATH: "inherited-lua-cpath",
       TITAN_LS_LUA_PATH: "/opt/titan/compiler/?.lua",
       TITAN_LS_LUA_CPATH: "/opt/titan/compiler/?.so",
+      TITAN_ROOT: "/opt/titan",
       TITAN_PREFIX: "inherited-cache-prefix",
       TITAN_LANGUAGE_SERVER_LOG_LEVEL: "debug",
       TITAN_TEST_ENV: "preserved"
@@ -391,6 +402,7 @@ describe("server launch validation", () => {
       LUA_CPATH: "inherited-lua-cpath",
       TITAN_LS_LUA_PATH: "inherited-server-lua-path",
       TITAN_LS_LUA_CPATH: "inherited-server-lua-cpath",
+      TITAN_ROOT: "inherited-titan-root",
       TITAN_PREFIX: "inherited-cache-prefix",
       TITAN_TEST_ENV: "preserved"
     });
@@ -402,7 +414,7 @@ describe("server launch validation", () => {
       [],
       "/workspace/project",
       { [SERVER_LOG_LEVEL_ENVIRONMENT_VARIABLE]: "inherited" },
-      { luaPath: "./?.lua", luaCPath: "./?.so" },
+      { luaPath: "./?.lua", luaCPath: "./?.so", titanRoot: "" },
       "trace"
     );
 

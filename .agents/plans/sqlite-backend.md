@@ -538,7 +538,7 @@ further merge confirmation is needed once the reconciled review and gates pass.
    report the new compiler/image identities and actual counts separately. Replace
    the benchmark's removed `TITAN_PROBE_CACHE_IDENTITY` control with the supported
    child-process `TITAN_PREFIX` cache-root override pointing at a fresh private
-   directory; retain the actual compiler installation via `TITAN_ROCKS_ROOT`.
+   directory; retain the actual compiler installation via `TITAN_ROOT`.
    Record that directory and verify probe records stay within it, without adding
    a namespace to raw-source keys or changing probe policy.
 4. Review the final diff against the new master specifically for regressions of

@@ -16,6 +16,12 @@
 #define LS_PROVIDER_GUARD "vscode-titan.windows.embedded-provider-handle"
 #define LS_PATH_CAPACITY 32768
 
+/* The language server statically links the installed runtime archive, so the
+ * support module is this image's own member rather than a provider export.
+ * Keep the declaration a plain `extern int`; the generated launcher uses the
+ * same shape for its support reference. */
+extern int luaopen_titan(lua_State *L);
+
 enum {
     LS_INTERFACE_COUNT = sizeof(titan_ls_windows_interfaces) /
                          sizeof(titan_ls_windows_interfaces[0])
@@ -210,7 +216,6 @@ static void ls_push_cache(lua_State *L) {
     void *address;
     HMODULE module = NULL;
     WCHAR *wide;
-    lua_CFunction open_support;
     luaL_checkstack(L, 16, "Windows embedded Titan provider");
     lua_getfield(L, LUA_REGISTRYINDEX, LS_PROVIDER_CACHE);
     if (!lua_isnil(L, -1)) return;
@@ -251,7 +256,6 @@ static void ls_push_cache(lua_State *L) {
     ls_push_final_path(L, guard->file); lua_replace(L, path_index);
     lua_pushvalue(L, path_index); lua_setfield(L, cache_index, "path");
     ls_push_identity(L, guard->file, path_index); lua_setfield(L, cache_index, "identity");
-    open_support = titan_cast_func(lua_CFunction, ls_symbol(L, module, "luaopen_titan"));
     lua_createtable(L, 0, LS_INTERFACE_COUNT);
     for (size_t index = 0; index < sizeof(titan_ls_windows_interfaces) / sizeof(titan_ls_windows_interfaces[0]); ++index) {
         const struct titan_ls_windows_interface *entry = &titan_ls_windows_interfaces[index];
@@ -262,7 +266,7 @@ static void ls_push_cache(lua_State *L) {
     lua_setfield(L, cache_index, "types");
     /* Install the same metadata-free support preload used by Unix. */
     luaL_getsubtable(L, LUA_REGISTRYINDEX, LUA_PRELOAD_TABLE);
-    lua_pushcfunction(L, open_support); lua_setfield(L, -2, "titan"); lua_pop(L, 1);
+    lua_pushcfunction(L, luaopen_titan); lua_setfield(L, -2, "titan"); lua_pop(L, 1);
     lua_pushvalue(L, cache_index); lua_setfield(L, LUA_REGISTRYINDEX, LS_PROVIDER_CACHE);
     owner->file = guard->file; guard->file = INVALID_HANDLE_VALUE;
     lua_closeslot(L, guard_index);

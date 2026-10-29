@@ -178,12 +178,14 @@ export async function buildWindows(target, {
   const env = childEnvironment(buildProfileEnvironment(target, process.env, buildProfile), {
     CC: compilerArgument(clang), AR: compilerArgument(ar), RANLIB: compilerArgument(ranlib),
     RC: compilerArgument(path.join(path.dirname(clang), "llvm-rc.exe")),
-    CCACHE_DISABLE: "1", TITAN_ROCKS_ROOT: sdk, TITAN_PREFIX: path.join(buildRoot, "compiler-cache"),
+    CCACHE_DISABLE: "1", TITAN_ROOT: sdk, TITAN_PREFIX: path.join(buildRoot, "compiler-cache"),
     PATH: `${path.dirname(process.execPath)};${path.dirname(clang)};${path.join(sdk, "bin")};${inheritedPath}`,
     TITAN_PATH_0_6: forward(path.join(sdk, "lib/titan/0.6")),
     TITAN_PATH: forward(path.join(sdk, "lib/titan/0.6")),
     LUA_PATH: `${forward(sdk)}/share/lua/5.5/?.lua;${forward(sdk)}/share/lua/5.5/?/init.lua`,
-    LUA_CPATH: `${forward(sdk)}/lib/lua/5.5/?.dll;${forward(sdk)}/lib/titan/0.6/?.dll`
+    // The support module is the ordinary Lua native module; the standard
+    // provider directory holds Titan providers, not Lua C modules.
+    LUA_CPATH: `${forward(sdk)}/lib/lua/5.5/?.dll`
   }, ["LUA_PATH_5_5", "LUA_CPATH_5_5", "TITAN_SOURCE_PATH"]);
   function run(command, args, cwd = repository, overrides = {}) {
     console.log(JSON.stringify({ command, args, cwd }));

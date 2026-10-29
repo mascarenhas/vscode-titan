@@ -61,7 +61,7 @@ async function fixture(context) {
   options.cflags = ["-DSSL_FLAG=1"];
   options.ldflags = ["-lssl", "-lcrypto"];
   const environment = { TITAN_EXTRA_CPPFLAGS: "-DSOURCE_FLAG=1", TITAN_EXTRA_LDFLAGS: "-lcaller", LUA_PATH: "ambient-path", TITAN_PATH: "ambient-provider",
-    TITAN_PREFIX: "ambient-sdk-prefix", TITAN_ROCKS_ROOT: "ambient-sdk",
+    TITAN_PREFIX: "ambient-sdk-prefix", TITAN_ROOT: "ambient-sdk",
     GCOV_PREFIX: "ambient-counter-directory", TITAN_FILTER: "drop-most-tests" };
   return { root, options, calls, run, environment, put };
 }
@@ -132,10 +132,10 @@ test("single direct test build roots every discovered production module and isol
   assert.ok(!args.includes("--coverage-source-map") && !args.includes("--coverage-gcovr") && args.includes("--incremental"));
   assert.equal(execution.cwd, options.buildDir);
   assert.equal(execution.env.TITAN_BUILD_PROFILE, "validation");
-  assert.equal(execution.env.TITAN_ROCKS_ROOT, options.prefix);
+  assert.equal(execution.env.TITAN_ROOT, options.prefix);
   assert.equal(execution.env.TITAN_PREFIX, path.join(options.buildDir, "compiler-cache"));
   assert.equal(environment.TITAN_PREFIX, "ambient-sdk-prefix");
-  assert.equal(environment.TITAN_ROCKS_ROOT, "ambient-sdk");
+  assert.equal(environment.TITAN_ROOT, "ambient-sdk");
   for (const name of ["LUA_PATH", "GCOV_PREFIX", "GCOV_PREFIX_STRIP", "TITAN_FILTER"]) assert.equal(execution.env[name], undefined);
   assert.equal(execution.env.TITAN_EXTRA_CPPFLAGS, "-DSOURCE_FLAG=1");
   assert.deepEqual(args.flatMap((arg, index) => arg === "--c-source" ? [args[index + 1]] : []),
@@ -195,10 +195,10 @@ test("direct execution uses selected runtime paths, ignores ambient filters, and
   assert.equal(invocation.execution.cwd, options.repository);
   assert.equal(invocation.execution.env.LUA_PATH_5_5, "selected-path");
   assert.equal(invocation.execution.env.LUA_CPATH_5_5, "selected-cpath");
-  assert.equal(invocation.execution.env.TITAN_ROCKS_ROOT, options.prefix);
+  assert.equal(invocation.execution.env.TITAN_ROOT, options.prefix);
   assert.equal(invocation.execution.env.TITAN_PREFIX, path.join(options.buildDir, "compiler-cache"));
   assert.equal(environment.TITAN_PREFIX, "ambient-sdk-prefix");
-  assert.equal(environment.TITAN_ROCKS_ROOT, "ambient-sdk");
+  assert.equal(environment.TITAN_ROOT, "ambient-sdk");
   assert.equal(invocation.execution.env.TITAN_COMPILER_IO_PROCESS_FIXTURE, path.join(options.nativeDir, "compiler_io_process_fixture"));
   assert.equal(invocation.execution.env.TITAN_EXTRA_LDFLAGS, "-lcaller");
   assert.equal(invocation.execution.env.TITAN_FILTER, undefined);

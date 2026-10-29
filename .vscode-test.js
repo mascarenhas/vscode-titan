@@ -6,7 +6,7 @@ module.exports = defineConfig({
   workspaceFolder: "test/fixtures/multiroot.code-workspace",
   env: {
     TITAN_PREFIX: undefined,
-    TITAN_ROCKS_ROOT: undefined
+    TITAN_ROOT: undefined
   },
   mocha: {
     timeout: 10000

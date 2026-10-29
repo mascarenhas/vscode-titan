@@ -9,7 +9,7 @@ test("explicit SDK overrides PATH without invoking a compiler", () => {
 });
 
 test("PATH compiler reports its SDK independently of Lua and probe overrides", () => {
-  const environment = { PATH: "/selected/bin", TITAN_PREFIX: "", TITAN_ROCKS_ROOT: "/wrong",
+  const environment = { PATH: "/selected/bin", TITAN_PREFIX: "", TITAN_ROOT: "/wrong",
     LUA_PATH: "/wrong", LUA_CPATH_5_5: "/wrong", LUA_INIT_5_5: "wrong", TITAN_PATH_0_6: "/wrong", CC: "cc" };
   const prefix = resolveTitanSdk({ platform: "linux", environment, run(command, args, options) {
     assert.equal(command, "titanc");
@@ -50,7 +50,7 @@ test("discovery failures are actionable and malformed output is rejected", () =>
   for (const stdout of ["", "relative\n", "/sdk\nnoise\n", "/sdk\0\n"]) {
     assert.throws(() => resolveTitanSdk({ platform: "linux", environment, run: () => ({ status: 0, stdout }) }), /one absolute/);
   }
-  assert.deepEqual(compilerDiscoveryEnvironment({ Path: "selected", tItAn_RoCkS_rOoT: "wrong" }), { Path: "selected" });
+  assert.deepEqual(compilerDiscoveryEnvironment({ Path: "selected", tItAn_RoOt: "wrong", tItAn_PaTh_0_6: "wrong" }), { Path: "selected" });
 });
 
 test("Titan 0.6 release discovery falls back after the renamed option is rejected", () => {

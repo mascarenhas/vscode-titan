@@ -11,7 +11,7 @@ function environmentValue(environment, name, platform) {
 
 export function compilerDiscoveryEnvironment(environment = process.env) {
   return Object.fromEntries(Object.entries(environment).filter(([name]) =>
-    !/^(LUA_(PATH|CPATH|INIT)(_[0-9_]+)?|TITAN_(PREFIX|ROCKS_ROOT|PATH(_[0-9_]+)?|SOURCE_PATH))$/i.test(name)));
+    !/^(LUA_(PATH|CPATH|INIT)(_[0-9_]+)?|TITAN_(PREFIX|ROOT|PATH(_[0-9_]+)?|SOURCE_PATH))$/i.test(name)));
 }
 
 // Windows LuaRocks installs a batch wrapper with installation-specific paths.

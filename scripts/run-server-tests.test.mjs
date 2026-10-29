@@ -100,7 +100,7 @@ assert.deepEqual(process.argv.slice(2, 4), ["-E", "-e"]);
 const prefix = path.dirname(path.dirname(process.argv[1]));
 switch (process.argv[4]) {
   case "io.write(package.path)": process.stdout.write(prefix + "/share/lua/5.5/?.lua"); break;
-  case "io.write(package.cpath)": process.stdout.write(prefix + "/lib/titan/0.6/?.so;" + prefix + "/lib/lua/5.5/?.so"); break;
+  case "io.write(package.cpath)": process.stdout.write(prefix + "/lib/lua/5.5/?.so;" + prefix + "/lib/lua/5.5/loadall.so"); break;
   default: throw new Error("unexpected Lua query");
 }
 `);
@@ -129,7 +129,7 @@ switch (process.argv[4]) {
     assert.deepEqual(JSON.parse(await readFile(path.join(root, filename), "utf8")), {
       versioned: null, fallback: null,
       lua: path.join(prefix, "share/lua/5.5/?.lua"),
-      c: path.join(prefix, "lib/titan/0.6/?.so") + ";" + path.join(prefix, "lib/lua/5.5/?.so"), cache: "1"
+      c: path.join(prefix, "lib/lua/5.5/?.so") + ";" + path.join(prefix, "lib/lua/5.5/loadall.so"), cache: "1"
     });
   }
 });

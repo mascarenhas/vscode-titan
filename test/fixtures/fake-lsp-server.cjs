@@ -271,6 +271,7 @@ function appendEvent(targetPath, details) {
       arguments: fixtureArguments,
       luaPath: process.env.TITAN_LS_LUA_PATH,
       luaCPath: process.env.TITAN_LS_LUA_CPATH,
+      titanRoot: process.env.TITAN_ROOT,
       compilerCachePrefix: process.env.TITAN_PREFIX,
       serverLogLevel: process.env.TITAN_LANGUAGE_SERVER_LOG_LEVEL,
       ...details

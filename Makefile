@@ -114,7 +114,7 @@ VSIX := $(VSIX_DIR)/titan-$(VSIX_TARGET).vsix
 # titanc owns module discovery, certification, scheduling and final outputs.
 shell_quote = '$(subst ','"'"',$(1))'
 COMPILER_ENV = env -u LUA_PATH -u LUA_CPATH -u LUA_PATH_5_5 -u LUA_CPATH_5_5 -u TITAN_SOURCE_PATH \
-	TITAN_ROCKS_ROOT=$(call shell_quote,$(TITAN_PREFIX)) \
+	TITAN_ROOT=$(call shell_quote,$(TITAN_PREFIX)) \
 	TITAN_PREFIX=$(call shell_quote,$(BUILD_ROOT)/compiler-cache) \
 	TITAN_PATH_0_6=$(call shell_quote,$(TITAN_PREFIX)/lib/titan/0.6) \
 	TITAN_PATH=$(call shell_quote,$(TITAN_PREFIX)/lib/titan/0.6)
@@ -131,7 +131,7 @@ TITAN_LINK_FLAGS = --ldflag=$(call shell_quote,$(EXPORT_LUA_LDFLAGS)) \
 # Ask its Lua executable for its own relocatable paths, as Titan's test harness
 # does. Ambient Titan paths must not replace that selected SDK at execution.
 TEST_ENV = env -u TITAN_PATH_0_6 -u TITAN_PATH \
-	TITAN_ROCKS_ROOT=$(call shell_quote,$(TITAN_PREFIX)) \
+	TITAN_ROOT=$(call shell_quote,$(TITAN_PREFIX)) \
 	TITAN_PREFIX=$(call shell_quote,$(BUILD_ROOT)/compiler-cache) \
 	TITAN_COMPILER_IO_PROCESS_FIXTURE=$(call shell_quote,$(COMPILER_IO_PROCESS_FIXTURE)) \
 	CCACHE_DISABLE=$(call shell_quote,$(CCACHE_DISABLE)) \
@@ -142,7 +142,7 @@ TEST_ENV = env -u TITAN_PATH_0_6 -u TITAN_PATH \
 SERVER_TEST_ENV = env -u TITAN_PREFIX -u TITAN_PATH_0_6 -u TITAN_PATH -u TITAN_SOURCE_PATH \
 	CC=$(call shell_quote,$(CC)) CCACHE_DISABLE=$(call shell_quote,$(CCACHE_DISABLE)) \
 	TITAN_EXTRA_CPPFLAGS=$(call shell_quote,$(strip $(TITAN_EXTRA_CPPFLAGS) $(OPENSSL_CPPFLAGS))) \
-	TITAN_ROCKS_ROOT=$(call shell_quote,$(TITAN_PREFIX)) \
+	TITAN_ROOT=$(call shell_quote,$(TITAN_PREFIX)) \
 	TITAN_LS_LUA_PATH=$(call shell_quote,$(DEVELOPMENT_LUA_PATH)) \
 	TITAN_LS_LUA_CPATH=$(call shell_quote,$(DEVELOPMENT_LUA_CPATH))
 
@@ -224,7 +224,7 @@ $(TITAN_STANDARD_PROVIDER): | $(TITANC)
 $(EMBEDDED_INTERFACES_SOURCE): $(EMBEDDED_INTERFACES_GENERATOR) $(TITAN_STANDARD_PROVIDER)
 	@mkdir -p "$(dir $(EMBEDDED_INTERFACES_SOURCE))"
 	CCACHE_DISABLE="$(CCACHE_DISABLE)" CC="$(CC)" \
-		TITAN_ROCKS_ROOT="$(TITAN_PREFIX)" \
+		TITAN_ROOT="$(TITAN_PREFIX)" \
 		LUA_PATH="$(DEVELOPMENT_LUA_PATH)" \
 		LUA_CPATH="$(DEVELOPMENT_LUA_CPATH)" \
 		"$(TITAN_LUA)" "$(EMBEDDED_INTERFACES_GENERATOR)" \

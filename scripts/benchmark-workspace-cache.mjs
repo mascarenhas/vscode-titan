@@ -124,19 +124,19 @@ async function probeCacheConfiguration(options, inherited = process.env) {
   assert.notEqual(inherited.TITAN_PROBE_CACHE_DISABLE, "1",
     "TITAN_PROBE_CACHE_DISABLE=1 prevents a cache-enabled benchmark; unset it before measuring");
   // TITAN_PREFIX selects probe storage in benchmark invocations. Discover the
-  // actual SDK separately unless the caller already selected its rocks root.
-  const rocksRoot = await realpath(inherited.TITAN_ROCKS_ROOT || resolveTitanSdk({
+  // actual SDK separately unless the caller already selected its Titan root.
+  const titanRoot = await realpath(inherited.TITAN_ROOT || resolveTitanSdk({
     environment: compilerDiscoveryEnvironment(inherited)
   }));
-  assert.ok((await stat(rocksRoot)).isDirectory(), "the actual Titan installation must be a directory");
+  assert.ok((await stat(titanRoot)).isDirectory(), "the actual Titan installation must be a directory");
   const prefix = path.join(options.output, "probe-prefix");
   assert.ok(path.isAbsolute(prefix), "the private probe prefix must be absolute");
   return {
     prefix, directory: path.join(prefix, "var/cache/titan-probes/2"), format: 2,
-    key: "SHA-256 of exact raw C source", rocksRoot,
+    key: "SHA-256 of exact raw C source", titanRoot,
     sharedAcrossProcesses: true, retained: true, excludedFromDatabaseBytes: true,
     inheritedEnvironment: Object.fromEntries([
-      "TITAN_PREFIX", "TITAN_ROCKS_ROOT", "TITAN_PROBE_CACHE_DISABLE", "TITAN_PROBE_CACHE_IDENTITY"
+      "TITAN_PREFIX", "TITAN_ROOT", "TITAN_PROBE_CACHE_DISABLE", "TITAN_PROBE_CACHE_IDENTITY"
     ].map((name) => [name, inherited[name] ?? null]))
   };
 }
@@ -144,11 +144,11 @@ async function probeCacheConfiguration(options, inherited = process.env) {
 function benchmarkEnvironment(probeCache, inherited = process.env) {
   assert.notEqual(inherited.TITAN_PROBE_CACHE_DISABLE, "1",
     "TITAN_PROBE_CACHE_DISABLE changed to 1 before process launch");
-  const luaRoot = path.join(probeCache.rocksRoot, "share/lua/5.5");
+  const luaRoot = path.join(probeCache.titanRoot, "share/lua/5.5");
   const environment = { ...inherited,
-    TITAN_PREFIX: probeCache.prefix, TITAN_ROCKS_ROOT: probeCache.rocksRoot,
+    TITAN_PREFIX: probeCache.prefix, TITAN_ROOT: probeCache.titanRoot,
     TITAN_LS_LUA_PATH: inherited.TITAN_LS_LUA_PATH ?? `${luaRoot}/?.lua;${luaRoot}/?/init.lua`,
-    TITAN_LS_LUA_CPATH: inherited.TITAN_LS_LUA_CPATH ?? path.join(probeCache.rocksRoot,
+    TITAN_LS_LUA_CPATH: inherited.TITAN_LS_LUA_CPATH ?? path.join(probeCache.titanRoot,
       "lib", "lua", "5.5", process.platform === "win32" ? "?.dll" : "?.so"),
     TITAN_LANGUAGE_SERVER_LOG_LEVEL: "trace" };
   // Raw-source probe keys have no namespace. The supported prefix changes only
@@ -767,7 +767,7 @@ async function benchmark(options) {
   probeCache.emptyBeforeCold = true;
   const childEnvironment = benchmarkEnvironment(probeCache);
   probeCache.effectiveEnvironment = Object.fromEntries([
-    "TITAN_PREFIX", "TITAN_ROCKS_ROOT", "TITAN_PROBE_CACHE_DISABLE", "TITAN_PROBE_CACHE_IDENTITY",
+    "TITAN_PREFIX", "TITAN_ROOT", "TITAN_PROBE_CACHE_DISABLE", "TITAN_PROBE_CACHE_IDENTITY",
     "TITAN_LS_LUA_PATH", "TITAN_LS_LUA_CPATH"
   ].map((name) => [name, childEnvironment[name] ?? null]));
   await writeFile(path.join(options.output, "source-original.bin"), target.original, { flag: "wx" });
