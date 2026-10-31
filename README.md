@@ -225,11 +225,14 @@ entry that contains it. Overlapping roots therefore still give a saved file one
 identity. The server checks that identity against the compiler's root order and
 its folder-before-flat rule. It reports a shadowed, blocked or ambiguous
 provider as a configuration issue instead of analyzing the file under an
-identity that `titanc` would not use. An included file outside every source
-root gets an `unmapped-source` warning. Such a file is excluded from
-compilation, indexing, navigation and watching. The next ordinary discovery
-pass updates the warning, for example after a mapped source is saved or the
-configuration changes.
+identity that `titanc` would not use. Target variants (`name.<label>.titan`)
+are grouped under their logical filename and selected for the host target
+(`TITAN_TARGET` is ignored); an unselected variant is excluded from analysis and
+receives an information-severity `inactive-variant` diagnostic. An included file
+outside every source root gets an `unmapped-source` warning. Such a file is
+excluded from compilation, indexing, navigation and watching. The next ordinary
+discovery pass updates the warning, for example after a mapped source is saved
+or the configuration changes.
 
 Project discovery ignores symlinked files and directories below the include
 roots; use ordinary files and directories for project modules. Opening the

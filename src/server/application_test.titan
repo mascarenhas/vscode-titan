@@ -3085,3 +3085,143 @@ function test_application_native_windows_watch_paths(_context: test.Context)
   test.assert(application.rebase_path("C:/main.titan", "C:/", "W:/") ==
               "W:/main.titan")
 end
+
+local function variant_lifecycle_diagnostics_and_completion_isolation()
+  local host = bridge.host_target()
+  local root = test_paths.temporary_name()
+  fs.unlink(root)
+  fs.mkdir(root)
+  local src = root .. "/src"
+  fs.mkdir(src)
+  local default_file = src .. "/foo.titan"
+  local host_file = src .. "/foo." .. host .. ".titan"
+  local browser_file = src .. "/foo.browser.titan"
+  local consumer_file = src .. "/consumer.titan"
+  fs.write_file(default_file,
+    "function selectedValue(): integer\n  return 1\nend\n")
+  fs.write_file(browser_file,
+    "foreign import \"nonexistent_browser_header.h\"\n" ..
+    "function browserOnly(): integer return 2 end\n" ..
+    "syntax error @@@\n")
+  fs.write_file(consumer_file,
+    "local foo = import \"foo\"\n" ..
+    "function read(): integer\n  return foo.selectedValue()\nend\n")
+  defer do
+    remove_application_cache(workspace_cache.directory(root))
+    if fs.lstat(consumer_file) ~= nil then fs.unlink(consumer_file) end
+    if fs.lstat(browser_file) ~= nil then fs.unlink(browser_file) end
+    if fs.lstat(host_file) ~= nil then fs.unlink(host_file) end
+    if fs.lstat(default_file) ~= nil then fs.unlink(default_file) end
+    if fs.lstat(src) ~= nil then fs.rmdir(src) end
+    if fs.lstat(root) ~= nil then fs.rmdir(root) end
+  end
+
+  local default_uri? = source_text.path_to_file_uri(default_file)
+  local host_uri? = source_text.path_to_file_uri(host_file)
+  local browser_uri? = source_text.path_to_file_uri(browser_file)
+  local consumer_uri? = source_text.path_to_file_uri(consumer_file)
+  local published: {string: diagnostics.Publication} = {}
+  local app = application.create(root)
+  defer app:close()
+  app:set_diagnostics_listener(function (publication: diagnostics.Publication)
+    published[publication.uri] = publication
+  end)
+  app:start_indexing()
+  wait_until(function (): boolean
+    local snapshot? = app:snapshot_for_testing()
+    return snapshot ~= nil and not app:indexing_metrics().refresh_chain_active and
+      published[browser_uri as string] ~= nil
+  end, "initial variant indexing did not finish")
+
+  local browser_pub = published[browser_uri as string]
+  test.assert(#browser_pub.items == 1 and
+    strings.find(browser_pub.items[1].message,
+      "not analyzed: inactive for host target '" .. host ..
+      "'; 'foo.titan' selects 'foo.titan'") ~= nil,
+    "inactive browser variant did not publish its information diagnostic")
+  test.assert(published[default_uri as string] == nil and
+    published[consumer_uri as string] == nil,
+    "valid active files received unexpected diagnostics")
+
+  -- Open inactive variant and verify it gets no completion and adds nothing to consumer.
+  local browser_doc = lsp.TextDocument.new(browser_uri as string, browser_file)
+  local browser_dirty = "function browserDirty(): integer return 99 end\n"
+  app:on_document(lsp.DocumentNotification.opened(
+    lsp.OpenDocument.new(browser_doc, 1, browser_dirty)))
+  local inactive_completion = app:capture_completion(
+    dispatcher.CompletionRequest.new(
+      dispatcher.RequestId.integer_id(1),
+      lsp.CompletionParams.new(
+        lsp.DocumentPosition.new(
+          browser_uri as string, browser_file, source_text.Position.new(0, 30)),
+        1, nil)))
+  case inactive_completion()
+  when result(value) then
+    local object? = wire.as_object(value)
+    local items? = wire.as_array(object["items"])
+    test.assert(#items == 0, "open inactive variant received completion items")
+  else
+    test.assert(false, "inactive variant completion request failed")
+  end
+
+  -- Creating foo.<host>.titan re-selects foo, updates definition, and marks foo.titan inactive.
+  fs.write_file(host_file,
+    "-- host override\nfunction selectedValue(): integer\n  return 42\nend\n")
+  app:watch_callback(project_watcher.RediscoveryBatch.new({
+    project_watcher.PathChange.created(host_file),
+  }, {}, false))
+  wait_until(function (): boolean
+    return not app:indexing_metrics().refresh_chain_active and
+      published[default_uri as string] ~= nil and
+      #published[default_uri as string].items == 1
+  end, "creating host variant did not republish diagnostics")
+  test.assert(strings.find(published[default_uri as string].items[1].message,
+    "not analyzed: inactive for host target '" .. host ..
+    "'; 'foo.titan' selects 'foo." .. host .. ".titan'") ~= nil,
+    "shadowed default file did not receive inactive-variant diagnostic")
+
+  local definition_outcome = app:handle(dispatcher.SemanticRequest.new(
+    dispatcher.RequestId.integer_id(2), "textDocument/definition", {
+      ["textDocument"] = {["uri"] = consumer_uri as string} as wire.Object,
+      ["position"] = {["line"] = 2, ["character"] = 15} as wire.Object,
+    } as wire.Object))
+  case definition_outcome
+  when result(value) then
+    local location? = wire.as_object(value)
+    test.assert(location ~= nil and
+      wire.as_string(location["uri"]) == host_uri,
+      "definition did not move to newly created host variant")
+  else
+    test.assert(false, "definition request failed after creating host variant")
+  end
+
+  -- Deleting foo.<host>.titan falls back to foo.titan and clears its inactive diagnostic.
+  fs.unlink(host_file)
+  app:watch_callback(project_watcher.RediscoveryBatch.new({
+    project_watcher.PathChange.deleted(host_file),
+  }, {}, false))
+  wait_until(function (): boolean
+    return not app:indexing_metrics().refresh_chain_active and
+      published[default_uri as string] ~= nil and
+      #published[default_uri as string].items == 0
+  end, "deleting host variant did not clear default file's inactive diagnostic")
+  local restored_definition = app:handle(dispatcher.SemanticRequest.new(
+    dispatcher.RequestId.integer_id(3), "textDocument/definition", {
+      ["textDocument"] = {["uri"] = consumer_uri as string} as wire.Object,
+      ["position"] = {["line"] = 2, ["character"] = 15} as wire.Object,
+    } as wire.Object))
+  case restored_definition
+  when result(value) then
+    local location? = wire.as_object(value)
+    test.assert(location ~= nil and
+      wire.as_string(location["uri"]) == default_uri,
+      "definition did not return to foo.titan after deleting host variant")
+  else
+    test.assert(false, "definition request failed after deleting host variant")
+  end
+end
+
+function test_application_variant_lifecycle_diagnostics_and_completion_isolation(
+    _context: test.Context)
+  test_runtime.run(variant_lifecycle_diagnostics_and_completion_isolation)
+end

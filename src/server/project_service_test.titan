@@ -3508,3 +3508,94 @@ extra_ffi_cppflags = "-DVARIANT=2"
     end)
   end)
 end
+
+function test_project_service_reselects_variants_on_create_and_delete_without_analyzing_inactive_files(
+    _context: test.Context)
+  test_runtime.run(function ()
+    with_fixture(function (fixture: Fixture)
+      local host = compiler_bridge.host_target()
+      configure_source_root(fixture)
+      fixture:mkdir("src")
+      fixture:write("src/provider.titan",
+        "function chosen(): integer\n  return 10\nend\n")
+      fixture:write("src/provider.browser.titan",
+        "foreign import \"missing_browser_only_header.h\"\n" ..
+        "this inactive variant must never be parsed @@@\n")
+      fixture:write("src/consumer.titan",
+        "local provider = import \"provider\"\n" ..
+        "function read(): integer\n  return provider.chosen()\nend\n")
+
+      local service?, load_error? = fixture:load_compiler()
+      test.assert(service ~= nil and load_error == nil,
+        "project service rejected tree with broken inactive variant")
+      fixture.services[#fixture.services + 1] = service
+      local initial = service:latest()
+      test.assert(#initial.project_modules == 2 and
+        #initial.discovery_issues == 1 and
+        initial.discovery_issues[1].path ==
+          fixture:path("src/provider.browser.titan") and
+        service:counters().file_reads == 2,
+        "inactive variant was read or omitted from discovery issues")
+      for index = 1, #initial.project_modules do
+        test.assert(#initial.project_modules[index].diagnostics == 0,
+          "inactive variant caused compiler diagnostics")
+      end
+
+      -- Creating a higher-precedence .native.titan variant re-selects and re-analyzes.
+      fixture:write("src/provider.native.titan",
+        "function chosen(): string\n  return \"native\"\nend\n")
+      local native_report?, native_error? = service:refresh()
+      test.assert(native_report ~= nil and native_error == nil and
+        native_report.analyzed and
+        #native_report.committed_modules == 1 and
+        native_report.committed_modules[1] == "provider" and
+        #native_report.failed_modules == 1 and
+        native_report.failed_modules[1] == "consumer",
+        "creating provider.native.titan did not re-select and re-analyze")
+
+      if host ~= "native" then
+        -- Creating the exact host OS variant overrides .native.titan and repairs consumer.
+        fixture:write("src/provider." .. host .. ".titan",
+          "function chosen(): integer\n  return 42\nend\n")
+        local host_report?, host_error? = service:refresh()
+        test.assert(host_report ~= nil and host_error == nil and
+          host_report.analyzed and
+          #host_report.committed_modules == 2 and
+          #host_report.failed_modules == 0,
+          "creating host variant did not override .native.titan and repair consumer")
+        local after_host = service:latest()
+        test.assert(#after_host.discovery_issues == 3,
+          "inactive variants did not all receive discovery issues")
+
+        -- Editing an inactive variant does not trigger compiler analysis.
+        local runs_before = service:counters().analysis_runs
+        fixture:write("src/provider.browser.titan",
+          "still inactive and broken @@@\n")
+        local inactive_report?, inactive_error? = service:refresh()
+        test.assert(inactive_report ~= nil and inactive_error == nil and
+          not inactive_report.analyzed and
+          service:counters().analysis_runs == runs_before,
+          "editing an inactive variant triggered compiler analysis")
+
+        -- Deleting the host variant falls back to .native.titan and re-analyzes.
+        fs.unlink(fixture:path("src/provider." .. host .. ".titan"))
+        local fallback_native?, fallback_native_error? = service:refresh()
+        test.assert(fallback_native ~= nil and fallback_native_error == nil and
+          fallback_native.analyzed and
+          #fallback_native.failed_modules == 1 and
+          fallback_native.failed_modules[1] == "consumer",
+          "deleting host variant did not fall back to provider.native.titan")
+      end
+
+      -- Deleting provider.native.titan falls back to provider.titan and repairs consumer.
+      fs.unlink(fixture:path("src/provider.native.titan"))
+      local restored?, restored_error? = service:refresh()
+      test.assert(restored ~= nil and restored_error == nil and
+        restored.analyzed and
+        #restored.committed_modules == 2 and
+        #restored.failed_modules == 0 and
+        #service:latest().discovery_issues == 1,
+        "deleting provider.native.titan did not restore provider.titan")
+    end)
+  end)
+end

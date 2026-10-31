@@ -33,7 +33,7 @@ async function compilerSDK(context) {
   for (const directory of directories) await mkdir(path.join(result.sdk, directory), { recursive: true });
   for (const member of ["argparse.lua", "inspect.lua", "relabel.lua", "c-parser/cdriver.lua", "titan-compiler/checker.lua",
     "titan-compiler/checker/completion.lua", "titan-compiler/completion.lua", "titan-compiler/maybe3.lua", "titan-compiler/documentation.lua",
-    "titan-compiler/parser.lua", "titan-compiler/path.lua", "titan-compiler/types.lua",
+    "titan-compiler/parser.lua", "titan-compiler/path.lua", "titan-compiler/source_selection.lua", "titan-compiler/types.lua",
     "titan-compiler/build.lua", "titan-compiler/build_worker.lua", "titan-compiler/process.lua"]) {
     await result.put(`sdk/share/lua/5.5/${member}`);
   }

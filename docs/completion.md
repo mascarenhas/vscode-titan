@@ -125,12 +125,14 @@ remove bounded retained artifacts. Process exit discards all TEMP rows.
 
 `document_buffers` assigns a fresh session to each open document and accepts
 increasing versions. The coordinator captures immutable inputs before it
-creates a request Task. Every open contributor to the active folder module
-takes part. Other modules' editor text is ignored, so imports see one
+creates a request Task. Every open selected contributor to the active folder
+module takes part. Open inactive target variants add nothing and receive no
+semantic completion. Other modules' editor text is ignored, so imports see one
 committed saved baseline. A new file-backed path works when the configured
-roots and the captured catalog prove an unambiguous module identity
-(`completion_discovery`). Untitled, unmapped, ambiguous, excluded and uncovered
-paths are deferred. Known saved ownership stays authoritative.
+roots and the captured catalog prove an unambiguous host-selected module
+identity (`completion_discovery`). Untitled, unmapped, inactive, ambiguous,
+excluded and uncovered paths are deferred. Known saved ownership stays
+authoritative.
 
 The watcher publishes the `main.completion_*` configuration, exact provenance,
 source and header inventories, scalar members and body-free compiler

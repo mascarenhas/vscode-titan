@@ -887,6 +887,75 @@ function test_completion_service_hover_declines_unwatched_unsaved_headers(_conte
   end)
 end
 
+function test_completion_service_ignores_open_inactive_variants_and_completes_selected_variants(
+    _context: test.Context)
+  runtime.run(function ()
+    local host = bridge.host_target()
+    local store = sql.open(":memory:")
+    defer store:close()
+    local main_path = ROOT .. "/pkg/pkg." .. host .. ".titan"
+    local active_ops = ROOT .. "/pkg/ops.native.titan"
+    local inactive_main = ROOT .. "/pkg/pkg.titan"
+    local inactive_browser = ROOT .. "/pkg/ops.browser.titan"
+    local inactive_default = ROOT .. "/pkg/ops.titan"
+    local oversize_inactive = ROOT .. "/pkg/oversize.browser.titan"
+    seed(store, {
+      bridge.ProjectModule.new("pkg", {
+        bridge.SourceFile.new(main_path, "function run(): integer\n return activeOp\nend\n"),
+        bridge.SourceFile.new(active_ops, "function activeOperation(): integer return 1 end\n"),
+      }),
+    })
+    local documents = buffers.create()
+    local completion = service.create(store, documents)
+    defer completion:close()
+    local main_text = "function run(): integer\n return activeOp\nend\n"
+    local active_ops_text = "function activeOperation(): integer return 1 end\n" ..
+      "function activeUnsaved(): integer return 2 end\n"
+    local inactive_browser_text = "foreign import \"missing_inactive_header.h\"\n" ..
+      "function activeFromBrowser(): integer return 3 end\n" ..
+      "function broken(\n"
+    local inactive_default_text = "function activeFromDefault(): integer return 4 end\n"
+    local inactive_main_text = "function activeFromDefaultMain(): integer return 5 end\n"
+    open(documents, main_path, 1, main_text)
+    open(documents, active_ops, 1, active_ops_text)
+    open(documents, inactive_browser, 1, inactive_browser_text)
+    open(documents, inactive_default, 1, inactive_default_text)
+    open(documents, inactive_main, 1, inactive_main_text)
+    -- Make an inactive variant exceed the document byte limit (unavailable_paths).
+    open(documents, oversize_inactive, 1, strings.rep("x", 4 * 1024 * 1024 + 16))
+
+    local work = completion:capture(request(main_path, main_text, "return active"))
+    work()
+    await_preparation(completion)
+    local names = labels(work())
+    test.assert(contains(names, "activeOperation") and contains(names, "activeUnsaved"),
+      "selected variant unsaved text was not included in completion analysis")
+    test.assert(not contains(names, "activeFromBrowser") and
+      not contains(names, "activeFromDefault") and
+      not contains(names, "activeFromDefaultMain"),
+      "open inactive variant contributed declarations to completion")
+
+    local browser_work = completion:capture(
+      request(inactive_browser, inactive_browser_text, "return 3"))
+    browser_work()
+    await_preparation(completion)
+    local browser_names, browser_incomplete = labels(browser_work())
+    test.assert(#browser_names == 0 and browser_incomplete,
+      "open inactive browser variant received semantic completion")
+    test.assert(completion:hover(documents:capture(
+      inactive_browser, source_text.Position.new(1, 10))) == nil,
+      "open inactive browser variant received semantic hover")
+
+    local default_work = completion:capture(
+      request(inactive_default, inactive_default_text, "return 4"))
+    default_work()
+    await_preparation(completion)
+    local default_names, default_incomplete = labels(default_work())
+    test.assert(#default_names == 0 and default_incomplete,
+      "open shadowed default variant received semantic completion")
+  end)
+end
+
 do
   if ffi.VSCODE_TITAN_WINDOWS ~= 0 then
     ROOT = "C:/completion-fixture"

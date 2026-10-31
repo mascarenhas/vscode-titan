@@ -4,6 +4,7 @@
 local async = import "async"
 local timer = import "timer"
 local strings = import "string"
+local file_paths = import "path"
 local bridge = import "server.compiler_bridge"
 local buffers = import "server.document_buffers"
 local discovery = import "server.completion_discovery"
@@ -231,12 +232,23 @@ local function module_for(path: string, baseline: storage.Baseline,
   return name
 end
 
+local function contributor_key(filename: string): string
+  local basename = file_paths.basename(filename)
+  local classification = bridge.classify_source_filename(basename)
+  if classification.logical_basename ~= nil then
+    return classification.logical_basename as string
+  end
+  return basename
+end
+
 local function sort_files(files: {bridge.SourceFile}, main_file: string)
   for index = 2, #files do
     local item = files[index]
+    local item_key = contributor_key(item.filename)
     local previous = index - 1
     while previous >= 1 and files[previous].filename ~= main_file and
-        (item.filename == main_file or item.filename < files[previous].filename) do
+        (item.filename == main_file or
+         item_key < contributor_key(files[previous].filename)) do
       files[previous + 1] = files[previous]
       previous = previous - 1
     end
@@ -288,7 +300,7 @@ local function active_module(request: Request): (bridge.ProjectModule?, {facts.I
     end
     for index = 1, #files do
       local file = files[index].filename
-      if strings.sub(file, -(#leaf + 6)) == "/" .. leaf .. ".titan" then main_file = file end
+      if contributor_key(file) == leaf .. ".titan" then main_file = file end
     end
     if main_file == "" then main_file = request.capture.document.path end
   end

@@ -43,6 +43,7 @@ export const requiredShareFiles = [
   "titan-compiler/documentation.lua",
   "titan-compiler/parser.lua",
   "titan-compiler/path.lua",
+  "titan-compiler/source_selection.lua",
   "titan-compiler/types.lua",
   "titan-compiler/version.lua"
 ];

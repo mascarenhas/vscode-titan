@@ -6,6 +6,8 @@ local discovery = import "server.project_discovery.titan"
 local source_text = import "server.source_text"
 local test_runtime = import "server.test_runtime"
 local test_links = import "server.test_links"
+local bridge = import "server.compiler_bridge"
+local lua = import "lua"
 
 local record Fixture
   root: string
@@ -762,4 +764,348 @@ function test_project_discovery_native_windows_roots(_context: test.Context)
                   "physical file spelling did not retain the saved owner")
     end)
   end)
+end
+
+local function with_target_override(target: string, body: function (): ())
+  local driver = lua.require("titan-compiler.driver") as {string: value}
+  local original: value = driver["context_target"]
+  driver["context_target"] = function (_context: value): value
+    return target
+  end
+  defer driver["context_target"] = original
+  body()
+end
+
+local function find_issue(issues: {discovery.Issue},
+                          path: string): discovery.Issue?
+  for index = 1, #issues do
+    if issues[index].path == path then return issues[index] end
+  end
+  return nil
+end
+
+local function assert_inactive_issue(issues: {discovery.Issue}, path: string,
+                                     target: string, logical: string,
+                                     selected: string?)
+  local issue? = find_issue(issues, path)
+  test.assert(issue ~= nil, "missing inactive variant issue for " .. path)
+  case issue.kind
+  when inactive_variant() then
+  else
+    test.assert(false,
+      "inactive variant received wrong issue kind: " .. issue.message)
+  end
+  local expected = "not analyzed: inactive for host target '" .. target ..
+    "'; '" .. logical .. "' has no active variant"
+  if selected ~= nil then
+    expected = "not analyzed: inactive for host target '" .. target ..
+      "'; '" .. logical .. "' selects '" .. (selected as string) .. "'"
+  end
+  test.assert(issue.message == expected,
+    "unexpected inactive variant diagnostic '" .. issue.message ..
+    "' (expected '" .. expected .. "')")
+end
+
+local function selects_host_variants_and_composes_folders()
+  with_fixture(function (fixture: Fixture)
+    local host = bridge.host_target()
+    local labels = bridge.source_labels()
+    test.assert(#labels == 5, "compiler did not expose all five source labels")
+    for index = 1, #labels do
+      fixture:write("host_label." .. labels[index] .. ".titan")
+    end
+    fixture:write("host_label.titan")
+    fixture:write("linux.titan")
+    fixture:write("browser_only.browser.titan")
+    fixture:mkdir("titan")
+    fixture:mkdir("titan/example")
+    fixture:write("titan/example/example.titan")
+    fixture:write("titan/example/operations-common.titan")
+    fixture:write("titan/example/operations.native.titan")
+    fixture:write("titan/example/operations.browser.titan")
+    fixture:write("titan/example/native-helpers.native.titan")
+    fixture:write("titan/example/browser-helpers.browser.titan")
+    fixture:write("titan/example/a-common.titan")
+    fixture:write("titan/example/a.native.titan")
+    fixture:write("titan/example/a.u.titan")
+    fixture:write("titan/example/a_extra.titan")
+
+    local found = require_discovery(fixture.root)
+    local expected_host_file = "host_label." .. host .. ".titan"
+    local host_module? = found:find_module("host_label")
+    test.assert(host_module ~= nil and not host_module:is_folder() and
+                #host_module.files == 1 and
+                host_module.main_file == fixture:path(expected_host_file),
+                "flat family did not select the host target variant")
+    test.assert(found:owner_for_file(fixture:path(expected_host_file)) ==
+                  "host_label" and
+                found:owner_for_file(fixture:path("host_label.titan")) == nil and
+                found:owner_for_file(fixture:path("host_label.browser.titan")) ==
+                  nil,
+                "inactive flat variants entered owner_by_file")
+    for index = 1, #labels do
+      local candidate = "host_label." .. labels[index] .. ".titan"
+      if candidate ~= expected_host_file then
+        assert_inactive_issue(
+          found.issues, fixture:path(candidate), host,
+          "host_label.titan", expected_host_file)
+      end
+    end
+    assert_inactive_issue(
+      found.issues, fixture:path("host_label.titan"), host,
+      "host_label.titan", expected_host_file)
+    assert_inactive_issue(
+      found.issues, fixture:path("browser_only.browser.titan"), host,
+      "browser_only.titan", nil)
+    test.assert(found:find_module("browser_only") == nil,
+                "target-only module with no applicable variant was discovered")
+    test.assert(found:find_module("linux") ~= nil and
+                found:owner_for_file(fixture:path("linux.titan")) == "linux",
+                "bare label stem linux.titan was misclassified as a variant")
+
+    local example? = found:find_module("titan.example")
+    test.assert(example ~= nil and example:is_folder(),
+                "folder module with variant contributors was not discovered")
+    test.assert(#example.files == 8 and
+                example.files[1] ==
+                  fixture:path("titan/example/example.titan") and
+                example.files[2] ==
+                  fixture:path("titan/example/a-common.titan") and
+                example.files[3] ==
+                  fixture:path("titan/example/a.native.titan") and
+                example.files[4] ==
+                  fixture:path("titan/example/a.u.titan") and
+                example.files[5] ==
+                  fixture:path("titan/example/a_extra.titan") and
+                example.files[6] ==
+                  fixture:path("titan/example/native-helpers.native.titan") and
+                example.files[7] ==
+                  fixture:path("titan/example/operations-common.titan") and
+                example.files[8] ==
+                  fixture:path("titan/example/operations.native.titan"),
+                "folder contributors did not follow logical bytewise sort order")
+    assert_inactive_issue(
+      found.issues, fixture:path("titan/example/operations.browser.titan"),
+      host, "operations.titan", "operations.native.titan")
+    assert_inactive_issue(
+      found.issues, fixture:path("titan/example/browser-helpers.browser.titan"),
+      host, "browser-helpers.titan", nil)
+
+    if host ~= "native" then
+      fixture:write("titan/example/example." .. host .. ".titan")
+      fixture:write("titan/example/operations." .. host .. ".titan")
+      local overridden = require_discovery(fixture.root)
+      local updated? = overridden:find_module("titan.example")
+      test.assert(updated ~= nil and #updated.files == 8 and
+                  updated.main_file ==
+                    fixture:path("titan/example/example." .. host .. ".titan") and
+                  updated.files[1] == updated.main_file and
+                  updated.files[8] ==
+                    fixture:path("titan/example/operations." .. host .. ".titan"),
+                  "OS-specific folder main and contributor did not override native/default")
+      assert_inactive_issue(
+        overridden.issues, fixture:path("titan/example/example.titan"),
+        host, "example.titan", "example." .. host .. ".titan")
+      assert_inactive_issue(
+        overridden.issues,
+        fixture:path("titan/example/operations.native.titan"),
+        host, "operations.titan", "operations." .. host .. ".titan")
+    end
+
+    with_target_override("native", function ()
+      local unlisted = require_discovery(fixture.root)
+      local unlisted_host? = unlisted:find_module("host_label")
+      test.assert(unlisted_host ~= nil and
+                  unlisted_host.main_file ==
+                    fixture:path("host_label.native.titan"),
+                  "label-less native host did not select .native.titan over default")
+      assert_inactive_issue(
+        unlisted.issues, fixture:path("host_label." .. host .. ".titan"),
+        "native", "host_label.titan", "host_label.native.titan")
+    end)
+
+    with_target_override("browser", function ()
+      local browser = require_discovery(fixture.root)
+      local browser_example? = browser:find_module("titan.example")
+      test.assert(browser_example ~= nil and #browser_example.files == 7 and
+                  browser_example.files[1] ==
+                    fixture:path("titan/example/example.titan") and
+                  browser_example.files[5] ==
+                    fixture:path("titan/example/browser-helpers.browser.titan") and
+                  browser_example.files[7] ==
+                    fixture:path("titan/example/operations.browser.titan"),
+                  "browser target did not select browser contributors and omit native-only ones")
+      test.assert(browser:find_module("browser_only") ~= nil,
+                  "browser target did not select browser-only flat module")
+    end)
+
+    if host ~= "native" then
+      fixture:remove(expected_host_file)
+      local after_host_removed = require_discovery(fixture.root)
+      local native_selected? = after_host_removed:find_module("host_label")
+      test.assert(native_selected ~= nil and
+                  native_selected.main_file ==
+                    fixture:path("host_label.native.titan"),
+                  "removing OS variant did not fall back to host_label.native.titan")
+      assert_inactive_issue(
+        after_host_removed.issues, fixture:path("host_label.titan"),
+        host, "host_label.titan", "host_label.native.titan")
+    end
+    fixture:remove("host_label.native.titan")
+    local after_native_removed = require_discovery(fixture.root)
+    local default_selected? = after_native_removed:find_module("host_label")
+    test.assert(default_selected ~= nil and
+                default_selected.main_file ==
+                  fixture:path("host_label.titan"),
+                "removing .native.titan did not fall back to host_label.titan")
+    test.assert(find_issue(
+      after_native_removed.issues, fixture:path("host_label.titan")) == nil,
+      "selected default file retained an inactive-variant issue")
+  end)
+end
+
+function test_project_discovery_selects_host_variants_and_composes_folders(
+    _context: test.Context)
+  test_runtime.run(selects_host_variants_and_composes_folders)
+end
+
+local function enforces_variant_precedence_privacy_and_reserved_labels()
+  with_fixture(function (fixture: Fixture)
+    local host = bridge.host_target()
+    fixture:mkdir("first")
+    fixture:mkdir("first/bar")
+    fixture:mkdir("first/baz")
+    fixture:mkdir("first/uv_only")
+    fixture:mkdir("first/uv_only/nested")
+    fixture:mkdir("first/bad_folder")
+    fixture:mkdir("second")
+    fixture:mkdir("second/uv_only")
+
+    -- Earlier root's foo.titan beats later root's foo.<host>.titan.
+    fixture:write("first/foo.titan")
+    fixture:write("second/foo." .. host .. ".titan")
+    fixture:write("second/foo.browser.titan")
+
+    -- Earlier root's inactive variant does not shadow later root's active file.
+    fixture:write("first/later_wins.browser.titan")
+    fixture:write("second/later_wins.titan")
+
+    -- Selected folder main bar/bar.titan beats sibling bar.<host>.titan.
+    fixture:write("first/bar/bar.titan")
+    fixture:write("first/bar." .. host .. ".titan")
+
+    -- baz/baz.browser.titan is absent on native hosts, so sibling baz.titan wins.
+    fixture:write("first/baz/baz.browser.titan")
+    fixture:write("first/baz.titan")
+
+    -- Contributor privacy under a folder with no active main on native hosts.
+    fixture:write("first/uv_only/uv_only.browser.titan")
+    fixture:write("first/uv_only/tcp.titan")
+    fixture:write("first/uv_only/nested/nested." .. host .. ".titan")
+    fixture:write("second/uv_only/tcp.titan")
+
+    -- Stacked and mis-cased labels are diagnosed at root and inside folders.
+    fixture:write("first/stacked.linux.native.titan")
+    fixture:write("first/miscased.Linux.titan")
+    fixture:write("first/bad_folder/bad_folder.titan")
+    fixture:write("first/bad_folder/part.Linux.titan")
+
+    local found?, failure? = discovery.discover(
+      {fixture:path("first"), fixture:path("second")}, {},
+      {fixture:path("first"), fixture:path("second")})
+    test.assert(failure == nil and found ~= nil,
+                "precedence and privacy fixture failed discovery")
+
+    local foo? = found:find_module("foo")
+    test.assert(foo ~= nil and foo.main_file == fixture:path("first/foo.titan"),
+                "later root variant overrode earlier root default")
+    local shadowed_foo? = find_issue(
+      found.issues, fixture:path("second/foo." .. host .. ".titan"))
+    test.assert(shadowed_foo ~= nil and
+                strings.find(shadowed_foo.message, "shadowed") ~= nil,
+                "shadowed later-root variant main was not reported")
+    assert_inactive_issue(
+      found.issues, fixture:path("second/foo.browser.titan"),
+      host, "foo.titan", "foo." .. host .. ".titan")
+
+    local later_wins? = found:find_module("later_wins")
+    test.assert(later_wins ~= nil and
+                later_wins.main_file == fixture:path("second/later_wins.titan"),
+                "inactive earlier-root variant shadowed later-root module")
+
+    local bar? = found:find_module("bar")
+    test.assert(bar ~= nil and bar:is_folder() and
+                bar.main_file == fixture:path("first/bar/bar.titan"),
+                "sibling flat variant overrode folder main")
+    assert_inactive_issue(
+      found.issues, fixture:path("first/bar." .. host .. ".titan"),
+      host, "bar.titan", "bar.titan")
+
+    local baz? = found:find_module("baz")
+    test.assert(baz ~= nil and not baz:is_folder() and
+                baz.main_file == fixture:path("first/baz.titan"),
+                "inactive folder main blocked sibling flat fallback")
+    assert_inactive_issue(
+      found.issues, fixture:path("first/baz/baz.browser.titan"),
+      host, "baz.titan", nil)
+
+    test.assert(found:find_module("uv_only") == nil and
+                found:find_module("uv_only.tcp") == nil,
+                "contributor under inactive folder main became an importable flat module")
+    assert_inactive_issue(
+      found.issues, fixture:path("first/uv_only/uv_only.browser.titan"),
+      host, "uv_only.titan", nil)
+    assert_inactive_issue(
+      found.issues, fixture:path("first/uv_only/tcp.titan"),
+      host, "uv_only.titan", nil)
+    local blocked_tcp? = find_issue(
+      found.issues, fixture:path("second/uv_only/tcp.titan"))
+    test.assert(blocked_tcp ~= nil and
+                strings.find(blocked_tcp.message, "blocked by folder source") ~= nil,
+                "later-root flat constituent was not blocked by earlier inactive folder main")
+    local nested? = found:find_module("uv_only.nested")
+    test.assert(nested ~= nil and nested:is_folder() and
+                nested.main_file ==
+                  fixture:path("first/uv_only/nested/nested." .. host .. ".titan"),
+                "genuinely nested folder module under inactive parent was lost")
+
+    local stacked? = find_issue(
+      found.issues, fixture:path("first/stacked.linux.native.titan"))
+    local miscased? = find_issue(
+      found.issues, fixture:path("first/miscased.Linux.titan"))
+    local folder_miscased? = find_issue(
+      found.issues, fixture:path("first/bad_folder/part.Linux.titan"))
+    test.assert(stacked ~= nil and
+                strings.find(stacked.message, "stacked target labels") ~= nil and
+                miscased ~= nil and
+                strings.find(miscased.message, "mis-cased target label") ~= nil and
+                folder_miscased ~= nil and
+                strings.find(folder_miscased.message, "mis-cased target label") ~= nil,
+                "stacked or mis-cased target labels were not diagnosed")
+
+    with_target_override("browser", function ()
+      local browser?, browser_error? = discovery.discover(
+        {fixture:path("first")}, {}, {fixture:path("first")})
+      test.assert(browser_error == nil and browser ~= nil,
+                  "browser target discovery failed")
+      local browser_baz? = browser:find_module("baz")
+      test.assert(browser_baz ~= nil and browser_baz:is_folder() and
+                  browser_baz.main_file ==
+                    fixture:path("first/baz/baz.browser.titan"),
+                  "baz did not switch to a folder module on browser")
+      local browser_uv? = browser:find_module("uv_only")
+      test.assert(browser_uv ~= nil and browser_uv:is_folder() and
+                  #browser_uv.files == 2 and
+                  browser_uv.files[1] ==
+                    fixture:path("first/uv_only/uv_only.browser.titan") and
+                  browser_uv.files[2] ==
+                    fixture:path("first/uv_only/tcp.titan"),
+                  "uv_only folder did not activate with its contributor on browser")
+    end)
+  end)
+end
+
+function test_project_discovery_enforces_variant_precedence_privacy_and_reserved_labels(
+    _context: test.Context)
+  test_runtime.run(enforces_variant_precedence_privacy_and_reserved_labels)
 end
