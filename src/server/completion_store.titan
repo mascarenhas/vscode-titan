@@ -98,10 +98,19 @@ end
 
 local function saved_roots(connection: sqlite3.Connection, kind: integer): {string}
   local rows = sql.rows(connection,
-    "SELECT path FROM main.completion_roots WHERE kind=? ORDER BY position", kind)
+    "SELECT path FROM main.completion_roots WHERE kind=? AND position>0 ORDER BY position", kind)
   local result: {string} = {}
   for index = 1, #rows do result[index] = sql.bytes(rows[index], 1) end
   return result
+end
+
+local function ownership_inventory_ready(connection: sqlite3.Connection): boolean
+  if sql.scalar_integer(connection,
+      "SELECT count(*) FROM main.sqlite_master WHERE type='table' AND name='completion_roots'") ~= 1 then
+    return false
+  end
+  return sql.scalar_integer(connection,
+    "SELECT count(*) FROM main.completion_roots WHERE kind=4 AND position=0") == 1
 end
 
 -- External graph revisions are always zero. Their reusable descriptor identity
@@ -153,7 +162,8 @@ function Store:capture_baseline(): Baseline?
       "SELECT count(*) FROM main.sqlite_master WHERE type='table' AND name IN " ..
       "('completion_configuration','completion_roots','completion_descriptors'," ..
       "'completion_source_files','completion_imports','completion_header_inputs'," ..
-      "'completion_members','semantic_files')") ~= 8 then return nil end
+      "'completion_members','semantic_files')") ~= 8 or
+     not ownership_inventory_ready(connection) then return nil end
   local settings = sql.rows(connection,
     "SELECT source_roots_present,binary_root,include_roots_present,cppflags " ..
     "FROM main.completion_configuration WHERE singleton=1")
@@ -222,6 +232,7 @@ end
 function Store:saved_generation(): integer
   local access = self.store:acquire()
   defer access:release()
+  if not ownership_inventory_ready(access.connection) then return 0 end
   return sql.scalar_integer(access.connection,
     "SELECT published_generation FROM main.store_state WHERE singleton=1")
 end
@@ -539,6 +550,7 @@ function publish_saved(connection: sqlite3.Connection,
   if exclude ~= nil then
     for index = 1, #exclude do insert:execute(3, index, blob(exclude[index])) end
   end
+  insert:execute(4, 0, blob(""))
   if inactive_files ~= nil then
     for index = 1, #inactive_files do
       insert:execute(4, index, blob(inactive_files[index]))

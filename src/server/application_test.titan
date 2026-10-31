@@ -3127,6 +3127,9 @@ local function variant_lifecycle_diagnostics_and_completion_isolation()
     "function nestedHelper(): integer return 7 end\n")
   defer do
     remove_application_cache(workspace_cache.directory(root))
+    if fs.lstat(src .. "/yielding_diagnostic.titan") ~= nil then
+      fs.unlink(src .. "/yielding_diagnostic.titan")
+    end
     if fs.lstat(nested_part) ~= nil then fs.unlink(nested_part) end
     if fs.lstat(nested_main) ~= nil then fs.unlink(nested_main) end
     if fs.lstat(inactive_folder_new_part) ~= nil then fs.unlink(inactive_folder_new_part) end
@@ -3328,6 +3331,95 @@ local function variant_lifecycle_diagnostics_and_completion_isolation()
       "definition did not return to foo.titan after deleting host variant")
   else
     test.assert(false, "definition request failed after deleting host variant")
+  end
+
+  -- Simulate a pre-feature persisted catalog by deleting kind-4 rows from
+  -- completion_roots while preserving schema, generation, and compiler/native
+  -- cache compatibility. Add a 1 MiB diagnostic-bearing module so initial
+  -- diagnostic coordinate construction yields during publish_view.
+  local yielding_diagnostic_file = src .. "/yielding_diagnostic.titan"
+  local yielding_diagnostic_uri? = source_text.path_to_file_uri(yielding_diagnostic_file)
+  fs.write_file(yielding_diagnostic_file,
+    "-- " .. strings.rep("x", 1024 * 1024) .. "\n" ..
+    "local broken: integer = \"not integer\"\n")
+  app:watch_callback(project_watcher.RediscoveryBatch.new({
+    project_watcher.PathChange.created(yielding_diagnostic_file),
+  }, {}, false))
+  wait_until(function (): boolean
+    return not app:indexing_metrics().refresh_chain_active and
+      published[yielding_diagnostic_uri as string] ~= nil
+  end, "yielding diagnostic fixture did not index")
+  local generation_before_legacy =
+    (app.completed_view as application.View).published_generation
+  app:close()
+  local db_path = workspace_cache.directory(root) .. "/index.sqlite3"
+  do
+    local raw_store = stores.open(db_path)
+    defer raw_store:close()
+    local access = raw_store:acquire()
+    defer access:release()
+    stores.execute(access.connection,
+      "DELETE FROM main.completion_roots WHERE kind=4")
+    test.assert(stores.scalar_integer(access.connection,
+      "SELECT count(*) FROM main.completion_roots WHERE kind=4") == 0,
+      "fixture did not remove kind-4 rows")
+  end
+
+  local restarted = application.create(root)
+  defer restarted:close()
+  restarted:on_document(lsp.DocumentNotification.opened(
+    lsp.OpenDocument.new(
+      lsp.TextDocument.new(inactive_folder_part_uri as string, inactive_folder_part),
+      1, private_part_text)))
+  restarted:start_indexing()
+  wait_until(function (): boolean
+    return restarted.service ~= nil
+  end, "restarted application did not load its service before publication")
+  -- Issue completion before initial publication commits its repaired catalog.
+  local during_startup = restarted:capture_completion(
+    dispatcher.CompletionRequest.new(
+      dispatcher.RequestId.integer_id(20),
+      lsp.CompletionParams.new(
+        lsp.DocumentPosition.new(
+          inactive_folder_part_uri as string, inactive_folder_part,
+          source_text.Position.new(2, 18)),
+        1, nil)))
+  case during_startup()
+  when result(value) then
+    local object? = wire.as_object(value)
+    local items? = wire.as_array(object["items"])
+    test.assert(#items == 0 and restarted.completion.baseline == nil and
+      restarted.completion.hover_context == nil,
+      "legacy catalog without kind-4 sentinel was consumed during startup publication")
+  else
+    test.assert(false, "startup completion against legacy catalog failed")
+  end
+
+  wait_until(function (): boolean
+    return restarted.completed_view ~= nil and
+      not restarted:indexing_metrics().refresh_chain_active
+  end, "restarted application did not finish repairing legacy catalog")
+  local repaired_generation =
+    (restarted.completed_view as application.View).published_generation
+  test.assert(repaired_generation > generation_before_legacy,
+    "repairing a legacy completion catalog did not advance published_generation")
+
+  local after_repair = restarted:capture_completion(
+    dispatcher.CompletionRequest.new(
+      dispatcher.RequestId.integer_id(21),
+      lsp.CompletionParams.new(
+        lsp.DocumentPosition.new(
+          inactive_folder_part_uri as string, inactive_folder_part,
+          source_text.Position.new(2, 18)),
+        1, nil)))
+  case after_repair()
+  when result(value) then
+    local object? = wire.as_object(value)
+    local items? = wire.as_array(object["items"])
+    test.assert(#items == 0 and restarted.completion.hover_context == nil,
+      "inactive contributor acquired completion after legacy catalog repair")
+  else
+    test.assert(false, "post-repair completion request failed")
   end
 end
 

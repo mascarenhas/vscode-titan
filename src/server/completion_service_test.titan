@@ -986,6 +986,39 @@ function test_completion_service_ignores_open_inactive_variants_and_completes_se
     test.assert(#new_part_names == 0 and new_part_incomplete and
       completion.hover_context == nil,
       "new unsaved contributor under unopened inactive-only main entered private analysis")
+
+    -- A pre-feature catalog without the kind-4 ownership sentinel row is
+    -- rejected as not ready, whereas a catalog with the sentinel row and
+    -- zero inactive files remains usable.
+    do
+      local access = store:acquire()
+      defer access:release()
+      sql.execute(access.connection, "DELETE FROM main.completion_roots WHERE kind=4")
+    end
+    completion.baseline = nil
+    completion.ready = nil
+    completion.previous_ready = nil
+    local legacy_part_work = completion:capture(
+      request(inactive_folder_saved_part, part_text, "return privateSen"))
+    local legacy_names, legacy_incomplete = labels(legacy_part_work())
+    test.assert(#legacy_names == 0 and legacy_incomplete and
+      completion.baseline == nil and completion.hover_context == nil,
+      "legacy catalog without kind-4 sentinel was admitted by completion")
+    do
+      local access = store:acquire()
+      defer access:release()
+      storage.publish_saved(access.connection, {
+        storage.SavedDescriptor.new("pkg", 1, 2, "project", main_path,
+          "root-not-decoded", "", nil, {main_path, active_ops}, {}, {}, {}),
+      }, {"pkg"}, bridge.CompilerConfiguration.new({ROOT}, nil, nil, nil),
+        {ROOT}, {}, {})
+    end
+    local empty_inventory_work = completion:capture(
+      request(main_path, main_text, "return active"))
+    empty_inventory_work()
+    await_preparation(completion)
+    test.assert(contains(labels(empty_inventory_work()), "activeOperation"),
+      "legitimate empty inactive-file inventory with sentinel was rejected")
   end)
 end
 

@@ -4,6 +4,7 @@ import { once } from "node:events";
 import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 const server = process.argv[2];
@@ -1215,7 +1216,12 @@ async function testTargetVariantSelectionAndPrivacy() {
   const partText =
     "local privateSentinel = 42\nfunction read(): integer\n return privateSen\nend\n";
   await writeFile(inactiveFolderPart, partText, "utf8");
-
+  const slowDiagnosticFile = path.join(sourceRoot, "slow_diagnostic.titan");
+  await writeFile(
+    slowDiagnosticFile,
+    `-- ${"x".repeat(1024 * 1024)}\nlocal wrong: integer = "not integer"\n`,
+    "utf8"
+  );
   const child = launch(root);
   const exit = exitOf(child);
   const stderr = collect(child.stderr);
@@ -1229,7 +1235,7 @@ async function testTargetVariantSelectionAndPrivacy() {
       params: {}
     }));
     await waitForIndexing(responses);
-    while (responses.diagnosticPublications.length < 3) {
+    while (responses.diagnosticPublications.length < 4) {
       await nextDiagnosticPublication(responses);
     }
     const byUri = new Map(
@@ -1342,6 +1348,84 @@ async function testTargetVariantSelectionAndPrivacy() {
     assert.deepEqual(await awaitExit(exit), { code: 0, signal: null });
     await responses.finish();
     assert.equal(stderr().length, 0, stderr().toString("utf8"));
+
+    // Legacy-catalog upgrade probe: remove kind-4 rows from completion_roots
+    // while preserving schema and compatibility, then restart and query
+    // completion both during initial indexing and after ready.
+    const database = new DatabaseSync(path.join(root, ".titan-ls", "index.sqlite3"));
+    try {
+      database.exec("DELETE FROM completion_roots WHERE kind=4");
+      const remaining = database.prepare(
+        "SELECT count(*) AS count FROM completion_roots WHERE kind=4"
+      ).get().count;
+      assert.equal(remaining, 0);
+    } finally {
+      database.close();
+    }
+
+    const restarted = launch(root);
+    const restartedExit = exitOf(restarted);
+    const restartedStderr = collect(restarted.stderr);
+    const restartedResponses = new FrameReader(restarted.stdout);
+    try {
+      const reinit = await request(restarted, restartedResponses, 100, "initialize", {});
+      assert.equal(reinit.error, undefined);
+      restarted.stdin.write(frame({
+        jsonrpc: "2.0",
+        method: "initialized",
+        params: {}
+      }));
+      restarted.stdin.write(frame({
+        jsonrpc: "2.0",
+        method: "textDocument/didOpen",
+        params: {
+          textDocument: {
+            uri: inactiveFolderPartUri,
+            languageId: "titan",
+            version: 1,
+            text: partText
+          }
+        }
+      }));
+      const duringIndexing = await request(
+        restarted,
+        restartedResponses,
+        "vss1-legacy-during-indexing",
+        "textDocument/completion",
+        {
+          textDocument: { uri: inactiveFolderPartUri },
+          position: { line: 2, character: 18 }
+        }
+      );
+      assert.equal(duringIndexing.error, undefined);
+      assert.deepEqual(duringIndexing.result.items, []);
+
+      await waitForIndexing(restartedResponses);
+      const afterReady = await request(
+        restarted,
+        restartedResponses,
+        "vss1-legacy-after-ready",
+        "textDocument/completion",
+        {
+          textDocument: { uri: inactiveFolderPartUri },
+          position: { line: 2, character: 18 }
+        }
+      );
+      assert.equal(afterReady.error, undefined);
+      assert.deepEqual(afterReady.result.items, []);
+
+      const secondShutdown = await request(
+        restarted, restartedResponses, "shutdown-restarted", "shutdown", null
+      );
+      assert.equal(secondShutdown.result, null);
+      restarted.stdin.write(frame({ jsonrpc: "2.0", method: "exit" }));
+      assert.deepEqual(await awaitExit(restartedExit), { code: 0, signal: null });
+      await restartedResponses.finish();
+      assert.equal(restartedStderr().length, 0, restartedStderr().toString("utf8"));
+    } finally {
+      if (restarted.exitCode === null && restarted.signalCode === null) restarted.kill();
+      await awaitExit(restartedExit);
+    }
   } catch (cause) {
     const diagnostic = stderr().toString("utf8").trim();
     throw new Error(
