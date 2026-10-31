@@ -1083,6 +1083,48 @@ local function enforces_variant_precedence_privacy_and_reserved_labels()
                 strings.find(folder_miscased.message, "mis-cased target label") ~= nil,
                 "stacked or mis-cased target labels were not diagnosed")
 
+
+    -- Differential check against the installed compiler's driver.resolve_source
+    -- on the exact same two-root fixture layout.
+    local check_compiler_parity = lua.load([==[
+return function(paths, modname)
+  local driver = require("titan-compiler.driver")
+  local context = driver.new_resolver_context()
+  local source, err = driver.resolve_source(context, modname, paths)
+  driver.close_resolver_context(context)
+  if err then return "error", "", {} end
+  if not source then return "absent", "", {} end
+  return source.kind, source.main or "", source.files or {}
+end
+]==], "=project_discovery_compiler_parity", nil)() as
+      function (string, string): (string, string, {integer: value})
+    local search_paths = fixture:path("first") .. ";" .. fixture:path("second")
+    local check_names = {
+      "foo", "later_wins", "bar", "baz", "uv_only", "uv_only.tcp",
+      "uv_only.nested", "bad_folder",
+    }
+    for name_index = 1, #check_names do
+      local check_name = check_names[name_index]
+      local compiler_kind, compiler_main, compiler_files =
+        check_compiler_parity(search_paths, check_name)
+      local discovered? = found:find_module(check_name)
+      if compiler_kind == "flat" or compiler_kind == "folder" then
+        test.assert(discovered ~= nil and
+          discovered:is_folder() == (compiler_kind == "folder") and
+          discovered.main_file == compiler_main and
+          #discovered.files == #compiler_files,
+          "server discovery diverged from driver.resolve_source for " .. check_name)
+        for file_index = 1, #discovered.files do
+          test.assert(discovered.files[file_index] ==
+            (compiler_files[file_index] as string),
+            "server discovery file order diverged from compiler for " .. check_name)
+        end
+      else
+        test.assert(discovered == nil,
+          "server discovery accepted module rejected/absent in compiler: " ..
+          check_name .. " (" .. compiler_kind .. ")")
+      end
+    end
     with_target_override("browser", function ()
       local browser?, browser_error? = discovery.discover(
         {fixture:path("first")}, {}, {fixture:path("first")})

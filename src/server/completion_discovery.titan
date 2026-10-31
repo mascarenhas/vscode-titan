@@ -63,8 +63,20 @@ local function open_exists(path: string, include: {string}, exclude: {string},
   return false
 end
 
+local function inactive_exists(path: string,
+                               inactive_paths: {string}?): boolean
+  if inactive_paths == nil then return false end
+  local paths: {string} = inactive_paths
+  for index = 1, #paths do
+    if paths[index] == path then return true end
+  end
+  return false
+end
+
 local function saved_family_member(directory: string, logical_basename: string,
-                                   sources: {bridge.ProjectModule}): string?
+                                   labels: {string},
+                                   sources: {bridge.ProjectModule},
+                                   inactive_paths: {string}?): string?
   for index = 1, #sources do
     local module = sources[index]
     for file_index = 1, #module.files do
@@ -78,16 +90,78 @@ local function saved_family_member(directory: string, logical_basename: string,
       end
     end
   end
+  if inactive_paths ~= nil then
+    local stem = strings.sub(logical_basename, 1, #logical_basename - 6)
+    for index = 1, #labels do
+      local candidate = discovery.join(
+        directory, stem .. "." .. labels[index] .. ".titan")
+      if inactive_exists(candidate, inactive_paths) then
+        return candidate
+      end
+    end
+    local default_path = discovery.join(directory, logical_basename)
+    if inactive_exists(default_path, inactive_paths) then
+      return default_path
+    end
+  end
   return nil
+end
+
+local function has_any_family_member(directory: string,
+                                     logical_basename: string,
+                                     sources: {bridge.ProjectModule},
+                                     inactive_paths: {string}?,
+                                     include: {string}, exclude: {string},
+                                     open_paths: const {string}): boolean
+  for index = 1, #sources do
+    local module = sources[index]
+    for file_index = 1, #module.files do
+      local filename = module.files[file_index].filename
+      if discovery.parent_directory(filename) == directory then
+        local classification = bridge.classify_source_filename(
+          discovery.leaf_name(filename))
+        if classification.logical_basename == logical_basename then
+          return true
+        end
+      end
+    end
+  end
+  if inactive_paths ~= nil then
+    local paths: {string} = inactive_paths
+    for index = 1, #paths do
+      local filename = paths[index]
+      if discovery.parent_directory(filename) == directory then
+        local classification = bridge.classify_source_filename(
+          discovery.leaf_name(filename))
+        if classification.logical_basename == logical_basename then
+          return true
+        end
+      end
+    end
+  end
+  for index = 1, #open_paths do
+    local filename = open_paths[index]
+    if admitted(filename, include, exclude) and
+       discovery.parent_directory(filename) == directory then
+      local classification = bridge.classify_source_filename(
+        discovery.leaf_name(filename))
+      if classification.logical_basename == logical_basename then
+        return true
+      end
+    end
+  end
+  return false
 end
 
 local function select_virtual_family(directory: string,
                                      logical_basename: string,
                                      labels: {string},
                                      sources: {bridge.ProjectModule},
+                                     inactive_paths: {string}?,
                                      include: {string}, exclude: {string},
                                      open_paths: const {string}): string?
-  local saved? = saved_family_member(directory, logical_basename, sources)
+  local saved? = saved_family_member(
+    directory, logical_basename, labels, sources, inactive_paths)
   if saved ~= nil then return saved end
   local stem = strings.sub(logical_basename, 1, #logical_basename - 6)
   for index = 1, #labels do
@@ -127,9 +201,11 @@ end
 
 function find(path: string, sources: {bridge.ProjectModule},
                source_roots: {string}, include: {string}, exclude: {string},
-               open_paths: const {string}): string?
+               open_paths: const {string},
+               inactive_paths: {string}?): string?
   local normalized? = source_text.normalize_absolute_path(path)
   if normalized == nil then return nil end
+  if inactive_exists(normalized, inactive_paths) then return nil end
   local known? = saved_owner(normalized, sources)
   if known ~= nil then return known end
   if not admitted(normalized, include, exclude) then return nil end
@@ -146,7 +222,6 @@ function find(path: string, sources: {bridge.ProjectModule},
   end
   local logical_basename = classification.logical_basename as string
   local selection_labels = bridge.target_selection_labels(target)
-  local all_labels = bridge.source_labels()
   local root_index? = selected_root(normalized, source_roots)
   if root_index == nil then return nil end
   local root = source_roots[root_index]
@@ -165,7 +240,7 @@ function find(path: string, sources: {bridge.ProjectModule},
   if relative_directory ~= "" then
     local folder_main? = select_virtual_family(
       directory, discovery.leaf_name(directory) .. ".titan",
-      selection_labels, sources, include, exclude, open_paths)
+      selection_labels, sources, nil, include, exclude, open_paths)
     if folder_main ~= nil then
       candidate_relative = relative_directory
     end
@@ -181,13 +256,13 @@ function find(path: string, sources: {bridge.ProjectModule},
     local folder = discovery.join(candidate_root, candidate_path)
     local folder_main? = select_virtual_family(
       folder, basename .. ".titan", selection_labels,
-      sources, include, exclude, open_paths)
+      sources, nil, include, exclude, open_paths)
     if folder_main ~= nil then
       if folder ~= directory or
          folder_conflicts(folder, candidate, sources) then return nil end
       local selected_member? = select_virtual_family(
         folder, logical_basename, selection_labels,
-        sources, include, exclude, open_paths)
+        sources, nil, include, exclude, open_paths)
       if selected_member ~= normalized then return nil end
       -- A saved module with the same identity but a different provider cannot
       -- be replaced by an unsaved new main. Wait for watcher publication.
@@ -203,18 +278,21 @@ function find(path: string, sources: {bridge.ProjectModule},
       discovery.join(candidate_root, candidate_path .. ".titan"))
     local flat? = select_virtual_family(
       flat_directory, basename .. ".titan", selection_labels,
-      sources, include, exclude, open_paths)
+      sources, inactive_paths, include, exclude, open_paths)
     if flat ~= nil then
       local owner? = discovery.module_owner(candidate)
       if owner ~= nil then
         local owner_folder = discovery.join(
           candidate_root, discovery.module_path(owner))
-        local owner_main? = select_virtual_family(
-          owner_folder, discovery.terminal_component(owner) .. ".titan",
-          all_labels, sources, include, exclude, open_paths)
-        if owner_main ~= nil then return nil end
+        if has_any_family_member(
+            owner_folder, discovery.terminal_component(owner) .. ".titan",
+            sources, inactive_paths, include, exclude, open_paths) then
+          return nil
+        end
       end
-      if flat ~= normalized then return nil end
+      if flat ~= normalized or inactive_exists(flat, inactive_paths) then
+        return nil
+      end
       for module_index = 1, #sources do
         local module = sources[module_index]
         if module.module_name == candidate and #module.files > 0 and

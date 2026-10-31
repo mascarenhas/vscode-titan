@@ -3093,10 +3093,19 @@ local function variant_lifecycle_diagnostics_and_completion_isolation()
   fs.mkdir(root)
   local src = root .. "/src"
   fs.mkdir(src)
+  local inactive_folder = src .. "/inactive_folder"
+  local nested_folder = inactive_folder .. "/nested"
+  fs.mkdir(inactive_folder)
+  fs.mkdir(nested_folder)
   local default_file = src .. "/foo.titan"
   local host_file = src .. "/foo." .. host .. ".titan"
   local browser_file = src .. "/foo.browser.titan"
   local consumer_file = src .. "/consumer.titan"
+  local inactive_folder_main = inactive_folder .. "/inactive_folder.browser.titan"
+  local inactive_folder_part = inactive_folder .. "/part.titan"
+  local inactive_folder_new_part = inactive_folder .. "/new_part.titan"
+  local nested_main = nested_folder .. "/nested.titan"
+  local nested_part = nested_folder .. "/part.titan"
   fs.write_file(default_file,
     "function selectedValue(): integer\n  return 1\nend\n")
   fs.write_file(browser_file,
@@ -3106,8 +3115,25 @@ local function variant_lifecycle_diagnostics_and_completion_isolation()
   fs.write_file(consumer_file,
     "local foo = import \"foo\"\n" ..
     "function read(): integer\n  return foo.selectedValue()\nend\n")
+  fs.write_file(inactive_folder_main,
+    "function browserFolderMain(): integer return 0 end\n")
+  local private_part_text =
+    "local privateSentinel = 42\nfunction read(): integer\n return privateSen\nend\n"
+  fs.write_file(inactive_folder_part, private_part_text)
+  local nested_main_text =
+    "function run(): integer\n return nestedHel\nend\n"
+  fs.write_file(nested_main, nested_main_text)
+  fs.write_file(nested_part,
+    "function nestedHelper(): integer return 7 end\n")
   defer do
     remove_application_cache(workspace_cache.directory(root))
+    if fs.lstat(nested_part) ~= nil then fs.unlink(nested_part) end
+    if fs.lstat(nested_main) ~= nil then fs.unlink(nested_main) end
+    if fs.lstat(inactive_folder_new_part) ~= nil then fs.unlink(inactive_folder_new_part) end
+    if fs.lstat(inactive_folder_part) ~= nil then fs.unlink(inactive_folder_part) end
+    if fs.lstat(inactive_folder_main) ~= nil then fs.unlink(inactive_folder_main) end
+    if fs.lstat(nested_folder) ~= nil then fs.rmdir(nested_folder) end
+    if fs.lstat(inactive_folder) ~= nil then fs.rmdir(inactive_folder) end
     if fs.lstat(consumer_file) ~= nil then fs.unlink(consumer_file) end
     if fs.lstat(browser_file) ~= nil then fs.unlink(browser_file) end
     if fs.lstat(host_file) ~= nil then fs.unlink(host_file) end
@@ -3120,6 +3146,10 @@ local function variant_lifecycle_diagnostics_and_completion_isolation()
   local host_uri? = source_text.path_to_file_uri(host_file)
   local browser_uri? = source_text.path_to_file_uri(browser_file)
   local consumer_uri? = source_text.path_to_file_uri(consumer_file)
+  local inactive_folder_main_uri? = source_text.path_to_file_uri(inactive_folder_main)
+  local inactive_folder_part_uri? = source_text.path_to_file_uri(inactive_folder_part)
+  local inactive_folder_new_part_uri? = source_text.path_to_file_uri(inactive_folder_new_part)
+  local nested_main_uri? = source_text.path_to_file_uri(nested_main)
   local published: {string: diagnostics.Publication} = {}
   local app = application.create(root)
   defer app:close()
@@ -3162,6 +3192,86 @@ local function variant_lifecycle_diagnostics_and_completion_isolation()
     test.assert(#items == 0, "open inactive variant received completion items")
   else
     test.assert(false, "inactive variant completion request failed")
+  end
+
+  test.assert(published[inactive_folder_main_uri as string] ~= nil and
+    published[inactive_folder_part_uri as string] ~= nil and
+    strings.find(published[inactive_folder_part_uri as string].items[1].message,
+      "'inactive_folder.titan' has no active variant") ~= nil,
+    "inactive folder main and contributor did not publish inactive diagnostics")
+
+  -- VSS-1: opening only a contributor under an unopened inactive-only folder main
+  -- must produce no completion and must not enter private compiler analysis.
+  app:on_document(lsp.DocumentNotification.opened(
+    lsp.OpenDocument.new(
+      lsp.TextDocument.new(inactive_folder_part_uri as string, inactive_folder_part),
+      1, private_part_text)))
+  local blocked_part_completion = app:capture_completion(
+    dispatcher.CompletionRequest.new(
+      dispatcher.RequestId.integer_id(10),
+      lsp.CompletionParams.new(
+        lsp.DocumentPosition.new(
+          inactive_folder_part_uri as string, inactive_folder_part,
+          source_text.Position.new(2, 18)),
+        1, nil)))
+  case blocked_part_completion()
+  when result(value) then
+    local object? = wire.as_object(value)
+    local items? = wire.as_array(object["items"])
+    test.assert(#items == 0 and app.completion.hover_context == nil,
+      "contributor of unopened inactive-only folder main entered completion analysis")
+  else
+    test.assert(false, "blocked contributor completion request failed")
+  end
+
+  app:on_document(lsp.DocumentNotification.opened(
+    lsp.OpenDocument.new(
+      lsp.TextDocument.new(inactive_folder_new_part_uri as string, inactive_folder_new_part),
+      1, private_part_text)))
+  local blocked_new_part_completion = app:capture_completion(
+    dispatcher.CompletionRequest.new(
+      dispatcher.RequestId.integer_id(11),
+      lsp.CompletionParams.new(
+        lsp.DocumentPosition.new(
+          inactive_folder_new_part_uri as string, inactive_folder_new_part,
+          source_text.Position.new(2, 18)),
+        1, nil)))
+  case blocked_new_part_completion()
+  when result(value) then
+    local object? = wire.as_object(value)
+    local items? = wire.as_array(object["items"])
+    test.assert(#items == 0 and app.completion.hover_context == nil,
+      "new unsaved contributor under unopened inactive-only folder main entered completion analysis")
+  else
+    test.assert(false, "blocked new contributor completion request failed")
+  end
+
+  -- A genuinely nested folder module under that inactive folder still completes.
+  app:on_document(lsp.DocumentNotification.opened(
+    lsp.OpenDocument.new(
+      lsp.TextDocument.new(nested_main_uri as string, nested_main),
+      1, nested_main_text)))
+  local nested_completion = app:capture_completion(
+    dispatcher.CompletionRequest.new(
+      dispatcher.RequestId.integer_id(12),
+      lsp.CompletionParams.new(
+        lsp.DocumentPosition.new(
+          nested_main_uri as string, nested_main,
+          source_text.Position.new(1, 17)),
+        1, nil)))
+  case nested_completion()
+  when result(value) then
+    local object? = wire.as_object(value)
+    local items? = wire.as_array(object["items"])
+    local found_nested = false
+    for index = 1, #items do
+      local item? = wire.as_object(items[index])
+      if wire.as_string(item["label"]) == "nestedHelper" then found_nested = true end
+    end
+    test.assert(found_nested,
+      "genuinely nested folder module under inactive parent lost completion")
+  else
+    test.assert(false, "nested folder completion request failed")
   end
 
   -- Creating foo.<host>.titan re-selects foo, updates definition, and marks foo.titan inactive.

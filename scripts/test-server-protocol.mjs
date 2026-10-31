@@ -202,6 +202,8 @@ function validateDiagnosticPublication(params) {
     assert.ok(diagnostic !== null && typeof diagnostic === "object");
     if (diagnostic.code === "unmapped-source") {
       assert.equal(diagnostic.severity, 2);
+    } else if (diagnostic.code === "inactive-variant") {
+      assert.equal(diagnostic.severity, 3);
     } else {
       assert.ok(["syntax", "type", "compiler"].includes(diagnostic.code));
       assert.equal(diagnostic.severity, 1);
@@ -1166,6 +1168,193 @@ async function testUnmappedSourceWarnings() {
   }
 }
 
+async function testTargetVariantSelectionAndPrivacy() {
+  const host = process.platform === "win32"
+    ? "windows"
+    : process.platform === "darwin"
+      ? "darwin"
+      : process.platform === "linux"
+        ? "linux"
+        : "native";
+  const root = await makePhysicalTemporaryRoot("vscode-titan-variants-");
+  const sourceRoot = path.join(root, "src");
+  const inactiveFolder = path.join(sourceRoot, "inactive_only");
+  const defaultFile = path.join(sourceRoot, "service.titan");
+  const hostFile = path.join(sourceRoot, `service.${host}.titan`);
+  const browserFile = path.join(sourceRoot, "service.browser.titan");
+  const consumerFile = path.join(sourceRoot, "consumer.titan");
+  const inactiveFolderMain = path.join(inactiveFolder, "inactive_only.browser.titan");
+  const inactiveFolderPart = path.join(inactiveFolder, "part.titan");
+  const defaultUri = pathToFileURL(defaultFile).href;
+  const hostUri = pathToFileURL(hostFile).href;
+  const browserUri = pathToFileURL(browserFile).href;
+  const consumerUri = pathToFileURL(consumerFile).href;
+  const inactiveFolderMainUri = pathToFileURL(inactiveFolderMain).href;
+  const inactiveFolderPartUri = pathToFileURL(inactiveFolderPart).href;
+  await mkdir(inactiveFolder, { recursive: true });
+  await writeFile(
+    defaultFile,
+    "function chosen(): integer\n  return 1\nend\n",
+    "utf8"
+  );
+  await writeFile(
+    browserFile,
+    'foreign import "nonexistent_browser_header.h"\nsyntax error @@@\n',
+    "utf8"
+  );
+  await writeFile(
+    consumerFile,
+    'local service = import "service"\nfunction read(): integer\n  return service.chosen()\nend\n',
+    "utf8"
+  );
+  await writeFile(
+    inactiveFolderMain,
+    "function browserMain(): integer return 0 end\n",
+    "utf8"
+  );
+  const partText =
+    "local privateSentinel = 42\nfunction read(): integer\n return privateSen\nend\n";
+  await writeFile(inactiveFolderPart, partText, "utf8");
+
+  const child = launch(root);
+  const exit = exitOf(child);
+  const stderr = collect(child.stderr);
+  const responses = new FrameReader(child.stdout);
+  try {
+    const initialized = await request(child, responses, 1, "initialize", {});
+    assert.equal(initialized.error, undefined);
+    child.stdin.write(frame({
+      jsonrpc: "2.0",
+      method: "initialized",
+      params: {}
+    }));
+    await waitForIndexing(responses);
+    while (responses.diagnosticPublications.length < 3) {
+      await nextDiagnosticPublication(responses);
+    }
+    const byUri = new Map(
+      responses.diagnosticPublications.map((item) => [item.uri, item.diagnostics])
+    );
+    assert.equal(byUri.get(browserUri)?.length, 1);
+    assert.equal(byUri.get(browserUri)[0].severity, 3);
+    assert.equal(byUri.get(browserUri)[0].code, "inactive-variant");
+    assert.match(
+      byUri.get(browserUri)[0].message,
+      new RegExp(`inactive for host target '${host}'; 'service\\.titan' selects 'service\\.titan'`)
+    );
+    assert.equal(byUri.get(inactiveFolderMainUri)?.length, 1);
+    assert.equal(byUri.get(inactiveFolderPartUri)?.length, 1);
+    assert.match(
+      byUri.get(inactiveFolderPartUri)[0].message,
+      /'inactive_only\.titan' has no active variant/
+    );
+
+    // VSS-1 over framed stdio: opening only part.titan under an unopened
+    // inactive-only folder main must return no completion candidates.
+    child.stdin.write(frame({
+      jsonrpc: "2.0",
+      method: "textDocument/didOpen",
+      params: {
+        textDocument: {
+          uri: inactiveFolderPartUri,
+          languageId: "titan",
+          version: 1,
+          text: partText
+        }
+      }
+    }));
+    const blockedCompletion = await request(
+      child,
+      responses,
+      "vss1-completion",
+      "textDocument/completion",
+      {
+        textDocument: { uri: inactiveFolderPartUri },
+        position: { line: 2, character: 18 }
+      }
+    );
+    assert.equal(blockedCompletion.error, undefined);
+    assert.deepEqual(blockedCompletion.result.items, []);
+
+    // Real OS watcher: creating service.<host>.titan re-selects service and
+    // marks service.titan inactive; deleting it falls back to service.titan.
+    if (host !== "native") {
+      const beforeCreateCount = responses.diagnosticPublications.length;
+      await writeSavedGeneration(
+        responses,
+        hostFile,
+        "-- host variant\nfunction chosen(): integer\n  return 2\nend\n"
+      );
+      while (responses.diagnosticPublications.length <= beforeCreateCount) {
+        await nextDiagnosticPublication(responses);
+      }
+      const afterCreate = new Map(
+        responses.diagnosticPublications.map((item) => [item.uri, item.diagnostics])
+      );
+      assert.equal(afterCreate.get(defaultUri)?.length, 1);
+      assert.equal(afterCreate.get(defaultUri)[0].code, "inactive-variant");
+      assert.match(
+        afterCreate.get(defaultUri)[0].message,
+        new RegExp(`'service\\.titan' selects 'service\\.${host}\\.titan'`)
+      );
+      const hostDefinition = await semanticRequest(
+        child,
+        responses,
+        "variant-host-definition",
+        "textDocument/definition",
+        {
+          textDocument: { uri: consumerUri },
+          position: { line: 2, character: 18 }
+        }
+      );
+      assert.equal(hostDefinition.error, undefined);
+      assert.equal(hostDefinition.result.uri, hostUri);
+
+      const beforeDeleteCount = responses.diagnosticPublications.length;
+      await rm(hostFile);
+      await waitForIndexing(responses);
+      while (responses.diagnosticPublications.length <= beforeDeleteCount) {
+        await nextDiagnosticPublication(responses);
+      }
+      const afterDelete = new Map(
+        responses.diagnosticPublications.map((item) => [item.uri, item.diagnostics])
+      );
+      assert.deepEqual(afterDelete.get(defaultUri), []);
+      const restoredDefinition = await semanticRequest(
+        child,
+        responses,
+        "variant-restored-definition",
+        "textDocument/definition",
+        {
+          textDocument: { uri: consumerUri },
+          position: { line: 2, character: 18 }
+        }
+      );
+      assert.equal(restoredDefinition.error, undefined);
+      assert.equal(restoredDefinition.result.uri, defaultUri);
+    }
+
+    const shutdown = await request(
+      child, responses, "shutdown", "shutdown", null
+    );
+    assert.equal(shutdown.result, null);
+    child.stdin.write(frame({ jsonrpc: "2.0", method: "exit" }));
+    assert.deepEqual(await awaitExit(exit), { code: 0, signal: null });
+    await responses.finish();
+    assert.equal(stderr().length, 0, stderr().toString("utf8"));
+  } catch (cause) {
+    const diagnostic = stderr().toString("utf8").trim();
+    throw new Error(
+      `${cause.message}${diagnostic.length > 0 ? `; stderr: ${diagnostic}` : ""}`,
+      { cause }
+    );
+  } finally {
+    if (child.exitCode === null && child.signalCode === null) child.kill();
+    await awaitExit(exit);
+    await rm(root, { recursive: true, force: true });
+  }
+}
+
 async function testSelfContainedCompilerModules({ sdkHeaders = false } = {}) {
   const root = await makePhysicalTemporaryRoot(
     "vscode-titan-self-contained-"
@@ -2072,6 +2261,7 @@ if (isMain) {
     await testSavedProjectSemantics();
     await testUnionPayloadSemantics();
     await testUnmappedSourceWarnings();
+    await testTargetVariantSelectionAndPrivacy();
     await testConfigCannotWriteProtocolStdout();
     await testSourceImportCppflagsAndUnchangedRequests();
     await testCrossModuleFolderAndIncrementalSemantics();

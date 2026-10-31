@@ -26,7 +26,8 @@ local ROOT = "/completion-fixture"
 local PATH = "/completion-fixture/app.titan"
 local URI = "file:///completion-fixture/app.titan"
 
-local function seed(store: sql.Store, projects: {bridge.ProjectModule})
+local function seed(store: sql.Store, projects: {bridge.ProjectModule},
+                    inactive_files: {string}?)
   local access = store:acquire()
   defer access:release()
   semantic.initialize_schema(access.connection)
@@ -54,7 +55,7 @@ local function seed(store: sql.Store, projects: {bridge.ProjectModule})
   end
   storage.publish_saved(access.connection, descriptors, names,
     bridge.CompilerConfiguration.new({ROOT}, nil, nil, nil),
-    {ROOT}, {})
+    {ROOT}, {}, inactive_files)
   sql.execute(access.connection, "UPDATE main.store_state SET published_generation=7 WHERE singleton=1")
 end
 
@@ -899,11 +900,17 @@ function test_completion_service_ignores_open_inactive_variants_and_completes_se
     local inactive_browser = ROOT .. "/pkg/ops.browser.titan"
     local inactive_default = ROOT .. "/pkg/ops.titan"
     local oversize_inactive = ROOT .. "/pkg/oversize.browser.titan"
+    local inactive_folder_main = ROOT .. "/inactive_folder/inactive_folder.browser.titan"
+    local inactive_folder_saved_part = ROOT .. "/inactive_folder/part.titan"
+    local inactive_folder_new_part = ROOT .. "/inactive_folder/new_part.titan"
     seed(store, {
       bridge.ProjectModule.new("pkg", {
         bridge.SourceFile.new(main_path, "function run(): integer\n return activeOp\nend\n"),
         bridge.SourceFile.new(active_ops, "function activeOperation(): integer return 1 end\n"),
       }),
+    }, {
+      inactive_main, inactive_browser, inactive_default,
+      inactive_folder_main, inactive_folder_saved_part,
     })
     local documents = buffers.create()
     local completion = service.create(store, documents)
@@ -953,6 +960,32 @@ function test_completion_service_ignores_open_inactive_variants_and_completes_se
     local default_names, default_incomplete = labels(default_work())
     test.assert(#default_names == 0 and default_incomplete,
       "open shadowed default variant received semantic completion")
+
+    -- VSS-1: an unopened inactive-only folder main blocks both a saved
+    -- contributor and a newly opened unsaved contributor from completion/hover.
+    local part_text = "local privateSentinel = 42\nfunction read(): integer\n return privateSen\nend\n"
+    open(documents, inactive_folder_saved_part, 1, part_text)
+    open(documents, inactive_folder_new_part, 1, part_text)
+    completion.hover_context = nil
+    local saved_part_work = completion:capture(
+      request(inactive_folder_saved_part, part_text, "return privateSen"))
+    saved_part_work()
+    await_preparation(completion)
+    local saved_part_names, saved_part_incomplete = labels(saved_part_work())
+    test.assert(#saved_part_names == 0 and saved_part_incomplete and
+      completion.hover_context == nil and
+      completion:hover(documents:capture(
+        inactive_folder_saved_part, source_text.Position.new(0, 8))) == nil,
+      "saved contributor under unopened inactive-only main entered private analysis")
+
+    local new_part_work = completion:capture(
+      request(inactive_folder_new_part, part_text, "return privateSen"))
+    new_part_work()
+    await_preparation(completion)
+    local new_part_names, new_part_incomplete = labels(new_part_work())
+    test.assert(#new_part_names == 0 and new_part_incomplete and
+      completion.hover_context == nil,
+      "new unsaved contributor under unopened inactive-only main entered private analysis")
   end)
 end
 
