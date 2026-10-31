@@ -26,7 +26,8 @@ local ROOT = "/completion-fixture"
 local PATH = "/completion-fixture/app.titan"
 local URI = "file:///completion-fixture/app.titan"
 
-local function seed(store: sql.Store, projects: {bridge.ProjectModule})
+local function seed(store: sql.Store, projects: {bridge.ProjectModule},
+                    inactive_files: {string}?)
   local access = store:acquire()
   defer access:release()
   semantic.initialize_schema(access.connection)
@@ -54,7 +55,7 @@ local function seed(store: sql.Store, projects: {bridge.ProjectModule})
   end
   storage.publish_saved(access.connection, descriptors, names,
     bridge.CompilerConfiguration.new({ROOT}, nil, nil, nil),
-    {ROOT}, {})
+    {ROOT}, {}, inactive_files)
   sql.execute(access.connection, "UPDATE main.store_state SET published_generation=7 WHERE singleton=1")
 end
 
@@ -884,6 +885,140 @@ function test_completion_service_hover_declines_unwatched_unsaved_headers(_conte
     test.assert(completion.hover_context == nil and
       completion:hover(documents:capture(PATH, source_text.Position.new(1, 8))) == nil,
       "hover retained C knowledge without watcher-owned header freshness")
+  end)
+end
+
+function test_completion_service_ignores_open_inactive_variants_and_completes_selected_variants(
+    _context: test.Context)
+  runtime.run(function ()
+    local host = bridge.host_target()
+    local store = sql.open(":memory:")
+    defer store:close()
+    local main_path = ROOT .. "/pkg/pkg." .. host .. ".titan"
+    local active_ops = ROOT .. "/pkg/ops.native.titan"
+    local inactive_main = ROOT .. "/pkg/pkg.titan"
+    local inactive_browser = ROOT .. "/pkg/ops.browser.titan"
+    local inactive_default = ROOT .. "/pkg/ops.titan"
+    local oversize_inactive = ROOT .. "/pkg/oversize.browser.titan"
+    local inactive_folder_main = ROOT .. "/inactive_folder/inactive_folder.browser.titan"
+    local inactive_folder_saved_part = ROOT .. "/inactive_folder/part.titan"
+    local inactive_folder_new_part = ROOT .. "/inactive_folder/new_part.titan"
+    seed(store, {
+      bridge.ProjectModule.new("pkg", {
+        bridge.SourceFile.new(main_path, "function run(): integer\n return activeOp\nend\n"),
+        bridge.SourceFile.new(active_ops, "function activeOperation(): integer return 1 end\n"),
+      }),
+    }, {
+      inactive_main, inactive_browser, inactive_default,
+      inactive_folder_main, inactive_folder_saved_part,
+    })
+    local documents = buffers.create()
+    local completion = service.create(store, documents)
+    defer completion:close()
+    local main_text = "function run(): integer\n return activeOp\nend\n"
+    local active_ops_text = "function activeOperation(): integer return 1 end\n" ..
+      "function activeUnsaved(): integer return 2 end\n"
+    local inactive_browser_text = "foreign import \"missing_inactive_header.h\"\n" ..
+      "function activeFromBrowser(): integer return 3 end\n" ..
+      "function broken(\n"
+    local inactive_default_text = "function activeFromDefault(): integer return 4 end\n"
+    local inactive_main_text = "function activeFromDefaultMain(): integer return 5 end\n"
+    open(documents, main_path, 1, main_text)
+    open(documents, active_ops, 1, active_ops_text)
+    open(documents, inactive_browser, 1, inactive_browser_text)
+    open(documents, inactive_default, 1, inactive_default_text)
+    open(documents, inactive_main, 1, inactive_main_text)
+    -- Make an inactive variant exceed the document byte limit (unavailable_paths).
+    open(documents, oversize_inactive, 1, strings.rep("x", 4 * 1024 * 1024 + 16))
+
+    local work = completion:capture(request(main_path, main_text, "return active"))
+    work()
+    await_preparation(completion)
+    local names = labels(work())
+    test.assert(contains(names, "activeOperation") and contains(names, "activeUnsaved"),
+      "selected variant unsaved text was not included in completion analysis")
+    test.assert(not contains(names, "activeFromBrowser") and
+      not contains(names, "activeFromDefault") and
+      not contains(names, "activeFromDefaultMain"),
+      "open inactive variant contributed declarations to completion")
+
+    local browser_work = completion:capture(
+      request(inactive_browser, inactive_browser_text, "return 3"))
+    browser_work()
+    await_preparation(completion)
+    local browser_names, browser_incomplete = labels(browser_work())
+    test.assert(#browser_names == 0 and browser_incomplete,
+      "open inactive browser variant received semantic completion")
+    test.assert(completion:hover(documents:capture(
+      inactive_browser, source_text.Position.new(1, 10))) == nil,
+      "open inactive browser variant received semantic hover")
+
+    local default_work = completion:capture(
+      request(inactive_default, inactive_default_text, "return 4"))
+    default_work()
+    await_preparation(completion)
+    local default_names, default_incomplete = labels(default_work())
+    test.assert(#default_names == 0 and default_incomplete,
+      "open shadowed default variant received semantic completion")
+
+    -- VSS-1: an unopened inactive-only folder main blocks both a saved
+    -- contributor and a newly opened unsaved contributor from completion/hover.
+    local part_text = "local privateSentinel = 42\nfunction read(): integer\n return privateSen\nend\n"
+    open(documents, inactive_folder_saved_part, 1, part_text)
+    open(documents, inactive_folder_new_part, 1, part_text)
+    completion.hover_context = nil
+    local saved_part_work = completion:capture(
+      request(inactive_folder_saved_part, part_text, "return privateSen"))
+    saved_part_work()
+    await_preparation(completion)
+    local saved_part_names, saved_part_incomplete = labels(saved_part_work())
+    test.assert(#saved_part_names == 0 and saved_part_incomplete and
+      completion.hover_context == nil and
+      completion:hover(documents:capture(
+        inactive_folder_saved_part, source_text.Position.new(0, 8))) == nil,
+      "saved contributor under unopened inactive-only main entered private analysis")
+
+    local new_part_work = completion:capture(
+      request(inactive_folder_new_part, part_text, "return privateSen"))
+    new_part_work()
+    await_preparation(completion)
+    local new_part_names, new_part_incomplete = labels(new_part_work())
+    test.assert(#new_part_names == 0 and new_part_incomplete and
+      completion.hover_context == nil,
+      "new unsaved contributor under unopened inactive-only main entered private analysis")
+
+    -- A pre-feature catalog without the kind-4 ownership sentinel row is
+    -- rejected as not ready, whereas a catalog with the sentinel row and
+    -- zero inactive files remains usable.
+    do
+      local access = store:acquire()
+      defer access:release()
+      sql.execute(access.connection, "DELETE FROM main.completion_roots WHERE kind=4")
+    end
+    completion.baseline = nil
+    completion.ready = nil
+    completion.previous_ready = nil
+    local legacy_part_work = completion:capture(
+      request(inactive_folder_saved_part, part_text, "return privateSen"))
+    local legacy_names, legacy_incomplete = labels(legacy_part_work())
+    test.assert(#legacy_names == 0 and legacy_incomplete and
+      completion.baseline == nil and completion.hover_context == nil,
+      "legacy catalog without kind-4 sentinel was admitted by completion")
+    do
+      local access = store:acquire()
+      defer access:release()
+      storage.publish_saved(access.connection, {
+        storage.SavedDescriptor.new("pkg", 1, 2, "project", main_path,
+          "root-not-decoded", "", nil, {main_path, active_ops}, {}, {}, {}),
+      }, {"pkg"}, bridge.CompilerConfiguration.new({ROOT}, nil, nil, nil),
+        {ROOT}, {}, {})
+    end
+    local empty_inventory_work = completion:capture(
+      request(main_path, main_text, "return active"))
+    empty_inventory_work()
+    await_preparation(completion)
+    test.assert(contains(labels(empty_inventory_work()), "activeOperation"),
+      "legitimate empty inactive-file inventory with sentinel was rejected")
   end)
 end
 

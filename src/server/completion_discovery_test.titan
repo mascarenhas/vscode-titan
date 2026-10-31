@@ -111,3 +111,125 @@ function test_completion_discovery_rejects_unmapped_or_excluded_paths(context: t
   rejects(context, "reserved_terminal", test_paths.workspace_root() .. "/src/pkg/titan.titan", roots, roots, {})
   rejects(context, "private_database", test_paths.workspace_root() .. "/src/.titan-ls/new.titan", roots, roots, {})
 end
+
+function test_completion_discovery_selects_active_variants_and_rejects_inactive_variants(
+    _context: test.Context)
+  local host = bridge.host_target()
+  local root = test_paths.workspace_root() .. "/src"
+  local roots = {root}
+  local saved_flat = module("foo", root .. "/foo." .. host .. ".titan")
+  local saved_folder = bridge.ProjectModule.new("pkg", {
+    bridge.SourceFile.new(root .. "/pkg/pkg." .. host .. ".titan", "saved main"),
+    bridge.SourceFile.new(root .. "/pkg/ops.native.titan", "saved ops"),
+  })
+  local sources = {saved_flat, saved_folder}
+  local open_paths: const {string} = {
+    root .. "/foo." .. host .. ".titan",
+    root .. "/foo.native.titan",
+    root .. "/foo.titan",
+    root .. "/foo.browser.titan",
+    root .. "/pkg/pkg." .. host .. ".titan",
+    root .. "/pkg/pkg.native.titan",
+    root .. "/pkg/pkg.titan",
+    root .. "/pkg/pkg.browser.titan",
+    root .. "/pkg/ops." .. host .. ".titan",
+    root .. "/pkg/ops.native.titan",
+    root .. "/pkg/ops.titan",
+    root .. "/pkg/ops.browser.titan",
+    root .. "/pkg/extra." .. host .. ".titan",
+    root .. "/pkg/extra.native.titan",
+    root .. "/pkg/extra.browser.titan",
+    root .. "/fresh." .. host .. ".titan",
+    root .. "/fresh.native.titan",
+    root .. "/fresh.browser.titan",
+    root .. "/stacked.linux.native.titan",
+    root .. "/miscased.Linux.titan",
+  }
+  test.assert(discovery.find(
+    root .. "/foo." .. host .. ".titan", sources, roots, roots, {}, open_paths) == "foo")
+  test.assert(discovery.find(
+    root .. "/foo.native.titan", sources, roots, roots, {}, open_paths) == nil and
+    discovery.find(
+      root .. "/foo.titan", sources, roots, roots, {}, open_paths) == nil and
+    discovery.find(
+      root .. "/foo.browser.titan", sources, roots, roots, {}, open_paths) == nil,
+    "open inactive flat variant was accepted into completion")
+
+  test.assert(discovery.find(
+    root .. "/pkg/pkg." .. host .. ".titan", sources, roots, roots, {}, open_paths) == "pkg" and
+    discovery.find(
+      root .. "/pkg/ops.native.titan", sources, roots, roots, {}, open_paths) == "pkg")
+  test.assert(discovery.find(
+    root .. "/pkg/pkg.native.titan", sources, roots, roots, {}, open_paths) == nil and
+    discovery.find(
+      root .. "/pkg/pkg.titan", sources, roots, roots, {}, open_paths) == nil and
+    discovery.find(
+      root .. "/pkg/pkg.browser.titan", sources, roots, roots, {}, open_paths) == nil and
+    discovery.find(
+      root .. "/pkg/ops." .. host .. ".titan", sources, roots, roots, {}, open_paths) == nil and
+    discovery.find(
+      root .. "/pkg/ops.titan", sources, roots, roots, {}, open_paths) == nil and
+    discovery.find(
+      root .. "/pkg/ops.browser.titan", sources, roots, roots, {}, open_paths) == nil,
+    "open inactive or unindexed folder variant displaced saved selection")
+
+  test.assert(discovery.find(
+    root .. "/pkg/extra." .. host .. ".titan", sources, roots, roots, {}, open_paths) == "pkg" and
+    discovery.find(
+      root .. "/pkg/extra.native.titan", sources, roots, roots, {}, open_paths) == nil and
+    discovery.find(
+      root .. "/pkg/extra.browser.titan", sources, roots, roots, {}, open_paths) == nil,
+    "new unsaved contributor family did not select only the winning host variant")
+
+  test.assert(discovery.find(
+    root .. "/fresh." .. host .. ".titan", sources, roots, roots, {}, open_paths) == "fresh" and
+    discovery.find(
+      root .. "/fresh.native.titan", sources, roots, roots, {}, open_paths) == nil and
+    discovery.find(
+      root .. "/fresh.browser.titan", sources, roots, roots, {}, open_paths) == nil,
+    "new unsaved flat family did not select only the winning host variant")
+
+  test.assert(discovery.find(
+    root .. "/stacked.linux.native.titan", sources, roots, roots, {}, open_paths) == nil and
+    discovery.find(
+      root .. "/miscased.Linux.titan", sources, roots, roots, {}, open_paths) == nil,
+    "reserved stacked or mis-cased variant acquired a completion module")
+
+  -- Inactive folder main privacy (VSS-1): unopened inactive-only main blocks
+  -- both saved contributors and new unsaved contributors, plus later-root
+  -- constituents, while preserving genuinely nested folder modules.
+  local first_root = test_paths.workspace_root() .. "/first"
+  local second_root = test_paths.workspace_root() .. "/second"
+  local multi_roots = {first_root, second_root}
+  local inactive_paths: {string} = {
+    first_root .. "/uv_only/uv_only.browser.titan",
+    first_root .. "/uv_only/part.titan",
+  }
+  local saved_part = first_root .. "/uv_only/part.titan"
+  local unsaved_part = first_root .. "/uv_only/new_part.titan"
+  local later_part = second_root .. "/uv_only/part.titan"
+  local nested_main = first_root .. "/uv_only/nested/nested.titan"
+  local nested_part = first_root .. "/uv_only/nested/part.titan"
+  local privacy_open: const {string} = {
+    saved_part, unsaved_part, later_part, nested_main, nested_part,
+  }
+  test.assert(discovery.find(
+    saved_part, {}, multi_roots, {test_paths.workspace_root()}, {},
+    privacy_open, inactive_paths) == nil,
+    "saved contributor under unopened inactive-only main became a flat module")
+  test.assert(discovery.find(
+    unsaved_part, {}, multi_roots, {test_paths.workspace_root()}, {},
+    privacy_open, inactive_paths) == nil,
+    "new unsaved contributor under unopened inactive-only main became a flat module")
+  test.assert(discovery.find(
+    later_part, {}, multi_roots, {test_paths.workspace_root()}, {},
+    privacy_open, inactive_paths) == nil,
+    "later-root constituent bypassed earlier-root unopened inactive-only main")
+  test.assert(discovery.find(
+    nested_main, {}, multi_roots, {test_paths.workspace_root()}, {},
+    privacy_open, inactive_paths) == "uv_only.nested" and
+    discovery.find(
+      nested_part, {}, multi_roots, {test_paths.workspace_root()}, {},
+      privacy_open, inactive_paths) == "uv_only.nested",
+    "genuinely nested folder module under inactive-only parent was rejected")
+end

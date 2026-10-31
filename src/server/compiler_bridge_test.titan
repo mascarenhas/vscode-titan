@@ -12,6 +12,7 @@ local test_runtime = import "server.test_runtime"
 local content_identity = import "server.content_identity"
 local test_paths = import "server.test_paths"
 local completion_types = import "server.completion_types"
+local system = import "os"
 
 
 local function fixture_headers_root(): string
@@ -95,6 +96,36 @@ return function(mode, contextual_provider_file, workspace_root, headers_root, sd
     INSTALL_PATHS = { titan_bin = sdk_root },
     imported = {},
   }
+  driver.SOURCE_LABELS = { "windows", "darwin", "linux", "browser", "native" }
+  local source_labels = {}
+  for _, label in ipairs(driver.SOURCE_LABELS) do source_labels[label] = true end
+  if mode ~= "same-api-missing-classify-source-filename" then
+    driver.classify_source_filename = function(basename)
+      local stem = basename:match("^(.*)%.titan$")
+      if not stem then return nil end
+      local base, label = stem:match("^(.+)%.([^.]+)$")
+      if not label or not source_labels[label:lower()] then return basename end
+      if label ~= label:lower() then
+        return nil, nil, "mis-cased target label in source '" .. basename .. "'"
+      end
+      local previous_base, previous = base:match("^(.+)%.([^.]+)$")
+      if previous_base and source_labels[previous:lower()] then
+        return nil, nil, "stacked target labels in source '" .. basename .. "'"
+      end
+      return base .. ".titan", label
+    end
+  end
+  driver.target_selection_labels = function(target)
+    if target == "linux" or target == "darwin" or target == "windows" then
+      return { target, "native" }
+    end
+    return { target }
+  end
+  driver.target_label_applies = function(target, label)
+    return label == target or (label == "native" and
+      (target == "linux" or target == "darwin" or target == "windows"))
+  end
+  driver.context_target = function() return "linux" end
   if mode == "missing-abi" then driver.TITAN_ABI_VERSION = nil end
   driver.encode_project_entry = function(entry, options)
     assert(type(options.sha256_binary) == "function")
@@ -798,6 +829,8 @@ function test_compiler_bridge_rejects_missing_incompatible_and_malformed_modules
                       "'split_shell_words' must be a function, found nil")
   expect_bridge_error("same-api-missing-compact-project-entry",
                       "'compact_project_entry' must be a function, found nil")
+  expect_bridge_error("same-api-missing-classify-source-filename",
+                      "'classify_source_filename' must be a function, found nil")
   expect_bridge_error("malformed-parser", "'parse' must be a function")
 end
 
@@ -5677,5 +5710,109 @@ return function() return assert(package.searchpath("luv", package.cpath)) end
     local replacement = compiler:cache_identity(fingerprint)
     test.assert(observed and first ~= replacement,
                 "changed native process transport retained compatible workspace facts")
+  end)
+end
+
+function test_compiler_bridge_raw_source_descriptor_uses_canonical_native_output(
+    _context: test.Context)
+  preload_real_compiler()
+  local host = bridge.host_target()
+  local root = test_paths.workspace_root() .. "/src"
+  local flat_main = root .. "/pkg/service." .. host .. ".titan"
+  local flat_descriptor = bridge.raw_source_descriptor(
+    bridge.ProjectModule.new("pkg.service", {
+      bridge.SourceFile.new(flat_main, "function run(): integer return 1 end\n"),
+    })) as {string: value}
+  test.assert(flat_descriptor["kind"] == "flat" and
+              flat_descriptor["main"] == flat_main and
+              flat_descriptor["native_output"] == root .. "/pkg/service.titan",
+              "flat variant descriptor did not use canonical logical native_output")
+
+  local folder_main = root .. "/pkg/folder/folder." .. host .. ".titan"
+  local folder_contrib = root .. "/pkg/folder/ops.native.titan"
+  local folder_descriptor = bridge.raw_source_descriptor(
+    bridge.ProjectModule.new("pkg.folder", {
+      bridge.SourceFile.new(folder_main, "function run(): integer return 1 end\n"),
+      bridge.SourceFile.new(folder_contrib, "function extra(): integer return 2 end\n"),
+    })) as {string: value}
+  test.assert(folder_descriptor["kind"] == "folder" and
+              folder_descriptor["main"] == folder_main and
+              folder_descriptor["native_output"] ==
+                root .. "/pkg/folder/folder.titan",
+              "folder variant descriptor did not use canonical logical native_output")
+
+  local single_folder = bridge.raw_source_descriptor(
+    bridge.ProjectModule.new("pkg.folder", {
+      bridge.SourceFile.new(folder_main, "function run(): integer return 1 end\n"),
+    })) as {string: value}
+  test.assert(single_folder["native_output"] ==
+              root .. "/pkg/folder/folder.titan",
+              "one-file folder variant descriptor lost canonical logical native_output")
+end
+
+function test_compiler_bridge_analyzes_variant_modules_and_ignores_titan_target_env(
+    _context: test.Context)
+  run_bridge(function ()
+    preload_real_compiler()
+    local previous_target? = system.getenv("TITAN_TARGET")
+    defer do
+      if previous_target ~= nil then
+        system.setenv("TITAN_TARGET", previous_target as string)
+      else
+        system.unsetenv("TITAN_TARGET")
+      end
+    end
+    system.setenv("TITAN_TARGET", "browser")
+    local host = bridge.host_target()
+    test.assert(host ~= "browser",
+                "TITAN_TARGET environment variable changed language-server host target")
+    system.setenv("TITAN_TARGET", "invalid-target-name")
+    test.assert(bridge.host_target() == host,
+                "invalid TITAN_TARGET environment variable affected host_target")
+
+    local root = test_paths.temporary_name()
+    fs.unlink(root)
+    fs.mkdir(root)
+    fs.mkdir(root .. "/pkg")
+    local main_path = root .. "/pkg/pkg." .. host .. ".titan"
+    local ops_path = root .. "/pkg/ops.native.titan"
+    local consumer_path = root .. "/consumer." .. host .. ".titan"
+    local main_text = "foreign function variant_c_add(x: int): int return x + 1 end\n" ..
+      "local function private_base(): integer return 40 end\n"
+    local ops_text = "function public_total(): integer return private_base() + 2 end\n"
+    local consumer_text = "local pkg = import \"pkg.titan\"\n" ..
+      "function answer(): integer return pkg.private_base() + pkg.public_total() end\n"
+    fs.write_file(main_path, main_text)
+    fs.write_file(ops_path, ops_text)
+    fs.write_file(consumer_path, consumer_text)
+    defer do
+      if fs.lstat(consumer_path) ~= nil then fs.unlink(consumer_path) end
+      if fs.lstat(ops_path) ~= nil then fs.unlink(ops_path) end
+      if fs.lstat(main_path) ~= nil then fs.unlink(main_path) end
+      if fs.lstat(root .. "/pkg") ~= nil then fs.rmdir(root .. "/pkg") end
+      if fs.lstat(root) ~= nil then fs.rmdir(root) end
+    end
+
+    local compiler = bridge.load()
+    compiler:configure(bridge.CompilerConfiguration.new {source_roots = {root}})
+    local projects = {
+      bridge.ProjectModule.new("pkg", {
+        bridge.SourceFile.new(main_path, main_text),
+        bridge.SourceFile.new(ops_path, ops_text),
+      }),
+      bridge.ProjectModule.new("consumer", {
+        bridge.SourceFile.new(consumer_path, consumer_text),
+      }),
+    }
+    local first = compiler:analyze_incremental(projects, {"pkg", "consumer"}, {})
+    test.assert(#first.diagnostics == 0 and
+                first:find_module("pkg") ~= nil and
+                first:find_module("consumer") ~= nil and
+                compiler:has_project_entry("pkg"),
+                "variant folder and source-import consumer failed initial analysis")
+    local second = compiler:analyze_incremental(projects, {"consumer"}, {})
+    test.assert(#second.diagnostics == 0 and
+                second:find_module("consumer") ~= nil,
+                "cached variant source entry failed incremental reuse")
   end)
 end

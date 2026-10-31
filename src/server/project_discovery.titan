@@ -8,6 +8,7 @@ local iteration = import "iteration"
 local strings = import "string"
 local paths = import "path"
 local source_text = import "server.source_text"
+local bridge = import "server.compiler_bridge"
 
 union ModuleKind
   flat()
@@ -32,6 +33,7 @@ end
 union IssueKind
   invalid_module()
   unmapped_source()
+  inactive_variant()
 end
 
 record Issue
@@ -124,6 +126,33 @@ end
 local union SourceResolution
   found(kind: ModuleKind, main_file: string, files: {string})
   blocked(string)
+  invalid(string)
+end
+
+local record ClassifiedEntry
+  const entry: FileEntry
+  const logical_basename: string
+  const label: string?
+end
+
+local record FileFamily
+  const directory: string
+  const logical_basename: string
+  const logical_relative: string
+  const by_label: {string: ClassifiedEntry}
+  default_entry: ClassifiedEntry?
+  const members: {ClassifiedEntry}
+end
+
+local record ContributorSelection
+  const logical_basename: string
+  const entry: FileEntry
+end
+
+local record SourceFamilyCandidate
+  const logical_basename: string
+  const by_label: {string: string}
+  default_name: string?
 end
 
 local record SourceSelection
@@ -161,12 +190,13 @@ local function sort_strings(items: {string})
   end
 end
 
-local function sort_files(items: {FileEntry})
+local function sort_contributors(items: {ContributorSelection})
   for index = 2, #items do
     local item = items[index]
     local target = index
     while target > 1 and
-          bytewise_less(item.basename, items[target - 1].basename) do
+          bytewise_less(item.logical_basename,
+                        items[target - 1].logical_basename) do
       items[target] = items[target - 1]
       target = target - 1
     end
@@ -456,17 +486,18 @@ function valid_module_name(name: string): boolean
   return components[#components] ~= "titan"
 end
 
-local function flat_module_name(entry: FileEntry): string
-  local stem = strings.sub(entry.relative, 1, #entry.relative - 6)
+local function flat_module_name_for_relative(logical_relative: string): string
+  local stem = strings.sub(logical_relative, 1, #logical_relative - 6)
   local components = path_components(stem)
   return dotted(components, #components)
 end
 
-local function folder_module_name(entry: FileEntry): string?
-  if entry.directory == "" then return nil end
-  if not valid_path_components(entry.directory) then return nil end
-  local components = path_components(entry.directory)
-  local stem = source_stem(entry.basename)
+local function folder_module_name_for_family(directory: string,
+                                             logical_basename: string): string?
+  if directory == "" then return nil end
+  if not valid_path_components(directory) then return nil end
+  local components = path_components(directory)
+  local stem = source_stem(logical_basename)
   if components[#components] ~= stem then return nil end
   local name = dotted(components, #components)
   if not valid_module_name(name) then return nil end
@@ -512,64 +543,231 @@ local function own(owner_by_file: {string: string}, entry: FileEntry,
   owner_by_file[entry.canonical_path] = module_name
 end
 
-local function discover_entries(entries: {FileEntry}): ModuleCatalog
+local function select_family_member(family: FileFamily,
+                                    selection_labels: {string}):
+    ClassifiedEntry?
+  for index = 1, #selection_labels do
+    local candidate? = family.by_label[selection_labels[index]]
+    if candidate ~= nil then return candidate end
+  end
+  return family.default_entry
+end
+
+local function inactive_issue(path: string, target: string,
+                              logical_basename: string,
+                              selected_basename: string?): Issue
+  local detail = "has no active variant"
+  if selected_basename ~= nil then
+    detail = "selects '" .. (selected_basename as string) .. "'"
+  end
+  return Issue.new(
+    path,
+    "not analyzed: inactive for host target '" .. target .. "'; '" ..
+    logical_basename .. "' " .. detail,
+    IssueKind.inactive_variant())
+end
+
+local function discover_entries(entries: {FileEntry}, target: string,
+                                selection_labels: {string}): ModuleCatalog
   local modules: {Module} = {}
   local modules_by_name: {string: Module} = {}
   local folders_by_directory: {string: Module} = {}
+  local folder_main_families: {string: FileFamily} = {}
+  local invalid_directories: {string: boolean} = {}
   local owner_by_file: {string: string} = {}
   local issues: {Issue} = {}
+  local families: {FileFamily} = {}
+  local families_by_key: {string: FileFamily} = {}
 
-  -- Folder mains are selected before flat files, exactly as driver.lua does.
   for index = 1, #entries do
     local entry = entries[index]
-    local name? = folder_module_name(entry)
-    if name ~= nil then
-      local module = Module.new(
-        name, ModuleKind.folder(), entry.path, {entry.path})
-      modules[#modules + 1] = module
-      modules_by_name[name] = module
-      folders_by_directory[entry.directory] = module
-      own(owner_by_file, entry, name)
+    local classification = bridge.classify_source_filename(entry.basename)
+    if classification.error ~= nil then
+      issues[#issues + 1] = Issue.new(
+        entry.path, classification.error as string,
+        IssueKind.invalid_module())
+      if entry.directory ~= "" then
+        invalid_directories[entry.directory] = true
+      end
+    elseif classification.logical_basename ~= nil then
+      local logical_basename = classification.logical_basename as string
+      local logical_relative = logical_basename
+      if entry.directory ~= "" then
+        logical_relative = entry.directory .. "/" .. logical_basename
+      end
+      local key = entry.directory .. "\0" .. logical_basename
+      local family? = families_by_key[key]
+      if family == nil then
+        family = FileFamily.new(
+          entry.directory, logical_basename, logical_relative,
+          {}, nil, {})
+        families_by_key[key] = family
+        families[#families + 1] = family
+      end
+      local classified = ClassifiedEntry.new(
+        entry, logical_basename, classification.label)
+      family.members[#family.members + 1] = classified
+      if classification.label ~= nil then
+        family.by_label[classification.label as string] = classified
+      else
+        family.default_entry = classified
+      end
     end
   end
 
-  -- Every immediate .titan sibling belongs to the folder module. Contributor
-  -- basenames use the compiler's raw byte ordering, while the main stays first.
-  for directory, module in iteration.pairs(folders_by_directory) do
-    local contributors: {FileEntry} = {}
-    for index = 1, #entries do
-      local entry = entries[index]
-      if entry.directory == directory and entry.path ~= module.main_file then
-        contributors[#contributors + 1] = entry
+  -- Folder mains are selected before flat files, exactly as driver.lua does.
+  for index = 1, #families do
+    local family = families[index]
+    local name? = folder_module_name_for_family(
+      family.directory, family.logical_basename)
+    if name ~= nil then
+      folder_main_families[family.directory] = family
+      local selected? = select_family_member(family, selection_labels)
+      if selected ~= nil then
+        local main_entry = selected.entry
+        if not invalid_directories[family.directory] then
+          local module = Module.new(
+            name, ModuleKind.folder(), main_entry.path, {main_entry.path})
+          modules[#modules + 1] = module
+          modules_by_name[name] = module
+          folders_by_directory[family.directory] = module
+          own(owner_by_file, main_entry, name)
+        end
+        for member_index = 1, #family.members do
+          local member = family.members[member_index]
+          if member.entry.path ~= main_entry.path then
+            issues[#issues + 1] = inactive_issue(
+              member.entry.path, target, family.logical_basename,
+              main_entry.basename)
+          end
+        end
+      else
+        for member_index = 1, #family.members do
+          local member = family.members[member_index]
+          issues[#issues + 1] = inactive_issue(
+            member.entry.path, target, family.logical_basename, nil)
+        end
       end
     end
-    sort_files(contributors)
+  end
+
+  -- Immediate .titan contributor families belong to the folder module.
+  -- Selected contributors sort by logical filename, while the main stays first.
+  local contributors_by_directory: {string: {ContributorSelection}} = {}
+  for directory in iteration.pairs(folders_by_directory) do
+    contributors_by_directory[directory] = {}
+  end
+  for index = 1, #families do
+    local family = families[index]
+    local main_family? = folder_main_families[family.directory]
+    if main_family ~= nil and family ~= main_family then
+      local module? = folders_by_directory[family.directory]
+      if module ~= nil then
+        local selected? = select_family_member(family, selection_labels)
+        if selected ~= nil then
+          local selected_entry = selected.entry
+          local bucket = contributors_by_directory[family.directory]
+          bucket[#bucket + 1] = ContributorSelection.new(
+            family.logical_basename, selected_entry)
+          for member_index = 1, #family.members do
+            local member = family.members[member_index]
+            if member.entry.path ~= selected_entry.path then
+              issues[#issues + 1] = inactive_issue(
+                member.entry.path, target, family.logical_basename,
+                selected_entry.basename)
+            end
+          end
+        else
+          for member_index = 1, #family.members do
+            local member = family.members[member_index]
+            issues[#issues + 1] = inactive_issue(
+              member.entry.path, target, family.logical_basename, nil)
+          end
+        end
+      elseif not invalid_directories[family.directory] then
+        for member_index = 1, #family.members do
+          local member = family.members[member_index]
+          issues[#issues + 1] = inactive_issue(
+            member.entry.path, target, main_family.logical_basename, nil)
+        end
+      end
+    end
+  end
+  for directory, module in iteration.pairs(folders_by_directory) do
+    local contributors = contributors_by_directory[directory]
+    sort_contributors(contributors)
     for index = 1, #contributors do
-      local contributor = contributors[index]
+      local contributor = contributors[index].entry
       module.files[#module.files + 1] = contributor.path
       own(owner_by_file, contributor, module.name)
     end
   end
 
-  for index = 1, #entries do
-    local entry = entries[index]
-    if owner_by_file[entry.path] == nil then
-      local name = flat_module_name(entry)
-      local stem = strings.sub(entry.relative, 1, #entry.relative - 6)
+  for index = 1, #families do
+    local family = families[index]
+    if folder_main_families[family.directory] == nil then
+      local name = flat_module_name_for_relative(family.logical_relative)
+      local stem = strings.sub(
+        family.logical_relative, 1, #family.logical_relative - 6)
       if stem == "" or not valid_path_components(stem) or
          not valid_module_name(name) then
-        issues[#issues + 1] = Issue.new(
-          entry.path,
-          "invalid logical Titan module name '" .. name .. "'",
-          IssueKind.invalid_module())
+        local selected? = select_family_member(family, selection_labels)
+        local selected_basename: string? = nil
+        if selected ~= nil then
+          selected_basename = selected.entry.basename
+        end
+        for member_index = 1, #family.members do
+          local member = family.members[member_index]
+          if member.label ~= nil and
+             (not bridge.target_label_applies(target, member.label as string) or
+              (selected ~= nil and member.entry.path ~= selected.entry.path)) then
+            issues[#issues + 1] = inactive_issue(
+              member.entry.path, target, family.logical_basename,
+              selected_basename)
+          else
+            local invalid_name = flat_module_name_for_relative(
+              member.entry.relative)
+            issues[#issues + 1] = Issue.new(
+              member.entry.path,
+              "invalid logical Titan module name '" .. invalid_name .. "'",
+              IssueKind.invalid_module())
+          end
+        end
       elseif modules_by_name[name] == nil then
-        local module = Module.new(
-          name, ModuleKind.flat(), entry.path, {entry.path})
-        modules[#modules + 1] = module
-        modules_by_name[name] = module
-        own(owner_by_file, entry, name)
+        local selected? = select_family_member(family, selection_labels)
+        if selected ~= nil then
+          local selected_entry = selected.entry
+          local module = Module.new(
+            name, ModuleKind.flat(), selected_entry.path, {selected_entry.path})
+          modules[#modules + 1] = module
+          modules_by_name[name] = module
+          own(owner_by_file, selected_entry, name)
+          for member_index = 1, #family.members do
+            local member = family.members[member_index]
+            if member.entry.path ~= selected_entry.path then
+              issues[#issues + 1] = inactive_issue(
+                member.entry.path, target, family.logical_basename,
+                selected_entry.basename)
+            end
+          end
+        else
+          for member_index = 1, #family.members do
+            local member = family.members[member_index]
+            issues[#issues + 1] = inactive_issue(
+              member.entry.path, target, family.logical_basename, nil)
+          end
+        end
+      else
+        -- A same-name flat family is shadowed by the already selected folder main.
+        local folder_main = paths.basename(modules_by_name[name].main_file)
+        for member_index = 1, #family.members do
+          local member = family.members[member_index]
+          if member.label ~= nil then
+            issues[#issues + 1] = inactive_issue(
+              member.entry.path, target, family.logical_basename, folder_main)
+          end
+        end
       end
-      -- A same-name flat file is shadowed by the already selected folder main.
     end
   end
 
@@ -710,49 +908,105 @@ local function regular_file(path: string): boolean
   end
 end
 
-local function source_resolution_in_root(root: SourceRoot, name: string):
+local function select_source_family(filename: string,
+                                    labels: {string}): string?
+  local stem = source_stem(filename)
+  for index = 1, #labels do
+    local candidate = stem .. "." .. labels[index] .. ".titan"
+    if regular_file(candidate) then return candidate end
+  end
+  if regular_file(filename) then return filename end
+  return nil
+end
+
+local function select_source_candidate(candidate: SourceFamilyCandidate,
+                                       labels: {string}): string?
+  for index = 1, #labels do
+    local selected? = candidate.by_label[labels[index]]
+    if selected ~= nil then return selected end
+  end
+  return candidate.default_name
+end
+
+local function source_resolution_in_root(root: SourceRoot, name: string,
+                                         selection_labels: {string},
+                                         all_labels: {string}):
     SourceResolution?
   local relative = module_path(name)
   local basename = terminal_component(name)
   local folder = join(root.lexical, relative)
-  local folder_main = join(folder, basename .. ".titan")
-  if regular_file(folder_main) then
-    local contributor_names: {string} = {}
+  local folder_main? = select_source_family(
+    join(folder, basename .. ".titan"), selection_labels)
+  if folder_main ~= nil then
+    local families: {string: SourceFamilyCandidate} = {}
     local entries = fs.list(folder)
     for index = 1, #entries do
       local entry = entries[index]
-      if entry ~= basename .. ".titan" and titan_source(entry) and
-         regular_file(join(folder, entry)) then
-        contributor_names[#contributor_names + 1] = entry
+      if titan_source(entry) and regular_file(join(folder, entry)) then
+        local classification = bridge.classify_source_filename(entry)
+        if classification.error ~= nil then
+          return SourceResolution.invalid(classification.error as string)
+        end
+        local logical? = classification.logical_basename
+        if logical ~= nil and (logical as string) ~= basename .. ".titan" then
+          local logical_name = logical as string
+          local family? = families[logical_name]
+          if family == nil then
+            family = SourceFamilyCandidate.new(logical_name, {}, nil)
+            families[logical_name] = family
+          end
+          if classification.label ~= nil then
+            family.by_label[classification.label as string] = entry
+          else
+            family.default_name = entry
+          end
+        end
       end
     end
-    sort_strings(contributor_names)
-    local files = {folder_main}
-    for index = 1, #contributor_names do
-      files[#files + 1] = join(folder, contributor_names[index])
+    local contributor_logicals: {string} = {}
+    local selected_by_logical: {string: string} = {}
+    for logical_name, family in iteration.pairs(families) do
+      local selected? = select_source_candidate(family, selection_labels)
+      if selected ~= nil then
+        contributor_logicals[#contributor_logicals + 1] = logical_name
+        selected_by_logical[logical_name] = selected as string
+      end
     end
-    return SourceResolution.found(ModuleKind.folder(), folder_main, files)
+    sort_strings(contributor_logicals)
+    local files = {folder_main as string}
+    for index = 1, #contributor_logicals do
+      local logical_name = contributor_logicals[index]
+      files[#files + 1] = join(folder, selected_by_logical[logical_name])
+    end
+    return SourceResolution.found(
+      ModuleKind.folder(), folder_main as string, files)
   end
 
-  local flat = join(root.lexical, relative .. ".titan")
-  if not regular_file(flat) then return nil end
+  local flat? = select_source_family(
+    join(root.lexical, relative .. ".titan"), selection_labels)
+  if flat == nil then return nil end
   local owner? = module_owner(name)
   if owner ~= nil then
-    local owner_main = join(
-      join(root.lexical, module_path(owner)),
-      terminal_component(owner) .. ".titan")
-    if regular_file(owner_main) then
-      return SourceResolution.blocked(owner_main)
+    local owner_main? = select_source_family(
+      join(
+        join(root.lexical, module_path(owner)),
+        terminal_component(owner) .. ".titan"),
+      all_labels)
+    if owner_main ~= nil then
+      return SourceResolution.blocked(owner_main as string)
     end
   end
-  return SourceResolution.found(ModuleKind.flat(), flat, {flat})
+  return SourceResolution.found(
+    ModuleKind.flat(), flat as string, {flat as string})
 end
 
-
-local function resolve_source(roots: {SourceRoot}, name: string):
+local function resolve_source(roots: {SourceRoot}, name: string,
+                              selection_labels: {string},
+                              all_labels: {string}):
     SourceResolution?
   for index = 1, #roots do
-    local resolved? = source_resolution_in_root(roots[index], name)
+    local resolved? = source_resolution_in_root(
+      roots[index], name, selection_labels, all_labels)
     if resolved ~= nil then return resolved end
   end
   return nil
@@ -881,10 +1135,14 @@ local function discover_or_raise(include: {string}, exclude: {string},
   -- identity against root-major compiler lookup before publishing it. This is
   -- essential for overlapping roots and earlier unwatched roots: either can
   -- make the compiler select a different physical provider for the same name.
+  local target = bridge.host_target()
+  local selection_labels = bridge.target_selection_labels(target)
+  local all_labels = bridge.source_labels()
   local candidates: {string: Candidate} = {}
   local candidate_names: {string} = {}
   for root_index = 1, #source_roots do
-    local catalog = discover_entries(entries_by_source_root[root_index])
+    local catalog = discover_entries(
+      entries_by_source_root[root_index], target, selection_labels)
     for index = 1, #catalog.modules do
       local module = catalog.modules[index]
       if candidates[module.name] == nil then
@@ -909,7 +1167,8 @@ local function discover_or_raise(include: {string}, exclude: {string},
   for index = 1, #candidate_names do
     local name = candidate_names[index]
     local candidate = candidates[name]
-    local resolved? = resolve_source(source_roots, name)
+    local resolved? = resolve_source(
+      source_roots, name, selection_labels, all_labels)
     if resolved == nil then
       issues[#issues + 1] = Issue.new(
         candidate.module.main_file,
@@ -924,6 +1183,9 @@ local function discover_or_raise(include: {string}, exclude: {string},
           "logical Titan module '" .. name ..
           "' is blocked by folder source '" .. blocking_source .. "'",
           IssueKind.invalid_module())
+      when invalid(message) then
+        issues[#issues + 1] = Issue.new(
+          candidate.module.main_file, message, IssueKind.invalid_module())
       when found{kind; main_file; files} then
         if same_physical_source(candidate.module, kind, files) then
           modules[#modules + 1] = candidate.module

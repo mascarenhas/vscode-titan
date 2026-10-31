@@ -49,6 +49,7 @@ record Baseline
   const projects: {bridge.ProjectModule}
   const include: {string}
   const exclude: {string}
+  const inactive_files: {string}
 end
 
 local function saved_headers(connection: sqlite3.Connection,
@@ -97,10 +98,19 @@ end
 
 local function saved_roots(connection: sqlite3.Connection, kind: integer): {string}
   local rows = sql.rows(connection,
-    "SELECT path FROM main.completion_roots WHERE kind=? ORDER BY position", kind)
+    "SELECT path FROM main.completion_roots WHERE kind=? AND position>0 ORDER BY position", kind)
   local result: {string} = {}
   for index = 1, #rows do result[index] = sql.bytes(rows[index], 1) end
   return result
+end
+
+local function ownership_inventory_ready(connection: sqlite3.Connection): boolean
+  if sql.scalar_integer(connection,
+      "SELECT count(*) FROM main.sqlite_master WHERE type='table' AND name='completion_roots'") ~= 1 then
+    return false
+  end
+  return sql.scalar_integer(connection,
+    "SELECT count(*) FROM main.completion_roots WHERE kind=4 AND position=0") == 1
 end
 
 -- External graph revisions are always zero. Their reusable descriptor identity
@@ -152,7 +162,8 @@ function Store:capture_baseline(): Baseline?
       "SELECT count(*) FROM main.sqlite_master WHERE type='table' AND name IN " ..
       "('completion_configuration','completion_roots','completion_descriptors'," ..
       "'completion_source_files','completion_imports','completion_header_inputs'," ..
-      "'completion_members','semantic_files')") ~= 8 then return nil end
+      "'completion_members','semantic_files')") ~= 8 or
+     not ownership_inventory_ready(connection) then return nil end
   local settings = sql.rows(connection,
     "SELECT source_roots_present,binary_root,include_roots_present,cppflags " ..
     "FROM main.completion_configuration WHERE singleton=1")
@@ -198,7 +209,8 @@ function Store:capture_baseline(): Baseline?
     project.files[#project.files + 1] = bridge.SourceFile.new(sql.bytes(row, 2), sql.bytes(row, 3))
   end
   return Baseline.new(generation(connection), configuration, modules, projects,
-    saved_roots(connection, 2), saved_roots(connection, 3))
+    saved_roots(connection, 2), saved_roots(connection, 3),
+    saved_roots(connection, 4))
 end
 
 function Store:read_descriptor(expected_generation: integer,
@@ -220,6 +232,7 @@ end
 function Store:saved_generation(): integer
   local access = self.store:acquire()
   defer access:release()
+  if not ownership_inventory_ready(access.connection) then return 0 end
   return sql.scalar_integer(access.connection,
     "SELECT published_generation FROM main.store_state WHERE singleton=1")
 end
@@ -463,7 +476,8 @@ end
 function publish_saved(connection: sqlite3.Connection,
                        descriptors: {SavedDescriptor}, retained_modules: {string},
                        configuration: bridge.CompilerConfiguration,
-                       include: {string}?, exclude: {string}?)
+                       include: {string}?, exclude: {string}?,
+                       inactive_files: {string}?)
   initialize_saved_schema(connection)
   local retained: {string: boolean} = {}
   for index = 1, #retained_modules do retained[retained_modules[index]] = true end
@@ -535,6 +549,12 @@ function publish_saved(connection: sqlite3.Connection,
   end
   if exclude ~= nil then
     for index = 1, #exclude do insert:execute(3, index, blob(exclude[index])) end
+  end
+  insert:execute(4, 0, blob(""))
+  if inactive_files ~= nil then
+    for index = 1, #inactive_files do
+      insert:execute(4, index, blob(inactive_files[index]))
+    end
   end
 end
 

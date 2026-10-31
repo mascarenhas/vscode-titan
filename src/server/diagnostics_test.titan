@@ -83,6 +83,89 @@ function test_diagnostics_publish_and_clear_unmapped_source_warnings(
               "ordinary discovery did not clear resolved unmapped warnings")
 end
 
+function test_diagnostics_publish_persist_and_clear_inactive_variant_information(
+    _context: test.Context)
+  test_runtime.run(function ()
+    local saved = snapshot(test_paths.workspace_root() .. "/src/foo.linux.titan", "", {})
+    local message = "not analyzed: inactive for host target 'linux'; " ..
+      "'foo.titan' selects 'foo.linux.titan'"
+    local issues = {
+      project_discovery.Issue.new(
+        test_paths.workspace_root() .. "/src/foo.windows.titan", message,
+        project_discovery.IssueKind.inactive_variant()),
+      project_discovery.Issue.new(
+        test_paths.workspace_root() .. "/src/foo.titan", message,
+        project_discovery.IssueKind.inactive_variant()),
+      project_discovery.Issue.new(
+        test_paths.workspace_root() .. "/src/invalid.name.titan",
+        "invalid logical module name",
+        project_discovery.IssueKind.invalid_module()),
+    }
+    local with_issues = project_service.Snapshot.new(
+      saved.generation, saved.config, issues, saved.project_directories,
+      saved.project_modules, saved.external_modules, saved.dirty_modules)
+    local publications = diagnostics.from_snapshot(with_issues)
+    test.assert(#publications == 2 and
+                publications[1].uri ==
+                  test_paths.workspace_uri() .. "/src/foo.windows.titan" and
+                publications[2].uri ==
+                  test_paths.workspace_uri() .. "/src/foo.titan",
+                "inactive variants did not produce one diagnostic publication each")
+    local envelope? = wire.as_object(wire.decode(
+      diagnostics.notification(publications[1])))
+    local params? = wire.as_object(envelope["params"])
+    local items? = wire.as_array(params["diagnostics"])
+    local item? = wire.as_object(items[1])
+    test.assert(wire.as_integer(item["severity"]) == 3 and
+                wire.as_string(item["code"]) == "inactive-variant" and
+                wire.as_string(item["source"]) == "Titan" and
+                wire.as_string(item["message"]) == message and
+                publications[1].items[1].range.start.line == 0 and
+                publications[1].items[1].range.start.character == 0,
+                "inactive variant diagnostic lost information severity, code, or message")
+
+    local path = fs.tmpname()
+    defer fs.unlink(path)
+    local store = stores.open(path)
+    defer store:close()
+    do
+      local access = store:acquire()
+      defer access:release()
+      published.initialize_schema(access.connection)
+      access.connection:set_autocommit(false)
+      published.publish(access.connection, publications)
+      stores.execute(access.connection,
+        "UPDATE main.store_state SET published_generation=3 WHERE singleton=1")
+      access.connection:commit()
+    end
+    local persisted = published.read(store, 3)
+    test.assert(#persisted == 2 and #persisted[1].items == 1 and
+                persisted[1].items[1].message == message,
+                "persisted inactive-variant diagnostic did not round-trip")
+    local reencoded? = wire.as_object(wire.decode(
+      diagnostics.notification(persisted[1])))
+    local reencoded_params? = wire.as_object(reencoded["params"])
+    local reencoded_items? = wire.as_array(reencoded_params["diagnostics"])
+    local reencoded_item? = wire.as_object(reencoded_items[1])
+    test.assert(wire.as_integer(reencoded_item["severity"]) == 3 and
+                wire.as_string(reencoded_item["code"]) == "inactive-variant",
+                "replayed inactive-variant diagnostic lost its kind code")
+
+    local publisher = diagnostics.create()
+    local observed: {diagnostics.Publication} = {}
+    publisher:set_listener(function (publication: diagnostics.Publication)
+      observed[#observed + 1] = publication
+    end)
+    publisher:publish(persisted)
+    publisher:publish(diagnostics.from_snapshot(saved))
+    test.assert(#observed == 4 and #observed[3].items == 0 and
+                observed[3].uri == publications[1].uri and
+                #observed[4].items == 0 and
+                observed[4].uri == publications[2].uri,
+                "removing inactive variants did not clear their diagnostics")
+  end)
+end
+
 function test_diagnostics_map_saved_compiler_byte_locations_to_lsp(
     _context: test.Context)
   local filename = test_paths.workspace_root() .. "/main.titan"

@@ -42,6 +42,12 @@ record ProjectModule
   files: {SourceFile}
 end
 
+record SourceClassification
+  const logical_basename: string?
+  const label: string?
+  const error: string?
+end
+
 record SourceLocation
   filename: string
   line: integer
@@ -1036,6 +1042,22 @@ local function make_type_of(): TypeOfFunction
   return candidate as TypeOfFunction
 end
 
+local function require_driver_module(module_name: string): value
+  do
+    return lua.require(module_name)
+  catch
+    local fallback = lua.load(
+      "return require(...)", "=compiler_bridge.require_driver", nil)
+    return fallback(module_name)
+  end
+end
+
+local function current_driver_module(): ({string: value}, TypeOfFunction)
+  local type_of = make_type_of()
+  return require_compiler_module(require_driver_module, type_of, DRIVER_MODULE),
+    type_of
+end
+
 local function emit_cache_stats(compiler: Compiler)
   if not logging.enabled("debug") then return end
   local query = checked_function(compiler.driver,DRIVER_MODULE,
@@ -1142,6 +1164,12 @@ local function load_with(require_function: RequireFunction,
   checked_function(driver, DRIVER_MODULE, "project_entries_registry", type_of)
   checked_function(driver, DRIVER_MODULE, "language_server_cache_identity", type_of)
   checked_function(driver, DRIVER_MODULE, "compiler_cache_stats", type_of)
+  checked_function(driver, DRIVER_MODULE, "classify_source_filename", type_of)
+  checked_function(driver, DRIVER_MODULE, "target_selection_labels", type_of)
+  checked_function(driver, DRIVER_MODULE, "target_label_applies", type_of)
+  checked_function(driver, DRIVER_MODULE, "context_target", type_of)
+  required_string_list(
+    driver["SOURCE_LABELS"], DRIVER_MODULE, "driver.SOURCE_LABELS")
   required_map(driver["imported"], DRIVER_MODULE, "driver.imported")
   required_map(types["registry"], TYPES_MODULE, "types.registry")
 
@@ -3581,7 +3609,28 @@ local function project_index(modules: {ProjectModule}): {string: ProjectModule}
   return result
 end
 
-local function raw_source_descriptor(module: ProjectModule): value
+local function canonical_source_output(driver: {string: value},
+    type_of: TypeOfFunction, filename: string): string
+  local classify = checked_function(
+    driver, DRIVER_MODULE, "classify_source_filename", type_of) as
+    function (string): (value, value, value)
+  local basename = paths.basename(filename)
+  local raw_logical, _raw_label, raw_error = classify(basename)
+  if raw_error ~= nil and raw_error ~= false then
+    return fail<|string|>(DRIVER_MODULE, strings.tostring(raw_error))
+  end
+  local logical? = optional_string(
+    raw_logical, DRIVER_MODULE, "classify_source_filename logical_basename")
+  if logical ~= nil and logical ~= basename and #filename >= #basename and
+     strings.sub(filename, #filename - #basename + 1) == basename then
+    return strings.sub(filename, 1, #filename - #basename) .. (logical as string)
+  end
+  return filename
+end
+
+local function raw_source_descriptor(module: ProjectModule,
+    supplied_driver: {string: value}?,
+    supplied_type_of: TypeOfFunction?): value
   local files: {integer: value} = {}
   local contents: {string: value} = {}
   for index = 1, #module.files do
@@ -3594,23 +3643,35 @@ local function raw_source_descriptor(module: ProjectModule): value
     files[index] = source.filename
     contents[source.filename] = source.contents
   end
+  local type_of = supplied_type_of or make_type_of()
+  local driver: {string: value} = {}
+  if supplied_driver ~= nil then
+    driver = supplied_driver as {string: value}
+  else
+    driver = require_compiler_module(
+      require_driver_module, type_of, DRIVER_MODULE)
+  end
+  local main = module.files[1].filename
   local descriptor: {string: value} = {}
   descriptor["kind"] = #module.files == 1 and "flat" or "folder"
-  descriptor["main"] = module.files[1].filename
+  descriptor["main"] = main
   descriptor["files"] = files
   descriptor["contents"] = contents
-  descriptor["native_output"] = module.files[1].filename
+  descriptor["native_output"] = canonical_source_output(driver, type_of, main)
   descriptor["program_output"] = module.module_name
   return descriptor
 end
 
-local function project_loader_inputs(modules: {ProjectModule}):
+local function project_loader_inputs(modules: {ProjectModule},
+    supplied_driver: {string: value}?,
+    supplied_type_of: TypeOfFunction?):
     ({string: value}, {string: ProjectModule})
   local projects = project_index(modules)
   local overrides: {string: value} = {}
   for index = 1, #modules do
     local module = modules[index]
-    overrides[module.module_name] = raw_source_descriptor(module)
+    overrides[module.module_name] = raw_source_descriptor(
+      module, supplied_driver, supplied_type_of)
   end
   return overrides, projects
 end
@@ -4642,7 +4703,8 @@ function Compiler:analyze_incremental(
     ["dirty_modules"] = #dirty_modules,
     ["cached_sources"] = #cached_sources,
   })
-  local overrides, projects = project_loader_inputs(project_modules)
+  local overrides, projects = project_loader_inputs(
+    project_modules, self.driver, self.type_of)
   local requested, ordered = requested_modules(dirty_modules, projects)
   local cached, raw_cached_interfaces = cached_source_map(
     cached_sources, projects)
@@ -5274,7 +5336,8 @@ function Compiler:analyze_completion(root_module: string,
   if hole ~= nil then kind = hole.kind end
   local previous = self:install_configuration()
   defer previous:apply()
-  local overrides, project_map = project_loader_inputs(projects)
+  local overrides, project_map = project_loader_inputs(
+    projects, self.driver, self.type_of)
   local _, interfaces = cached_source_map(cached, project_map)
   local active: {string: value} = {}
   local entries: {string: value} = {}
@@ -5450,4 +5513,80 @@ end
   -- inventory, including libraries not linked by application declarations.
   output:write(fingerprint(self.embedded_provider_file))
   return content_identity.digest(output:drain())
+end
+
+local cached_target_driver: value = nil
+local cached_new_context: value = nil
+local cached_context_target: value = nil
+local cached_host_target: string? = nil
+
+function host_target(): string
+  local driver, type_of = current_driver_module()
+  local new_context_fn = checked_function(
+    driver, DRIVER_MODULE, "new_resolver_context", type_of)
+  local context_target_fn = checked_function(
+    driver, DRIVER_MODULE, "context_target", type_of)
+  if cached_host_target ~= nil and
+     cached_target_driver == (driver as value) and
+     cached_new_context == new_context_fn and
+     cached_context_target == context_target_fn then
+    return cached_host_target as string
+  end
+  local create_context = new_context_fn as function (value): value
+  local close_fn = checked_function(
+    driver, DRIVER_MODULE, "close_resolver_context", type_of) as
+    function (value): (value, value)
+  local context = create_context({} as {string: value})
+  defer close_fn(context)
+  local query = context_target_fn as function (value): (value, value)
+  local raw_target, raw_error = query(context)
+  if not (raw_target is string) or (raw_target as string) == "" then
+    return fail<|string|>(DRIVER_MODULE,
+      "cannot determine host target: " .. strings.tostring(raw_error))
+  end
+  local target = raw_target as string
+  cached_target_driver = driver
+  cached_new_context = new_context_fn
+  cached_context_target = context_target_fn
+  cached_host_target = target
+  return target
+end
+
+function source_labels(): {string}
+  local driver, type_of = current_driver_module()
+  return required_string_list(
+    driver["SOURCE_LABELS"], DRIVER_MODULE, "driver.SOURCE_LABELS")
+end
+
+function target_selection_labels(target: string): {string}
+  local driver, type_of = current_driver_module()
+  local select_labels = checked_function(
+    driver, DRIVER_MODULE, "target_selection_labels", type_of) as
+    function (string): value
+  return required_string_list(
+    select_labels(target), DRIVER_MODULE, "driver.target_selection_labels")
+end
+
+function target_label_applies(target: string, label: string): boolean
+  local driver, type_of = current_driver_module()
+  local applies = checked_function(
+    driver, DRIVER_MODULE, "target_label_applies", type_of) as
+    function (string, string): value
+  return required_boolean(
+    applies(target, label), DRIVER_MODULE, "driver.target_label_applies")
+end
+
+function classify_source_filename(basename: string): SourceClassification
+  local driver, type_of = current_driver_module()
+  local classify = checked_function(
+    driver, DRIVER_MODULE, "classify_source_filename", type_of) as
+    function (string): (value, value, value)
+  local raw_logical, raw_label, raw_error = classify(basename)
+  local logical? = optional_string(
+    raw_logical, DRIVER_MODULE, "classify_source_filename logical_basename")
+  local label? = optional_string(
+    raw_label, DRIVER_MODULE, "classify_source_filename label")
+  local message? = optional_string(
+    raw_error, DRIVER_MODULE, "classify_source_filename error")
+  return SourceClassification.new(logical, label, message)
 end
