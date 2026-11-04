@@ -61,7 +61,9 @@ const child = spawn(process.execPath, [
   "--line", String(callLine),
   "--character", String(callCharacter),
   "--server", server,
-  "--timeout-ms", "300000"
+  // A cold index of this repository takes about 260 s on the two-CPU CI
+  // runner, so allow the adapter's maximum.
+  "--timeout-ms", "600000"
 ], {
   cwd: repositoryRoot,
   detached: process.platform !== "win32",
@@ -121,7 +123,7 @@ try {
   outcome = await withTimeout(Promise.race([
     close.then((status) => ({ status })),
     interruption.then(() => ({ status: undefined }))
-  ]), "native Codex adapter", 330_000);
+  ]), "native Codex adapter", 630_000);
 } finally {
   if (!closed) {
     terminate("SIGTERM");
