@@ -1,0 +1,410 @@
+foreign import "compiler_io_platform.h"
+local fs = import "fs"
+local test = import "test"
+local config = import "server.project_config.titan"
+local root_settings = import "server.root_settings.titan"
+local roots = import "server.roots.titan"
+local strings = import "string"
+local test_paths = import "server.test_paths"
+local test_runtime = import "server.test_runtime"
+
+local type Body = function (string): ()
+local type PrefixBody = function (string, string): ()
+
+local function remove_tree(path: string)
+  local metadata? = fs.lstat(path)
+  if metadata == nil then return end
+  if metadata.kind == "directory" then
+    local names = fs.list(path)
+    for index = 1, #names do remove_tree(path .. "/" .. names[index]) end
+    fs.rmdir(path)
+    return
+  end
+  fs.unlink(path)
+end
+
+-- Filesystem work is a Runtime operation, so every case owns one Runtime
+-- session exactly as the other server test owners do.
+local function with_root(body: Body)
+  test_runtime.run(function ()
+    local base = fs.realpath(test_paths.temporary_name())
+    fs.unlink(base)
+    fs.mkdir(base)
+    defer remove_tree(base)
+    body(base)
+  end)
+end
+
+-- An installed SDK prefix carries exactly the entries the router validates.
+-- Small stand-in files keep every assertion about layout, not archive content.
+local function make_prefix(base: string, name: string): string
+  local prefix = base .. "/" .. name
+  local directories = {
+    "", "/share", "/share/lua", "/share/lua/5.5",
+    "/share/lua/5.5/titan-compiler", "/lib", "/lib/lua", "/lib/lua/5.5",
+    "/lib/titan", "/lib/titan/0.6",
+  }
+  for index = 1, #directories do fs.mkdir(prefix .. directories[index]) end
+  fs.write_file(prefix .. "/share/lua/5.5/titan-compiler/driver.lua",
+    "return {}\n")
+  fs.write_file(prefix .. "/lib/titan/0.6/titan.a", "archive\n")
+  fs.write_file(prefix .. "/lib/titan/0.6/sdk-digests", "digests\n")
+  return prefix
+end
+
+local function trusted_root(base: string): root_settings.Trust
+  return root_settings.create({fs.realpath(base)})
+end
+
+local function run_absent(base: string)
+  local trust = trusted_root(base)
+  local settings?, failure? = root_settings.load(roots.canonical(base), trust)
+  test.assert(failure == nil and settings ~= nil,
+    "a root without configuration failed to load settings")
+  local actual = settings as root_settings.Settings
+  test.assert(actual.compiler_root == nil,
+    "an absent configuration selected an SDK")
+  test.assert(actual.trusted, "a trusted root reported itself untrusted")
+end
+
+function test_root_settings_use_the_default_sdk_without_configuration(
+    _context: test.Context)
+  with_root(run_absent)
+end
+
+local function run_trust_containment(base: string)
+  local trust = trusted_root(base)
+  test.assert(trust:allows(fs.realpath(base)),
+    "a trusted directory did not trust itself")
+  test.assert(trust:allows(fs.realpath(base) .. "/slice"),
+    "a trusted directory did not trust its child")
+  test.assert(not trust:allows(fs.realpath(base) .. "sibling"),
+    "a trusted directory trusted a prefix-sharing sibling")
+  test.assert(not trust:allows("/elsewhere"),
+    "a trusted directory trusted an unrelated path")
+  local declared_roots: {value} = {base as value, 5 as value}
+  local declared_options: {string: value} = {
+    ["trustedRoots"] = declared_roots, ["maxWorkers"] = 2,
+  }
+  local declared = root_settings.trust_directories(
+    declared_options, "/elsewhere")
+  test.assert(#declared == 2,
+    "trustedRoots did not keep strings and add the environment entry")
+end
+
+function test_root_settings_restrict_trust_to_directory_containment(
+    _context: test.Context)
+  with_root(run_trust_containment)
+end
+
+local function run_tracked_selection(base: string)
+  local prefix = make_prefix(base, "sdk")
+  fs.write_file(base .. "/titan-config.lua",
+    "include = { \"src\" }\ncompiler_root = \"sdk\"\n")
+  local root = roots.canonical(base)
+  local settings?, failure? = root_settings.load(root, trusted_root(base))
+  test.assert(failure == nil and settings ~= nil,
+    "a trusted configured compiler_root was rejected")
+  local actual = settings as root_settings.Settings
+  test.assert(actual.compiler_root == prefix,
+    "a relative compiler_root was not resolved against the root")
+  test.assert(actual.compiler_root_file == base .. "/titan-config.lua",
+    "the tracked configuration was not recorded as the selection source")
+  test.assert(actual.trusted, "a trusted root reported itself untrusted")
+end
+
+function test_root_settings_resolve_a_tracked_compiler_root(
+    _context: test.Context)
+  with_root(run_tracked_selection)
+end
+
+local function run_local_override(base: string)
+  local tracked = make_prefix(base, "tracked-sdk")
+  local local_prefix = make_prefix(base, "local-sdk")
+  fs.write_file(base .. "/titan-config.lua",
+    "include = { \"./titan\" }\nsource_module_roots = { \".\" }\n" ..
+    "compiler_root = \"tracked-sdk\"\n")
+  fs.write_file(base .. "/titan-config.local.lua",
+    "compiler_root = \"local-sdk\"\n")
+  local loaded?, failure? = config.load(base, tracked)
+  test.assert(failure == nil and loaded ~= nil,
+    "the local override broke the tracked configuration load")
+  local actual = loaded as config.ProjectConfig
+  test.assert(actual.compiler_root == local_prefix,
+    "the local override did not replace the tracked compiler_root")
+  test.assert(actual.compiler_root_file == base .. "/titan-config.local.lua",
+    "the local override was not recorded as the selection source")
+  test.assert(actual.include[1] == base .. "/titan",
+    "the local override disturbed tracked discovery settings")
+
+  local settings?, settings_failure? =
+    root_settings.load(roots.canonical(base), trusted_root(base))
+  test.assert(settings_failure == nil and settings ~= nil,
+    "the local override did not produce usable root settings")
+  test.assert((settings as root_settings.Settings).compiler_root == local_prefix,
+    "root settings ignored the local override")
+
+  fs.write_file(base .. "/titan-config.local.lua",
+    "compiler_root = \"local-sdk\"\ninclude = { \"./other\" }\n")
+  local rejected?, rejected_failure? = config.load(base, tracked)
+  test.assert(rejected == nil and rejected_failure ~= nil,
+    "a local override with another key was accepted")
+  test.assert(strings.find((rejected_failure as config.Error).message,
+    "may only assign compiler_root") ~= nil,
+    "the local override rejection did not name the rule")
+end
+
+function test_root_settings_local_override_only_selects_compiler_root(
+    _context: test.Context)
+  with_root(run_local_override)
+end
+
+local function run_untrusted_selection(base: string)
+  local prefix = make_prefix(base, "sdk")
+  fs.write_file(base .. "/titan-config.lua", "compiler_root = \"sdk\"\n")
+  fs.write_file(base .. "/marker.txt", "unused\n")
+  local settings?, failure? = root_settings.load(
+    roots.canonical(base), root_settings.create({}))
+  test.assert(settings == nil and failure ~= nil,
+    "an untrusted compiler_root started root settings")
+  local actual = failure as root_settings.Error
+  test.assert(actual.path == base .. "/titan-config.lua",
+    "the trust failure did not name the file that set compiler_root")
+  test.assert(strings.find(actual.message, "trustedRoots") ~= nil,
+    "the trust failure did not name initializationOptions.trustedRoots")
+  test.assert(failure is root_settings.Error,
+    "the trust failure did not report a selection error")
+  do
+    local reason = actual.reason
+    local refused = false
+    case reason
+    when untrusted_selection() then refused = true
+    when invalid_prefix() then refused = false
+    end
+    test.assert(refused,
+      "the trust failure did not classify itself as an untrusted selection")
+  end
+end
+
+function test_root_settings_refuse_untrusted_compiler_root(
+    _context: test.Context)
+  with_root(run_untrusted_selection)
+end
+
+-- A configuration error has three distinct outcomes, and only one of them may
+-- start a worker without a selected SDK.
+local function refusal_reason(failure: root_settings.Error): string
+  local reason = failure.reason
+  case reason
+  when untrusted_selection() then return "untrusted"
+  when invalid_prefix() then return "prefix"
+  when invalid_configuration() then return "configuration"
+  end
+  return "unknown"
+end
+
+local function run_unusable_selection(base: string)
+  local trusted = trusted_root(base)
+
+  -- 1. A local override that assigns anything else cannot select an SDK: the
+  --    root is refused instead of silently using the router's own SDK.
+  fs.write_file(base .. "/titan-config.lua", "compiler_root = \"tracked\"\n")
+  fs.write_file(base .. "/titan-config.local.lua",
+    "compiler_root = \"local\"\ninclude = { \"./other\" }\n")
+  local refused?, refusal? = root_settings.load(roots.canonical(base), trusted)
+  test.assert(refused == nil and refusal ~= nil,
+    "a local override with another key produced settings")
+  local refusal_error = refusal as root_settings.Error
+  test.assert(refusal_error.path == base .. "/titan-config.local.lua",
+    "the refusal did not name the local override")
+  test.assert(refusal_reason(refusal_error) == "configuration",
+    "the refusal was not classified as a configuration error")
+
+  -- 2. The same file on an untrusted root still refuses: trust never turns an
+  --    unusable selection into a worker start.
+  local untrusted?, untrusted_failure? = root_settings.load(
+    roots.canonical(base), root_settings.create({}))
+  test.assert(untrusted == nil and untrusted_failure ~= nil,
+    "an untrusted root with an unusable override started settings")
+  test.assert(refusal_reason(untrusted_failure as root_settings.Error) ==
+    "configuration",
+    "the untrusted refusal was misclassified")
+
+  -- 3. A present but non-string compiler_root selects nothing verifiable.
+  fs.write_file(base .. "/titan-config.local.lua", "compiler_root = true\n")
+  local invalid?, invalid_failure? =
+    root_settings.load(roots.canonical(base), trusted)
+  test.assert(invalid == nil and invalid_failure ~= nil,
+    "a non-string local compiler_root was accepted")
+  test.assert(refusal_reason(invalid_failure as root_settings.Error) ==
+    "configuration",
+    "a non-string local compiler_root was misclassified")
+
+  -- 4. A tracked file this server cannot evaluate, with no override, keeps the
+  --    single-root behaviour: the worker reports it, and no SDK is selected.
+  fs.unlink(base .. "/titan-config.local.lua")
+  fs.write_file(base .. "/titan-config.lua", "compiler_root = \n")
+  local tolerated?, tolerated_failure? =
+    root_settings.load(roots.canonical(base), trusted)
+  test.assert(tolerated_failure == nil and tolerated ~= nil,
+    "an unreadable tracked configuration refused the root settings")
+  test.assert((tolerated as root_settings.Settings).compiler_root == nil,
+    "an unreadable tracked configuration selected an SDK")
+
+  -- 5. With an override present the same breakage makes the selection
+  --    unverifiable, so it is refused.
+  fs.write_file(base .. "/titan-config.local.lua", "compiler_root = \"local\"\n")
+  local refused_tracked?, tracked_failure? =
+    root_settings.load(roots.canonical(base), trusted)
+  test.assert(refused_tracked == nil and tracked_failure ~= nil,
+    "a broken tracked file next to an override was tolerated")
+  test.assert((tracked_failure as root_settings.Error).path ==
+    base .. "/titan-config.lua",
+    "the refusal did not name the tracked configuration")
+
+  -- 6. A non-string tracked compiler_root is a configuration error too.
+  fs.unlink(base .. "/titan-config.local.lua")
+  fs.write_file(base .. "/titan-config.lua", "compiler_root = 3\n")
+  local typed?, typed_failure? =
+    root_settings.load(roots.canonical(base), trusted)
+  test.assert(typed == nil and typed_failure ~= nil,
+    "a non-string tracked compiler_root was accepted")
+  test.assert(refusal_reason(typed_failure as root_settings.Error) ==
+    "configuration",
+    "a non-string tracked compiler_root was misclassified")
+end
+
+function test_root_settings_refuse_unusable_compiler_root_configuration(
+    _context: test.Context)
+  with_root(run_unusable_selection)
+end
+
+local function run_layout_validation(base: string)
+  local prefix = make_prefix(base, "sdk")
+  fs.write_file(base .. "/titan-config.lua", "compiler_root = \"sdk\"\n")
+  local trust = trusted_root(base)
+  test.assert(root_settings.validate_prefix(prefix) == nil,
+    "a complete SDK layout was rejected")
+  local missing?, failure? = root_settings.load(roots.canonical(base), trust)
+  test.assert(missing ~= nil and failure == nil,
+    "a complete SDK layout failed root settings")
+
+  fs.unlink(prefix .. "/lib/titan/0.6/titan.a")
+  local rejected?, layout_failure? =
+    root_settings.load(roots.canonical(base), trust)
+  test.assert(rejected == nil and layout_failure ~= nil,
+    "a prefix without its provider archive was accepted")
+  local layout_error = layout_failure as root_settings.Error
+  test.assert(strings.find(layout_error.message,
+    "lib/titan/0.6/titan.a") ~= nil,
+    "the layout failure did not name the missing archive")
+  do
+    local invalid = false
+    local reason = layout_error.reason
+    case reason
+    when invalid_prefix() then invalid = true
+    when untrusted_selection() then invalid = false
+    end
+    test.assert(invalid,
+      "a broken SDK layout was classified as an untrusted selection")
+  end
+
+  fs.unlink(prefix .. "/share/lua/5.5/titan-compiler/driver.lua")
+  local invalid?, invalid_failure? = root_settings.load(
+    roots.canonical(base), trust)
+  test.assert(invalid == nil and invalid_failure ~= nil,
+    "a prefix without its compiler driver was accepted")
+  test.assert(strings.find((invalid_failure as root_settings.Error).message,
+    "titan-compiler/driver.lua") ~= nil,
+    "the layout failure did not name the missing driver")
+end
+
+function test_root_settings_validate_the_selected_sdk_layout(
+    _context: test.Context)
+  with_root(run_layout_validation)
+end
+
+local function run_identity(base: string)
+  local first = make_prefix(base, "first")
+  local second = make_prefix(base, "second")
+  fs.write_file(base .. "/titan-config.lua", "compiler_root = \"first\"\n")
+  local root = roots.canonical(base)
+  local trust = trusted_root(base)
+  local settings?, failure? = root_settings.load(root, trust)
+  test.assert(settings ~= nil and failure == nil, "root settings failed")
+  local actual = settings as root_settings.Settings
+  local identity = root_settings.sdk_identity(
+    actual.compiler_root, nil)
+  test.assert(#identity > 0, "the SDK identity was empty")
+  test.assert(identity == root_settings.sdk_identity(actual.compiler_root, nil),
+    "the SDK identity was not stable")
+  fs.write_file(first .. "/lib/titan/0.6/titan.a", "reinstalled archive\n")
+  test.assert(identity ~= root_settings.sdk_identity(actual.compiler_root, nil),
+    "reinstalling the SDK did not change its identity")
+  local before = root_settings.fingerprint(actual)
+  fs.write_file(base .. "/titan-config.lua", "compiler_root = \"second\"\n")
+  local replaced?, replaced_failure? = root_settings.load(root, trust)
+  test.assert(replaced ~= nil and replaced_failure == nil,
+    "a changed compiler_root failed root settings")
+  test.assert(before ~= root_settings.fingerprint(
+    replaced as root_settings.Settings),
+    "a changed compiler_root did not change the settings fingerprint")
+end
+
+function test_root_settings_observe_sdk_reinstallation(
+    _context: test.Context)
+  with_root(run_identity)
+end
+
+local function run_probe_prefixes(base: string)
+  local root = roots.canonical(base)
+  local plain = root_settings.probe_prefix(nil, root)
+  test.assert(plain == root .. "/.titan-ls",
+    "a root without an inherited prefix did not keep its own cache")
+  local shared = root_settings.probe_prefix("/shared/probes", root)
+  test.assert(strings.sub(shared, 1, #"/shared/probes/roots/") ==
+    "/shared/probes/roots/",
+    "an inherited probe prefix was not qualified per root")
+  local other = root_settings.probe_prefix("/shared/probes", root .. "/inner")
+  test.assert(shared ~= other,
+    "two roots shared one probe namespace below an inherited prefix")
+  test.assert(shared == root_settings.probe_prefix("/shared/probes", root),
+    "the per-root probe namespace was not stable")
+  local digest = strings.sub(shared, #"/shared/probes/roots/" + 1)
+  test.assert(#digest == 16, "the probe namespace did not use 16 hex digits")
+end
+
+function test_root_settings_isolate_probe_caches(_context: test.Context)
+  with_root(run_probe_prefixes)
+end
+
+local function run_compiler_root_discovery(base: string)
+  local prefix = make_prefix(base, "sdk")
+  fs.write_file(base .. "/titan-config.lua",
+    "include = { \"src\" }\n")
+  local absent?, absent_failure? = config.load_compiler_root(base)
+  test.assert(absent ~= nil and absent_failure == nil,
+    "compiler_root discovery failed without a selection")
+  test.assert((absent as config.CompilerRoot).compiler_root == nil,
+    "compiler_root discovery invented a selection")
+
+  fs.write_file(base .. "/titan-config.lua",
+    "include = { \"src\" }\ncompiler_root = \"sdk\"\n")
+  local selected?, selected_failure? = config.load_compiler_root(base)
+  test.assert(selected ~= nil and selected_failure == nil,
+    "compiler_root discovery failed")
+  test.assert((selected as config.CompilerRoot).compiler_root == prefix,
+    "compiler_root discovery ignored the tracked selection")
+
+  fs.write_file(base .. "/titan-config.lua", "compiler_root = 7\n")
+  local invalid?, invalid_failure? = config.load_compiler_root(base)
+  test.assert(invalid == nil and invalid_failure ~= nil,
+    "a non-string compiler_root was accepted")
+  test.assert(strings.find((invalid_failure as config.Error).message, "compiler_root") ~= nil,
+    "the compiler_root failure did not name the field")
+end
+
+function test_project_config_discovers_compiler_root_for_the_router(
+    _context: test.Context)
+  with_root(run_compiler_root_discovery)
+end

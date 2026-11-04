@@ -10,6 +10,7 @@ import {
 } from "vscode-languageclient/node";
 import {
   DEFAULT_SERVER_LOG_LEVEL,
+  createInitializationOptions,
   createServerLaunchOptions,
   ensureServerExecutable,
   formatServerStartup,
@@ -267,7 +268,10 @@ class TitanClientManager {
       );
       const documentSelector = createWorkspaceDocumentSelector(folder);
       const clientOptions: LanguageClientOptions = {
-        initializationOptions: completionConfiguration,
+        initializationOptions: createInitializationOptions(
+          completionConfiguration,
+          [physicalWorkspaceRoot]
+        ),
         diagnosticCollectionName: diagnosticCollectionName(folder),
         documentSelector,
         middleware: createWorkspaceMiddleware(folder),

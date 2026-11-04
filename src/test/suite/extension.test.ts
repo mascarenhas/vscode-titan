@@ -35,7 +35,10 @@ interface FixtureEvent {
   rootUri?: string | null;
   workspaceFolders?: Array<{ uri: string; name: string }> | null;
   trace?: string;
-  initializationOptions?: { insertCallSnippets: boolean };
+  initializationOptions?: {
+    insertCallSnippets: boolean;
+    trustedRoots?: string[];
+  };
   signal?: string;
 }
 
@@ -599,7 +602,13 @@ suite("Titan extension", () => {
         await configuration.update("arguments", [fakeServer, alphaMarkerPath, "--semantic", "--completion",
           "--call-completion", "--fixture-token", "call-snippets"], vscode.ConfigurationTarget.WorkspaceFolder);
         const initialization = await waitForInitializationToken(alphaMarkerPath, "call-snippets", 10_000);
-        assert.deepEqual(initialization.initializationOptions, { insertCallSnippets: true });
+        const alphaPhysicalRoot = await realpath(alpha.uri.fsPath);
+        // The session owns exactly the folder it launched, which is the only
+        // directory whose roots may select their own SDK.
+        assert.deepEqual(initialization.initializationOptions, {
+          insertCallSnippets: true,
+          trustedRoots: [alphaPhysicalRoot]
+        });
         document = await vscode.workspace.openTextDocument(vscode.Uri.joinPath(alpha.uri, "sample.titan"));
         await replaceDocumentText(document, "method");
         const item = await waitForNamedCompletion(
@@ -619,7 +628,10 @@ suite("Titan extension", () => {
         await completionConfiguration.update("insertCallSnippets", false, vscode.ConfigurationTarget.WorkspaceFolder);
         const optedOut = await waitForInitializationToken(alphaMarkerPath, "call-snippets", 10_000, initialization.pid);
         assert.notEqual(optedOut.pid, initialization.pid);
-        assert.deepEqual(optedOut.initializationOptions, { insertCallSnippets: false });
+        assert.deepEqual(optedOut.initializationOptions, {
+          insertCallSnippets: false,
+          trustedRoots: [alphaPhysicalRoot]
+        });
         const reference = await waitForNamedCompletion(
           document, new vscode.Position(0, 3), "method", 10_000);
         assert.ok(reference, "name-only completion did not reach the editor");
@@ -1540,7 +1552,10 @@ async function assertInitialization(
     "the native server owns the default probe-cache location");
   assert.equal(event.serverLogLevel, "info");
   assert.equal(event.trace, "off");
-  assert.deepEqual(event.initializationOptions, { insertCallSnippets: true });
+  assert.deepEqual(event.initializationOptions, {
+    insertCallSnippets: true,
+    trustedRoots: [physicalRoot]
+  });
   assertNativePathEqual(event.rootPath, folder.uri.fsPath);
   assert.equal(event.rootUri, physicalUri);
   assert.deepEqual(event.workspaceFolders, [{

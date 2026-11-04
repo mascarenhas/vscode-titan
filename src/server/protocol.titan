@@ -17,20 +17,23 @@ end
 type NotificationSink = function (string): ()
 type NotificationBinder = function (NotificationSink): ()
 
-local record InputDelivery
+--- One framed client body whose acknowledged delivery resumes the reader.
+record InputDelivery
   body: string
   acknowledged: boolean
   reader: async.Task?
   resume_token: async.ResumeToken
 end
 
-local union InputEvent
+--- Next framed client body, clean end of input, or transport failure.
+union InputEvent
   message(InputDelivery)
   eof()
   failure(string)
 end
 
-local record InputQueue
+--- Ordered client-input queue with one reserved consumer.
+record InputQueue
   items: {InputEvent}
   waiter: async.Task?
   resume_token: async.ResumeToken
@@ -45,12 +48,14 @@ local record Session
   closed: boolean
 end
 
-local function new_input_queue(): InputQueue
+--- Create an empty framed-input queue for one client stream.
+function new_input_queue(): InputQueue
   return InputQueue.new(
     {}, nil, async.ResumeToken.new("server.protocol.input_queue"))
 end
 
-local function InputDelivery:acknowledge()
+--- Release the client reader to submit the next framed body.
+function InputDelivery:acknowledge()
   if self.acknowledged then return end
   self.acknowledged = true
   local reader? = self.reader
@@ -72,7 +77,8 @@ local function InputDelivery:wait()
   async.suspend(self.resume_token, detach)
 end
 
-local function InputQueue:push(event: InputEvent)
+--- Append one input event and wake the reserved consumer.
+function InputQueue:push(event: InputEvent)
   self.items[#self.items + 1] = event
   local waiter? = self.waiter
   if waiter == nil then return end
@@ -80,7 +86,8 @@ local function InputQueue:push(event: InputEvent)
   waiter:resume(self.resume_token)
 end
 
-local function InputQueue:take(): InputEvent
+--- Take the next input event, suspending while the queue is empty.
+function InputQueue:take(): InputEvent
   if #self.items == 0 then
     if self.waiter ~= nil then
       raise "protocol input queue already has a waiting consumer"
@@ -105,7 +112,8 @@ end
 
 -- This Task is the sole stdin owner and keeps reading while semantic request
 -- Tasks are suspended or running between cooperative yields.
-local function read_messages(source: io.Reader, queue: InputQueue): nil
+--- Read framed bodies from one client stream into an input queue.
+function read_messages(source: io.Reader, queue: InputQueue): nil
   local reader = framing.reader()
   while true do
     local body? = reader:read(source)
@@ -139,8 +147,9 @@ end
 
 -- No other Task writes stdout/the injected writer. Queue publication itself is
 -- nonyielding, while this owner performs each complete framed write in order.
-local function write_messages(target: io.Writer,
-                              queue: response_queue.ResponseQueue): nil
+--- Write queued framed bodies to one client stream in order.
+function write_messages(target: io.Writer,
+                        queue: response_queue.ResponseQueue): nil
   while true do
     local message? = queue:take()
     if message == nil then return nil end
@@ -207,6 +216,8 @@ local function Session:close()
 end
 
 --- Drive framed requests and notifications with one serialized response writer.
+-- @param startup_notification One notification body published before any client
+-- message is read, used by a worker to report its process identity.
 function run(source: io.Reader, target: io.Writer,
              handler: coordinator.SemanticHandler?,
              initialized_handler: coordinator.InitializedHandler?,
@@ -214,7 +225,8 @@ function run(source: io.Reader, target: io.Writer,
              shutdown_handler: coordinator.ShutdownHandler?,
              document_handler: coordinator.DocumentHandler?,
              completion_capture: coordinator.CompletionCapture?,
-             hover_capture: coordinator.HoverCapture?): integer
+             hover_capture: coordinator.HoverCapture?,
+             startup_notification: string?): integer
   local session = new_session(
     source, target, handler, initialized_handler, shutdown_handler,
     document_handler, completion_capture, hover_capture)
@@ -227,6 +239,9 @@ function run(source: io.Reader, target: io.Writer,
     notification_binder(function (message: string)
       if notifications_active then session.output:push(message) end
     end)
+  end
+  if startup_notification ~= nil then
+    session.output:push(startup_notification as string)
   end
 
   while true do

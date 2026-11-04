@@ -52,6 +52,20 @@ local MAX_DOCUMENT_BYTES = 4 * 1024 * 1024
 local MAX_WORKSPACE_BYTES = 32 * 1024 * 1024
 local MAX_DOCUMENTS = 256
 
+--- Editor-text limits one workspace applies to retained buffers.
+-- The router retains open documents for replay and applies the same limits, so
+-- this is the one owner of the numbers.
+record Limits
+  const document_bytes: integer
+  const workspace_bytes: integer
+  const documents: integer
+end
+
+--- Return the limits every retained editor buffer obeys.
+function limits(): Limits
+  return Limits.new(MAX_DOCUMENT_BYTES, MAX_WORKSPACE_BYTES, MAX_DOCUMENTS)
+end
+
 function create(): BufferStore
   return BufferStore.new({}, 0, 0, 0, false)
 end
@@ -84,8 +98,9 @@ local function BufferStore:replace(state: DocumentState,
   end
   state.version = version
   state.input = nil
-  if #text <= MAX_DOCUMENT_BYTES and
-     self.retained_bytes + #text <= MAX_WORKSPACE_BYTES then
+  local bounded = limits()
+  if #text <= bounded.document_bytes and
+     self.retained_bytes + #text <= bounded.workspace_bytes then
     local uri? = source_text.path_to_file_uri(document.path)
     state.input = Input.new(uri, document.path, state.session, version, text)
     self.retained_bytes = self.retained_bytes + #text
@@ -101,7 +116,7 @@ function BufferStore:apply(notification: lsp.DocumentNotification): boolean
   when opened(opened) then
     local state? = self:find(opened.document.path)
     if state == nil then
-      if #self.documents >= MAX_DOCUMENTS then
+      if #self.documents >= limits().documents then
         -- We cannot forget an open contributor and silently reuse its saved
         -- bytes. Stop completion until this workspace store is recreated.
         self.capacity_exceeded = true
@@ -141,6 +156,36 @@ function BufferStore:apply(notification: lsp.DocumentNotification): boolean
     return false
   end
   return false
+end
+
+--- Track one open document whose text this server does not have.
+-- The document stays an unavailable contributor: its saved bytes are never used
+-- as its buffer, and completion for its module reports the unavailable result.
+function BufferStore:observe_unavailable(document: lsp.TextDocument,
+                                         version: integer): boolean
+  local state? = self:find(document.path)
+  if state == nil then
+    if #self.documents >= limits().documents then
+      -- The workspace store cannot take another document; completion stops
+      -- until it is recreated, exactly as for an over-count open.
+      self.capacity_exceeded = true
+      self.revision = self.revision + 1
+      return true
+    end
+    self.documents[#self.documents + 1] =
+      DocumentState.new(document.path, 0, version, nil)
+    self.revision = self.revision + 1
+    return true
+  end
+  local actual = state as DocumentState
+  local previous? = actual.input
+  if previous ~= nil then
+    self.retained_bytes = self.retained_bytes - #((previous as Input).text)
+  end
+  actual.input = nil
+  actual.version = version
+  self.revision = self.revision + 1
+  return true
 end
 
 function BufferStore:inputs(): const {Input}

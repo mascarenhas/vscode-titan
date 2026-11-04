@@ -52,9 +52,14 @@ Titan V1 semantics always come from disk. Ask the user to save relevant files
 before querying. Treat a returned rename edit as a preview; apply it only in a
 separate, explicitly authorized source-editing step.
 
-Use a server built against the same pinned Titan revision as the compiler Lua
-modules and SDK. API version `1` is held constant during prerelease development;
-it is not evidence that two arbitrary compiler revisions are interchangeable.
+One server executable serves every SDK: a root's `compiler_root` selects the
+prefix its worker loads, and an SDK whose compiler needs a support function this
+server build lacks fails that root with a clear error, fixed by a server built
+from a matching SDK. Loading a selected SDK executes its code, so export
+`TITAN_LS_TRUSTED_ROOTS` (an OS path list) when the queried slice sets
+`compiler_root`: this client sends no `initializationOptions`, and an untrusted
+selection is refused rather than replaced by another SDK.
+
 Derive the UTF-16 `--line` and `--character` values from the saved text before
 each query; never reuse positions computed against an earlier revision of the
 file. Foreign type metadata can contribute hover information, but FFI definition
@@ -66,6 +71,9 @@ use the repository's startup benchmark for cold/warm analysis regressions.
 
 The native server defaults its C probe prefix to `<workspace>/.titan-ls`, the
 SQLite directory. A nonempty inherited `TITAN_PREFIX` overrides only the probe
-prefix. The VS Code extension uses the same default; it does not supply a
-workspace-storage prefix. Preserve an explicit override when reproducing a
-query, and use a fresh override only for a deliberately isolated measurement.
+prefix, and then a router session gives each root its own
+`<TITAN_PREFIX>/roots/<digest>` namespace, because probe results depend on that
+root's SDK headers and flags. The VS Code extension uses the same default; it
+does not supply a workspace-storage prefix. Preserve an explicit override when
+reproducing a query, and use a fresh override only for a deliberately isolated
+measurement.

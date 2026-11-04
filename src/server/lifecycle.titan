@@ -25,6 +25,7 @@ end
 record Lifecycle
   local phase: Phase
   local completion_enabled: boolean
+  local workspace_folders: boolean
 end
 
 local INVALID_REQUEST = -32600
@@ -32,8 +33,11 @@ local INVALID_PARAMS = -32602
 local SERVER_NOT_INITIALIZED = -32002
 
 --- Create an uninitialized LSP lifecycle owner.
-function create(): Lifecycle
-  return Lifecycle.new(Phase.before_initialize(), false)
+-- @param workspace_folders Advertise workspace-folder support and change notifications.
+function create(workspace_folders: boolean?): Lifecycle
+  local folders = false
+  if workspace_folders then folders = true end
+  return Lifecycle.new(Phase.before_initialize(), false, folders)
 end
 
 function Lifecycle:enable_completion()
@@ -55,7 +59,8 @@ local function fail(code: integer, message: string): Decision
   return Decision.failure(code, message)
 end
 
-local function initialize_result(completion_enabled: boolean): wire.Object
+local function initialize_result(completion_enabled: boolean,
+                                 workspace_folders: boolean): wire.Object
   local capabilities: wire.Object = {
     -- vscode-languageclient currently advertises only UTF-16 and rejects any
     -- other selection. State the negotiated/default encoding explicitly.
@@ -79,6 +84,14 @@ local function initialize_result(completion_enabled: boolean): wire.Object
     completion["completionItem"] = completion_item
     capabilities["textDocumentSync"] = sync
     capabilities["completionProvider"] = completion
+  end
+  if workspace_folders then
+    -- The router owns folder membership for several roots, so it must accept
+    -- additions and removals after initialize.
+    local folders: wire.Object = {
+      ["supported"] = true, ["changeNotifications"] = true,
+    }
+    capabilities["workspace"] = {["workspaceFolders"] = folders}
   end
   return {["capabilities"] = capabilities}
 end
@@ -119,7 +132,8 @@ local function Lifecycle:handle_initialize(
       return fail(INVALID_PARAMS, "initialize params must be an object")
     end
     self.phase = Phase.awaiting_initialized()
-    return Decision.result(initialize_result(self.completion_enabled))
+    return Decision.result(
+      initialize_result(self.completion_enabled, self.workspace_folders))
   else
     return fail(INVALID_REQUEST, "initialize may only be sent once")
   end

@@ -72,7 +72,10 @@ node plugins/titan-lsp/skills/titan-lsp-query/scripts/titan-lsp-query.mjs \
 ```
 
 - `--root` is the Titan project root. The client uses it as the LSP workspace
-  and the server's working directory.
+  folder and the server's working directory. It sends no
+  `initializationOptions`, so a root that selects its own `compiler_root` needs
+  `TITAN_LS_TRUSTED_ROOTS` in the environment (see the
+  [Titan LSP query skill](../plugins/titan-lsp/skills/titan-lsp-query/SKILL.md)).
 - `definition`, `references` and `hover` need `--line` and `--character`:
   zero-based LSP coordinates, with characters counted in UTF-16 code units.
   `folding` needs only `--root` and `--file`.

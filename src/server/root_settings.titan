@@ -1,0 +1,240 @@
+--- Root-level SDK selection, trust, and SDK identity for the router.
+-- @module server.root_settings
+
+foreign import "compiler_io_platform.h"
+
+local fs = import "fs"
+local paths = import "path"
+local strings = import "string"
+local wire = import "server.wire"
+local content_identity = import "server.content_identity"
+local project_config = import "server.project_config"
+local roots = import "server.roots"
+
+-- An installed Titan SDK prefix carries these exact entries. The router checks
+-- them before it starts a worker so a missing or partial installation is a
+-- root-scoped error instead of a worker crash.
+local const SDK_FILES: const {string} = {
+  "share/lua/5.5/titan-compiler/driver.lua",
+  "lib/titan/0.6/titan.a",
+}
+local const SDK_DIRECTORIES: const {string} = {
+  "lib/lua/5.5",
+}
+local const IDENTITY_FILES: const {string} = {
+  "share/lua/5.5/titan-compiler/driver.lua",
+  "lib/titan/0.6/titan.a",
+  "lib/titan/0.6/sdk-digests",
+}
+local const PROBE_ROOTS_DIRECTORY = "roots"
+local const PROBE_ROOT_DIGEST_BYTES = 16
+local PATH_LIST_SEPARATOR_LINUX = 58
+local PATH_LIST_SEPARATOR_WINDOWS = 59
+
+--- Why a root's settings cannot be accepted.
+-- The router reacts structurally, not by matching a message.
+union Reason
+  untrusted_selection()
+  invalid_prefix()
+  invalid_configuration()
+end
+
+--- One root-scoped configuration or selection failure.
+record Error
+  const path: string
+  const message: string
+  const reason: Reason
+end
+
+--- Canonical directories whose Titan roots may select their own SDK.
+record Trust
+  local directories: {string}
+end
+
+local function join(parent: string, name: string): string
+  return paths.to_slash(paths.join(parent, name))
+end
+
+local function split_path_list(text: string): {string}
+  local separator = PATH_LIST_SEPARATOR_LINUX
+  if ffi.VSCODE_TITAN_WINDOWS ~= 0 then separator = PATH_LIST_SEPARATOR_WINDOWS end
+  local result: {string} = {}
+  local start = 1
+  for index = 1, #text do
+    local byte: integer = strings.byte(text, index)
+    if byte == separator then
+      if index > start then
+        result[#result + 1] = strings.sub(text, start, index - 1)
+      end
+      start = index + 1
+    end
+  end
+  if #text >= start then result[#result + 1] = strings.sub(text, start) end
+  return result
+end
+
+local function trusted_entry(candidate: string): string?
+  if candidate == "" then return nil end
+  if strings.sub(candidate, 1, 1) == "/" then
+    return roots.canonical(candidate)
+  end
+  if ffi.VSCODE_TITAN_WINDOWS ~= 0 and strings.sub(candidate, 2, 2) == ":" then
+    return roots.canonical(candidate)
+  end
+  return nil
+end
+
+--- Create a trust set from configured directories, canonicalising each entry.
+function create(directories: {string}): Trust
+  local result: {string} = {}
+  for index = 1, #directories do
+    local canonical? = trusted_entry(directories[index])
+    if canonical ~= nil then result[#result + 1] = canonical as string end
+  end
+  return Trust.new(result)
+end
+
+--- Return the number of configured trusted directories.
+function Trust:count(): integer
+  return #self.directories
+end
+
+--- Report whether a canonical root is equal to or inside a trusted directory.
+function Trust:allows(root: string): boolean
+  for index = 1, #self.directories do
+    local directory = self.directories[index]
+    if root == directory then return true end
+    local prefix = directory
+    if strings.sub(prefix, -1) ~= "/" then prefix = prefix .. "/" end
+    if strings.sub(root, 1, #prefix) == prefix then return true end
+  end
+  return false
+end
+
+-- Trusted directories arrive from two sources: the client's
+-- initializationOptions.trustedRoots array and TITAN_LS_TRUSTED_ROOTS, whose
+-- spelling is the host's path-list separator.
+--- Collect configured trusted directories before canonicalisation.
+function trust_directories(initialization_options: value?,
+                           environment: string?): {string}
+  local result: {string} = {}
+  if initialization_options ~= nil then
+    local object? = wire.as_object(initialization_options)
+    if object ~= nil then
+      local declared = object["trustedRoots"]
+      if declared ~= nil then
+        local entries? = wire.as_array(declared)
+        if entries ~= nil then
+          local items = entries as {value}
+          for index = 1, #items do
+            local item = items[index]
+            if item is string then result[#result + 1] = item as string end
+          end
+        end
+      end
+    end
+  end
+  if environment ~= nil and environment ~= "" then
+    local entries = split_path_list(environment)
+    for index = 1, #entries do result[#result + 1] = entries[index] end
+  end
+  return result
+end
+
+--- Validated SDK selection for one root.
+record Settings
+  const root: string
+  const compiler_root: string?
+  const compiler_root_file: string?
+  const trusted: boolean
+end
+
+--- Validate the layout of an installed Titan SDK prefix.
+function validate_prefix(prefix: string): Error?
+  for index = 1, #SDK_FILES do
+    local entry = join(prefix, SDK_FILES[index])
+    local metadata? = fs.stat(entry)
+    if metadata == nil or metadata.kind ~= "file" then
+      return Error.new(prefix,
+        "compiler_root '" .. prefix .. "' is not an installed Titan SDK: " ..
+        "missing " .. SDK_FILES[index], Reason.invalid_prefix())
+    end
+  end
+  for index = 1, #SDK_DIRECTORIES do
+    local entry = join(prefix, SDK_DIRECTORIES[index])
+    local metadata? = fs.stat(entry)
+    if metadata == nil or metadata.kind ~= "directory" then
+      return Error.new(prefix,
+        "compiler_root '" .. prefix .. "' is not an installed Titan SDK: " ..
+        "missing " .. SDK_DIRECTORIES[index], Reason.invalid_prefix())
+    end
+  end
+  return nil
+end
+
+--- Resolve one root's effective SDK selection, trust decision and layout check.
+function load(root: string, trust: Trust): (Settings?, Error?)
+  local allowed = trust:allows(root)
+  local selection?, selection_failure? = project_config.load_compiler_root(root)
+  if selection == nil then
+    -- A local override exists to select an SDK, and an unusable compiler_root
+    -- selects nothing verifiable, so the root is refused instead of falling
+    -- back to the router's own SDK.
+    local problem = selection_failure as project_config.Error
+    return nil, Error.new(problem.path, problem.message,
+      Reason.invalid_configuration())
+  end
+  local selected = selection as project_config.CompilerRoot
+  local compiler_root: string? = selected.compiler_root
+  if compiler_root ~= nil then
+    if not allowed then
+      local source_file? = selected.compiler_root_file
+      if source_file == nil then source_file = root end
+      return nil, Error.new(source_file,
+        "root '" .. root .. "' selects compiler_root '" ..
+        (compiler_root as string) .. "' from " .. source_file ..
+        " but is not a trusted directory; add it to " ..
+        "initializationOptions.trustedRoots or TITAN_LS_TRUSTED_ROOTS",
+        Reason.untrusted_selection())
+    end
+    local invalid? = validate_prefix(compiler_root as string)
+    if invalid ~= nil then return nil, invalid end
+  end
+  return Settings.new(
+    root, compiler_root, selected.compiler_root_file, allowed), nil
+end
+
+--- Return the configuration identity that decides whether a worker must restart.
+function fingerprint(settings: Settings): string
+  local compiler_root = settings.compiler_root or ""
+  local trusted = "untrusted"
+  if settings.trusted then trusted = "trusted" end
+  return #compiler_root .. ":" .. compiler_root .. trusted
+end
+
+-- Installation identity is the stat tuple of the files that decide the
+-- compiler and its standard-library inventory. Content-hashing an archive this
+-- large belongs to the worker's own cache compatibility, not to a restart
+-- check the router repeats.
+--- Observe the selected SDK installation identity for reinstall detection.
+function sdk_identity(compiler_root: string?, titan_root: string?): string
+  local prefix? = compiler_root
+  if prefix == nil then prefix = titan_root end
+  if prefix == nil then return "" end
+  local output = strings.writer()
+  for index = 1, #IDENTITY_FILES do
+    local entry = join(prefix as string, IDENTITY_FILES[index])
+    output:write(content_identity.stat_identity(entry))
+  end
+  return content_identity.digest(output:drain())
+end
+
+--- Choose one root's compiler probe-cache prefix.
+function probe_prefix(inherited: string?, root: string): string
+  if inherited == nil or inherited == "" then
+    return join(root, ".titan-ls")
+  end
+  local digest = content_identity.hex_digest(root)
+  local name = strings.sub(digest, 1, PROBE_ROOT_DIGEST_BYTES)
+  return join(inherited, PROBE_ROOTS_DIRECTORY .. "/" .. name)
+end

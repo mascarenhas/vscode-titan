@@ -53,6 +53,39 @@ export function readCompletionConfiguration(
   return { insertCallSnippets };
 }
 
+export interface InitializationOptions {
+  insertCallSnippets: boolean;
+  /**
+   * Canonicalizable directories whose Titan roots may select their own SDK.
+   * The server canonicalizes each entry and refuses an untrusted root's
+   * `compiler_root`, so this list never grants a workspace permission it did
+   * not already own.
+   */
+  trustedRoots: string[];
+}
+
+/**
+ * Build the client's initializationOptions.
+ *
+ * The extension only runs in trusted workspaces, so the folder it owns is the
+ * trusted directory for every root that session serves.
+ */
+export function createInitializationOptions(
+  completion: CompletionConfiguration,
+  trustedRoots: readonly string[]
+): InitializationOptions {
+  if (!Array.isArray(trustedRoots) ||
+      trustedRoots.some((root) => typeof root !== "string" || root.length === 0)) {
+    throw new ServerConfigurationError(
+      "trustedRoots must be an array of absolute directory paths"
+    );
+  }
+  return {
+    insertCallSnippets: completion.insertCallSnippets,
+    trustedRoots: [...trustedRoots]
+  };
+}
+
 export interface ServerLaunchOptions {
   command: string;
   args: string[];

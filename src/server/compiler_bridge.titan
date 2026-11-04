@@ -21,6 +21,8 @@ local documentation = import "server.documentation"
 local COMPILER_ABI = "2"
 local COMPILER_LANGUAGE_SERVER_API = 1
 local COMPILER_LANGUAGE_SERVER_API_MARKER = "LANGUAGE_SERVER_API_VERSION"
+-- The 0.6 SDK layout names this archive under its library version directory.
+local SDK_PROVIDER_ARCHIVE = "lib/titan/0.6/titan.a"
 local PARSER_MODULE = "titan-compiler.parser"
 local CHECKER_MODULE = "titan-compiler.checker"
 local TYPES_MODULE = "titan-compiler.types"
@@ -494,6 +496,9 @@ record Compiler
   local cache_adapter: {string: value}?
   local completion_exports: {string: CompletionExport}
   local completion_binaries: {CompletionBinary}
+  -- True when embedded_interface_provider describes this executable's build
+  -- SDK. A selected SDK supplies none: its inventory comes from its own archive.
+  local const embedded_provider: boolean
 end
 
 local function fail<|T|>(module_name: string, message: string): T
@@ -1090,7 +1095,9 @@ end
 
 local function load_with(require_function: RequireFunction,
                          embedded_interface_provider: {string: value},
-                         embedded_identity: compiler_io.LstatIdentity): Compiler
+                         provider_file: string,
+                         embedded_identity: compiler_io.LstatIdentity,
+                         embedded_provider: boolean): Compiler
   local type_of = make_type_of()
   local parser = require_compiler_module(
     require_function, type_of, PARSER_MODULE)
@@ -1173,14 +1180,48 @@ local function load_with(require_function: RequireFunction,
   required_map(driver["imported"], DRIVER_MODULE, "driver.imported")
   required_map(types["registry"], TYPES_MODULE, "types.registry")
 
-  local embedded_provider_file = required_string(
-    embedded_interface_provider["provider_file"], DRIVER_MODULE,
-    "embedded_interface_provider.provider_file")
   local baseline = capture_driver_configuration(driver)
   return Compiler.new(
     parser, checker, types, driver, type_of, embedded_interface_provider,
-    embedded_provider_file, embedded_identity, compiler_io.create(),
-    {}, CompilerConfiguration.new(), baseline, baseline, {}, nil, {}, {})
+    provider_file,
+    embedded_identity, compiler_io.create(),
+    {}, CompilerConfiguration.new(), baseline, baseline, {}, nil, {}, {},
+    embedded_provider)
+end
+
+-- The selected-SDK path names the same file the embedded provider's identity
+-- stands for: the standard provider archive. Its stat tuple fences provider
+-- selection just as the executable's identity fences the embedded inventory.
+local function archive_provider_identity(
+    provider_file: string): compiler_io.LstatIdentity
+  local metadata? = fs.stat(provider_file)
+  if metadata == nil then
+    return fail<|compiler_io.LstatIdentity|>(DRIVER_MODULE,
+      "selected compiler provider '" .. provider_file .. "' is missing")
+  end
+  local actual = metadata as fs.Stat
+  return compiler_io.LstatIdentity.new(
+    provider_file, actual.size, actual.kind, actual.device, actual.inode,
+    actual.modified_seconds, actual.modified_nanoseconds)
+end
+
+local function selected_provider_file(compiler_root: string): string
+  return paths.to_slash(paths.join(compiler_root, SDK_PROVIDER_ARCHIVE))
+end
+
+-- One process hosts exactly one compiler. The worker selects an installed SDK
+-- before any compiler module loads, so the bridge keeps that selection and
+-- every later load derives its provider mode from it.
+local selected_compiler_root: string? = nil
+
+--- Select an installed SDK whose compiler Lua modules this process will load.
+function select_compiler_root(compiler_root: string?)
+  selected_compiler_root = compiler_root
+end
+
+--- Report the SDK prefix selected for this process, or nil for the build SDK.
+function compiler_root(): string?
+  return selected_compiler_root
 end
 
 function load(): Compiler
@@ -1188,6 +1229,13 @@ function load(): Compiler
   -- compiler operation restores its temporary driver configuration.
   local permit = compiler_scheduler.acquire()
   defer permit:release()
+  local configured? = selected_compiler_root
+  if configured ~= nil then
+    local provider_file = selected_provider_file(configured)
+    return load_with(
+      lua.require, {}, provider_file,
+      archive_provider_identity(provider_file), false)
+  end
   local provider: {string: value} = {}
   local raw_identity: {string: value} = {}
   do
@@ -1202,8 +1250,8 @@ function load(): Compiler
     provider["provider_file"], DRIVER_MODULE,
     "embedded_interface_provider.provider_file")
   return load_with(
-    lua.require, provider,
-    embedded_provider_identity(raw_identity, provider_file))
+    lua.require, provider, provider_file,
+    embedded_provider_identity(raw_identity, provider_file), true)
 end
 
 function Compiler:compiler_abi(): string
@@ -1334,7 +1382,14 @@ local function Compiler:new_context(supplied: {string: value}?): value
   local options: {string: value} = {}
   if supplied ~= nil then options = supplied end
   options["io"] = self.io
-  options["embedded_interface_provider"] = self.embedded_interface_provider
+  if self.embedded_provider then
+    options["embedded_interface_provider"] = self.embedded_interface_provider
+  else
+    -- The embedded inventory describes this executable's build SDK, never the
+    -- selected one. Parse the selected SDK's static archive instead, which
+    -- reads metadata without running another build's native provider code.
+    options["prefer_static"] = true
+  end
   if self.cache_adapter ~= nil then options["cache_adapter"] = self.cache_adapter end
   options["extra_ffi_include_dirs"] = self.include_dirs
   local context: value = create(options)
@@ -4215,6 +4270,20 @@ end
 
 local function validate_embedded_provider_baseline(
     compiler: Compiler): compiler_io.LstatIdentity
+  if not compiler.embedded_provider then
+    -- A selected SDK's provider is its standard-library archive. Re-observe
+    -- the same stat tuple so a reinstalled prefix cannot keep a stale resolver
+    -- inventory inside a running worker.
+    local observed = archive_provider_identity(compiler.embedded_provider_file)
+    if not compiler_io.same_lstat_identity(
+        compiler.embedded_provider_identity, observed) then
+      raise BridgeError.new(
+        DRIVER_MODULE,
+        "selected compiler provider '" .. compiler.embedded_provider_file ..
+        "' changed after compiler initialization; restart the language server")
+    end
+    return observed
+  end
   local observed = observe_embedded_provider(compiler)
   if not compiler_io.same_lstat_identity(
       compiler.embedded_provider_identity, observed) then
@@ -5514,7 +5583,13 @@ end
   end
   -- This image owns the complete static provider and embedded target/interface
   -- inventory, including libraries not linked by application declarations.
-  output:write(fingerprint(self.embedded_provider_file))
+  if self.embedded_provider then
+    output:write(fingerprint(self.embedded_provider_file))
+  else
+    -- A selected SDK's provider archive is far larger than this executable and
+    -- is already fenced by its stat tuple on every analysis attempt.
+    output:write(content_identity.stat_identity(self.embedded_provider_file))
+  end
   return content_identity.digest(output:drain())
 end
 
