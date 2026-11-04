@@ -66,6 +66,7 @@ describe("server configuration", () => {
     );
     assert.deepEqual(options, {
       insertCallSnippets: false,
+      pullDiagnostics: false,
       trustedRoots: ["/work/slice"]
     });
     assert.notEqual(options.trustedRoots, roots);
@@ -85,6 +86,22 @@ describe("server configuration", () => {
       () => createInitializationOptions(completion, [42 as unknown as string]),
       (error: unknown) => error instanceof ServerConfigurationError
     );
+  });
+
+  test("opts the editor out of pull diagnostics", () => {
+    // The editor keeps the server's pushed collection: vscode-languageclient
+    // would otherwise show pulled and pushed diagnostics twice for open files,
+    // and pull-only without workspace diagnostics would hide closed files.
+    for (const insertCallSnippets of [true, false]) {
+      assert.deepEqual(
+        createInitializationOptions({ insertCallSnippets }, ["/work/slice"]),
+        {
+          insertCallSnippets,
+          pullDiagnostics: false,
+          trustedRoots: ["/work/slice"]
+        }
+      );
+    }
   });
 
   test("normalizes a configured path and copies arguments", () => {
