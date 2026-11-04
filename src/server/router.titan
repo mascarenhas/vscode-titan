@@ -1475,8 +1475,9 @@ function worker_response_body(original: value, object: wire.Object): string
   return wire.encode(envelope)
 end
 
-local function Router:on_client_response(object: wire.Object)
-  local raw_id = object["id"]
+local function Router:on_client_response(object: wire.Object,
+                                         response: dispatcher.ClientResponse)
+  local raw_id: value = response.id
   local key = worker_process.id_key(raw_id)
   local entry? = self.outbound[key]
   if entry == nil then
@@ -1867,26 +1868,18 @@ function Router:handle(body: string): integer?
   end
   local actual = object as wire.Object
   local method? = wire.as_string(actual["method"])
-  local raw_id = actual["id"]
-  if method == nil then
-    if raw_id ~= nil and (actual["result"] ~= nil or actual["error"] ~= nil) then
-      self:on_client_response(actual)
-    end
-    return nil
-  end
-  local actual_method = method as string
-  if actual_method == "initialize" and
+  if method == "initialize" and
      self.envelope:phase_name() == "before_initialize" then
     -- Trust, limits and initial roots are captured once: a replayed or hostile
     -- second initialize is answered by the lifecycle and must not widen this
     -- session's trust.
     self:capture_initialize(actual["params"])
-  elseif actual_method == "workspace/didChangeWorkspaceFolders" then
+  elseif method == "workspace/didChangeWorkspaceFolders" then
     if self.envelope:phase_name() ~= "before_initialize" then
       self:on_folders(actual["params"])
     end
     return nil
-  elseif actual_method == "workspace/didChangeConfiguration" then
+  elseif method == "workspace/didChangeConfiguration" then
     if self.envelope:phase_name() ~= "before_initialize" then
       self:revalidate_all(true)
     end
@@ -1917,6 +1910,12 @@ function Router:handle(body: string): integer?
     local response? = result.response
     if response ~= nil then router_publish(self, response as string) end
     self:drain_retired()
+    return nil
+  when client_response(response) then
+    -- A client answers one of this session's worker requests: the envelope
+    -- owner is the single classifier, so an invalid body never reaches here and
+    -- a response is never answered as a request.
+    self:on_client_response(actual, response)
     return nil
   when exit(code) then
     return code

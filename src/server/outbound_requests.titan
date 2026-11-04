@@ -174,11 +174,24 @@ function PendingRequest:wait(milliseconds: integer?): (value?, string?)
     end)
   end
   defer do
+    -- A wait that unwinds because its owner was cancelled only retires the
+    -- timer; joining there would re-raise that pending cancellation.
     if deadline ~= nil and not deadline:status():has_finished() then
       deadline:cancel(async.CancellationReason.simple("request settled"))
     end
   end
 
   async.suspend(self.resume_token, detach)
+
+  -- The wait settled: retire its timer and join it, so the deadline Task and
+  -- its native timer handle are terminal before the caller continues.
+  local pending_deadline? = deadline
+  if pending_deadline ~= nil then
+    local retired = pending_deadline as async.Task<|nil, value|>
+    if not retired:status():has_finished() then
+      retired:cancel(async.CancellationReason.simple("request settled"))
+    end
+    async.join(retired)
+  end
   return self.result, self.failure
 end

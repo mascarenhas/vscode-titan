@@ -230,18 +230,25 @@ local function document_notification(method: string, params: value): Route
   return immediate(no_response())
 end
 
--- A client answers a server-initiated request with an id and a result or
--- error instead of a method. Only the string identifiers this server allocates
--- can be client responses.
+-- A client answers a server-initiated request with an id and a result or error
+-- instead of a method. Only the string identifiers this server allocates can be
+-- client responses, and a body with neither member is a malformed request, not
+-- an answer: it receives Invalid Request rather than being dropped.
 local function client_response(object: wire.Object): ClientResponse?
   local id? = wire.as_string(object["id"])
   if id == nil then return nil end
+  local has_result = object["result"] ~= nil
+  local raw_error = object["error"]
+  if not has_result and raw_error == nil then return nil end
   local failure_message: string? = nil
-  local failure? = wire.as_object(object["error"])
-  if failure ~= nil then
-    failure_message = wire.as_string(failure["message"])
-    if failure_message == nil then
-      failure_message = "client request failed"
+  if raw_error ~= nil then
+    -- A response that carries an error always fails, even when the client sent
+    -- something other than a JSON-RPC error object.
+    failure_message = "client request failed"
+    local failure? = wire.as_object(raw_error)
+    if failure ~= nil then
+      local message? = wire.as_string((failure as wire.Object)["message"])
+      if message ~= nil then failure_message = message end
     end
   end
   return ClientResponse.new(id, object["result"], failure_message)

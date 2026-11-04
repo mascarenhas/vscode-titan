@@ -4,6 +4,7 @@ foreign import "compiler_io_platform.h"
 local test_service = import "server.test_service"
 local async = import "async"
 local fs = import "fs"
+local paths = import "path"
 local json = import "json"
 local sqlite3 = import "sqlite3"
 local strings = import "string"
@@ -3686,4 +3687,111 @@ end
 function test_application_pulls_the_completed_generation_and_refreshes_new_bytes(
     _context: test.Context)
   test_runtime.run(pulls_the_completed_generation_and_waits_for_new_bytes)
+end
+
+local function ends_the_progress_period_after_a_refresh_exception()
+  with_cold_application(function (
+      _filename: string, _analyzer: YieldingAnalyzer,
+      app: application.Application)
+    app:stop_watching_for_testing()
+    local output = response_queue.create()
+    local requests = outbound_requests.create(output)
+    local creates: {wire.Object} = {}
+    local progress: {wire.Object} = {}
+    app:set_client_channel(requests,
+      function (): lsp.ClientCapabilities?
+        return lsp.ClientCapabilities.new(true, false)
+      end)
+    defer requests:close()
+    local drain = function ()
+      drained_protocol_messages(output, requests, creates, progress,
+        function () end)
+    end
+
+    -- The first status emit belongs to the chain itself, before the refresh
+    -- Task exists; raising on the completed-state emit unwinds the pass after
+    -- its progress period has begun.
+    local raised = false
+    app:set_indexing_listener(function (status: indexing_status.Status)
+      if not raised and indexing_status.state_name(status.state) == "ready" then
+        raised = true
+        raise "deliberate status publication failure"
+      end
+    end)
+    app:start_indexing()
+    local refresh_task? = app.refresh_task
+    test.assert(refresh_task ~= nil, "indexing did not start a refresh Task")
+    wait_until(function (): boolean
+      drain()
+      return raised and not app:indexing_metrics().refresh_chain_active
+    end, "a raising status listener did not end the indexing chain")
+    wait_until(function (): boolean
+      drain()
+      return count_progress_kind(progress, "end") == 1
+    end, "a refresh exception after progress began left its period open")
+    -- The test owns this Task's terminal status. Titan still prints an
+    -- uncaught Task failure to stderr, which is the product's own diagnostic
+    -- for an unexpected refresh exception.
+    if refresh_task ~= nil then
+      case async.join(refresh_task)
+      when failed() then
+      else test.assert(false, "a raising status listener did not fail the Task")
+      end
+    end
+
+    -- The reporter is usable again: the next chain opens a new period.
+    app:set_indexing_listener(nil)
+    local tokens_before = #creates
+    app:note_saved_change()
+    wait_until(function (): boolean
+      drain()
+      return #creates == tokens_before + 1 and
+             count_progress_kind(progress, "end") == 2
+    end, "a refresh exception wedged the progress reporter")
+  end)
+end
+
+function test_application_ends_the_progress_period_after_a_refresh_exception(
+    _context: test.Context)
+  test_runtime.run(ends_the_progress_period_after_a_refresh_exception)
+end
+
+local function pulls_the_repaired_saved_project_after_a_failed_pass()
+  with_cold_application(function (
+      filename: string, _analyzer: YieldingAnalyzer,
+      app: application.Application)
+    local root = paths.dirname(paths.dirname(filename))
+    local config = root .. "/titan-config.lua"
+    fs.write_file(config, "include = {\n")
+    defer do
+      if fs.lstat(config) ~= nil then fs.unlink(config) end
+    end
+    app:start_indexing()
+    wait_until(function (): boolean
+      return app.refresh_failure ~= nil and
+             not app:indexing_metrics().refresh_chain_active
+    end, "a broken project configuration did not fail indexing")
+    test.assert(app.completed_view == nil,
+                "a failed first pass installed a completed view")
+
+    -- Repair the saved input and pull before any watcher event can be relied
+    -- on: the pull itself must obtain the generation covering the repaired
+    -- bytes instead of reporting the superseded failure.
+    app:stop_watching_for_testing()
+    fs.write_file(config,
+      'include = { "./src" }\nsource_module_roots = { "./src" }\n')
+    local report = pull_report(app, filename, nil)
+    test.assert(wire.as_string(report["kind"]) == "full",
+                "a pull after repairing the project did not return a report")
+    local items? = wire.as_array(report["items"])
+    test.assert(items ~= nil and #items == 0,
+                "the repaired project reported stale diagnostics")
+    test.assert(app:indexing_metrics().refresh_passes >= 2,
+                "the pull did not retry the failed saved project")
+  end)
+end
+
+function test_application_pulls_the_repaired_project_after_a_failed_pass(
+    _context: test.Context)
+  test_runtime.run(pulls_the_repaired_saved_project_after_a_failed_pass)
 end

@@ -2724,6 +2724,71 @@ async function testCancelledPullDiagnostics() {
   }
 }
 
+
+async function testRejectedProgressTokenAndInvalidBodies() {
+  const root = await makePhysicalTemporaryRoot("vscode-titan-progress-reject-");
+  await writeValidProject(root);
+  const child = launch(root);
+  const exit = exitOf(child);
+  const stderr = collect(child.stderr);
+  const responses = new FrameReader(child.stdout);
+  try {
+    await request(child, responses, 1, "initialize", {
+      capabilities: { window: { workDoneProgress: true } }
+    });
+    // A client that advertises work-done progress may still answer the create
+    // request with something that is not a JSON-RPC error object. The server
+    // must treat that as a failure and keep indexing without progress.
+    responses.serverRequestHandler = (message) => {
+      assert.equal(message.method, "window/workDoneProgress/create");
+      child.stdin.write(frame({
+        jsonrpc: "2.0", id: message.id, error: "rejected"
+      }));
+    };
+    child.stdin.write(frame({
+      jsonrpc: "2.0", method: "initialized", params: {}
+    }));
+    await waitForIndexing(responses);
+    assert.equal(responses.serverRequests.length, 1,
+      "a rejected progress token did not stop further progress requests");
+    assert.deepEqual(responses.progress, [],
+      "a rejected progress token still published work-done progress");
+
+    // A malformed body with a string id is a request, not a client response:
+    // it receives Invalid Request instead of being dropped.
+    child.stdin.write(frame({ jsonrpc: "2.0", id: "orphan-request" }));
+    let invalid;
+    while (invalid === undefined) {
+      const message = await responses.read();
+      if (message.id === undefined) {
+        collectNotification(responses, message);
+        continue;
+      }
+      invalid = message;
+    }
+    assert.equal(invalid.id, null,
+      `Invalid Request reply kept a request id: ${JSON.stringify(invalid)}`);
+    assert.equal(invalid.error?.code, -32600,
+      `malformed body was not rejected: ${JSON.stringify(invalid)}`);
+
+    const shutdown = await request(child, responses, "shutdown", "shutdown", null);
+    assert.equal(shutdown.result, null);
+    child.stdin.write(frame({ jsonrpc: "2.0", method: "exit" }));
+    assert.deepEqual(await awaitExit(exit), { code: 0, signal: null });
+    assert.equal(stderr().length, 0, stderr().toString("utf8"));
+  } catch (cause) {
+    const diagnostic = stderr().toString("utf8").trim();
+    throw new Error(
+      `${cause.message}${diagnostic.length > 0 ? `; stderr: ${diagnostic}` : ""}`,
+      { cause }
+    );
+  } finally {
+    if (child.exitCode === null && child.signalCode === null) child.kill();
+    await awaitExit(exit);
+    await rm(root, { recursive: true, force: true });
+  }
+}
+
 async function testTruncatedFrame() {
   const child = launch(process.cwd(), "error");
   const stdout = collect(child.stdout);
@@ -2792,6 +2857,7 @@ if (isMain) {
     await testVSCodePullDiagnosticsOptOut();
     await testPullDiagnostics();
     await testCancelledPullDiagnostics();
+    await testRejectedProgressTokenAndInvalidBodies();
     await testTruncatedFrame();
     console.log("native server protocol transcript passed");
   }

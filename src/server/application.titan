@@ -1167,6 +1167,9 @@ local function Application:start_refresh(force: boolean, reason: string):
       end
       -- Terminal cleanup must not depend on any best-effort output path.
       do self.diagnostic_publisher:clear() catch end
+      -- An unexpected exception must still close this chain's progress period;
+      -- otherwise the reporter stays busy and every later chain is silent.
+      do self.progress:finish("Titan indexing failed") catch self.progress:reset() end
       -- Preserve the original exceptional value. Its normalization is not
       -- allowed to become another failure merely to enrich telemetry.
       self:complete_refresh_chain("failed", target_epoch, nil)
@@ -1376,12 +1379,20 @@ end
 -- pass, which this loop joins; the client's own timeout bounds the wait through
 -- ordinary request cancellation.
 local function Application:fresh_view_for(path: string): (View?, Error?)
+  local retried_failure = false
   while true do
     if self.closed then
       return nil, Error.new("language server application is closed")
     end
     local view?, view_error? = self:current_view()
-    if view_error ~= nil then return nil, view_error end
+    if view_error ~= nil then
+      -- A failed pass is authoritative for the saved epoch it attempted, but
+      -- the saved input may have been repaired since, before any watcher hint.
+      -- A pull is an explicit on-demand request, so it spends one saved-change
+      -- hint of its own; a second failure is the answer.
+      if retried_failure then return nil, view_error end
+      retried_failure = true
+    end
     if view ~= nil and self:view_covers(view, path) then return view, nil end
     if self.refresh_task == nil then
       -- The watcher has not observed this saved change yet; index the same
@@ -1390,6 +1401,7 @@ local function Application:fresh_view_for(path: string): (View?, Error?)
     end
     local task? = self.refresh_task
     if task == nil then
+      if view_error ~= nil then return nil, view_error end
       return nil, Error.new("project refresh did not start")
     end
     async.join(task)

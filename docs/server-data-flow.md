@@ -214,9 +214,9 @@ The protocol layer also owns server-initiated requests. `outbound_requests`
 allocates string identifiers (`titan/<n>`), writes each request through the same
 sole writer as replies, and routes a client response — an object with an `id`
 and no `method` — to its waiting Task. A response with an unknown identifier is
-logged and dropped rather than answered, and session close fails every request
-still pending so its waiting Task unwinds. `indexing_progress` owns one
-work-done period per refresh chain: it requests the token, then publishes
+logged and dropped rather than answered, and both `shutdown` and session close
+fail every request still pending so its waiting Task unwinds. `indexing_progress`
+owns one work-done period per refresh chain: it requests the token, then publishes
 `$/progress` for that chain only, and `Application` ends the period after the
 completed view and its diagnostics are published. Progress tokens embed the
 server's process id, so the router forwards `$/progress` unchanged instead of
@@ -225,6 +225,9 @@ rewriting a token shared across workers. `textDocument/diagnostic`
 document request and joins `Application:fresh_view_for`, which compares a
 `project_graph.FileStamp` recorded for the discovered module with the file's
 current saved bytes and joins a refresh until the completed generation covers
-them. It answers from `published_diagnostics.read_uri`, the same rows push
-reads, and `diagnostics.report` encodes the report with a `resultId` derived
-from those items.
+them. A pull that follows a failed pass spends one saved-change hint of its own
+before it reports that failure, so a saved project repaired on disk answers with
+the repaired generation instead of the superseded error. It answers from
+`published_diagnostics.read_uri`, the same rows push reads, and
+`diagnostics.report` encodes the report with a `resultId` derived from those
+items.

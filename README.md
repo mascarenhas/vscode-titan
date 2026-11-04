@@ -381,11 +381,14 @@ The server advertises `diagnosticProvider` and answers `textDocument/diagnostic`
 from the same published rows it pushes, so pull and push never disagree. A pull
 waits for a refresh which covers the file's current saved bytes instead of
 answering from an older generation, and a cancelled pull is answered as
-cancelled. Each report carries a `resultId`, and a pull whose `previousResultId`
-still matches answers `unchanged`. Passing `initializationOptions.pullDiagnostics
-= false` omits `diagnosticProvider`; the VS Code extension always passes it
-because `vscode-languageclient` collects pulled and pushed diagnostics
-separately, and a pull-only client would lose diagnostics for closed files. See
+cancelled. A pull that follows a failed indexing pass re-indexes the saved
+project once, so repairing a file on disk answers with the repaired generation
+rather than the superseded error. Each report carries a `resultId`, and a pull
+whose `previousResultId` still matches answers `unchanged`. Passing
+`initializationOptions.pullDiagnostics = false` omits `diagnosticProvider`; the
+VS Code extension always passes it because `vscode-languageclient` collects
+pulled and pushed diagnostics separately, and a pull-only client would lose
+diagnostics for closed files. See
 [server data flow](docs/server-data-flow.md#protocol-boundary) for the protocol
 ownership of these requests.
 

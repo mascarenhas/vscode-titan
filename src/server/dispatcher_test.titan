@@ -511,6 +511,36 @@ function test_dispatcher_routes_client_responses_for_outbound_requests(
       "client error response without a message was not normalized")
   else test.assert(false, "message-less client error was not routed")
   end
+  -- An error member that is not a JSON-RPC error object still fails the
+  -- request instead of reporting success.
+  case server:route([[{"jsonrpc":"2.0","id":"titan/6","error":"rejected"}]])
+  when client_response(response) then
+    test.assert(response.id == "titan/6" and response.result == nil and
+      response.failure == "client request failed",
+      "non-object client error was reported as a successful response")
+  else test.assert(false, "non-object client error was not routed")
+  end
+  case server:route([[{"jsonrpc":"2.0","id":"titan/7","error":null}]])
+  when client_response(response) then
+    test.assert(response.id == "titan/7" and
+      response.failure == "client request failed",
+      "null client error was reported as a successful response")
+  else test.assert(false, "null client error was not routed")
+  end
+  -- A body with neither a result nor an error is a malformed request, not an
+  -- answer, whatever its id or method member looks like.
+  case server:route([[{"jsonrpc":"2.0","id":"req-1"}]])
+  when immediate(result) then
+    test.assert(response_error_code(result) == -32600,
+      "string-id body without a result escaped Invalid Request")
+  else test.assert(false, "string-id body without a result was routed")
+  end
+  case server:route([[{"jsonrpc":"2.0","id":"req-2","method":123}]])
+  when immediate(result) then
+    test.assert(response_error_code(result) == -32600,
+      "non-string method member escaped Invalid Request")
+  else test.assert(false, "non-string method member was routed")
+  end
   -- An object without a method and without a response id remains an invalid
   -- request, and an integer id cannot name a server-initiated request.
   case server:route([[{"jsonrpc":"2.0","id":7}]])
