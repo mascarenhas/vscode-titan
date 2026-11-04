@@ -65,8 +65,10 @@ local INTERNAL_ERROR = -32603
 local MIN_REQUEST_ID = -2147483648
 local MAX_REQUEST_ID = 2147483647
 
-function create(): Dispatcher
-  return Dispatcher.new(lifecycle.create(), nil)
+--- Create the stateful envelope validator and lifecycle router.
+-- @param workspace_folders Advertise multi-root folder support to the client.
+function create(workspace_folders: boolean?): Dispatcher
+  return Dispatcher.new(lifecycle.create(workspace_folders), nil)
 end
 
 function Dispatcher:phase_name(): string
@@ -296,6 +298,59 @@ local function Dispatcher:route_call(object: wire.Object): Route
   return immediate(no_response())
 end
 
+--- Route one already-decoded JSON value from a client message.
+function Dispatcher:route_value(parsed: value): Route
+  local object? = wire.as_object(parsed)
+  if object == nil then
+    return immediate(failure_response(nil, INVALID_REQUEST, "Invalid Request"))
+  end
+  return self:route_call(object as wire.Object)
+end
+
+-- The router forwards original message bytes, so it needs the same response
+-- envelopes without a nominal RequestId. These builders accept the decoded
+-- identifier a forwarded request already carried.
+--- Encode a successful response for an already-decoded request identifier.
+function result_body(id: value, result: value): string
+  local response_result = result
+  if response_result == nil then response_result = wire.null() end
+  local response_id = id
+  if response_id == nil then response_id = wire.null() end
+  local envelope: wire.Object = {
+    ["jsonrpc"] = "2.0", ["id"] = response_id, ["result"] = response_result,
+  }
+  return wire.encode(envelope)
+catch
+  if error is json.Error then
+    return failure_body(id, INTERNAL_ERROR, "Internal error")
+  end
+  raise
+end
+
+--- Encode a JSON-RPC error for an already-decoded request identifier.
+function failure_body(id: value, code: integer, message: string): string
+  local response_id = id
+  if response_id == nil then response_id = wire.null() end
+  local failure: wire.Object = {["code"] = code, ["message"] = message}
+  local envelope: wire.Object = {
+    ["jsonrpc"] = "2.0", ["id"] = response_id, ["error"] = failure,
+  }
+  return wire.encode(envelope)
+catch
+  if error is json.Error then
+    local response_id = id
+    if response_id == nil then response_id = wire.null() end
+    local failure: wire.Object = {
+      ["code"] = INTERNAL_ERROR, ["message"] = "Internal error",
+    }
+    local envelope: wire.Object = {
+      ["jsonrpc"] = "2.0", ["id"] = response_id, ["error"] = failure,
+    }
+    return wire.encode(envelope)
+  end
+  raise
+end
+
 --- Decode and validate a message before selecting its typed route.
 function Dispatcher:route(source: string): Route
   local parsed: value = nil
@@ -312,12 +367,7 @@ function Dispatcher:route(source: string): Route
     end
     raise
   end
-  local object? = wire.as_object(parsed)
-  if object == nil then
-    return immediate(failure_response(
-      nil, INVALID_REQUEST, "Invalid Request"))
-  end
-  return self:route_call(object)
+  return self:route_value(parsed)
 end
 
 -- Synchronous compatibility facade for protocol-unit callers. The async

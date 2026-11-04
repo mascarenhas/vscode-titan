@@ -7,6 +7,7 @@ local async = import "async"
 local fs = import "fs"
 local strings = import "string"
 local application = import "server.application"
+local bridge = import "server.compiler_bridge"
 local diagnostics = import "server.diagnostics"
 local dispatcher = import "server.dispatcher"
 local coordinator = import "server.coordinator"
@@ -16,13 +17,85 @@ local indexing_status = import "server.indexing_status"
 local logging = import "server.logging"
 local lua_paths = import "server.lua_paths"
 local protocol = import "server.protocol"
+local root_settings = import "server.root_settings"
+local roots = import "server.roots"
+local router = import "server.router"
+local source_text = import "server.source_text"
+local wire = import "server.wire"
 local workspace_cache = import "server.workspace_cache"
+
+local record Options
+  const worker: boolean
+  const root: string?
+  const compiler_root: string?
+  const print_paths: boolean
+end
+
+local function parse_options(args: {string}): Options
+  local options = Options.new(false, nil, nil, false)
+  local index = 1
+  while index <= #args do
+    local argument = args[index]
+    if argument == "--print-paths" then
+      options = Options.new(
+        options.worker, options.root, options.compiler_root, true)
+    elseif argument == "--worker" then
+      options = Options.new(
+        true, options.root, options.compiler_root, options.print_paths)
+    elseif argument == "--root" then
+      index = index + 1
+      if index <= #args then
+        options = Options.new(
+          options.worker, args[index], options.compiler_root,
+          options.print_paths)
+      end
+    elseif argument == "--compiler-root" then
+      index = index + 1
+      if index <= #args then
+        options = Options.new(
+          options.worker, options.root, args[index], options.print_paths)
+      end
+    end
+    index = index + 1
+  end
+  return options
+end
+
+local function absolute_root(candidate: string?): string
+  local requested? = candidate
+  if requested == nil then return fs.pwd() end
+  local resolved?, failure? = source_text.resolve_path(
+    fs.pwd(), requested as string)
+  if resolved == nil then
+    raise "invalid --root path: " .. failure.message
+  end
+  return resolved as string
+end
+
+-- A worker reports the process identity the router publishes as workerPid,
+-- plus the SDK and probe prefix its own environment resolved. The router
+-- consumes this notification and never forwards it to the client, so an agent
+-- reading titan/workspaceStatus sees each root's observed isolation rather than
+-- the router's intention.
+local function info_envelope(): wire.Object
+  local params: wire.Object = {
+    ["pid"] = os.pid(),
+    ["titanRoot"] = os.getenv("TITAN_ROOT") or "",
+    ["probePrefix"] = os.getenv("TITAN_PREFIX") or "",
+  }
+  return {
+    ["jsonrpc"] = "2.0",
+    ["method"] = "titan/workerInfo",
+    ["params"] = params,
+  }
+end
 
 local function serve(root: string): integer
   logging.emit("info", "server.start", {
     ["root"] = root,
     ["log_level"] = logging.level(),
     ["probe_cache_prefix"] = os.getenv("TITAN_PREFIX"),
+    ["compiler_root"] = bridge.compiler_root(),
   })
   local result = 1
   do
@@ -52,7 +125,8 @@ local function serve(root: string): integer
       end,
       function (request: dispatcher.SemanticRequest): coordinator.CompletionWork
         return server:capture_hover(request)
-      end)
+      end,
+      wire.encode(info_envelope()) as string)
   catch
     if error is protocol.ProtocolError then
       local failure = error as protocol.ProtocolError
@@ -86,10 +160,66 @@ local function serve(root: string): integer
   return result
 end
 
---- Configure the compiler environment and serve one workspace from command-line arguments.
+local function serve_router(root: string, executable: string): integer
+  local inherited_probe? = os.getenv("TITAN_PREFIX")
+  if inherited_probe == "" then inherited_probe = nil end
+  local titan_root? = os.getenv("TITAN_ROOT")
+  if titan_root == "" then titan_root = nil end
+  local launch_root = roots.canonical(root)
+  logging.emit("info", "server.start", {
+    ["root"] = launch_root,
+    ["log_level"] = logging.level(),
+    ["probe_cache_prefix"] = root_settings.probe_prefix(
+      inherited_probe, launch_root),
+  })
+  local result = 1
+  do
+    result = router.run(
+      os.stdin, os.stdout,
+      router.LaunchOptions.new(
+        executable, launch_root, inherited_probe, titan_root))
+  catch
+    if error is protocol.ProtocolError then
+      local failure = error as protocol.ProtocolError
+      logging.emit("error", "server.failure", {
+        ["message"] = failure.message,
+      })
+    elseif error is framing.FrameError then
+      local failure = error as framing.FrameError
+      logging.emit("error", "server.failure", {
+        ["message"] = failure.message,
+      })
+    elseif error is async.OperationError then
+      local failure = error as async.OperationError
+      logging.emit("error", "server.failure", {
+        ["operation"] = failure.operation,
+        ["message"] = failure.message,
+        ["name"] = failure.name,
+      })
+    else
+      local details = strings.tostring(error)
+      if #traceback > 0 then
+        details = details .. "\nstack traceback:\n" .. traceback
+      end
+      logging.emit("error", "server.failure", {
+        ["message"] = details,
+      })
+    end
+    result = 1
+  end
+  logging.emit("info", "server.stop", nil)
+  return result
+end
+
+--- Configure the compiler environment and serve the requested mode.
 function main(args: {string}): integer
-  local path, cpath = lua_paths.configure()
-  if #args > 0 and args[1] == "--print-paths" then
+  local options = parse_options(args)
+  if options.print_paths then
+    local path, cpath = lua_paths.configure()
+    local selected? = options.compiler_root
+    if selected ~= nil then
+      path, cpath = lua_paths.select_compiler_root(selected as string)
+    end
     io.print("package.path=" .. path)
     io.print("package.cpath=" .. cpath)
     return 0
@@ -109,13 +239,26 @@ function main(args: {string}): integer
       ["fallback"] = "info",
     })
   end
-  local root = fs.pwd()
-  local probe_prefix? = os.getenv("TITAN_PREFIX")
-  if probe_prefix == nil or probe_prefix == "" then
-    -- Each native process owns its startup working directory as its workspace.
-    -- Set the compiler's cache-only prefix before its Lua driver first loads;
-    -- TITAN_PREFIX does not choose compiler source, providers, or SDK headers.
-    os.setenv("TITAN_PREFIX", workspace_cache.directory(root))
+  if options.worker then
+    local root = absolute_root(options.root)
+    -- A worker owns its root as its process workspace, exactly like the
+    -- single-root server this mode replaces.
+    os.chdir(root)
+    local selected? = options.compiler_root
+    if selected ~= nil then
+      lua_paths.select_compiler_root(selected as string)
+      bridge.select_compiler_root(selected as string)
+    else
+      lua_paths.configure()
+    end
+    local probe_prefix? = os.getenv("TITAN_PREFIX")
+    if probe_prefix == nil or probe_prefix == "" then
+      -- Each native process owns its startup working directory as its workspace.
+      -- Set the compiler's cache-only prefix before its Lua driver first loads;
+      -- TITAN_PREFIX does not choose compiler source, providers, or SDK headers.
+      os.setenv("TITAN_PREFIX", workspace_cache.directory(root))
+    end
+    return serve(root)
   end
-  return serve(root)
+  return serve_router(fs.pwd(), os.exepath())
 end

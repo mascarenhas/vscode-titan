@@ -1,0 +1,203 @@
+--- Canonical workspace-root registry, document ownership, and config discovery.
+-- @module server.roots
+
+foreign import "compiler_io_platform.h"
+
+local async = import "async"
+local fs = import "fs"
+local paths = import "path"
+local strings = import "string"
+local source_text = import "server.source_text"
+
+local CONFIG_FILE_NAME = "titan-config.lua"
+
+--- Workspace-root provenance: an explicit client folder or config discovery.
+union Origin
+  folder()
+  discovered()
+end
+
+--- One canonical workspace root and the claims that keep it registered.
+record Root
+  const path: string
+  local folder_refs: integer
+  local discovered: boolean
+end
+
+function Root:origin(): Origin
+  if self.folder_refs > 0 then return Origin.folder() end
+  return Origin.discovered()
+end
+
+--- Report whether a client folder or a discovered config still claims this root.
+-- A discovered root outlives every folder reference: the document that revealed
+-- it keeps routing there, so only a released session drops it.
+function Root:claimed(): boolean
+  return self.folder_refs > 0 or self.discovered
+end
+
+--- Canonical root registry with most-specific containment lookup.
+record Roots
+  local entries: {string: Root}
+  local order: {string}
+end
+
+local function normalize_platform(path: string): string
+  if ffi.VSCODE_TITAN_WINDOWS == 0 then return path end
+  local normalized?, failure? = source_text.normalize_absolute_path(path)
+  if normalized == nil then raise failure end
+  return normalized
+end
+
+local function join(parent: string, name: string): string
+  return paths.to_slash(paths.join(parent, name))
+end
+
+local function parent_path(subject: string): string
+  local parent?, failure? = source_text.normalize_absolute_path(
+    paths.dirname(subject))
+  if parent == nil then raise failure end
+  return parent
+end
+
+-- Physical identity is the deepest existing ancestor's realpath plus the
+-- unresolved suffix. A folder or document may not exist yet; the root that
+-- owns it must still compare equal to the same path spelled through a symlink.
+--- Return the canonical spelling of an absolute path with a possibly absent suffix.
+function canonical(path: string): string
+  local candidate = normalize_platform(path)
+  local suffix: {string} = {}
+  while true do
+    do
+      local resolved = paths.to_slash(fs.realpath(candidate))
+      for index = #suffix, 1, -1 do
+        resolved = join(resolved, suffix[index])
+      end
+      return normalize_platform(resolved)
+    catch
+      if error is async.CancellationReason then raise end
+    end
+    local parent = parent_path(candidate)
+    if parent == candidate then return candidate end
+    local name = paths.basename(candidate)
+    if name == "" then return candidate end
+    suffix[#suffix + 1] = name
+    candidate = parent
+  end
+  return candidate
+end
+
+--- Report whether a canonical root contains a canonical subject path.
+function contains(root: string, subject: string): boolean
+  if subject == root then return true end
+  local prefix = root
+  if strings.sub(prefix, -1) ~= "/" then prefix = prefix .. "/" end
+  return strings.sub(subject, 1, #prefix) == prefix
+end
+
+local function configuration_file(directory: string): string
+  return join(directory, CONFIG_FILE_NAME)
+end
+
+local function has_configuration(directory: string): boolean
+  local metadata? = fs.stat(configuration_file(directory))
+  return metadata ~= nil and metadata.kind == "file"
+end
+
+-- Lazy discovery never guesses an SDK: it only finds the nearest directory
+-- whose own titan-config.lua makes it a Titan root.
+--- Return the nearest ancestor directory of a document that holds a config file.
+function discover(document_path: string): string?
+  local current = parent_path(document_path)
+  while true do
+    if has_configuration(current) then return canonical(current) end
+    local parent = parent_path(current)
+    if parent == current then return nil end
+    current = parent
+  end
+  return nil
+end
+
+--- Create an empty canonical root registry.
+function create(): Roots
+  return Roots.new({}, {})
+end
+
+function Roots:find(root_path: string): Root?
+  return self.entries[root_path]
+end
+
+function Roots:count(): integer
+  return #self.order
+end
+
+--- Return the registered roots in stable insertion order.
+function Roots:list(): {Root}
+  local result: {Root} = {}
+  for index = 1, #self.order do
+    result[index] = self.entries[self.order[index]]
+  end
+  return result
+end
+
+local function Roots:register(root_path: string): Root
+  local existing? = self.entries[root_path]
+  if existing ~= nil then return existing as Root end
+  local entry = Root.new(root_path, 0, false)
+  self.entries[root_path] = entry
+  self.order[#self.order + 1] = root_path
+  return entry
+end
+
+local function Roots:unregister(entry: Root)
+  if entry:claimed() then return end
+  if self.entries[entry.path] == nil then return end
+  self.entries[entry.path] = nil
+  local count = #self.order
+  for index = 1, count do
+    if self.order[index] == entry.path then
+      for following = index, count - 1 do
+        self.order[following] = self.order[following + 1]
+      end
+      self.order[count] = nil
+      return
+    end
+  end
+end
+
+--- Add one client folder claim and return its canonical root.
+function Roots:add_folder(root_path: string): Root
+  local entry = self:register(root_path)
+  entry.folder_refs = entry.folder_refs + 1
+  return entry
+end
+
+--- Drop one client folder claim; return true when the root is fully released.
+function Roots:remove_folder(root_path: string): boolean
+  local entry? = self.entries[root_path]
+  if entry == nil then return false end
+  local actual = entry as Root
+  if actual.folder_refs > 0 then actual.folder_refs = actual.folder_refs - 1 end
+  if actual:claimed() then return false end
+  self:unregister(actual)
+  return true
+end
+
+--- Register a root found by nearest-ancestor configuration discovery.
+function Roots:attach_discovery(root_path: string): Root
+  local entry = self:register(root_path)
+  entry.discovered = true
+  return entry
+end
+
+--- Return the most specific registered root that contains a canonical path.
+function Roots:owner(subject: string): Root?
+  local best: Root? = nil
+  for index = 1, #self.order do
+    local entry = self.entries[self.order[index]]
+    if contains(entry.path, subject) then
+      if best == nil or #entry.path > #best.path then best = entry end
+    end
+  end
+  return best
+end

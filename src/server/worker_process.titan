@@ -1,0 +1,431 @@
+--- One per-root language-server worker process and its framed stdio relay.
+-- @module server.worker_process
+
+local async = import "async"
+local framing = import "server.framing"
+local iteration = import "iteration"
+local logging = import "server.logging"
+local os = import "os"
+local strings = import "string"
+local timer = import "timer"
+local wire = import "server.wire"
+
+--- Outcome of one router-to-worker request.
+union ReplyOutcome
+  answered(value)
+  failed(value)
+  unavailable(string)
+end
+
+--- Router-owned side of a worker stream: notifications, requests, and replies.
+record Listener
+  const on_notification: function (string, value, string): ()
+  const on_request: function (value, string, value, string): ()
+  const on_response: function (string): ()
+  const on_exit: function (string): ()
+end
+
+local record Reply
+  local result: value
+  local failure: value
+  local message: string?
+  local finished: boolean
+  local waiter: async.Task?
+  local token: async.ResumeToken
+end
+
+local function new_reply(): Reply
+  return Reply.new(nil, nil, nil, false, nil,
+    async.ResumeToken.new("server.worker_process.reply"))
+end
+
+local function Reply:finish()
+  self.finished = true
+  local waiter? = self.waiter
+  self.waiter = nil
+  if waiter ~= nil then waiter:resume(self.token) end
+end
+
+local function Reply:resolve(result: value, failure: value)
+  if self.finished then return end
+  self.result = result
+  self.failure = failure
+  self:finish()
+end
+
+local function Reply:unavailable(message: string)
+  if self.finished then return end
+  self.message = message
+  self:finish()
+end
+
+local function Reply:take(): ReplyOutcome
+  if not self.finished then
+    if self.waiter ~= nil then
+      raise "worker reply already has a waiting consumer"
+    end
+    local current = async.running()
+    self.waiter = current
+    local detach = function ()
+      if self.waiter == current then self.waiter = nil end
+    end
+    defer detach()
+    async.suspend(self.token, detach)
+  end
+  if self.finished and self.message ~= nil then
+    return ReplyOutcome.unavailable(self.message as string)
+  end
+  if self.failure ~= nil then return ReplyOutcome.failed(self.failure) end
+  return ReplyOutcome.answered(self.result)
+end
+
+--- Stable map key for a client or router request identifier.
+function id_key(id: value): string
+  do
+    return wire.encode(id)
+  catch
+    return "unkeyable"
+  end
+end
+
+--- One live worker process with its relay Tasks and pending replies.
+record WorkerProcess
+  const root: string
+  const listener: Listener
+  local process: os.Process?
+  local input: os.OutputStream?
+  local output: os.InputStream?
+  local error_stream: os.InputStream?
+  local reader: async.Task<|nil, value|>?
+  local diagnostics: async.Task<|nil, value|>?
+  local waiter: async.Task<|nil, value|>?
+  local pending: {string: Reply}
+  local next_request: integer
+  local exited: boolean
+  local exit_message: string?
+end
+
+-- A worker that stopped reading its input (or already died) must never raise
+-- into the router's client loop: one root's transport failure is that root's
+-- own problem. The exit observer reports the failure that matters.
+--- Write one framed body to the worker, reporting whether it was delivered.
+function WorkerProcess:send(body: string): boolean
+  local target? = self.input
+  if target == nil then return false end
+  do
+    target:write(framing.frame(body))
+    return true
+  catch
+    if error is async.CancellationReason then raise end
+    logging.emit("debug", "worker.input.failure", {
+      ["root"] = self.root,
+      ["message"] = strings.tostring(error),
+    })
+  end
+  return false
+end
+
+function WorkerProcess:notify(method: string, params: value)
+  local envelope: wire.Object = {
+    ["jsonrpc"] = "2.0",
+    ["method"] = method,
+    ["params"] = params,
+  }
+  self:send(wire.encode(envelope))
+end
+
+local function fail_all(worker: WorkerProcess, message: string)
+  local replies: {Reply} = {}
+  for _key, reply in iteration.pairs(worker.pending) do
+    replies[#replies + 1] = reply
+  end
+  worker.pending = {}
+  for index = 1, #replies do replies[index]:unavailable(message) end
+end
+
+local function observe_exit(worker: WorkerProcess, message: string)
+  if worker.exited then return end
+  worker.exited = true
+  worker.exit_message = message
+  fail_all(worker, message)
+  worker.listener.on_exit(message)
+end
+
+local function dispatch_body(worker: WorkerProcess, body: string)
+  local parsed: value = nil
+  do
+    parsed = wire.decode(body)
+  catch
+    logging.emit("error", "worker.message.rejected", {
+      ["root"] = worker.root,
+      ["message"] = strings.tostring(error),
+    })
+    return
+  end
+  local object? = wire.as_object(parsed)
+  if object == nil then
+    logging.emit("error", "worker.message.rejected", {
+      ["root"] = worker.root,
+      ["message"] = "worker message is not a JSON object",
+    })
+    return
+  end
+  local actual = object as wire.Object
+  local method? = wire.as_string(actual["method"])
+  local id = actual["id"]
+  if method ~= nil then
+    if id ~= nil then
+      worker.listener.on_request(id, method as string, actual["params"], body)
+    else
+      worker.listener.on_notification(
+        method as string, actual["params"], body)
+    end
+    return
+  end
+  if id == nil then
+    logging.emit("error", "worker.message.rejected", {
+      ["root"] = worker.root,
+      ["message"] = "worker response has no id",
+    })
+    return
+  end
+  local reply? = worker.pending[id_key(id)]
+  if reply ~= nil then
+    worker.pending[id_key(id)] = nil
+    reply:resolve(actual["result"], actual["error"])
+    return
+  end
+  worker.listener.on_response(body)
+end
+
+local function read_messages(worker: WorkerProcess): nil
+  local source? = worker.output
+  if source == nil then return nil end
+  local reader = framing.reader()
+  while true do
+    local body? = reader:read(source)
+    if body == nil then return nil end
+    dispatch_body(worker, body)
+  end
+  return nil
+catch
+  if error is async.CancellationReason then raise end
+  local message = strings.tostring(error)
+  logging.emit("error", "worker.stream.failure", {
+    ["root"] = worker.root,
+    ["message"] = message,
+  })
+  return nil
+end
+
+-- Worker stderr is already structured log output. Forward complete lines
+-- through the router's single stderr owner so records never interleave.
+local function read_diagnostics(worker: WorkerProcess): nil
+  local source? = worker.error_stream
+  if source == nil then return nil end
+  local buffered = ""
+  while true do
+    local chunk? = source:read()
+    if chunk == nil then break end
+    buffered = buffered .. chunk
+    local start = 1
+    while true do
+      local newline?: integer = strings.find(buffered, "\n", start)
+      if newline == nil then break end
+      local line = strings.sub(buffered, start, newline - 1)
+      logging.raw(line)
+      start = newline + 1
+    end
+    buffered = strings.sub(buffered, start)
+  end
+  if #buffered > 0 then logging.raw(buffered) end
+  return nil
+catch
+  if error is async.CancellationReason then raise end
+  return nil
+end
+
+local function await_exit(worker: WorkerProcess): nil
+  local child? = worker.process
+  if child == nil then return nil end
+  local status = (child as os.Process):wait()
+  local message = "Titan worker for " .. worker.root .. " exited"
+  if status.signal == nil then
+    message = message .. " with code " .. status.code
+  else
+    message = message .. " on signal " .. status.signal
+  end
+  observe_exit(worker, message)
+  return nil
+catch
+  if error is async.CancellationReason then raise end
+  observe_exit(worker, "Titan worker for " .. worker.root .. " exited")
+  return nil
+end
+
+--- Spawn one worker process for a canonical root.
+function spawn(executable: string, arguments: {string}, root: string,
+               probe_prefix: string, listener: Listener): WorkerProcess
+  local process = os.spawn(executable, arguments,
+    os.with_env("TITAN_PREFIX", probe_prefix))
+  local worker = WorkerProcess.new(
+    root, listener, process, process.stdin, process.stdout, process.stderr,
+    nil, nil, nil, {}, 1, false, nil)
+  worker.reader = async.run<|nil, value|>(function (): nil
+    return read_messages(worker)
+  end)
+  worker.diagnostics = async.run<|nil, value|>(function (): nil
+    return read_diagnostics(worker)
+  end)
+  worker.waiter = async.run<|nil, value|>(function (): nil
+    return await_exit(worker)
+  end)
+  return worker
+end
+
+--- Send one request to the worker and await its bounded reply.
+function WorkerProcess:request(method: string, params: value,
+                               timeout_milliseconds: integer): ReplyOutcome
+  if self.exited then
+    local message? = self.exit_message
+    if message == nil then message = "Titan worker for " .. self.root .. " exited" end
+    return ReplyOutcome.unavailable(message)
+  end
+  local id = "titan-ls-worker:" .. strings.tostring(self.next_request)
+  self.next_request = self.next_request + 1
+  local reply = new_reply()
+  local key = id_key(id as value)
+  self.pending[key] = reply
+  local envelope: wire.Object = {
+    ["jsonrpc"] = "2.0",
+    ["id"] = id,
+    ["method"] = method,
+    ["params"] = wire.null(),
+  }
+  if params ~= nil then envelope["params"] = params end
+  if not self:send(wire.encode(envelope)) then
+    self.pending[key] = nil
+    return ReplyOutcome.unavailable(
+      "cannot write to Titan worker for " .. self.root)
+  end
+  local expiry = async.run<|nil, value|>(function (): nil
+    timer.sleep(timeout_milliseconds)
+    reply:unavailable(
+      "Titan worker for " .. self.root .. " did not answer " .. method)
+    return nil
+  end)
+  local outcome = reply:take()
+  self.pending[key] = nil
+  if not expiry:status():has_finished() then
+    expiry:cancel(async.CancellationReason.simple("worker reply arrived"))
+  end
+  return outcome
+end
+
+local function close_input(worker: WorkerProcess)
+  local stream? = worker.input
+  worker.input = nil
+  if stream == nil then return end
+  do
+    (stream as os.OutputStream):close()
+  catch
+    if error is async.CancellationReason then raise end
+  end
+end
+
+--- Stop a worker gracefully: shutdown request, exit notification, then kill.
+function WorkerProcess:stop(timeout_milliseconds: integer)
+  if self.exited then
+    close_input(self)
+    return
+  end
+  do
+    local outcome = self:request(
+      "shutdown", nil, timeout_milliseconds)
+    case outcome
+    when unavailable(message) then
+      logging.emit("debug", "root.worker.shutdown_unanswered", {
+        ["root"] = self.root,
+        ["message"] = message,
+      })
+    else
+    end
+    if not self.exited then
+      local envelope: wire.Object = {
+        ["jsonrpc"] = "2.0", ["method"] = "exit",
+        ["params"] = wire.null(),
+      }
+      self:send(wire.encode(envelope))
+    end
+  catch
+    if error is async.CancellationReason then raise end
+  end
+  close_input(self)
+  local waiter? = self.waiter
+  if waiter ~= nil then
+    do
+      local expiry = async.run<|nil, value|>(function (): nil
+        timer.sleep(timeout_milliseconds)
+        self:kill()
+        return nil
+      end)
+      async.join(waiter as async.Task<|nil, value|>)
+      if not expiry:status():has_finished() then
+        expiry:cancel(async.CancellationReason.simple("worker exited"))
+      end
+    catch
+      if error is async.CancellationReason then raise end
+    end
+  end
+end
+
+--- Terminate a worker that must not outlive the router.
+function WorkerProcess:kill()
+  close_input(self)
+  local child? = self.process
+  if child == nil or self.exited then return end
+  do
+    (child as os.Process):kill("kill")
+  catch
+    if error is async.CancellationReason then raise end
+  end
+end
+
+--- Release relay Tasks after the worker process has exited.
+function WorkerProcess:close()
+  self:kill()
+  local tasks: {async.Task<|nil, value|>} = {}
+  if self.reader ~= nil then tasks[#tasks + 1] = self.reader as async.Task<|nil, value|> end
+  if self.diagnostics ~= nil then
+    tasks[#tasks + 1] = self.diagnostics as async.Task<|nil, value|>
+  end
+  if self.waiter ~= nil then tasks[#tasks + 1] = self.waiter as async.Task<|nil, value|> end
+  self.reader = nil
+  self.diagnostics = nil
+  self.waiter = nil
+  for index = 1, #tasks do
+    local task = tasks[index]
+    if not task:status():has_finished() then
+      task:cancel(async.CancellationReason.simple("worker released"))
+    end
+    async.join(task)
+  end
+  local output? = self.output
+  self.output = nil
+  if output ~= nil then
+    do
+      output:close()
+    catch
+      if error is async.CancellationReason then raise end
+    end
+  end
+  local diagnostics? = self.error_stream
+  self.error_stream = nil
+  if diagnostics ~= nil then
+    do
+      diagnostics:close()
+    catch
+      if error is async.CancellationReason then raise end
+    end
+  end
+end

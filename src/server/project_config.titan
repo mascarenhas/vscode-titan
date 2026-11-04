@@ -15,8 +15,19 @@ record Error
   message: string
 end
 
+--- One evaluated configuration file's global assignments.
+type Environment = {value: value}
+--- Absent-or-evaluated configuration, including a missing optional file.
+type OptionalEnvironment = Environment?
+
+local LOCAL_CONFIG_FILE_NAME = "titan-config.local.lua"
+
 local function configuration_path(root: string): string
   return paths.to_slash(paths.join(root, "titan-config.lua"))
+end
+
+local function local_configuration_path(root: string): string
+  return paths.to_slash(paths.join(root, LOCAL_CONFIG_FILE_NAME))
 end
 
 --- Normalized project discovery, source roots, native flags, and provider settings.
@@ -29,6 +40,8 @@ record ProjectConfig
   binary_modules_root: string
   extra_ffi_include_dirs: {string}
   extra_ffi_cppflags: string?
+  compiler_root: string?
+  compiler_root_file: string?
 end
 
 local function copy_paths(source: {string}): {string}
@@ -47,11 +60,17 @@ function ProjectConfig:copy(): ProjectConfig
     binary_modules_root = self.binary_modules_root,
     extra_ffi_include_dirs = copy_paths(self.extra_ffi_include_dirs),
     extra_ffi_cppflags = self.extra_ffi_cppflags,
+    compiler_root = self.compiler_root,
+    compiler_root_file = self.compiler_root_file,
   }
 end
 
 -- Persist the same semantic fields used by live invalidation. Exclude only
 -- changes watcher policy and must not invalidate a compatible checked graph.
+-- compiler_root stays out of the identity on purpose: it selects the compiler
+-- before this process loads it, and the workspace cache already fences the
+-- compiler installation by its own compatibility fingerprint, so a selected
+-- SDK change rebuilds the cache without changing this digest.
 --- Return the complete identity fencing semantic cache compatibility.
 function ProjectConfig:semantic_identity(): string
   local output = strings.writer()
@@ -182,10 +201,24 @@ local function normalize_paths(config_file: string, base: string,
   return result
 end
 
+local function normalize_compiler_root(config_file: string,
+                                       project_root: string,
+                                       candidate: value): string
+  if not (candidate is string) then
+    return fail<|string|>(config_file, "compiler_root must be a string")
+  end
+  local text = candidate as string
+  if text == "" then
+    return fail<|string|>(config_file, "compiler_root must not be empty")
+  end
+  return resolve_config_path(config_file, project_root, text, "compiler_root")
+end
+
 local function normalize_environment(config_file: string?,
+                                     compiler_root_file: string?,
                                      project_root: string,
                                      default_binary_root: string,
-                                     environment: {value: value}):
+                                     environment: Environment):
     ProjectConfig
   -- Invalid defaults still belong to the expected configuration pathname,
   -- while config_file remains nil when the optional file is absent.
@@ -196,6 +229,7 @@ local function normalize_environment(config_file: string?,
   local raw_binary_root: value = nil
   local raw_include_dirs: value = nil
   local raw_cppflags: value = nil
+  local raw_compiler_root: value = nil
   for key, item in iteration.pairs(environment) do
     if not (key is string) then
       return fail<|ProjectConfig|>(
@@ -214,6 +248,8 @@ local function normalize_environment(config_file: string?,
       raw_include_dirs = item
     elseif name == "extra_ffi_cppflags" then
       raw_cppflags = item
+    elseif name == "compiler_root" then
+      raw_compiler_root = item
     else
       return fail<|ProjectConfig|>(
         error_path, "unknown titan-config.lua field '" .. name .. "'")
@@ -235,9 +271,64 @@ local function normalize_environment(config_file: string?,
     "extra_ffi_include_dirs", {})
   local cppflags: string? = optional_string(
     error_path, raw_cppflags, "extra_ffi_cppflags")
+  local compiler_root: string? = nil
+  if raw_compiler_root ~= nil then
+    local source_file = compiler_root_file or error_path
+    compiler_root = normalize_compiler_root(
+      source_file, project_root, raw_compiler_root)
+  end
   return ProjectConfig.new(
     project_root, config_file, include, exclude, source_module_roots,
-    binary_root, include_dirs, cppflags)
+    binary_root, include_dirs, cppflags, compiler_root, compiler_root_file)
+end
+
+-- Configuration is data, not an extension hook. Evaluate it with an empty
+-- environment so workspace code cannot write protocol-corrupting bytes through
+-- print/io (or mutate the embedded compiler Lua state). A valid file needs only
+-- assignments and Lua literals. The environment itself is the result;
+-- accepting a returned table would silently support a second, incompatible
+-- configuration format. A missing file yields nil, and a non-file path is an
+-- error.
+local function evaluate(config_file: string): Environment?
+  local metadata? = fs.stat(config_file)
+  if metadata == nil then return nil end
+  if metadata.kind ~= "file" then
+    return fail<|OptionalEnvironment|>(config_file,
+      paths.basename(config_file) .. " is not a regular file")
+  end
+  local environment: Environment = {}
+  local returned: value = nil
+  do
+    local source = fs.read_file(config_file)
+    local chunk = lua.load(source, "@" .. config_file, environment)
+    returned = chunk()
+  catch
+    if error is async.CancellationReason then raise end
+    return fail<|OptionalEnvironment|>(config_file,
+      "cannot evaluate " .. paths.basename(config_file) .. ": " ..
+      strings.tostring(error))
+  end
+  if returned ~= nil then
+    return fail<|OptionalEnvironment|>(config_file,
+      paths.basename(config_file) ..
+      " must use global assignments and return no value")
+  end
+  return environment
+end
+
+-- The untracked local override exists for one job: naming a machine-specific
+-- SDK prefix without dirtying the tracked configuration. Every other key is
+-- rejected rather than silently shadowing the tracked file.
+local function evaluate_local(config_file: string): Environment?
+  local environment? = evaluate(config_file)
+  if environment == nil then return nil end
+  for key, item in iteration.pairs(environment as Environment) do
+    if not (key is string) or (key as string) ~= "compiler_root" then
+      return fail<|OptionalEnvironment|>(config_file,
+        "titan-config.local.lua may only assign compiler_root")
+    end
+  end
+  return environment
 end
 
 local function load_or_raise(project_root: string,
@@ -249,40 +340,66 @@ local function load_or_raise(project_root: string,
     "installed binary modules root")
   local config_file = configuration_path(root)
 
-  local metadata? = fs.stat(config_file)
-  if metadata == nil then
-    return normalize_environment(nil, root, default_binary_root, {})
+  local tracked? = evaluate(config_file)
+  local environment: Environment = {}
+  local actual_config_file: string? = config_file
+  if tracked == nil then
+    actual_config_file = nil
+  else
+    environment = tracked as Environment
   end
-  if metadata.kind ~= "file" then
-    return fail<|ProjectConfig|>(
-      config_file, "titan-config.lua is not a regular file")
-  end
-
-  local environment: {value: value} = {}
-  local returned: value = nil
-  do
-    -- Configuration is data, not an extension hook. Evaluate it with an
-    -- empty environment so workspace code cannot write protocol-corrupting
-    -- bytes through print/io (or mutate the embedded compiler Lua state).
-    -- A valid file needs only assignments and Lua literals. The environment
-    -- itself is the result; accepting a returned table would silently support
-    -- a second, incompatible configuration format.
-    local source = fs.read_file(config_file)
-    local chunk = lua.load(source, "@" .. config_file, environment)
-    returned = chunk()
-  catch
-    if error is async.CancellationReason then raise end
-    return fail<|ProjectConfig|>(
-      config_file,
-      "cannot evaluate titan-config.lua: " .. strings.tostring(error))
-  end
-  if returned ~= nil then
-    return fail<|ProjectConfig|>(
-      config_file,
-      "titan-config.lua must use global assignments and return no value")
+  local compiler_root_file: string? = nil
+  local local_file = local_configuration_path(root)
+  local overrides? = evaluate_local(local_file)
+  if overrides ~= nil and overrides["compiler_root"] ~= nil then
+    environment["compiler_root"] = overrides["compiler_root"]
+    compiler_root_file = local_file
   end
   return normalize_environment(
-    config_file, root, default_binary_root, environment)
+    actual_config_file, compiler_root_file, root, default_binary_root,
+    environment)
+end
+
+--- Compiler SDK selection the router reads before any worker process exists.
+record CompilerRoot
+  compiler_root: string?
+  compiler_root_file: string?
+end
+
+-- The router must select an SDK and evaluate trust before a worker exists, and
+-- it must not load the compiler to do it. This reads only the two configuration
+-- files' compiler_root assignment; every other key stays the worker's business,
+-- which reports unknown or malformed fields as its own project error.
+--- Read the effective compiler_root from the tracked file and local override.
+function load_compiler_root(project_root: string): (CompilerRoot?, Error?)
+  do
+    local root = absolute_project_root(project_root)
+    local compiler_root: string? = nil
+    local compiler_root_file: string? = nil
+    local config_file = configuration_path(root)
+    local tracked? = evaluate(config_file)
+    if tracked ~= nil then
+      local raw = tracked["compiler_root"]
+      if raw ~= nil then
+        compiler_root = normalize_compiler_root(config_file, root, raw)
+        compiler_root_file = config_file
+      end
+    end
+    local local_file = local_configuration_path(root)
+    local overrides? = evaluate_local(local_file)
+    if overrides ~= nil then
+      local raw = overrides["compiler_root"]
+      if raw ~= nil then
+        compiler_root = normalize_compiler_root(local_file, root, raw)
+        compiler_root_file = local_file
+      end
+    end
+    return CompilerRoot.new(compiler_root, compiler_root_file), nil
+  catch
+    if error is async.CancellationReason then raise end
+    if error is Error then return nil, error as Error end
+    return nil, Error.new(project_root, strings.tostring(error))
+  end
 end
 
 -- The caller supplies the installed library-versioned directory reported by

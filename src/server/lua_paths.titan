@@ -4,6 +4,7 @@
 foreign import "compiler_io_platform.h"
 
 local os = import "os"
+local paths = import "path"
 local lua = import "lua"
 
 local LUA_PATH_ENVIRONMENT_VARIABLE = "TITAN_LS_LUA_PATH"
@@ -32,6 +33,35 @@ function configure(): (string, string)
   if ffi.VSCODE_TITAN_WINDOWS ~= 0 then default_cpath = "./?.dll" end
   local cpath =
     os.getenv(LUA_CPATH_ENVIRONMENT_VARIABLE) or default_cpath
+  set_package_paths(path, cpath)
+  return path, cpath
+end
+
+local function compiler_root_paths(prefix: string): (string, string)
+  local source = paths.to_slash(paths.join(prefix, "share/lua/5.5"))
+  local native = paths.to_slash(paths.join(prefix, "lib/lua/5.5"))
+  local path = source .. "/?.lua;" .. source .. "/?/init.lua"
+  local cpath = native .. "/?.so"
+  if ffi.VSCODE_TITAN_WINDOWS ~= 0 then cpath = native .. "/?.dll" end
+  return path, cpath
+end
+
+-- A selected SDK supplies its own compiler Lua, native modules, headers and
+-- providers. Inherited TITAN_* provider paths could otherwise mix another
+-- installation into this worker, and os.spawn cannot remove a variable, so the
+-- worker removes them here before any compiler module is required.
+--
+-- They must be removed rather than assigned an empty string: the driver reads
+-- `platform.getenv("TITAN_PATH_0_6") or platform.getenv("TITAN_PATH")`, and in
+-- Lua `""` is a present value, so an empty assignment would replace the
+-- selected prefix's own default provider path with an empty entry list.
+--- Select one installed SDK prefix for this process before compiler modules load.
+function select_compiler_root(prefix: string): (string, string)
+  os.setenv("TITAN_ROOT", prefix)
+  os.unsetenv("TITAN_PATH_0_6")
+  os.unsetenv("TITAN_PATH")
+  os.unsetenv("TITAN_SOURCE_PATH")
+  local path, cpath = compiler_root_paths(prefix)
   set_package_paths(path, cpath)
   return path, cpath
 end
