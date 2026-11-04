@@ -60,6 +60,9 @@ To build this repository you need:
 - an installed Titan SDK. Put its `titanc` on `PATH`, or set `TITAN_PREFIX` to
   its installation prefix, such as `$HOME/.local/titan`;
 - a C toolchain and the native prerequisites that Titan needs;
+- GNU Make 4.2 or newer. macOS ships GNU Make 3.81, so install Homebrew's
+  `make` and put its `libexec/gnubin` directory first on `PATH`; see
+  [native builds](docs/native-build.md#sdk-selection);
 - Node.js 24 and npm;
 - VS Code 1.106 or newer.
 
@@ -70,8 +73,7 @@ must provide compiler-owned incremental builds (certified object, native-C,
 and final-link reuse, native input switches, `--output`, and `--exe`).
 Installing a packaged VSIX needs none of this toolchain.
 
-Native packages build on Linux and macOS. On macOS, put GNU Make 4.4.1 first
-on `PATH`; see [native builds](docs/native-build.md#sdk-selection). Windows is
+Native packages build on Linux and macOS. Windows is
 [experimental](#windows).
 
 ## Build and test
@@ -124,7 +126,7 @@ server-only installation. On a headless Linux machine, run it as
 validation profile; `make`, `make server`, `make package` and installation use
 the optimized production profile.
 
-Run `make help` for the focused targets. `make server-test` runs the native
+Run `make help` for every target. `make server-test` runs the native
 suite serially, while `make server-test-sharded` runs it in two parallel
 shards; `make test` and `make verify` use the sharded runner.
 `make extension-test` runs the JavaScript unit tests. A successful compile is
