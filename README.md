@@ -383,7 +383,12 @@ waits for a refresh which covers the file's current saved bytes instead of
 answering from an older generation, and a cancelled pull is answered as
 cancelled. A pull that follows a failed indexing pass re-indexes the saved
 project once, so repairing a file on disk answers with the repaired generation
-rather than the superseded error. Each report carries a `resultId`, and a pull
+rather than the superseded error. A pull for a saved file the completed
+generation has not seen yet — a source created since, or one that was just
+deleted — re-indexes before it answers, so a newly written module reports its
+own diagnostics; a `.titan` file the project cannot admit as a source (outside
+every `include` root, excluded, or an inactive target variant) answers an empty
+report without re-indexing. Each report carries a `resultId`, and a pull
 whose `previousResultId` still matches answers `unchanged`. Passing
 `initializationOptions.pullDiagnostics = false` omits `diagnosticProvider`; the
 VS Code extension always passes it because `vscode-languageclient` collects

@@ -2789,6 +2789,108 @@ async function testRejectedProgressTokenAndInvalidBodies() {
   }
 }
 
+
+async function testPullForANewProjectSource() {
+  const root = await makePhysicalTemporaryRoot("vscode-titan-new-source-");
+  await mkdir(path.join(root, "src"), { recursive: true });
+  await writeFile(
+    path.join(root, "titan-config.lua"),
+    'include = { "./src" }\nsource_module_roots = { "./src" }\n',
+    "utf8"
+  );
+  const existing = path.join(root, "src", "main.titan");
+  await writeFile(existing, [
+    "function answer(item: integer): integer",
+    "  return item * 2",
+    "end",
+    ""
+  ].join("\n"), "utf8");
+  const child = launch(root);
+  const exit = exitOf(child);
+  const stderr = collect(child.stderr);
+  const responses = new FrameReader(child.stdout);
+  try {
+    await request(child, responses, 1, "initialize", {
+      capabilities: { window: { workDoneProgress: true } }
+    });
+    answerProgressRequests(child, responses);
+    child.stdin.write(frame({
+      jsonrpc: "2.0", method: "initialized", params: {}
+    }));
+    await nextProgressEvent(responses, "end");
+    const periodsBefore = responses.progress.filter(
+      (entry) => entry.value.kind === "begin").length;
+
+    // The commonest agent sequence: write a new source, then ask for its
+    // diagnostics before any watcher hint can be relied on.
+    const created = path.join(root, "src", "fresh.titan");
+    await writeFile(created, [
+      "function broken(): integer",
+      '  return "text"',
+      "end",
+      ""
+    ].join("\n"), "utf8");
+    const createdUri = pathToFileURL(created).href;
+    const pulled = await request(child, responses, "pull-created",
+      "textDocument/diagnostic", { textDocument: { uri: createdUri } },
+      30_000);
+    assert.equal(pulled.error, undefined,
+      `pull for a new source failed: ${JSON.stringify(pulled.error)}`);
+    assert.equal(pulled.result.kind, "full");
+    assert.equal(pulled.result.items.length, 1,
+      `a new project source reported ${JSON.stringify(pulled.result.items)}`);
+    assert.equal(pulled.result.items[0].code, "type");
+    assert.equal(pulled.result.items[0].source, "Titan");
+    // Let any follow-up period start, then drain through a router-owned request
+    // so a progress notification is recorded rather than read concurrently.
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    await request(child, responses, "after-created", "titan/workspaceStatus", {});
+    assert.ok(responses.progress.filter(
+      (entry) => entry.value.kind === "begin").length > periodsBefore,
+      "a pull for a new project source did not index it");
+
+    // A saved .titan file outside every include root can never be a source, so
+    // it answers an empty report and starts no indexing period.
+    const outside = path.join(root, "stray.titan");
+    await writeFile(outside, [
+      "function stray(): integer",
+      '  return "text"',
+      "end",
+      ""
+    ].join("\n"), "utf8");
+    const outsideUri = pathToFileURL(outside).href;
+    const periods = responses.progress.filter(
+      (entry) => entry.value.kind === "begin").length;
+    const empty = await request(child, responses, "pull-outside",
+      "textDocument/diagnostic", { textDocument: { uri: outsideUri } },
+      30_000);
+    assert.equal(empty.error, undefined);
+    assert.deepEqual(empty.result.items, [],
+      "a file outside every include root reported diagnostics");
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    await request(child, responses, "after-outside", "titan/workspaceStatus", {});
+    assert.equal(responses.progress.filter(
+      (entry) => entry.value.kind === "begin").length, periods,
+      "a pull outside every include root re-indexed the project");
+
+    const shutdown = await request(child, responses, "shutdown", "shutdown", null);
+    assert.equal(shutdown.result, null);
+    child.stdin.write(frame({ jsonrpc: "2.0", method: "exit" }));
+    assert.deepEqual(await awaitExit(exit), { code: 0, signal: null });
+    assert.equal(stderr().length, 0, stderr().toString("utf8"));
+  } catch (cause) {
+    const diagnostic = stderr().toString("utf8").trim();
+    throw new Error(
+      `${cause.message}${diagnostic.length > 0 ? `; stderr: ${diagnostic}` : ""}`,
+      { cause }
+    );
+  } finally {
+    if (child.exitCode === null && child.signalCode === null) child.kill();
+    await awaitExit(exit);
+    await rm(root, { recursive: true, force: true });
+  }
+}
+
 async function testTruncatedFrame() {
   const child = launch(process.cwd(), "error");
   const stdout = collect(child.stdout);
@@ -2858,6 +2960,7 @@ if (isMain) {
     await testPullDiagnostics();
     await testCancelledPullDiagnostics();
     await testRejectedProgressTokenAndInvalidBodies();
+    await testPullForANewProjectSource();
     await testTruncatedFrame();
     console.log("native server protocol transcript passed");
   }

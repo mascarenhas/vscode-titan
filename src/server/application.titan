@@ -1359,18 +1359,84 @@ local function stamp_is_current(stamp: project_graph.FileStamp): boolean
   return recorded == content_identity.digest(contents)
 end
 
-local function Application:view_covers(view: View, path: string): boolean
-  if self.closed then return false end
-  if self.change_epoch > self.completed_epoch then return false end
-  if self.refresh_task ~= nil then return false end
+local function snapshot_issue_for(snapshot: project_service.Snapshot,
+                                  path: string): project_discovery.Issue?
+  for index = 1, #snapshot.discovery_issues do
+    local issue = snapshot.discovery_issues[index]
+    if issue.path == path then return issue end
+  end
+  return nil
+end
+
+-- Could a refresh promote this path into the saved catalog? The rule is the
+-- watcher's relevance classification for one created regular file
+-- (`watch_change_disposition`) plus the compiler's own source-name admission, so
+-- a path the project can never treat as a source answers without a rescan.
+local function admits_project_source(snapshot: project_service.Snapshot,
+                                     path: string): boolean
+  local filter = build_watch_filter(snapshot)
+  for index = 1, #filter.cache_paths do
+    if path_within(filter.cache_paths[index], path) then return false end
+  end
+  for index = 1, #filter.excluded_paths do
+    if path_within(filter.excluded_paths[index], path) then return false end
+  end
+  if not titan_source_path(path) then return false end
+  if not mapped_source_path(path, filter.source_roots) then return false end
+  -- Discovery rejects a name this classification rejects, so it can never
+  -- become a module, and a variant label this host does not select is inactive.
+  local classification = bridge.classify_source_filename(paths.basename(path))
+  if classification.logical_basename == nil then return false end
+  local label? = classification.label
+  if label ~= nil then
+    local variant: string = label
+    if not bridge.target_label_applies(bridge.host_target(), variant) then
+      return false
+    end
+  end
+  local parent = parent_directory(path)
+  for index = 1, #filter.include_roots do
+    local include_root = filter.include_roots[index]
+    if path_within(include_root, path) and
+       included_directory_path(include_root, parent, filter.source_roots) then
+      return true
+    end
+  end
+  return false
+end
+
+-- Why one completed generation does or does not answer for one path.
+local union Coverage
+  fresh()
+  -- The accepted bytes are not the file's current bytes.
+  changed()
+  -- The completed catalog has no entry for this admitted source yet.
+  absent()
+end
+
+local function Application:coverage(view: View, path: string): Coverage
+  if self.closed then return Coverage.changed() end
+  if self.change_epoch > self.completed_epoch then return Coverage.changed() end
+  if self.refresh_task ~= nil then return Coverage.changed() end
   local service? = self.service
-  if service == nil then return false end
+  if service == nil then return Coverage.changed() end
   local snapshot = service:latest()
-  if snapshot.generation ~= view.work_generation then return false end
+  if snapshot.generation ~= view.work_generation then return Coverage.changed() end
   local stamp? = project_source_stamp(snapshot, path)
-  -- A path outside the saved project cannot gain diagnostics from a refresh.
-  if stamp == nil then return true end
-  return stamp_is_current(stamp)
+  if stamp ~= nil then
+    if stamp_is_current(stamp) then return Coverage.fresh() end
+    return Coverage.changed()
+  end
+  -- The catalog has no stamp for this path. The generation is authoritative
+  -- when it already classified the path (a discovery issue describes it), and a
+  -- path the project could never admit as a source cannot gain diagnostics from
+  -- a refresh. Otherwise a refresh has not seen this source yet, for example a
+  -- file created since the completed generation.
+  if snapshot_issue_for(snapshot, path) ~= nil then return Coverage.fresh() end
+  local observed? = content_identity.observe(path)
+  if observed == nil or observed.kind ~= "file" then return Coverage.fresh() end
+  if admits_project_source(snapshot, path) then return Coverage.absent() end
+  return Coverage.fresh()
 end
 
 -- A pull describes the saved bytes the client is about to read. Wait for a
@@ -1380,6 +1446,7 @@ end
 -- ordinary request cancellation.
 local function Application:fresh_view_for(path: string): (View?, Error?)
   local retried_failure = false
+  local refreshed_absent = false
   while true do
     if self.closed then
       return nil, Error.new("language server application is closed")
@@ -1393,7 +1460,18 @@ local function Application:fresh_view_for(path: string): (View?, Error?)
       if retried_failure then return nil, view_error end
       retried_failure = true
     end
-    if view ~= nil and self:view_covers(view, path) then return view, nil end
+    if view ~= nil then
+      case self:coverage(view, path)
+      when fresh() then return view, nil
+      when absent() then
+        -- One refresh may promote this source into the catalog. A generation
+        -- that still does not contain it is the answer, so a pull can never
+        -- rescan the same state forever.
+        if refreshed_absent then return view, nil end
+        refreshed_absent = true
+      when changed() then
+      end
+    end
     if self.refresh_task == nil then
       -- The watcher has not observed this saved change yet; index the same
       -- saved state a watcher hint would.

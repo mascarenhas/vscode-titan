@@ -3795,3 +3795,79 @@ function test_application_pulls_the_repaired_project_after_a_failed_pass(
     _context: test.Context)
   test_runtime.run(pulls_the_repaired_saved_project_after_a_failed_pass)
 end
+
+local function pulls_new_and_deleted_project_sources()
+  with_cold_application(function (
+      filename: string, _analyzer: YieldingAnalyzer,
+      app: application.Application)
+    local source_root = paths.dirname(filename)
+    local root = paths.dirname(source_root)
+    local config = root .. "/titan-config.lua"
+    fs.write_file(config,
+      'include = { "./src" }\nsource_module_roots = { "./src" }\n')
+    defer do
+      if fs.lstat(config) ~= nil then fs.unlink(config) end
+    end
+    app:start_indexing()
+    wait_until(function (): boolean
+      return app.completed_view ~= nil and
+             not app:indexing_metrics().refresh_chain_active
+    end, "the project did not finish its first indexing pass")
+    -- Replace the watcher with one that never delivers an event, so only the
+    -- pull's own freshness rule can start a refresh.
+    use_manual_watch_delivery(app)
+
+    local created = source_root .. "/created.titan"
+    fs.write_file(created, "function created(): integer\n  return 1\nend\n")
+    defer do
+      if fs.lstat(created) ~= nil then fs.unlink(created) end
+    end
+    local before = app:indexing_metrics().refresh_passes
+    local report = pull_report(app, created, nil)
+    test.assert(wire.as_string(report["kind"]) == "full",
+                "a pull for a new project source did not return a report")
+    local items? = wire.as_array(report["items"])
+    test.assert(items ~= nil and #items == 0,
+                "a new project source reported diagnostics")
+    test.assert(app:indexing_metrics().refresh_passes == before + 1,
+                "a pull for a new project source did not index it")
+    local settled = app:indexing_metrics().refresh_passes
+    local repeated = pull_report(app, created,
+      wire.as_string(report["resultId"]))
+    test.assert(wire.as_string(repeated["kind"]) == "unchanged" and
+                app:indexing_metrics().refresh_passes == settled,
+                "a second pull for the indexed source re-indexed the project")
+
+    -- A saved .titan file outside every include root can never become a source,
+    -- so it answers immediately and starts no refresh.
+    local outside = root .. "/stray.titan"
+    fs.write_file(outside, "function stray(): integer\n  return 1\nend\n")
+    defer do
+      if fs.lstat(outside) ~= nil then fs.unlink(outside) end
+    end
+    local outside_passes = app:indexing_metrics().refresh_passes
+    local empty = pull_report(app, outside, nil)
+    local empty_items? = wire.as_array(empty["items"])
+    test.assert(wire.as_string(empty["kind"]) == "full" and
+                empty_items ~= nil and #empty_items == 0,
+                "a pull outside every include root reported diagnostics")
+    test.assert(app:indexing_metrics().refresh_passes == outside_passes,
+                "a pull outside every include root re-indexed the project")
+
+    -- Deleting an indexed source makes the generation stale: the pull refreshes
+    -- instead of answering for the vanished module.
+    fs.unlink(created)
+    local deleted = pull_report(app, created, nil)
+    local deleted_items? = wire.as_array(deleted["items"])
+    test.assert(wire.as_string(deleted["kind"]) == "full" and
+                deleted_items ~= nil and #deleted_items == 0,
+                "a pull for a deleted source answered a stale generation")
+    test.assert(app:indexing_metrics().refresh_passes > settled,
+                "a pull for a deleted source did not refresh the project")
+  end)
+end
+
+function test_application_pulls_new_and_deleted_project_sources(
+    _context: test.Context)
+  test_runtime.run(pulls_new_and_deleted_project_sources)
+end
