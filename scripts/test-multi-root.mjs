@@ -1785,6 +1785,111 @@ async function testOverlayLimits() {
   }
 }
 
+// A worker restart must not reset what the client already accepted: the
+// extension's indexing model drops an epoch below its watermark, so the router
+// owns one session timeline per root.
+async function testIndexingEpochs() {
+  const base = await makeBase("epochs");
+  const root = path.join(base, "slice");
+  const source = await writeRoot(root, ROOT_A_SOURCE);
+  const session = new Session(launch(root, "error"));
+  try {
+    await session.initialize({
+      workspaceFolders: [{ uri: uri(root), name: "slice" }],
+      initializationOptions: { trustedRoots: [root] }
+    });
+    session.notify("initialized", {});
+    await pollStatus(session, (roots) =>
+      rootEntry(roots, root).state === "ready",
+      "the root did not start");
+    await pollHover(session, source, ROOT_A_SOURCE, "doubled", /integer/,
+      "the first worker");
+    const before = session.responses.indexingStatuses.slice();
+    assert.ok(before.length > 0, "the session reported no indexing status");
+    let watermark = 0;
+    for (const status of before) {
+      if (status.epoch > watermark) watermark = status.epoch;
+    }
+    const running = rootEntry(await session.status(), root);
+    process.kill(running.workerPid, "SIGKILL");
+    await pollStatus(session, (roots) =>
+      rootEntry(roots, root).workerPid === null,
+      "the worker's exit was not observed");
+    await pollHover(session, source, ROOT_A_SOURCE, "doubled", /integer/,
+      "the replacement worker");
+    const after = session.responses.indexingStatuses.slice(before.length);
+    assert.ok(after.length > 0,
+      "the replacement worker reported no indexing status");
+    // The client drops an epoch below its watermark, so the first epoch of the
+    // replacement worker must clear it; later frames of one indexing pass may
+    // repeat that epoch, exactly as the worker's own epochs do.
+    let previous = watermark;
+    for (let index = 0; index < after.length; index += 1) {
+      const epoch = after[index].epoch;
+      const accepted = index === 0 ? epoch > watermark : epoch >= previous;
+      assert.ok(Number.isInteger(epoch) && accepted,
+        `a forwarded epoch restarted below the session watermark: ${
+          JSON.stringify(after.map((entry) => entry.epoch))} after ${watermark}`);
+      previous = epoch;
+    }
+    assert.ok(after.some((status) => status.state === "ready"),
+      "the replacement worker's ready status was not forwarded");
+    await session.shutdown();
+  } finally {
+    await session.abort();
+  }
+}
+
+// A cancelled cleanup must never leave a worker owned by nobody: shutdown
+// cancels the housekeeping Task that may be restarting or evicting a worker.
+async function testShutdownDuringRestart() {
+  const base = await makeBase("stop-cancel");
+  const sdk = path.join(base, "sdk");
+  await farmSdk(sdkRoot(), sdk);
+  const digests = path.join(sdk, "lib", "titan", "0.6", "sdk-digests");
+  await assertFarmedFile(sdk, digests);
+  await replaceWithCopy(digests);
+  const root = path.join(base, "slice");
+  await writeRoot(root, ROOT_A_SOURCE,
+    `include = { "./src" }\nsource_module_roots = { "./src" }\ncompiler_root = "${sdk}"\n`);
+  const delays = [0, 40, 90, 150, 240];
+  for (let attempt = 0; attempt < delays.length; attempt += 1) {
+    const session = new Session(launch(root, "error"));
+    const pids = new Set();
+    try {
+      await session.initialize({
+        workspaceFolders: [{ uri: uri(root), name: "slice" }],
+        initializationOptions: { trustedRoots: [base] }
+      });
+      session.notify("initialized", {});
+      const started = await pollStatus(session, (roots) => {
+        const entry = rootEntry(roots, root);
+        return entry.state === "ready" && entry.workerPid !== null
+          ? { accepted: roots } : { rejected: roots };
+      }, "the selected-SDK root did not start");
+      pids.add(rootEntry(started, root).workerPid);
+      // A reinstall makes housekeeping restart this root on its next sweep; the
+      // shutdown below lands in that restart for at least one delay.
+      await writeFile(digests, `reinstalled digests ${attempt}\n`, "utf8");
+      if (delays[attempt] > 0) {
+        await new Promise((resolve) => setTimeout(resolve, delays[attempt]));
+      }
+      await session.shutdown();
+      const stderr = session.stderr().toString("utf8");
+      assert.equal(
+        /server\.failure|worker\.wait\.failure|root\.worker\.stop_failure/
+          .test(stderr), false,
+        `a cancelled worker stop reported a failure: ${stderr.slice(0, 600)}`);
+      for (const pid of pids) {
+        assert.throws(() => process.kill(pid, 0), /ESRCH/,
+          `worker ${pid} outlived the router`);
+      }
+    } finally {
+      await session.abort();
+    }
+  }
+}
+
 const groups = [
   ["independent", testIndependentRoots, "independent roots"],
   ["folders", testFolderChanges, "folder changes"],
@@ -1798,7 +1903,9 @@ const groups = [
   ["nested", testNestedProjects, "nested projects"],
   ["released", testReleasedRoots, "released roots"],
   ["migrate", testOwnershipMigration, "ownership migration"],
-  ["overlay-limits", testOverlayLimits, "overlay limits"]
+  ["overlay-limits", testOverlayLimits, "overlay limits"],
+  ["indexing-epochs", testIndexingEpochs, "indexing epochs"],
+  ["shutdown-restart", testShutdownDuringRestart, "shutdown during a restart"]
 ];
 
 async function main() {

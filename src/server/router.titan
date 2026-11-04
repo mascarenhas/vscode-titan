@@ -127,6 +127,11 @@ record Slot
   local probe_prefix: string?
   -- The worker reported background indexing; it is not idle then.
   local indexing: boolean
+  -- Session timeline for titan/indexingStatus. A replacement worker restarts
+  -- its own epochs, and the client rejects anything below what it already saw.
+  local epoch_base: integer?
+  local epoch_offset: integer
+  local indexing_watermark: integer
   local diagnosed_file: string?
   -- URIs this root published diagnostics for, and the document each names.
   local published: {string: string}
@@ -306,6 +311,9 @@ local function slot_for_root(router: Router, entry: roots.Root): Slot
     titan_root = nil,
     probe_prefix = nil,
     indexing = false,
+    epoch_base = nil,
+    epoch_offset = 0,
+    indexing_watermark = 0,
     diagnosed_file = nil,
     published = {},
     transitioning = false,
@@ -556,11 +564,22 @@ local function stop_worker_locked(router: Router, slot: Slot, reason: string)
   slot.probe_prefix = nil
   slot.indexing = false
   if worker ~= nil then
-    slot.stopping = true
     local actual_worker = worker as worker_process.WorkerProcess
-    actual_worker:stop(SHUTDOWN_TIMEOUT_MILLISECONDS)
+    -- Ownership moves to the router before any suspension point: a caller
+    -- cancelled inside `stop` (shutdown cancelling housekeeping) must not drop
+    -- the child or its relay Tasks, so the terminal paths can still release it.
+    router.retired[#router.retired + 1] = actual_worker
+    slot.stopping = true
+    do
+      actual_worker:stop(SHUTDOWN_TIMEOUT_MILLISECONDS)
+    catch
+      if error is async.CancellationReason then raise end
+      logging.emit("error", "root.worker.stop_failure", {
+        ["root"] = slot.root.path,
+        ["message"] = strings.tostring(error),
+      })
+    end
     slot.stopping = false
-    router.retired[#router.retired + 1] = worker as worker_process.WorkerProcess
   end
   fail_forwarded(router, slot.root.path,
     "Titan worker for " .. slot.root.path .. " stopped: " .. reason)
@@ -625,14 +644,45 @@ local function worker_listener(router: Router, slot: Slot): worker_process.Liste
         return
       end
       if method == "titan/indexingStatus" then
-        -- The publication itself is forwarded unchanged: it carries no root
-        -- identity, so only this slot's idleness may observe it.
+        -- Idleness observes the publication, and the router owns one session
+        -- timeline per root: a replacement worker restarts its own epochs at 1
+        -- and the client drops anything below the epoch it already saw, so the
+        -- forwarded epoch is translated into that timeline. The publication
+        -- carries no root identity, so only this slot's state uses it.
         local object? = wire.as_object(params)
         if object ~= nil then
-          local state? = wire.as_string((object as wire.Object)["state"])
+          local actual_params = object as wire.Object
+          local state? = wire.as_string(actual_params["state"])
           if state ~= nil then
             local name: string = state
             owner.indexing = name == "indexing"
+          end
+          local epoch? = wire.as_integer(actual_params["epoch"])
+          if epoch ~= nil then
+            local worker_epoch: integer = epoch
+            local base? = owner.epoch_base
+            if base == nil then
+              owner.epoch_base = worker_epoch
+              owner.epoch_offset = owner.indexing_watermark
+            end
+            local actual_base: integer = owner.epoch_base as integer
+            local session_epoch =
+              owner.epoch_offset + (worker_epoch - actual_base) + 1
+            if session_epoch > owner.indexing_watermark then
+              owner.indexing_watermark = session_epoch
+            end
+            local rewritten: wire.Object = {}
+            for key, value in iteration.pairs(actual_params) do
+              rewritten[key] = value
+            end
+            rewritten["epoch"] = session_epoch
+            local envelope: wire.Object = {
+              ["jsonrpc"] = "2.0",
+              ["method"] = "titan/indexingStatus",
+              ["params"] = rewritten,
+            }
+            router.output:push(wire.encode(envelope))
+            return
           end
         end
       end
@@ -1010,6 +1060,7 @@ local function start_worker(router: Router, slot: Slot,
   -- A freshly started worker is not idle: it indexes before its first
   -- titan/indexingStatus frame arrives, and stopping it would discard that pass.
   slot.indexing = true
+  slot.epoch_base = nil
   slot.generation = slot.generation + 1
   local outcome = worker:request(
     "initialize", worker_initialize_params(router, slot.root.path),
@@ -1033,8 +1084,14 @@ local function start_worker(router: Router, slot: Slot,
   when failed(error_value) then
     slot.worker = nil
     slot.indexing = false
-    worker:stop(SHUTDOWN_TIMEOUT_MILLISECONDS)
+    -- Ownership moves before any suspension, so a cancelled caller still
+    -- leaves the child and its relay Tasks to the terminal paths.
     router.retired[#router.retired + 1] = worker
+    do
+      worker:stop(SHUTDOWN_TIMEOUT_MILLISECONDS)
+    catch
+      if error is async.CancellationReason then raise end
+    end
     record_crash(slot)
     fail_slot(slot, "Titan worker for " .. slot.root.path ..
       " rejected initialize: " .. strings.tostring(error_value))
@@ -1044,8 +1101,8 @@ local function start_worker(router: Router, slot: Slot,
     -- harmless because release is idempotent.
     slot.worker = nil
     slot.indexing = false
-    worker:kill()
     router.retired[#router.retired + 1] = worker
+    worker:kill()
     record_crash(slot)
     fail_slot(slot, message)
     return false
@@ -1771,8 +1828,8 @@ local function Router:stop_all()
     slot.worker_pid = nil
     if worker ~= nil then
       local actual_worker = worker as worker_process.WorkerProcess
-      actual_worker:kill()
       self.retired[#self.retired + 1] = actual_worker
+      actual_worker:kill()
     end
   end
   self:drain_retired()

@@ -172,7 +172,12 @@ requests, completion and document notifications. `lifecycle` owns the
 `initialize`/`shutdown`/`exit` states and the advertised capabilities; the
 router enables its workspace-folder capability and only the router advertises
 it. The custom `titan/indexingStatus` notification (`indexing_status`) drives
-the extension's language-status item.
+the extension's language-status item; because a replacement worker restarts its
+own epochs and the client drops anything below the epoch it already saw, the
+router forwards each root's epochs on one session timeline
+(`Slot.indexing_watermark`). A worker detached from its slot is owned by the
+router (`Router.retired`) before any suspension, so a shutdown that cancels a
+restart still releases its process and relay Tasks.
 
 The router also filters diagnostics by ownership: a worker's
 `textDocument/publishDiagnostics` for a URI is forwarded only when that worker

@@ -338,10 +338,17 @@ local function close_input(worker: WorkerProcess)
 end
 
 --- Stop a worker gracefully: shutdown request, exit notification, then kill.
+-- Every exit path, including cancellation of the caller, still closes the
+-- child's stdin and kills a child that stays alive: a cancelled stop must never
+-- leave the process (or a relay Task) owned by nobody.
 function WorkerProcess:stop(timeout_milliseconds: integer)
   if self.exited then
     close_input(self)
     return
+  end
+  defer do
+    close_input(self)
+    if not self.exited then self:kill() end
   end
   do
     local outcome = self:request(
