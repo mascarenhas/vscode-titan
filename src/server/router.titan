@@ -469,6 +469,14 @@ local function fail_forwarded(router: Router, root: string, message: string)
   end
 end
 
+-- Forget the worker requests this root still owes the client. Its successor is
+-- a new process, so a late client answer must not reach it under a retired id.
+local function forget_outbound(router: Router, root: string)
+  for key, entry in iteration.pairs(router.outbound) do
+    if entry.root == root then router.outbound[key] = nil end
+  end
+end
+
 local function in_flight_for(router: Router, root: string): integer
   local count = 0
   for _key, entry in iteration.pairs(router.forwarded) do
@@ -591,6 +599,7 @@ local function stop_worker_locked(router: Router, slot: Slot, reason: string)
       overlay.owner = nil
     end
   end
+  forget_outbound(router, slot.root.path)
   slot.state = WorkerState.evicted()
   logging.emit("info", "root.stop", {
     ["root"] = slot.root.path,
@@ -762,6 +771,9 @@ local function worker_listener(router: Router, slot: Slot): worker_process.Liste
       owner.titan_root = nil
       owner.probe_prefix = nil
       owner.indexing = false
+      -- The process is gone, so the requests it owed the client can never be
+      -- answered; forget them before any early return below.
+      forget_outbound(router, owner.root.path)
       if not state_ready(owner.state) then
         -- Activation owns the failure for a worker that never became ready: its
         -- initialize reply carries this same exit, and counting it here too
