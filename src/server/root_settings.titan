@@ -36,6 +36,7 @@ local PATH_LIST_SEPARATOR_WINDOWS = 59
 union Reason
   untrusted_selection()
   invalid_prefix()
+  invalid_configuration()
 end
 
 --- One root-scoped configuration or selection failure.
@@ -174,16 +175,20 @@ end
 --- Resolve one root's effective SDK selection, trust decision and layout check.
 function load(root: string, trust: Trust): (Settings?, Error?)
   local allowed = trust:allows(root)
-  local selection?, failure? = project_config.load_compiler_root(root)
+  local selection?, selection_failure? = project_config.load_compiler_root(root)
   if selection == nil then
-    -- A configuration file this server cannot evaluate is the worker's error
-    -- to report. The router selects no SDK rather than assuming one.
-    return Settings.new(root, nil, nil, allowed), nil
+    -- A local override exists to select an SDK, and an unusable compiler_root
+    -- selects nothing verifiable, so the root is refused instead of falling
+    -- back to the router's own SDK.
+    local problem = selection_failure as project_config.Error
+    return nil, Error.new(problem.path, problem.message,
+      Reason.invalid_configuration())
   end
-  local compiler_root: string? = selection.compiler_root
+  local selected = selection as project_config.CompilerRoot
+  local compiler_root: string? = selected.compiler_root
   if compiler_root ~= nil then
     if not allowed then
-      local source_file? = selection.compiler_root_file
+      local source_file? = selected.compiler_root_file
       if source_file == nil then source_file = root end
       return nil, Error.new(source_file,
         "root '" .. root .. "' selects compiler_root '" ..
@@ -196,7 +201,7 @@ function load(root: string, trust: Trust): (Settings?, Error?)
     if invalid ~= nil then return nil, invalid end
   end
   return Settings.new(
-    root, compiler_root, selection.compiler_root_file, allowed), nil
+    root, compiler_root, selected.compiler_root_file, allowed), nil
 end
 
 --- Return the configuration identity that decides whether a worker must restart.

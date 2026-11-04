@@ -370,31 +370,60 @@ end
 -- it must not load the compiler to do it. This reads only the two configuration
 -- files' compiler_root assignment; every other key stays the worker's business,
 -- which reports unknown or malformed fields as its own project error.
+--
+-- Three outcomes are distinct on purpose:
+--   * no local override and a tracked file this server cannot evaluate means no
+--     SDK is selected here: the worker reports that project error itself, which
+--     is what the single-root server always did;
+--   * the local override exists only to select an SDK, so every problem in it is
+--     a root-scoped selection error, never a silent default SDK;
+--   * a present but unusable compiler_root value selects nothing verifiable, so
+--     it is also a selection error.
 --- Read the effective compiler_root from the tracked file and local override.
 function load_compiler_root(project_root: string): (CompilerRoot?, Error?)
   do
     local root = absolute_project_root(project_root)
-    local compiler_root: string? = nil
-    local compiler_root_file: string? = nil
-    local config_file = configuration_path(root)
-    local tracked? = evaluate(config_file)
-    if tracked ~= nil then
-      local raw = tracked["compiler_root"]
-      if raw ~= nil then
-        compiler_root = normalize_compiler_root(config_file, root, raw)
-        compiler_root_file = config_file
-      end
-    end
     local local_file = local_configuration_path(root)
     local overrides? = evaluate_local(local_file)
+    local override_root: string? = nil
     if overrides ~= nil then
-      local raw = overrides["compiler_root"]
+      local raw = (overrides as Environment)["compiler_root"]
       if raw ~= nil then
-        compiler_root = normalize_compiler_root(local_file, root, raw)
-        compiler_root_file = local_file
+        override_root = normalize_compiler_root(local_file, root, raw)
       end
     end
-    return CompilerRoot.new(compiler_root, compiler_root_file), nil
+    local config_file = configuration_path(root)
+    local tracked: OptionalEnvironment = nil
+    local tracked_error: Error? = nil
+    do
+      tracked = evaluate(config_file)
+    catch
+      if error is async.CancellationReason then raise end
+      if error is Error then
+        tracked_error = error as Error
+      else
+        raise
+      end
+    end
+    if tracked_error ~= nil then
+      -- An override exists, so this root exists to select an SDK; a tracked file
+      -- that cannot be read makes that selection unverifiable.
+      if overrides ~= nil then return nil, tracked_error as Error end
+      return CompilerRoot.new(nil, nil), nil
+    end
+    local tracked_root: string? = nil
+    local tracked_file: string? = nil
+    if tracked ~= nil then
+      local raw = (tracked as Environment)["compiler_root"]
+      if raw ~= nil then
+        tracked_root = normalize_compiler_root(config_file, root, raw)
+        tracked_file = config_file
+      end
+    end
+    if override_root ~= nil then
+      return CompilerRoot.new(override_root, local_file), nil
+    end
+    return CompilerRoot.new(tracked_root, tracked_file), nil
   catch
     if error is async.CancellationReason then raise end
     if error is Error then return nil, error as Error end

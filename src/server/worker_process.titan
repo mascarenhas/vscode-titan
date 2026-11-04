@@ -314,12 +314,16 @@ function WorkerProcess:request(method: string, params: value,
       "Titan worker for " .. self.root .. " did not answer " .. method)
     return nil
   end)
-  local outcome = reply:take()
-  self.pending[key] = nil
-  if not expiry:status():has_finished() then
-    expiry:cancel(async.CancellationReason.simple("worker reply arrived"))
+  -- The timer must not outlive this request, even when the caller is cancelled
+  -- while waiting for the reply.
+  defer do
+    self.pending[key] = nil
+    if not expiry:status():has_finished() then
+      expiry:cancel(async.CancellationReason.simple("worker reply settled"))
+    end
+    async.join(expiry)
   end
-  return outcome
+  return reply:take()
 end
 
 local function close_input(worker: WorkerProcess)
@@ -363,16 +367,19 @@ function WorkerProcess:stop(timeout_milliseconds: integer)
   close_input(self)
   local waiter? = self.waiter
   if waiter ~= nil then
-    do
-      local expiry = async.run<|nil, value|>(function (): nil
-        timer.sleep(timeout_milliseconds)
-        self:kill()
-        return nil
-      end)
-      async.join(waiter as async.Task<|nil, value|>)
+    local expiry = async.run<|nil, value|>(function (): nil
+      timer.sleep(timeout_milliseconds)
+      self:kill()
+      return nil
+    end)
+    defer do
       if not expiry:status():has_finished() then
         expiry:cancel(async.CancellationReason.simple("worker exited"))
       end
+      async.join(expiry)
+    end
+    do
+      async.join(waiter as async.Task<|nil, value|>)
     catch
       if error is async.CancellationReason then raise end
     end

@@ -1,7 +1,7 @@
 --- One client session serving several independent Titan roots through workers.
 -- @module server.router
 
-foreign import "compiler_io_platform.h"
+foreign import "compiler_io_clock.h"
 
 local async = import "async"
 local dispatcher = import "server.dispatcher"
@@ -107,12 +107,14 @@ record Slot
   local stopping: boolean
   local failure: string?
   local generation: integer
-  local last_used: integer
+  local last_used: float
+  -- Monotonic use counter: two uses inside one clock tick still order.
+  local use_serial: integer
   local settings: root_settings.Settings?
   local settings_fingerprint: string
   local sdk_identity: string
-  local checked: integer
-  local crashes: {integer}
+  local checked: float
+  local crashes: {float}
   local worker_pid: integer?
   -- The worker's own report of the SDK and probe prefix it resolved.
   local titan_root: string?
@@ -152,6 +154,7 @@ record Router
   local client_initialization_options: value
   local max_workers: integer
   local idle_timeout_seconds: float
+  local next_use: integer
   local next_outbound: integer
   local initial_activated: boolean
   local housekeeping: async.Task<|nil, value|>?
@@ -161,8 +164,10 @@ end
 
 type Finish = function (): ()
 
-local function now_milliseconds(): integer
-  return logging.wall_clock() * 1000
+-- Elapsed-time decisions must not read the calendar clock: whole seconds make
+-- two uses tie, quantize a fractional idle timeout, and can step backwards.
+local function now_milliseconds(): float
+  return ffi.vscode_titan_monotonic_ms()
 end
 
 -- A configured duration arrives as a JSON number: an integer second count or a
@@ -192,8 +197,13 @@ local function router_publish(router: Router, message: string)
   router.output:push(message)
 end
 
-local function overlay_belongs(slot: Slot, overlay: Overlay): boolean
-  return roots.contains(slot.root.path, overlay.path)
+-- An open buffer belongs to one root only: the most specific registered root
+-- that contains it, exactly like a request for that document.
+local function overlay_belongs(router: Router, slot: Slot,
+                               overlay: Overlay): boolean
+  local owner? = router.registry:owner(overlay.path)
+  if owner == nil then return false end
+  return (owner as roots.Root).path == slot.root.path
 end
 
 local function Slot:wake()
@@ -238,7 +248,7 @@ function create(options: LaunchOptions, output: response_queue.ResponseQueue): R
   return Router.new(
     options, output, roots.create(), root_settings.create({}),
     {}, {}, {}, {}, {}, {}, {}, envelope, {},
-    nil, nil, max_workers, DEFAULT_IDLE_TIMEOUT_SECONDS, 1,
+    nil, nil, max_workers, DEFAULT_IDLE_TIMEOUT_SECONDS, 1, 1,
     false, nil, {}, false)
 end
 
@@ -253,6 +263,7 @@ local function slot_for_root(router: Router, entry: roots.Root): Slot
     failure = nil,
     generation = 0,
     last_used = now_milliseconds(),
+    use_serial = 0,
     settings = nil,
     settings_fingerprint = "",
     sdk_identity = "",
@@ -272,6 +283,13 @@ local function slot_for_root(router: Router, entry: roots.Root): Slot
   return slot
 end
 
+-- One observation of "this root was used", ordered without clock resolution.
+local function note_use(router: Router, slot: Slot)
+  router.next_use = router.next_use + 1
+  slot.use_serial = router.next_use
+  slot.last_used = now_milliseconds()
+end
+
 local function status_value(router: Router): value
   local result: wire.Array = {}
   for index = 1, #router.order do
@@ -286,18 +304,22 @@ local function status_value(router: Router): value
     when discovered() then entry["origin"] = "discovered"
     end
     local settings? = slot.settings
+    -- Trust is a containment fact, not a consequence of a usable configuration:
+    -- a root whose settings were refused still reports whether its directory is
+    -- trusted.
+    local trusted = router.trust:allows(slot.root.path)
     if settings ~= nil then
       local actual = settings as root_settings.Settings
-      entry["trusted"] = actual.trusted
+      trusted = actual.trusted
       if actual.compiler_root ~= nil then
         entry["compilerRoot"] = actual.compiler_root
       else
         entry["compilerRoot"] = wire.null()
       end
     else
-      entry["trusted"] = false
       entry["compilerRoot"] = wire.null()
     end
+    entry["trusted"] = trusted
     local failure? = slot.failure
     if failure ~= nil then entry["failure"] = failure as string end
     local pid? = slot.worker_pid
@@ -350,7 +372,7 @@ end
 
 local function record_crash(slot: Slot)
   local now = now_milliseconds()
-  local kept: {integer} = {}
+  local kept: {float} = {}
   for index = 1, #slot.crashes do
     local stamp = slot.crashes[index]
     if now - stamp <= CRASH_WINDOW_MILLISECONDS then kept[#kept + 1] = stamp end
@@ -368,6 +390,27 @@ local function drain_requests(router: Router, root: string)
         now_milliseconds() < deadline do
     timer.sleep(DRAIN_POLL_MILLISECONDS)
   end
+end
+
+-- Every mutation of a slot's worker or state happens inside one transition, so
+-- the client loop and the housekeeping Task can never interleave one root's
+-- restart. A transition is not a lock: it is a cooperative ownership token the
+-- other Task suspends on. Begin it after a suspend, and never begin twice for
+-- one slot (the inner code uses the *_locked helpers instead).
+local function begin_transition(slot: Slot)
+  slot:wait_settled()
+  slot.transitioning = true
+end
+
+local function end_transition(slot: Slot)
+  slot.transitioning = false
+  slot:wake()
+end
+
+-- A slot the router still owns: not shut down, and not removed with its folder.
+local function still_owned(router: Router, slot: Slot): boolean
+  if router.closed then return false end
+  return router.slots[slot.root.path] == slot
 end
 
 -- Stop one slot's worker after its in-flight requests finish. The caller owns
@@ -398,10 +441,9 @@ end
 
 --- Stop one slot's worker process, settling its waiters.
 local function stop_slot(router: Router, slot: Slot, reason: string)
-  slot.transitioning = true
+  begin_transition(slot)
+  defer end_transition(slot)
   stop_worker_locked(router, slot, reason)
-  slot.transitioning = false
-  slot:wake()
 end
 
 local function worker_listener(router: Router, slot: Slot): worker_process.Listener
@@ -489,11 +531,27 @@ local function worker_listener(router: Router, slot: Slot): worker_process.Liste
     end,
     function (message: string)
       if owner.stopping or owner.worker == nil then return end
+      -- The process is gone, so its transport Tasks and pipes must be released
+      -- even though this listener cannot yield: the housekeeping Task drains
+      -- `retired` on its next pass.
+      router.retired[#router.retired + 1] =
+        owner.worker as worker_process.WorkerProcess
       owner.worker = nil
       owner.worker_pid = nil
       owner.titan_root = nil
       owner.probe_prefix = nil
       owner.indexing = false
+      if not state_ready(owner.state) then
+        -- Activation owns the failure for a worker that never became ready: its
+        -- initialize reply carries this same exit, and counting it here too
+        -- would burn two crash slots for one exit.
+        logging.emit("info", "root.worker.exited", {
+          ["root"] = owner.root.path,
+          ["message"] = message,
+          ["state"] = state_name(owner.state),
+        })
+        return
+      end
       record_crash(owner)
       owner.state = WorkerState.failed(message)
       owner.failure = message
@@ -538,7 +596,7 @@ local function replay_overlays(router: Router, slot: Slot,
                                worker: worker_process.WorkerProcess)
   for index = 1, #router.overlay_order do
     local overlay = router.overlays[router.overlay_order[index]] as Overlay
-    if overlay_belongs(slot, overlay) then
+    if overlay_belongs(router, slot, overlay) then
       local document: wire.Object = {
         ["uri"] = overlay.uri,
         ["languageId"] = "titan",
@@ -654,6 +712,9 @@ local function start_worker(router: Router, slot: Slot,
   slot.last_used = now_milliseconds()
   slot.stopping = false
   slot.state = WorkerState.starting()
+  -- A freshly started worker is not idle: it indexes before its first
+  -- titan/indexingStatus frame arrives, and stopping it would discard that pass.
+  slot.indexing = true
   slot.generation = slot.generation + 1
   local outcome = worker:request(
     "initialize", worker_initialize_params(router, slot.root.path),
@@ -676,6 +737,7 @@ local function start_worker(router: Router, slot: Slot,
     return true
   when failed(error_value) then
     slot.worker = nil
+    slot.indexing = false
     worker:stop(SHUTDOWN_TIMEOUT_MILLISECONDS)
     router.retired[#router.retired + 1] = worker
     record_crash(slot)
@@ -683,7 +745,10 @@ local function start_worker(router: Router, slot: Slot,
       " rejected initialize: " .. strings.tostring(error_value))
     return false
   when unavailable(message) then
+    -- The exit listener already retired this worker; releasing it twice is
+    -- harmless because release is idempotent.
     slot.worker = nil
+    slot.indexing = false
     worker:kill()
     router.retired[#router.retired + 1] = worker
     record_crash(slot)
@@ -696,17 +761,16 @@ end
 -- A changed root restarts gracefully: stop routing new requests to it, let its
 -- pending ones finish (bounded), stop the worker, then start a fresh one with
 -- the accepted settings. Overlays are replayed, so an unsaved buffer survives.
-local function restart_slot(router: Router, slot: Slot, reason: string)
-  slot.transitioning = true
+-- The caller owns the slot transition.
+local function restart_worker(router: Router, slot: Slot, reason: string)
   stop_worker_locked(router, slot, reason)
+  if not still_owned(router, slot) then return end
   local settings? = slot.settings
   if settings ~= nil then
     start_worker(router, slot, settings as root_settings.Settings)
   else
     slot.state = WorkerState.inactive()
   end
-  slot.transitioning = false
-  slot:wake()
 end
 
 local function slot_idle(router: Router, slot: Slot): boolean
@@ -714,9 +778,8 @@ local function slot_idle(router: Router, slot: Slot): boolean
   if slot.indexing then return false end
   if in_flight_for(router, slot.root.path) > 0 then return false end
   for index = 1, #router.overlay_order do
-    if overlay_belongs(slot, router.overlays[router.overlay_order[index]]) then
-      return false
-    end
+    local overlay = router.overlays[router.overlay_order[index]] as Overlay
+    if overlay_belongs(router, slot, overlay) then return false end
   end
   return true
 end
@@ -736,7 +799,7 @@ local function make_room(router: Router): boolean
   for index = 1, #router.order do
     local slot = router.slots[router.order[index]]
     if not slot.transitioning and slot_idle(router, slot) then
-      if candidate == nil or slot.last_used < candidate.last_used then
+      if candidate == nil or slot.use_serial < candidate.use_serial then
         candidate = slot
       end
     end
@@ -759,6 +822,8 @@ end
 
 -- A root's settings decide its SDK and trust. Reloading them is bounded to one
 -- observation per interval except when the client explicitly asks for a reload.
+-- The caller owns the slot transition: this reads two configuration files and
+-- may restart the worker, and both yield.
 local function revalidate(router: Router, slot: Slot, force: boolean): boolean
   local now = now_milliseconds()
   if not force and now - slot.checked < REVALIDATE_INTERVAL_MILLISECONDS then
@@ -770,7 +835,9 @@ local function revalidate(router: Router, slot: Slot, force: boolean): boolean
     local error_value = failure as root_settings.Error
     local message = error_value.message
     slot.settings = nil
-    if slot.worker ~= nil then stop_slot(router, slot, "settings error") end
+    if slot.worker ~= nil then
+      stop_worker_locked(router, slot, "settings error")
+    end
     slot.state = WorkerState.failed(message)
     slot.failure = message
     if selection_refused(error_value.reason) then
@@ -810,7 +877,7 @@ local function revalidate(router: Router, slot: Slot, force: boolean): boolean
         ["root"] = slot.root.path,
         ["reason"] = "settings changed",
       })
-      restart_slot(router, slot, "settings changed")
+      restart_worker(router, slot, "settings changed")
     elseif not state_ready(slot.state) then
       slot.state = WorkerState.inactive()
     end
@@ -821,7 +888,12 @@ end
 --- Ensure a canonical root has a live, initialized worker.
 local function activate(router: Router, slot: Slot): (Slot?, string?)
   while true do
-    slot:wait_settled()
+    begin_transition(slot)
+    defer end_transition(slot)
+    if not still_owned(router, slot) then
+      return nil, "Titan root '" .. slot.root.path ..
+        "' is no longer part of this session"
+    end
     -- A root is re-observed at most once per interval on the routing path, so a
     -- reinstalled SDK or a changed override cannot answer a request from a
     -- stale runtime.
@@ -846,12 +918,7 @@ local function activate(router: Router, slot: Slot): (Slot?, string?)
       fail_slot(slot, cap_message)
       return nil, cap_message
     end
-    -- Activation itself is a transition: the housekeeping Task must not
-    -- revalidate or evict a worker that is still settling its initialize.
-    slot.transitioning = true
     local started = start_worker(router, slot, settings as root_settings.Settings)
-    slot.transitioning = false
-    slot:wake()
     if started then return slot, nil end
     local current? = slot.failure
     if current == nil then current = "cannot start a Titan worker" end
@@ -905,14 +972,19 @@ end
 
 local function forward_request(router: Router, slot: Slot, id: value,
                                body: string)
-  router.forwarded[worker_process.id_key(id)] =
-    Forwarded.new(slot.root.path, id)
-  slot.last_used = now_milliseconds()
+  local key = worker_process.id_key(id)
+  router.forwarded[key] = Forwarded.new(slot.root.path, id)
+  note_use(router, slot)
   local worker? = slot.worker
   if worker ~= nil then
     local actual_worker = worker as worker_process.WorkerProcess
-    actual_worker:send(body)
+    if actual_worker:send(body) then return end
   end
+  -- The request never reached the worker, so this root owes the client an
+  -- answer: dropping it would leave the request open forever.
+  router.forwarded[key] = nil
+  router_publish(router, dispatcher.failure_body(id, REQUEST_FAILED,
+    "Titan worker for " .. slot.root.path .. " is unavailable"))
 end
 
 local function Router:route_request(request: dispatcher.SemanticRequest,
@@ -968,17 +1040,21 @@ local function notification_closes(notification: lsp.DocumentNotification): bool
   return false
 end
 
-local function Router:set_overlay(notification: lsp.DocumentNotification)
+-- Overlays are stored and matched by the document's canonical path: a client
+-- may spell a file through a symlinked folder, and a restarted worker must still
+-- receive the buffer it was editing.
+local function Router:set_overlay(notification: lsp.DocumentNotification,
+                                  canonical: string)
   case notification
   when opened(item) then
-    local path = item.document.path
+    local path = canonical
     if self.overlays[path] == nil then
       self.overlay_order[#self.overlay_order + 1] = path
     end
     self.overlays[path] = Overlay.new(
       item.document.uri, path, item.version, item.text)
   when changed(item) then
-    local path = item.document.path
+    local path = canonical
     local existing? = self.overlays[path]
     if existing == nil then
       self.overlay_order[#self.overlay_order + 1] = path
@@ -990,7 +1066,7 @@ local function Router:set_overlay(notification: lsp.DocumentNotification)
       overlay.text = item.text
     end
   when closed(item) then
-    local path = item.path
+    local path = canonical
     if self.overlays[path] ~= nil then
       self.overlays[path] = nil
       local kept: {string} = {}
@@ -1009,7 +1085,7 @@ local function Router:route_document(notification: lsp.DocumentNotification,
   local uri, path = notification_identity(notification)
   if path == "" then return end
   local canonical = roots.canonical(path)
-  self:set_overlay(notification)
+  self:set_overlay(notification, canonical)
   local current? = self.registry:owner(canonical)
   if current == nil then
     local discovered? = roots.discover(canonical)
@@ -1027,7 +1103,7 @@ local function Router:route_document(notification: lsp.DocumentNotification,
     return
   end
   local live = actual as Slot
-  live.last_used = now_milliseconds()
+  note_use(self, live)
   local worker? = live.worker
   if worker ~= nil then
     local actual_worker = worker as worker_process.WorkerProcess
@@ -1085,7 +1161,12 @@ local function Router:remove_root(canonical: string)
   if not self.registry:remove_folder(canonical) then return end
   local slot? = self.slots[canonical]
   if slot ~= nil then
-    stop_slot(self, slot as Slot, "folder removed")
+    local actual = slot as Slot
+    -- The transition covers the stop and the deregistration together, so a
+    -- restart in progress cannot spawn a worker for a root that is gone.
+    begin_transition(actual)
+    defer end_transition(actual)
+    stop_worker_locked(self, actual, "folder removed")
     self.slots[canonical] = nil
     local kept: {string} = {}
     for index = 1, #self.order do
@@ -1154,9 +1235,13 @@ local function Router:revalidate_all(force: boolean)
   local paths = self:root_paths()
   for index = 1, #paths do
     local slot? = self.slots[paths[index]]
-    if slot ~= nil then
+    if slot ~= nil and still_owned(self, slot as Slot) then
       local actual = slot as Slot
-      if not actual.transitioning then
+      begin_transition(actual)
+      defer end_transition(actual)
+      -- A folder removal or shutdown may have taken this slot while the
+      -- transition was awaited.
+      if still_owned(self, actual) then
         do
           revalidate(self, actual, force)
         catch
@@ -1186,16 +1271,18 @@ local function Router:drain_retired()
 end
 
 local function Router:evict_idle()
-  local now = now_milliseconds()
   local paths = self:root_paths()
   for index = 1, #paths do
     local slot? = self.slots[paths[index]]
-    if slot ~= nil then
+    if slot ~= nil and still_owned(self, slot as Slot) then
       local actual = slot as Slot
-      if not actual.transitioning and slot_idle(self, actual) then
-        local idle_seconds = (now - actual.last_used) as float / 1000.0
+      begin_transition(actual)
+      defer end_transition(actual)
+      if still_owned(self, actual) and slot_idle(self, actual) then
+        local idle_seconds =
+          (now_milliseconds() - actual.last_used) / 1000.0
         if idle_seconds >= self.idle_timeout_seconds then
-          stop_slot(self, actual, "idle timeout")
+          stop_worker_locked(self, actual, "idle timeout")
         end
       end
     end
@@ -1269,7 +1356,10 @@ local function Router:capture_initialize(params: value)
           end
         end
       end
-    else
+    end
+    -- An empty folder list selects nothing, so the deprecated single-root
+    -- parameters still get their chance before the launch directory.
+    if #declared == 0 then
       local root_uri? = wire.as_string(actual["rootUri"])
       if root_uri ~= nil then
         local path?, failure? = source_text.file_uri_to_path(root_uri as string)
@@ -1288,7 +1378,10 @@ local function Router:capture_initialize(params: value)
   local seen: {string: boolean} = {}
   for index = 1, #declared do
     local canonical = roots.canonical(declared[index])
-    self.registry:add_folder(canonical)
+    local entry = self.registry:add_folder(canonical)
+    -- Every known root is visible in titan/workspaceStatus from the start, even
+    -- when the worker cap leaves it inactive until its first routed message.
+    slot_for_root(self, entry)
     if seen[canonical] == nil then
       seen[canonical] = true
       self.initial_roots[#self.initial_roots + 1] = canonical
@@ -1306,33 +1399,62 @@ local function Router:activate_initial_roots()
   self.initial_activated = true
   for index = 1, #self.initial_roots do
     local root_path = self.initial_roots[index]
-    local entry? = self.registry:find(root_path)
-    if entry ~= nil then
-      local slot = slot_for_root(self, entry as roots.Root)
-      do
-        local actual?, message? = activate(self, slot)
-        if actual == nil and message ~= nil then
+    if live_workers(self) >= self.max_workers then
+      -- "Up to the worker cap": a root beyond it stays inactive and activates
+      -- on its first routed message. Starting it now would either evict a
+      -- just-started initial root or refuse it outright.
+      logging.emit("info", "root.activation.deferred", {
+        ["root"] = root_path,
+        ["max_workers"] = self.max_workers,
+      })
+    else
+      local entry? = self.registry:find(root_path)
+      if entry ~= nil then
+        local slot = slot_for_root(self, entry as roots.Root)
+        do
+          local actual?, message? = activate(self, slot)
+          if actual == nil and message ~= nil then
+            logging.emit("error", "root.activation.failure", {
+              ["root"] = root_path,
+              ["message"] = message as string,
+            })
+          end
+        catch
+          if error is async.CancellationReason then raise end
           logging.emit("error", "root.activation.failure", {
             ["root"] = root_path,
-            ["message"] = message as string,
+            ["message"] = strings.tostring(error),
           })
         end
-      catch
-        if error is async.CancellationReason then raise end
-        logging.emit("error", "root.activation.failure", {
-          ["root"] = root_path,
-          ["message"] = strings.tostring(error),
-        })
       end
     end
   end
 end
 
+-- Retire the housekeeping Task before a terminal path mutates slots: a restart
+-- it was performing settles through cancellation (every transition owner has a
+-- deferred release), so nothing can respawn a worker while shutdown runs.
+local function Router:stop_housekeeping()
+  local task? = self.housekeeping
+  self.housekeeping = nil
+  if task == nil then return end
+  local actual = task as async.Task<|nil, value|>
+  if not actual:status():has_finished() then
+    actual:cancel(async.CancellationReason.simple("router stopping"))
+  end
+  async.join(actual)
+end
+
 local function Router:shutdown_all()
-  for index = 1, #self.order do
-    local slot = self.slots[self.order[index]]
-    if not slot.transitioning and slot.worker ~= nil then
-      stop_slot(self, slot, "shutdown")
+  self:stop_housekeeping()
+  local paths = self:root_paths()
+  for index = 1, #paths do
+    local slot? = self.slots[paths[index]]
+    if slot ~= nil then
+      local actual = slot as Slot
+      if actual.worker ~= nil then
+        stop_slot(self, actual, "shutdown")
+      end
     end
   end
   self:drain_retired()
@@ -1340,8 +1462,9 @@ end
 
 local function Router:stop_all()
   self.closed = true
-  local housekeeping_task? = self.housekeeping
-  self.housekeeping = nil
+  -- Retire housekeeping before killing: a spawn in flight would otherwise leave
+  -- an unkilled worker behind.
+  self:stop_housekeeping()
   for index = 1, #self.order do
     local slot = self.slots[self.order[index]]
     local worker? = slot.worker
@@ -1352,13 +1475,6 @@ local function Router:stop_all()
       actual_worker:kill()
       self.retired[#self.retired + 1] = actual_worker
     end
-  end
-  if housekeeping_task ~= nil then
-    local task = housekeeping_task as async.Task<|nil, value|>
-    if not task:status():has_finished() then
-      task:cancel(async.CancellationReason.simple("router stopped"))
-    end
-    async.join(task)
   end
   self:drain_retired()
 end

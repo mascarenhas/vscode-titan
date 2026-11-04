@@ -191,6 +191,94 @@ function test_root_settings_refuse_untrusted_compiler_root(
   with_root(run_untrusted_selection)
 end
 
+-- A configuration error has three distinct outcomes, and only one of them may
+-- start a worker without a selected SDK.
+local function refusal_reason(failure: root_settings.Error): string
+  local reason = failure.reason
+  case reason
+  when untrusted_selection() then return "untrusted"
+  when invalid_prefix() then return "prefix"
+  when invalid_configuration() then return "configuration"
+  end
+  return "unknown"
+end
+
+local function run_unusable_selection(base: string)
+  local trusted = trusted_root(base)
+
+  -- 1. A local override that assigns anything else cannot select an SDK: the
+  --    root is refused instead of silently using the router's own SDK.
+  fs.write_file(base .. "/titan-config.lua", "compiler_root = \"tracked\"\n")
+  fs.write_file(base .. "/titan-config.local.lua",
+    "compiler_root = \"local\"\ninclude = { \"./other\" }\n")
+  local refused?, refusal? = root_settings.load(roots.canonical(base), trusted)
+  test.assert(refused == nil and refusal ~= nil,
+    "a local override with another key produced settings")
+  local refusal_error = refusal as root_settings.Error
+  test.assert(refusal_error.path == base .. "/titan-config.local.lua",
+    "the refusal did not name the local override")
+  test.assert(refusal_reason(refusal_error) == "configuration",
+    "the refusal was not classified as a configuration error")
+
+  -- 2. The same file on an untrusted root still refuses: trust never turns an
+  --    unusable selection into a worker start.
+  local untrusted?, untrusted_failure? = root_settings.load(
+    roots.canonical(base), root_settings.create({}))
+  test.assert(untrusted == nil and untrusted_failure ~= nil,
+    "an untrusted root with an unusable override started settings")
+  test.assert(refusal_reason(untrusted_failure as root_settings.Error) ==
+    "configuration",
+    "the untrusted refusal was misclassified")
+
+  -- 3. A present but non-string compiler_root selects nothing verifiable.
+  fs.write_file(base .. "/titan-config.local.lua", "compiler_root = true\n")
+  local invalid?, invalid_failure? =
+    root_settings.load(roots.canonical(base), trusted)
+  test.assert(invalid == nil and invalid_failure ~= nil,
+    "a non-string local compiler_root was accepted")
+  test.assert(refusal_reason(invalid_failure as root_settings.Error) ==
+    "configuration",
+    "a non-string local compiler_root was misclassified")
+
+  -- 4. A tracked file this server cannot evaluate, with no override, keeps the
+  --    single-root behaviour: the worker reports it, and no SDK is selected.
+  fs.unlink(base .. "/titan-config.local.lua")
+  fs.write_file(base .. "/titan-config.lua", "compiler_root = \n")
+  local tolerated?, tolerated_failure? =
+    root_settings.load(roots.canonical(base), trusted)
+  test.assert(tolerated_failure == nil and tolerated ~= nil,
+    "an unreadable tracked configuration refused the root settings")
+  test.assert((tolerated as root_settings.Settings).compiler_root == nil,
+    "an unreadable tracked configuration selected an SDK")
+
+  -- 5. With an override present the same breakage makes the selection
+  --    unverifiable, so it is refused.
+  fs.write_file(base .. "/titan-config.local.lua", "compiler_root = \"local\"\n")
+  local refused_tracked?, tracked_failure? =
+    root_settings.load(roots.canonical(base), trusted)
+  test.assert(refused_tracked == nil and tracked_failure ~= nil,
+    "a broken tracked file next to an override was tolerated")
+  test.assert((tracked_failure as root_settings.Error).path ==
+    base .. "/titan-config.lua",
+    "the refusal did not name the tracked configuration")
+
+  -- 6. A non-string tracked compiler_root is a configuration error too.
+  fs.unlink(base .. "/titan-config.local.lua")
+  fs.write_file(base .. "/titan-config.lua", "compiler_root = 3\n")
+  local typed?, typed_failure? =
+    root_settings.load(roots.canonical(base), trusted)
+  test.assert(typed == nil and typed_failure ~= nil,
+    "a non-string tracked compiler_root was accepted")
+  test.assert(refusal_reason(typed_failure as root_settings.Error) ==
+    "configuration",
+    "a non-string tracked compiler_root was misclassified")
+end
+
+function test_root_settings_refuse_unusable_compiler_root_configuration(
+    _context: test.Context)
+  with_root(run_unusable_selection)
+end
+
 local function run_layout_validation(base: string)
   local prefix = make_prefix(base, "sdk")
   fs.write_file(base .. "/titan-config.lua", "compiler_root = \"sdk\"\n")

@@ -579,6 +579,21 @@ async function testLazyDiscovery() {
   const plainSource = path.join(plain, "main.titan");
   await writeFile(plainSource, ROOT_A_SOURCE, "utf8");
 
+  // An empty folder list selects nothing, so the deprecated single-root
+  // parameters still decide the root before the launch directory does.
+  const fallback = new Session(launch(sessionRoot, "error"));
+  try {
+    await fallback.initialize({ workspaceFolders: [], rootPath: plain });
+    fallback.notify("initialized", {});
+    const fallbackRoots = await pollStatus(fallback, (roots) =>
+      roots.length === 1 && roots[0].root === plain && roots[0].state === "ready",
+      "an empty folder list did not fall back to rootPath");
+    assert.equal(rootEntry(fallbackRoots, plain).origin, "folder");
+    await fallback.shutdown();
+  } finally {
+    await fallback.abort();
+  }
+
   const session = new Session(launch(sessionRoot, "error"));
   try {
     await session.initialize({});
@@ -754,6 +769,45 @@ async function testSecondSdk() {
       "an SDK reinstall restarted an unrelated root");
     await pollHover(session, sdkSource, SDK_SOURCE, "tripled", /integer/,
       "the root after the SDK reinstall");
+
+    // A local override exists only to select an SDK, so a broken one refuses an
+    // already-ready root instead of quietly serving the router's own SDK.
+    await writeFile(localOverride,
+      `compiler_root = "${secondSdk}"\ninclude = { "./src" }\n`, "utf8");
+    session.notify("workspace/didChangeConfiguration", { settings: {} });
+    const broken = await pollStatus(session, (entries) => {
+      const entry = entries.find((candidate) => candidate.root === sdkRootDir);
+      return entry?.state === "failed" && entry.workerPid === null
+        ? { accepted: entries }
+        : { rejected: entries };
+    }, "the broken local override did not refuse its root");
+    const brokenEntry = rootEntry(broken, sdkRootDir);
+    assert.match(brokenEntry.failure ?? "", /titan-config\.local\.lua/,
+      "the refusal did not name the local override");
+    assert.equal(brokenEntry.compilerRoot, null,
+      "a refused root kept a selected SDK");
+    assert.equal(brokenEntry.trusted, true,
+      "a configuration refusal forgot that the root is trusted");
+    assert.equal(rootEntry(broken, defaultRoot).state, "ready",
+      "a broken override disturbed an unrelated root");
+    const refusedHover = await session.failure("textDocument/hover", {
+      textDocument: { uri: uri(sdkSource) },
+      position: positionOf(SDK_SOURCE, "tripled")
+    });
+    assert.equal(refusedHover.code, -32803, JSON.stringify(refusedHover));
+    assert.match(refusedHover.message, /titan-config\.local\.lua/);
+
+    // Removing the broken override restores the tracked selection.
+    await rm(localOverride, { force: true });
+    session.notify("workspace/didChangeConfiguration", { settings: {} });
+    const recovered = await pollStatus(session, (entries) => {
+      const entry = entries.find((candidate) => candidate.root === sdkRootDir);
+      return entry?.state === "ready" &&
+        entry.compilerRoot === path.normalize(sdk)
+        ? { accepted: entries }
+        : { rejected: entries };
+    }, "the root did not recover after the broken override was removed");
+    assert.ok(recovered);
     await session.shutdown();
   } finally {
     await session.abort();
@@ -804,6 +858,7 @@ async function testRootScopedSdkErrors() {
   const abiRoot = path.join(base, "abi-root");
   const missingRoot = path.join(base, "missing-root");
   const untrustedRoot = path.join(base, "untrusted-root");
+  const brokenOverrideRoot = path.join(base, "broken-override-root");
   const incompatibleSource = await writeRoot(incompatibleRoot, ROOT_A_SOURCE,
     `include = { "./src" }\nsource_module_roots = { "./src" }\ncompiler_root = "${incompatible}"\n`);
   const abiRootSource = await writeRoot(abiRoot, ROOT_A_SOURCE,
@@ -812,6 +867,12 @@ async function testRootScopedSdkErrors() {
     `include = { "./src" }\nsource_module_roots = { "./src" }\ncompiler_root = "${path.join(base, "absent-sdk")}"\n`);
   const untrustedSource = await writeRoot(untrustedRoot, ROOT_A_SOURCE,
     `include = { "./src" }\nsource_module_roots = { "./src" }\ncompiler_root = "${untrusted}"\n`);
+  // An untrusted root whose override cannot even be read must still never load
+  // the SDK: there is no selection to trust and none to fall back to.
+  const brokenOverrideSource = await writeRoot(brokenOverrideRoot, ROOT_A_SOURCE,
+    `include = { "./src" }\nsource_module_roots = { "./src" }\ncompiler_root = "${untrusted}"\n`);
+  await writeFile(path.join(brokenOverrideRoot, "titan-config.local.lua"),
+    `compiler_root = "${untrusted}"\ninclude = { "./src" }\n`, "utf8");
 
   const session = new Session(launch(incompatibleRoot, "error"));
   try {
@@ -820,7 +881,8 @@ async function testRootScopedSdkErrors() {
         { uri: uri(incompatibleRoot), name: "incompatible" },
         { uri: uri(abiRoot), name: "abi" },
         { uri: uri(missingRoot), name: "missing" },
-        { uri: uri(untrustedRoot), name: "untrusted" }
+        { uri: uri(untrustedRoot), name: "untrusted" },
+        { uri: uri(brokenOverrideRoot), name: "broken-override" }
       ],
       // Only the incompatible, ABI and missing roots are trusted.
       initializationOptions: { trustedRoots: [incompatibleRoot, abiRoot, missingRoot] }
@@ -828,9 +890,15 @@ async function testRootScopedSdkErrors() {
     session.notify("initialized", {});
 
     const roots = await pollStatus(session, (entries) =>
-      entries.length === 4 && entries.every((entry) => entry.state !== "starting"),
+      entries.length === 5 && entries.every((entry) => entry.state !== "starting"),
       "root-scoped failures did not settle");
-    assert.equal(roots.length, 4);
+    assert.equal(roots.length, 5);
+    const brokenOverrideEntry = rootEntry(roots, brokenOverrideRoot);
+    assert.equal(brokenOverrideEntry.state, "failed");
+    assert.match(brokenOverrideEntry.failure ?? "", /titan-config\.local\.lua/,
+      "an unreadable override on an untrusted root did not name the file");
+    assert.equal(brokenOverrideEntry.workerPid, null,
+      "an untrusted root with an unreadable override started a worker");
     const incompatibleEntry = rootEntry(roots, incompatibleRoot);
     assert.equal(incompatibleEntry.compilerRoot, await realpath(incompatible));
     const untrustedEntry = rootEntry(roots, untrustedRoot);
@@ -890,6 +958,14 @@ async function testRootScopedSdkErrors() {
     assert.equal(abiFailure.code, -32803);
     assert.match(abiFailure.message, /compiler ABI|TITAN_ABI_VERSION/,
       abiFailure.message);
+    const brokenOverrideFailure = await session.failure("textDocument/hover", {
+      textDocument: { uri: uri(brokenOverrideSource) },
+      position: positionOf(ROOT_A_SOURCE, "doubled")
+    });
+    assert.equal(brokenOverrideFailure.code, -32803);
+    assert.match(brokenOverrideFailure.message, /titan-config\.local\.lua/);
+    assert.equal(await exists(marker), false,
+      "an unreadable override on an untrusted root loaded its driver");
     await session.shutdown();
   } finally {
     await session.abort();
@@ -945,6 +1021,36 @@ async function testWorkerCrashAndOverlay() {
       "the crashed root did not respawn");
     assert.equal(recovered[0].generation, 2,
       "the respawned worker did not advance its generation");
+
+    // Crash accounting: one exit counts once, and a root that keeps dying stops
+    // being restarted until its settings change. The second crash is still
+    // within the limit, which a double-counted first crash would break.
+    let current = rootEntry(recovered, root);
+    process.kill(current.workerPid, "SIGKILL");
+    const second = await pollStatus(session, (roots) =>
+      roots[0].workerPid === null && roots[0].state === "failed",
+      "the second crash was not observed");
+    assert.match(second[0].failure ?? "", /exited/);
+    await pollHover(session, saved, ROOT_A_SOURCE, "doubled", /integer/,
+      "the root after the second crash");
+    current = rootEntry(await session.status(), root);
+    assert.equal(typeof current.workerPid, "number",
+      "the second crash did not restart the worker");
+    process.kill(current.workerPid, "SIGKILL");
+    await pollStatus(session, (roots) =>
+      roots[0].workerPid === null && roots[0].state === "failed",
+      "the third crash was not observed");
+    const suppressed = await session.failure("textDocument/hover", {
+      textDocument: { uri: uri(saved) },
+      position: positionOf(ROOT_A_SOURCE, "doubled")
+    });
+    assert.equal(suppressed.code, -32803, JSON.stringify(suppressed));
+    assert.match(suppressed.message, /restart suppressed/,
+      `a crash loop was restarted anyway: ${suppressed.message}`);
+    // An explicit reload is the documented recovery.
+    session.notify("workspace/didChangeConfiguration", { settings: {} });
+    await pollHover(session, saved, ROOT_A_SOURCE, "doubled", /integer/,
+      "the root after an explicit reload cleared the crash loop");
     await session.shutdown();
   } finally {
     await session.abort();
@@ -1060,6 +1166,162 @@ async function testCancellation() {
   }
 }
 
+const OVERLAY_SOURCE = [
+  "function overlay_marker(): integer",
+  "  return 1",
+  "end",
+  "function use_overlay(): integer",
+  "  return overlay_",
+  "end",
+  ""
+].join("\n");
+
+// Buffers belong to the root that owns the document, not to every root whose
+// directory happens to contain the path.
+async function testOverlayOwnership() {
+  const base = await makeBase("overlays");
+  const rootA = path.join(base, "a");
+  const rootB = path.join(base, "b");
+  const sourceA = await writeRoot(rootA, ROOT_A_SOURCE);
+  const sourceB = await writeRoot(rootB, ROOT_B_SOURCE);
+  const linkPath = path.join(base, "a-link");
+  await symlink(rootA, linkPath);
+  // The client spells a document through the symlinked folder.
+  const linkedDraft = path.join(linkPath, "src", "draft.titan");
+  // A buffer inside the physical tree is what a worker can analyse.
+  const canonicalDraft = path.join(rootA, "src", "canonical-draft.titan");
+  const overlayPosition = endOfToken(OVERLAY_SOURCE, "overlay_", 1);
+
+  const session = new Session(launch(rootA, "error"));
+  try {
+    await session.initialize({
+      workspaceFolders: [
+        { uri: uri(linkPath), name: "a" },
+        { uri: uri(rootB), name: "b" }
+      ],
+      initializationOptions: { trustedRoots: [base], maxWorkers: 1 }
+    });
+    session.notify("initialized", {});
+    const first = await pollStatus(session, (roots) =>
+      roots.length === 2 && roots.some((entry) =>
+        entry.root === rootA && entry.state === "ready"),
+      "the symlinked folder did not activate its physical root");
+    assert.equal(rootEntry(first, rootA).origin, "folder");
+    assert.equal(rootEntry(first, rootB).workerPid, null,
+      "the worker cap started both roots");
+
+    // A buffer spelled through the symlink still belongs to the physical root,
+    // so that root is not idle and the only worker slot stays taken.
+    session.notify("textDocument/didOpen", {
+      textDocument: {
+        uri: uri(linkedDraft), languageId: "titan", version: 1,
+        text: OVERLAY_SOURCE
+      }
+    });
+    const capped = await session.failure("textDocument/hover", {
+      textDocument: { uri: uri(sourceB) },
+      position: positionOf(ROOT_B_SOURCE, "tripled")
+    });
+    assert.equal(capped.code, -32803, JSON.stringify(capped));
+    assert.match(capped.message, /cap/i,
+      `a symlink-spelled open buffer did not keep its root busy: ${capped.message}`);
+
+    // Closing it releases the slot, so the other root may now start.
+    session.notify("textDocument/didClose", {
+      textDocument: { uri: uri(linkedDraft) }
+    });
+    await pollHover(session, sourceB, ROOT_B_SOURCE, "tripled", /integer/,
+      "the root that reused the released slot");
+    await pollStatus(session, (roots) =>
+      roots.some((entry) => entry.root === rootA && entry.workerPid === null),
+      "closing the symlink-spelled buffer did not release the root");
+    await pollHover(session, sourceA, ROOT_A_SOURCE, "doubled", /integer/,
+      "the root that gave up its slot");
+
+    // An unsaved buffer inside the physical root survives a crash: the router
+    // replays it into the replacement worker.
+    session.notify("textDocument/didOpen", {
+      textDocument: {
+        uri: uri(canonicalDraft), languageId: "titan", version: 1,
+        text: OVERLAY_SOURCE
+      }
+    });
+    const before = await pollCompletion(session, canonicalDraft, overlayPosition,
+      "the unsaved buffer in the symlinked root");
+    assert.ok(before.some((item) => item.label === "overlay_marker"),
+      "the unsaved document offered no overlay symbol");
+    const running = rootEntry(await session.status(), rootA);
+    assert.equal(typeof running.workerPid, "number",
+      "the symlinked root had no worker to crash");
+    process.kill(running.workerPid, "SIGKILL");
+    await pollStatus(session, (roots) =>
+      rootEntry(roots, rootA).workerPid === null,
+      "the symlinked worker's exit was not observed");
+    const after = await pollCompletion(session, canonicalDraft, overlayPosition,
+      "the replayed unsaved buffer");
+    assert.ok(after.some((item) => item.label === "overlay_marker"),
+      "the respawned worker lost the unsaved buffer");
+    await session.shutdown();
+  } finally {
+    await session.abort();
+  }
+
+  // A nested root's open document belongs to the nested root alone.
+  const outer = path.join(base, "outer");
+  const inner = path.join(outer, "inner");
+  const outerSource = await writeRoot(outer, ROOT_A_SOURCE);
+  const innerSource = await writeRoot(inner, ROOT_B_SOURCE);
+  const nestedSession = new Session(launch(outer, "error"));
+  try {
+    await nestedSession.initialize({
+      workspaceFolders: [
+        { uri: uri(outer), name: "outer" },
+        { uri: uri(inner), name: "inner" }
+      ],
+      initializationOptions: { trustedRoots: [base], maxWorkers: 1 }
+    });
+    nestedSession.notify("initialized", {});
+    await pollStatus(nestedSession, (roots) =>
+      rootEntry(roots, outer).state === "ready",
+      "the outer root did not activate");
+    nestedSession.notify("textDocument/didOpen", {
+      textDocument: {
+        uri: uri(innerSource), languageId: "titan", version: 1,
+        text: ROOT_B_SOURCE
+      }
+    });
+    await pollHover(nestedSession, innerSource, ROOT_B_SOURCE, "tripled", /integer/,
+      "the nested root with an open document");
+    const nested = await pollStatus(nestedSession, (entries) => {
+      const innerEntry = rootEntry(entries, inner);
+      const outerEntry = rootEntry(entries, outer);
+      return innerEntry.state === "ready" && outerEntry.workerPid === null
+        ? { accepted: entries }
+        : { rejected: entries };
+    }, "the nested root's buffer pinned the outer root");
+    assert.equal(rootEntry(nested, outer).state, "evicted");
+    // The nested root's open document pins it, so the outer root stays out.
+    const nestedCap = await nestedSession.failure("textDocument/hover", {
+      textDocument: { uri: uri(outerSource) },
+      position: positionOf(ROOT_A_SOURCE, "doubled")
+    });
+    assert.equal(nestedCap.code, -32803, JSON.stringify(nestedCap));
+    assert.match(nestedCap.message, /cap/i, nestedCap.message);
+    // Closing it releases the slot for the outer root.
+    nestedSession.notify("textDocument/didClose", {
+      textDocument: { uri: uri(innerSource) }
+    });
+    await pollHover(nestedSession, outerSource, ROOT_A_SOURCE, "doubled",
+      /integer/, "the outer root after the nested buffer closed");
+    await pollStatus(nestedSession, (entries) =>
+      rootEntry(entries, inner).workerPid === null,
+      "closing the nested buffer did not release its worker");
+    await nestedSession.shutdown();
+  } finally {
+    await nestedSession.abort();
+  }
+}
+
 const groups = [
   ["independent", testIndependentRoots, "independent roots"],
   ["folders", testFolderChanges, "folder changes"],
@@ -1068,7 +1330,8 @@ const groups = [
   ["sdk-errors", testRootScopedSdkErrors, "root-scoped SDK errors"],
   ["crash", testWorkerCrashAndOverlay, "crash and overlay replay"],
   ["cap", testCapAndIdleEviction, "worker cap and idle eviction"],
-  ["cancel", testCancellation, "request cancellation"]
+  ["cancel", testCancellation, "request cancellation"],
+  ["overlays", testOverlayOwnership, "overlay ownership"]
 ];
 
 async function main() {

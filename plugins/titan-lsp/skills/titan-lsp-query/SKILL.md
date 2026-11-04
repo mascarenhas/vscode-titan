@@ -52,21 +52,13 @@ Titan V1 semantics always come from disk. Ask the user to save relevant files
 before querying. Treat a returned rename edit as a preview; apply it only in a
 separate, explicitly authorized source-editing step.
 
-The server is a router: it serves one LSP session and starts one worker per
-Titan root. One executable serves every SDK — a root's `compiler_root` selects
-the prefix that worker loads — so the compiler Lua modules and SDK do not have
-to match the server's own build. What is still fixed is the C support table the
-executable links: an SDK whose compiler calls a support function that build
-lacks fails that root with a clear error, and the fix is a server built from a
-matching SDK. API version `1` is held constant during prerelease development; it
-is not evidence that two arbitrary compiler revisions are interchangeable.
-
-Loading a selected SDK executes its code, so a root that sets `compiler_root` is
-only honoured when it is trusted. This query client sends no
-`initializationOptions`, so export `TITAN_LS_TRUSTED_ROOTS` (an OS path list)
-when the queried slice selects its own prefix; otherwise that root fails with an
-error naming the root, the setting and the trust option, and no fallback SDK is
-loaded.
+One server executable serves every SDK: a root's `compiler_root` selects the
+prefix its worker loads, and an SDK whose compiler needs a support function this
+server build lacks fails that root with a clear error, fixed by a server built
+from a matching SDK. Loading a selected SDK executes its code, so export
+`TITAN_LS_TRUSTED_ROOTS` (an OS path list) when the queried slice sets
+`compiler_root`: this client sends no `initializationOptions`, and an untrusted
+selection is refused rather than replaced by another SDK.
 
 Derive the UTF-16 `--line` and `--character` values from the saved text before
 each query; never reuse positions computed against an earlier revision of the

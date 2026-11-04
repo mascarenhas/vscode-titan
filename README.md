@@ -249,25 +249,14 @@ not watched, indexed or a navigation target.
 
 ### Choosing an SDK per root
 
-`compiler_root` selects the compiler Lua modules, native Lua modules, SDK
-headers and standard-library interfaces of one installed Titan SDK prefix for
-one root, for example `/tmp/titan-314/slice-a/prefix`. One server executable
-serves every SDK: the worker for a root is always the router's own image, and
-`compiler_root` only decides which SDK that worker loads. The server checks the
-prefix layout (`share/lua/5.5/titan-compiler/driver.lua`, `lib/lua/5.5` and
-`lib/titan/0.6/titan.a`), installs that prefix's Lua and native module paths,
-removes any inherited provider paths, loads that SDK's compiler before any
-compiler module loads, and reads standard-library interfaces from that
-installation's own `titan.a` by parsing it rather than loading native provider
-code. The executable's own embedded interface inventory, which describes its
-build SDK, stays out of that root. An incompatible SDK — wrong Titan ABI, wrong
-language-server API or a missing driver entry point — is a root-scoped error
-naming the prefix; the root never falls back to another compiler.
-
-The one thing a selected SDK cannot change is the `titan` support table, which
-is linked into the server executable. An SDK whose compiler calls a support
-function this server build lacks fails that root with a clear error; running a
-server built from a matching SDK is the fix.
+`compiler_root` names an installed Titan SDK prefix for one root, for example
+`/tmp/titan-314/slice-a/prefix`; relative paths resolve from the root. One
+server executable serves every SDK, because the setting selects what that
+root's worker loads. An SDK that is missing, that has the wrong Titan ABI or
+language-server API, or that this server build cannot use is a root-scoped
+error naming the prefix, and the root never falls back to another compiler.
+[Server data flow](docs/server-data-flow.md#compiler-compatibility) owns how a
+selected SDK is installed and the one case that needs a matching server build.
 
 Because a machine-specific prefix must not dirty a tracked checkout, the
 optional `titan-config.local.lua` beside `titan-config.lua` may assign only
@@ -280,7 +269,9 @@ compiler_root = "/tmp/titan-314/slice-a/prefix"
 
 Any other key in that file is rejected, and the tracked `titan-config.lua`
 stays the authority for discovery: the local file changes only which SDK that
-root uses.
+root uses. An override this server cannot read, or one whose `compiler_root` is
+not a non-empty string, fails its root with that error instead of falling back
+to the default SDK.
 
 A root's editor and command line must agree: run `titanc` from the same SDK the
 root selects, or the editor will report a different ABI or a different
