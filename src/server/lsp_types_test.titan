@@ -369,3 +369,44 @@ function test_lsp_types_completion_preserves_existing_call_arguments(context: te
       "method(${1:count})$0") == "method(${1:count})$0")
   end)
 end
+
+function test_lsp_types_reads_pull_and_progress_capabilities(
+    _context: test.Context)
+  local defaults = lsp.client_capabilities(wire.decode([[{}]]))
+  test.assert(not defaults.work_done_progress and
+    not defaults.pull_diagnostics_disabled,
+    "missing client capabilities changed server advertisements")
+  local enabled = lsp.client_capabilities(wire.decode(
+    [[{"capabilities":{"window":{"workDoneProgress":true}},"initializationOptions":{"pullDiagnostics":false}}]]))
+  test.assert(enabled.work_done_progress and
+    enabled.pull_diagnostics_disabled,
+    "advertised progress and the pull opt-out were lost")
+  local malformed = lsp.client_capabilities(wire.decode(
+    [[{"capabilities":{"window":{"workDoneProgress":1}},"initializationOptions":{"pullDiagnostics":"false"}}]]))
+  test.assert(not malformed.work_done_progress and
+    not malformed.pull_diagnostics_disabled,
+    "malformed capabilities changed server advertisements")
+end
+
+function test_lsp_types_accepts_a_previous_diagnostic_result_id(
+    _context: test.Context)
+  local params?, failure? = lsp.parse_diagnostic(wire.decode(
+    [[{"textDocument":{"uri":"]] .. test_paths.workspace_uri() ..
+    [[/main.titan"},"previousResultId":"abc"}]]))
+  test.assert(failure == nil and params ~= nil and
+    params.previous_result_id == "abc" and
+    params.document.path == test_paths.workspace_root() .. "/main.titan",
+    "diagnostic pull params lost the document or the previous result id")
+  local fresh?, fresh_failure? = lsp.parse_diagnostic(wire.decode(
+    [[{"textDocument":{"uri":"]] .. test_paths.workspace_uri() ..
+    [[/main.titan"}}]]))
+  test.assert(fresh_failure == nil and fresh ~= nil and
+    fresh.previous_result_id == nil,
+    "diagnostic pull required a previous result id")
+  local rejected?, rejected_failure? = lsp.parse_diagnostic(wire.decode(
+    [[{"textDocument":{"uri":"]] .. test_paths.workspace_uri() ..
+    [[/main.titan"},"previousResultId":2}]]))
+  test.assert(rejected == nil and rejected_failure ~= nil and
+    rejected_failure.code == -32602,
+    "diagnostic pull accepted a non-string previous result id")
+end

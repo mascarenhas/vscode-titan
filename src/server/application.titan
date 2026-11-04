@@ -9,11 +9,13 @@ local strings = import "string"
 local paths = import "path"
 local source_text = import "server.source_text"
 local bridge = import "server.compiler_bridge"
+local content_identity = import "server.content_identity"
 local diagnostics = import "server.diagnostics"
 local dispatcher = import "server.dispatcher"
 local coordinator = import "server.coordinator"
 local document_buffers = import "server.document_buffers"
 local completion_service = import "server.completion_service"
+local indexing_progress = import "server.indexing_progress"
 local indexing_status = import "server.indexing_status"
 local wire = import "server.wire"
 local logging = import "server.logging"
@@ -21,6 +23,8 @@ local lsp = import "server.lsp_types"
 local project_discovery = import "server.project_discovery"
 local project_service = import "server.project_service"
 local project_loader = import "server.project_loader"
+local outbound_requests = import "server.outbound_requests"
+local project_graph = import "server.project_graph"
 local published_diagnostics = import "server.published_diagnostics"
 local semantic_index = import "server.semantic_index"
 local sqlite3 = import "sqlite3"
@@ -119,6 +123,7 @@ record Application
   local restoration: project_loader.Restoration?
   local const buffers: document_buffers.BufferStore
   local completion: completion_service.Service?
+  local const progress: indexing_progress.Reporter
 end
 
 -- Source-imported application tests use these counters to assert coalescing and
@@ -969,6 +974,7 @@ local function Application:emit_compiler_progress(
   self:emit_indexing_status(
     indexing_status.State.indexing(), nil,
     progress.completed_files, progress.total_files)
+  self.progress:report(progress.completed_files, progress.total_files)
 end
 
 local function Application:begin_refresh_chain(reason: string)
@@ -1061,6 +1067,9 @@ local function Application:start_refresh(force: boolean, reason: string):
         ["pass"] = self.refresh_passes,
         ["follow_up"] = self.refresh_passes > chain.first_pass + 1,
       })
+      -- A client which advertises work-done progress sees one begin for the
+      -- whole contiguous period, before this pass performs compiler work.
+      self.progress:start(self.refresh_chain_initial)
       local completed = self:refresh_once()
       local outcome_name = "unknown"
       local outcome_message: string? = nil
@@ -1124,12 +1133,16 @@ local function Application:start_refresh(force: boolean, reason: string):
       else
         self:complete_refresh_chain(
           outcome_name, target_epoch, outcome_message)
+        -- Progress ends only after the completed view and its diagnostics are
+        -- published, so a request issued after `end` sees that generation.
         case completed
         when failure(failure) then
           self:emit_indexing_status(
             indexing_status.State.failed(), failure.message)
+          self.progress:finish(failure.message)
         when ready(view) then
           self:emit_indexing_status(indexing_status.State.ready(), nil)
+          self.progress:finish(nil)
           local restoration? = self.restoration
           if restoration ~= nil and not self.closed then
             restoration:start(function ()
@@ -1149,6 +1162,7 @@ local function Application:start_refresh(force: boolean, reason: string):
       self.active_refresh_epoch = nil
       if error is async.CancellationReason then
         self:complete_refresh_chain("cancelled", target_epoch, nil)
+        self.progress:finish(nil)
         raise
       end
       -- Terminal cleanup must not depend on any best-effort output path.
@@ -1172,6 +1186,13 @@ end
 
 function Application:set_indexing_listener(listener: indexing_status.Listener?)
   self.indexing_listener = listener
+end
+
+--- Attach the protocol client channel used for server-initiated progress.
+function Application:set_client_channel(
+    requests: outbound_requests.OutboundRequests?,
+    capabilities: lsp.CapabilitiesReader?)
+  self.progress:configure(requests, capabilities)
 end
 
 function Application:set_diagnostics_listener(listener: diagnostics.Listener?)
@@ -1296,6 +1317,96 @@ local function Application:fresh_view(): (View?, Error?)
     return nil, Error.new("saved Titan project changed while indexing; retry")
   end
   return view, nil
+end
+
+local function project_source_stamp(snapshot: project_service.Snapshot,
+                                    path: string): project_graph.FileStamp?
+  for module_index = 1, #snapshot.project_modules do
+    local files = snapshot.project_modules[module_index].source_files
+    for file_index = 1, #files do
+      local stamp = files[file_index].stamp
+      if stamp.path == path then return stamp end
+    end
+  end
+  return nil
+end
+
+-- A recorded stamp still describes the saved bytes when its complete filesystem
+-- observation matches, or when the saved content digest does. A timestamp-only
+-- change does not make the saved input different.
+local function stamp_is_current(stamp: project_graph.FileStamp): boolean
+  local observed? = content_identity.observe(stamp.path)
+  if observed == nil or observed.kind ~= "file" then return false end
+  if observed.size == stamp.size and
+     observed.modified_seconds == stamp.modified_seconds and
+     observed.modified_nanoseconds == stamp.modified_nanoseconds and
+     observed.physical_identity == stamp.physical_identity then
+    return true
+  end
+  local identity? = stamp.identity
+  if identity == nil then return false end
+  local recorded: string = identity
+  local contents: string? = nil
+  do
+    contents = fs.read_file(stamp.path)
+  catch
+    if error is async.CancellationReason then raise end
+  end
+  if contents == nil then return false end
+  return recorded == content_identity.digest(contents)
+end
+
+local function Application:view_covers(view: View, path: string): boolean
+  if self.closed then return false end
+  if self.change_epoch > self.completed_epoch then return false end
+  if self.refresh_task ~= nil then return false end
+  local service? = self.service
+  if service == nil then return false end
+  local snapshot = service:latest()
+  if snapshot.generation ~= view.work_generation then return false end
+  local stamp? = project_source_stamp(snapshot, path)
+  -- A path outside the saved project cannot gain diagnostics from a refresh.
+  if stamp == nil then return true end
+  return stamp_is_current(stamp)
+end
+
+-- A pull describes the saved bytes the client is about to read. Wait for a
+-- completed generation which covers the file's current saved bytes instead of
+-- answering from an older publication. A newer save starts the next coalesced
+-- pass, which this loop joins; the client's own timeout bounds the wait through
+-- ordinary request cancellation.
+local function Application:fresh_view_for(path: string): (View?, Error?)
+  while true do
+    if self.closed then
+      return nil, Error.new("language server application is closed")
+    end
+    local view?, view_error? = self:current_view()
+    if view_error ~= nil then return nil, view_error end
+    if view ~= nil and self:view_covers(view, path) then return view, nil end
+    if self.refresh_task == nil then
+      -- The watcher has not observed this saved change yet; index the same
+      -- saved state a watcher hint would.
+      self:note_saved_change()
+    end
+    local task? = self.refresh_task
+    if task == nil then
+      return nil, Error.new("project refresh did not start")
+    end
+    async.join(task)
+  end
+  return nil, Error.new("project refresh did not start")
+end
+
+local function Application:published_items(view: View, uri: string):
+    {diagnostics.Item}?
+  local service = self.service as project_service.Service
+  do
+    return published_diagnostics.read_uri(
+      service:workspace_store(), view.published_generation, uri)
+  catch
+    if error is semantic_index.StaleView then return nil end
+    raise
+  end
 end
 
 local function parse_error(item: lsp.Error?): dispatcher.SemanticOutcome
@@ -1443,6 +1554,40 @@ local function Application:handle_folding(
     view.features:folding_ranges(params.path)))
 end
 
+-- Pull diagnostics answer from the same published rows push uses, so both
+-- channels always agree. The reported resultId identifies this document's
+-- items exactly, which lets a client keep its previous report.
+local function Application:handle_diagnostic(
+    request: dispatcher.SemanticRequest): dispatcher.SemanticOutcome
+  local params?, params_error? = lsp.parse_diagnostic(request.params)
+  if params == nil then return parse_error(params_error) end
+  -- Publication rows carry this server's own URI spelling, so answer under the
+  -- same spelling rather than the client's equivalent but differently escaped
+  -- one.
+  local uri?, uri_error? = source_text.path_to_file_uri(params.document.path)
+  if uri == nil then
+    return failure(INVALID_PARAMS, "textDocument.uri is not a local file URI")
+  end
+  local published_uri: string = uri
+  while true do
+    local view?, view_error? = self:fresh_view_for(params.document.path)
+    if view == nil then
+      return failure(REQUEST_FAILED, view_error.message)
+    end
+    local items? = self:published_items(view, published_uri)
+    if items ~= nil then
+      -- Honour a cancellation which arrived while the pull waited for the
+      -- saved generation it had to answer from.
+      async.checkpoint()
+      return dispatcher.SemanticOutcome.result(
+        diagnostics.report(items, params.previous_result_id))
+    end
+    -- A newer publication was installed while acquiring the store lease; answer
+    -- from that completed generation instead of this stale one.
+  end
+  return failure(INTERNAL_ERROR, "diagnostic pull did not complete")
+end
+
 local function default_rename_analyzer(
     snapshot: project_service.Snapshot,
     projects: {bridge.ProjectModule}): bridge.Analysis
@@ -1536,7 +1681,8 @@ function create(project_root: string, loader: ProjectLoader?,
     project_root, loader or project_loader.load, nil, nil, nil, nil, nil, nil,
     nil, 1, 0, nil, nil, false, 0, 0, 0, nil, false,
     new_directory_probes(), rename_analyzer or default_rename_analyzer,
-    diagnostics.create(), nil, document_buffers.create(), nil)
+    diagnostics.create(), nil, document_buffers.create(), nil,
+    indexing_progress.create())
 end
 
 function Application:on_document(notification: lsp.DocumentNotification)
@@ -1627,6 +1773,8 @@ function Application:handle(
     return self:handle_hover(request)
   elseif request.method == "textDocument/foldingRange" then
     return self:handle_folding(request)
+  elseif request.method == "textDocument/diagnostic" then
+    return self:handle_diagnostic(request)
   end
   return failure(METHOD_NOT_FOUND, "Method not found")
 catch
@@ -1678,6 +1826,7 @@ function Application:close()
     self:complete_refresh_chain(
       "cancelled", attempted_epoch as integer, nil)
   end
+  self.progress:reset()
   self.active_refresh_epoch = nil
   if restoration ~= nil then restoration:close() end
   self.restoration = nil

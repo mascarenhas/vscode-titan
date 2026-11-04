@@ -1,0 +1,152 @@
+local test = import "test"
+local async = import "async"
+local wire = import "server.wire"
+local lsp = import "server.lsp_types"
+local outbound = import "server.outbound_requests"
+local progress = import "server.indexing_progress"
+local response_queue = import "server.response_queue"
+local test_runtime = import "server.test_runtime"
+
+local function object(source: string): wire.Object
+  local parsed = wire.decode(source)
+  local item? = wire.as_object(parsed)
+  test.assert(item ~= nil, "indexing progress was not a JSON object")
+  return item
+end
+
+local function capable(): lsp.ClientCapabilities?
+  return lsp.ClientCapabilities.new(true, false)
+end
+
+local function incapable(): lsp.ClientCapabilities?
+  return lsp.ClientCapabilities.new(false, false)
+end
+
+local function drain(output: response_queue.ResponseQueue): {wire.Object}
+  local messages: {wire.Object} = {}
+  while output:pending() > 0 do
+    messages[#messages + 1] = object(output:take())
+  end
+  return messages
+end
+
+local function progress_value(message: wire.Object): (wire.Object?, string?)
+  local params? = wire.as_object(message["params"])
+  if params == nil then return nil, nil end
+  return wire.as_object(params["value"]), wire.as_string(params["token"])
+end
+
+function test_indexing_progress_stays_silent_without_the_capability(
+    _context: test.Context)
+  test_runtime.run(function ()
+    local output = response_queue.create()
+    local requests = outbound.create(output)
+    local reporter = progress.create()
+    reporter:configure(requests, incapable)
+    local worker = async.run<|nil, value|>(function (): nil
+      reporter:start(true)
+      reporter:report(1, 2)
+      reporter:finish(nil)
+      return nil
+    end)
+    async.join(worker)
+    test.assert(output:pending() == 0,
+      "progress was published to a client without the capability")
+    test.assert(requests:count() == 0,
+      "progress created a token without the capability")
+  end)
+end
+
+function test_indexing_progress_reports_one_period_per_chain(
+    _context: test.Context)
+  test_runtime.run(function ()
+    local output = response_queue.create()
+    local requests = outbound.create(output)
+    local reporter = progress.create()
+    reporter:configure(requests, capable)
+    local worker = async.run<|nil, value|>(function (): nil
+      reporter:start(true)
+      reporter:report(1, 2)
+      -- A coalesced follow-up pass belongs to the same contiguous period.
+      reporter:start(false)
+      reporter:report(2, 2)
+      reporter:finish(nil)
+      return nil
+    end)
+
+    local create = object(output:take())
+    test.assert(wire.as_string(create["method"]) ==
+                  "window/workDoneProgress/create",
+      "progress did not request a token")
+    local params? = wire.as_object(create["params"])
+    local token? = wire.as_string(params["token"])
+    local request_id? = wire.as_string(create["id"])
+    test.assert(token ~= nil and request_id ~= nil,
+      "progress request lost its token or identifier")
+    test.assert(requests:route(request_id, wire.null(), nil),
+      "progress token response was not routed")
+    async.join(worker)
+
+    local messages = drain(output)
+    test.assert(#messages == 4,
+      "progress published more than one begin/end pair for one chain")
+    local begin_value?, begin_token? = progress_value(messages[1])
+    test.assert(begin_value ~= nil and
+                wire.as_string(begin_value["kind"]) == "begin" and
+                wire.as_string(begin_value["title"]) == "Titan indexing" and
+                wire.as_string(begin_value["message"]) == "initial",
+      "progress did not begin with the initial indexing title")
+    local first_value?, first_token? = progress_value(messages[2])
+    test.assert(first_value ~= nil and
+                wire.as_string(first_value["kind"]) == "report" and
+                wire.as_string(first_value["message"]) == "1/2 files" and
+                wire.as_integer(first_value["percentage"]) == 50,
+      "progress report lost its completed workset")
+    local second_value?, second_token? = progress_value(messages[3])
+    test.assert(second_value ~= nil and
+                wire.as_string(second_value["message"]) == "2/2 files" and
+                wire.as_integer(second_value["percentage"]) == 100,
+      "progress report lost the follow-up workset")
+    local end_value?, end_token? = progress_value(messages[4])
+    test.assert(end_value ~= nil and
+                wire.as_string(end_value["kind"]) == "end",
+      "progress did not end its period")
+    test.assert(begin_token == first_token and first_token == second_token and
+                second_token == end_token,
+      "progress changed token inside one contiguous period")
+    test.assert(requests:count() == 0,
+      "progress retained its token request after the period")
+  end)
+end
+
+function test_indexing_progress_skips_a_rejected_token_request(
+    _context: test.Context)
+  test_runtime.run(function ()
+    local output = response_queue.create()
+    local requests = outbound.create(output)
+    local reporter = progress.create()
+    reporter:configure(requests, capable)
+    local worker = async.run<|nil, value|>(function (): nil
+      reporter:start(true)
+      -- A failed creation is not retried inside the same chain.
+      reporter:start(false)
+      reporter:report(1, 1)
+      reporter:finish("cannot index")
+      return nil
+    end)
+
+    local create = object(output:take())
+    local params? = wire.as_object(create["params"])
+    local token? = wire.as_string(params["token"])
+    local request_id? = wire.as_string(create["id"])
+    test.assert(token ~= nil and request_id ~= nil,
+      "progress request lost its token or identifier")
+    test.assert(requests:route(request_id, nil, "client refused the token"),
+      "refused progress token was not routed")
+    async.join(worker)
+    test.assert(output:pending() == 0,
+      "a refused token still published progress")
+    test.assert(requests:count() == 0,
+      "a refused token stayed pending")
+  end)
+end
