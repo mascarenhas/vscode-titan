@@ -19,6 +19,7 @@ import {
   SERVER_BASENAME,
   SERVER_LOG_LEVEL_ENVIRONMENT_VARIABLE,
   ServerConfigurationError,
+  createInitializationOptions,
   createServerLaunchOptions,
   ensureServerExecutable,
   formatServerStartup,
@@ -57,6 +58,35 @@ describe("server configuration", () => {
         /insertCallSnippets must be a boolean/.test(error.message)
     );
   });
+  test("declares the folder the session owns as its only trusted root", () => {
+    const roots = ["/work/slice"];
+    const options = createInitializationOptions(
+      readCompletionConfiguration(false),
+      roots
+    );
+    assert.deepEqual(options, {
+      insertCallSnippets: false,
+      trustedRoots: ["/work/slice"]
+    });
+    assert.notEqual(options.trustedRoots, roots);
+    assert.equal(roots.length, 1, "initialization options mutated the caller");
+  });
+
+  test("rejects empty or non-string trusted roots", () => {
+    const completion = readCompletionConfiguration();
+    assert.throws(
+      () => createInitializationOptions(completion, [""]),
+      (error: unknown) => error instanceof ServerConfigurationError &&
+        /trustedRoots must be an array of absolute directory paths/.test(
+          error.message
+        )
+    );
+    assert.throws(
+      () => createInitializationOptions(completion, [42 as unknown as string]),
+      (error: unknown) => error instanceof ServerConfigurationError
+    );
+  });
+
   test("normalizes a configured path and copies arguments", () => {
     const argumentsSetting = ["--trace", "messages"];
     const configuration = readServerConfiguration(
