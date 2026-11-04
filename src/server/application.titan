@@ -1565,6 +1565,24 @@ local function unavailable_completion(): dispatcher.SemanticOutcome
     lsp.completion_list_value(lsp.CompletionList.new(true, {})))
 end
 
+-- The router keeps editor text for replay under the same limits this process
+-- applies. When it could not retain a buffer, the document is still open: record
+-- it as an unavailable contributor so completion never falls back to saved bytes
+-- for a document the editor is editing unsaved.
+--- Record one open document whose text this process does not have.
+function Application:on_unavailable_document(document: lsp.TextDocument,
+                                             version: integer)
+  if self.closed then return end
+  local path = document.path
+  if not path_within(self.project_root, path) or not titan_source_path(path) then
+    return
+  end
+  if self.buffers:observe_unavailable(document, version) then
+    local completion? = self.completion
+    if completion ~= nil then completion:changed() end
+  end
+end
+
 --- Capture completion inputs before later editor notifications can change them.
 function Application:capture_completion(request: dispatcher.CompletionRequest):
     coordinator.CompletionWork

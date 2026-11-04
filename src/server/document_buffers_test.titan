@@ -94,6 +94,32 @@ function test_buffers_bound_text_and_recover_after_oversize_changes(
   test.assert(after.document.text == "recovered")
 end
 
+function test_buffers_track_unavailable_documents_without_saved_bytes(
+    _context: test.Context)
+  local bounded = buffers.limits()
+  test.assert(bounded.document_bytes > 0 and bounded.workspace_bytes > 0 and
+    bounded.documents > 0, "buffer limits are not exposed to their other owner")
+  local store = buffers.create()
+  open(store, "main.titan", 1, "small")
+  local path = test_paths.workspace_root() .. "/main.titan"
+  test.assert(store:capture(path, source_text.Position.new(0, 1)) ~= nil,
+    "the retained buffer was not capturable")
+  -- The router could not retain this buffer: the document stays open but
+  -- contributes nothing, exactly like an over-budget change.
+  test.assert(store:observe_unavailable(document("main.titan"), 9),
+    "an unavailable document was not recorded")
+  test.assert(store:bytes() == 0, "an unavailable document retained bytes")
+  test.assert(store:tracked(path), "an unavailable document was not tracked")
+  test.assert(store:capture(path, source_text.Position.new(0, 1)) == nil,
+    "an unavailable document returned a capture")
+  test.assert(store:apply(lsp.DocumentNotification.changed(
+    lsp.ChangeDocument.new(document("main.titan"), 10, "recovered"))),
+    "a bounded replacement after unavailability was ignored")
+  local after? = store:capture(path, source_text.Position.new(0, 1))
+  test.assert(after.document.text == "recovered",
+    "a recovered buffer kept the unavailable state")
+end
+
 function test_buffers_replace_whole_identifier_using_unsaved_utf16_coordinates(
     _context: test.Context)
   local store = buffers.create()

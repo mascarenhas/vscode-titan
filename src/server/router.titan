@@ -5,6 +5,7 @@ foreign import "compiler_io_clock.h"
 
 local async = import "async"
 local dispatcher = import "server.dispatcher"
+local documents = import "server.document_buffers"
 local fs = import "fs"
 local iteration = import "iteration"
 local json = import "json"
@@ -79,12 +80,17 @@ local function state_failure(state: WorkerState): string?
   return nil
 end
 
---- One open editor buffer replayed into a (re)started worker.
+--- One open editor buffer retained for replay into its owner's worker.
+-- `text` is nil when the buffer is over the limits the worker applies
+-- (`documents.limits`): the document is then delivered as an unavailable
+-- contributor rather than as saved bytes. `owner` is the root whose worker
+-- currently holds it open, or nil when delivery is still pending.
 record Overlay
   const uri: string
   const path: string
   local version: integer
-  local text: string
+  local text: string?
+  local owner: string?
 end
 
 --- One forwarded client request awaiting its worker's response.
@@ -122,6 +128,8 @@ record Slot
   -- The worker reported background indexing; it is not idle then.
   local indexing: boolean
   local diagnosed_file: string?
+  -- URIs this root published diagnostics for, and the document each names.
+  local published: {string: string}
   local transitioning: boolean
   local waiter: async.Task?
   local token: async.ResumeToken
@@ -145,6 +153,7 @@ record Router
   local order: {string}
   local overlays: {string: Overlay}
   local overlay_order: {string}
+  local overlay_bytes: integer
   local forwarded: {string: Forwarded}
   local outbound: {string: Outbound}
   local retired: {worker_process.WorkerProcess}
@@ -247,11 +256,33 @@ function create(options: LaunchOptions, output: response_queue.ResponseQueue): R
   -- The router always serves completion, exactly as the single-root server did,
   -- so the advertised capabilities must include it.
   envelope:enable_completion()
-  return Router.new(
-    options, output, roots.create(), root_settings.create({}),
-    {}, {}, {}, {}, {}, {}, {}, envelope, {},
-    nil, nil, max_workers, DEFAULT_IDLE_TIMEOUT_SECONDS, 1, 1,
-    false, nil, {}, {}, false)
+  return Router.new {
+    options = options,
+    output = output,
+    registry = roots.create(),
+    trust = root_settings.create({}),
+    slots = {},
+    order = {},
+    overlays = {},
+    overlay_order = {},
+    overlay_bytes = 0,
+    forwarded = {},
+    outbound = {},
+    retired = {},
+    envelope = envelope,
+    initial_roots = {},
+    client_capabilities = nil,
+    client_initialization_options = nil,
+    max_workers = max_workers,
+    idle_timeout_seconds = DEFAULT_IDLE_TIMEOUT_SECONDS,
+    next_use = 1,
+    next_outbound = 1,
+    initial_activated = false,
+    housekeeping = nil,
+    unowned_logged = {},
+    discovered = {},
+    closed = false,
+  }
 end
 
 local function slot_for_root(router: Router, entry: roots.Root): Slot
@@ -276,6 +307,7 @@ local function slot_for_root(router: Router, entry: roots.Root): Slot
     probe_prefix = nil,
     indexing = false,
     diagnosed_file = nil,
+    published = {},
     transitioning = false,
     waiter = nil,
     token = async.ResumeToken.new("server.router.slot"),
@@ -296,6 +328,48 @@ end
 -- decides ownership: every registered root is reported whether or not its slot
 -- has been touched yet, and a root that just served a request is always in the
 -- registry. A root with no slot has no worker and reports `inactive`.
+-- The owner of a canonical document path is the most specific of the known
+-- roots that contain it and its nearest ancestor configuration directory. A
+-- project nested inside a folder root is therefore its own root, and a folder
+-- root with no titan-config.lua cannot claim a configured project below it.
+-- The walk is memoized per directory and containing root: configuration files
+-- appear and disappear rarely, and an explicit reload clears the memo.
+local function nested_configuration(router: Router, canonical: string,
+                                    owner_path: string): string?
+  local directory = paths.to_slash(paths.dirname(canonical))
+  local key = owner_path .. "|" .. directory
+  local cached? = router.discovered[key]
+  if cached ~= nil then
+    local text: string = cached
+    if text == "" then return nil end
+    return text
+  end
+  local found? = roots.discover(canonical)
+  if found == nil or (owner_path ~= "" and #(found as string) <= #owner_path) then
+    router.discovered[key] = ""
+    return nil
+  end
+  local deeper: string = found
+  router.discovered[key] = deeper
+  return deeper
+end
+
+local function owner_root(router: Router, canonical: string): roots.Root?
+  local owner? = router.registry:owner(canonical)
+  local owner_path = ""
+  if owner ~= nil then owner_path = (owner as roots.Root).path end
+  local discovered? = nested_configuration(router, canonical, owner_path)
+  if discovered ~= nil then
+    local entry = router.registry:attach_discovery(discovered as string)
+    logging.emit("info", "root.discovered", {
+      ["root"] = entry.path,
+      ["path"] = canonical,
+    })
+    return entry
+  end
+  return owner
+end
+
 local function status_value(router: Router): value
   local result: wire.Array = {}
   local entries = router.registry:list()
@@ -440,6 +514,39 @@ end
 
 -- Stop one slot's worker after its in-flight requests finish. The caller owns
 -- the slot transition, so a restart can stop and start inside one transition.
+-- Publish an empty diagnostic set: the one publication that clears whatever a
+-- previous owner said about this document.
+local function publish_empty_diagnostics(router: Router, uri: string)
+  local diagnostics: wire.Array = {}
+  local params: wire.Object = {["uri"] = uri, ["diagnostics"] = diagnostics}
+  local envelope: wire.Object = {
+    ["jsonrpc"] = "2.0",
+    ["method"] = "textDocument/publishDiagnostics",
+    ["params"] = params,
+  }
+  router.output:push(wire.encode(envelope))
+end
+
+-- Clear every publication this root made for a document another root now owns.
+local function clear_stale_diagnostics(router: Router, slot: Slot)
+  local stale: {string} = {}
+  for uri, path in iteration.pairs(slot.published) do
+    local current? = owner_root(router, path)
+    local current_path = ""
+    if current ~= nil then current_path = (current as roots.Root).path end
+    if current_path ~= slot.root.path then stale[#stale + 1] = uri end
+  end
+  for index = 1, #stale do
+    local uri = stale[index]
+    slot.published[uri] = nil
+    publish_empty_diagnostics(router, uri)
+    logging.emit("info", "diagnostics.cleared", {
+      ["root"] = slot.root.path,
+      ["uri"] = uri,
+    })
+  end
+end
+
 local function stop_worker_locked(router: Router, slot: Slot, reason: string)
   drain_requests(router, slot.root.path)
   local worker? = slot.worker
@@ -457,6 +564,14 @@ local function stop_worker_locked(router: Router, slot: Slot, reason: string)
   end
   fail_forwarded(router, slot.root.path,
     "Titan worker for " .. slot.root.path .. " stopped: " .. reason)
+  -- The worker that held these buffers is gone; they are pending delivery.
+  for index = 1, #router.overlay_order do
+    local overlay = router.overlays[router.overlay_order[index]] as Overlay
+    local owner? = overlay.owner
+    if owner ~= nil and (owner as string) == slot.root.path then
+      overlay.owner = nil
+    end
+  end
   slot.state = WorkerState.evicted()
   logging.emit("info", "root.stop", {
     ["root"] = slot.root.path,
@@ -469,6 +584,7 @@ end
 local function forget_released(router: Router, slot: Slot)
   if slot.root:claimed() then return end
   local path = slot.root.path
+  clear_stale_diagnostics(router, slot)
   if not router.registry:drop(path) then return end
   router.slots[path] = nil
   local kept: {string} = {}
@@ -523,18 +639,32 @@ local function worker_listener(router: Router, slot: Slot): worker_process.Liste
       if method == "textDocument/publishDiagnostics" then
         local object? = wire.as_object(params)
         if object ~= nil then
-          local uri? = wire.as_string((object as wire.Object)["uri"])
+          local actual_params = object as wire.Object
+          local uri? = wire.as_string(actual_params["uri"])
           if uri ~= nil then
-            local path?, failure? = source_text.file_uri_to_path(uri as string)
+            local text_uri: string = uri
+            local path?, failure? = source_text.file_uri_to_path(text_uri)
             if path ~= nil then
               local canonical = roots.canonical(path as string)
-              local current? = router.registry:owner(canonical)
-              if current == nil or current.path ~= owner.root.path then
+              local current? = owner_root(router, canonical)
+              local current_path = ""
+              if current ~= nil then
+                current_path = (current as roots.Root).path
+              end
+              if current_path ~= owner.root.path then
                 logging.emit("debug", "diagnostics.dropped", {
                   ["root"] = owner.root.path,
-                  ["uri"] = uri,
+                  ["uri"] = text_uri,
                 })
                 return
+              end
+              -- Remember what this root told the client, so an ownership change
+              -- can clear exactly those publications.
+              local published? = wire.as_array(actual_params["diagnostics"])
+              if published ~= nil and #(published as wire.Array) > 0 then
+                owner.published[text_uri] = canonical
+              else
+                owner.published[text_uri] = nil
               end
             end
           end
@@ -633,24 +763,148 @@ local function worker_initialize_params(router: Router, root_path: string): wire
   return params
 end
 
+local UNAVAILABLE_DELIVERY_TIMEOUT_MILLISECONDS = 5000
+
+-- Retain one editor buffer under the limits the worker's own BufferStore
+-- applies (`documents.limits`). An over-limit buffer keeps only its identity and
+-- version watermark, and is delivered as an unavailable contributor.
+local function store_overlay(router: Router, uri: string, path: string,
+                             version: integer, text: string)
+  local existing? = router.overlays[path]
+  if existing == nil then
+    router.overlay_order[#router.overlay_order + 1] = path
+  else
+    local previous = existing as Overlay
+    local previous_text? = previous.text
+    if previous_text ~= nil then
+      router.overlay_bytes = router.overlay_bytes - #((previous_text as string))
+    end
+  end
+  local bounded = documents.limits()
+  local retained: string? = nil
+  if #text <= bounded.document_bytes and
+     router.overlay_bytes + #text <= bounded.workspace_bytes and
+     #router.overlay_order <= bounded.documents then
+    retained = text
+    router.overlay_bytes = router.overlay_bytes + #text
+  else
+    -- Same limits as the worker's BufferStore: the document stays an available
+    -- identity with no retained bytes, and replay marks it unavailable.
+    logging.emit("info", "overlay.unavailable", {
+      ["uri"] = uri,
+      ["bytes"] = #text,
+      ["retained_bytes"] = router.overlay_bytes,
+    })
+  end
+  local owner: string? = nil
+  if existing ~= nil then owner = (existing as Overlay).owner end
+  router.overlays[path] = Overlay.new {
+    uri = uri,
+    path = path,
+    version = version,
+    text = retained,
+    owner = owner,
+  }
+end
+
+local function forget_overlay(router: Router, path: string)
+  local existing? = router.overlays[path]
+  if existing == nil then return end
+  local overlay = existing as Overlay
+  local text? = overlay.text
+  if text ~= nil then
+    router.overlay_bytes = router.overlay_bytes - #((text as string))
+  end
+  router.overlays[path] = nil
+  local kept: {string} = {}
+  for index = 1, #router.overlay_order do
+    local candidate = router.overlay_order[index]
+    if candidate ~= path then kept[#kept + 1] = candidate end
+  end
+  router.overlay_order = kept
+end
+
+-- Deliver the router's copy of an open document to one worker: its retained text
+-- as a normal open, or the unavailable-contributor marker when the buffer is
+-- over the limits, which leaves the worker in the same state as an over-limit
+-- open received directly.
+local function deliver_overlay(router: Router, slot: Slot, overlay: Overlay)
+  local worker? = slot.worker
+  if worker == nil then return false end
+  local actual_worker = worker as worker_process.WorkerProcess
+  local text? = overlay.text
+  if text ~= nil then
+    local document: wire.Object = {
+      ["uri"] = overlay.uri,
+      ["languageId"] = "titan",
+      ["version"] = overlay.version,
+      ["text"] = text as string,
+    }
+    local params: wire.Object = {["textDocument"] = document}
+    local envelope: wire.Object = {
+      ["jsonrpc"] = "2.0",
+      ["method"] = "textDocument/didOpen",
+      ["params"] = params,
+    }
+    if actual_worker:send(wire.encode(envelope)) then
+      overlay.owner = slot.root.path
+      return true
+    end
+    return false
+  end
+  local document: wire.Object = {
+    ["uri"] = overlay.uri,
+    ["languageId"] = "titan",
+  }
+  local params: wire.Object = {
+    ["textDocument"] = document, ["version"] = overlay.version,
+  }
+  local outcome = actual_worker:request("titan/documentUnavailable", params,
+    UNAVAILABLE_DELIVERY_TIMEOUT_MILLISECONDS)
+  case outcome
+  when answered(_value) then
+    overlay.owner = slot.root.path
+    return true
+  when failed(error_value) then
+    logging.emit("error", "overlay.unavailable.failure", {
+      ["root"] = slot.root.path,
+      ["uri"] = overlay.uri,
+      ["message"] = strings.tostring(error_value),
+    })
+  when unavailable(message) then
+    logging.emit("debug", "overlay.unavailable.pending", {
+      ["root"] = slot.root.path,
+      ["uri"] = overlay.uri,
+      ["message"] = message,
+    })
+  end
+  return false
+end
+
+-- The root that no longer owns an open document must forget the buffer, so it
+-- cannot contribute unsaved facts the router no longer routes to it.
+local function close_overlay_on(router: Router, owner_path: string,
+                                overlay: Overlay)
+  local slot? = router.slots[owner_path]
+  if slot == nil then return end
+  local actual = slot as Slot
+  local worker? = actual.worker
+  if worker == nil or not state_ready(actual.state) then return end
+  local actual_worker: worker_process.WorkerProcess = worker
+  local params: wire.Object = {
+    ["textDocument"] = {["uri"] = overlay.uri},
+  }
+  actual_worker:notify("textDocument/didClose", params)
+end
+
 local function replay_overlays(router: Router, slot: Slot,
                                worker: worker_process.WorkerProcess)
   for index = 1, #router.overlay_order do
     local overlay = router.overlays[router.overlay_order[index]] as Overlay
     if overlay_belongs(router, slot, overlay) then
-      local document: wire.Object = {
-        ["uri"] = overlay.uri,
-        ["languageId"] = "titan",
-        ["version"] = overlay.version,
-        ["text"] = overlay.text,
-      }
-      local params: wire.Object = {["textDocument"] = document}
-      local envelope: wire.Object = {
-        ["jsonrpc"] = "2.0",
-        ["method"] = "textDocument/didOpen",
-        ["params"] = params,
-      }
-      worker:send(wire.encode(envelope))
+      -- A worker that just started holds no buffers.
+      overlay.owner = nil
+      deliver_overlay(router, slot, overlay)
     end
   end
 end
@@ -968,48 +1222,6 @@ local function activate(router: Router, slot: Slot): (Slot?, string?)
   return nil, "cannot start a Titan worker"
 end
 
--- The owner of a canonical document path is the most specific of the known
--- roots that contain it and its nearest ancestor configuration directory. A
--- project nested inside a folder root is therefore its own root, and a folder
--- root with no titan-config.lua cannot claim a configured project below it.
--- The walk is memoized per directory and containing root: configuration files
--- appear and disappear rarely, and an explicit reload clears the memo.
-local function nested_configuration(router: Router, canonical: string,
-                                    owner_path: string): string?
-  local directory = paths.to_slash(paths.dirname(canonical))
-  local key = owner_path .. "|" .. directory
-  local cached? = router.discovered[key]
-  if cached ~= nil then
-    local text: string = cached
-    if text == "" then return nil end
-    return text
-  end
-  local found? = roots.discover(canonical)
-  if found == nil or (owner_path ~= "" and #(found as string) <= #owner_path) then
-    router.discovered[key] = ""
-    return nil
-  end
-  local deeper: string = found
-  router.discovered[key] = deeper
-  return deeper
-end
-
-local function owner_root(router: Router, canonical: string): roots.Root?
-  local owner? = router.registry:owner(canonical)
-  local owner_path = ""
-  if owner ~= nil then owner_path = (owner as roots.Root).path end
-  local discovered? = nested_configuration(router, canonical, owner_path)
-  if discovered ~= nil then
-    local entry = router.registry:attach_discovery(discovered as string)
-    logging.emit("info", "root.discovered", {
-      ["root"] = entry.path,
-      ["path"] = canonical,
-    })
-    return entry
-  end
-  return owner
-end
-
 local function ensure_slot(router: Router, path: string): (Slot?, string?)
   local entry? = owner_root(router, path)
   if entry == nil then
@@ -1121,35 +1333,17 @@ local function Router:set_overlay(notification: lsp.DocumentNotification,
                                   canonical: string)
   case notification
   when opened(item) then
-    local path = canonical
-    if self.overlays[path] == nil then
-      self.overlay_order[#self.overlay_order + 1] = path
-    end
-    self.overlays[path] = Overlay.new(
-      item.document.uri, path, item.version, item.text)
+    store_overlay(self, item.document.uri, canonical, item.version, item.text)
   when changed(item) then
-    local path = canonical
-    local existing? = self.overlays[path]
+    local existing? = self.overlays[canonical]
     if existing == nil then
-      self.overlay_order[#self.overlay_order + 1] = path
-      self.overlays[path] = Overlay.new(
-        item.document.uri, path, item.version, item.text)
+      store_overlay(self, item.document.uri, canonical, item.version, item.text)
     else
       local overlay = existing as Overlay
-      overlay.version = item.version
-      overlay.text = item.text
+      store_overlay(self, overlay.uri, canonical, item.version, item.text)
     end
   when closed(item) then
-    local path = canonical
-    if self.overlays[path] ~= nil then
-      self.overlays[path] = nil
-      local kept: {string} = {}
-      for index = 1, #self.overlay_order do
-        local candidate = self.overlay_order[index]
-        if candidate ~= path then kept[#kept + 1] = candidate end
-      end
-      self.overlay_order = kept
-    end
+    forget_overlay(self, canonical)
   when saved() then
   end
 end
@@ -1177,7 +1371,10 @@ local function Router:route_document(notification: lsp.DocumentNotification,
   local worker? = live.worker
   if worker ~= nil then
     local actual_worker = worker as worker_process.WorkerProcess
-    actual_worker:send(body)
+    if actual_worker:send(body) and not notification_closes(notification) then
+      local stored? = self.overlays[canonical]
+      if stored ~= nil then (stored as Overlay).owner = live.root.path end
+    end
   end
 end
 
@@ -1354,6 +1551,40 @@ local function Router:evict_idle()
         end
       end
     end
+  end
+end
+
+-- Move per-document state with its owner. Every ownership change (folder add or
+-- removal, release, nested discovery, a root that stops) ends here: the document
+-- still open in the client is closed in the old owner, opened in the new one with
+-- the router's latest text (or its unavailable-contributor marker), and any
+-- diagnostics a root published for a document it no longer owns are cleared.
+local function Router:reconcile()
+  for index = 1, #self.overlay_order do
+    local overlay = self.overlays[self.overlay_order[index]] as Overlay
+    local current? = owner_root(self, overlay.path)
+    local current_path = ""
+    if current ~= nil then current_path = (current as roots.Root).path end
+    local delivered? = overlay.owner
+    local delivered_path = ""
+    if delivered ~= nil then delivered_path = delivered as string end
+    if delivered_path ~= current_path then
+      overlay.owner = nil
+      if delivered_path ~= "" then
+        close_overlay_on(self, delivered_path, overlay)
+      end
+      if current ~= nil then
+        local slot = slot_for_root(self, current as roots.Root)
+        if slot.worker ~= nil and state_ready(slot.state) then
+          deliver_overlay(self, slot, overlay)
+        end
+      end
+    end
+  end
+  local paths = self:root_paths()
+  for index = 1, #paths do
+    local slot? = self.slots[paths[index]]
+    if slot ~= nil then clear_stale_diagnostics(self, slot as Slot) end
   end
 end
 
@@ -1664,6 +1895,9 @@ function run(source: io.Reader, target: io.Writer,
       local exit_code? = router:handle(delivery.body)
       delivery:acknowledge()
       if exit_code ~= nil then return exit_code end
+      -- One place turns any ownership change made by this message into migrated
+      -- buffers and cleared publications.
+      router:reconcile()
       async.yield()
     when eof() then
       raise protocol.ProtocolError.new(

@@ -324,6 +324,12 @@ watchers and caches, so roots cannot see each other's facts.
   seconds; a fractional value is accepted). Open editor buffers are replayed
   into a worker that starts again, so unsaved text survives eviction and a
   crashed worker.
+- A document whose owning root changes — a folder added or removed, a nested
+  project discovered, a worker restarted — keeps its unsaved text, and
+  diagnostics a previous owner published for it are cleared. Buffers are
+  retained under the same size limits the worker applies, and a document too
+  large to retain is reported as unavailable rather than analysed from its saved
+  bytes.
 - A worker that exits unexpectedly fails its pending requests. Three crashes of
   one root within a minute stop automatic restarts until that root's settings
   change or the client sends `workspace/didChangeConfiguration`.

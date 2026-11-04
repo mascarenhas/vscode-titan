@@ -24,6 +24,9 @@ local source_text = import "server.source_text"
 local wire = import "server.wire"
 local workspace_cache = import "server.workspace_cache"
 
+local UNAVAILABLE_DOCUMENT_METHOD = "titan/documentUnavailable"
+local INVALID_PARAMS = -32602
+
 local record Options
   const worker: boolean
   const root: string?
@@ -90,6 +93,33 @@ local function info_envelope(): wire.Object
   }
 end
 
+-- The router keeps editor text for replay under the same limits this process
+-- applies. When it could not retain a buffer it opens the document here as an
+-- unavailable contributor instead of pretending the saved bytes are the buffer.
+local function unavailable_document(request: dispatcher.SemanticRequest,
+                                   server: application.Application):
+    dispatcher.SemanticOutcome
+  local object? = wire.as_object(request.params)
+  if object == nil then
+    return dispatcher.SemanticOutcome.failure(INVALID_PARAMS,
+      "params must be an object")
+  end
+  local params = object as wire.Object
+  local document?, document_error? = lsp.parse_document(params)
+  if document == nil then
+    return dispatcher.SemanticOutcome.failure(INVALID_PARAMS,
+      (document_error as lsp.Error).message)
+  end
+  local version? = wire.as_integer(params["version"])
+  if version == nil then
+    return dispatcher.SemanticOutcome.failure(INVALID_PARAMS,
+      "params.version must be an integer")
+  end
+  server:on_unavailable_document(document as lsp.TextDocument,
+    version as integer)
+  return dispatcher.SemanticOutcome.result(wire.null())
+end
+
 local function serve(root: string): integer
   logging.emit("info", "server.start", {
     ["root"] = root,
@@ -104,6 +134,9 @@ local function serve(root: string): integer
     result = protocol.run(
       os.stdin, os.stdout,
       function (request: dispatcher.SemanticRequest): dispatcher.SemanticOutcome
+        if request.method == UNAVAILABLE_DOCUMENT_METHOD then
+          return unavailable_document(request, server)
+        end
         return server:handle(request)
       end,
       function () server:start_indexing() end,

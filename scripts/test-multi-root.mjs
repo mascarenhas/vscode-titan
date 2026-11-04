@@ -1543,6 +1543,248 @@ async function testReleasedRoots() {
   }
 }
 
+// Ownership of an open document can move between roots. Its buffer and its
+// diagnostics must move with it: one reconciliation step does both.
+async function testOwnershipMigration() {
+  const base = await makeBase("migrate");
+  const outerRoot = path.join(base, "outer");
+  const innerRoot = path.join(outerRoot, "inner");
+  // The outer project maps the nested directory; the nested folder itself is a
+  // config-less folder root, so removing it hands its document back to outer.
+  await mkdir(innerRoot, { recursive: true });
+  await writeFile(path.join(outerRoot, "titan-config.lua"),
+    'include = { "." }\nsource_module_roots = { ".", "./inner" }\n', "utf8");
+  const outerSource = path.join(outerRoot, "main.titan");
+  const outerText = "function outer_symbol(): integer\n  return 1\nend\n";
+  await writeFile(outerSource, outerText, "utf8");
+  await mkdir(path.join(innerRoot, "src"), { recursive: true });
+  const savedInner = "function saved_symbol(): integer\n  return 1\nend\n" +
+    "function use_saved(): integer\n  return saved_\nend\n";
+  await writeFile(path.join(innerRoot, "src", "m.titan"), savedInner, "utf8");
+  const innerSource = path.join(innerRoot, "src", "m.titan");
+  const overlay = "function saved_symbol(): integer\n  return 1\nend\n" +
+    "function overlay_marker(): integer\n  return 2\nend\n" +
+    "function use_overlay(): integer\n  return overlay_\nend\n";
+  const overlayPosition = endOfToken(overlay, "overlay_", 1);
+
+  const session = new Session(launch(outerRoot, "error"));
+  try {
+    await session.initialize({
+      workspaceFolders: [{ uri: uri(outerRoot), name: "outer" }],
+      initializationOptions: { trustedRoots: [base] }
+    });
+    session.notify("initialized", {});
+    await pollStatus(session, (roots) =>
+      rootEntry(roots, outerRoot).state === "ready",
+      "the outer root did not start");
+
+    // The nested folder is its own root while it is a folder.
+    session.notify("workspace/didChangeWorkspaceFolders", {
+      event: { added: [{ uri: uri(innerRoot), name: "inner" }], removed: [] }
+    });
+    session.notify("textDocument/didOpen", {
+      textDocument: {
+        uri: uri(innerSource), languageId: "titan", version: 1, text: overlay
+      }
+    });
+    const inInner = await pollCompletion(session, innerSource, overlayPosition,
+      "the unsaved buffer in the nested folder");
+    assert.ok(inInner.some((item) => item.label === "overlay_marker"),
+      "the nested folder did not see its own unsaved buffer");
+
+    // Removing the folder moves the document to the enclosing root, whose
+    // already-running worker must receive the buffer.
+    session.notify("workspace/didChangeWorkspaceFolders", {
+      event: { added: [], removed: [{ uri: uri(innerRoot), name: "inner" }] }
+    });
+    await pollStatus(session, (roots) => {
+      const entry = roots.find((candidate) => candidate.root === innerRoot);
+      return entry?.origin === "released" ? { accepted: roots } : { rejected: roots };
+    }, "the nested folder was not released");
+    const inOuter = await pollCompletion(session, innerSource, overlayPosition,
+      "the migrated unsaved buffer");
+    assert.ok(inOuter.some((item) => item.label === "overlay_marker"),
+      "the enclosing root's worker never received the migrated buffer");
+    await pollHover(session, outerSource, outerText, "outer_symbol",
+      /integer/, "the enclosing root");
+    await session.shutdown();
+  } finally {
+    await session.abort();
+  }
+
+  // A root that loses a document must not leave the diagnostics it published
+  // for it in the client.
+  const plainBase = await makeBase("migrate-diagnostics");
+  const sessionRoot = path.join(plainBase, "session");
+  const homeRoot = path.join(plainBase, "home");
+  await writeRoot(sessionRoot, ROOT_A_SOURCE);
+  await mkdir(path.join(homeRoot, "src"), { recursive: true });
+  const brokenFile = path.join(homeRoot, "src", "broken.titan");
+  await writeFile(brokenFile, "function broken(: integer\n  return 1\nend\n",
+    "utf8");
+  const homeText = "function home_symbol(): integer\n  return 1\nend\n";
+  const homeSource = path.join(homeRoot, "src", "ok.titan");
+  await writeFile(homeSource, homeText, "utf8");
+  const plainSession = new Session(launch(sessionRoot, "error"));
+  try {
+    await plainSession.initialize({
+      workspaceFolders: [{ uri: uri(sessionRoot), name: "session" }],
+      initializationOptions: { trustedRoots: [plainBase] }
+    });
+    plainSession.notify("initialized", {});
+    await pollStatus(plainSession, (roots) =>
+      rootEntry(roots, sessionRoot).state === "ready",
+      "the session root did not start");
+    plainSession.notify("workspace/didChangeWorkspaceFolders", {
+      event: { added: [{ uri: uri(homeRoot), name: "home" }], removed: [] }
+    });
+    // An added root starts lazily; the first request activates its saved index.
+    await pollHover(plainSession, homeSource, homeText, "home_symbol",
+      /integer/, "the config-less root");
+    await poll("the config-less root's diagnostic", async () => {
+      const found = plainSession.responses.diagnosticPublications.filter(
+        (publication) => publication.uri === uri(brokenFile) &&
+          publication.diagnostics.length > 0);
+      return found.length > 0 ? { accepted: found } : { rejected: found };
+    });
+    const beforeRemoval = plainSession.responses.diagnosticPublications.length;
+    plainSession.notify("workspace/didChangeWorkspaceFolders", {
+      event: { added: [], removed: [{ uri: uri(homeRoot), name: "home" }] }
+    });
+    await pollStatus(plainSession, (roots) => {
+      const entry = roots.find((candidate) => candidate.root === homeRoot);
+      return entry?.origin === "released" ? { accepted: roots } : { rejected: roots };
+    }, "the config-less folder was not released");
+    // The document is unowned now, so nobody republishes: the router owes the
+    // client an empty set for what the removed root last said.
+    const cleared = await poll("cleared diagnostics", async () => {
+      const found = plainSession.responses.diagnosticPublications
+        .slice(beforeRemoval)
+        .filter((publication) => publication.uri === uri(brokenFile) &&
+          publication.diagnostics.length === 0);
+      return found.length > 0 ? { accepted: found } : { rejected: found };
+    });
+    assert.ok(cleared.length > 0);
+    const unowned = await plainSession.failure("textDocument/hover", {
+      textDocument: { uri: uri(brokenFile) },
+      position: positionOf("function broken", "broken")
+    });
+    assert.equal(unowned.code, -32803, JSON.stringify(unowned));
+    await pollHover(plainSession, path.join(sessionRoot, "src", "main.titan"),
+      ROOT_A_SOURCE, "doubled", /integer/, "the surviving session root");
+    await plainSession.shutdown();
+  } finally {
+    await plainSession.abort();
+  }
+}
+
+// The router retains editor text under the worker's own limits. A buffer it
+// cannot retain is replayed as an unavailable contributor, never as saved bytes.
+async function testOverlayLimits() {
+  const base = await makeBase("overlay-limits");
+  const root = path.join(base, "slice");
+  const moduleDirectory = path.join(root, "src", "app");
+  await mkdir(moduleDirectory, { recursive: true });
+  await writeFile(path.join(root, "titan-config.lua"),
+    'include = { "./src" }\nsource_module_roots = { "./src" }\n', "utf8");
+  const appSource = [
+    "function app_symbol(): integer",
+    "  return 1",
+    "end",
+    "function use_saved(): integer",
+    "  return saved_",
+    "end",
+    ""
+  ].join("\n");
+  const appFile = path.join(moduleDirectory, "app.titan");
+  await writeFile(appFile, appSource, "utf8");
+  const extraFile = path.join(moduleDirectory, "extra.titan");
+  await writeFile(extraFile, "function saved_only(): integer\n  return 2\nend\n",
+    "utf8");
+  const appPosition = endOfToken(appSource, "saved_");
+  // Over the per-document limit the worker applies (document_buffers.limits).
+  const huge = "function saved_only(): integer\n  return 2\nend\n-- " +
+    "y".repeat(4 * 1024 * 1024 + 16) + "\n";
+  const hugeVersion = 1;
+
+  const completionAt = async (file, position) => {
+    const response = await session.send("textDocument/completion", {
+      textDocument: { uri: uri(file) },
+      position,
+      context: { triggerKind: 1 }
+    });
+    assert.equal(response.error, undefined, JSON.stringify(response.error));
+    return response.result;
+  };
+
+  const session = new Session(launch(root, "info"));
+  try {
+    await session.initialize({
+      workspaceFolders: [{ uri: uri(root), name: "slice" }],
+      initializationOptions: { trustedRoots: [base] }
+    });
+    session.notify("initialized", {});
+    await pollStatus(session, (roots) => rootEntry(roots, root).state === "ready",
+      "the root did not start");
+    session.notify("textDocument/didOpen", {
+      textDocument: { uri: uri(appFile), languageId: "titan", version: 1, text: appSource }
+    });
+    const usable = await pollCompletion(session, appFile, appPosition,
+      "the folder module before the over-limit buffer");
+    assert.ok(usable.some((item) => item.label === "saved_only"),
+      "the saved contributor offered no completion before the over-limit buffer");
+
+    // Opening an over-limit contributor leaves the document open but
+    // unavailable in the worker, so the editor text is never analysed.
+    session.notify("textDocument/didOpen", {
+      textDocument: {
+        uri: uri(extraFile), languageId: "titan", version: hugeVersion, text: huge
+      }
+    });
+    const hugePosition = { line: 0, character: 0 };
+    const before = await completionAt(extraFile, hugePosition);
+    assert.deepEqual({ incomplete: before.isIncomplete, items: before.items.length },
+      { incomplete: true, items: 0 },
+      "an over-limit document received semantic completion");
+
+    // The router must not retain the buffer; it records the drop instead.
+    await poll("the router's over-limit record", async () => {
+      const found = session.stderr().toString("utf8").split("\n").filter(
+        (line) => line.includes('"overlay.unavailable"') &&
+          line.includes(JSON.stringify(uri(extraFile)).slice(1, -1)));
+      return found.length > 0 ? { accepted: found } : { rejected: found };
+    });
+
+    const running = rootEntry(await session.status(), root);
+    process.kill(running.workerPid, "SIGKILL");
+    await pollStatus(session, (roots) =>
+      rootEntry(roots, root).workerPid === null,
+      "the worker's exit was not observed");
+    // The replayed worker must report the same unavailable state, not saved bytes.
+    const after = await completionAt(extraFile, hugePosition);
+    assert.deepEqual({ incomplete: after.isIncomplete, items: after.items.length },
+      { incomplete: true, items: 0 },
+      "the replayed over-limit document fell back to its saved bytes");
+
+    // The worker tracks the replayed document: a bounded replacement recovers,
+    // exactly as it does for a directly received over-limit open.
+    const replacement = "function saved_only(): integer\n  return 3\nend\n" +
+      "function use_replacement(): integer\n  return saved_\nend\n";
+    const recoveredPosition = endOfToken(replacement, "return saved_");
+    session.notify("textDocument/didChange", {
+      textDocument: { uri: uri(extraFile), version: hugeVersion + 1 },
+      contentChanges: [{ text: replacement }]
+    });
+    const recovered = await pollCompletion(session, extraFile, recoveredPosition,
+      "the recovered over-limit document");
+    assert.ok(Array.isArray(recovered) && recovered.length > 0,
+      "a bounded replacement of the replayed document was ignored");
+    await session.shutdown();
+  } finally {
+    await session.abort();
+  }
+}
+
 const groups = [
   ["independent", testIndependentRoots, "independent roots"],
   ["folders", testFolderChanges, "folder changes"],
@@ -1554,7 +1796,9 @@ const groups = [
   ["cancel", testCancellation, "request cancellation"],
   ["overlays", testOverlayOwnership, "overlay ownership"],
   ["nested", testNestedProjects, "nested projects"],
-  ["released", testReleasedRoots, "released roots"]
+  ["released", testReleasedRoots, "released roots"],
+  ["migrate", testOwnershipMigration, "ownership migration"],
+  ["overlay-limits", testOverlayLimits, "overlay limits"]
 ];
 
 async function main() {

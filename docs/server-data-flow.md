@@ -177,7 +177,15 @@ the extension's language-status item.
 The router also filters diagnostics by ownership: a worker's
 `textDocument/publishDiagnostics` for a URI is forwarded only when that worker
 owns the URI, so a nested root's outer worker cannot publish for an inner root's
-documents. It forwards `$/cancelRequest` to the worker that owns the request id,
+documents. Ownership can move at runtime (a folder add or removal, a release, a
+nested discovery, a worker that stops), and every such change ends in one
+reconciliation step (`Router:reconcile`): a document the client still has open is
+closed in the old owner and opened in the new one with the router's latest text,
+and diagnostics a root published for a document it no longer owns are cleared
+with an empty publication. The router retains each open document's text under the
+same limits the worker applies (`document_buffers.limits`); a buffer it cannot
+retain is replayed as an unavailable contributor (`titan/documentUnavailable`),
+never as the saved bytes. It forwards `$/cancelRequest` to the worker that owns the request id,
 and it remaps a worker-to-client request under a router-allocated id
 (`router.worker_response_body` restores the worker's id on the reply), so a
 later worker feature can ask the client questions. `titan/workspaceStatus`
