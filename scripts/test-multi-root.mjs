@@ -497,28 +497,42 @@ async function testFolderChanges() {
       `workspaceStatus omitted a root that just served a request: ${
         JSON.stringify(afterServing.map((entry) => entry.root))}`);
 
+    // Removal releases the root: its warm worker stays for a later re-add.
+    const servedPid = rootEntry(twoRoots, rootB).workerPid;
+    const servedGeneration = rootEntry(twoRoots, rootB).generation;
     session.notify("workspace/didChangeWorkspaceFolders", {
       event: { added: [], removed: [{ uri: uri(rootB), name: "b" }] }
     });
-    const removed = await pollStatus(session, (roots) =>
-      roots.length === 1 && roots[0].root === rootA, "the folder removal did not release the root");
-    assert.equal(removed[0].state, "ready",
+    const released = await pollStatus(session, (roots) => {
+      const entry = roots.find((candidate) => candidate.root === rootB);
+      return entry?.origin === "released" && entry.state === "ready"
+        ? { accepted: roots }
+        : { rejected: roots };
+    }, "the folder removal did not release its root");
+    assert.equal(rootEntry(released, rootB).workerPid, servedPid,
+      "releasing a folder stopped its worker");
+    assert.equal(rootEntry(released, rootA).state, "ready",
       "removing one folder disturbed another root");
-    assert.notEqual(removed[0].workerPid, twoRoots[1].workerPid);
-    const hoverA = await pollHover(session, sourceA, ROOT_A_SOURCE, "doubled",
+    assert.equal(rootEntry(released, rootA).workerPid,
+      rootEntry(twoRoots, rootA).workerPid,
+      "removing one folder restarted another root");
+    await pollHover(session, sourceA, ROOT_A_SOURCE, "doubled",
       /doubled|integer/, "the surviving root");
 
-    // A removed folder's document is now outside every known root, so the
-    // documented lazy discovery owns it again as a discovered root.
+    // A released root still answers documents that its own configuration
+    // claims, through discovery, with the same warm worker.
     await pollHover(session, sourceB, ROOT_B_SOURCE, "tripled", /integer/,
-      "the removed root's document");
+      "the released root's document");
     const rediscovered = await pollStatus(session, (roots) => {
       const entry = roots.find((candidate) => candidate.root === rootB);
       return entry?.origin === "discovered"
         ? { accepted: roots }
         : { rejected: roots };
-    }, "the removed root was not rediscovered");
-    assert.equal(rediscovered.length, 2);
+    }, "the released root was not reclaimed through discovery");
+    assert.equal(rootEntry(rediscovered, rootB).workerPid, servedPid,
+      "discovery restarted the released root's worker");
+    assert.equal(rootEntry(rediscovered, rootB).generation, servedGeneration,
+      "discovery advanced the released root's generation");
 
     session.notify("workspace/didChangeWorkspaceFolders", {
       event: { added: [{ uri: uri(rootB), name: "b" }], removed: [] }
@@ -528,6 +542,10 @@ async function testFolderChanges() {
       "the re-added folder did not reclaim its root");
     assert.equal(rootEntry(readded, rootB).state, "ready",
       "a re-added root lost its worker");
+    assert.equal(rootEntry(readded, rootB).workerPid, servedPid,
+      "re-adding a folder restarted its worker");
+    assert.equal(rootEntry(readded, rootB).generation, servedGeneration,
+      "re-adding a folder advanced the generation");
     await pollHover(session, sourceB, ROOT_B_SOURCE, "tripled", /integer/,
       "the re-added root");
 
@@ -1416,6 +1434,115 @@ async function testNestedProjects() {
   }
 }
 
+// Removal releases a root instead of stopping it: a client that adds a sibling
+// checkout for one call and removes it afterwards must not pay a restart and a
+// fresh index on every call.
+async function testReleasedRoots() {
+  const base = await makeBase("released");
+  const rootA = path.join(base, "a");
+  const rootB = path.join(base, "b");
+  const sourceA = await writeRoot(rootA, ROOT_A_SOURCE);
+  const sourceB = await writeRoot(rootB, ROOT_B_SOURCE);
+  const session = new Session(launch(rootA, "error"));
+  try {
+    await session.initialize({
+      workspaceFolders: [{ uri: uri(rootA), name: "a" }],
+      initializationOptions: { trustedRoots: [base], idleTimeoutSeconds: 1 }
+    });
+    session.notify("initialized", {});
+    await pollStatus(session, (roots) =>
+      rootEntry(roots, rootA).state === "ready",
+      "the first root did not start");
+    session.notify("workspace/didChangeWorkspaceFolders", {
+      event: { added: [{ uri: uri(rootB), name: "b" }], removed: [] }
+    });
+    await pollHover(session, sourceB, ROOT_B_SOURCE, "tripled", /integer/,
+      "the sibling root");
+    const served = rootEntry(await session.status(), rootB);
+    session.notify("workspace/didChangeWorkspaceFolders", {
+      event: { added: [], removed: [{ uri: uri(rootB), name: "b" }] }
+    });
+    await pollStatus(session, (roots) => {
+      const entry = roots.find((candidate) => candidate.root === rootB);
+      return entry?.origin === "released" ? { accepted: roots } : { rejected: roots };
+    }, "the removed folder did not release its root");
+
+    // Idle eviction is what stops a released root, and the registry drops it
+    // once no worker, folder or discovered configuration keeps it alive.
+    await pollStatus(session, (roots) =>
+      roots.every((entry) => entry.root !== rootB),
+      "idle eviction kept a released root");
+    session.notify("workspace/didChangeWorkspaceFolders", {
+      event: { added: [{ uri: uri(rootB), name: "b" }], removed: [] }
+    });
+    await pollHover(session, sourceB, ROOT_B_SOURCE, "tripled", /integer/,
+      "the re-added root after eviction");
+    const restarted = rootEntry(await session.status(), rootB);
+    // The released root's slot was dropped with its worker, so re-adding it
+    // starts a fresh worker (and a fresh generation).
+    assert.notEqual(restarted.workerPid, served.workerPid,
+      "an evicted released root came back with its old worker pid");
+    assert.equal(restarted.generation, 1,
+      "an evicted released root kept its old generation");
+    await pollHover(session, sourceA, ROOT_A_SOURCE, "doubled", /integer/,
+      "the unrelated root");
+    await session.shutdown();
+  } finally {
+    await session.abort();
+  }
+
+  // A released root with no configuration of its own owns nothing: it is a
+  // known, reported root with a warm worker, not an owner.
+  const plainBase = await makeBase("released-unowned");
+  const sessionRoot = path.join(plainBase, "session");
+  const plainRoot = path.join(plainBase, "plain");
+  const sessionSource = await writeRoot(sessionRoot, ROOT_A_SOURCE);
+  await mkdir(plainRoot, { recursive: true });
+  const plainFile = path.join(plainRoot, "note.titan");
+  await writeFile(plainFile, ROOT_B_SOURCE, "utf8");
+  const plainSession = new Session(launch(sessionRoot, "error"));
+  try {
+    await plainSession.initialize({
+      workspaceFolders: [{ uri: uri(sessionRoot), name: "session" }],
+      initializationOptions: { trustedRoots: [plainBase] }
+    });
+    plainSession.notify("initialized", {});
+    await pollStatus(plainSession, (roots) =>
+      rootEntry(roots, sessionRoot).state === "ready",
+      "the session root did not start");
+    plainSession.notify("workspace/didChangeWorkspaceFolders", {
+      event: { added: [{ uri: uri(plainRoot), name: "plain" }], removed: [] }
+    });
+    await pollStatus(plainSession, (roots) => {
+      const entry = roots.find((candidate) => candidate.root === plainRoot);
+      return entry !== undefined && entry.workerPid === null
+        ? { accepted: roots } : { rejected: roots };
+    }, "the added config-less folder started a worker");
+    plainSession.notify("workspace/didChangeWorkspaceFolders", {
+      event: { added: [], removed: [{ uri: uri(plainRoot), name: "plain" }] }
+    });
+    const released = await pollStatus(plainSession, (roots) => {
+      const entry = roots.find((candidate) => candidate.root === plainRoot);
+      return entry?.origin === "released"
+        ? { accepted: roots } : { rejected: roots };
+    }, "the config-less folder was not released");
+    assert.equal(rootEntry(released, plainRoot).workerPid, null,
+      "a released root without a worker reported one");
+    const unowned = await plainSession.failure("textDocument/hover", {
+      textDocument: { uri: uri(plainFile) },
+      position: positionOf(ROOT_B_SOURCE, "tripled")
+    });
+    assert.equal(unowned.code, -32803, JSON.stringify(unowned));
+    assert.match(unowned.message, /outside every known Titan root|titan-config\.lua/,
+      `a released root without configuration claimed a document: ${unowned.message}`);
+    await pollHover(plainSession, sessionSource, ROOT_A_SOURCE, "doubled",
+      /integer/, "the surviving session root");
+    await plainSession.shutdown();
+  } finally {
+    await plainSession.abort();
+  }
+}
+
 const groups = [
   ["independent", testIndependentRoots, "independent roots"],
   ["folders", testFolderChanges, "folder changes"],
@@ -1426,7 +1553,8 @@ const groups = [
   ["cap", testCapAndIdleEviction, "worker cap and idle eviction"],
   ["cancel", testCancellation, "request cancellation"],
   ["overlays", testOverlayOwnership, "overlay ownership"],
-  ["nested", testNestedProjects, "nested projects"]
+  ["nested", testNestedProjects, "nested projects"],
+  ["released", testReleasedRoots, "released roots"]
 ];
 
 async function main() {

@@ -92,11 +92,34 @@ local function run_folder_claims(base: string)
   test.assert(not registry:remove_folder(outer),
     "the first folder removal released a twice-claimed root")
   test.assert(registry:count() == 1, "a still-claimed root was released")
+  test.assert(not registry:drop(outer),
+    "a claimed root was dropped")
   test.assert(registry:remove_folder(outer),
     "the final folder removal did not release the root")
-  test.assert(registry:count() == 0, "a released root remained registered")
+  -- A released root stays registered so its warm worker can be reused.
+  test.assert(registry:count() == 1, "a released root was dropped immediately")
   test.assert(registry:owner(outer .. "/main.titan") == nil,
     "a released root kept owning documents")
+  do
+    local entry? = registry:find(outer)
+    test.assert(entry ~= nil, "a released root disappeared from the registry")
+    local reported = (entry as roots.Root):origin()
+    local released = false
+    case reported
+    when folder() then released = false
+    when discovered() then released = false
+    when released() then released = true
+    end
+    test.assert(released, "a released root did not report a released origin")
+  end
+  test.assert(registry:drop(outer), "dropping a released root failed")
+  test.assert(registry:count() == 0, "a dropped root remained registered")
+
+  -- Re-adding the same canonical root reclaims the same entry.
+  registry:add_folder(outer)
+  test.assert(registry:count() == 1, "re-adding a released root registered a second entry")
+  test.assert(describe(registry:owner(outer .. "/main.titan")) == outer,
+    "a re-added root did not own its documents again")
 end
 
 function test_roots_refcount_duplicate_folders(_context: test.Context)
@@ -123,6 +146,10 @@ local function run_symlink_folders(base: string)
     "a document below the symlink lost its physical root")
   test.assert(registry:remove_folder(linked),
     "removing the final claim did not release the root")
+  test.assert(registry:owner(
+    roots.canonical(base .. "/link/src/a.titan")) == nil,
+    "a released root kept owning documents through a symlink")
+  test.assert(registry:drop(outer), "a released symlinked root was not droppable")
 end
 
 function test_roots_share_one_root_for_symlinked_folders(
@@ -172,12 +199,29 @@ local function run_discovered_claims(base: string)
     "a discovered root was released while its document still routed there")
   test.assert(registry:count() == 1, "re-claiming dropped the discovered root")
 
-  -- A plain folder root is still released at its final claim.
+  -- A discovered root reports itself as discovered, never as released, and a
+  -- drop is refused while it still owns documents.
+  do
+    local entry? = registry:find(inner)
+    test.assert(entry ~= nil, "the discovered root disappeared")
+    local discovered = false
+    case (entry as roots.Root):origin()
+    when discovered() then discovered = true
+    when folder() then discovered = false
+    when released() then discovered = false
+    end
+    test.assert(discovered, "a discovered root did not report a discovered origin")
+  end
+  test.assert(not registry:drop(inner), "a discovered root was dropped")
+
+  -- A plain folder root is released at its final claim and droppable.
   registry:add_folder(outer)
   test.assert(registry:remove_folder(outer),
     "the final folder removal did not release the root")
-  test.assert(registry:count() == 1,
+  test.assert(registry:count() == 2,
     "releasing a folder root released the discovered root too")
+  test.assert(registry:drop(outer), "a released folder root was not droppable")
+  test.assert(registry:count() == 1, "dropping a released root removed another root")
 end
 
 function test_roots_keep_discovered_roots_after_folder_removal(

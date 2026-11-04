@@ -331,12 +331,18 @@ watchers and caches, so roots cannot see each other's facts.
   root's worker, immediately and without client action. A tracked
   `titan-config.lua` edit that leaves `compiler_root` unchanged needs no
   restart: the worker rescans it.
+- Removing a folder releases its root; it does not stop it. The warm worker is
+  kept, the released root owns only documents that its own `titan-config.lua`
+  claims, and adding the same folder again reuses that worker without a restart
+  or a fresh index. Only idle eviction and the worker cap stop a released root.
+  A client that adds a sibling checkout for one call and removes it afterwards
+  therefore pays the index cost once, not once per call.
 
 The router answers the custom request `titan/workspaceStatus` (no params) with
 one entry per known root: canonical `root`, `origin` (`folder` or
-`discovered`), `trusted`, effective `compilerRoot`, `state` (`inactive`,
-`starting`, `ready`, `failed` or `evicted`), `failure`, `workerPid` and restart
-`generation`. `titanRoot` and `probePrefix` are what the worker itself reports
+`discovered` or `released`), `trusted`, effective `compilerRoot`, `state`
+(`inactive`, `starting`, `ready`, `failed` or `evicted`), `failure`, `workerPid`
+and restart `generation`. `titanRoot` and `probePrefix` are what the worker itself reports
 for its `TITAN_ROOT` and `TITAN_PREFIX`, so they prove per-root SDK and probe
 isolation instead of restating the router's decision; a root with no worker
 reports them as null. The router also logs every root transition to stderr with

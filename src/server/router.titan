@@ -310,6 +310,7 @@ local function status_value(router: Router): value
     case root_entry:origin()
     when folder() then item["origin"] = "folder"
     when discovered() then item["origin"] = "discovered"
+    when released() then item["origin"] = "released"
     end
     -- Trust is a containment fact, not a consequence of a usable configuration:
     -- a root whose settings were refused still reports whether its directory is
@@ -463,11 +464,27 @@ local function stop_worker_locked(router: Router, slot: Slot, reason: string)
   })
 end
 
+-- A released root whose worker has stopped keeps nothing alive: no folder, no
+-- discovered configuration, no worker.
+local function forget_released(router: Router, slot: Slot)
+  if slot.root:claimed() then return end
+  local path = slot.root.path
+  if not router.registry:drop(path) then return end
+  router.slots[path] = nil
+  local kept: {string} = {}
+  for index = 1, #router.order do
+    if router.order[index] ~= path then kept[#kept + 1] = router.order[index] end
+  end
+  router.order = kept
+  logging.emit("info", "root.forget", {["root"] = path})
+end
+
 --- Stop one slot's worker process, settling its waiters.
 local function stop_slot(router: Router, slot: Slot, reason: string)
   begin_transition(slot)
   defer end_transition(slot)
   stop_worker_locked(router, slot, reason)
+  forget_released(router, slot)
 end
 
 local function worker_listener(router: Router, slot: Slot): worker_process.Listener
@@ -1210,27 +1227,19 @@ local function Router:on_client_response(object: wire.Object)
   actual_worker:send(worker_response_body(outbound.id, object))
 end
 
+-- A folder removal releases its root instead of stopping it: a client that adds
+-- a sibling checkout for one call and removes it afterwards would otherwise
+-- restart and re-index that root on every call. The warm worker is reused by a
+-- later add, owns nothing until discovery or a folder claims it again, and is
+-- stopped only by idle eviction or the worker cap.
 local function Router:remove_root(canonical: string)
-  if not self.registry:remove_folder(canonical) then return end
-  local slot? = self.slots[canonical]
-  if slot ~= nil then
-    local actual = slot as Slot
-    -- The transition covers the stop and the deregistration together, so a
-    -- restart in progress cannot spawn a worker for a root that is gone.
-    begin_transition(actual)
-    defer end_transition(actual)
-    stop_worker_locked(self, actual, "folder removed")
-    self.slots[canonical] = nil
-    local kept: {string} = {}
-    for index = 1, #self.order do
-      if self.order[index] ~= canonical then
-        kept[#kept + 1] = self.order[index]
-      end
-    end
-    self.order = kept
-  end
-  logging.emit("info", "root.removed", {["root"] = canonical})
+  local released = self.registry:remove_folder(canonical)
+  logging.emit("info", "root.release", {
+    ["root"] = canonical,
+    ["released"] = released,
+  })
 end
+
 
 local function Router:on_folders(params: value)
   local object? = wire.as_object(params)
@@ -1341,6 +1350,7 @@ local function Router:evict_idle()
           (now_milliseconds() - actual.last_used) / 1000.0
         if idle_seconds >= self.idle_timeout_seconds then
           stop_worker_locked(self, actual, "idle timeout")
+          forget_released(self, actual)
         end
       end
     end

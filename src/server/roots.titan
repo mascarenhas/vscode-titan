@@ -11,10 +11,12 @@ local source_text = import "server.source_text"
 
 local CONFIG_FILE_NAME = "titan-config.lua"
 
---- Workspace-root provenance: an explicit client folder or config discovery.
+--- Workspace-root provenance: a client folder, config discovery, or a root whose
+--- folder was removed while its worker stays warm.
 union Origin
   folder()
   discovered()
+  released()
 end
 
 --- One canonical workspace root and the claims that keep it registered.
@@ -26,7 +28,8 @@ end
 
 function Root:origin(): Origin
   if self.folder_refs > 0 then return Origin.folder() end
-  return Origin.discovered()
+  if self.discovered then return Origin.discovered() end
+  return Origin.released()
 end
 
 --- Report whether a client folder or a discovered config still claims this root.
@@ -172,12 +175,23 @@ function Roots:add_folder(root_path: string): Root
   return entry
 end
 
---- Drop one client folder claim; return true when the root is fully released.
+--- Drop one client folder claim; return true when the root is now released.
+-- A released root stays registered: it keeps its warm worker for a later add of
+-- the same canonical root, owns no documents until something claims it again,
+-- and is dropped only when that worker stops (`Roots:drop`).
 function Roots:remove_folder(root_path: string): boolean
   local entry? = self.entries[root_path]
   if entry == nil then return false end
   local actual = entry as Root
   if actual.folder_refs > 0 then actual.folder_refs = actual.folder_refs - 1 end
+  return not actual:claimed()
+end
+
+--- Drop a released root whose worker has stopped.
+function Roots:drop(root_path: string): boolean
+  local entry? = self.entries[root_path]
+  if entry == nil then return false end
+  local actual = entry as Root
   if actual:claimed() then return false end
   self:unregister(actual)
   return true
@@ -191,11 +205,13 @@ function Roots:attach_discovery(root_path: string): Root
 end
 
 --- Return the most specific registered root that contains a canonical path.
+-- A released root owns nothing: it is a known root with a warm worker, not an
+-- owner, until a folder or a discovered configuration claims it again.
 function Roots:owner(subject: string): Root?
   local best: Root? = nil
   for index = 1, #self.order do
     local entry = self.entries[self.order[index]]
-    if contains(entry.path, subject) then
+    if entry:claimed() and contains(entry.path, subject) then
       if best == nil or #entry.path > #best.path then best = entry end
     end
   end
