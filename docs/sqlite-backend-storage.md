@@ -28,8 +28,9 @@ Startup opens the file with `workspace_cache.open_for_inventory`, and
 key. The key digests the physical root with `Compiler:cache_identity` and
 `ProjectConfig:semantic_identity`. The first fingerprints the compiler Lua
 trees, their native Lua dependencies and the server executable. The second
-covers the project configuration, except watcher policy. A missing key is
-recorded, and a different stored key triggers `Cache:rebuild`.
+covers the project configuration, except watcher policy. The key carries no
+schema number: `PRAGMA user_version` alone decides schema compatibility. A
+missing key is recorded, and a different stored key triggers `Cache:rebuild`.
 `Cache:accept_native_context` likewise compares the stored `native_context`
 with `Compiler:native_cache_identity` and rebuilds on a mismatch. A rejected
 file, or one that SQLite reports as corrupt (`SQLITE_CORRUPT` or
