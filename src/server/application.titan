@@ -1427,14 +1427,22 @@ local function Application:coverage(view: View, path: string): Coverage
     if stamp_is_current(stamp) then return Coverage.fresh() end
     return Coverage.changed()
   end
-  -- The catalog has no stamp for this path. The generation is authoritative
-  -- when it already classified the path (a discovery issue describes it), and a
-  -- path the project could never admit as a source cannot gain diagnostics from
-  -- a refresh. Otherwise a refresh has not seen this source yet, for example a
-  -- file created since the completed generation.
-  if snapshot_issue_for(snapshot, path) ~= nil then return Coverage.fresh() end
+  -- The catalog has no stamp for this path, so the generation describes it, if
+  -- at all, through a discovery issue. That issue is only authoritative while
+  -- the saved file it names still exists: a deleted issue path must refresh so
+  -- the generation drops the row instead of the pull answering a diagnostic for
+  -- a file that is gone.
   local observed? = content_identity.observe(path)
-  if observed == nil or observed.kind ~= "file" then return Coverage.fresh() end
+  local present = observed ~= nil and observed.kind == "file"
+  if snapshot_issue_for(snapshot, path) ~= nil then
+    if present then return Coverage.fresh() end
+    return Coverage.changed()
+  end
+  -- A path the project could never admit as a source cannot gain diagnostics
+  -- from a refresh, and a path with nothing saved has nothing to refresh for.
+  if not present then return Coverage.fresh() end
+  -- Otherwise a refresh has not seen this source yet, for example a file created
+  -- since the completed generation.
   if admits_project_source(snapshot, path) then return Coverage.absent() end
   return Coverage.fresh()
 end

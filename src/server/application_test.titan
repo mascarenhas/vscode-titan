@@ -3878,3 +3878,76 @@ function test_application_pulls_new_and_deleted_project_sources(
     _context: test.Context)
   test_runtime.run(pulls_new_and_deleted_project_sources)
 end
+
+local function pulls_a_deleted_discovery_issue_path()
+  with_cold_application(function (
+      filename: string, _analyzer: YieldingAnalyzer,
+      app: application.Application)
+    local source_root = paths.dirname(filename)
+    local root = paths.dirname(source_root)
+    local config = root .. "/titan-config.lua"
+    -- `include` admits the whole root, but only `./src` is a source root, so a
+    -- `.titan` file beside it is an unmapped source with its own published
+    -- diagnostic and no project-module stamp.
+    fs.write_file(config,
+      'include = { "." }\nsource_module_roots = { "./src" }\n')
+    defer do
+      if fs.lstat(config) ~= nil then fs.unlink(config) end
+    end
+    local unmapped = root .. "/unmapped.titan"
+    fs.write_file(unmapped, "function unmapped(): integer\n  return 1\nend\n")
+    defer do
+      if fs.lstat(unmapped) ~= nil then fs.unlink(unmapped) end
+    end
+    app:start_indexing()
+    wait_until(function (): boolean
+      return app.completed_view ~= nil and
+             not app:indexing_metrics().refresh_chain_active
+    end, "the project did not finish its first indexing pass")
+    use_manual_watch_delivery(app)
+
+    local report = pull_report(app, unmapped, nil)
+    test.assert(wire.as_string(report["kind"]) == "full",
+                "a pull for an unmapped source did not return a report")
+    local items? = wire.as_array(report["items"])
+    test.assert(items ~= nil and #items == 1,
+                "an unmapped source reported no discovery diagnostic")
+    if items ~= nil and #items == 1 then
+      local only = wire.as_object(items[1])
+      test.assert(wire.as_string(only["code"]) == "unmapped-source",
+                  "the unmapped source reported a different diagnostic")
+    end
+    local report_id = wire.as_string(report["resultId"])
+    local settled = app:indexing_metrics().refresh_passes
+    local unchanged = pull_report(app, unmapped, report_id)
+    test.assert(wire.as_string(unchanged["kind"]) == "unchanged" and
+                app:indexing_metrics().refresh_passes == settled,
+                "an unchanged discovery issue started a refresh")
+
+    -- A discovery issue describes a file that is still saved. Deleting it must
+    -- refresh before the answer, so the client does not keep a diagnostic for a
+    -- path that is gone.
+    fs.unlink(unmapped)
+    local passes = app:indexing_metrics().refresh_passes
+    local deleted = pull_report(app, unmapped, report_id)
+    local deleted_items? = wire.as_array(deleted["items"])
+    test.assert(wire.as_string(deleted["kind"]) == "full" and
+                deleted_items ~= nil and #deleted_items == 0,
+                "a pull for a deleted discovery issue answered its old diagnostic")
+    test.assert(app:indexing_metrics().refresh_passes == passes + 1,
+                "a pull for a deleted discovery issue did not refresh")
+    -- The generation no longer describes the path, so the answer settles.
+    local after = app:indexing_metrics().refresh_passes
+    local settled_empty = pull_report(app, unmapped, nil)
+    local settled_items? = wire.as_array(settled_empty["items"])
+    test.assert(wire.as_string(settled_empty["kind"]) == "full" and
+                settled_items ~= nil and #settled_items == 0 and
+                app:indexing_metrics().refresh_passes == after,
+                "a deleted discovery issue kept refreshing")
+  end)
+end
+
+function test_application_pulls_a_deleted_discovery_issue_path(
+    _context: test.Context)
+  test_runtime.run(pulls_a_deleted_discovery_issue_path)
+end
