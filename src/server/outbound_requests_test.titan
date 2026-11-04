@@ -1,0 +1,145 @@
+local test = import "test"
+local async = import "async"
+local wire = import "server.wire"
+local outbound = import "server.outbound_requests"
+local response_queue = import "server.response_queue"
+local test_runtime = import "server.test_runtime"
+
+local function object(source: string): wire.Object
+  local parsed = wire.decode(source)
+  local item? = wire.as_object(parsed)
+  test.assert(item ~= nil, "outbound request was not a JSON object")
+  return item
+end
+
+function test_outbound_requests_allocate_identifiers_and_envelopes(
+    _context: test.Context)
+  test_runtime.run(function ()
+    local output = response_queue.create()
+    local requests = outbound.create(output)
+    local first?, first_failure? = requests:start(
+      "window/workDoneProgress/create", {["token"] = "titan-progress/7/1"})
+    test.assert(first ~= nil and first_failure == nil,
+      "outbound request was not allocated")
+    local second? = requests:start("client/other", {["sequence"] = 2})
+    test.assert(second ~= nil and requests:count() == 2,
+      "outbound requests did not stay pending")
+
+    local first_message = object(output:take())
+    test.assert(wire.as_string(first_message["jsonrpc"]) == "2.0" and
+                wire.as_string(first_message["id"]) == "titan/1" and
+                wire.as_string(first_message["method"]) ==
+                  "window/workDoneProgress/create",
+      "first outbound request used the wrong envelope")
+    local params? = wire.as_object(first_message["params"])
+    test.assert(params ~= nil and
+                wire.as_string(params["token"]) == "titan-progress/7/1",
+      "outbound request lost its params")
+    local second_message = object(output:take())
+    test.assert(wire.as_string(second_message["id"]) == "titan/2",
+      "outbound request identifiers were not sequential")
+    requests:close()
+    test.assert(output:pending() == 0,
+      "failed session close wrote an extra protocol message")
+  end)
+end
+
+function test_outbound_requests_route_matching_client_responses(
+    _context: test.Context)
+  test_runtime.run(function ()
+    local output = response_queue.create()
+    local requests = outbound.create(output)
+    local failure_text: string? = nil
+    local observed: value = nil
+    local observed_id = ""
+    local worker = async.run<|nil, value|>(function (): nil
+      local request? = requests:start("window/workDoneProgress/create", {})
+      if request ~= nil then
+        defer requests:forget(request)
+        observed_id = request:request_id()
+        local result?, failure? = request:wait(nil)
+        observed = result
+        failure_text = failure
+      end
+      return nil
+    end)
+
+    local message = object(output:take())
+    test.assert(wire.as_string(message["id"]) == "titan/1",
+      "waiting request did not send its envelope first")
+    test.assert(requests:route("titan/9", wire.null(), nil) == false,
+      "unknown client response was accepted")
+    test.assert(requests:count() == 1,
+      "unknown client response retired a pending request")
+    local response: wire.Object = {["accepted"] = true}
+    test.assert(requests:route("titan/1", response, nil),
+      "matching client response was not routed")
+    test.assert(requests:count() == 0,
+      "matching client response retained its pending request")
+    async.join(worker)
+
+    test.assert(observed_id == "titan/1", "waited request lost its id")
+    test.assert(failure_text == nil, "successful response reported a failure")
+    local result? = wire.as_object(observed)
+    test.assert(result ~= nil and
+                wire.as_boolean(result["accepted"]) == true,
+      "waited response lost its result payload")
+    test.assert(output:pending() == 0,
+      "client response routing wrote an extra protocol message")
+    test.assert(requests:route("titan/1", wire.null(), nil) == false,
+      "an already delivered response was routed twice")
+  end)
+end
+
+function test_outbound_requests_fail_pending_at_session_close(
+    _context: test.Context)
+  test_runtime.run(function ()
+    local output = response_queue.create()
+    local requests = outbound.create(output)
+    local failure_text: string? = nil
+    local worker = async.run<|nil, value|>(function (): nil
+      local request? = requests:start("window/workDoneProgress/create", {})
+      if request ~= nil then
+        local _result?, failure? = request:wait(nil)
+        failure_text = failure
+      end
+      return nil
+    end)
+
+    object(output:take())
+    requests:close()
+    async.join(worker)
+    test.assert(failure_text == "language server session ended",
+      "session close did not fail the pending request")
+    test.assert(requests:is_closed(), "session close did not close routing")
+    local refused?, refused_failure? = requests:start("client/other", {})
+    test.assert(refused == nil and refused_failure ~= nil,
+      "closed session accepted a new outbound request")
+  end)
+end
+
+function test_outbound_requests_bound_waiting_requests(
+    _context: test.Context)
+  test_runtime.run(function ()
+    local output = response_queue.create()
+    local requests = outbound.create(output)
+    local failure_text: string? = nil
+    local worker = async.run<|nil, value|>(function (): nil
+      local request? = requests:start("window/workDoneProgress/create", {})
+      if request ~= nil then
+        defer requests:forget(request)
+        local _result?, failure? = request:wait(0)
+        failure_text = failure
+      end
+      return nil
+    end)
+    object(output:take())
+    async.join(worker)
+    test.assert(failure_text == "timeout",
+      "a bounded wait did not report its timeout")
+    test.assert(requests:count() == 0,
+      "a forgotten request stayed pending after its timeout")
+    test.assert(requests:route("titan/1", wire.null(), nil) == false,
+      "a timed-out response was routed to a forgotten request")
+  end)
+end

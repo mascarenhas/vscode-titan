@@ -342,3 +342,71 @@ function test_diagnostics_replays_published_rows_after_file_reopen(
       "diagnostic listener replay mutated the workspace database")
   end)
 end
+
+local function typed_item(message: string, line: integer): diagnostics.Item
+  return diagnostics.Item.new(
+    diagnostics.Kind.compiler(bridge.DiagnosticKind.type_error()), message,
+    source_text.Span.new(
+      source_text.Position.new(line, 1), source_text.Position.new(line, 4)))
+end
+
+function test_diagnostics_result_id_is_stable_and_answers_unchanged(
+    _context: test.Context)
+  local first = typed_item("expected integer", 3)
+  local items = {first}
+  local id = diagnostics.result_id(items)
+  test.assert(#id == 64, "diagnostic result id was not a hex SHA-256 digest")
+  test.assert(diagnostics.result_id({first}) == id,
+    "diagnostic result id was not stable for equal items")
+  test.assert(diagnostics.result_id({}) ~= id,
+    "diagnostic result id ignored the item set")
+
+  local full? = wire.as_object(diagnostics.report(items, nil))
+  test.assert(full ~= nil and wire.as_string(full["kind"]) == "full" and
+    wire.as_string(full["resultId"]) == id,
+    "pull report was not a full report with its result id")
+  local encoded? = wire.as_array(full["items"])
+  test.assert(encoded ~= nil and #encoded == 1,
+    "pull report lost its diagnostics")
+
+  -- Push and pull describe the same item exactly.
+  local pushed? = wire.as_object(wire.decode(diagnostics.notification(
+    diagnostics.Publication.new(test_paths.workspace_uri() .. "/main.titan",
+      items))))
+  local params? = wire.as_object(pushed["params"])
+  local pushed_items? = wire.as_array(params["diagnostics"])
+  local pushed_item? = wire.as_object(pushed_items[1])
+  local pulled_item? = wire.as_object(encoded[1])
+  test.assert(pushed_item ~= nil and pulled_item ~= nil,
+    "push or pull lost its encoded diagnostic")
+  test.assert(wire.as_string(pushed_item["code"]) ==
+                wire.as_string(pulled_item["code"]) and
+              wire.as_string(pushed_item["source"]) ==
+                wire.as_string(pulled_item["source"]) and
+              wire.as_integer(pushed_item["severity"]) ==
+                wire.as_integer(pulled_item["severity"]) and
+              wire.as_string(pushed_item["message"]) ==
+                wire.as_string(pulled_item["message"]),
+    "push and pull encoded the same diagnostic differently")
+  local pushed_range? = wire.as_object(pushed_item["range"])
+  local pulled_range? = wire.as_object(pulled_item["range"])
+  local pushed_start? = wire.as_object(pushed_range["start"])
+  local pulled_start? = wire.as_object(pulled_range["start"])
+  test.assert(wire.as_integer(pushed_start["line"]) ==
+                wire.as_integer(pulled_start["line"]) and
+              wire.as_integer(pushed_start["character"]) ==
+                wire.as_integer(pulled_start["character"]),
+    "push and pull encoded different diagnostic coordinates")
+
+  local unchanged? = wire.as_object(diagnostics.report(items, id))
+  test.assert(unchanged ~= nil and
+    wire.as_string(unchanged["kind"]) == "unchanged" and
+    wire.as_string(unchanged["resultId"]) == id and
+    unchanged["items"] == nil,
+    "unchanged report did not omit its items")
+  local changed? = wire.as_object(
+    diagnostics.report({first, typed_item("other failure", 9)}, id))
+  test.assert(changed ~= nil and wire.as_string(changed["kind"]) == "full" and
+    wire.as_string(changed["resultId"]) ~= id,
+    "changed item set retained the previous result id")
+end

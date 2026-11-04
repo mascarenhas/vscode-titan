@@ -6,6 +6,7 @@ local dispatcher = import "server.dispatcher"
 local logging = import "server.logging"
 local response_queue = import "server.response_queue"
 local lsp = import "server.lsp_types"
+local outbound_requests = import "server.outbound_requests"
 
 type SemanticHandler = function (dispatcher.SemanticRequest):
   dispatcher.SemanticOutcome
@@ -38,6 +39,7 @@ record Coordinator
   local document_handler: DocumentHandler?
   local completion_capture: CompletionCapture?
   local hover_capture: HoverCapture?
+  local outbound: outbound_requests.OutboundRequests?
 end
 
 local REQUEST_CANCELLED = -32800
@@ -59,7 +61,7 @@ function create(output: response_queue.ResponseQueue,
   if handler ~= nil then actual = handler end
   return Coordinator.new(
     dispatcher.create(), output, actual, initialized_handler,
-    shutdown_handler, {}, nil, nil, nil)
+    shutdown_handler, {}, nil, nil, nil, nil)
 end
 
 function Coordinator:configure_hover(capture: HoverCapture)
@@ -75,6 +77,16 @@ end
 
 function Coordinator:phase_name(): string
   return self.router:phase_name()
+end
+
+--- Route client responses to the session's server-initiated requests.
+function Coordinator:configure_outbound(requests: outbound_requests.OutboundRequests)
+  self.outbound = requests
+end
+
+--- Capabilities advertised by the client's accepted initialize request.
+function Coordinator:client_capabilities(): lsp.ClientCapabilities?
+  return self.router:client_capabilities()
 end
 
 function Coordinator:active_count(): integer
@@ -289,11 +301,24 @@ function Coordinator:handle(source: string): integer?
     local handler? = self.document_handler
     if handler ~= nil then handler(notification) end
     return nil
+  when client_response(response) then
+    local requests? = self.outbound
+    if requests ~= nil then
+      requests:route(response.id, response.result, response.failure)
+    end
+    return nil
   when cancel(id) then
     self:cancel(id)
     return nil
   when shutdown(result) then
     self:cancel_all("language server shutdown")
+    -- The session will not answer a server-initiated request after shutdown, so
+    -- a waiting owner resumes now instead of when the writer finally stops.
+    local outbound? = self.outbound
+    if outbound ~= nil then
+      local requests = outbound as outbound_requests.OutboundRequests
+      requests:close()
+    end
     local handler? = self.shutdown_handler
     if handler ~= nil then handler() end
     self:publish(result)

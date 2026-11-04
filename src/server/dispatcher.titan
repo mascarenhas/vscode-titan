@@ -27,6 +27,13 @@ record SemanticRequest
   params: value
 end
 
+--- Client response to a server-initiated request, identified by its string id.
+record ClientResponse
+  id: string
+  result: value
+  failure: string?
+end
+
 --- Completion request whose editor inputs are captured before deferred preparation.
 record CompletionRequest
   id: RequestId
@@ -47,6 +54,7 @@ union Route
   semantic(SemanticRequest)
   completion(CompletionRequest)
   document(lsp.DocumentNotification)
+  client_response(ClientResponse)
   cancel(RequestId)
   shutdown(DispatchResult)
   exit(integer)
@@ -73,6 +81,11 @@ end
 
 function Dispatcher:phase_name(): string
   return self.lifecycle_state:phase_name()
+end
+
+--- Capabilities advertised by the client's accepted initialize request.
+function Dispatcher:client_capabilities(): lsp.ClientCapabilities?
+  return self.lifecycle_state:client_capabilities()
 end
 
 function Dispatcher:enable_completion()
@@ -217,11 +230,39 @@ local function document_notification(method: string, params: value): Route
   return immediate(no_response())
 end
 
+-- A client answers a server-initiated request with an id and a result or error
+-- instead of a method. Only the string identifiers this server allocates can be
+-- client responses, and a body with neither member is a malformed request, not
+-- an answer: it receives Invalid Request rather than being dropped.
+local function client_response(object: wire.Object): ClientResponse?
+  local id? = wire.as_string(object["id"])
+  if id == nil then return nil end
+  local has_result = object["result"] ~= nil
+  local raw_error = object["error"]
+  if not has_result and raw_error == nil then return nil end
+  local failure_message: string? = nil
+  if raw_error ~= nil then
+    -- A response that carries an error always fails, even when the client sent
+    -- something other than a JSON-RPC error object.
+    failure_message = "client request failed"
+    local failure? = wire.as_object(raw_error)
+    if failure ~= nil then
+      local message? = wire.as_string((failure as wire.Object)["message"])
+      if message ~= nil then failure_message = message end
+    end
+  end
+  return ClientResponse.new(id, object["result"], failure_message)
+end
+
 local function Dispatcher:route_call(object: wire.Object): Route
   local protocol? = object_string(object, "jsonrpc")
   local method? = object_string(object, "method")
   local raw_id = object["id"]
   if protocol ~= "2.0" or method == nil then
+    if protocol == "2.0" and method == nil then
+      local response? = client_response(object)
+      if response ~= nil then return Route.client_response(response) end
+    end
     -- A notification is still a valid Request object without an id. An object
     -- with the wrong JSON-RPC version is not a notification, so it receives the
     -- required Invalid Request response with a null id.
@@ -381,6 +422,7 @@ function Dispatcher:dispatch(source: string): DispatchResult
   when completion(request) then
     return failure_response(request.id, METHOD_NOT_FOUND, "Method not found")
   when document() then return no_response()
+  when client_response() then return no_response()
   when cancel() then return no_response()
   when shutdown(result) then return result
   when exit(code) then return DispatchResult.new(nil, code)

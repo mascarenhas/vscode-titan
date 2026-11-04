@@ -134,3 +134,30 @@ function read(store: stores.Store, generation: integer): {diagnostics.Publicatio
   end
   return result
 end
+
+--- Read one document's items from the specified accepted generation.
+-- Pull diagnostics serve the exact rows push publication reads.
+function read_uri(store: stores.Store, generation: integer,
+                  uri: string): {diagnostics.Item}
+  local access = store:acquire()
+  defer access:release()
+  indexer.check_generation(access.connection, generation)
+  local statement = access.connection:prepare(
+    "SELECT i.kind,i.message,i.start_line,i.start_character," ..
+    "i.finish_line,i.finish_character " ..
+    "FROM main.semantic_diagnostic_publications AS p " ..
+    "JOIN main.semantic_diagnostic_items AS i " ..
+    "ON i.publication_order=p.publication_order " ..
+    "WHERE p.uri=? ORDER BY i.item_order")
+  defer statement:close()
+  local cursor = statement:query(indexer.blob(uri))
+  defer cursor:close()
+  local items: {diagnostics.Item} = {}
+  for row in cursor:fetch do
+    items[#items + 1] = diagnostics.Item.new(read_kind(row:get(1) as integer),
+      indexer.bytes(row, 2), source_text.Span.new(
+        source_text.Position.new(row:get(3) as integer, row:get(4) as integer),
+        source_text.Position.new(row:get(5) as integer, row:get(6) as integer)))
+  end
+  return items
+end

@@ -139,14 +139,15 @@ function test_dispatcher_runs_the_lsp_lifecycle(_context: test.Context)
     wire.as_object(initialize_response["result"])
   local capabilities? =
     wire.as_object(initialize_result["capabilities"])
-  test.assert(capabilities ~= nil and member_count(capabilities) == 6 and
+  test.assert(capabilities ~= nil and member_count(capabilities) == 7 and
               wire.as_string(capabilities["positionEncoding"]) ==
                 "utf-16" and
               wire.as_boolean(capabilities["definitionProvider"]) and
               wire.as_boolean(capabilities["referencesProvider"]) and
               wire.as_boolean(capabilities["renameProvider"]) and
               wire.as_boolean(capabilities["hoverProvider"]) and
-              wire.as_boolean(capabilities["foldingRangeProvider"]),
+              wire.as_boolean(capabilities["foldingRangeProvider"]) and
+              wire.as_object(capabilities["diagnosticProvider"]) ~= nil,
               "dispatcher omitted a supported semantic capability")
 
   local ready = server:dispatch(
@@ -482,4 +483,86 @@ function test_dispatcher_processes_a_coalesced_framed_transcript(
               "second coalesced request was lost or reordered")
   test.assert(input:next() == nil,
               "coalesced transcript left an unexpected third frame")
+end
+
+function test_dispatcher_routes_client_responses_for_outbound_requests(
+    _context: test.Context)
+  local server = dispatcher.create()
+  server:dispatch([[{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}]])
+  server:dispatch([[{"jsonrpc":"2.0","method":"initialized","params":{}}]])
+  case server:route([[{"jsonrpc":"2.0","id":"titan/3","result":null}]])
+  when client_response(response) then
+    test.assert(response.id == "titan/3" and response.result ~= nil and
+      wire.is_null(response.result) and response.failure == nil,
+      "client response lost its identifier or null result")
+  else test.assert(false, "client response was not routed")
+  end
+  case server:route([[{"jsonrpc":"2.0","id":"titan/4","error":{"code":-32601,"message":"Method not found"}}]])
+  when client_response(response) then
+    test.assert(response.id == "titan/4" and
+      response.failure == "Method not found",
+      "client response error message was lost")
+  else test.assert(false, "client error response was not routed")
+  end
+  case server:route([[{"jsonrpc":"2.0","id":"titan/5","error":{"code":-32601}}]])
+  when client_response(response) then
+    test.assert(response.id == "titan/5" and
+      response.failure == "client request failed",
+      "client error response without a message was not normalized")
+  else test.assert(false, "message-less client error was not routed")
+  end
+  -- An error member that is not a JSON-RPC error object still fails the
+  -- request instead of reporting success.
+  case server:route([[{"jsonrpc":"2.0","id":"titan/6","error":"rejected"}]])
+  when client_response(response) then
+    test.assert(response.id == "titan/6" and response.result == nil and
+      response.failure == "client request failed",
+      "non-object client error was reported as a successful response")
+  else test.assert(false, "non-object client error was not routed")
+  end
+  case server:route([[{"jsonrpc":"2.0","id":"titan/7","error":null}]])
+  when client_response(response) then
+    test.assert(response.id == "titan/7" and
+      response.failure == "client request failed",
+      "null client error was reported as a successful response")
+  else test.assert(false, "null client error was not routed")
+  end
+  -- A body with neither a result nor an error is a malformed request, not an
+  -- answer, whatever its id or method member looks like.
+  case server:route([[{"jsonrpc":"2.0","id":"req-1"}]])
+  when immediate(result) then
+    test.assert(response_error_code(result) == -32600,
+      "string-id body without a result escaped Invalid Request")
+  else test.assert(false, "string-id body without a result was routed")
+  end
+  case server:route([[{"jsonrpc":"2.0","id":"req-2","method":123}]])
+  when immediate(result) then
+    test.assert(response_error_code(result) == -32600,
+      "non-string method member escaped Invalid Request")
+  else test.assert(false, "non-string method member was routed")
+  end
+  -- An object without a method and without a response id remains an invalid
+  -- request, and an integer id cannot name a server-initiated request.
+  case server:route([[{"jsonrpc":"2.0","id":7}]])
+  when immediate(result) then
+    test.assert(response_error_code(result) == -32600,
+      "unidentified response object escaped Invalid Request")
+  else test.assert(false, "unidentified response object was routed")
+  end
+end
+
+function test_dispatcher_exposes_accepted_client_capabilities(
+    _context: test.Context)
+  local server = dispatcher.create()
+  test.assert(server:client_capabilities() == nil,
+    "capabilities were reported before initialize")
+  server:dispatch([[{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{"window":{"workDoneProgress":true}}}}]])
+  local capabilities? = server:client_capabilities()
+  test.assert(capabilities ~= nil and capabilities.work_done_progress and
+    not capabilities.pull_diagnostics_disabled,
+    "accepted capabilities were not exposed")
+  server:dispatch([[{"jsonrpc":"2.0","id":2,"method":"initialize","params":{}}]])
+  local retained? = server:client_capabilities()
+  test.assert(retained ~= nil and retained.work_done_progress,
+    "rejected repeated initialization replaced accepted capabilities")
 end

@@ -1,0 +1,197 @@
+--- Server-initiated JSON-RPC requests routed back through the session writer.
+-- @module server.outbound_requests
+
+local async = import "async"
+local logging = import "server.logging"
+local response_queue = import "server.response_queue"
+local timer = import "timer"
+local wire = import "server.wire"
+
+--- One server-initiated request awaiting its client response.
+record PendingRequest
+  const id: string
+  const method: string
+  local settled: boolean
+  local result: value
+  local failure: string?
+  local waiter: async.Task?
+  local resume_token: async.ResumeToken
+end
+
+--- Identifier allocation, outbound envelopes, and client-response routing.
+record OutboundRequests
+  local const output: response_queue.ResponseQueue
+  local sequence: integer
+  local pending: {PendingRequest}
+  local closed: boolean
+end
+
+--- Create the outbound request owner over the session's sole writer.
+function create(output: response_queue.ResponseQueue): OutboundRequests
+  return OutboundRequests.new(output, 0, {}, false)
+end
+
+function OutboundRequests:is_closed(): boolean
+  return self.closed
+end
+
+function OutboundRequests:count(): integer
+  return #self.pending
+end
+
+--- Append a server notification through the session writer.
+function OutboundRequests:notify(method: string, params: value)
+  if self.closed then return end
+  local envelope: wire.Object = {
+    ["jsonrpc"] = "2.0",
+    ["method"] = method,
+    ["params"] = params,
+  }
+  do
+    self.output:push(wire.encode(envelope))
+  catch
+    -- Protocol output is best effort: a stopped or retired writer ends
+    -- delivery without unwinding the indexing work that owns the completed
+    -- saved generation.
+    logging.emit("debug", "protocol.notification.dropped", {
+      ["method"] = method,
+    })
+  end
+end
+
+local function OutboundRequests:remove(index: integer)
+  local count = #self.pending
+  for following = index, count - 1 do
+    self.pending[following] = self.pending[following + 1]
+  end
+  self.pending[count] = nil
+end
+
+--- Retire one request the caller stopped waiting for.
+function OutboundRequests:forget(request: PendingRequest)
+  for index = 1, #self.pending do
+    if self.pending[index] == request then
+      self:remove(index)
+      return
+    end
+  end
+end
+
+--- Allocate one request identifier and write its request envelope.
+function OutboundRequests:start(method: string, params: value):
+    (PendingRequest?, string?)
+  if self.closed then return nil, "language server session ended" end
+  self.sequence = self.sequence + 1
+  local id = "titan/" .. self.sequence
+  local pending = PendingRequest.new(
+    id, method, false, nil, nil, nil,
+    async.ResumeToken.new("server.outbound_requests"))
+  local envelope: wire.Object = {
+    ["jsonrpc"] = "2.0",
+    ["id"] = id,
+    ["method"] = method,
+    ["params"] = params,
+  }
+  local encoded = ""
+  do
+    encoded = wire.encode(envelope)
+  catch
+    return nil, "request envelope could not be encoded"
+  end
+  self.pending[#self.pending + 1] = pending
+  do
+    self.output:push(encoded)
+  catch
+    self:forget(pending)
+    return nil, "language server session ended"
+  end
+  return pending, nil
+end
+
+--- Deliver one client response; unknown identifiers are logged and dropped.
+function OutboundRequests:route(id: string, result: value,
+                                failure: string?): boolean
+  for index = 1, #self.pending do
+    local candidate = self.pending[index]
+    if candidate.id == id then
+      self:remove(index)
+      candidate:settle(result, failure)
+      return true
+    end
+  end
+  logging.emit("debug", "protocol.unexpected_response", {
+    ["id"] = id,
+  })
+  return false
+end
+
+--- Fail every pending request so waiting Tasks can unwind at session close.
+function OutboundRequests:close()
+  if self.closed then return end
+  self.closed = true
+  local remaining = self.pending
+  self.pending = {}
+  for index = 1, #remaining do
+    remaining[index]:settle(nil, "language server session ended")
+  end
+end
+
+function PendingRequest:request_id(): string
+  return self.id
+end
+
+--- Record the client response and wake the reserved waiter.
+function PendingRequest:settle(result: value, failure: string?)
+  if self.settled then return end
+  self.settled = true
+  self.result = result
+  self.failure = failure
+  local waiter? = self.waiter
+  self.waiter = nil
+  if waiter ~= nil then waiter:resume(self.resume_token) end
+end
+
+--- Wait for the client response, bounded by the optional timeout in ms.
+function PendingRequest:wait(milliseconds: integer?): (value?, string?)
+  if self.settled then return self.result, self.failure end
+  if self.waiter ~= nil then
+    raise "outbound request already has a waiting reader"
+  end
+
+  local current = async.running()
+  self.waiter = current
+  local detach = function ()
+    if self.waiter == current then self.waiter = nil end
+  end
+  defer detach()
+
+  local deadline: async.Task<|nil, value|>? = nil
+  if milliseconds ~= nil then
+    deadline = async.run<|nil, value|>(function (): nil
+      timer.sleep(milliseconds)
+      self:settle(nil, "timeout")
+      return nil
+    end)
+  end
+  defer do
+    -- A wait that unwinds because its owner was cancelled only retires the
+    -- timer; joining there would re-raise that pending cancellation.
+    if deadline ~= nil and not deadline:status():has_finished() then
+      deadline:cancel(async.CancellationReason.simple("request settled"))
+    end
+  end
+
+  async.suspend(self.resume_token, detach)
+
+  -- The wait settled: retire its timer and join it, so the deadline Task and
+  -- its native timer handle are terminal before the caller continues.
+  local pending_deadline? = deadline
+  if pending_deadline ~= nil then
+    local retired = pending_deadline as async.Task<|nil, value|>
+    if not retired:status():has_finished() then
+      retired:cancel(async.CancellationReason.simple("request settled"))
+    end
+    async.join(retired)
+  end
+  return self.result, self.failure
+end

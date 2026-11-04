@@ -2,8 +2,11 @@ local test_paths = import "server.test_paths"
 local test_links = import "server.test_links"
 foreign import "compiler_io_platform.h"
 local test_service = import "server.test_service"
+local content_identity = import "server.content_identity"
 local async = import "async"
+local diag_os = import "os"
 local fs = import "fs"
+local paths = import "path"
 local json = import "json"
 local sqlite3 = import "sqlite3"
 local strings = import "string"
@@ -18,6 +21,8 @@ local diagnostics = import "server.diagnostics"
 local dispatcher = import "server.dispatcher"
 local lsp = import "server.lsp_types"
 local indexing_status = import "server.indexing_status"
+local outbound_requests = import "server.outbound_requests"
+local response_queue = import "server.response_queue"
 local wire = import "server.wire"
 local logging = import "server.logging"
 local project_config = import "server.project_config"
@@ -2601,6 +2606,9 @@ local function continues_indexing_after_status_encoding_failure()
   with_unindexed_application(function (
       filename: string, _analyzer: YieldingAnalyzer,
       app: application.Application)
+    -- A watcher hint that arrives mid-pass would add a second pass and make the
+    -- status/view counts below platform-dependent.
+    use_manual_watch_delivery(app)
     local observed = 0
     app:set_indexing_listener(function (status: indexing_status.Status)
       observed = observed + 1
@@ -3426,4 +3434,711 @@ end
 function test_application_variant_lifecycle_diagnostics_and_completion_isolation(
     _context: test.Context)
   test_runtime.run(variant_lifecycle_diagnostics_and_completion_isolation)
+end
+
+-- Record the last generation a `$/progress` end reported, so a test can prove
+-- the period closed only after the completed view was installed.
+local function drained_protocol_messages(
+    output: response_queue.ResponseQueue,
+    requests: outbound_requests.OutboundRequests,
+    creates: {wire.Object}, progress: {wire.Object},
+    on_end: function (): ())
+  while output:pending() > 0 do
+    local message? = output:take()
+    local envelope? = wire.as_object(wire.decode(message))
+    test.assert(envelope ~= nil, "protocol message is not an object")
+    if envelope == nil then return end
+    local method? = wire.as_string(envelope["method"])
+    if method == "window/workDoneProgress/create" then
+      creates[#creates + 1] = envelope
+      local id? = wire.as_string(envelope["id"])
+      test.assert(id ~= nil, "progress create request has no string id")
+      if id ~= nil then
+        local target: string = id
+        requests:route(target, wire.null(), nil)
+      end
+    elseif method == "$/progress" then
+      local params? = wire.as_object(envelope["params"])
+      test.assert(params ~= nil, "progress notification has no params")
+      if params ~= nil then
+        local value? = wire.as_object(params["value"])
+        test.assert(value ~= nil, "progress notification has no value")
+        if value ~= nil then
+          progress[#progress + 1] = params
+          if wire.as_string(value["kind"]) == "end" then on_end() end
+        end
+      end
+    end
+  end
+end
+
+local function progress_kind(entry: wire.Object): string?
+  local value? = wire.as_object(entry["value"])
+  if value == nil then return nil end
+  return wire.as_string((value as wire.Object)["kind"])
+end
+
+local function count_progress_kind(progress: {wire.Object}, kind: string): integer
+  local count = 0
+  for index = 1, #progress do
+    if progress_kind(progress[index]) == kind then count = count + 1 end
+  end
+  return count
+end
+
+local function reports_work_done_progress_per_indexing_chain()
+  with_cold_application(function (
+      _filename: string, analyzer: YieldingAnalyzer,
+      app: application.Application)
+    app:stop_watching_for_testing()
+    local output = response_queue.create()
+    local requests = outbound_requests.create(output)
+    local creates: {wire.Object} = {}
+    local progress: {wire.Object} = {}
+    local completed_at_end: integer? = nil
+    app:set_client_channel(requests,
+      function (): lsp.ClientCapabilities?
+        return lsp.ClientCapabilities.new(true, false)
+      end)
+    defer requests:close()
+    local drain = function ()
+      drained_protocol_messages(output, requests, creates, progress,
+        function ()
+          local view? = app.completed_view
+          if view ~= nil then
+            completed_at_end = (view as application.View).published_generation
+          end
+        end)
+    end
+
+    analyzer.block = true
+    app:start_indexing()
+    wait_until(function (): boolean
+      drain()
+      return #progress > 0
+    end, "indexing work-done progress did not begin")
+    wait_until(function (): boolean return analyzer.started end,
+               "blocked indexing pass never started")
+    test.assert(#creates == 1,
+                "indexing chain did not request exactly one progress token")
+    local create_params? = wire.as_object(creates[1]["params"])
+    test.assert(create_params ~= nil, "progress create request has no params")
+    local begin = progress[1]
+    local begin_value? = wire.as_object(begin["value"])
+    local token? = wire.as_string(begin["token"])
+    test.assert(progress_kind(begin) == "begin" and
+                begin_value ~= nil and
+                wire.as_string(begin_value["title"]) == "Titan indexing" and
+                wire.as_string(begin_value["message"]) == "initial" and
+                token ~= nil and token == wire.as_string(create_params["token"]),
+                "progress did not begin for the created token")
+    test.assert(strings.find(token as string, "titan-progress/") == 1,
+                "progress token is not process-qualified")
+
+    -- A save inside the same contiguous period must not begin or end again.
+    app:note_saved_change()
+    analyzer.block = false
+    wait_until(function (): boolean
+      drain()
+      return not app:indexing_metrics().refresh_chain_active and
+             #progress >= 2 and
+             count_progress_kind(progress, "end") == 1
+    end, "indexing progress chain did not finish")
+    test.assert(count_progress_kind(progress, "begin") == 1 and
+                count_progress_kind(progress, "end") == 1,
+                "coalesced follow-up started or ended a second progress period")
+    test.assert(completed_at_end ~= nil,
+                "progress ended before the completed generation was installed")
+    local last = progress[#progress]
+    test.assert(progress_kind(last) == "end" and
+                wire.as_string(last["token"]) == token,
+                "progress period did not end with its own token")
+    test.assert(#creates == 1,
+                "coalesced follow-up requested a second progress token")
+  end)
+end
+
+function test_application_reports_work_done_progress_per_indexing_chain(
+    _context: test.Context)
+  test_runtime.run(reports_work_done_progress_per_indexing_chain)
+end
+
+local function with_recovering_application(
+    body: function (string, RecoveringAnalyzer, application.Application): ())
+  local root = test_paths.temporary_name()
+  fs.unlink(root)
+  fs.mkdir(root)
+  local source_root = root .. "/src"
+  fs.mkdir(source_root)
+  local filename = source_root .. "/main.titan"
+  fs.write_file(filename,
+    "function answer(): integer\n" ..
+    "  return 1\n" ..
+    "end\n")
+  defer do
+    if fs.lstat(filename) ~= nil then fs.unlink(filename) end
+    if fs.lstat(source_root) ~= nil then fs.rmdir(source_root) end
+    if fs.lstat(root) ~= nil then fs.rmdir(root) end
+  end
+
+  local analyzer = RecoveringAnalyzer.new(true, 0)
+  local service?, service_error? = test_service.load {
+    project_root = root,
+    installed_binary_modules_root = test_paths.sdk_binary_root(),
+    analyzer = analyzer:analyze,
+  }
+  test.assert(service_error == nil and service ~= nil,
+              "pull diagnostics fixture project did not load")
+  if service == nil then raise "pull diagnostics fixture Service is missing" end
+  local app = application.create_with_service(root, service)
+  defer app:close()
+  app:stop_watching_for_testing()
+  body(filename, analyzer, app)
+end
+
+local function diagnostic_request(path: string, id: integer,
+    previous_result_id: string?): dispatcher.SemanticRequest
+  local uri?, uri_error? = source_text.path_to_file_uri(path)
+  test.assert(uri_error == nil and uri ~= nil,
+              "pull diagnostics fixture path did not become a file URI")
+  if uri == nil then raise "pull diagnostics fixture URI is missing" end
+  local document: wire.Object = {["uri"] = uri}
+  local params: wire.Object = {["textDocument"] = document}
+  if previous_result_id ~= nil then
+    params["previousResultId"] = previous_result_id
+  end
+  return dispatcher.SemanticRequest.new(
+    dispatcher.RequestId.integer_id(id), "textDocument/diagnostic", params)
+end
+
+local function pull_report(app: application.Application, path: string,
+    previous_result_id: string?): wire.Object
+  local outcome = app:handle(diagnostic_request(path, 1, previous_result_id))
+  case outcome
+  when result(value) then
+    local object? = wire.as_object(value)
+    test.assert(object ~= nil,
+                "textDocument/diagnostic did not return an object")
+    if object == nil then raise "pull diagnostics object is missing" end
+    return object
+  when failure{code; message} then
+    test.assert(false, "pull diagnostics failed with " ..
+                strings.tostring(code) .. ": " .. message)
+  end
+  test.assert(false, "pull diagnostics produced no outcome")
+  return {}
+end
+
+local function pulls_the_completed_generation_and_waits_for_new_bytes()
+  with_recovering_application(function (
+      filename: string, analyzer: RecoveringAnalyzer,
+      app: application.Application)
+    local first = pull_report(app, filename, nil)
+    test.assert(wire.as_string(first["kind"]) == "full",
+                "first pull did not return a full report")
+    local items? = wire.as_array(first["items"])
+    test.assert(items ~= nil and #items == 1,
+                "pull did not report the saved diagnostic")
+    if items ~= nil then
+      local only = wire.as_object(items[1])
+      test.assert(wire.as_string(only["code"]) == "syntax" and
+                  wire.as_string(only["source"]) == "Titan" and
+                  wire.as_string(only["message"]) ==
+                    "deliberate saved-source error",
+                  "pull reported a different diagnostic than push")
+    end
+    local first_id? = wire.as_string(first["resultId"])
+    test.assert(first_id ~= nil and #first_id == 64,
+                "pull report omitted its hex result id")
+
+    local repeated = pull_report(app, filename, first_id)
+    test.assert(wire.as_string(repeated["kind"]) == "unchanged" and
+                wire.as_string(repeated["resultId"]) == first_id and
+                repeated["items"] == nil,
+                "unchanged pull repeated a full report")
+
+    -- Rewrite the saved file and pull before the watcher can deliver a hint:
+    -- the pull itself must obtain the generation covering the new bytes.
+    analyzer.fail = false
+    fs.write_file(filename,
+      "function answer(): integer\n" ..
+      "  return 2\n" ..
+      "end\n")
+    local repaired = pull_report(app, filename, first_id)
+    test.assert(wire.as_string(repaired["kind"]) == "full",
+                "pull after a saved rewrite did not return a full report")
+    local repaired_items? = wire.as_array(repaired["items"])
+    test.assert(repaired_items ~= nil and #repaired_items == 0,
+                "pull after a repaired rewrite returned the stale diagnostic")
+    local repaired_id? = wire.as_string(repaired["resultId"])
+    test.assert(repaired_id ~= nil and repaired_id ~= first_id,
+                "repaired pull reused the preceding result id")
+    test.assert(app:indexing_metrics().refresh_passes >= 1,
+                "pull did not refresh the saved project for new bytes")
+
+    -- A file the project does not contain reports no diagnostics; the pull is
+    -- still a freshness barrier like every other pull.
+    local outside = filename .. ".other"
+    fs.write_file(outside, "not Titan source\n")
+    defer fs.unlink(outside)
+    local empty = pull_report(app, outside, nil)
+    local empty_items? = wire.as_array(empty["items"])
+    test.assert(wire.as_string(empty["kind"]) == "full" and
+                empty_items ~= nil and #empty_items == 0,
+                "pull for a non-project file reported diagnostics")
+  end)
+end
+
+function test_application_pulls_the_completed_generation_and_refreshes_new_bytes(
+    _context: test.Context)
+  test_runtime.run(pulls_the_completed_generation_and_waits_for_new_bytes)
+end
+
+local function ends_the_progress_period_after_a_refresh_exception()
+  with_cold_application(function (
+      _filename: string, _analyzer: YieldingAnalyzer,
+      app: application.Application)
+    -- An inert backend keeps the pass deterministic: a real watcher hint that
+    -- arrives mid-pass bumps the saved epoch, so the pass completes and starts a
+    -- coalesced follow-up, and the deliberate raise then lands in that follow-up
+    -- instead of the Task this test captures.
+    use_manual_watch_delivery(app)
+    local output = response_queue.create()
+    local requests = outbound_requests.create(output)
+    local creates: {wire.Object} = {}
+    local progress: {wire.Object} = {}
+    app:set_client_channel(requests,
+      function (): lsp.ClientCapabilities?
+        return lsp.ClientCapabilities.new(true, false)
+      end)
+    defer requests:close()
+    local drain = function ()
+      drained_protocol_messages(output, requests, creates, progress,
+        function () end)
+    end
+
+    -- The first status emit belongs to the chain itself, before the refresh
+    -- Task exists; raising on the completed-state emit unwinds the pass after
+    -- its progress period has begun.
+    local raised = false
+    app:set_indexing_listener(function (status: indexing_status.Status)
+      if not raised and indexing_status.state_name(status.state) == "ready" then
+        raised = true
+        raise "deliberate status publication failure"
+      end
+    end)
+    app:start_indexing()
+    local refresh_task? = app.refresh_task
+    test.assert(refresh_task ~= nil, "indexing did not start a refresh Task")
+    wait_until(function (): boolean
+      drain()
+      return raised and not app:indexing_metrics().refresh_chain_active
+    end, "a raising status listener did not end the indexing chain")
+    wait_until(function (): boolean
+      drain()
+      return count_progress_kind(progress, "end") == 1
+    end, "a refresh exception after progress began left its period open")
+    -- The test owns this Task's terminal status. Titan still prints an
+    -- uncaught Task failure to stderr, which is the product's own diagnostic
+    -- for an unexpected refresh exception.
+    if refresh_task ~= nil then
+      case async.join(refresh_task)
+      when failed() then
+      else test.assert(false, "a raising status listener did not fail the Task")
+      end
+    end
+
+    -- The reporter is usable again: the next chain opens a new period.
+    app:set_indexing_listener(nil)
+    local tokens_before = #creates
+    app:note_saved_change()
+    wait_until(function (): boolean
+      drain()
+      return #creates == tokens_before + 1 and
+             count_progress_kind(progress, "end") == 2
+    end, "a refresh exception wedged the progress reporter")
+  end)
+end
+
+function test_application_ends_the_progress_period_after_a_refresh_exception(
+    _context: test.Context)
+  test_runtime.run(ends_the_progress_period_after_a_refresh_exception)
+end
+
+local function pulls_the_repaired_saved_project_after_a_failed_pass()
+  with_cold_application(function (
+      filename: string, _analyzer: YieldingAnalyzer,
+      app: application.Application)
+    local root = paths.dirname(paths.dirname(filename))
+    local config = root .. "/titan-config.lua"
+    fs.write_file(config, "include = {\n")
+    defer do
+      if fs.lstat(config) ~= nil then fs.unlink(config) end
+    end
+    app:start_indexing()
+    wait_until(function (): boolean
+      return app.refresh_failure ~= nil and
+             not app:indexing_metrics().refresh_chain_active
+    end, "a broken project configuration did not fail indexing")
+    test.assert(app.completed_view == nil,
+                "a failed first pass installed a completed view")
+
+    -- Repair the saved input and pull before any watcher event can be relied
+    -- on: the pull itself must obtain the generation covering the repaired
+    -- bytes instead of reporting the superseded failure.
+    app:stop_watching_for_testing()
+    fs.write_file(config,
+      'include = { "./src" }\nsource_module_roots = { "./src" }\n')
+    local report = pull_report(app, filename, nil)
+    test.assert(wire.as_string(report["kind"]) == "full",
+                "a pull after repairing the project did not return a report")
+    local items? = wire.as_array(report["items"])
+    test.assert(items ~= nil and #items == 0,
+                "the repaired project reported stale diagnostics")
+    test.assert(app:indexing_metrics().refresh_passes >= 2,
+                "the pull did not retry the failed saved project")
+  end)
+end
+
+function test_application_pulls_the_repaired_project_after_a_failed_pass(
+    _context: test.Context)
+  test_runtime.run(pulls_the_repaired_saved_project_after_a_failed_pass)
+end
+
+local function pulls_new_and_deleted_project_sources()
+  with_cold_application(function (
+      filename: string, _analyzer: YieldingAnalyzer,
+      app: application.Application)
+    local source_root = paths.dirname(filename)
+    local root = paths.dirname(source_root)
+    local config = root .. "/titan-config.lua"
+    fs.write_file(config,
+      'include = { "./src" }\nsource_module_roots = { "./src" }\n')
+    defer do
+      if fs.lstat(config) ~= nil then fs.unlink(config) end
+    end
+    app:start_indexing()
+    wait_until(function (): boolean
+      return app.completed_view ~= nil and
+             not app:indexing_metrics().refresh_chain_active
+    end, "the project did not finish its first indexing pass")
+    -- Replace the watcher with one that never delivers an event, so only the
+    -- pull's own freshness rule can start a refresh.
+    use_manual_watch_delivery(app)
+
+    local created = source_root .. "/created.titan"
+    fs.write_file(created, "function created(): integer\n  return 1\nend\n")
+    defer do
+      if fs.lstat(created) ~= nil then fs.unlink(created) end
+    end
+    local before = app:indexing_metrics().refresh_passes
+    local report = pull_report(app, created, nil)
+    test.assert(wire.as_string(report["kind"]) == "full",
+                "a pull for a new project source did not return a report")
+    local items? = wire.as_array(report["items"])
+    test.assert(items ~= nil and #items == 0,
+                "a new project source reported diagnostics")
+    test.assert(app:indexing_metrics().refresh_passes == before + 1,
+                "a pull for a new project source did not index it")
+    local settled = app:indexing_metrics().refresh_passes
+    local repeated = pull_report(app, created,
+      wire.as_string(report["resultId"]))
+    test.assert(wire.as_string(repeated["kind"]) == "unchanged",
+                "a second pull for the indexed source did not replay its report")
+    test.assert(app:indexing_metrics().refresh_passes == settled + 1,
+                "a barrier pull did not run exactly one saved-change pass")
+
+    -- A saved .titan file outside every include root is not in any project
+    -- generation, so it reports nothing; the pull is still a barrier.
+    local outside = root .. "/stray.titan"
+    fs.write_file(outside, "function stray(): integer\n  return 1\nend\n")
+    defer do
+      if fs.lstat(outside) ~= nil then fs.unlink(outside) end
+    end
+    local empty = pull_report(app, outside, nil)
+    local empty_items? = wire.as_array(empty["items"])
+    test.assert(wire.as_string(empty["kind"]) == "full" and
+                empty_items ~= nil and #empty_items == 0,
+                "a pull outside every include root reported diagnostics")
+
+    -- Deleting an indexed source makes the generation stale: the pull refreshes
+    -- instead of answering for the vanished module.
+    fs.unlink(created)
+    local deleted = pull_report(app, created, nil)
+    local deleted_items? = wire.as_array(deleted["items"])
+    test.assert(wire.as_string(deleted["kind"]) == "full" and
+                deleted_items ~= nil and #deleted_items == 0,
+                "a pull for a deleted source answered a stale generation")
+    test.assert(app:indexing_metrics().refresh_passes > settled,
+                "a pull for a deleted source did not refresh the project")
+  end)
+end
+
+function test_application_pulls_new_and_deleted_project_sources(
+    _context: test.Context)
+  test_runtime.run(pulls_new_and_deleted_project_sources)
+end
+
+local function pulls_a_deleted_discovery_issue_path()
+  with_cold_application(function (
+      filename: string, _analyzer: YieldingAnalyzer,
+      app: application.Application)
+    local source_root = paths.dirname(filename)
+    local root = paths.dirname(source_root)
+    local config = root .. "/titan-config.lua"
+    -- `include` admits the whole root, but only `./src` is a source root, so a
+    -- `.titan` file beside it is an unmapped source with its own published
+    -- diagnostic and no project-module stamp.
+    fs.write_file(config,
+      'include = { "." }\nsource_module_roots = { "./src" }\n')
+    defer do
+      if fs.lstat(config) ~= nil then fs.unlink(config) end
+    end
+    local unmapped = root .. "/unmapped.titan"
+    fs.write_file(unmapped, "function unmapped(): integer\n  return 1\nend\n")
+    defer do
+      if fs.lstat(unmapped) ~= nil then fs.unlink(unmapped) end
+    end
+    app:start_indexing()
+    wait_until(function (): boolean
+      return app.completed_view ~= nil and
+             not app:indexing_metrics().refresh_chain_active
+    end, "the project did not finish its first indexing pass")
+    use_manual_watch_delivery(app)
+
+    local report = pull_report(app, unmapped, nil)
+    test.assert(wire.as_string(report["kind"]) == "full",
+                "a pull for an unmapped source did not return a report")
+    local items? = wire.as_array(report["items"])
+    test.assert(items ~= nil and #items == 1,
+                "an unmapped source reported no discovery diagnostic")
+    if items ~= nil and #items == 1 then
+      local only = wire.as_object(items[1])
+      test.assert(wire.as_string(only["code"]) == "unmapped-source",
+                  "the unmapped source reported a different diagnostic")
+    end
+    local report_id = wire.as_string(report["resultId"])
+    local settled = app:indexing_metrics().refresh_passes
+    local unchanged = pull_report(app, unmapped, report_id)
+    test.assert(wire.as_string(unchanged["kind"]) == "unchanged" and
+                app:indexing_metrics().refresh_passes == settled + 1,
+                "an unchanged discovery issue did not replay through one barrier pass")
+
+    -- A discovery issue describes a file that is still saved. Deleting it must
+    -- refresh before the answer, so the client does not keep a diagnostic for a
+    -- path that is gone.
+    fs.unlink(unmapped)
+    local passes = app:indexing_metrics().refresh_passes
+    local deleted = pull_report(app, unmapped, report_id)
+    local deleted_items? = wire.as_array(deleted["items"])
+    test.assert(wire.as_string(deleted["kind"]) == "full" and
+                deleted_items ~= nil and #deleted_items == 0,
+                "a pull for a deleted discovery issue answered its old diagnostic")
+    test.assert(app:indexing_metrics().refresh_passes == passes + 1,
+                "a pull for a deleted discovery issue did not refresh")
+    -- The generation no longer describes the path, so the answer settles.
+    local settled_empty = pull_report(app, unmapped, nil)
+    local settled_items? = wire.as_array(settled_empty["items"])
+    test.assert(wire.as_string(settled_empty["kind"]) == "full" and
+                settled_items ~= nil and #settled_items == 0,
+                "a deleted discovery issue kept reporting diagnostics")
+  end)
+end
+
+function test_application_pulls_a_deleted_discovery_issue_path(
+    _context: test.Context)
+  test_runtime.run(pulls_a_deleted_discovery_issue_path)
+end
+
+local function pull_is_a_scan_only_freshness_barrier()
+  with_cold_application(function (
+      filename: string, analyzer: YieldingAnalyzer,
+      app: application.Application)
+    app:start_indexing()
+    wait_until(function (): boolean
+      return app.completed_view ~= nil and
+             not app:indexing_metrics().refresh_chain_active
+    end, "the project did not finish its first indexing pass")
+    use_manual_watch_delivery(app)
+
+    local first = pull_report(app, filename, nil)
+    test.assert(wire.as_string(first["kind"]) == "full",
+                "a pull for the saved project did not return a report")
+    local first_items? = wire.as_array(first["items"])
+    test.assert(first_items ~= nil and #first_items == 0,
+                "the clean project reported diagnostics")
+    local result_id? = wire.as_string(first["resultId"])
+    test.assert(result_id ~= nil,
+                "the pull report omitted its result id")
+
+    -- A pull with nothing dirty is a barrier pass that only scans: it runs
+    -- exactly one saved-change pass, never re-analyses, and keeps the items and
+    -- their resultId.
+    local passes = app:indexing_metrics().refresh_passes
+    local runs = analyzer.runs
+    local repeated = pull_report(app, filename, result_id)
+    test.assert(wire.as_string(repeated["kind"]) == "unchanged" and
+                wire.as_string(repeated["resultId"]) == result_id,
+                "a no-op barrier pass changed the report identity")
+    test.assert(app:indexing_metrics().refresh_passes == passes + 1,
+                "a pull did not run exactly one saved-change pass")
+    test.assert(analyzer.runs == runs,
+                "a pull with nothing dirty re-analysed the project")
+  end)
+end
+
+function test_application_pull_is_a_scan_only_freshness_barrier(
+    _context: test.Context)
+  test_runtime.run(pull_is_a_scan_only_freshness_barrier)
+end
+
+-- A saved input can change what another file's report says: an importer's error
+-- comes from its dependency's interface, and a folder module's diagnostics span
+-- every contributor. This analyzer models both with the production graph:
+-- manifest digests are derived from the saved contents (so a save invalidates
+-- importers exactly as a compiler interface digest does) and a module reports one
+-- diagnostic on its first file whenever any project source contains the marker.
+local record InputAnalyzer
+  runs: integer
+end
+
+local function project_input_digest(module: bridge.ProjectModule): string
+  local joined = strings.writer()
+  for index = 1, #module.files do
+    local file = module.files[index]
+    joined:write(#file.filename .. ":" .. #file.contents .. ":" .. file.contents)
+  end
+  return content_identity.hex_digest(joined:drain())
+end
+
+local function marker_saved(project_modules: {bridge.ProjectModule}): boolean
+  for index = 1, #project_modules do
+    local module = project_modules[index]
+    for file_index = 1, #module.files do
+      if strings.find(module.files[file_index].contents, "BROKEN_INPUT") ~= nil then
+        return true
+      end
+    end
+  end
+  return false
+end
+
+local function InputAnalyzer:analyze(
+    request: project_service.AnalysisRequest): bridge.Analysis
+  self.runs = self.runs + 1
+  local broken = marker_saved(request.project_modules)
+  local modules: {bridge.ModuleSnapshot} = {}
+  local diagnostics: {bridge.Diagnostic} = {}
+  for index = 1, #request.dirty_modules do
+    local name = request.dirty_modules[index]
+    local module? = find_project(request, name)
+    test.assert(module ~= nil, "input analyzer lost a dirty project module")
+    if module == nil then raise "dirty input module is missing" end
+    local actual = module as bridge.ProjectModule
+    local filenames: {string} = {}
+    for file_index = 1, #actual.files do
+      filenames[file_index] = actual.files[file_index].filename
+    end
+    local imports: {bridge.Import} = {}
+    local digest = project_input_digest(actual)
+    modules[index] = bridge.ModuleSnapshot.new(
+      name,
+      bridge.Provenance.project_source(filenames[1], filenames),
+      bridge.Manifest.new(name, digest, digest),
+      {}, {}, imports, {}, nil, nil)
+    if broken then
+      for file_index = 1, #filenames do
+        diagnostics[#diagnostics + 1] = bridge.Diagnostic.new(
+          bridge.DiagnosticKind.type_error(),
+          "deliberate saved-input failure",
+          bridge.SourceLocation.new(filenames[file_index], 1, 1))
+      end
+    end
+  end
+  return bridge.Analysis.new(request.root_module, diagnostics, modules, {}, {}, {})
+end
+
+local function with_input_application(
+    body: function (string, string, InputAnalyzer, application.Application): ())
+  local root = test_paths.temporary_name()
+  fs.unlink(root)
+  fs.mkdir(root)
+  local source_root = root .. "/src"
+  fs.mkdir(source_root)
+  local filename = source_root .. "/main.titan"
+  fs.write_file(filename,
+    'local helper = import "helper"\n\n' ..
+    "function use(): integer\n  return 1\nend\n")
+  local config = root .. "/titan-config.lua"
+  fs.write_file(config,
+    'include = { "." }\nsource_module_roots = { "./src" }\n')
+  defer do
+    if fs.lstat(config) ~= nil then fs.unlink(config) end
+    if fs.lstat(filename) ~= nil then fs.unlink(filename) end
+    if fs.lstat(source_root) ~= nil then fs.rmdir(source_root) end
+    if fs.lstat(root) ~= nil then fs.rmdir(root) end
+  end
+  local analyzer = InputAnalyzer.new(0)
+  local app = application.create(
+    root,
+    function (project_root: string,
+              _progress_listener: bridge.ProgressListener?,
+              snapshot_listener: project_service.SnapshotListener?):
+        (project_service.Service?, project_service.Error?, project_loader.Restoration?)
+      local loaded?, failure? = test_service.load {
+        project_root = project_root,
+        installed_binary_modules_root = test_paths.sdk_binary_root(),
+        analyzer = analyzer:analyze,
+        snapshot_listener = snapshot_listener,
+      }
+      return loaded, failure, nil
+    end)
+  defer app:close()
+  body(root, source_root, analyzer, app)
+end
+
+local function pulls_a_folder_contributor_change()
+  with_input_application(function (
+      root: string, source_root: string, analyzer: InputAnalyzer,
+      app: application.Application)
+    local folder = source_root .. "/group"
+    fs.mkdir(folder)
+    local main_file = folder .. "/group.titan"
+    local contributor = folder .. "/b.titan"
+    fs.write_file(main_file, "function group_value(): integer\n  return 1\nend\n")
+    fs.write_file(contributor, "function other_value(): integer\n  return 2\nend\n")
+    defer do
+      if fs.lstat(main_file) ~= nil then fs.unlink(main_file) end
+      if fs.lstat(contributor) ~= nil then fs.unlink(contributor) end
+      if fs.lstat(folder) ~= nil then fs.rmdir(folder) end
+    end
+    app:start_indexing()
+    wait_until(function (): boolean
+      return app.completed_view ~= nil and
+             not app:indexing_metrics().refresh_chain_active
+    end, "the folder-module project did not finish indexing")
+    use_manual_watch_delivery(app)
+    local clean = pull_report(app, main_file, nil)
+    local clean_items? = wire.as_array(clean["items"])
+    test.assert(wire.as_string(clean["kind"]) == "full" and
+                clean_items ~= nil and #clean_items == 0,
+                "the folder-module project is not clean")
+    local clean_id = wire.as_string(clean["resultId"])
+
+    -- Another contributor of the same folder module is saved; the pulled
+    -- contributor's own bytes do not change.
+    fs.write_file(contributor,
+      "function other_value(): integer\n  return 0 -- BROKEN_INPUT\nend\n")
+    local report = pull_report(app, main_file, clean_id)
+    local items? = wire.as_array(report["items"])
+    test.assert(wire.as_string(report["kind"]) == "full" and
+                items ~= nil and #items == 1,
+                "a pull after a contributor save replayed the stale generation")
+    local _unused = root
+  end)
+end
+
+function test_application_pull_revalidates_a_folder_contributor_change(
+    _context: test.Context)
+  test_runtime.run(pulls_a_folder_contributor_change)
 end

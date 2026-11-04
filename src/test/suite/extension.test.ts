@@ -37,6 +37,7 @@ interface FixtureEvent {
   trace?: string;
   initializationOptions?: {
     insertCallSnippets: boolean;
+    pullDiagnostics: false;
     trustedRoots?: string[];
   };
   signal?: string;
@@ -607,6 +608,7 @@ suite("Titan extension", () => {
         // directory whose roots may select their own SDK.
         assert.deepEqual(initialization.initializationOptions, {
           insertCallSnippets: true,
+          pullDiagnostics: false,
           trustedRoots: [alphaPhysicalRoot]
         });
         document = await vscode.workspace.openTextDocument(vscode.Uri.joinPath(alpha.uri, "sample.titan"));
@@ -630,6 +632,7 @@ suite("Titan extension", () => {
         assert.notEqual(optedOut.pid, initialization.pid);
         assert.deepEqual(optedOut.initializationOptions, {
           insertCallSnippets: false,
+          pullDiagnostics: false,
           trustedRoots: [alphaPhysicalRoot]
         });
         const reference = await waitForNamedCompletion(
@@ -1554,6 +1557,7 @@ async function assertInitialization(
   assert.equal(event.trace, "off");
   assert.deepEqual(event.initializationOptions, {
     insertCallSnippets: true,
+    pullDiagnostics: false,
     trustedRoots: [physicalRoot]
   });
   assertNativePathEqual(event.rootPath, folder.uri.fsPath);

@@ -20,6 +20,7 @@ import { pathToFileURL } from "node:url";
 import {
   FrameReader,
   collect,
+  collectNotification,
   exitOf,
   frame,
   launch,
@@ -1890,6 +1891,225 @@ async function testShutdownDuringRestart() {
   }
 }
 
+// Criterion 4: two roots' indexing progress and pulled diagnostics must stay
+// separate through the router. Each root's file saves a different type error,
+// so a leaked generation or a shared progress period is visible in the report.
+const PULL_A_SOURCE = [
+  "function source(value: integer): integer",
+  '  return "text"',
+  "end",
+  ""
+].join("\n");
+
+const PULL_B_SOURCE = [
+  "function source(value: integer): integer",
+  "  return true",
+  "end",
+  ""
+].join("\n");
+
+// The client answers the router's remapped work-done requests exactly as an
+// editor does. A router that lost a worker's request or its answer leaves that
+// worker without progress, which the assertions below detect.
+function answerWorkDoneRequests(session) {
+  session.responses.serverRequestHandler = (message) => {
+    assert.equal(message.method, "window/workDoneProgress/create",
+      `unexpected server request ${message.method}`);
+    session.child.stdin.write(frame({
+      jsonrpc: "2.0", id: message.id, result: null
+    }));
+  };
+}
+
+
+// Read the next message that is a reply to a client request, collecting any
+// notifications that arrive first.
+async function nextServerReply(session, milliseconds = QUERY_TIMEOUT_MILLISECONDS) {
+  while (true) {
+    const message = await session.responses.read(milliseconds);
+    if (message.id === undefined && typeof message.method === "string") {
+      collectNotification(session.responses, message);
+      continue;
+    }
+    return message;
+  }
+}
+
+function progressFor(progress, token) {
+  return progress.filter((entry) => entry.token === token);
+}
+
+function assertOnePeriod(progress, token, label) {
+  const events = progressFor(progress, token);
+  assert.ok(events.length >= 3,
+    `${label}: progress for ${token} reported only ${events.length} events`);
+  const kinds = events.map((entry) => entry.value.kind);
+  assert.equal(kinds[0], "begin", `${label}: progress did not begin`);
+  assert.equal(kinds.at(-1), "end", `${label}: progress did not end`);
+  assert.equal(kinds.filter((kind) => kind === "begin").length, 1,
+    `${label}: one indexing period published more than one begin`);
+  assert.equal(kinds.filter((kind) => kind === "end").length, 1,
+    `${label}: one indexing period published more than one end`);
+  assert.equal(kinds.filter((kind) => kind === "report").length >= 1, true,
+    `${label}: progress published no saved-file workset`);
+}
+
+function lastPublicationFor(session, uri) {
+  const publications = session.responses.diagnosticPublications;
+  for (let index = publications.length - 1; index >= 0; index -= 1) {
+    if (publications[index].uri === uri) return publications[index];
+  }
+  return undefined;
+}
+
+async function pullDiagnostics(session, uri) {
+  const report = await session.result("textDocument/diagnostic", {
+    textDocument: { uri }
+  });
+  assert.equal(typeof report.resultId, "string",
+    `a pull for ${uri} omitted its result id`);
+  assert.match(report.resultId, /^[0-9a-f]{64}$/,
+    "a pull result id is not a lowercase hex SHA-256");
+  return report;
+}
+
+async function testProgressAndPullPerRoot() {
+  const base = await makeBase("cells");
+  const rootA = path.join(base, "a");
+  const rootB = path.join(base, "b");
+  const sourceA = await writeRoot(rootA, PULL_A_SOURCE);
+  const sourceB = await writeRoot(rootB, PULL_B_SOURCE);
+  const session = new Session(launch(rootA, "error"));
+  try {
+    answerWorkDoneRequests(session);
+    const result = await session.initialize({
+      capabilities: { window: { workDoneProgress: true } },
+      workspaceFolders: [
+        { uri: uri(rootA), name: "a" },
+        { uri: uri(rootB), name: "b" }
+      ],
+      initializationOptions: { trustedRoots: [rootA, rootB] }
+    });
+    // The router advertises pull diagnostics from the client's capabilities.
+    assert.deepEqual(result.capabilities.diagnosticProvider, {
+      interFileDependencies: true, workspaceDiagnostics: false
+    }, "the router did not advertise pull diagnostics");
+    session.notify("initialized", {});
+
+    // Drain worker traffic through a router-owned request until both roots end
+    // their own indexing period.
+    const ends = await poll("both roots' indexing progress", async () => {
+      await session.status();
+      const found = session.responses.progress.filter(
+        (entry) => entry.value.kind === "end");
+      return found.length >= 2 ? { accepted: found } : { rejected: found };
+    });
+    assert.equal(ends.length, 2,
+      `two roots reported ${ends.length} indexing periods`);
+    const tokens = ends.map((entry) => entry.token);
+    assert.equal(new Set(tokens).size, 2,
+      "two roots shared one work-done progress token");
+    const pids = tokens.map((token) => {
+      const match = /^titan-progress\/(\d+)\/(\d+)$/.exec(token);
+      assert.ok(match, `token ${token} is not process-qualified`);
+      return match[1];
+    });
+    assert.equal(new Set(pids).size, 2,
+      "two roots' progress tokens name one worker process");
+    for (const token of tokens) {
+      assertOnePeriod(session.responses.progress, token,
+        `root progress ${token}`);
+    }
+    assert.equal(session.responses.serverRequests.length, 2,
+      "two roots requested an unexpected number of progress tokens");
+    const created = session.responses.serverRequests.map(
+      (message) => message.params.token);
+    assert.deepEqual([...created].sort(), [...tokens].sort(),
+      "a root's created token did not carry its own progress");
+    assert.equal(new Set(session.responses.serverRequests.map(
+      (message) => message.id)).size, 2,
+      "the router reused one request id for both workers");
+
+    // Criterion 4: each root's pull reports only its own saved diagnostics.
+    const reportA = await pullDiagnostics(session, uri(sourceA));
+    const reportB = await pullDiagnostics(session, uri(sourceB));
+    assert.equal(reportA.kind, "full");
+    assert.equal(reportB.kind, "full");
+    assert.equal(reportA.items.length, 1,
+      `root A pulled ${JSON.stringify(reportA.items)}`);
+    assert.equal(reportB.items.length, 1,
+      `root B pulled ${JSON.stringify(reportB.items)}`);
+    assert.match(reportA.items[0].message, /string/i,
+      "root A's pull did not describe its own type error");
+    assert.match(reportB.items[0].message, /boolean/i,
+      "root B's pull did not describe its own type error");
+    assert.equal(reportA.items[0].message.includes("boolean"), false,
+      "root A's pull reported root B's diagnostic");
+    assert.notEqual(reportA.resultId, reportB.resultId,
+      "two roots' pulls reported one result id");
+    // Pull and push agree per root: the pull serves the published rows.
+    const publishedA = lastPublicationFor(session, uri(sourceA));
+    const publishedB = lastPublicationFor(session, uri(sourceB));
+    assert.ok(publishedA && publishedB,
+      "a root published no diagnostics for its own error");
+    assert.deepEqual(publishedA.diagnostics, reportA.items,
+      "root A's pull disagreed with its push");
+    assert.deepEqual(publishedB.diagnostics, reportB.items,
+      "root B's pull disagreed with its push");
+
+    // Replaying a result id answers unchanged for that root only.
+    const repeated = await session.result("textDocument/diagnostic", {
+      textDocument: { uri: uri(sourceA) },
+      previousResultId: reportA.resultId
+    });
+    assert.deepEqual(repeated, {
+      kind: "unchanged", resultId: reportA.resultId
+    }, "a repeated pull did not replay its own result id");
+
+    // The router classifies bodies through the same envelope owner as its
+    // workers: an answer to an unknown id is dropped silently (the following
+    // request would report the stray reply), and a malformed body with a string
+    // id is Invalid Request rather than a client response.
+    session.child.stdin.write(frame({
+      jsonrpc: "2.0", id: "titan-ls:9999", result: null
+    }));
+    await pollStatus(session, (entries) => entries.length === 2,
+      "the router stopped answering after an unknown client response");
+    session.child.stdin.write(frame({ jsonrpc: "2.0", id: "orphan-request" }));
+    const invalid = await nextServerReply(session);
+    assert.equal(invalid.id, null,
+      `Invalid Request reply kept a request id: ${JSON.stringify(invalid)}`);
+    assert.equal(invalid.error?.code, -32600,
+      `a malformed body was not rejected: ${JSON.stringify(invalid)}`);
+    await session.shutdown();
+  } finally {
+    await session.abort();
+  }
+}
+
+async function testRouterPullOptOut() {
+  const base = await makeBase("optout");
+  const root = path.join(base, "a");
+  await writeRoot(root, PULL_A_SOURCE);
+  const session = new Session(launch(root, "error"));
+  try {
+    const result = await session.initialize({
+      workspaceFolders: [{ uri: uri(root), name: "a" }],
+      initializationOptions: { trustedRoots: [root], pullDiagnostics: false }
+    });
+    assert.equal(result.capabilities.diagnosticProvider, undefined,
+      "the router advertised pull diagnostics to an opted-out client");
+    assert.deepEqual(result.capabilities.workspace, {
+      workspaceFolders: { supported: true, changeNotifications: true }
+    }, "the pull opt-out suppressed the folder capability");
+    session.notify("initialized", {});
+    await pollSettled(session, 1, "the opted-out root did not start");
+    await session.shutdown();
+  } finally {
+    await session.abort();
+  }
+}
+
 const groups = [
   ["independent", testIndependentRoots, "independent roots"],
   ["folders", testFolderChanges, "folder changes"],
@@ -1905,7 +2125,9 @@ const groups = [
   ["migrate", testOwnershipMigration, "ownership migration"],
   ["overlay-limits", testOverlayLimits, "overlay limits"],
   ["indexing-epochs", testIndexingEpochs, "indexing epochs"],
-  ["shutdown-restart", testShutdownDuringRestart, "shutdown during a restart"]
+  ["shutdown-restart", testShutdownDuringRestart, "shutdown during a restart"],
+  ["diagnostics", testProgressAndPullPerRoot, "progress and pull per root"],
+  ["diagnostics-optout", testRouterPullOptOut, "router pull opt-out"]
 ];
 
 async function main() {

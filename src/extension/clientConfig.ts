@@ -56,6 +56,16 @@ export function readCompletionConfiguration(
 export interface InitializationOptions {
   insertCallSnippets: boolean;
   /**
+   * The editor keeps the server's pushed diagnostics.
+   *
+   * vscode-languageclient stores pulled diagnostics in a collection separate
+   * from pushed ones, so advertising pull while the server keeps pushing would
+   * show every open file twice. Pull-only would hide diagnostics for closed
+   * files, because the server advertises no workspace-wide enumeration. The
+   * extension therefore opts out of pull and depends on push alone.
+   */
+  pullDiagnostics: false;
+  /**
    * Canonicalizable directories whose Titan roots may select their own SDK.
    * The server canonicalizes each entry and refuses an untrusted root's
    * `compiler_root`, so this list never grants a workspace permission it did
@@ -82,6 +92,7 @@ export function createInitializationOptions(
   }
   return {
     insertCallSnippets: completion.insertCallSnippets,
+    pullDiagnostics: false,
     trustedRoots: [...trustedRoots]
   };
 }

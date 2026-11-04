@@ -7,6 +7,8 @@ local dispatcher = import "server.dispatcher"
 local wire = import "server.wire"
 local response_queue = import "server.response_queue"
 local test_runtime = import "server.test_runtime"
+local async = import "async"
+local outbound_requests = import "server.outbound_requests"
 local lsp = import "server.lsp_types"
 local buffers = import "server.document_buffers"
 
@@ -451,4 +453,38 @@ end
 function test_coordinator_recovers_encoding_failure_and_preserves_nulls(
     _context: test.Context)
   test_runtime.run(recovers_after_unencodable_result_and_preserves_nulls)
+end
+
+local function releases_outbound_requests_on_shutdown()
+  local output = response_queue.create()
+  local server = coordinator.create(output)
+  local requests = outbound_requests.create(output)
+  server:configure_outbound(requests)
+  initialize(server, output)
+
+  local reason: string? = nil
+  local waiter = async.run<|nil, value|>(function (): nil
+    local request?, start_failure? = requests:start(
+      "window/workDoneProgress/create", {["token"] = "titan-progress/1/1"})
+    test.assert(request ~= nil and start_failure == nil,
+                "server-initiated request did not start")
+    if request == nil then return nil end
+    local _result?, failure? =
+      (request as outbound_requests.PendingRequest):wait(nil)
+    reason = failure
+    return nil
+  end)
+  while requests:count() == 0 do timer.yield() end
+  server:handle([[{"jsonrpc":"2.0","id":9,"method":"shutdown"}]])
+  async.join(waiter)
+  test.assert(reason == "language server session ended",
+              "shutdown left a server-initiated request waiting: " ..
+                strings.tostring(reason))
+  test.assert(requests:is_closed(),
+              "shutdown left the outbound request table accepting requests")
+end
+
+function test_coordinator_releases_outbound_requests_on_shutdown(
+    _context: test.Context)
+  test_runtime.run(releases_outbound_requests_on_shutdown)
 end

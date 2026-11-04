@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
-import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -41,9 +41,13 @@ class FrameReader {
     this.lastIndexingProgress = [];
     this.diagnosticPublications = [];
     this.diagnosticPublicationCursor = 0;
+    this.serverRequests = [];
+    this.progress = [];
+    this.progressCursor = 0;
+    this.serverRequestHandler = undefined;
   }
 
-  async read(milliseconds = 5_000) {
+  async readFrame(milliseconds = 5_000) {
     while (true) {
       const headerEnd = this.buffer.indexOf("\r\n\r\n");
       if (headerEnd >= 0) {
@@ -71,6 +75,23 @@ class FrameReader {
         throw new Error(`server stdout ended with ${this.buffer.length} pending bytes`);
       }
       this.buffer = Buffer.concat([this.buffer, next.value]);
+    }
+  }
+
+  // Server-initiated requests and work-done progress are protocol traffic, not
+  // replies or notifications a transcript waits on. Record them, answer them
+  // when the test installed a handler, and keep reading.
+  async read(milliseconds = 5_000) {
+    while (true) {
+      const message = await this.readFrame(milliseconds);
+      if (typeof message.method === "string" && message.id !== undefined) {
+        this.serverRequests.push(message);
+        if (this.serverRequestHandler !== undefined) {
+          this.serverRequestHandler(message);
+        }
+        continue;
+      }
+      return message;
     }
   }
 
@@ -237,7 +258,33 @@ function collectNotification(responses, message) {
     responses.diagnosticPublications.push(message.params);
     return;
   }
+  if (message.method === "$/progress") {
+    validateProgressParams(message.params);
+    responses.progress.push(message.params);
+    return;
+  }
   assert.fail(`unexpected server notification ${message.method}`);
+}
+
+function validateProgressParams(params) {
+  assert.ok(params !== null && typeof params === "object");
+  assert.equal(typeof params.token, "string");
+  const value = params.value;
+  assert.ok(value !== null && typeof value === "object");
+  assert.ok(["begin", "report", "end"].includes(value.kind),
+    `unexpected work-done progress kind: ${value.kind}`);
+  if (value.kind === "begin") {
+    assert.equal(typeof value.title, "string");
+    assert.ok(value.title.length > 0);
+  }
+  if (value.kind === "report") {
+    assert.equal(typeof value.message, "string");
+    assert.ok(Number.isInteger(value.percentage));
+    assert.ok(value.percentage >= 0 && value.percentage <= 100);
+  }
+  if (value.message !== undefined) {
+    assert.equal(typeof value.message, "string");
+  }
 }
 
 function validateIndexingStatus(status) {
@@ -299,6 +346,20 @@ async function nextDiagnosticPublication(responses) {
   responses.diagnosticPublicationCursor += 1;
   validateDiagnosticPublication(publication);
   return publication;
+}
+
+async function nextProgressEvent(responses, kind, timeoutMilliseconds = 30_000) {
+  while (true) {
+    while (responses.progressCursor < responses.progress.length) {
+      const params = responses.progress[responses.progressCursor];
+      responses.progressCursor += 1;
+      if (params.value.kind === kind) return params;
+    }
+    const message = await responses.read(timeoutMilliseconds);
+    assert.equal(message.id, undefined);
+    assert.equal(typeof message.method, "string");
+    collectNotification(responses, message);
+  }
 }
 
 async function waitForIndexing(
@@ -460,6 +521,10 @@ async function testLifecycle() {
         renameProvider: true,
         hoverProvider: true,
         foldingRangeProvider: true,
+        diagnosticProvider: {
+          interFileDependencies: true,
+          workspaceDiagnostics: false
+        },
         positionEncoding: "utf-16",
         textDocumentSync: { openClose: true, change: 1, save: { includeText: false } },
         completionProvider: { resolveProvider: false, triggerCharacters: [".", ":"],
@@ -2293,6 +2358,653 @@ async function testDebugCompilerProgress() {
   }
 }
 
+function answerProgressRequests(child, responses) {
+  responses.serverRequestHandler = (message) => {
+    assert.equal(message.jsonrpc, "2.0");
+    assert.equal(message.method, "window/workDoneProgress/create");
+    assert.equal(typeof message.params?.token, "string");
+    child.stdin.write(frame({ jsonrpc: "2.0", id: message.id, result: null }));
+  };
+}
+
+async function writeProjectConfig(root) {
+  await writeFile(
+    path.join(root, "titan-config.lua"),
+    'include = { "." }\nsource_module_roots = { "." }\n',
+    "utf8"
+  );
+}
+
+async function writeValidProject(root) {
+  await writeProjectConfig(root);
+  const filename = path.join(root, "sample.titan");
+  await writeFile(filename, [
+    "function answer(item: integer): integer",
+    "  return item * 2",
+    "end",
+    "function use(): integer",
+    "  return answer(21)",
+    "end",
+    ""
+  ].join("\n"), "utf8");
+  return filename;
+}
+
+async function writeErrorProject(root) {
+  await writeProjectConfig(root);
+  const filename = path.join(root, "sample.titan");
+  const errorLines = [
+    "function answer(item: integer): integer",
+    "  return item * 2",
+    "end",
+    "function broken(): integer",
+    '  return answer("text")',
+    "end",
+    ""
+  ];
+  await writeFile(filename, errorLines.join("\n"), "utf8");
+  await writeFile(
+    path.join(root, "other.titan"),
+    "function other(value: integer): integer\n  return value + 1\nend\n",
+    "utf8"
+  );
+  return filename;
+}
+
+async function testIndexingWorkDoneProgress() {
+  const root = await makePhysicalTemporaryRoot("vscode-titan-progress-");
+  const filename = await writeValidProject(root);
+  const uri = pathToFileURL(filename).href;
+  const child = launch(root);
+  const exit = exitOf(child);
+  const stderr = collect(child.stderr);
+  const responses = new FrameReader(child.stdout);
+  try {
+    const initialized = await request(child, responses, 1, "initialize", {
+      capabilities: { window: { workDoneProgress: true } }
+    });
+    assert.deepEqual(initialized.result.capabilities.diagnosticProvider,
+      { interFileDependencies: true, workspaceDiagnostics: false });
+    answerProgressRequests(child, responses);
+    child.stdin.write(frame({
+      jsonrpc: "2.0", method: "initialized", params: {}
+    }));
+
+    // The omp pattern waits for the progress end instead of a timeout fallback.
+    const end = await nextProgressEvent(responses, "end");
+    const token = end.token;
+    assert.match(token, /^titan-progress\/[0-9]+\/[0-9]+$/);
+    const events = responses.progress.filter((params) => params.token === token);
+    assert.equal(events.length > 2, true,
+      "indexing progress reported no compiler workset");
+    assert.equal(events[0].value.kind, "begin");
+    assert.equal(events[0].value.title, "Titan indexing");
+    assert.equal(events[0].value.message, "initial");
+    assert.equal(events[events.length - 1].value.kind, "end");
+    assert.deepEqual(
+      events.filter((params) => params.value.kind === "end").length,
+      1,
+      "one indexing period published more than one end"
+    );
+    const reports = events.filter((params) => params.value.kind === "report");
+    assert.ok(reports.length > 0, "indexing progress omitted its workset reports");
+    for (const report of reports) {
+      assert.match(report.value.message, /^[0-9]+\/[0-9]+ files$/);
+    }
+    assert.equal(
+      responses.serverRequests.filter((request) =>
+        request.method === "window/workDoneProgress/create").length,
+      1,
+      "initial indexing requested more than one progress token"
+    );
+
+    // A request issued after `end` observes the indexed saved generation.
+    const definition = await semanticRequest(
+      child,
+      responses,
+      "after-progress",
+      "textDocument/definition",
+      { textDocument: { uri }, position: { line: 4, character: 10 } }
+    );
+    assert.equal(definition.error, undefined,
+      `definition failed: ${JSON.stringify(definition.error)}`);
+    assert.deepEqual(definition.result, {
+      uri,
+      range: {
+        start: { line: 0, character: 9 },
+        end: { line: 0, character: 15 }
+      }
+    });
+
+    const shutdown = await request(child, responses, "shutdown", "shutdown", null);
+    assert.equal(shutdown.result, null);
+    child.stdin.write(frame({ jsonrpc: "2.0", method: "exit" }));
+    assert.deepEqual(await awaitExit(exit), { code: 0, signal: null });
+    assert.equal(stderr().length, 0, stderr().toString("utf8"));
+  } catch (cause) {
+    const diagnostic = stderr().toString("utf8").trim();
+    throw new Error(
+      `${cause.message}${diagnostic.length > 0 ? `; stderr: ${diagnostic}` : ""}`,
+      { cause }
+    );
+  } finally {
+    if (child.exitCode === null && child.signalCode === null) child.kill();
+    await awaitExit(exit);
+    await rm(root, { recursive: true, force: true });
+  }
+}
+
+async function testIndexingWithoutWorkDoneProgress() {
+  const root = await makePhysicalTemporaryRoot("vscode-titan-no-progress-");
+  await writeValidProject(root);
+  const child = launch(root);
+  const exit = exitOf(child);
+  const stderr = collect(child.stderr);
+  const responses = new FrameReader(child.stdout);
+  try {
+    const initialized = await request(child, responses, 1, "initialize", {});
+    // Pull diagnostics stay advertised for a client which did not opt out.
+    assert.deepEqual(initialized.result.capabilities.diagnosticProvider,
+      { interFileDependencies: true, workspaceDiagnostics: false });
+    child.stdin.write(frame({
+      jsonrpc: "2.0", method: "initialized", params: {}
+    }));
+    await waitForIndexing(responses);
+    assert.deepEqual(responses.serverRequests, [],
+      "a client without work-done progress received a server request");
+    const shutdown = await request(child, responses, "shutdown", "shutdown", null);
+    assert.equal(shutdown.result, null);
+    child.stdin.write(frame({ jsonrpc: "2.0", method: "exit" }));
+    assert.deepEqual(await awaitExit(exit), { code: 0, signal: null });
+  } catch (cause) {
+    const diagnostic = stderr().toString("utf8").trim();
+    throw new Error(
+      `${cause.message}${diagnostic.length > 0 ? `; stderr: ${diagnostic}` : ""}`,
+      { cause }
+    );
+  } finally {
+    if (child.exitCode === null && child.signalCode === null) child.kill();
+    await awaitExit(exit);
+    await rm(root, { recursive: true, force: true });
+  }
+}
+
+async function testVSCodePullDiagnosticsOptOut() {
+  const root = await makePhysicalTemporaryRoot("vscode-titan-pull-optout-");
+  const child = launch(root);
+  const exit = exitOf(child);
+  const stderr = collect(child.stderr);
+  const responses = new FrameReader(child.stdout);
+  try {
+    const initialized = await request(child, responses, 1, "initialize", {
+      capabilities: { window: { workDoneProgress: true } },
+      initializationOptions: { pullDiagnostics: false }
+    });
+    assert.equal(initialized.result.capabilities.diagnosticProvider, undefined,
+      "the pull opt-out still advertised diagnosticProvider");
+    // Work-done progress stays on for every client that advertises it.
+    assert.equal(initialized.result.capabilities.positionEncoding, "utf-16");
+    const shutdown = await request(child, responses, "shutdown", "shutdown", null);
+    assert.equal(shutdown.result, null);
+    child.stdin.write(frame({ jsonrpc: "2.0", method: "exit" }));
+    assert.deepEqual(await awaitExit(exit), { code: 0, signal: null });
+    assert.equal(stderr().length, 0, stderr().toString("utf8"));
+  } catch (cause) {
+    const diagnostic = stderr().toString("utf8").trim();
+    throw new Error(
+      `${cause.message}${diagnostic.length > 0 ? `; stderr: ${diagnostic}` : ""}`,
+      { cause }
+    );
+  } finally {
+    if (child.exitCode === null && child.signalCode === null) child.kill();
+    await awaitExit(exit);
+    await rm(root, { recursive: true, force: true });
+  }
+}
+
+async function testPullDiagnostics() {
+  const root = await makePhysicalTemporaryRoot("vscode-titan-pull-");
+  const filename = await writeErrorProject(root);
+  const uri = pathToFileURL(filename).href;
+  const child = launch(root);
+  const exit = exitOf(child);
+  const stderr = collect(child.stderr);
+  const responses = new FrameReader(child.stdout);
+  try {
+    await request(child, responses, 1, "initialize", {
+      capabilities: { window: { workDoneProgress: true } }
+    });
+    answerProgressRequests(child, responses);
+    child.stdin.write(frame({
+      jsonrpc: "2.0", method: "initialized", params: {}
+    }));
+    await nextProgressEvent(responses, "end");
+
+    // omp refreshes the document from disk before asking for diagnostics.
+    const diskText = await readFile(filename, "utf8");
+    child.stdin.write(frame({
+      jsonrpc: "2.0",
+      method: "textDocument/didOpen",
+      params: {
+        textDocument: { uri, languageId: "titan", version: 1, text: diskText }
+      }
+    }));
+    child.stdin.write(frame({
+      jsonrpc: "2.0",
+      method: "textDocument/didChange",
+      params: {
+        textDocument: { uri, version: 2 },
+        contentChanges: [{ text: diskText }]
+      }
+    }));
+
+    const first = await request(child, responses, "pull-1",
+      "textDocument/diagnostic", { textDocument: { uri } });
+    assert.equal(first.error, undefined,
+      `diagnostic pull failed: ${JSON.stringify(first.error)}`);
+    assert.equal(first.result.kind, "full");
+    assert.equal(typeof first.result.resultId, "string");
+    assert.equal(first.result.resultId.length, 64);
+    assert.equal(first.result.items.length, 1);
+    assert.equal(first.result.items[0].code, "type");
+    assert.equal(first.result.items[0].source, "Titan");
+    assert.equal(typeof first.result.items[0].message, "string");
+
+    // An unrelated saved change publishes a new generation; this document's
+    // items did not change, so the previous result id still matches.
+    await writeFile(
+      path.join(root, "other.titan"),
+      "function other(value: integer): integer\n  return value + 2\nend\n",
+      "utf8"
+    );
+    const unchanged = await request(child, responses, "pull-2",
+      "textDocument/diagnostic",
+      { textDocument: { uri }, previousResultId: first.result.resultId });
+    assert.equal(unchanged.error, undefined);
+    assert.equal(unchanged.result.kind, "unchanged");
+    assert.equal(unchanged.result.resultId, first.result.resultId);
+    assert.equal(unchanged.result.items, undefined);
+
+    // Rewriting the file on disk must be observed by the pull itself, without
+    // relying on watcher timing. The final bytes win over the intermediate
+    // saved generation.
+    await writeFile(filename, [
+      "function answer(item: integer): integer",
+      "  return item * 3",
+      "end",
+      "function broken(): integer",
+      '  return answer("text")',
+      "end",
+      ""
+    ].join("\n"), "utf8");
+    const repaired = [
+      "function answer(item: integer): integer",
+      "  return item * 2",
+      "end",
+      "function fixed(): integer",
+      "  return answer(21)",
+      "end",
+      ""
+    ].join("\n");
+    await writeFile(filename, repaired, "utf8");
+    const repulled = await request(child, responses, "pull-3",
+      "textDocument/diagnostic",
+      { textDocument: { uri }, previousResultId: first.result.resultId });
+    assert.equal(repulled.error, undefined,
+      `repull failed: ${JSON.stringify(repulled.error)}`);
+    assert.equal(repulled.result.kind, "full");
+    assert.deepEqual(repulled.result.items, []);
+    assert.notEqual(repulled.result.resultId, first.result.resultId);
+
+    const shutdown = await request(child, responses, "shutdown", "shutdown", null);
+    assert.equal(shutdown.result, null);
+    child.stdin.write(frame({ jsonrpc: "2.0", method: "exit" }));
+    assert.deepEqual(await awaitExit(exit), { code: 0, signal: null });
+  } catch (cause) {
+    const diagnostic = stderr().toString("utf8").trim();
+    throw new Error(
+      `${cause.message}${diagnostic.length > 0 ? `; stderr: ${diagnostic}` : ""}`,
+      { cause }
+    );
+  } finally {
+    if (child.exitCode === null && child.signalCode === null) child.kill();
+    await awaitExit(exit);
+    await rm(root, { recursive: true, force: true });
+  }
+}
+
+async function testCancelledPullDiagnostics() {
+  const root = await makePhysicalTemporaryRoot("vscode-titan-pull-cancel-");
+  const filename = await writeErrorProject(root);
+  const uri = pathToFileURL(filename).href;
+  const child = launch(root);
+  const exit = exitOf(child);
+  const stderr = collect(child.stderr);
+  const responses = new FrameReader(child.stdout);
+  try {
+    await request(child, responses, 1, "initialize", {
+      capabilities: { window: { workDoneProgress: true } }
+    });
+    answerProgressRequests(child, responses);
+    // The pull joins the initial indexing pass, so its cancellation always
+    // lands at a suspension instead of racing a completed generation.
+    child.stdin.write(Buffer.concat([
+      frame({ jsonrpc: "2.0", method: "initialized", params: {} }),
+      frame({
+        jsonrpc: "2.0",
+        id: "cancelled-pull",
+        method: "textDocument/diagnostic",
+        params: { textDocument: { uri } }
+      }),
+      frame({
+        jsonrpc: "2.0",
+        method: "$/cancelRequest",
+        params: { id: "cancelled-pull" }
+      })
+    ]));
+    const cancelled = await responseFor(responses, "cancelled-pull");
+    assert.equal(cancelled.result, undefined,
+      "cancelled pull answered with a report");
+    assert.equal(cancelled.error?.code, -32800);
+
+    const shutdown = await request(child, responses, "shutdown", "shutdown", null);
+    assert.equal(shutdown.result, null);
+    child.stdin.write(frame({ jsonrpc: "2.0", method: "exit" }));
+    assert.deepEqual(await awaitExit(exit), { code: 0, signal: null });
+  } catch (cause) {
+    const diagnostic = stderr().toString("utf8").trim();
+    throw new Error(
+      `${cause.message}${diagnostic.length > 0 ? `; stderr: ${diagnostic}` : ""}`,
+      { cause }
+    );
+  } finally {
+    if (child.exitCode === null && child.signalCode === null) child.kill();
+    await awaitExit(exit);
+    await rm(root, { recursive: true, force: true });
+  }
+}
+
+
+async function testRejectedProgressTokenAndInvalidBodies() {
+  const root = await makePhysicalTemporaryRoot("vscode-titan-progress-reject-");
+  await writeValidProject(root);
+  const child = launch(root);
+  const exit = exitOf(child);
+  const stderr = collect(child.stderr);
+  const responses = new FrameReader(child.stdout);
+  try {
+    await request(child, responses, 1, "initialize", {
+      capabilities: { window: { workDoneProgress: true } }
+    });
+    // A client that advertises work-done progress may still answer the create
+    // request with something that is not a JSON-RPC error object. The server
+    // must treat that as a failure and keep indexing without progress.
+    responses.serverRequestHandler = (message) => {
+      assert.equal(message.method, "window/workDoneProgress/create");
+      child.stdin.write(frame({
+        jsonrpc: "2.0", id: message.id, error: "rejected"
+      }));
+    };
+    child.stdin.write(frame({
+      jsonrpc: "2.0", method: "initialized", params: {}
+    }));
+    await waitForIndexing(responses);
+    assert.equal(responses.serverRequests.length, 1,
+      "a rejected progress token did not stop further progress requests");
+    assert.deepEqual(responses.progress, [],
+      "a rejected progress token still published work-done progress");
+
+    // A malformed body with a string id is a request, not a client response:
+    // it receives Invalid Request instead of being dropped.
+    child.stdin.write(frame({ jsonrpc: "2.0", id: "orphan-request" }));
+    let invalid;
+    while (invalid === undefined) {
+      const message = await responses.read();
+      if (message.id === undefined) {
+        collectNotification(responses, message);
+        continue;
+      }
+      invalid = message;
+    }
+    assert.equal(invalid.id, null,
+      `Invalid Request reply kept a request id: ${JSON.stringify(invalid)}`);
+    assert.equal(invalid.error?.code, -32600,
+      `malformed body was not rejected: ${JSON.stringify(invalid)}`);
+
+    const shutdown = await request(child, responses, "shutdown", "shutdown", null);
+    assert.equal(shutdown.result, null);
+    child.stdin.write(frame({ jsonrpc: "2.0", method: "exit" }));
+    assert.deepEqual(await awaitExit(exit), { code: 0, signal: null });
+    assert.equal(stderr().length, 0, stderr().toString("utf8"));
+  } catch (cause) {
+    const diagnostic = stderr().toString("utf8").trim();
+    throw new Error(
+      `${cause.message}${diagnostic.length > 0 ? `; stderr: ${diagnostic}` : ""}`,
+      { cause }
+    );
+  } finally {
+    if (child.exitCode === null && child.signalCode === null) child.kill();
+    await awaitExit(exit);
+    await rm(root, { recursive: true, force: true });
+  }
+}
+
+
+async function testPullForANewProjectSource() {
+  const root = await makePhysicalTemporaryRoot("vscode-titan-new-source-");
+  await mkdir(path.join(root, "src"), { recursive: true });
+  await writeFile(
+    path.join(root, "titan-config.lua"),
+    'include = { "./src" }\nsource_module_roots = { "./src" }\n',
+    "utf8"
+  );
+  const existing = path.join(root, "src", "main.titan");
+  await writeFile(existing, [
+    "function answer(item: integer): integer",
+    "  return item * 2",
+    "end",
+    ""
+  ].join("\n"), "utf8");
+  const child = launch(root);
+  const exit = exitOf(child);
+  const stderr = collect(child.stderr);
+  const responses = new FrameReader(child.stdout);
+  try {
+    await request(child, responses, 1, "initialize", {
+      capabilities: { window: { workDoneProgress: true } }
+    });
+    answerProgressRequests(child, responses);
+    child.stdin.write(frame({
+      jsonrpc: "2.0", method: "initialized", params: {}
+    }));
+    await nextProgressEvent(responses, "end");
+    const periodsBefore = responses.progress.filter(
+      (entry) => entry.value.kind === "begin").length;
+
+    // The commonest agent sequence: write a new source, then ask for its
+    // diagnostics before any watcher hint can be relied on.
+    const created = path.join(root, "src", "fresh.titan");
+    await writeFile(created, [
+      "function broken(): integer",
+      '  return "text"',
+      "end",
+      ""
+    ].join("\n"), "utf8");
+    const createdUri = pathToFileURL(created).href;
+    const pulled = await request(child, responses, "pull-created",
+      "textDocument/diagnostic", { textDocument: { uri: createdUri } },
+      30_000);
+    assert.equal(pulled.error, undefined,
+      `pull for a new source failed: ${JSON.stringify(pulled.error)}`);
+    assert.equal(pulled.result.kind, "full");
+    assert.equal(pulled.result.items.length, 1,
+      `a new project source reported ${JSON.stringify(pulled.result.items)}`);
+    assert.equal(pulled.result.items[0].code, "type");
+    assert.equal(pulled.result.items[0].source, "Titan");
+    // Let any follow-up period start, then drain through a router-owned request
+    // so a progress notification is recorded rather than read concurrently.
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    await request(child, responses, "after-created", "titan/workspaceStatus", {});
+    assert.ok(responses.progress.filter(
+      (entry) => entry.value.kind === "begin").length > periodsBefore,
+      "a pull for a new project source did not index it");
+
+    // A saved .titan file outside every include root can never be a source, so
+    // it answers an empty report and starts no indexing period.
+    const outside = path.join(root, "stray.titan");
+    await writeFile(outside, [
+      "function stray(): integer",
+      '  return "text"',
+      "end",
+      ""
+    ].join("\n"), "utf8");
+    const outsideUri = pathToFileURL(outside).href;
+    const periods = responses.progress.filter(
+      (entry) => entry.value.kind === "begin").length;
+    const empty = await request(child, responses, "pull-outside",
+      "textDocument/diagnostic", { textDocument: { uri: outsideUri } },
+      30_000);
+    assert.equal(empty.error, undefined);
+    assert.deepEqual(empty.result.items, [],
+      "a file outside every include root reported diagnostics");
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    await request(child, responses, "after-outside", "titan/workspaceStatus", {});
+    // Every pull is a freshness barrier, so this one runs one saved-change pass;
+    // it must not answer with diagnostics for a file no project contains.
+    assert.equal(responses.progress.filter(
+      (entry) => entry.value.kind === "begin").length, periods + 1,
+      "a pull did not run exactly one freshness-barrier pass");
+
+    const shutdown = await request(child, responses, "shutdown", "shutdown", null);
+    assert.equal(shutdown.result, null);
+    child.stdin.write(frame({ jsonrpc: "2.0", method: "exit" }));
+    assert.deepEqual(await awaitExit(exit), { code: 0, signal: null });
+    assert.equal(stderr().length, 0, stderr().toString("utf8"));
+  } catch (cause) {
+    const diagnostic = stderr().toString("utf8").trim();
+    throw new Error(
+      `${cause.message}${diagnostic.length > 0 ? `; stderr: ${diagnostic}` : ""}`,
+      { cause }
+    );
+  } finally {
+    if (child.exitCode === null && child.signalCode === null) child.kill();
+    await awaitExit(exit);
+    await rm(root, { recursive: true, force: true });
+  }
+}
+
+
+// A pull must revalidate every saved input the requested document's report
+// depends on, not only the document's own bytes. Both cases below pull an
+// unchanged file immediately after another saved file in its module graph
+// changed, so a generation-only answer would be stale (or `unchanged`).
+async function pullAcrossSavedInputs(root, prepare, change, target,
+    expectedMessage) {
+  await mkdir(path.join(root, ".."), { recursive: true });
+  await writeFile(path.join(root, "titan-config.lua"),
+    'include = { "." }\nsource_module_roots = { "." }\n', "utf8");
+  await prepare(root);
+  const child = launch(root);
+  const exit = exitOf(child);
+  const stderr = collect(child.stderr);
+  const responses = new FrameReader(child.stdout);
+  try {
+    await request(child, responses, 1, "initialize", {
+      capabilities: { window: { workDoneProgress: true } }
+    });
+    answerProgressRequests(child, responses);
+    child.stdin.write(frame({ jsonrpc: "2.0", method: "initialized", params: {} }));
+    await nextProgressEvent(responses, "end");
+    const targetUri = pathToFileURL(target).href;
+    const clean = await request(child, responses, "pull-clean",
+      "textDocument/diagnostic", { textDocument: { uri: targetUri } },
+      30_000);
+    assert.equal(clean.error, undefined, JSON.stringify(clean.error));
+    assert.deepEqual(clean.result.items, [],
+      `the fixture project is not clean: ${JSON.stringify(clean.result.items)}`);
+
+    // Change the other saved input and pull before any watcher hint can be
+    // relied on: the barrier pass must see the change.
+    await change();
+    const pulled = await request(child, responses, "pull-changed",
+      "textDocument/diagnostic", {
+        textDocument: { uri: targetUri },
+        previousResultId: clean.result.resultId
+      }, 30_000);
+    assert.equal(pulled.error, undefined, JSON.stringify(pulled.error));
+    assert.equal(pulled.result.kind, "full",
+      "a pull after a related saved change replayed the stale generation");
+    assert.equal(pulled.result.items.length, 1,
+      `the related change was not reported: ${JSON.stringify(pulled.result.items)}`);
+    assert.match(pulled.result.items[0].message, expectedMessage);
+    assert.notEqual(pulled.result.resultId, clean.result.resultId,
+      "the changed report kept the preceding result id");
+
+    const shutdown = await request(child, responses, "shutdown", "shutdown", null);
+    assert.equal(shutdown.result, null);
+    child.stdin.write(frame({ jsonrpc: "2.0", method: "exit" }));
+    assert.deepEqual(await awaitExit(exit), { code: 0, signal: null });
+    assert.equal(stderr().length, 0, stderr().toString("utf8"));
+  } catch (cause) {
+    const diagnostic = stderr().toString("utf8").trim();
+    throw new Error(
+      `${cause.message}${diagnostic.length > 0 ? `; stderr: ${diagnostic}` : ""}`,
+      { cause }
+    );
+  } finally {
+    if (child.exitCode === null && child.signalCode === null) child.kill();
+    await awaitExit(exit);
+    await rm(root, { recursive: true, force: true });
+  }
+}
+
+async function testPullRevalidatesADependencyChange() {
+  const root = await makePhysicalTemporaryRoot("vscode-titan-dep-pull-");
+  const main = path.join(root, "main.titan");
+  await pullAcrossSavedInputs(root,
+    async (directory) => {
+      await writeFile(path.join(directory, "helper.titan"),
+        "function value(): integer\n  return 1\nend\n", "utf8");
+      await writeFile(main, [
+        'local helper = import "helper"',
+        "",
+        "function use(): integer",
+        "  return helper.value()",
+        "end",
+        ""
+      ].join("\n"), "utf8");
+    },
+    async () => {
+      // The importer is untouched; only its dependency changes.
+      await writeFile(path.join(root, "helper.titan"),
+        'function value(): string\n  return "text"\nend\n', "utf8");
+    },
+    main, /integer/i);
+}
+
+async function testPullRevalidatesAFolderContributorChange() {
+  const root = await makePhysicalTemporaryRoot("vscode-titan-folder-pull-");
+  const module = path.join(root, "group");
+  const pulled = path.join(module, "a.titan");
+  await pullAcrossSavedInputs(root,
+    async (directory) => {
+      await mkdir(path.join(directory, "group"), { recursive: true });
+      await writeFile(path.join(directory, "group", "group.titan"),
+        "function group_value(): integer\n  return 1\nend\n", "utf8");
+      await writeFile(path.join(directory, "group", "a.titan"),
+        "function pulled(): integer\n  return other_value()\nend\n", "utf8");
+      await writeFile(path.join(directory, "group", "b.titan"),
+        "function other_value(): integer\n  return 2\nend\n", "utf8");
+    },
+    async () => {
+      // Another contributor of the same folder module changes; the pulled
+      // contributor's own bytes do not.
+      await writeFile(path.join(module, "b.titan"),
+        'function other_value(): string\n  return "text"\nend\n', "utf8");
+    },
+    pulled, /integer/i);
+}
+
 async function testTruncatedFrame() {
   const child = launch(process.cwd(), "error");
   const stdout = collect(child.stdout);
@@ -2317,8 +3029,9 @@ async function testTruncatedFrame() {
 }
 
 export {
-  FrameReader, collect, exitOf, frame, launch, makePhysicalTemporaryRoot,
-  printedLuaPaths, request, semanticRequest, structuredLogRecords, waitForIndexing,
+  FrameReader, answerProgressRequests, collect, collectNotification, exitOf,
+  frame, launch, makePhysicalTemporaryRoot, nextProgressEvent, printedLuaPaths,
+  request, responseFor, semanticRequest, structuredLogRecords, waitForIndexing,
   testInputNestingLimits, withTimeout, writeSavedGeneration
 };
 
@@ -2355,6 +3068,15 @@ if (isMain) {
     await testSourceImportCppflagsAndUnchangedRequests();
     await testCrossModuleFolderAndIncrementalSemantics();
     await testDebugCompilerProgress();
+    await testIndexingWorkDoneProgress();
+    await testIndexingWithoutWorkDoneProgress();
+    await testVSCodePullDiagnosticsOptOut();
+    await testPullDiagnostics();
+    await testCancelledPullDiagnostics();
+    await testRejectedProgressTokenAndInvalidBodies();
+    await testPullForANewProjectSource();
+    await testPullRevalidatesADependencyChange();
+    await testPullRevalidatesAFolderContributorChange();
     await testTruncatedFrame();
     console.log("native server protocol transcript passed");
   }

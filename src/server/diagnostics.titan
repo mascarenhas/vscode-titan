@@ -2,6 +2,7 @@
 -- @module server.diagnostics
 
 local async = import "async"
+local content_identity = import "server.content_identity"
 local strings = import "string"
 local bridge = import "server.compiler_bridge"
 local wire = import "server.wire"
@@ -95,19 +96,22 @@ local function item_key(item: Item): string
     strings.tostring(#item.message) .. ":" .. item.message
 end
 
+--- Encode one diagnostic item for push and pull alike.
+function item_value(item: Item): wire.Object
+  return {
+    ["range"] = lsp.range_value(item.range),
+    ["severity"] = diagnostic_severity(item.kind),
+    ["code"] = diagnostic_code(item.kind),
+    ["source"] = "Titan",
+    ["message"] = item.message,
+  }
+end
+
 --- Encode one publishDiagnostics notification.
 function notification(publication: Publication): string
   local encoded: wire.Array = {}
   for index = 1, #publication.items do
-    local item = publication.items[index]
-    local diagnostic: wire.Object = {
-      ["range"] = lsp.range_value(item.range),
-      ["severity"] = diagnostic_severity(item.kind),
-      ["code"] = diagnostic_code(item.kind),
-      ["source"] = "Titan",
-      ["message"] = item.message,
-    }
-    encoded[index] = diagnostic
+    encoded[index] = item_value(publication.items[index])
   end
   local params: wire.Object = {
     ["uri"] = publication.uri,
@@ -284,4 +288,29 @@ end
 function Publisher:stop()
   self:clear()
   self.listener = nil
+end
+
+--- Stable identity of one document's diagnostic items.
+-- The canonical encoding is the ordered item keys; a pull answers `unchanged`
+-- exactly when the client's previous identifier still describes these items.
+function result_id(items: {Item}): string
+  local canonical = strings.writer()
+  canonical:write(#items .. ":")
+  for index = 1, #items do
+    local key = item_key(items[index])
+    canonical:write(#key .. ":" .. key)
+  end
+  -- The content-identity owner already spells a log-safe hexadecimal digest.
+  return content_identity.hex_digest(canonical:drain())
+end
+
+--- Encode one textDocument/diagnostic report from the same items push uses.
+function report(items: {Item}, previous_result_id: string?): wire.Object
+  local id = result_id(items)
+  if previous_result_id ~= nil and previous_result_id == id then
+    return {["kind"] = "unchanged", ["resultId"] = id}
+  end
+  local encoded: wire.Array = {}
+  for index = 1, #items do encoded[index] = item_value(items[index]) end
+  return {["kind"] = "full", ["resultId"] = id, ["items"] = encoded}
 end

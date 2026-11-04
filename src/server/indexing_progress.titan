@@ -1,0 +1,144 @@
+--- Work-done progress for one contiguous indexing refresh chain.
+-- @module server.indexing_progress
+
+local logging = import "server.logging"
+local lsp = import "server.lsp_types"
+local os = import "os"
+local outbound_requests = import "server.outbound_requests"
+local wire = import "server.wire"
+
+local PROGRESS_TITLE = "Titan indexing"
+local CREATE_TIMEOUT_MS = 5000
+
+-- Tokens are unique across the router's worker processes, so the #122 router
+-- forwards each worker's progress unchanged instead of rewriting its token.
+local sequence = 0
+
+local function next_token(): string
+  sequence = sequence + 1
+  return "titan-progress/" .. os.pid() .. "/" .. sequence
+end
+
+--- One contiguous indexing period's work-done progress.
+record Reporter
+  local requests: outbound_requests.OutboundRequests?
+  local capabilities: lsp.CapabilitiesReader?
+  local token: string?
+  local attempted: boolean
+  local active: boolean
+end
+
+--- Create a reporter that stays silent until a client channel is attached.
+function create(): Reporter
+  return Reporter.new(nil, nil, nil, false, false)
+end
+
+--- Attach the protocol client channel, or detach when it is unavailable.
+function Reporter:configure(requests: outbound_requests.OutboundRequests?,
+                            capabilities: lsp.CapabilitiesReader?)
+  self.requests = requests
+  self.capabilities = capabilities
+end
+
+local function Reporter:emit(token: string, value: wire.Object)
+  local requests? = self.requests
+  if requests == nil then return end
+  local params: wire.Object = {["token"] = token, ["value"] = value}
+  requests:notify("$/progress", params)
+end
+
+local function begin_value(initial: boolean): wire.Object
+  local message = "refresh"
+  if initial then message = "initial" end
+  return {
+    ["kind"] = "begin",
+    ["title"] = PROGRESS_TITLE,
+    ["message"] = message,
+  }
+end
+
+local function percentage(completed: integer, total: integer): integer
+  if total <= 0 then return 0 end
+  local result = completed * 100 // total
+  if result < 0 then return 0 end
+  if result > 100 then return 100 end
+  return result
+end
+
+--- Open work-done progress for the current chain, once per period.
+-- The create request is awaited and bounded, so a client which never answers
+-- it only costs the first pass of one chain; a failed or slow create disables
+-- progress for that chain instead of failing the refresh.
+function Reporter:start(initial: boolean)
+  if self.token ~= nil or self.attempted then return end
+  local requests? = self.requests
+  if requests == nil or requests:is_closed() then return end
+  local reader? = self.capabilities
+  if reader == nil then return end
+  local client? = reader()
+  if client == nil or not client.work_done_progress then return end
+
+  self.attempted = true
+  local token = next_token()
+  local request?, start_failure? = requests:start(
+    "window/workDoneProgress/create", {["token"] = token})
+  if request == nil then
+    logging.emit("debug", "indexing.progress.unavailable", {
+      ["reason"] = start_failure,
+    })
+    return
+  end
+  defer requests:forget(request)
+
+  local _result?, failure? = request:wait(CREATE_TIMEOUT_MS)
+  if failure ~= nil then
+    logging.emit("debug", "indexing.progress.unavailable", {
+      ["reason"] = failure,
+    })
+    return
+  end
+
+  self.token = token
+  self.active = true
+  self:emit(token, begin_value(initial))
+  logging.emit("debug", "indexing.progress.begin", {
+    ["token"] = token,
+    ["initial"] = initial,
+  })
+end
+
+--- Report the compiler's completed/total saved-file workset.
+function Reporter:report(completed: integer, total: integer)
+  local token? = self.token
+  if token == nil or not self.active then return end
+  local value: wire.Object = {
+    ["kind"] = "report",
+    ["message"] = completed .. "/" .. total .. " files",
+    ["percentage"] = percentage(completed, total),
+  }
+  self:emit(token, value)
+end
+
+--- End the current period after its completed generation is published.
+function Reporter:finish(message: string?)
+  local token? = self.token
+  local active = self.active
+  self.token = nil
+  self.attempted = false
+  self.active = false
+  if token == nil or not active then return end
+  local value: wire.Object = {["kind"] = "end"}
+  if message ~= nil and message ~= "" then value["message"] = message end
+  self:emit(token, value)
+  logging.emit("debug", "indexing.progress.end", {
+    ["token"] = token,
+    ["failed"] = message ~= nil,
+  })
+end
+
+--- Discard the current period without publishing, during server teardown.
+function Reporter:reset()
+  self.token = nil
+  self.attempted = false
+  self.active = false
+end

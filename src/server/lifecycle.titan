@@ -1,6 +1,7 @@
 --- LSP initialization, capability negotiation, shutdown, and exit decisions.
 -- @module server.lifecycle
 
+local lsp = import "server.lsp_types"
 local wire = import "server.wire"
 
 --- Lifecycle handling outcome for a validated request or notification.
@@ -26,6 +27,10 @@ record Lifecycle
   local phase: Phase
   local completion_enabled: boolean
   local workspace_folders: boolean
+  -- The accepted initialize request's client behaviors. Both the worker and
+  -- the router answer `initialize` through this owner, so both advertise the
+  -- same optional features from the same parse.
+  local client: lsp.ClientCapabilities?
 end
 
 local INVALID_REQUEST = -32600
@@ -37,7 +42,12 @@ local SERVER_NOT_INITIALIZED = -32002
 function create(workspace_folders: boolean?): Lifecycle
   local folders = false
   if workspace_folders then folders = true end
-  return Lifecycle.new(Phase.before_initialize(), false, folders)
+  return Lifecycle.new(Phase.before_initialize(), false, folders, nil)
+end
+
+--- Capabilities advertised by the accepted initialize request.
+function Lifecycle:client_capabilities(): lsp.ClientCapabilities?
+  return self.client
 end
 
 function Lifecycle:enable_completion()
@@ -60,7 +70,8 @@ local function fail(code: integer, message: string): Decision
 end
 
 local function initialize_result(completion_enabled: boolean,
-                                 workspace_folders: boolean): wire.Object
+                                 workspace_folders: boolean,
+                                 client: lsp.ClientCapabilities?): wire.Object
   local capabilities: wire.Object = {
     -- vscode-languageclient currently advertises only UTF-16 and rejects any
     -- other selection. State the negotiated/default encoding explicitly.
@@ -71,6 +82,14 @@ local function initialize_result(completion_enabled: boolean,
     ["hoverProvider"] = true,
     ["foldingRangeProvider"] = true,
   }
+  local pull_disabled = false
+  if client ~= nil then pull_disabled = client.pull_diagnostics_disabled end
+  if not pull_disabled then
+    -- Pull answers from the newest completed saved generation, so a report
+    -- participates in inter-file dependencies but never enumerates the whole
+    -- workspace on its own.
+    capabilities["diagnosticProvider"] = lsp.diagnostic_provider()
+  end
   if completion_enabled then
     local save: wire.Object = {["includeText"] = false}
     local sync: wire.Object = {
@@ -132,8 +151,9 @@ local function Lifecycle:handle_initialize(
       return fail(INVALID_PARAMS, "initialize params must be an object")
     end
     self.phase = Phase.awaiting_initialized()
-    return Decision.result(
-      initialize_result(self.completion_enabled, self.workspace_folders))
+    self.client = lsp.client_capabilities(params)
+    return Decision.result(initialize_result(
+      self.completion_enabled, self.workspace_folders, self.client))
   else
     return fail(INVALID_REQUEST, "initialize may only be sent once")
   end

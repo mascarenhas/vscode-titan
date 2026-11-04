@@ -63,6 +63,21 @@ record CompletionOptions
   const insert_call_snippets: boolean
 end
 
+--- Client behavior that changes a server-advertised feature.
+record ClientCapabilities
+  const work_done_progress: boolean
+  const pull_diagnostics_disabled: boolean
+end
+
+--- Accessor for the capabilities advertised by the client's initialize.
+type CapabilitiesReader = function (): ClientCapabilities?
+
+--- Parameters of one textDocument/diagnostic pull.
+record DiagnosticParams
+  document: TextDocument
+  previous_result_id: string?
+end
+
 record CompletionList
   is_incomplete: boolean
   items: {CompletionItem}
@@ -200,6 +215,22 @@ end
 function parse_document_position(params: value):
     (DocumentPosition?, Error?)
   return parse_document_position_or_error(params)
+end
+
+function parse_diagnostic(params: value): (DiagnosticParams?, Error?)
+  local document?, document_error? = parse_document(params)
+  if document == nil then return nil, document_error end
+  local object? = wire.as_object(params)
+  local previous?: string
+  if object["previousResultId"] ~= nil then
+    local parsed? = wire.as_string(object["previousResultId"])
+    if parsed == nil then
+      return invalid<|DiagnosticParams|>(
+        "params.previousResultId must be a string")
+    end
+    previous = parsed
+  end
+  return DiagnosticParams.new(document, previous), nil
 end
 
 local function parse_version(params: value): (integer?, Error?)
@@ -403,6 +434,37 @@ function completion_options(params: value): CompletionOptions
     end
   end
   return CompletionOptions.new(snippets, label_details, insert_calls)
+end
+
+--- Options advertised for textDocument/diagnostic pulls.
+-- Reports answer from the completed saved generation, so they declare exact
+-- inter-file dependencies without promising workspace-wide enumeration.
+function diagnostic_provider(): wire.Object
+  return {
+    ["interFileDependencies"] = true,
+    ["workspaceDiagnostics"] = false,
+  }
+end
+
+--- Read the client behaviors the server's advertisements depend on.
+function client_capabilities(params: value): ClientCapabilities
+  local progress = false
+  local pull_disabled = false
+  local object? = wire.as_object(params)
+  if object ~= nil then
+    local capabilities? = wire.as_object(object["capabilities"])
+    if capabilities ~= nil then
+      local window? = wire.as_object(capabilities["window"])
+      if window ~= nil then
+        progress = wire.as_boolean(window["workDoneProgress"]) == true
+      end
+    end
+    local options? = wire.as_object(object["initializationOptions"])
+    if options ~= nil and options["pullDiagnostics"] ~= nil then
+      pull_disabled = wire.as_boolean(options["pullDiagnostics"]) == false
+    end
+  end
+  return ClientCapabilities.new(progress, pull_disabled)
 end
 
 local function completion_long_string_delimiter(contents: string,

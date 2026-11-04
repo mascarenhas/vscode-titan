@@ -20,7 +20,7 @@ function test_lifecycle_completes_initialize_shutdown_exit(
   when result(result) then
     local object? = wire.as_object(result)
     local capabilities? = wire.as_object(object["capabilities"])
-    test.assert(capabilities ~= nil and member_count(capabilities) == 6,
+    test.assert(capabilities ~= nil and member_count(capabilities) == 7,
                 "initialize advertised the wrong capability count")
     test.assert(wire.as_string(capabilities["positionEncoding"]) ==
                   "utf-16" and
@@ -30,6 +30,11 @@ function test_lifecycle_completes_initialize_shutdown_exit(
                 wire.as_boolean(capabilities["hoverProvider"]) and
                 wire.as_boolean(capabilities["foldingRangeProvider"]),
                 "initialize omitted a supported semantic capability")
+    local provider? = wire.as_object(capabilities["diagnosticProvider"])
+    test.assert(provider ~= nil and
+                wire.as_boolean(provider["interFileDependencies"]) and
+                wire.as_boolean(provider["workspaceDiagnostics"]) == false,
+                "initialize omitted pull diagnostics")
     test.assert(capabilities["completionProvider"] == nil,
                 "initialize advertised completion without a configured handler")
   else
@@ -134,5 +139,24 @@ function test_lifecycle_enforces_order_and_message_kinds(
     test.assert(code == 1, "exit without shutdown returned success")
   else
     test.assert(false, "early exit did not terminate the lifecycle")
+  end
+end
+
+function test_lifecycle_honors_the_client_pull_opt_out(_context: test.Context)
+  local server = lifecycle.create()
+  local params = wire.decode(
+    [[{"capabilities":{"window":{"workDoneProgress":true}},"initializationOptions":{"pullDiagnostics":false}}]])
+  case server:dispatch("initialize", true, params)
+  when result(result) then
+    local object? = wire.as_object(result)
+    local capabilities? = wire.as_object(object["capabilities"])
+    test.assert(capabilities["diagnosticProvider"] == nil,
+                "client pull opt-out still advertised diagnosticProvider")
+    local client? = server:client_capabilities()
+    test.assert(client ~= nil and client.work_done_progress and
+                client.pull_diagnostics_disabled,
+                "accepted capabilities were not retained")
+  else
+    test.assert(false, "initialize with a pull opt-out failed")
   end
 end
