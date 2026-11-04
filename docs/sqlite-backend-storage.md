@@ -28,8 +28,9 @@ Startup opens the file with `workspace_cache.open_for_inventory`, and
 key. The key digests the physical root with `Compiler:cache_identity` and
 `ProjectConfig:semantic_identity`. The first fingerprints the compiler Lua
 trees, their native Lua dependencies and the server executable. The second
-covers the project configuration, except watcher policy. A missing key is
-recorded, and a different stored key triggers `Cache:rebuild`.
+covers the project configuration, except watcher policy. The key carries no
+schema number: `PRAGMA user_version` alone decides schema compatibility. A
+missing key is recorded, and a different stored key triggers `Cache:rebuild`.
 `Cache:accept_native_context` likewise compares the stored `native_context`
 with `Compiler:native_cache_identity` and rebuilds on a mismatch. A rejected
 file, or one that SQLite reports as corrupt (`SQLITE_CORRUPT` or
@@ -82,15 +83,19 @@ source and binary modules keep manifests and provenance only
 (`external_records`).
 
 C-header artifacts accept `c-header-v8`; FFI conversion artifacts accept
-`ffi-conversion-v8`. `artifact_table` and `artifact_scope` in
-`workspace_cache.titan` map these namespaces to their tables.
-`Store:read_saved_cache` in `completion_store.titan` accepts the same kinds for
-private preparation. Older namespaces are misses, not aliases.
+`ffi-conversion-v8`. `artifact_namespace` in `src/server/workspace_cache.titan`
+is the single owner of that mapping: it resolves a kind to its payload table
+and to the `header_store` provenance scope for its ordered inputs. Schema
+creation, staging, publication, `Cache:lookup` and `Store:read_saved_cache` in
+`src/server/completion_store.titan` all read the same map, so private
+preparation accepts exactly the namespaces the watcher publishes. Older
+namespaces are misses, not aliases.
 `test_workspace_cache_accepts_installed_compiler_artifact_namespaces` in
 `src/server/workspace_cache_test.titan` reads both kinds from the installed
 compiler and exercises saved lookup and private reads, including their saved
 generation fence. A compiler update that renames a kind therefore fails that
-test instead of silently missing the cache. Unknown kinds remain cache misses.
+test on both paths instead of silently missing the cache. Unknown kinds remain
+cache misses.
 The relational store never interprets payload contents; the compiler's envelope
 and version checks govern them.
 

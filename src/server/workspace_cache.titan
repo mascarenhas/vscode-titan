@@ -41,6 +41,35 @@ local record Artifact
   const inputs: {bridge.CHeaderDependency}
 end
 
+--- Persisted compiler artifact namespace and its header provenance scope.
+-- `table` holds its opaque payloads by key; `scope` is the `header_store`
+-- provenance scope for its ordered inputs.
+record ArtifactNamespace
+  const kind: string
+  const table: string
+  const scope: integer
+end
+
+-- The one owner of the compiler's artifact namespaces. Schema creation,
+-- staging, publication, `Cache:lookup` and the completion store's private
+-- saved reads all resolve through this map, so a compiler pin that renames a
+-- namespace is one edit here, and the installed-kind regression covers both
+-- read paths.
+local const artifact_namespaces: const {ArtifactNamespace} = {
+  ArtifactNamespace.new("c-header-v8","main.header_graphs",2),
+  ArtifactNamespace.new("ffi-conversion-v8","main.ffi_conversion_snapshots",3),
+}
+
+--- Resolve a compiler artifact namespace to its table and header scope.
+--- Unknown namespaces are cache misses, never aliases of a known one.
+function artifact_namespace(kind: string): ArtifactNamespace?
+  for index = 1, #artifact_namespaces do
+    local namespace = artifact_namespaces[index]
+    if namespace.kind == kind then return namespace end
+  end
+  return nil
+end
+
 --- Stage compiler payloads and inventories for atomic saved publication.
 record Cache
   const store: sql.Store
@@ -54,12 +83,6 @@ record Cache
   local inventory_reads: integer
   local inventory_hashes: integer
   local inventory_reused: integer
-end
-
-local function artifact_table(kind: string): string?
-  if kind == "c-header-v8" then return "main.header_graphs" end
-  if kind == "ffi-conversion-v8" then return "main.ffi_conversion_snapshots" end
-  return nil
 end
 
 local function metadata(connection: sqlite3.Connection, key: string): string?
@@ -101,11 +124,16 @@ local function open_compatible(path: string, compatibility: string?): Cache?
   headers.create(connection)
   local schema = {
     "CREATE TABLE IF NOT EXISTS main.project_snapshots(module BLOB PRIMARY KEY,payload BLOB NOT NULL,revision INTEGER NOT NULL) WITHOUT ROWID",
-    "CREATE TABLE IF NOT EXISTS main.header_graphs(key BLOB PRIMARY KEY,payload BLOB NOT NULL) WITHOUT ROWID",
-    "CREATE TABLE IF NOT EXISTS main.ffi_conversion_snapshots(key BLOB PRIMARY KEY,payload BLOB NOT NULL) WITHOUT ROWID",
     "CREATE TABLE IF NOT EXISTS main.compiler_inputs(path BLOB PRIMARY KEY,observation BLOB NOT NULL,fingerprint BLOB NOT NULL) WITHOUT ROWID",
   }
   for index = 1, #schema do sql.execute(connection, schema[index]) end
+  -- Artifact tables come from the namespace map so a new namespace cannot
+  -- stage payloads into a table this schema never created.
+  for index = 1, #artifact_namespaces do
+    sql.execute(connection,"CREATE TABLE IF NOT EXISTS " ..
+      artifact_namespaces[index].table ..
+      "(key BLOB PRIMARY KEY,payload BLOB NOT NULL) WITHOUT ROWID")
+  end
   sql.execute(connection, "PRAGMA main.user_version=" .. SCHEMA_VERSION)
   if sql.scalar_integer(connection, "PRAGMA main.user_version") ~= SCHEMA_VERSION then
     raise "workspace cache schema version was not installed"
@@ -344,12 +372,6 @@ function Cache:rebuild(replacement_compatibility: string?): Cache
   return replacement
 end
 
-local function artifact_scope(kind: string): integer
-  if kind == "c-header-v8" then return 2 end
-  if kind == "ffi-conversion-v8" then return 3 end
-  raise "unknown header artifact namespace"
-end
-
 --- Read a compatible compiler payload and its ordered header closure.
 function Cache:lookup(kind: string, key: string): (string?,{bridge.CHeaderDependency}?)
   local refreshed?: {bridge.CHeaderDependency}
@@ -361,16 +383,16 @@ function Cache:lookup(kind: string, key: string): (string?,{bridge.CHeaderDepend
       break
     end
   end
-  local table? = artifact_table(kind)
-  if table == nil then return nil,nil end
+  local namespace? = artifact_namespace(kind)
+  if namespace == nil then return nil,nil end
   local access = self.store:acquire()
   defer access:release()
   local rows = sql.rows(access.connection,
-    "SELECT payload FROM " .. table .. " WHERE key=?",sqlite3.Blob.new(key))
+    "SELECT payload FROM " .. namespace.table .. " WHERE key=?",sqlite3.Blob.new(key))
   if #rows == 0 then return nil,nil end
   local payload: value = rows[1]:get(1)
   if not (payload is sqlite3.Blob) then return nil,nil end
-  if refreshed == nil then refreshed = headers.read(access.connection,artifact_scope(kind),key) end
+  if refreshed == nil then refreshed = headers.read(access.connection,namespace.scope,key) end
   if refreshed == nil then return nil,nil end
   return (payload as sqlite3.Blob).bytes,refreshed
 end
@@ -380,7 +402,7 @@ end
 --- Stage a complete compiler payload for later accepted publication.
 function Cache:stage(kind: string, key: string, payload: string,
                       inputs: {bridge.CHeaderDependency})
-  if artifact_table(kind) == nil then return end
+  if artifact_namespace(kind) == nil then return end
   local item = Artifact.new(kind,key,payload,inputs)
   for index = 1, #self.pending do
     if self.pending[index].kind == kind and self.pending[index].key == key then
@@ -393,8 +415,8 @@ end
 
 function Cache:refresh_inputs(kind: string,key: string,
     inputs: {bridge.CHeaderDependency}): boolean
-  local table? = artifact_table(kind)
-  if table == nil then return false end
+  local namespace? = artifact_namespace(kind)
+  if namespace == nil then return false end
   for index = #self.pending, 1, -1 do
     local item = self.pending[index]
     if item.kind == kind and item.key == key then
@@ -405,7 +427,7 @@ function Cache:refresh_inputs(kind: string,key: string,
   do
     local access = self.store:acquire()
     defer access:release()
-    if sql.scalar_integer(access.connection,"SELECT count(*) FROM " .. table ..
+    if sql.scalar_integer(access.connection,"SELECT count(*) FROM " .. namespace.table ..
         " WHERE key=? AND typeof(payload)='blob'",sqlite3.Blob.new(key)) ~= 1 then
       return false
     end
@@ -611,13 +633,14 @@ function Cache:publish(connection: sqlite3.Connection)
   end
   for index = 1, #self.pending do
     local item = self.pending[index]
-    local table = artifact_table(item.kind)
+    -- Staging rejects unknown namespaces, so every pending item resolves.
+    local namespace = artifact_namespace(item.kind)
     if item.payload ~= nil then
-      sql.execute(connection,"INSERT INTO " .. table ..
+      sql.execute(connection,"INSERT INTO " .. namespace.table ..
         " VALUES(?,?) ON CONFLICT(key) DO UPDATE SET payload=excluded.payload",
         sqlite3.Blob.new(item.key),sqlite3.Blob.new(item.payload))
     end
-    headers.replace(connection,artifact_scope(item.kind),item.key,item.inputs)
+    headers.replace(connection,namespace.scope,item.key,item.inputs)
   end
   headers.prune(connection)
   write_metadata(connection,"published_revisions",self.publication_key)

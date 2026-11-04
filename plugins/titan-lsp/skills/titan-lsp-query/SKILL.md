@@ -55,11 +55,9 @@ separate, explicitly authorized source-editing step.
 Use a server built against the same pinned Titan revision as the compiler Lua
 modules and SDK. API version `1` is held constant during prerelease development;
 it is not evidence that two arbitrary compiler revisions are interchangeable.
-After a source-syntax migration, derive UTF-16 positions from the saved text
-again rather than reusing old columns. For the parser-overhaul syntax this
-includes `<|...|>` generics, `function (...): ...` types, parenthesized union
-variants/case arms, and unqualified types inside `foreign` annotations.
-Foreign type metadata can contribute hover information, but FFI definition
+Derive the UTF-16 `--line` and `--character` values from the saved text before
+each query; never reuse positions computed against an earlier revision of the
+file. Foreign type metadata can contribute hover information, but FFI definition
 navigation remains outside V1's scope.
 
 A warm workspace can serve saved SQL facts before background compiler-manifest

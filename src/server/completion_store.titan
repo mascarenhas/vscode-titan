@@ -6,6 +6,7 @@ local async = import "async"
 local strings = import "string"
 local iteration = import "iteration"
 local sql = import "server.workspace_store"
+local caches = import "server.workspace_cache"
 local bridge = import "server.compiler_bridge"
 local headers = import "server.header_store"
 local facts = import "server.completion_types"
@@ -246,25 +247,20 @@ function Store:read_header_inputs(expected_generation: integer,
 end
 
 -- This preparation-only accessor bypasses Cache.pending. Its persisted payload
--- and scope-2/3 provenance are committed by the watcher in the same publication.
+-- and header provenance are committed by the watcher in the same publication,
+-- and both resolve the artifact namespace through the workspace cache's map so
+-- this path cannot disagree with `Cache:lookup`.
 function Store:read_saved_cache(expected_generation: integer,
     kind: string, key: string): (string?, {bridge.CHeaderDependency}?)
-  local table = ""
-  local scope = 0
-  if kind == "c-header-v8" then
-    table, scope = "main.header_graphs", 2
-  elseif kind == "ffi-conversion-v8" then
-    table, scope = "main.ffi_conversion_snapshots", 3
-  else
-    return nil, nil
-  end
+  local namespace? = caches.artifact_namespace(kind)
+  if namespace == nil then return nil, nil end
   local access = self.store:acquire()
   defer access:release()
   if not current_generation(access.connection, expected_generation) then return nil, nil end
   local rows = sql.rows(access.connection,
-    "SELECT payload FROM " .. table .. " WHERE key=? AND length(payload)<=?", blob(key), MAX_DESCRIPTOR_BYTES)
+    "SELECT payload FROM " .. namespace.table .. " WHERE key=? AND length(payload)<=?", blob(key), MAX_DESCRIPTOR_BYTES)
   if #rows ~= 1 then return nil, nil end
-  local inputs? = headers.read(access.connection, scope, key)
+  local inputs? = headers.read(access.connection, namespace.scope, key)
   if inputs == nil then return nil, nil end
   return sql.bytes(rows[1], 1), inputs
 end

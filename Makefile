@@ -2,6 +2,20 @@ SHELL := /bin/bash
 .SHELLFLAGS := -eu -o pipefail -c
 .DELETE_ON_ERROR:
 
+# This file needs GNU Make 4.2: $(.SHELLSTATUS), which SDK discovery below reads
+# to detect a failed titanc lookup, is the newest feature used anywhere here
+# (.SHELLFLAGS needs 3.82). Guard before discovery so macOS's stock
+# /usr/bin/make 3.81 reports this instead of a missing-SDK error.
+MINIMUM_MAKE_VERSION := 4.2
+MAKE_VERSION_MAJOR := $(firstword $(subst ., ,$(MAKE_VERSION)))
+MAKE_VERSION_MINOR := $(word 2,$(subst ., ,$(MAKE_VERSION)))
+# Accept any major above 4 and 4.2 or newer; everything else, including a make
+# that does not identify its version, fails the guard.
+MAKE_VERSION_SUPPORTED := $(if $(filter 4,$(MAKE_VERSION_MAJOR)),$(filter-out 0 1,$(MAKE_VERSION_MINOR)),$(filter-out 0 1 2 3,$(MAKE_VERSION_MAJOR)))
+ifeq ($(strip $(MAKE_VERSION_SUPPORTED)),)
+$(error this Makefile needs GNU Make $(MINIMUM_MAKE_VERSION) or newer, but found $(if $(MAKE_VERSION),GNU Make $(MAKE_VERSION),an unidentified make); on macOS, install GNU Make with "brew install make" and put "$$(brew --prefix make)/libexec/gnubin" first on PATH, as docs/native-build.md describes)
+endif
+
 # Choose a whole-invocation profile for compiler-owned builds.
 # Verification also exercises the ordinary server and disposable packaging.
 VALIDATION_GOALS := verify test server-test server-test-build server-test-objects server-test-run server-test-sharded \
@@ -174,29 +188,52 @@ all: server extension
 
 help:
 	@echo "vscode-titan targets:"
-	@echo "  SDK selection        TITAN_PREFIX override, otherwise titanc --print-root from PATH"
-	@echo "  server               build bin/titan-language-server as one native executable"
-	@echo "  server-objects       compile production modules without linking"
-	@echo "  server-test-objects  compile test modules without linking"
-	@echo "  server-test          compile and run the native Titan protocol tests"
-	@echo "  server-test-build    compile the native test aggregate once"
-	@echo "  server-test-run      run the current native aggregate without rebuilding"
-	@echo "  server-test-sharded  compile once and run two native execution shards"
-	@echo "  server-coverage         build and run native tests with Titan line coverage"
-	@echo "  server-coverage-build   build an isolated covered native aggregate (GCC 14+)"
-	@echo "  server-coverage-run     run the covered aggregate and generate its reports"
-	@echo "  completion-protocol-test  exercise unsaved completion through the native server"
-	@echo "  incremental-build-test smoke-test compiler-owned incremental builds"
-	@echo "  server-protocol-test exercise the native executable over framed stdio"
-	@echo "  codex-native-test    query the native executable through the Codex adapter"
-	@echo "  extension-test       compile and run the JavaScript unit tests"
-	@echo "  extension-host-test  run the VS Code Extension Host smoke test"
-	@echo "  test                 run the native Titan and JavaScript unit suites"
-	@echo "  package              build $(VSIX) with the native server"
-	@echo "  verify               run all tests, packaging, and artifact inspections"
-	@echo "  install-server       install the server under INSTALL_PREFIX (default /usr/local)"
-	@echo "  install-server-test  stage and inspect a server-only installation"
-	@echo "  install-vsix         install the development VSIX with the VS Code CLI"
+	@echo "  SDK selection            TITAN_PREFIX override, otherwise titanc --print-root from PATH"
+	@echo ""
+	@echo "  Build:"
+	@echo "    all                      build the server and the extension (default)"
+	@echo "    server                   build bin/titan-language-server as one native executable"
+	@echo "    extension                compile dist/extension.js and stage its SDK payload"
+	@echo "    npm-ci                   install the dependencies pinned in package-lock.json"
+	@echo "    package                  build $(VSIX) with the native server"
+	@echo ""
+	@echo "  Test:"
+	@echo "    test                     run the native, protocol, Codex, extension, script and incremental-build suites"
+	@echo "    server-test              compile and run the native Titan protocol tests"
+	@echo "    server-test-build        compile the native test aggregate once"
+	@echo "    server-test-run          run the current native aggregate without rebuilding"
+	@echo "    server-test-sharded      compile once and run two native execution shards"
+	@echo "    server-protocol-test     exercise the native executable over framed stdio"
+	@echo "    completion-protocol-test exercise unsaved completion through the native server"
+	@echo "    codex-native-test        query the native executable through the Codex adapter"
+	@echo "    extension-test           compile and run the JavaScript unit tests"
+	@echo "    extension-host-test      run the VS Code Extension Host smoke test"
+	@echo "    shard-runner-test        run the unit tests for the build and test-runner scripts"
+	@echo "    incremental-build-test   smoke-test compiler-owned incremental builds"
+	@echo ""
+	@echo "  Coverage:"
+	@echo "    server-coverage          build and run native tests with Titan line coverage"
+	@echo "    server-coverage-build    build an isolated covered native aggregate (GCC 14+)"
+	@echo "    server-coverage-run      run the covered aggregate and generate its reports"
+	@echo ""
+	@echo "  Inspect and install:"
+	@echo "    verify                   run all tests, packaging and artifact inspections"
+	@echo "    inspect-server           inspect the server executable and its native dependencies"
+	@echo "    inspect-vsix             inspect the packaged VSIX contents"
+	@echo "    plugin-validate          validate the Codex plugin marketplace and bundle"
+	@echo "    install-server           install the server under INSTALL_PREFIX (default /usr/local)"
+	@echo "    install-server-test      stage and inspect a server-only installation"
+	@echo "    install-vsix             install the development VSIX with the VS Code CLI"
+	@echo ""
+	@echo "  Build steps:"
+	@echo "    server-build             compile and link the server executable"
+	@echo "    server-objects           compile production modules without linking"
+	@echo "    server-test-objects      compile test modules without linking"
+	@echo ""
+	@echo "  Housekeeping:"
+	@echo "    clean                    remove build outputs and the built server"
+	@echo "    clean-node               remove node_modules and .vscode-test"
+	@echo "    help                     list these targets"
 
 $(TITANC):
 	@echo "Titan compiler is missing at $@; install Titan or select another TITAN_PREFIX" >&2
@@ -288,6 +325,7 @@ shard-runner-test:
 	node --test scripts/server-coverage.test.mjs scripts/run-extension-host-tests.test.mjs
 	node --test scripts/run-server-tests.test.mjs
 	node --test scripts/openssl-packaging.test.mjs
+	node --test scripts/makefile-contract.test.mjs
 	node --test scripts/build-windows.test.mjs scripts/inspect-windows-package.test.mjs \
 		scripts/compiler-rocks.test.mjs scripts/stage-lua-modules.test.mjs scripts/stage-notices.test.mjs
 

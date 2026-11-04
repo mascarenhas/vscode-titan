@@ -3,7 +3,7 @@
 This page owns the build system: SDK selection, compiler-owned native builds,
 profiles, test execution, packaging inputs, CI and the experimental Windows
 driver. For the user-facing commands, see the
-[README](../README.md#build-and-test). `make help` lists the main targets.
+[README](../README.md#build-and-test). `make help` lists every target.
 
 ## SDK selection
 
@@ -39,15 +39,20 @@ a system SDK, Make passes the ordered pkg-config flags as `--cflag` and
 `--ldflag` switches. Titan certifies their effective arguments, header inputs
 and linked libraries; Make maintains no SDK or OpenSSL header inventory.
 
-GNU Make 4.4 or newer's FIFO jobserver lets the compiler share a parent Make
-jobserver, and on Linux the compiler also shares an older pipe jobserver by
-reopening it privately. Elsewhere, an older pipe jobserver (such as macOS's
-stock GNU Make 3.81) leaves Titan on its local `--jobs` cap. On macOS, put
-Homebrew GNU Make first on `PATH` to share the pool:
+The `Makefile` needs GNU Make 4.2 or newer. It reads `.SHELLSTATUS` during SDK
+discovery, which is the newest feature it uses, and it refuses older versions
+before that discovery runs. CI's Ubuntu 24.04 runner satisfies this with its
+stock 4.3. macOS ships GNU Make 3.81 as `/usr/bin/make`, so install Homebrew's
+`make` and put it first on `PATH`:
 
 ```sh
 export PATH="$(brew --prefix make)/libexec/gnubin:$PATH"
 ```
+
+GNU Make 4.4 or newer additionally gives the compiler a FIFO jobserver it can
+share with this Make process; on Linux the compiler also shares an older pipe
+jobserver by reopening it privately. Older versions leave Titan on its local
+`--jobs` cap, which changes scheduling and not correctness.
 
 macOS validation includes a native Apple Silicon M1 run, including the arm64
 VSIX and Extension Host smoke tests. Use an SDK built for the host architecture.
