@@ -1,0 +1,51 @@
+foreign import "compiler_io_platform.h"
+local test = import "test"
+local router = import "server.router.titan"
+local wire = import "server.wire"
+
+local function response(body: string): wire.Object
+  local object? = wire.as_object(wire.decode(body))
+  test.assert(object ~= nil, "the rewritten worker response is not a JSON object")
+  return object as wire.Object
+end
+
+function test_router_remaps_worker_requests_under_a_router_identity(
+    _context: test.Context)
+  local result_body: wire.Object = {["result"] = 42}
+  local forwarded = response(
+    router.worker_response_body("client-17" as value, result_body))
+  test.assert(forwarded["id"] == "client-17",
+    "the worker's original request id was not restored")
+  test.assert(forwarded["result"] == 42,
+    "the worker's result was not forwarded")
+  test.assert(forwarded["error"] == nil,
+    "a successful worker result gained an error")
+
+  local error_object: wire.Object = {
+    ["code"] = -32601, ["message"] = "Method not found",
+  }
+  local error_body: wire.Object = {["error"] = error_object}
+  local failed = response(router.worker_response_body(19 as value, error_body))
+  test.assert(failed["id"] == 19,
+    "an integer worker request id was not restored")
+  test.assert(failed["result"] == nil,
+    "a failed worker request also carried a result")
+  local forwarded_error? = wire.as_object(failed["error"])
+  test.assert(forwarded_error ~= nil,
+    "the worker's error object was not forwarded")
+  test.assert((forwarded_error as wire.Object)["code"] == -32601,
+    "the forwarded error code changed")
+end
+
+function test_router_reports_each_worker_state_name(_context: test.Context)
+  test.assert(router.state_name(router.WorkerState.inactive()) == "inactive",
+    "the inactive state had the wrong name")
+  test.assert(router.state_name(router.WorkerState.starting()) == "starting",
+    "the starting state had the wrong name")
+  test.assert(router.state_name(router.WorkerState.ready()) == "ready",
+    "the ready state had the wrong name")
+  test.assert(router.state_name(router.WorkerState.evicted()) == "evicted",
+    "the evicted state had the wrong name")
+  test.assert(router.state_name(router.WorkerState.failed("broken")) == "failed",
+    "the failed state had the wrong name")
+end

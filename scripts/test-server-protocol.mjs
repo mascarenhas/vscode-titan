@@ -205,6 +205,10 @@ function validateDiagnosticPublication(params) {
       assert.equal(diagnostic.severity, 2);
     } else if (diagnostic.code === "inactive-variant") {
       assert.equal(diagnostic.severity, 3);
+    } else if (diagnostic.code === "configuration") {
+      // The router publishes a root-scoped configuration refusal on the file
+      // that set it, before any worker exists.
+      assert.equal(diagnostic.severity, 1);
     } else {
       assert.ok(["syntax", "type", "compiler"].includes(diagnostic.code));
       assert.equal(diagnostic.severity, 1);
@@ -459,7 +463,8 @@ async function testLifecycle() {
         positionEncoding: "utf-16",
         textDocumentSync: { openClose: true, change: 1, save: { includeText: false } },
         completionProvider: { resolveProvider: false, triggerCharacters: [".", ":"],
-          completionItem: { labelDetailsSupport: true } }
+          completionItem: { labelDetailsSupport: true } },
+        workspace: { workspaceFolders: { supported: true, changeNotifications: true } }
       }
     });
 

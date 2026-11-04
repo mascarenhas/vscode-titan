@@ -335,6 +335,7 @@ incremental-build-test:
 server-protocol-test: $(SERVER) completion-protocol-test
 	$(SERVER_TEST_ENV) node scripts/test-server-protocol.mjs "$(SERVER)"
 	$(SERVER_TEST_ENV) node scripts/test-workspace-cache.mjs "$(SERVER)"
+	$(SERVER_TEST_ENV) node scripts/test-multi-root.mjs "$(SERVER)"
 
 completion-protocol-test: $(SERVER)
 	$(SERVER_TEST_ENV) node scripts/test-completion-protocol.mjs "$(SERVER)"

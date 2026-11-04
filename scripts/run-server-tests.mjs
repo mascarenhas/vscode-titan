@@ -15,7 +15,8 @@ export const serverTestShards = [
     "compiler_bridge_test", "compiler_bridge_concurrency_test", "compiler_io_test",
     "completion_discovery_test", "diagnostics_test", "dispatcher_test", "document_buffers_test", "embedded_interfaces_test",
     "framing_test", "header_store_test", "indexing_status_test", "lifecycle_test",
-    "logging_test", "lsp_types_test", "lua_paths_test", "protocol_test", "wire_test", "documentation_test"
+    "logging_test", "lsp_types_test", "lua_paths_test", "protocol_test", "wire_test", "documentation_test",
+    "roots_test", "root_settings_test", "worker_process_test", "router_test"
   ],
   [
     "application_test", "compiler_scheduler_test", "completion_service_test", "completion_store_test", "coordinator_test",

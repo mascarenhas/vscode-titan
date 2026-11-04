@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { cp, mkdir, readFile, readdir, rm, stat, utimes, writeFile } from "node:fs/promises";
 import * as path from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -343,6 +344,10 @@ try {
   await writeFile(headerFile, fixtureHeader("typedef short fixture_int;\n"));
   await utimes(headerFile, headerTimestamp, new Date(headerTimestamp.getTime() + 1000));
   const explicitProbePrefix = path.join(root, ".titan-ls", "explicit-probe-prefix");
+  // An inherited probe prefix is namespaced per root: roots never share probe
+  // results, which depend on each root's SDK headers and flags.
+  const rootProbePrefix = path.join(explicitProbePrefix, "roots",
+    createHash("sha256").update(root, "utf8").digest("hex").slice(0, 16));
   const changedHeader = await withServer("changed-header", featureSnapshot,
     { TITAN_PREFIX: explicitProbePrefix });
   assert.deepEqual(changedHeader.result, cold.result);
@@ -352,8 +357,8 @@ try {
   assert.ok(cacheStats(changedHeader.records).conversion_misses > 0,
     "header type edit reused a stale FFI conversion");
   assertProbePrefix(changedHeader.records.find((record) => record.event === "server.start")
-    ?.probe_cache_prefix, explicitProbePrefix);
-  await assertProbeRecords(explicitProbePrefix);
+    ?.probe_cache_prefix, rootProbePrefix);
+  await assertProbeRecords(rootProbePrefix);
 
   await writeFile(inheritedHeaderFile, inheritedHeader(9));
   await utimes(inheritedHeaderFile, headerTimestamp,
