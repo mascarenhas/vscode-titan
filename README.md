@@ -367,6 +367,28 @@ while a refresh runs. A watcher event for a saved project change starts one
 coalesced refresh. Unwatched external inputs are revalidated by the next
 saved-project refresh or by rename's strict refresh.
 
+A client which advertises `window.workDoneProgress` also receives standard
+work-done progress for the same work: one `window/workDoneProgress/create` token
+per contiguous indexing period, then a `$/progress` `begin` when that period
+starts, `report` updates with the saved-file workset, and exactly one `end`.
+`end` follows publication of the completed generation and its diagnostics, so a
+request issued after `end` observes that generation. A coalesced follow-up pass
+keeps the same token. A client which does not advertise the capability receives
+no progress request, and `titan/indexingStatus` remains for the
+language-status item above.
+
+The server advertises `diagnosticProvider` and answers `textDocument/diagnostic`
+from the same published rows it pushes, so pull and push never disagree. A pull
+waits for a refresh which covers the file's current saved bytes instead of
+answering from an older generation, and a cancelled pull is answered as
+cancelled. Each report carries a `resultId`, and a pull whose `previousResultId`
+still matches answers `unchanged`. Passing `initializationOptions.pullDiagnostics
+= false` omits `diagnosticProvider`; the VS Code extension always passes it
+because `vscode-languageclient` collects pulled and pushed diagnostics
+separately, and a pull-only client would lose diagnostics for closed files. See
+[server data flow](docs/server-data-flow.md#protocol-boundary) for the protocol
+ownership of these requests.
+
 Compiler errors from each completed saved generation appear in the
 **Problems** view, with columns converted from compiler bytes using the saved
 text. Unsaved editor contents are not diagnostic input. A module the compiler
@@ -479,7 +501,10 @@ For setup, see [Codex setup](docs/codex.md).
 
 The server reserves stdout for `Content-Length`-framed JSON-RPC and writes all
 logs to stderr. Without the extension, its log level comes from
-`TITAN_LANGUAGE_SERVER_LOG_LEVEL` and defaults to `info`.
+`TITAN_LANGUAGE_SERVER_LOG_LEVEL` and defaults to `info`. A standalone client
+gets the same indexing progress and pull diagnostics described under
+[indexing and diagnostics](#indexing-and-diagnostics), so an agent harness can
+wait for `$/progress` before its first semantic request instead of polling.
 
 ### Pointing an agent harness at several slices
 

@@ -199,3 +199,32 @@ identity, SDK and probe prefix, so every registered root appears whether or not
 its worker has started; the
 [README](../README.md#multiple-roots-in-one-server-session) owns its fields.
 Every root transition is logged with the root path.
+
+The client capabilities that gate an advertisement are parsed once, at
+`initialize`: `lsp.client_capabilities` reads `window.workDoneProgress` and
+`initializationOptions.pullDiagnostics`, `lifecycle` stores the record, and
+`Dispatcher:client_capabilities` exposes it. `window.workDoneProgress` enables
+indexing work-done progress; `pullDiagnostics = false` omits
+`diagnosticProvider`. Both modes answer `initialize` through `lifecycle`, so the
+router advertises exactly what its workers observe. The
+[README](../README.md#indexing-and-diagnostics) describes the client-visible
+behavior.
+
+The protocol layer also owns server-initiated requests. `outbound_requests`
+allocates string identifiers (`titan/<n>`), writes each request through the same
+sole writer as replies, and routes a client response — an object with an `id`
+and no `method` — to its waiting Task. A response with an unknown identifier is
+logged and dropped rather than answered, and session close fails every request
+still pending so its waiting Task unwinds. `indexing_progress` owns one
+work-done period per refresh chain: it requests the token, then publishes
+`$/progress` for that chain only, and `Application` ends the period after the
+completed view and its diagnostics are published. Progress tokens embed the
+server's process id, so the router forwards `$/progress` unchanged instead of
+rewriting a token shared across workers. `textDocument/diagnostic`
+(`Application:handle_diagnostic`) is routed by document URI like every other
+document request and joins `Application:fresh_view_for`, which compares a
+`project_graph.FileStamp` recorded for the discovered module with the file's
+current saved bytes and joins a refresh until the completed generation covers
+them. It answers from `published_diagnostics.read_uri`, the same rows push
+reads, and `diagnostics.report` encodes the report with a `resultId` derived
+from those items.
