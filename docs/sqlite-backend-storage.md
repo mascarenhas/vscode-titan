@@ -1,6 +1,6 @@
 # Workspace storage
 
-Each workspace persists its saved index, dependency metadata and compiler
+Each workspace root persists its saved index, dependency metadata and compiler
 artifacts in one SQLite database. The database is a disposable cache: a
 compatible restart reuses it, and anything else rebuilds it through ordinary
 indexing. [Completion](completion.md#temp-storage-and-selection) adds
@@ -12,7 +12,8 @@ connection-local TEMP tables on the same connection.
 `.titan-ls/` in the physical (realpath) workspace root. It creates the
 directory with a `.gitignore` containing `*`, then opens `index.sqlite3` there.
 Project discovery and the watchers always skip `.titan-ls`. The same directory
-is the default compiler probe-cache prefix; see
+is that root's default compiler probe-cache prefix, so a router session with
+several roots keeps one database and one probe namespace per root; see
 [server data flow](server-data-flow.md#where-compiler-inputs-come-from).
 
 Startup opens the file with `workspace_cache.open_for_inventory`, and
@@ -27,7 +28,11 @@ Startup opens the file with `workspace_cache.open_for_inventory`, and
 `project_loader` then calls `Cache:validate_inventory` with a compatibility
 key. The key digests the physical root with `Compiler:cache_identity` and
 `ProjectConfig:semantic_identity`. The first fingerprints the compiler Lua
-trees, their native Lua dependencies and the server executable. The second
+trees as this process loaded them, their native Lua dependencies and the
+interface provider: the executable's embedded provider for the server's own
+SDK, or the selected installation's standard-provider archive by stat identity
+for a root that selects its own. Reinstalling either SDK therefore invalidates
+only the roots that used it. The second
 covers the project configuration, except watcher policy. The key carries no
 schema number: `PRAGMA user_version` alone decides schema compatibility. A
 missing key is recorded, and a different stored key triggers `Cache:rebuild`.

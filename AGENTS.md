@@ -51,6 +51,9 @@ Documentation rules:
 ## Product invariants
 
 - The language server is written in Titan and runs out of process over stdio.
+- One executable serves every root and every SDK: the router owns the client
+  session and starts one worker process per Titan root, and a root's
+  `compiler_root` selects what its worker loads, never a different executable.
 - The server build produces one native executable. Its Titan standard library,
   embedded Lua interpreter, and selected native dependencies are linked through
   Titan's static-provider path.

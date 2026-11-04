@@ -150,8 +150,10 @@ More build documentation:
 ## Settings
 
 The extension starts one server per workspace folder, by default the packaged
-`bin/titan-language-server`. Untrusted and virtual workspaces are not
-supported.
+`bin/titan-language-server`. That process is a router for the LSP session and
+starts one worker per Titan root it serves
+([multiple roots](#multiple-roots-in-one-server-session)). Untrusted and
+virtual workspaces are not supported.
 
 | Setting | Default | Meaning |
 | --- | --- | --- |
@@ -217,6 +219,9 @@ Every field is optional:
   inherited value. This affects editor analysis only: keep the matching
   `TITAN_EXTRA_CPPFLAGS` when you run `titanc`, or the editor and the command
   line will see different preprocessing environments.
+- `compiler_root` (default: the server's own `TITAN_ROOT`) names an installed
+  Titan SDK prefix for this root. Relative paths resolve from the root. See
+  [choosing an SDK per root](#choosing-an-sdk-per-root).
 
 Unknown fields and returned values are rejected. The file runs in an otherwise
 empty Lua environment, so it cannot write to the server's stdout or change
@@ -242,8 +247,107 @@ workspace root itself through a symlink works. A path listed only in
 `source_module_roots` is external source: the compiler resolves it, but it is
 not watched, indexed or a navigation target.
 
+### Choosing an SDK per root
+
+`compiler_root` selects the compiler Lua modules, native Lua modules, SDK
+headers and standard-library interfaces of one installed Titan SDK prefix for
+one root, for example `/tmp/titan-314/slice-a/prefix`. One server executable
+serves every SDK: the worker for a root is always the router's own image, and
+`compiler_root` only decides which SDK that worker loads. The server checks the
+prefix layout (`share/lua/5.5/titan-compiler/driver.lua`, `lib/lua/5.5` and
+`lib/titan/0.6/titan.a`), installs that prefix's Lua and native module paths,
+removes any inherited provider paths, loads that SDK's compiler before any
+compiler module loads, and reads standard-library interfaces from that
+installation's own `titan.a` by parsing it rather than loading native provider
+code. The executable's own embedded interface inventory, which describes its
+build SDK, stays out of that root. An incompatible SDK — wrong Titan ABI, wrong
+language-server API or a missing driver entry point — is a root-scoped error
+naming the prefix; the root never falls back to another compiler.
+
+The one thing a selected SDK cannot change is the `titan` support table, which
+is linked into the server executable. An SDK whose compiler calls a support
+function this server build lacks fails that root with a clear error; running a
+server built from a matching SDK is the fix.
+
+Because a machine-specific prefix must not dirty a tracked checkout, the
+optional `titan-config.local.lua` beside `titan-config.lua` may assign only
+`compiler_root`, and overrides the tracked value:
+
+```lua
+-- titan-config.local.lua, ignored by version control
+compiler_root = "/tmp/titan-314/slice-a/prefix"
+```
+
+Any other key in that file is rejected, and the tracked `titan-config.lua`
+stays the authority for discovery: the local file changes only which SDK that
+root uses.
+
+A root's editor and command line must agree: run `titanc` from the same SDK the
+root selects, or the editor will report a different ABI or a different
+standard-library inventory.
+
+### Trusting a root's SDK
+
+Loading an SDK means executing its Lua and native modules, so `compiler_root` is
+honoured only for a trusted root. A root is trusted when its canonical path is
+equal to or inside a trusted directory. Trusted directories come from the
+client's `initializationOptions.trustedRoots` (an array of absolute paths) or
+`TITAN_LS_TRUSTED_ROOTS` (an OS path list). The extension declares the workspace
+folder it launched, because it never runs in an untrusted workspace.
+
+An untrusted root that selects `compiler_root` gets a root-scoped error naming
+the root, the setting and the trust option, and the server publishes a
+`configuration` diagnostic on the configuration file that set it. The
+publication is replaced by an empty one once the selection is accepted. That
+root starts no worker and never falls back to the default SDK. A root without
+`compiler_root` needs no trust and behaves exactly as before.
+
 For how each input reaches the compiler, see
 [server data flow](docs/server-data-flow.md).
+
+## Multiple roots in one server session
+
+The native server is a router: it owns the client session and starts one worker
+process per Titan root (`src/server/router.titan`,
+`src/server/worker_process.titan`). Each worker has its own compiler, index,
+watchers and caches, so roots cannot see each other's facts.
+
+- Every `workspaceFolders` entry is an independent Titan root. The server
+  advertises `workspace.workspaceFolders.changeNotifications` and accepts
+  additions and removals at any time. Roots are canonicalized, so a folder
+  opened through a symlink shares the root it names.
+- A document belongs to the most specific known root that contains it. Adding an
+  inner folder therefore narrows routing to that folder without restarting the
+  outer root.
+- A document outside every known root discovers the nearest ancestor
+  `titan-config.lua` and activates that directory as a root. With no such
+  ancestor the file is unowned: the server drops its notifications and fails its
+  requests with an error naming the file, instead of borrowing another root's
+  settings.
+- At most four workers run at once (`initializationOptions.maxWorkers`, or
+  `TITAN_LS_MAX_WORKERS`). A worker is idle when its root has no open documents,
+  no request in flight and no background indexing pass running. An idle worker
+  is stopped after `initializationOptions.idleTimeoutSeconds` (default 600
+  seconds; a fractional value is accepted). Open editor buffers are replayed
+  into a worker that starts again, so unsaved text survives eviction and a
+  crashed worker.
+- A worker that exits unexpectedly fails its pending requests. Three crashes of
+  one root within a minute stop automatic restarts until that root's settings
+  change or the client sends `workspace/didChangeConfiguration`.
+- Changing a root's configuration, or reinstalling its SDK, restarts only that
+  root's worker, immediately and without client action. A tracked
+  `titan-config.lua` edit that leaves `compiler_root` unchanged needs no
+  restart: the worker rescans it.
+
+The router answers the custom request `titan/workspaceStatus` (no params) with
+one entry per known root: canonical `root`, `origin` (`folder` or
+`discovered`), `trusted`, effective `compilerRoot`, `state` (`inactive`,
+`starting`, `ready`, `failed` or `evicted`), `failure`, `workerPid` and restart
+`generation`. `titanRoot` and `probePrefix` are what the worker itself reports
+for its `TITAN_ROOT` and `TITAN_PREFIX`, so they prove per-root SDK and probe
+isolation instead of restating the router's decision; a root with no worker
+reports them as null. The router also logs every root transition to stderr with
+the root path.
 
 ## Indexing and diagnostics
 
@@ -296,13 +400,15 @@ payloads. `verbose` traces can include source text, so reset the setting to
 
 ## Workspace cache
 
-The server stores its index in `.titan-ls/index.sqlite3` inside the resolved
-workspace root. The directory includes a `.gitignore` and is never scanned or
-watched. By default the compiler's C probe cache lives in the same directory,
-under `.titan-ls/var/cache/titan-probes/2`. A nonempty inherited `TITAN_PREFIX`
-moves only the probe cache; clear an overridden probe directory separately.
-If the database cannot be created or opened, the server logs that persistence
-is unavailable and keeps the index in memory.
+The server stores one index per root, in `.titan-ls/index.sqlite3` inside that
+root. The directory includes a `.gitignore` and is never scanned or watched. By
+default the compiler's C probe cache lives in the same directory, under
+`.titan-ls/var/cache/titan-probes/2`. A nonempty inherited `TITAN_PREFIX` moves
+only the probe cache, and then each root uses its own namespace below it,
+`<TITAN_PREFIX>/roots/<digest>`; clear an overridden probe directory
+separately. Roots never share a probe directory, because probe results depend on
+each root's SDK headers and flags. If the database cannot be created or opened,
+the server logs that persistence is unavailable and keeps the index in memory.
 
 A compatible restart answers from the stored index first and restores compiler
 declarations in the background. A different compiler, server build or project
@@ -324,7 +430,9 @@ scheme to that host's `file:` paths and maps returned locations back. A
 workspace root opened through a directory symlink is resolved once, and
 returned locations map back to the lexical workspace URI. In nested multi-root
 workspaces, VS Code's most specific workspace folder owns each document's
-requests.
+requests, and each workspace folder gets its own server session.
+
+Non-`file:` folder URIs are ignored, and documents below them are unowned.
 
 ## Package and install the VSIX
 
@@ -367,6 +475,41 @@ For setup, see [Codex setup](docs/codex.md).
 The server reserves stdout for `Content-Length`-framed JSON-RPC and writes all
 logs to stderr. Without the extension, its log level comes from
 `TITAN_LANGUAGE_SERVER_LOG_LEVEL` and defaults to `info`.
+
+### Pointing an agent harness at several slices
+
+The default mode is the [router](#multiple-roots-in-one-server-session); it
+starts one worker per root. `--worker --root PATH` runs one root directly and
+is internal: the router uses it, and other clients should not. `--print-paths`
+reports the compiler search paths without starting a server.
+
+An agent harness that launches one server for a project benefits from folder
+change notifications: omp's `lsp` tool adds a sibling checkout with
+`workspace/didChangeWorkspaceFolders` before it opens a document there. Such a
+configuration must list the directories whose roots may select their own SDK:
+
+```json
+{
+  "servers": {
+    "titan": {
+      "command": "/home/you/.local/bin/titan-language-server",
+      "args": [],
+      "fileTypes": [".titan"],
+      "rootMarkers": ["titan-config.lua", ".git"],
+      "initOptions": {
+        "trustedRoots": ["/home/you/work"]
+      }
+    }
+  }
+}
+```
+
+omp inherits the process environment, so the compiler search paths and
+`TITAN_ROOT` come from the environment as described above. Each slice then
+selects its own installed prefix with `compiler_root` in its
+`titan-config.local.lua`; a root without that setting uses the inherited
+`TITAN_ROOT`. Query `titan/workspaceStatus` to see which SDK and worker each
+root is using.
 
 ## Windows
 
