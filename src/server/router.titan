@@ -159,6 +159,8 @@ record Router
   local initial_activated: boolean
   local housekeeping: async.Task<|nil, value|>?
   local unowned_logged: {string: boolean}
+  -- Memoized nearest-ancestor configuration per owner root and directory.
+  local discovered: {string: string}
   local closed: boolean
 end
 
@@ -249,7 +251,7 @@ function create(options: LaunchOptions, output: response_queue.ResponseQueue): R
     options, output, roots.create(), root_settings.create({}),
     {}, {}, {}, {}, {}, {}, {}, envelope, {},
     nil, nil, max_workers, DEFAULT_IDLE_TIMEOUT_SECONDS, 1, 1,
-    false, nil, {}, false)
+    false, nil, {}, {}, false)
 end
 
 local function slot_for_root(router: Router, entry: roots.Root): Slot
@@ -290,57 +292,79 @@ local function note_use(router: Router, slot: Slot)
   slot.last_used = now_milliseconds()
 end
 
+-- The report is derived from the root registry, which is the one structure that
+-- decides ownership: every registered root is reported whether or not its slot
+-- has been touched yet, and a root that just served a request is always in the
+-- registry. A root with no slot has no worker and reports `inactive`.
 local function status_value(router: Router): value
   local result: wire.Array = {}
-  for index = 1, #router.order do
-    local slot = router.slots[router.order[index]] as Slot
-    local entry: wire.Object = {
-      ["root"] = slot.root.path,
-      ["state"] = state_name(slot.state),
-      ["generation"] = slot.generation,
+  local entries = router.registry:list()
+  for index = 1, #entries do
+    local root_entry = entries[index]
+    local slot? = router.slots[root_entry.path]
+    local item: wire.Object = {
+      ["root"] = root_entry.path,
+      ["state"] = "inactive",
+      ["generation"] = 0,
     }
-    case slot.root:origin()
-    when folder() then entry["origin"] = "folder"
-    when discovered() then entry["origin"] = "discovered"
+    case root_entry:origin()
+    when folder() then item["origin"] = "folder"
+    when discovered() then item["origin"] = "discovered"
     end
-    local settings? = slot.settings
     -- Trust is a containment fact, not a consequence of a usable configuration:
     -- a root whose settings were refused still reports whether its directory is
     -- trusted.
-    local trusted = router.trust:allows(slot.root.path)
-    if settings ~= nil then
-      local actual = settings as root_settings.Settings
-      trusted = actual.trusted
-      if actual.compiler_root ~= nil then
-        entry["compilerRoot"] = actual.compiler_root
-      else
-        entry["compilerRoot"] = wire.null()
+    local trusted = router.trust:allows(root_entry.path)
+    local compiler_root: string? = nil
+    local failure: string? = nil
+    local worker_pid: integer? = nil
+    local titan_root: string? = nil
+    local probe_prefix: string? = nil
+    if slot ~= nil then
+      local actual = slot as Slot
+      item["state"] = state_name(actual.state)
+      item["generation"] = actual.generation
+      failure = actual.failure
+      worker_pid = actual.worker_pid
+      titan_root = actual.titan_root
+      probe_prefix = actual.probe_prefix
+      local settings? = actual.settings
+      if settings ~= nil then
+        local loaded = settings as root_settings.Settings
+        trusted = loaded.trusted
+        compiler_root = loaded.compiler_root
       end
-    else
-      entry["compilerRoot"] = wire.null()
     end
-    entry["trusted"] = trusted
-    local failure? = slot.failure
-    if failure ~= nil then entry["failure"] = failure as string end
-    local pid? = slot.worker_pid
-    if pid ~= nil then
-      entry["workerPid"] = pid as integer
+    item["trusted"] = trusted
+    if compiler_root ~= nil then
+      local selected: string = compiler_root
+      item["compilerRoot"] = selected
     else
-      entry["workerPid"] = wire.null()
+      item["compilerRoot"] = wire.null()
     end
-    local titan_root? = slot.titan_root
+    if failure ~= nil then
+      local text: string = failure
+      item["failure"] = text
+    end
+    if worker_pid ~= nil then
+      local pid: integer = worker_pid
+      item["workerPid"] = pid
+    else
+      item["workerPid"] = wire.null()
+    end
     if titan_root ~= nil then
-      entry["titanRoot"] = titan_root as string
+      local reported: string = titan_root
+      item["titanRoot"] = reported
     else
-      entry["titanRoot"] = wire.null()
+      item["titanRoot"] = wire.null()
     end
-    local probe? = slot.probe_prefix
-    if probe ~= nil then
-      entry["probePrefix"] = probe as string
+    if probe_prefix ~= nil then
+      local probe: string = probe_prefix
+      item["probePrefix"] = probe
     else
-      entry["probePrefix"] = wire.null()
+      item["probePrefix"] = wire.null()
     end
-    result[index] = entry
+    result[index] = item
   end
   return {["roots"] = result}
 end
@@ -927,20 +951,53 @@ local function activate(router: Router, slot: Slot): (Slot?, string?)
   return nil, "cannot start a Titan worker"
 end
 
-local function ensure_slot(router: Router, path: string): (Slot?, string?)
-  local owner? = router.registry:owner(path)
-  local entry: roots.Root? = owner
-  if entry == nil then
-    local discovered? = roots.discover(path)
-    if discovered == nil then
-      return nil, "Titan file '" .. path .. "' is outside every known Titan " ..
-        "root and has no titan-config.lua ancestor"
-    end
-    entry = router.registry:attach_discovery(discovered as string)
+-- The owner of a canonical document path is the most specific of the known
+-- roots that contain it and its nearest ancestor configuration directory. A
+-- project nested inside a folder root is therefore its own root, and a folder
+-- root with no titan-config.lua cannot claim a configured project below it.
+-- The walk is memoized per directory and containing root: configuration files
+-- appear and disappear rarely, and an explicit reload clears the memo.
+local function nested_configuration(router: Router, canonical: string,
+                                    owner_path: string): string?
+  local directory = paths.to_slash(paths.dirname(canonical))
+  local key = owner_path .. "|" .. directory
+  local cached? = router.discovered[key]
+  if cached ~= nil then
+    local text: string = cached
+    if text == "" then return nil end
+    return text
+  end
+  local found? = roots.discover(canonical)
+  if found == nil or (owner_path ~= "" and #(found as string) <= #owner_path) then
+    router.discovered[key] = ""
+    return nil
+  end
+  local deeper: string = found
+  router.discovered[key] = deeper
+  return deeper
+end
+
+local function owner_root(router: Router, canonical: string): roots.Root?
+  local owner? = router.registry:owner(canonical)
+  local owner_path = ""
+  if owner ~= nil then owner_path = (owner as roots.Root).path end
+  local discovered? = nested_configuration(router, canonical, owner_path)
+  if discovered ~= nil then
+    local entry = router.registry:attach_discovery(discovered as string)
     logging.emit("info", "root.discovered", {
-      ["root"] = (entry as roots.Root).path,
-      ["path"] = path,
+      ["root"] = entry.path,
+      ["path"] = canonical,
     })
+    return entry
+  end
+  return owner
+end
+
+local function ensure_slot(router: Router, path: string): (Slot?, string?)
+  local entry? = owner_root(router, path)
+  if entry == nil then
+    return nil, "Titan file '" .. path .. "' is outside every known Titan " ..
+      "root and has no titan-config.lua ancestor"
   end
   local slot = slot_for_root(router, entry as roots.Root)
   return activate(router, slot)
@@ -1086,14 +1143,10 @@ local function Router:route_document(notification: lsp.DocumentNotification,
   if path == "" then return end
   local canonical = roots.canonical(path)
   self:set_overlay(notification, canonical)
-  local current? = self.registry:owner(canonical)
+  local current? = owner_root(self, canonical)
   if current == nil then
-    local discovered? = roots.discover(canonical)
-    if discovered == nil then
-      note_unowned(self, uri, "notification")
-      return
-    end
-    current = self.registry:attach_discovery(discovered as string)
+    note_unowned(self, uri, "notification")
+    return
   end
   local slot = slot_for_root(self, current as roots.Root)
   if notification_closes(notification) and slot.worker == nil then return end
@@ -1182,6 +1235,10 @@ end
 local function Router:on_folders(params: value)
   local object? = wire.as_object(params)
   if object == nil then return end
+  -- Folder membership changes what "the containing root" is for every memoized
+  -- directory, and a client reload is the documented way to re-observe
+  -- configuration files.
+  self.discovered = {}
   local event? = wire.as_object((object as wire.Object)["event"])
   if event == nil then return end
   local actual = event as wire.Object
@@ -1232,6 +1289,7 @@ local function Router:root_paths(): {string}
 end
 
 local function Router:revalidate_all(force: boolean)
+  if force then self.discovered = {} end
   local paths = self:root_paths()
   for index = 1, #paths do
     local slot? = self.slots[paths[index]]

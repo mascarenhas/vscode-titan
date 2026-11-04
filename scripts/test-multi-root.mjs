@@ -490,6 +490,12 @@ async function testFolderChanges() {
     assert.equal(rootEntry(twoRoots, rootB).origin, "folder");
     await pollHover(session, sourceB, ROOT_B_SOURCE, "tripled", /integer/,
       "the added root");
+    // The omp order: a status request that follows a completed request for a
+    // root must report that root.
+    const afterServing = await session.status();
+    assert.equal(afterServing.filter((entry) => entry.root === rootB).length, 1,
+      `workspaceStatus omitted a root that just served a request: ${
+        JSON.stringify(afterServing.map((entry) => entry.root))}`);
 
     session.notify("workspace/didChangeWorkspaceFolders", {
       event: { added: [], removed: [{ uri: uri(rootB), name: "b" }] }
@@ -1322,6 +1328,94 @@ async function testOverlayOwnership() {
   }
 }
 
+// A folder root is not a Titan project just because it is a folder: the owner
+// of a document is the most specific of the known roots and its nearest
+// ancestor titan-config.lua.
+async function testNestedProjects() {
+  const base = await makeBase("nested");
+  const sessionRoot = path.join(base, "session");
+  const configlessRoot = path.join(base, "home");
+  const projectRoot = path.join(configlessRoot, "project");
+  const sessionSource = await writeRoot(sessionRoot, ROOT_A_SOURCE);
+  const projectSource = await writeRoot(projectRoot, ROOT_B_SOURCE);
+  await mkdir(path.join(configlessRoot, "notes"), { recursive: true });
+
+  const session = new Session(launch(sessionRoot, "error"));
+  try {
+    await session.initialize({
+      workspaceFolders: [{ uri: uri(sessionRoot), name: "session" }],
+      initializationOptions: { trustedRoots: [base] }
+    });
+    session.notify("initialized", {});
+    await pollStatus(session, (roots) =>
+      rootEntry(roots, sessionRoot).state === "ready",
+      "the session root did not start");
+
+    // omp adds the checkout root it inferred from a stray marker directory; it
+    // is not a Titan project.
+    session.notify("workspace/didChangeWorkspaceFolders", {
+      event: { added: [{ uri: uri(configlessRoot), name: "home" }], removed: [] }
+    });
+    const added = await pollStatus(session, (roots) =>
+      roots.length === 2 && roots.some((entry) => entry.root === configlessRoot),
+      "the added folder root was not registered");
+    assert.equal(rootEntry(added, configlessRoot).workerPid, null,
+      "an added folder with no configuration started a worker before a document");
+    assert.equal(rootEntry(added, configlessRoot).state, "inactive");
+
+    // A configured project below it answers for its own documents.
+    await pollHover(session, projectSource, ROOT_B_SOURCE, "tripled", /integer/,
+      "the nested configured project");
+    const nested = await pollStatus(session, (entries) => {
+      const entry = entries.find((candidate) => candidate.root === projectRoot);
+      return entry?.origin === "discovered" && entry.state === "ready"
+        ? { accepted: entries }
+        : { rejected: entries };
+    }, "the nested configuration did not become its own root");
+    assert.equal(rootEntry(nested, configlessRoot).workerPid, null,
+      "the folder root without configuration served its nested project");
+    await pollHover(session, sessionSource, ROOT_A_SOURCE, "doubled", /integer/,
+      "the unrelated session root");
+    await session.shutdown();
+  } finally {
+    await session.abort();
+  }
+
+  // The same rule holds when the outer folder root does have its own project.
+  const outerRoot = path.join(base, "outer");
+  const innerRoot = path.join(outerRoot, "inner");
+  const outerSource = await writeRoot(outerRoot, ROOT_A_SOURCE);
+  const innerSource = await writeRoot(innerRoot, ROOT_B_SOURCE);
+  const nestedSession = new Session(launch(outerRoot, "error"));
+  try {
+    await nestedSession.initialize({
+      workspaceFolders: [{ uri: uri(outerRoot), name: "outer" }],
+      initializationOptions: { trustedRoots: [base] }
+    });
+    nestedSession.notify("initialized", {});
+    await pollStatus(nestedSession, (roots) =>
+      rootEntry(roots, outerRoot).state === "ready",
+      "the outer root did not start");
+    await pollHover(nestedSession, outerSource, ROOT_A_SOURCE, "doubled",
+      /integer/, "the outer root");
+    await pollHover(nestedSession, innerSource, ROOT_B_SOURCE, "tripled",
+      /integer/, "the nested project inside a configured folder root");
+    const nested = await pollStatus(nestedSession, (entries) => {
+      const entry = entries.find((candidate) => candidate.root === innerRoot);
+      return entry?.origin === "discovered" && entry.state === "ready"
+        ? { accepted: entries }
+        : { rejected: entries };
+    }, "the nested project was not its own root");
+    assert.equal(rootEntry(nested, outerRoot).origin, "folder");
+    // The outer root keeps serving its own tree.
+    await pollHover(nestedSession, outerSource, ROOT_A_SOURCE, "doubled",
+      /integer/, "the outer root after its nested project became a root");
+    await nestedSession.shutdown();
+  } finally {
+    await nestedSession.abort();
+  }
+}
+
 const groups = [
   ["independent", testIndependentRoots, "independent roots"],
   ["folders", testFolderChanges, "folder changes"],
@@ -1331,7 +1425,8 @@ const groups = [
   ["crash", testWorkerCrashAndOverlay, "crash and overlay replay"],
   ["cap", testCapAndIdleEviction, "worker cap and idle eviction"],
   ["cancel", testCancellation, "request cancellation"],
-  ["overlays", testOverlayOwnership, "overlay ownership"]
+  ["overlays", testOverlayOwnership, "overlay ownership"],
+  ["nested", testNestedProjects, "nested projects"]
 ];
 
 async function main() {

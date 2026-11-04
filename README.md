@@ -307,14 +307,16 @@ watchers and caches, so roots cannot see each other's facts.
   advertises `workspace.workspaceFolders.changeNotifications` and accepts
   additions and removals at any time. Roots are canonicalized, so a folder
   opened through a symlink shares the root it names.
-- A document belongs to the most specific known root that contains it. Adding an
-  inner folder therefore narrows routing to that folder without restarting the
-  outer root.
-- A document outside every known root discovers the nearest ancestor
-  `titan-config.lua` and activates that directory as a root. With no such
-  ancestor the file is unowned: the server drops its notifications and fails its
-  requests with an error naming the file, instead of borrowing another root's
-  settings.
+- A document belongs to the most specific of the known roots that contain it
+  and its nearest ancestor `titan-config.lua`: a project nested inside an outer
+  folder is its own root, and an inner folder narrows routing without
+  restarting the outer root. A folder that merely contains a project (a checkout
+  root inferred from a marker directory, a home directory, a monorepo) is a root
+  only for documents it owns itself, and an added folder starts no worker until
+  a document routes to it.
+- A document with no containing root and no configuration ancestor is unowned:
+  the server drops its notifications and fails its requests with an error naming
+  the file, instead of borrowing another root's settings.
 - At most four workers run at once (`initializationOptions.maxWorkers`, or
   `TITAN_LS_MAX_WORKERS`). A worker is idle when its root has no open documents,
   no request in flight and no background indexing pass running. An idle worker

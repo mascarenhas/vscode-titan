@@ -5,10 +5,10 @@ in one of two modes selected by `main` in `src/titan_language_server.titan`:
 
 - The **router** (default) owns the client session (`router.run` in
   `src/server/router.titan`). It reads the client's workspace folders, routes
-  each document to the most specific root (`Roots:owner` in
-  `src/server/roots.titan`), and starts one **worker** process per root
-  (`worker_process.spawn` in `src/server/worker_process.titan`). It never loads
-  the compiler.
+  each document to the most specific of the roots and its nearest ancestor
+  configuration (`owner_root`, `Roots:owner`, `roots.discover`), and starts one
+  **worker** process per root (`worker_process.spawn` in
+  `src/server/worker_process.titan`). It never loads the compiler.
 - The **worker** (`--worker --root PATH`) is one root's server: it changes its
   working directory to that root, and `application.create(root)` owns that
   root's project service, index, watchers and caches. `--compiler-root PREFIX`
@@ -49,7 +49,7 @@ input.
 | --- | --- |
 | Compiler Lua and native Lua module paths | The extension sets `TITAN_LS_LUA_PATH` and `TITAN_LS_LUA_CPATH` from its packaged trees or explicit settings (`readCompilerDiscoveryConfiguration` in `src/extension/clientConfig.ts`). `lua_paths.configure` assigns them, or the [standalone defaults](../README.md#standalone-server), to `package.path` and `package.cpath` before compiler modules load. A worker started with `--compiler-root` ignores both and takes the prefix's own `share/lua/5.5` and `lib/lua/5.5` instead (`lua_paths.select_compiler_root`), which also removes the inherited `TITAN_PATH`, `TITAN_PATH_0_6` and `TITAN_SOURCE_PATH`. Removing them matters: the driver treats an empty string as a configured path, so blanking them would replace the selected prefix's own default provider path with an empty list. These paths are separate from Titan source and provider paths. |
 | Compiler installation root | The extension reports the packaged `dist/titan` payload, which `createServerLaunchOptions` passes as `TITAN_ROOT`. A root's `compiler_root` (tracked `titan-config.lua` or the `titan-config.local.lua` override) is resolved by the router before it starts that worker, checked for the SDK layout (`root_settings.validate_prefix` in `src/server/root_settings.titan`) and passed as `--compiler-root`. The compiler takes its SDK headers, Lua sources and library layout from that root and never from a Lua search path; the server links the runtime archive, so the payload carries no `lib/titan` providers. |
-| Root membership and trust | `src/server/roots.titan` owns canonical roots, folder references, discovered roots and most-specific ownership (`Roots:add_folder`, `Roots:remove_folder`, `Roots:owner`). `Trust:allows` in `src/server/root_settings.titan` decides trust from `initializationOptions.trustedRoots` plus `TITAN_LS_TRUSTED_ROOTS`, and `root_settings.load` refuses an untrusted or unusable `compiler_root` before a worker exists. |
+| Root membership and trust | `src/server/roots.titan` owns canonical roots, folder references, discovered roots and most-specific containment (`Roots:add_folder`, `Roots:remove_folder`, `Roots:owner`, `roots.discover`). The router's owner for a document is the most specific of the known roots containing it and its nearest ancestor `titan-config.lua` (`owner_root` in `src/server/router.titan`), so a nested project is its own root and a folder root without configuration cannot claim one. `Trust:allows` in `src/server/root_settings.titan` decides trust from `initializationOptions.trustedRoots` plus `TITAN_LS_TRUSTED_ROOTS`, and `root_settings.load` refuses an untrusted or unusable `compiler_root` before a worker exists. |
 | Saved project discovery and watching | `project_config` loads `include` and `exclude` and resolves them against the workspace root. `project_discovery` scans `include` and selects target variants for the host target using the compiler driver's source-selection helpers (`TITAN_TARGET` is ignored); `exclude` narrows only the watcher set. |
 | Titan source module roots | `source_module_roots` is an ordered array in `ProjectConfig` and `CompilerConfiguration`. Only `Compiler:configure` joins it with `;` into the driver's `TITAN_SOURCE_PATH`. It also determines logical module names and canonical `native_output` paths (`raw_source_descriptor` in `src/server/compiler_bridge.titan`). |
 | Titan binary providers | `binary_modules_root` defaults to the compiler's installed root (`Compiler:installed_binary_modules_root`). It is independent of the Lua native-module path. |
@@ -180,6 +180,7 @@ and it remaps a worker-to-client request under a router-allocated id
 (`router.worker_response_body` restores the worker's id on the reply), so a
 later worker feature can ask the client questions. `titan/workspaceStatus`
 answers from the root registry plus each worker's own report of its process
-identity, SDK and probe prefix; the
+identity, SDK and probe prefix, so every registered root appears whether or not
+its worker has started; the
 [README](../README.md#multiple-roots-in-one-server-session) owns its fields.
 Every root transition is logged with the root path.
