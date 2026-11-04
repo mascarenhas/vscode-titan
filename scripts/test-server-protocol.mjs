@@ -2869,9 +2869,11 @@ async function testPullForANewProjectSource() {
       "a file outside every include root reported diagnostics");
     await new Promise((resolve) => setTimeout(resolve, 500));
     await request(child, responses, "after-outside", "titan/workspaceStatus", {});
+    // Every pull is a freshness barrier, so this one runs one saved-change pass;
+    // it must not answer with diagnostics for a file no project contains.
     assert.equal(responses.progress.filter(
-      (entry) => entry.value.kind === "begin").length, periods,
-      "a pull outside every include root re-indexed the project");
+      (entry) => entry.value.kind === "begin").length, periods + 1,
+      "a pull did not run exactly one freshness-barrier pass");
 
     const shutdown = await request(child, responses, "shutdown", "shutdown", null);
     assert.equal(shutdown.result, null);
@@ -2889,6 +2891,118 @@ async function testPullForANewProjectSource() {
     await awaitExit(exit);
     await rm(root, { recursive: true, force: true });
   }
+}
+
+
+// A pull must revalidate every saved input the requested document's report
+// depends on, not only the document's own bytes. Both cases below pull an
+// unchanged file immediately after another saved file in its module graph
+// changed, so a generation-only answer would be stale (or `unchanged`).
+async function pullAcrossSavedInputs(root, prepare, change, target,
+    expectedMessage) {
+  await mkdir(path.join(root, ".."), { recursive: true });
+  await writeFile(path.join(root, "titan-config.lua"),
+    'include = { "." }\nsource_module_roots = { "." }\n', "utf8");
+  await prepare(root);
+  const child = launch(root);
+  const exit = exitOf(child);
+  const stderr = collect(child.stderr);
+  const responses = new FrameReader(child.stdout);
+  try {
+    await request(child, responses, 1, "initialize", {
+      capabilities: { window: { workDoneProgress: true } }
+    });
+    answerProgressRequests(child, responses);
+    child.stdin.write(frame({ jsonrpc: "2.0", method: "initialized", params: {} }));
+    await nextProgressEvent(responses, "end");
+    const targetUri = pathToFileURL(target).href;
+    const clean = await request(child, responses, "pull-clean",
+      "textDocument/diagnostic", { textDocument: { uri: targetUri } },
+      30_000);
+    assert.equal(clean.error, undefined, JSON.stringify(clean.error));
+    assert.deepEqual(clean.result.items, [],
+      `the fixture project is not clean: ${JSON.stringify(clean.result.items)}`);
+
+    // Change the other saved input and pull before any watcher hint can be
+    // relied on: the barrier pass must see the change.
+    await change();
+    const pulled = await request(child, responses, "pull-changed",
+      "textDocument/diagnostic", {
+        textDocument: { uri: targetUri },
+        previousResultId: clean.result.resultId
+      }, 30_000);
+    assert.equal(pulled.error, undefined, JSON.stringify(pulled.error));
+    assert.equal(pulled.result.kind, "full",
+      "a pull after a related saved change replayed the stale generation");
+    assert.equal(pulled.result.items.length, 1,
+      `the related change was not reported: ${JSON.stringify(pulled.result.items)}`);
+    assert.match(pulled.result.items[0].message, expectedMessage);
+    assert.notEqual(pulled.result.resultId, clean.result.resultId,
+      "the changed report kept the preceding result id");
+
+    const shutdown = await request(child, responses, "shutdown", "shutdown", null);
+    assert.equal(shutdown.result, null);
+    child.stdin.write(frame({ jsonrpc: "2.0", method: "exit" }));
+    assert.deepEqual(await awaitExit(exit), { code: 0, signal: null });
+    assert.equal(stderr().length, 0, stderr().toString("utf8"));
+  } catch (cause) {
+    const diagnostic = stderr().toString("utf8").trim();
+    throw new Error(
+      `${cause.message}${diagnostic.length > 0 ? `; stderr: ${diagnostic}` : ""}`,
+      { cause }
+    );
+  } finally {
+    if (child.exitCode === null && child.signalCode === null) child.kill();
+    await awaitExit(exit);
+    await rm(root, { recursive: true, force: true });
+  }
+}
+
+async function testPullRevalidatesADependencyChange() {
+  const root = await makePhysicalTemporaryRoot("vscode-titan-dep-pull-");
+  const main = path.join(root, "main.titan");
+  await pullAcrossSavedInputs(root,
+    async (directory) => {
+      await writeFile(path.join(directory, "helper.titan"),
+        "function value(): integer\n  return 1\nend\n", "utf8");
+      await writeFile(main, [
+        'local helper = import "helper"',
+        "",
+        "function use(): integer",
+        "  return helper.value()",
+        "end",
+        ""
+      ].join("\n"), "utf8");
+    },
+    async () => {
+      // The importer is untouched; only its dependency changes.
+      await writeFile(path.join(root, "helper.titan"),
+        'function value(): string\n  return "text"\nend\n', "utf8");
+    },
+    main, /integer/i);
+}
+
+async function testPullRevalidatesAFolderContributorChange() {
+  const root = await makePhysicalTemporaryRoot("vscode-titan-folder-pull-");
+  const module = path.join(root, "group");
+  const pulled = path.join(module, "a.titan");
+  await pullAcrossSavedInputs(root,
+    async (directory) => {
+      await mkdir(path.join(directory, "group"), { recursive: true });
+      await writeFile(path.join(directory, "group", "group.titan"),
+        "function group_value(): integer\n  return 1\nend\n", "utf8");
+      await writeFile(path.join(directory, "group", "a.titan"),
+        "function pulled(): integer\n  return other_value()\nend\n", "utf8");
+      await writeFile(path.join(directory, "group", "b.titan"),
+        "function other_value(): integer\n  return 2\nend\n", "utf8");
+    },
+    async () => {
+      // Another contributor of the same folder module changes; the pulled
+      // contributor's own bytes do not.
+      await writeFile(path.join(module, "b.titan"),
+        'function other_value(): string\n  return "text"\nend\n', "utf8");
+    },
+    pulled, /integer/i);
 }
 
 async function testTruncatedFrame() {
@@ -2961,6 +3075,8 @@ if (isMain) {
     await testCancelledPullDiagnostics();
     await testRejectedProgressTokenAndInvalidBodies();
     await testPullForANewProjectSource();
+    await testPullRevalidatesADependencyChange();
+    await testPullRevalidatesAFolderContributorChange();
     await testTruncatedFrame();
     console.log("native server protocol transcript passed");
   }

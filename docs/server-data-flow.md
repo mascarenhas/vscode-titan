@@ -222,18 +222,16 @@ after the completed view and its diagnostics are published. Progress tokens
 embed the server's process id, so the router forwards `$/progress` unchanged
 instead of rewriting a token shared across workers. `textDocument/diagnostic`
 (`Application:handle_diagnostic`) is routed by document URI like every other
-document request and joins `Application:fresh_view_for`, which compares a
-`project_graph.FileStamp` recorded for the discovered module with the file's
-current saved bytes and joins a refresh until the completed generation covers
-them. A pull that follows a failed pass spends one saved-change hint of its own
-before it reports that failure, so a saved project repaired on disk answers with
-the repaired generation instead of the superseded error. For a path the catalog
-does not contain, the same rule asks whether the generation already classified
-it (a recorded `project_graph.FileStamp`, or a discovery issue naming it) and
-otherwise whether a refresh could promote it: the watcher's relevance
-classification for a created regular file plus
-`compiler_bridge.classify_source_filename` and `target_label_applies`, so a new
-source is indexed before the answer while a non-source file answers immediately.
-It answers from `published_diagnostics.read_uri`, the same rows push reads, and
-`diagnostics.report` encodes the report with a `resultId` derived from those
-items.
+document request and is a freshness barrier through
+`Application:fresh_view_for`: the pull calls the same `note_saved_change` path a
+watcher hint uses, coalescing with any in-flight chain, and answers only from the
+generation that pass completed. The protocol layer therefore never inspects one
+file's recorded `project_graph.FileStamp` to decide freshness; every saved input
+the requested document's report can depend on — its module's other contributors,
+its dependencies and their dependencies — is revalidated by that pass. A pass
+that finds nothing dirty is a scan only: no analysis runs, the items are
+unchanged and so is their `resultId`, which keeps `unchanged` answers working.
+A pull whose pass fails reports that failure, and a cancelled pull is answered as
+cancelled. It answers from `published_diagnostics.read_uri`, the same rows push
+reads, and `diagnostics.report` encodes the report with a `resultId` derived from
+those items.

@@ -9,7 +9,6 @@ local strings = import "string"
 local paths = import "path"
 local source_text = import "server.source_text"
 local bridge = import "server.compiler_bridge"
-local content_identity = import "server.content_identity"
 local diagnostics = import "server.diagnostics"
 local dispatcher = import "server.dispatcher"
 local coordinator = import "server.coordinator"
@@ -24,7 +23,6 @@ local project_discovery = import "server.project_discovery"
 local project_service = import "server.project_service"
 local project_loader = import "server.project_loader"
 local outbound_requests = import "server.outbound_requests"
-local project_graph = import "server.project_graph"
 local published_diagnostics = import "server.published_diagnostics"
 local semantic_index = import "server.semantic_index"
 local sqlite3 = import "sqlite3"
@@ -1322,177 +1320,34 @@ local function Application:fresh_view(): (View?, Error?)
   return view, nil
 end
 
-local function project_source_stamp(snapshot: project_service.Snapshot,
-                                    path: string): project_graph.FileStamp?
-  for module_index = 1, #snapshot.project_modules do
-    local files = snapshot.project_modules[module_index].source_files
-    for file_index = 1, #files do
-      local stamp = files[file_index].stamp
-      if stamp.path == path then return stamp end
-    end
+-- Every pull is a freshness barrier. It asks for one saved-change pass through
+-- the same coalescing path a watcher hint uses, then answers from the generation
+-- that pass completed, so a dependency or another contributor of the requested
+-- document's module is revalidated before the report is read. A pass that finds
+-- nothing dirty is a scan only: the generation keeps its items and therefore its
+-- resultIds, and no analysis runs.
+local function Application:fresh_view_for(): (View?, Error?)
+  if self.closed then
+    return nil, Error.new("language server application is closed")
   end
-  return nil
-end
-
--- A recorded stamp still describes the saved bytes when its complete filesystem
--- observation matches, or when the saved content digest does. A timestamp-only
--- change does not make the saved input different.
-local function stamp_is_current(stamp: project_graph.FileStamp): boolean
-  local observed? = content_identity.observe(stamp.path)
-  if observed == nil or observed.kind ~= "file" then return false end
-  if observed.size == stamp.size and
-     observed.modified_seconds == stamp.modified_seconds and
-     observed.modified_nanoseconds == stamp.modified_nanoseconds and
-     observed.physical_identity == stamp.physical_identity then
-    return true
-  end
-  local identity? = stamp.identity
-  if identity == nil then return false end
-  local recorded: string = identity
-  local contents: string? = nil
-  do
-    contents = fs.read_file(stamp.path)
-  catch
-    if error is async.CancellationReason then raise end
-  end
-  if contents == nil then return false end
-  return recorded == content_identity.digest(contents)
-end
-
-local function snapshot_issue_for(snapshot: project_service.Snapshot,
-                                  path: string): project_discovery.Issue?
-  for index = 1, #snapshot.discovery_issues do
-    local issue = snapshot.discovery_issues[index]
-    if issue.path == path then return issue end
-  end
-  return nil
-end
-
--- Could a refresh promote this path into the saved catalog? The rule is the
--- watcher's relevance classification for one created regular file
--- (`watch_change_disposition`) plus the compiler's own source-name admission, so
--- a path the project can never treat as a source answers without a rescan.
-local function admits_project_source(snapshot: project_service.Snapshot,
-                                     path: string): boolean
-  local filter = build_watch_filter(snapshot)
-  for index = 1, #filter.cache_paths do
-    if path_within(filter.cache_paths[index], path) then return false end
-  end
-  for index = 1, #filter.excluded_paths do
-    if path_within(filter.excluded_paths[index], path) then return false end
-  end
-  if not titan_source_path(path) then return false end
-  if not mapped_source_path(path, filter.source_roots) then return false end
-  -- Discovery rejects a name this classification rejects, so it can never
-  -- become a module, and a variant label this host does not select is inactive.
-  local classification = bridge.classify_source_filename(paths.basename(path))
-  if classification.logical_basename == nil then return false end
-  local label? = classification.label
-  if label ~= nil then
-    local variant: string = label
-    if not bridge.target_label_applies(bridge.host_target(), variant) then
-      return false
-    end
-  end
-  local parent = parent_directory(path)
-  for index = 1, #filter.include_roots do
-    local include_root = filter.include_roots[index]
-    if path_within(include_root, path) and
-       included_directory_path(include_root, parent, filter.source_roots) then
-      return true
-    end
-  end
-  return false
-end
-
--- Why one completed generation does or does not answer for one path.
-local union Coverage
-  fresh()
-  -- The accepted bytes are not the file's current bytes.
-  changed()
-  -- The completed catalog has no entry for this admitted source yet.
-  absent()
-end
-
-local function Application:coverage(view: View, path: string): Coverage
-  if self.closed then return Coverage.changed() end
-  if self.change_epoch > self.completed_epoch then return Coverage.changed() end
-  if self.refresh_task ~= nil then return Coverage.changed() end
-  local service? = self.service
-  if service == nil then return Coverage.changed() end
-  local snapshot = service:latest()
-  if snapshot.generation ~= view.work_generation then return Coverage.changed() end
-  local stamp? = project_source_stamp(snapshot, path)
-  if stamp ~= nil then
-    if stamp_is_current(stamp) then return Coverage.fresh() end
-    return Coverage.changed()
-  end
-  -- The catalog has no stamp for this path, so the generation describes it, if
-  -- at all, through a discovery issue. That issue is only authoritative while
-  -- the saved file it names still exists: a deleted issue path must refresh so
-  -- the generation drops the row instead of the pull answering a diagnostic for
-  -- a file that is gone.
-  local observed? = content_identity.observe(path)
-  local present = observed ~= nil and observed.kind == "file"
-  if snapshot_issue_for(snapshot, path) ~= nil then
-    if present then return Coverage.fresh() end
-    return Coverage.changed()
-  end
-  -- A path the project could never admit as a source cannot gain diagnostics
-  -- from a refresh, and a path with nothing saved has nothing to refresh for.
-  if not present then return Coverage.fresh() end
-  -- Otherwise a refresh has not seen this source yet, for example a file created
-  -- since the completed generation.
-  if admits_project_source(snapshot, path) then return Coverage.absent() end
-  return Coverage.fresh()
-end
-
--- A pull describes the saved bytes the client is about to read. Wait for a
--- completed generation which covers the file's current saved bytes instead of
--- answering from an older publication. A newer save starts the next coalesced
--- pass, which this loop joins; the client's own timeout bounds the wait through
--- ordinary request cancellation.
-local function Application:fresh_view_for(path: string): (View?, Error?)
-  local retried_failure = false
-  local refreshed_absent = false
+  self:note_saved_change()
   while true do
     if self.closed then
       return nil, Error.new("language server application is closed")
     end
-    local view?, view_error? = self:current_view()
-    if view_error ~= nil then
-      -- A failed pass is authoritative for the saved epoch it attempted, but
-      -- the saved input may have been repaired since, before any watcher hint.
-      -- A pull is an explicit on-demand request, so it spends one saved-change
-      -- hint of its own; a second failure is the answer.
-      if retried_failure then return nil, view_error end
-      retried_failure = true
-    end
-    if view ~= nil then
-      case self:coverage(view, path)
-      when fresh() then return view, nil
-      when absent() then
-        -- One refresh may promote this source into the catalog. A generation
-        -- that still does not contain it is the answer, so a pull can never
-        -- rescan the same state forever.
-        if refreshed_absent then return view, nil end
-        refreshed_absent = true
-      when changed() then
-      end
-    end
-    if self.refresh_task == nil then
-      -- The watcher has not observed this saved change yet; index the same
-      -- saved state a watcher hint would.
-      self:note_saved_change()
-    end
-    local task? = self.refresh_task
-    if task == nil then
+    local running? = self.refresh_task
+    if running ~= nil then
+      async.join(running as async.Task<|RefreshOutcome, value|>)
+    else
+      local view?, view_error? = self:current_view()
       if view_error ~= nil then return nil, view_error end
-      return nil, Error.new("project refresh did not start")
+      if view ~= nil and self.change_epoch <= self.completed_epoch then
+        return view, nil
+      end
+      return nil, Error.new("saved project refresh did not start")
     end
-    async.join(task)
   end
-  return nil, Error.new("project refresh did not start")
+  return nil, Error.new("saved project refresh did not settle")
 end
 
 local function Application:published_items(view: View, uri: string):
@@ -1668,7 +1523,7 @@ local function Application:handle_diagnostic(
   end
   local published_uri: string = uri
   while true do
-    local view?, view_error? = self:fresh_view_for(params.document.path)
+    local view?, view_error? = self:fresh_view_for()
     if view == nil then
       return failure(REQUEST_FAILED, view_error.message)
     end

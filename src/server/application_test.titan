@@ -2,7 +2,9 @@ local test_paths = import "server.test_paths"
 local test_links = import "server.test_links"
 foreign import "compiler_io_platform.h"
 local test_service = import "server.test_service"
+local content_identity = import "server.content_identity"
 local async = import "async"
+local diag_os = import "os"
 local fs = import "fs"
 local paths = import "path"
 local json = import "json"
@@ -3674,8 +3676,8 @@ local function pulls_the_completed_generation_and_waits_for_new_bytes()
     test.assert(app:indexing_metrics().refresh_passes >= 1,
                 "pull did not refresh the saved project for new bytes")
 
-    -- A file that is not a project source reports no diagnostics without
-    -- waiting for any refresh.
+    -- A file the project does not contain reports no diagnostics; the pull is
+    -- still a freshness barrier like every other pull.
     local outside = filename .. ".other"
     fs.write_file(outside, "not Titan source\n")
     defer fs.unlink(outside)
@@ -3841,25 +3843,23 @@ local function pulls_new_and_deleted_project_sources()
     local settled = app:indexing_metrics().refresh_passes
     local repeated = pull_report(app, created,
       wire.as_string(report["resultId"]))
-    test.assert(wire.as_string(repeated["kind"]) == "unchanged" and
-                app:indexing_metrics().refresh_passes == settled,
-                "a second pull for the indexed source re-indexed the project")
+    test.assert(wire.as_string(repeated["kind"]) == "unchanged",
+                "a second pull for the indexed source did not replay its report")
+    test.assert(app:indexing_metrics().refresh_passes == settled + 1,
+                "a barrier pull did not run exactly one saved-change pass")
 
-    -- A saved .titan file outside every include root can never become a source,
-    -- so it answers immediately and starts no refresh.
+    -- A saved .titan file outside every include root is not in any project
+    -- generation, so it reports nothing; the pull is still a barrier.
     local outside = root .. "/stray.titan"
     fs.write_file(outside, "function stray(): integer\n  return 1\nend\n")
     defer do
       if fs.lstat(outside) ~= nil then fs.unlink(outside) end
     end
-    local outside_passes = app:indexing_metrics().refresh_passes
     local empty = pull_report(app, outside, nil)
     local empty_items? = wire.as_array(empty["items"])
     test.assert(wire.as_string(empty["kind"]) == "full" and
                 empty_items ~= nil and #empty_items == 0,
                 "a pull outside every include root reported diagnostics")
-    test.assert(app:indexing_metrics().refresh_passes == outside_passes,
-                "a pull outside every include root re-indexed the project")
 
     -- Deleting an indexed source makes the generation stale: the pull refreshes
     -- instead of answering for the vanished module.
@@ -3921,8 +3921,8 @@ local function pulls_a_deleted_discovery_issue_path()
     local settled = app:indexing_metrics().refresh_passes
     local unchanged = pull_report(app, unmapped, report_id)
     test.assert(wire.as_string(unchanged["kind"]) == "unchanged" and
-                app:indexing_metrics().refresh_passes == settled,
-                "an unchanged discovery issue started a refresh")
+                app:indexing_metrics().refresh_passes == settled + 1,
+                "an unchanged discovery issue did not replay through one barrier pass")
 
     -- A discovery issue describes a file that is still saved. Deleting it must
     -- refresh before the answer, so the client does not keep a diagnostic for a
@@ -3937,17 +3937,208 @@ local function pulls_a_deleted_discovery_issue_path()
     test.assert(app:indexing_metrics().refresh_passes == passes + 1,
                 "a pull for a deleted discovery issue did not refresh")
     -- The generation no longer describes the path, so the answer settles.
-    local after = app:indexing_metrics().refresh_passes
     local settled_empty = pull_report(app, unmapped, nil)
     local settled_items? = wire.as_array(settled_empty["items"])
     test.assert(wire.as_string(settled_empty["kind"]) == "full" and
-                settled_items ~= nil and #settled_items == 0 and
-                app:indexing_metrics().refresh_passes == after,
-                "a deleted discovery issue kept refreshing")
+                settled_items ~= nil and #settled_items == 0,
+                "a deleted discovery issue kept reporting diagnostics")
   end)
 end
 
 function test_application_pulls_a_deleted_discovery_issue_path(
     _context: test.Context)
   test_runtime.run(pulls_a_deleted_discovery_issue_path)
+end
+
+local function pull_is_a_scan_only_freshness_barrier()
+  with_cold_application(function (
+      filename: string, analyzer: YieldingAnalyzer,
+      app: application.Application)
+    app:start_indexing()
+    wait_until(function (): boolean
+      return app.completed_view ~= nil and
+             not app:indexing_metrics().refresh_chain_active
+    end, "the project did not finish its first indexing pass")
+    use_manual_watch_delivery(app)
+
+    local first = pull_report(app, filename, nil)
+    test.assert(wire.as_string(first["kind"]) == "full",
+                "a pull for the saved project did not return a report")
+    local first_items? = wire.as_array(first["items"])
+    test.assert(first_items ~= nil and #first_items == 0,
+                "the clean project reported diagnostics")
+    local result_id? = wire.as_string(first["resultId"])
+    test.assert(result_id ~= nil,
+                "the pull report omitted its result id")
+
+    -- A pull with nothing dirty is a barrier pass that only scans: it runs
+    -- exactly one saved-change pass, never re-analyses, and keeps the items and
+    -- their resultId.
+    local passes = app:indexing_metrics().refresh_passes
+    local runs = analyzer.runs
+    local repeated = pull_report(app, filename, result_id)
+    test.assert(wire.as_string(repeated["kind"]) == "unchanged" and
+                wire.as_string(repeated["resultId"]) == result_id,
+                "a no-op barrier pass changed the report identity")
+    test.assert(app:indexing_metrics().refresh_passes == passes + 1,
+                "a pull did not run exactly one saved-change pass")
+    test.assert(analyzer.runs == runs,
+                "a pull with nothing dirty re-analysed the project")
+  end)
+end
+
+function test_application_pull_is_a_scan_only_freshness_barrier(
+    _context: test.Context)
+  test_runtime.run(pull_is_a_scan_only_freshness_barrier)
+end
+
+-- A saved input can change what another file's report says: an importer's error
+-- comes from its dependency's interface, and a folder module's diagnostics span
+-- every contributor. This analyzer models both with the production graph:
+-- manifest digests are derived from the saved contents (so a save invalidates
+-- importers exactly as a compiler interface digest does) and a module reports one
+-- diagnostic on its first file whenever any project source contains the marker.
+local record InputAnalyzer
+  runs: integer
+end
+
+local function project_input_digest(module: bridge.ProjectModule): string
+  local joined = strings.writer()
+  for index = 1, #module.files do
+    local file = module.files[index]
+    joined:write(#file.filename .. ":" .. #file.contents .. ":" .. file.contents)
+  end
+  return content_identity.hex_digest(joined:drain())
+end
+
+local function marker_saved(project_modules: {bridge.ProjectModule}): boolean
+  for index = 1, #project_modules do
+    local module = project_modules[index]
+    for file_index = 1, #module.files do
+      if strings.find(module.files[file_index].contents, "BROKEN_INPUT") ~= nil then
+        return true
+      end
+    end
+  end
+  return false
+end
+
+local function InputAnalyzer:analyze(
+    request: project_service.AnalysisRequest): bridge.Analysis
+  self.runs = self.runs + 1
+  local broken = marker_saved(request.project_modules)
+  local modules: {bridge.ModuleSnapshot} = {}
+  local diagnostics: {bridge.Diagnostic} = {}
+  for index = 1, #request.dirty_modules do
+    local name = request.dirty_modules[index]
+    local module? = find_project(request, name)
+    test.assert(module ~= nil, "input analyzer lost a dirty project module")
+    if module == nil then raise "dirty input module is missing" end
+    local actual = module as bridge.ProjectModule
+    local filenames: {string} = {}
+    for file_index = 1, #actual.files do
+      filenames[file_index] = actual.files[file_index].filename
+    end
+    local imports: {bridge.Import} = {}
+    local digest = project_input_digest(actual)
+    modules[index] = bridge.ModuleSnapshot.new(
+      name,
+      bridge.Provenance.project_source(filenames[1], filenames),
+      bridge.Manifest.new(name, digest, digest),
+      {}, {}, imports, {}, nil, nil)
+    if broken then
+      for file_index = 1, #filenames do
+        diagnostics[#diagnostics + 1] = bridge.Diagnostic.new(
+          bridge.DiagnosticKind.type_error(),
+          "deliberate saved-input failure",
+          bridge.SourceLocation.new(filenames[file_index], 1, 1))
+      end
+    end
+  end
+  return bridge.Analysis.new(request.root_module, diagnostics, modules, {}, {}, {})
+end
+
+local function with_input_application(
+    body: function (string, string, InputAnalyzer, application.Application): ())
+  local root = test_paths.temporary_name()
+  fs.unlink(root)
+  fs.mkdir(root)
+  local source_root = root .. "/src"
+  fs.mkdir(source_root)
+  local filename = source_root .. "/main.titan"
+  fs.write_file(filename,
+    'local helper = import "helper"\n\n' ..
+    "function use(): integer\n  return 1\nend\n")
+  local config = root .. "/titan-config.lua"
+  fs.write_file(config,
+    'include = { "." }\nsource_module_roots = { "./src" }\n')
+  defer do
+    if fs.lstat(config) ~= nil then fs.unlink(config) end
+    if fs.lstat(filename) ~= nil then fs.unlink(filename) end
+    if fs.lstat(source_root) ~= nil then fs.rmdir(source_root) end
+    if fs.lstat(root) ~= nil then fs.rmdir(root) end
+  end
+  local analyzer = InputAnalyzer.new(0)
+  local app = application.create(
+    root,
+    function (project_root: string,
+              _progress_listener: bridge.ProgressListener?,
+              snapshot_listener: project_service.SnapshotListener?):
+        (project_service.Service?, project_service.Error?, project_loader.Restoration?)
+      local loaded?, failure? = test_service.load {
+        project_root = project_root,
+        installed_binary_modules_root = test_paths.sdk_binary_root(),
+        analyzer = analyzer:analyze,
+        snapshot_listener = snapshot_listener,
+      }
+      return loaded, failure, nil
+    end)
+  defer app:close()
+  body(root, source_root, analyzer, app)
+end
+
+local function pulls_a_folder_contributor_change()
+  with_input_application(function (
+      root: string, source_root: string, analyzer: InputAnalyzer,
+      app: application.Application)
+    local folder = source_root .. "/group"
+    fs.mkdir(folder)
+    local main_file = folder .. "/group.titan"
+    local contributor = folder .. "/b.titan"
+    fs.write_file(main_file, "function group_value(): integer\n  return 1\nend\n")
+    fs.write_file(contributor, "function other_value(): integer\n  return 2\nend\n")
+    defer do
+      if fs.lstat(main_file) ~= nil then fs.unlink(main_file) end
+      if fs.lstat(contributor) ~= nil then fs.unlink(contributor) end
+      if fs.lstat(folder) ~= nil then fs.rmdir(folder) end
+    end
+    app:start_indexing()
+    wait_until(function (): boolean
+      return app.completed_view ~= nil and
+             not app:indexing_metrics().refresh_chain_active
+    end, "the folder-module project did not finish indexing")
+    use_manual_watch_delivery(app)
+    local clean = pull_report(app, main_file, nil)
+    local clean_items? = wire.as_array(clean["items"])
+    test.assert(wire.as_string(clean["kind"]) == "full" and
+                clean_items ~= nil and #clean_items == 0,
+                "the folder-module project is not clean")
+    local clean_id = wire.as_string(clean["resultId"])
+
+    -- Another contributor of the same folder module is saved; the pulled
+    -- contributor's own bytes do not change.
+    fs.write_file(contributor,
+      "function other_value(): integer\n  return 0 -- BROKEN_INPUT\nend\n")
+    local report = pull_report(app, main_file, clean_id)
+    local items? = wire.as_array(report["items"])
+    test.assert(wire.as_string(report["kind"]) == "full" and
+                items ~= nil and #items == 1,
+                "a pull after a contributor save replayed the stale generation")
+    local _unused = root
+  end)
+end
+
+function test_application_pull_revalidates_a_folder_contributor_change(
+    _context: test.Context)
+  test_runtime.run(pulls_a_folder_contributor_change)
 end
