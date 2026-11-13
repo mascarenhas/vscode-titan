@@ -33,14 +33,16 @@ export function compilerArgument(value) {
   return `"${forward(value)}"`;
 }
 
-export function windowsApplicationArguments({ sourceRoot, directory, embeddedSource, sdk, test = false }) {
+export function windowsApplicationArguments({ sourceRoot, directory, embeddedSource, sdk, test = false,
+  entry = test ? "server.tests" : "titan_language_server",
+  executable = test ? "server.tests.exe" : "titan-language-server.exe" }) {
   return ["--tree", forward(sourceRoot), "--output", forward(directory), "--source-first", "--incremental",
-    "--exe", forward(path.join(directory, "bin", test ? "server.tests.exe" : "titan-language-server.exe")),
+    "--exe", forward(path.join(directory, "bin", executable)),
     "-I", forward(path.join(repository, "src/server")),
     "--c-source", forward(path.join(repository, "src/server/compiler_io_clock.c")),
     "--c-source", forward(embeddedSource), "-L", forward(path.join(sdk, "lib")), "-lcrypto",
     ...(test ? ["--test", "--no-uv-bootstrap", "--ldflag=-Wl,--stack,8388608"] : []),
-    test ? "server.tests" : "titan_language_server"];
+    entry];
 }
 
 export function childEnvironment(inherited, overrides, removed = []) {
@@ -205,9 +207,12 @@ export async function buildWindows(target, {
   try {
     await lock.writeFile(`${process.pid}\n`);
     const fixture = path.join(nativeBuildDirectory(buildRoot, target), "compiler_io_process_fixture.exe");
+    const routerFixtureDirectory = path.join(nativeBuildDirectory(buildRoot, target), "router-worker");
+    const routerFixture = path.join(routerFixtureDirectory, "bin", "router_worker_fixture.exe");
     const testExe = path.join(buildRoot, "tests", "bin", "server.tests.exe");
     if (target === "server-test-run") {
       const testEnv = { ...env, TITAN_PROBE_CACHE_DISABLE: "1", TITAN_COMPILER_IO_PROCESS_FIXTURE: fixture,
+        TITAN_ROUTER_WORKER_FIXTURE: routerFixture,
         LUA_PATH_5_5: env.LUA_PATH, LUA_CPATH_5_5: env.LUA_CPATH };
       delete testEnv.TITAN_PATH; delete testEnv.TITAN_PATH_0_6;
       const result = spawnSync(testExe, filter ? [`--filter=${filter}`] : [], {
@@ -228,10 +233,17 @@ export async function buildWindows(target, {
       const flags = nativeBuildFlags(env.TITAN_BUILD_PROFILE, nativeExtraFlags(lua, env));
       run(clang, [...flags.cppflags, ...flags.cflags, "-municode",
         "test/fixtures/compiler-io-process.c", ...flags.ldflags, "-o", fixture]);
+      compile(windowsApplicationArguments({
+        sourceRoot: `${sourceRoot};${path.join(repository, "test/fixtures")}`,
+        directory: routerFixtureDirectory, embeddedSource, sdk,
+        entry: "router_worker_fixture", executable: "router_worker_fixture.exe"
+      }), repository);
     }
     compile(windowsApplicationArguments({ sourceRoot, directory, embeddedSource, sdk, test }), repository);
-    for (const name of runtimeDlls) await copyChanged(path.join(sdk, "bin", name), path.join(directory, "bin", name));
-    await copyChanged(path.join(sdk, "lib/titan/0.6/titan.dll"), path.join(directory, "lib/titan/0.6/titan.dll"));
+    for (const destination of test ? [directory, routerFixtureDirectory] : [directory]) {
+      for (const name of runtimeDlls) await copyChanged(path.join(sdk, "bin", name), path.join(destination, "bin", name));
+      await copyChanged(path.join(sdk, "lib/titan/0.6/titan.dll"), path.join(destination, "lib/titan/0.6/titan.dll"));
+    }
     if (test) return;
     // The extension's bin is the launcher's installation bin; DLL providers are
     // siblings under lib/titan/0.6, preserving Titan's normal runtime lookup.

@@ -25,7 +25,7 @@ async function fixture(context) {
     "server/used_test.titan", "server/test_paths.titan", "server/clock.h", "server/clock.c", "server/clock.ffi.h", "server/clock.o",
     "server/.coverage/stale.titan"]) await put(path.join(options.repository, "src", name));
   await put(path.join(options.repository, "src/server/compiler_io_clock.c"));
-  for (const name of ["embedded_interfaces_native.c", "compiler_io_process_fixture"])
+  for (const name of ["embedded_interfaces_native.c", "compiler_io_process_fixture", "router_worker_fixture"])
     await put(path.join(options.nativeDir, name));
   for (const name of ["titanc", "lua"]) await put(path.join(options.prefix, "bin", name));
   await put(path.join(options.prefix, "lib/titan/0.6/titan.a"));
@@ -200,6 +200,7 @@ test("direct execution uses selected runtime paths, ignores ambient filters, and
   assert.equal(environment.TITAN_PREFIX, "ambient-sdk-prefix");
   assert.equal(environment.TITAN_ROOT, "ambient-sdk");
   assert.equal(invocation.execution.env.TITAN_COMPILER_IO_PROCESS_FIXTURE, path.join(options.nativeDir, "compiler_io_process_fixture"));
+  assert.equal(invocation.execution.env.TITAN_ROUTER_WORKER_FIXTURE, path.join(options.nativeDir, "router_worker_fixture"));
   assert.equal(invocation.execution.env.TITAN_EXTRA_LDFLAGS, "-lcaller");
   assert.equal(invocation.execution.env.TITAN_FILTER, undefined);
   assert.equal(invocation.execution.env.GCOV_PREFIX, undefined);

@@ -9,7 +9,8 @@ A bundled, skills-only Codex plugin queries the same executable; see
 On Linux and macOS, the native executable statically links the Titan
 standard-library runtime, an embedded Lua interpreter, libuv, llhttp and
 SQLite. OpenSSL follows the selected Titan SDK: by default it uses the
-system's OpenSSL 3 libraries, while a bundled-OpenSSL SDK links its own archive.
+system's OpenSSL 3 or 4 libraries, while a bundled-OpenSSL SDK links its own
+archive.
 The executable also embeds
 metadata-only interfaces for all SDK-selected canonical Titan standard
 modules, so ordinary project typechecking needs no SDK at run time.
@@ -356,10 +357,12 @@ the root path.
 
 ## Indexing and diagnostics
 
-While the server builds or refreshes its saved-file state, a busy
-**Titan indexing N/M files** language-status item appears for that workspace
-folder. It disappears when the generation is ready. An indexing failure stays
-visible as an error, and selecting it opens the language-server output.
+While claimed roots build or refresh their saved-file state, one session-wide
+**Titan indexing N/M files** language-status item stays busy until no claimed
+root is indexing. Counts appear only when every busy root reports its workset.
+It disappears when the session is ready. A claimed root's latest indexing
+failure stays visible as an error, and selecting it opens the language-server
+output.
 Read-only features stay responsive during indexing. Until the first generation
 is ready they return their ordinary empty result. Afterward an unchanged
 request uses the most recent completed generation without rescanning, also

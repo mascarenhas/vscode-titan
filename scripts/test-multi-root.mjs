@@ -1,7 +1,7 @@
-// Real-server transcript for one language-server session serving several
-// independent Titan roots. Every case launches the built executable and speaks
-// framed JSON-RPC over its stdio, exactly as a client does.
+// Client transcripts over framed stdio. Most cases launch the real server;
+// controlled lifecycle cases use the production router with a framed test peer.
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
 import {
   lstat,
   mkdir,
@@ -2315,6 +2315,155 @@ async function testWarmDiagnosticReplay() {
   }
 }
 
+function peerSession(root) {
+  const executable = process.env.TITAN_ROUTER_WORKER_FIXTURE;
+  assert.ok(executable, "build the router peer and set TITAN_ROUTER_WORKER_FIXTURE");
+  return new Session(spawn(executable, ["--router"], {
+    cwd: root, env: process.env, stdio: ["pipe", "pipe", "pipe"]
+  }));
+}
+
+function assertAcceptedTimeline(session) {
+  const model = new IndexingStatusModel();
+  let epoch = -1;
+  let generation = 0;
+  for (const status of session.responses.indexingStatuses) {
+    assert.ok(status.epoch >= epoch && status.generation >= generation,
+      `the session timeline regressed: ${JSON.stringify(status)}`);
+    assert.ok(model.update(status),
+      `the extension rejected a lifecycle status: ${JSON.stringify(status)}`);
+    epoch = status.epoch;
+    generation = status.generation;
+  }
+}
+
+async function testRouterActivationTransitions() {
+  const base = await makeBase("activation-transitions");
+  for (const mode of ["reject-initialize", "exit-before-initialize",
+    "exit-on-initialize", "invalid-settings", "quiet"]) {
+    const root = path.join(base, mode);
+    await writeRoot(root, ROOT_A_SOURCE);
+    if (mode === "invalid-settings") {
+      await writeFile(path.join(root, "titan-config.lua"), "compiler_root = 3\n", "utf8");
+    }
+    const session = peerSession(root);
+    try {
+      await session.initialize({ workspaceFolders: [{ uri: uri(root), name: mode }] });
+      session.notify("initialized", {});
+      if (mode === "quiet") {
+        const running = rootEntry(await session.status(), root);
+        assert.ok(Number.isInteger(running.workerPid), "the quiet peer reported no PID");
+        assert.equal(session.responses.indexingStatuses.length, 1,
+          "the quiet peer emitted an indexing frame before the kill");
+        process.kill(running.workerPid, "SIGKILL");
+      }
+      await waitNotification(session, session.responses.indexingStatuses, 0,
+        (status) => status.state === "failed", `${mode} terminal status`);
+      const statuses = session.responses.indexingStatuses;
+      assert.equal(statuses[0].state, "indexing");
+      assert.equal(statuses[0].initial, true);
+      assert.equal(statuses[0].completed_files, undefined);
+      assert.equal(statuses.at(-1).generation, 0,
+        "failure counted a completed root publication");
+      assert.equal(statuses.length, 2, "activation repeated its terminal frame");
+      assert.equal(rootEntry(await session.status(), root).state, "failed");
+      assertAcceptedTimeline(session);
+      await session.shutdown();
+    } finally {
+      await session.abort();
+    }
+  }
+}
+
+async function testNestedDiscoveryDuringBlockedRefresh() {
+  const base = await makeBase("blocked-refresh");
+  const outer = path.join(base, "refresh-blocked");
+  const inner = path.join(outer, "accept");
+  // No outer config: releasing the folder must really exclude that root, not
+  // rediscover and immediately reclaim it while clearing diagnostic ownership.
+  await mkdir(outer);
+  const outerSource = path.join(outer, "main.titan");
+  await writeFile(outerSource, ROOT_A_SOURCE, "utf8");
+  const innerSource = await writeRoot(inner, ROOT_B_SOURCE);
+  const session = peerSession(outer);
+  const folder = { uri: uri(outer), name: "outer" };
+  const issue = (method, params) => {
+    const id = session.nextId++;
+    session.child.stdin.write(frame({ jsonrpc: "2.0", id, method, params }));
+    return id;
+  };
+  try {
+    await session.initialize({ workspaceFolders: [folder] });
+    session.notify("initialized", {});
+    await waitNotification(session, session.responses.indexingStatuses, 0,
+      (status) => status.state === "ready", "the peer's initial index");
+    const running = rootEntry(await session.status(), outer);
+    const refreshStart = session.responses.indexingStatuses.length;
+    const pullId = issue("textDocument/diagnostic", {
+      textDocument: { uri: uri(outerSource) }
+    });
+    const busy = await waitNotification(session, session.responses.indexingStatuses,
+      refreshStart, (status) => status.state === "indexing", "blocked saved refresh");
+    const nestedStart = session.responses.indexingStatuses.length;
+    // The peer deliberately rejects semantic requests; that reply is a barrier
+    // proving the router discovered and activated the nested root, not a compiler
+    // assertion. The outer pull cannot complete until the later outer hover.
+    const nested = await session.send("textDocument/hover", {
+      textDocument: { uri: uri(innerSource) }, position: { line: 0, character: 0 }
+    });
+    assert.match(nested.error?.message ?? "", /unsupported fixture request/);
+    const discovered = await session.status();
+    assert.equal(rootEntry(discovered, inner).origin, "discovered");
+    assert.ok(session.responses.indexingStatuses.slice(nestedStart)
+      .some((status) => status.state === "indexing" && status.initial &&
+        status.epoch > busy.epoch), "nested discovery did not replace the busy workset");
+    assert.equal(session.responses.indexingStatuses.at(-1).state, "indexing",
+      "the nested ready frame hid the blocked outer refresh");
+
+    let start = session.responses.indexingStatuses.length;
+    session.notify("workspace/didChangeWorkspaceFolders", {
+      event: { added: [], removed: [folder] }
+    });
+    const released = await waitNotification(session, session.responses.indexingStatuses,
+      start, (status) => status.state === "ready", "release of the busy outer root");
+    start = session.responses.indexingStatuses.length;
+    session.notify("workspace/didChangeWorkspaceFolders", {
+      event: { added: [folder], removed: [] }
+    });
+    const reclaimed = await waitNotification(session, session.responses.indexingStatuses,
+      start, (status) => status.state === "indexing", "reclaim of the busy outer root");
+    assert.ok(reclaimed.epoch > released.epoch);
+    assert.equal(reclaimed.generation, released.generation,
+      "warm reclaim counted another completed publication");
+    assert.equal(rootEntry(await session.status(), outer).workerPid, running.workerPid,
+      "busy release/reclaim replaced the warm worker");
+
+    const hoverId = issue("textDocument/hover", {
+      textDocument: { uri: uri(outerSource) }, position: { line: 0, character: 0 }
+    });
+    const replies = new Map();
+    while (replies.size < 2) {
+      const message = await session.responses.read(STATUS_TIMEOUT_MILLISECONDS);
+      if (message.id === undefined) {
+        collectNotification(session.responses, message);
+      } else {
+        assert.ok(message.id === pullId || message.id === hoverId,
+          `unexpected reply while releasing refresh: ${JSON.stringify(message)}`);
+        assert.ok(!replies.has(message.id), "the peer repeated a request reply");
+        replies.set(message.id, message);
+      }
+    }
+    assert.deepEqual(replies.get(pullId).result, { kind: "full", items: [] });
+    assert.equal(replies.get(hoverId).result, null);
+    await waitNotification(session, session.responses.indexingStatuses, start,
+      (status) => status.state === "ready", "the released saved refresh");
+    assertAcceptedTimeline(session);
+    await session.shutdown();
+  } finally {
+    await session.abort();
+  }
+}
+
 const groups = [
   ["independent", testIndependentRoots, "independent roots"],
   ["folders", testFolderChanges, "folder changes"],
@@ -2333,6 +2482,8 @@ const groups = [
   ["nested-status", testNestedIndexingStatus, "nested indexing and failure status"],
   ["crash-diagnostics", testCrashDiagnosticClearing, "crashed diagnostic clearing"],
   ["warm-diagnostics", testWarmDiagnosticReplay, "warm diagnostic replay"],
+  ["activation-transitions", testRouterActivationTransitions, "framed activation failure transitions"],
+  ["busy-membership", testNestedDiscoveryDuringBlockedRefresh, "nested discovery and busy membership transitions"],
   ["shutdown-restart", testShutdownDuringRestart, "shutdown during a restart"],
   ["diagnostics", testProgressAndPullPerRoot, "progress and pull per root"],
   ["diagnostics-optout", testRouterPullOptOut, "router pull opt-out"]

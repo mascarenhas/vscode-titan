@@ -66,6 +66,7 @@ SERVER_COVERAGE_FORMATS ?=
 SERVER_COVERAGE_TIMEOUT ?= 1200
 COMPILER_IO_CLOCK_SOURCE := src/server/compiler_io_clock.c
 COMPILER_IO_PROCESS_FIXTURE := $(NATIVE_BUILD_DIR)/compiler_io_process_fixture
+ROUTER_WORKER_FIXTURE := $(NATIVE_BUILD_DIR)/router_worker_fixture
 EMBEDDED_INTERFACES_GENERATOR := scripts/generate-embedded-interfaces.lua
 EMBEDDED_INTERFACES_SOURCE := $(NATIVE_BUILD_DIR)/embedded_interfaces_native.c
 HOST_OS := $(shell uname -s)
@@ -133,9 +134,10 @@ COMPILER_ENV = env -u LUA_PATH -u LUA_CPATH -u LUA_PATH_5_5 -u LUA_CPATH_5_5 -u 
 	TITAN_PATH_0_6=$(call shell_quote,$(TITAN_PREFIX)/lib/titan/0.6) \
 	TITAN_PATH=$(call shell_quote,$(TITAN_PREFIX)/lib/titan/0.6)
 TITAN_FLAGS ?=
-TITAN_COMPILE_FLAGS = $(TITAN_FLAGS) --tree $(call shell_quote,$(SOURCE_ROOT)) --source-first --incremental --static \
+TITAN_COMPILE_OPTIONS = --source-first --incremental --static \
 	-I $(call shell_quote,$(abspath src/server)) \
 	$(foreach flag,$(OPENSSL_CPPFLAGS),--cflag=$(call shell_quote,$(flag)))
+TITAN_COMPILE_FLAGS = $(TITAN_FLAGS) --tree $(call shell_quote,$(SOURCE_ROOT)) $(TITAN_COMPILE_OPTIONS)
 TITAN_LINK_FLAGS = --ldflag=$(call shell_quote,$(EXPORT_LUA_LDFLAGS)) \
 	--ldflag=$(call shell_quote,$(TITAN_STANDARD_PROVIDER)) \
 	$(foreach flag,$(OPENSSL_LDFLAGS),--ldflag=$(call shell_quote,$(flag))) \
@@ -148,6 +150,7 @@ TEST_ENV = env -u TITAN_PATH_0_6 -u TITAN_PATH \
 	TITAN_ROOT=$(call shell_quote,$(TITAN_PREFIX)) \
 	TITAN_PREFIX=$(call shell_quote,$(BUILD_ROOT)/compiler-cache) \
 	TITAN_COMPILER_IO_PROCESS_FIXTURE=$(call shell_quote,$(COMPILER_IO_PROCESS_FIXTURE)) \
+	TITAN_ROUTER_WORKER_FIXTURE=$(call shell_quote,$(ROUTER_WORKER_FIXTURE)) \
 	CCACHE_DISABLE=$(call shell_quote,$(CCACHE_DISABLE)) \
 	LUA_PATH_5_5="$$( $(call shell_quote,$(TITAN_LUA)) -E -e 'io.write(package.path)' )" \
 	LUA_CPATH_5_5="$$( $(call shell_quote,$(TITAN_LUA)) -E -e 'io.write(package.cpath)' )"
@@ -157,6 +160,7 @@ SERVER_TEST_ENV = env -u TITAN_PREFIX -u TITAN_PATH_0_6 -u TITAN_PATH -u TITAN_S
 	CC=$(call shell_quote,$(CC)) CCACHE_DISABLE=$(call shell_quote,$(CCACHE_DISABLE)) \
 	TITAN_EXTRA_CPPFLAGS=$(call shell_quote,$(strip $(TITAN_EXTRA_CPPFLAGS) $(OPENSSL_CPPFLAGS))) \
 	TITAN_ROOT=$(call shell_quote,$(TITAN_PREFIX)) \
+	TITAN_ROUTER_WORKER_FIXTURE=$(call shell_quote,$(ROUTER_WORKER_FIXTURE)) \
 	TITAN_LS_LUA_PATH=$(call shell_quote,$(DEVELOPMENT_LUA_PATH)) \
 	TITAN_LS_LUA_CPATH=$(call shell_quote,$(DEVELOPMENT_LUA_CPATH))
 
@@ -280,6 +284,14 @@ server-build: $(EMBEDDED_INTERFACES_SOURCE) | $(TITANC)
 		--output $(call shell_quote,$(SERVER_BUILD_DIR)) --exe $(call shell_quote,$(SERVER)) \
 		$(TITAN_LINK_FLAGS) titan_language_server
 
+# Like the server, let Titan own incremental products in a private output tree.
+.PHONY: $(ROUTER_WORKER_FIXTURE)
+$(ROUTER_WORKER_FIXTURE): $(EMBEDDED_INTERFACES_SOURCE) | $(TITANC)
+	+$(COMPILER_ENV) $(call shell_quote,$(TITANC)) $(TITAN_FLAGS) \
+		--tree $(call shell_quote,$(SOURCE_ROOT);$(abspath test/fixtures)) $(TITAN_COMPILE_OPTIONS) \
+		--output $(call shell_quote,$(BUILD_ROOT)/router-worker) \
+		--exe $(call shell_quote,$(ROUTER_WORKER_FIXTURE)) $(TITAN_LINK_FLAGS) router_worker_fixture
+
 server-test: server-test-build
 	+$(MAKE) server-test-run
 
@@ -287,7 +299,7 @@ server-test-objects: | $(TITANC)
 	+$(COMPILER_ENV) $(call shell_quote,$(TITANC)) $(TITAN_COMPILE_FLAGS) \
 		--output $(call shell_quote,$(TEST_BUILD_DIR)) --test -c server.tests
 
-server-test-build: $(EMBEDDED_INTERFACES_SOURCE) $(COMPILER_IO_PROCESS_FIXTURE) | $(TITANC)
+server-test-build: $(EMBEDDED_INTERFACES_SOURCE) $(COMPILER_IO_PROCESS_FIXTURE) $(ROUTER_WORKER_FIXTURE) | $(TITANC)
 	+$(COMPILER_ENV) $(call shell_quote,$(TITANC)) $(TITAN_COMPILE_FLAGS) \
 		--output $(call shell_quote,$(TEST_BUILD_DIR)) --exe $(call shell_quote,$(SERVER_TEST)) \
 		--test --no-uv-bootstrap $(TITAN_LINK_FLAGS) server.tests
@@ -300,7 +312,7 @@ server-test-sharded: server-test-build
 
 # Coverage uses a separate source tree; the test executable resets and reports
 # its own counters through the compiler's embedded coverage inventory.
-server-coverage-build: $(EMBEDDED_INTERFACES_SOURCE) $(COMPILER_IO_PROCESS_FIXTURE)
+server-coverage-build: $(EMBEDDED_INTERFACES_SOURCE) $(COMPILER_IO_PROCESS_FIXTURE) $(ROUTER_WORKER_FIXTURE)
 	+$(COMPILER_ENV) node scripts/server-coverage.mjs build \
 		--prefix $(call shell_quote,$(TITAN_PREFIX)) \
 		--build-dir $(call shell_quote,$(abspath $(SERVER_COVERAGE_BUILD_DIR))) \
@@ -332,7 +344,7 @@ shard-runner-test:
 incremental-build-test:
 	node scripts/test-incremental-build.mjs --prefix $(call shell_quote,$(TITAN_PREFIX))
 
-server-protocol-test: $(SERVER) completion-protocol-test
+server-protocol-test: $(SERVER) $(ROUTER_WORKER_FIXTURE) completion-protocol-test
 	$(SERVER_TEST_ENV) node scripts/test-server-protocol.mjs "$(SERVER)"
 	$(SERVER_TEST_ENV) node scripts/test-workspace-cache.mjs "$(SERVER)"
 	$(SERVER_TEST_ENV) node scripts/test-multi-root.mjs "$(SERVER)"

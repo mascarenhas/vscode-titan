@@ -177,6 +177,8 @@ record Router
   local discovered: {string: string}
   local closed: boolean
   local indexing_status: indexing_status.Status?
+  -- Strict clients keep one initial cycle open until the first session ready.
+  local initial_pending: boolean
 end
 
 type Finish = function (): ()
@@ -289,6 +291,7 @@ function create(options: LaunchOptions, output: response_queue.ResponseQueue): R
     discovered = {},
     closed = false,
     indexing_status = nil,
+    initial_pending = true,
   }
 end
 
@@ -370,6 +373,7 @@ local function owner_root(router: Router, canonical: string): roots.Root?
   local discovered? = nested_configuration(router, canonical, owner_path)
   if discovered ~= nil then
     local entry = router.registry:attach_discovery(discovered as string)
+    router:publish_indexing { reset = false, completed = false }
     logging.emit("info", "root.discovered", {
       ["root"] = entry.path,
       ["path"] = canonical,
@@ -529,8 +533,6 @@ local function still_owned(router: Router, slot: Slot): boolean
   return router.slots[slot.root.path] == slot
 end
 
--- Stop one slot's worker after its in-flight requests finish. The caller owns
--- the slot transition, so a restart can stop and start inside one transition.
 -- Publish an empty diagnostic set: the one publication that clears whatever a
 -- previous owner said about this document.
 local function publish_empty_diagnostics(router: Router, uri: string)
@@ -554,7 +556,7 @@ local function Router:publish_indexing(reset: boolean, completed: boolean)
   local completed_files = 0
   local total_files = 0
   local claimed = 0
-  local failed: Slot? = nil
+  local failure_slot: Slot? = nil
   for index = 1, #self.order do
     local slot = self.slots[self.order[index]]
     if slot.root:claimed() then
@@ -572,7 +574,7 @@ local function Router:publish_indexing(reset: boolean, completed: boolean)
             total_files = total_files + status.total_files
           end
         when failed() then
-          if failed == nil then failed = slot end
+          if failure_slot == nil then failure_slot = slot end
         else
         end
       elseif slot.indexing then
@@ -583,8 +585,19 @@ local function Router:publish_indexing(reset: boolean, completed: boolean)
       end
     end
   end
+  initial = self.initial_pending or initial
   local previous? = self.indexing_status
-  if previous == nil and not busy and failed == nil then return end
+  if previous == nil and not busy and failure_slot == nil then return end
+  if previous == nil and not busy then
+    -- Settings or admission can fail before any worker starts. Strict clients
+    -- still require the initial busy frame before the terminal failure.
+    previous = indexing_status.Status {
+      state = indexing_status.State.indexing(), initial = true,
+      epoch = 1, generation = 0,
+    }
+    self.indexing_status = previous
+    self.output:push(indexing_status.notification(previous))
+  end
   local epoch = 0
   local generation = 0
   if previous ~= nil then
@@ -595,19 +608,23 @@ local function Router:publish_indexing(reset: boolean, completed: boolean)
   -- restartable generation or the current number of roots.
   if completed then generation = generation + 1 end
   if busy then
+    -- Aggregate counters have the same safe-integer bound as worker counters.
+    counted = counted and total_files <= 9007199254740991
     if previous == nil then
       reset = true
     else
       reset = reset or
         indexing_status.state_name(previous.state) ~= "indexing" or
         previous.initial ~= initial
-      if counted and previous.completed_files ~= nil then
-        reset = reset or previous.total_files ~= total_files or
+      if previous.completed_files ~= nil then
+        reset = reset or not counted or previous.total_files ~= total_files or
           completed_files < previous.completed_files
       end
     end
-    -- Aggregate counters have the same safe-integer bound as worker counters.
-    counted = counted and total_files <= 9007199254740991
+    if not reset and previous ~= nil and previous.generation == generation and
+       ((not counted and previous.completed_files == nil) or
+        (counted and previous.completed_files == completed_files and
+         previous.total_files == total_files)) then return end
     if reset then
       epoch = epoch + 1
       local status = indexing_status.Status {
@@ -617,7 +634,17 @@ local function Router:publish_indexing(reset: boolean, completed: boolean)
       self.indexing_status = status
       self.output:push(indexing_status.notification(status))
     end
-    if not counted then return end
+    if not counted then
+      if not reset then
+        local status = indexing_status.Status {
+          state = indexing_status.State.indexing(), initial = initial,
+          epoch = epoch, generation = generation,
+        }
+        self.indexing_status = status
+        self.output:push(indexing_status.notification(status))
+      end
+      return
+    end
     if reset or previous == nil or previous.completed_files == nil then
       local baseline = indexing_status.Status {
         state = indexing_status.State.indexing(), initial = initial,
@@ -638,18 +665,21 @@ local function Router:publish_indexing(reset: boolean, completed: boolean)
     return
   end
   if previous ~= nil then initial = previous.initial end
-  -- Lifecycle resets (including a crash after ready) also advance the session
-  -- watermark, even when no busy root remains.
-  if reset then epoch = epoch + 1 end
   local state = indexing_status.State.ready()
   local message: string? = nil
-  if failed ~= nil then
+  if failure_slot ~= nil then
     state = indexing_status.State.failed()
-    message = failed.indexing_status.message
+    message = failure_slot.indexing_status.message
     if claimed > 1 then
-      message = failed.root.path .. ": " .. (message or "Titan indexing failed")
+      message = failure_slot.root.path .. ": " .. (message or "Titan indexing failed")
     end
   end
+  if previous ~= nil and
+     indexing_status.state_name(previous.state) == indexing_status.state_name(state) and
+     previous.initial == initial and previous.generation == generation and
+     previous.message == message then return end
+  epoch = epoch + 1
+  if failure_slot == nil then self.initial_pending = false end
   local status = indexing_status.Status {
     state = state, initial = initial, epoch = epoch, generation = generation,
     message = message,
@@ -658,10 +688,26 @@ local function Router:publish_indexing(reset: boolean, completed: boolean)
   self.output:push(indexing_status.notification(status))
 end
 
+local function Slot:fail_indexing(router: Router, message: string)
+  self.indexing = false
+  local previous? = self.indexing_status
+  if previous ~= nil and indexing_status.state_name(previous.state) == "failed" and
+     previous.message == message then return end
+  self.indexing_status = indexing_status.Status {
+    state = indexing_status.State.failed(),
+    initial = previous == nil or previous.initial,
+    epoch = 0, message = message,
+  }
+  if self.root:claimed() then
+    router:publish_indexing { reset = false, completed = false }
+  end
+end
+
 local function Slot:on_indexing(router: Router, params: wire.Object)
   local name? = wire.as_string(params["state"])
   local epoch? = wire.as_integer(params["epoch"])
-  if name == nil or epoch == nil then return end
+  local initial? = wire.as_boolean(params["initial"])
+  if name == nil or epoch == nil or initial == nil then return end
   local state = indexing_status.State.indexing()
   if name == "ready" then
     state = indexing_status.State.ready()
@@ -675,7 +721,7 @@ local function Slot:on_indexing(router: Router, params: wire.Object)
   -- allowing it to roll back the root before aggregating it.
   if previous ~= nil and epoch < previous.epoch then return end
   local status = indexing_status.Status {
-    state = state, initial = params["initial"] as boolean, epoch = epoch,
+    state = state, initial = initial, epoch = epoch,
     generation = wire.as_integer(params["generation"]),
     message = wire.as_string(params["message"]),
     completed_files = wire.as_integer(params["completed_files"]),
@@ -692,7 +738,7 @@ local function Slot:on_indexing(router: Router, params: wire.Object)
   local completed = name == "ready" and
     (previous == nil or indexing_status.state_name(previous.state) ~= "ready" or
      previous.generation ~= status.generation)
-  router:publish_indexing(reset, completed)
+  router:publish_indexing { reset = reset, completed = completed }
 end
 
 -- Clear every publication this root made for a document another root now owns.
@@ -715,6 +761,8 @@ local function clear_stale_diagnostics(router: Router, slot: Slot)
   end
 end
 
+-- Stop one worker while holding its slot transition. The caller decides when
+-- to publish: a restart replaces busy without an intermediate ready frame.
 local function stop_worker_locked(router: Router, slot: Slot, reason: string)
   drain_requests(router, slot.root.path)
   local worker? = slot.worker
@@ -722,7 +770,6 @@ local function stop_worker_locked(router: Router, slot: Slot, reason: string)
   slot.worker_pid = nil
   slot.titan_root = nil
   slot.probe_prefix = nil
-  local was_indexing = slot.indexing
   slot.indexing = false
   -- Stopping ends busy, but idle eviction must not dismiss a latest failure.
   local status? = slot.indexing_status
@@ -731,11 +778,6 @@ local function stop_worker_locked(router: Router, slot: Slot, reason: string)
     slot.indexing_status = nil
   end
   slot.replay_diagnostics = false
-  -- An already-terminal root changes no indexing workset when its process
-  -- stops. In particular, shutdown must not manufacture another ready epoch.
-  if was_indexing and slot.root:claimed() then
-    router:publish_indexing(true, false)
-  end
   if worker ~= nil then
     local actual_worker = worker as worker_process.WorkerProcess
     -- Ownership moves to the router before any suspension point: a caller
@@ -743,6 +785,7 @@ local function stop_worker_locked(router: Router, slot: Slot, reason: string)
     -- the child or its relay Tasks, so the terminal paths can still release it.
     router.retired[#router.retired + 1] = actual_worker
     slot.stopping = true
+    defer do slot.stopping = false end
     do
       actual_worker:stop(SHUTDOWN_TIMEOUT_MILLISECONDS)
     catch
@@ -752,7 +795,6 @@ local function stop_worker_locked(router: Router, slot: Slot, reason: string)
         ["message"] = strings.tostring(error),
       })
     end
-    slot.stopping = false
   end
   fail_forwarded(router, slot.root.path,
     "Titan worker for " .. slot.root.path .. " stopped: " .. reason)
@@ -792,13 +834,19 @@ end
 local function stop_slot(router: Router, slot: Slot, reason: string)
   begin_transition(slot)
   defer end_transition(slot)
+  local was_indexing = slot.indexing
+  defer do
+    if was_indexing and slot.root:claimed() then
+      router:publish_indexing { reset = false, completed = false }
+    end
+  end
   stop_worker_locked(router, slot, reason)
   forget_released(router, slot)
 end
 
 local function worker_listener(router: Router, slot: Slot): worker_process.Listener
   local owner = slot
-  local generation = slot.generation + 1
+  local generation = slot.generation
   return worker_process.Listener.new(
     function (method: string, params: value, body: string)
       if owner.generation ~= generation or
@@ -821,6 +869,7 @@ local function worker_listener(router: Router, slot: Slot): worker_process.Liste
         return
       end
       if method == "titan/indexingStatus" then
+        if owner.stopping then return end
         local object? = wire.as_object(params)
         if object ~= nil then owner:on_indexing(router, object) end
         return
@@ -867,6 +916,8 @@ local function worker_listener(router: Router, slot: Slot): worker_process.Liste
       router.output:push(body)
     end,
     function (id: value, method: string, params: value, body: string)
+      if owner.generation ~= generation or
+         (owner.worker == nil and not owner.stopping) then return end
       router.next_outbound = router.next_outbound + 1
       local generated = "titan-ls:" .. strings.tostring(router.next_outbound)
       router.outbound[worker_process.id_key(generated as value)] =
@@ -880,6 +931,8 @@ local function worker_listener(router: Router, slot: Slot): worker_process.Liste
       router.output:push(wire.encode(envelope))
     end,
     function (body: string)
+      if owner.generation ~= generation or
+         (owner.worker == nil and not owner.stopping) then return end
       do
         local parsed = wire.decode(body)
         local object? = wire.as_object(parsed)
@@ -895,7 +948,8 @@ local function worker_listener(router: Router, slot: Slot): worker_process.Liste
       router.output:push(body)
     end,
     function (message: string)
-      if owner.stopping or owner.worker == nil then return end
+      if owner.generation ~= generation or
+         owner.stopping or owner.worker == nil then return end
       -- The process is gone, so its transport Tasks and pipes must be released
       -- even though this listener cannot yield: the housekeeping Task drains
       -- `retired` on its next pass.
@@ -905,7 +959,6 @@ local function worker_listener(router: Router, slot: Slot): worker_process.Liste
       owner.worker_pid = nil
       owner.titan_root = nil
       owner.probe_prefix = nil
-      owner.indexing = false
       -- The replacement's empty Publisher cannot clear the dead worker's rows.
       -- Registry ownership is nonyielding here; leave any newer owner's rows.
       for uri, path in iteration.pairs(owner.published) do
@@ -916,13 +969,7 @@ local function worker_listener(router: Router, slot: Slot): worker_process.Liste
       end
       owner.published = {}
       owner.replay_diagnostics = false
-      local previous? = owner.indexing_status
-      owner.indexing_status = indexing_status.Status {
-        state = indexing_status.State.failed(),
-        initial = previous ~= nil and previous.initial,
-        epoch = 0, message = message,
-      }
-      router:publish_indexing(true, false)
+      owner:fail_indexing(router, message)
       -- The process is gone, so the requests it owed the client can never be
       -- answered; forget them before any early return below.
       forget_outbound(router, owner.root.path)
@@ -1194,9 +1241,10 @@ local function clear_configuration_diagnostic(router: Router, slot: Slot)
   router.output:push(wire.encode(envelope))
 end
 
-local function fail_slot(slot: Slot, message: string)
+local function fail_slot(router: Router, slot: Slot, message: string)
   slot.state = WorkerState.failed(message)
   slot.failure = message
+  slot:fail_indexing(router, message)
   logging.emit("error", "root.failed", {
     ["root"] = slot.root.path,
     ["message"] = message,
@@ -1213,6 +1261,7 @@ local function start_worker(router: Router, slot: Slot,
   end
   local probe = root_settings.probe_prefix(
     router.options.probe_prefix, slot.root.path)
+  slot.generation = slot.generation + 1
   local worker = worker_process.spawn(
     router.options.executable, arguments, slot.root.path, probe,
     worker_listener(router, slot))
@@ -1225,8 +1274,9 @@ local function start_worker(router: Router, slot: Slot,
   -- titan/indexingStatus frame arrives, and stopping it would discard that pass.
   slot.indexing = true
   slot.indexing_status = nil
-  slot.generation = slot.generation + 1
-  router:publish_indexing(true, false)
+  if slot.root:claimed() then
+    router:publish_indexing { reset = true, completed = false }
+  end
   local outcome = worker:request(
     "initialize", worker_initialize_params(router, slot.root.path),
     ACTIVATION_TIMEOUT_MILLISECONDS)
@@ -1248,28 +1298,26 @@ local function start_worker(router: Router, slot: Slot,
     return true
   when failed(error_value) then
     slot.worker = nil
-    slot.indexing = false
     -- Ownership moves before any suspension, so a cancelled caller still
     -- leaves the child and its relay Tasks to the terminal paths.
     router.retired[#router.retired + 1] = worker
+    record_crash(slot)
+    fail_slot(router, slot, "Titan worker for " .. slot.root.path ..
+      " rejected initialize: " .. wire.encode(error_value))
     do
       worker:stop(SHUTDOWN_TIMEOUT_MILLISECONDS)
     catch
       if error is async.CancellationReason then raise end
     end
-    record_crash(slot)
-    fail_slot(slot, "Titan worker for " .. slot.root.path ..
-      " rejected initialize: " .. strings.tostring(error_value))
     return false
   when unavailable(message) then
     -- The exit listener already retired this worker; releasing it twice is
     -- harmless because release is idempotent.
     slot.worker = nil
-    slot.indexing = false
+    fail_slot(router, slot, message)
     router.retired[#router.retired + 1] = worker
     worker:kill()
     record_crash(slot)
-    fail_slot(slot, message)
     return false
   end
   return false
@@ -1357,6 +1405,7 @@ local function revalidate(router: Router, slot: Slot, force: boolean): boolean
     end
     slot.state = WorkerState.failed(message)
     slot.failure = message
+    slot:fail_indexing(router, message)
     if selection_refused(error_value.reason) then
       publish_configuration_diagnostic(router, slot, error_value.path, message)
     end
@@ -1432,7 +1481,7 @@ local function activate(router: Router, slot: Slot): (Slot?, string?)
         strings.tostring(router.max_workers) ..
         ") reached; close another Titan root or raise " ..
         MAX_WORKERS_ENVIRONMENT_VARIABLE
-      fail_slot(slot, cap_message)
+      fail_slot(router, slot, cap_message)
       return nil, cap_message
     end
     local started = start_worker(router, slot, settings as root_settings.Settings)
@@ -1657,7 +1706,7 @@ local function Router:remove_root(canonical: string)
   if released then
     local slot? = self.slots[canonical]
     if slot ~= nil then slot.replay_diagnostics = slot.worker ~= nil end
-    self:publish_indexing(true, false)
+    self:publish_indexing { reset = false, completed = false }
   end
   logging.emit("info", "root.release", {
     ["root"] = canonical,
@@ -1706,6 +1755,7 @@ local function Router:on_folders(params: value)
           else
             local canonical = roots.canonical(path as string)
             slot_for_root(self, self.registry:add_folder(canonical))
+            self:publish_indexing { reset = false, completed = false }
             logging.emit("info", "root.added", {["root"] = canonical})
           end
         end
@@ -1823,13 +1873,12 @@ local function Router:reconcile()
       defer end_transition(slot)
       local worker? = slot.worker
       if worker ~= nil and state_ready(slot.state) then
-        slot.replay_diagnostics = false
-        self:publish_indexing(true, false)
         local params: wire.Object = {}
         local outcome = worker:request("titan/republishDiagnostics",
           params, ACTIVATION_TIMEOUT_MILLISECONDS)
         case outcome
         when answered() then
+          slot.replay_diagnostics = false
         when failed(failure) then
           logging.emit("error", "diagnostics.replay.failure", {
             ["root"] = slot.root.path, ["message"] = wire.encode(failure),
@@ -1976,9 +2025,16 @@ local function Router:activate_initial_roots()
           end
         catch
           if error is async.CancellationReason then raise end
+          local message = strings.tostring(error)
+          begin_transition(slot)
+          defer end_transition(slot)
+          if slot.worker ~= nil then
+            stop_worker_locked(self, slot, "activation failure")
+          end
+          fail_slot(self, slot, message)
           logging.emit("error", "root.activation.failure", {
             ["root"] = root_path,
-            ["message"] = strings.tostring(error),
+            ["message"] = message,
           })
         end
       end

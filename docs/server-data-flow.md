@@ -175,14 +175,20 @@ it. The custom `titan/indexingStatus` notification (`indexing_status`) drives
 the extension's language-status item. `Router:publish_indexing` aggregates the
 latest snapshots of claimed roots onto one session timeline: busy while any
 root indexes, otherwise failed while any root's latest snapshot failed,
-otherwise ready. Busy is initial if any indexing root is initial. File counters
-are summed only when every indexing root reports them; otherwise busy has no
-counters. A changed workset or busy-root membership starts a newer bare-busy
+otherwise ready. Busy stays initial until the first session ready; afterward it
+is initial if any indexing root is initial. File counters are summed only when
+every indexing root reports them; otherwise busy has no counters. A changed
+workset or busy-root membership starts a newer bare-busy
 epoch and a zero-count baseline before counted progress. Failure messages
 identify the failed root when more than one root is claimed.
 Terminal snapshots survive idle worker eviction; releasing a root excludes its
-snapshot until that root is claimed again. Stopping an already-terminal worker
-does not publish a new indexing status.
+snapshot until that root is claimed again, independently of diagnostic replay.
+Lifecycle changes publish only when the visible aggregate changes: an unchanged
+release, reclaim, replay or unclaimed exit does not manufacture an epoch. A busy
+restart replaces the old workset without an intermediate ready frame.
+An initialization or settings failure ends the root's busy contribution with a
+failed snapshot; an exit that already published terminal is not published again.
+If admission fails before any worker starts, initial bare busy precedes failed.
 
 The notification's session `generation` counts completed root publications.
 It is monotonic across worker restarts and root release, reclaim and eviction;
@@ -204,14 +210,16 @@ closed in the old owner and opened in the new one with the router's latest text,
 and diagnostics a root published for a document it no longer owns are cleared
 with an empty publication. An unexpectedly exited worker's tracked publications
 are cleared immediately for URIs it still owns, so a file fixed or deleted
-before replacement startup cannot retain a stale diagnostic. Retired worker
-notifications are rejected, including a diagnostic frame whose path lookup
-suspended across process exit or replacement. A released warm
+before replacement startup cannot retain a stale diagnostic. Every worker
+callback is fenced by its captured generation, including a diagnostic frame
+whose path lookup suspended across process exit or replacement. A released warm
 root that regains ownership replays its completed diagnostics after old-owner
 clearing: the router requests `titan/republishDiagnostics`, and the worker
-reattaches its listener through `Application:set_diagnostics_listener`. The
-completed view's persisted rows remain the single diagnostic source, with no
-router-side snapshot. The router retains each open document's text under the
+reattaches its listener through `Application:set_diagnostics_listener`. Replay
+remains pending until the worker answers successfully; failure or unavailability
+leaves it eligible for the next reconciliation. The completed view's persisted
+rows remain the single diagnostic source, with no router-side snapshot. The
+router retains each open document's text under the
 same limits the worker applies (`document_buffers.limits`); a buffer it cannot
 retain is replayed as an unavailable contributor (`titan/documentUnavailable`),
 never as the saved bytes. It forwards `$/cancelRequest` to the worker that owns the request id,
