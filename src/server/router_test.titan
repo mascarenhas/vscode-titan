@@ -208,8 +208,51 @@ function test_router_busy_precedes_failure_and_release_removes_it(_: test.Contex
   test.assert(take_status(subject)["message"] == "nested failure",
     "a lone claimed root's failure gained an unnecessary root prefix")
   router.stop_worker_locked(subject, inner, "idle")
-  test.assert(take_status(subject)["message"] == "nested failure",
+  test.assert(subject.output:pending() == 0 and
+    subject.indexing_status.message == "nested failure",
     "idle eviction dismissed the root's latest indexing failure")
+end
+
+function test_router_stop_only_republishes_changed_busy_worksets(_: test.Context)
+  local subject = indexing_router()
+  local outer = router.slot_for_root(subject, subject.registry:add_folder("/outer"))
+  local inner = router.slot_for_root(subject, subject.registry:add_folder("/outer/inner"))
+  outer:on_indexing(subject, {
+    ["state"] = "indexing", ["initial"] = true, ["epoch"] = 1,
+  })
+  take_status(subject)
+  outer:on_indexing(subject, {
+    ["state"] = "ready", ["initial"] = true, ["epoch"] = 1, ["generation"] = 1,
+  })
+  local ready = take_status(subject)
+  router.stop_worker_locked(subject, outer, "shutdown")
+  test.assert(subject.output:pending() == 0 and
+    subject.indexing_status.epoch == wire.as_integer(ready["epoch"]),
+    "stopping a ready worker manufactured an indexing epoch")
+  inner:on_indexing(subject, {
+    ["state"] = "indexing", ["initial"] = true, ["epoch"] = 1,
+  })
+  local busy = take_status(subject)
+  router.stop_worker_locked(subject, outer, "idle")
+  test.assert(subject.output:pending() == 0 and
+    subject.indexing_status.epoch == wire.as_integer(busy["epoch"]),
+    "stopping a terminal worker reset another root's busy workset")
+  router.stop_worker_locked(subject, inner, "shutdown")
+  local stopped = take_status(subject)
+  test.assert(stopped["state"] == "ready" and
+    wire.as_integer(stopped["epoch"]) > wire.as_integer(busy["epoch"]) and
+    stopped["generation"] == ready["generation"],
+    "stopping an indexing worker did not finish its busy workset")
+  inner:on_indexing(subject, {
+    ["state"] = "indexing", ["initial"] = true, ["epoch"] = 2,
+  })
+  take_status(subject)
+  subject.registry:remove_folder("/outer/inner")
+  subject:publish_indexing(true, false)
+  take_status(subject)
+  router.stop_worker_locked(subject, inner, "released")
+  test.assert(subject.output:pending() == 0,
+    "stopping an excluded root reset the claimed roots' indexing status")
 end
 
 function test_router_rejects_retired_worker_notifications(_: test.Context)

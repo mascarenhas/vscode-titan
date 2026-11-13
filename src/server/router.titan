@@ -722,6 +722,7 @@ local function stop_worker_locked(router: Router, slot: Slot, reason: string)
   slot.worker_pid = nil
   slot.titan_root = nil
   slot.probe_prefix = nil
+  local was_indexing = slot.indexing
   slot.indexing = false
   -- Stopping ends busy, but idle eviction must not dismiss a latest failure.
   local status? = slot.indexing_status
@@ -730,7 +731,11 @@ local function stop_worker_locked(router: Router, slot: Slot, reason: string)
     slot.indexing_status = nil
   end
   slot.replay_diagnostics = false
-  router:publish_indexing(true, false)
+  -- An already-terminal root changes no indexing workset when its process
+  -- stops. In particular, shutdown must not manufacture another ready epoch.
+  if was_indexing and slot.root:claimed() then
+    router:publish_indexing(true, false)
+  end
   if worker ~= nil then
     local actual_worker = worker as worker_process.WorkerProcess
     -- Ownership moves to the router before any suspension point: a caller

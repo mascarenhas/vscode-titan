@@ -181,7 +181,8 @@ counters. A changed workset or busy-root membership starts a newer bare-busy
 epoch and a zero-count baseline before counted progress. Failure messages
 identify the failed root when more than one root is claimed.
 Terminal snapshots survive idle worker eviction; releasing a root excludes its
-snapshot until that root is claimed again.
+snapshot until that root is claimed again. Stopping an already-terminal worker
+does not publish a new indexing status.
 
 The notification's session `generation` counts completed root publications.
 It is monotonic across worker restarts and root release, reclaim and eviction;
