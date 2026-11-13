@@ -390,6 +390,124 @@ describe("Titan TextMate grammar", () => {
     assertScope(split[4], "integer", "storage.type.primitive.titan");
   });
 
+  test("reads block words written as names in a foreign function as names", () => {
+    // `repeat` and `end` are legal C names. After a `foreign import` of a
+    // header declaring `KeywordNode { int end; }` and `visit(int repeat)`,
+    // this source compiles; none of these names may open or close a block.
+    const lines = tokenizeLines([
+      "foreign type repeat = int",
+      "foreign type end = int",
+      "local foreign function callback_repeat(cb: function(repeat): void): void",
+      "end",
+      "local foreign function callback_end(cb: function(end): void): void",
+      "  local n: int = 0",
+      "end",
+      "local foreign function multiline_member(node: *KeywordNode): int",
+      "  local item: int = node.",
+      "    end",
+      "  local copied: int = item",
+      "  return copied",
+      "end",
+      "local foreign function named_repeat(): void",
+      "  ffi.visit { repeat -- comment",
+      "    = 0 }",
+      "  local after_label: int = 0",
+      "end",
+      "local foreign function split_cast(x: int): int",
+      "  local n = x as",
+      "    end",
+      "  local copied: int = n",
+      "  return copied",
+      "end",
+      "local foreign function comment_annotation(x: int): int",
+      "  local n: -- type comment",
+      "    repeat = x",
+      "  local copied: int = n",
+      "  return copied",
+      "end",
+      "function plain(input: integer): integer",
+      "  return input",
+      "end",
+      "local tail: integer = 1"
+    ]);
+
+    for (const [index, name, scope] of [
+      [2, "repeat)", "entity.name.type.titan"],
+      [4, "end)", "entity.name.type.titan"],
+      [9, "end", "variable.other.member.titan"],
+      [14, "repeat", "variable.other.member.titan"],
+      [20, "end", "entity.name.type.titan"],
+      [26, "repeat", "entity.name.type.titan"]
+    ] as const) {
+      assertScope(lines[index], name, scope);
+      assertNoScope(lines[index], name, "keyword.control.titan");
+      assertScope(lines[index], name, foreignFunctionScope);
+    }
+    // C scopes continue later in each body, and each function's own `end`
+    // closes it before the next declaration.
+    for (const index of [5, 10, 16, 21, 27]) {
+      assertScope(lines[index], "int", "entity.name.type.titan");
+      assertScope(lines[index], "int", foreignFunctionScope);
+    }
+    for (const index of [3, 6, 12, 17, 23, 29]) {
+      assertScope(lines[index], "end", "keyword.control.titan");
+      assertScope(lines[index], "end", foreignFunctionScope);
+    }
+    for (const index of [4, 7, 13, 18, 24]) {
+      assertNoScope(lines[index], "local", foreignFunctionScope);
+    }
+    for (const index of [30, 33]) {
+      assertScope(lines[index], "integer", "storage.type.primitive.titan");
+      assertNoScope(lines[index], "integer", "entity.name.type.titan");
+      assertNoScope(lines[index], "integer", foreignFunctionScope);
+    }
+  });
+
+  test("keeps block words as names across comments, type prefixes and line breaks", () => {
+    // Compiles after typedefs of `repeat` and `end` and a header declaring
+    // `KeywordNode { int repeat; }` and `visit(int start, int end)`.
+    const lines = tokenizeLines([
+      "foreign function continued(node: *KeywordNode, cb: function(int,",
+      "    -- the next parameter type is a typedef named repeat",
+      "    repeat): void, done: function(--[[ first ]] end): void): int",
+      "  local p: const",
+      "    *end = nil",
+      "  local size = foreign",
+      "    end.sizeof",
+      "  local field = node.--[[ member ]]repeat",
+      "  ffi.visit { start = 0,",
+      "    end = size as int }",
+      "  local q: *(repeat) = nil",
+      "  local count: int = 0",
+      "  return count",
+      "end",
+      "local tail: integer = 1"
+    ]);
+
+    assertScope(lines[2], "repeat", "entity.name.type.titan");
+    assertScope(lines[2], "end", "entity.name.type.titan");
+    assertScope(lines[3], "const", "storage.modifier.titan");
+    assertScope(lines[4], "*", "storage.modifier.titan");
+    assertScope(lines[4], "end", "entity.name.type.titan");
+    assertScope(lines[5], "foreign", "storage.modifier.titan");
+    assertScope(lines[6], "end", "entity.name.type.titan");
+    assertScope(lines[6], "sizeof", "variable.other.member.titan");
+    assertScope(lines[7], "member", "comment.block.titan");
+    assertScope(lines[7], "repeat", "variable.other.member.titan");
+    assertScope(lines[9], "end", "variable.other.member.titan");
+    assertScope(lines[10], "repeat", "entity.name.type.titan");
+    for (const [index, name] of [[2, "repeat"], [2, "end"], [4, "end"],
+      [6, "end"], [7, "repeat"], [9, "end"], [10, "repeat"]] as const) {
+      assertNoScope(lines[index], name, "keyword.control.titan");
+    }
+    assertScope(lines[11], "int", "entity.name.type.titan");
+    assertScope(lines[11], "int", foreignFunctionScope);
+    assertScope(lines[13], "end", "keyword.control.titan");
+    assertScope(lines[13], "end", foreignFunctionScope);
+    assertScope(lines[14], "integer", "storage.type.primitive.titan");
+    assertNoScope(lines[14], "integer", foreignFunctionScope);
+  });
+
   test("recognizes multiple union parts, constructors, and both case forms", () => {
     const [declaration, parts, , positional, named, prefix, selected, empty] =
       tokenizeLines([
