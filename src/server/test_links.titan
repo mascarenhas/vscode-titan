@@ -2,24 +2,12 @@ foreign import "compiler_io_platform.h"
 local async = import "async"
 local fs = import "fs"
 local os = import "os"
+local strings = import "string"
 local test = import "test"
-
--- Windows marks a link created without SeCreateSymbolicLinkPrivilege as an
--- untrusted mount point and refuses to traverse it, so creation alone does not
--- make the fixture usable.
-local function traversable(link: string)
-  do
-    fs.realpath(link)
-  catch
-    if error is async.CancellationReason then raise end
-    test.skip("Windows refuses to traverse the created directory link " ..
-      "(untrusted mount point)")
-  end
-end
 
 -- Directory-link fixtures retain their native path arguments and report a
 -- missing Windows privilege only after the actual creation attempt.
-function directory(source: string, link: string, message: string)
+local function spawn_link(source: string, link: string): integer
   local command = "/bin/ln"
   local arguments = {"-s", source, link}
   if ffi.VSCODE_TITAN_WINDOWS ~= 0 then
@@ -37,11 +25,60 @@ function directory(source: string, link: string, message: string)
   if link_output ~= nil then link_output:close() end
   local link_error? = linker.stderr
   if link_error ~= nil then link_error:close() end
-  if ffi.VSCODE_TITAN_WINDOWS ~= 0 and status.signal == nil then
-    if status.code == 1314 then
-      test.skip("Windows account cannot create directory symbolic links (Win32 1314)")
+  if status.signal ~= nil then return -1 end
+  return status.code
+end
+
+local checked = false
+local reason: string? = nil
+
+-- Windows marks a link created without SeCreateSymbolicLinkPrivilege as an
+-- untrusted mount point and refuses to traverse it, so creation alone does not
+-- make the fixture usable. Probe once in a scratch directory: a fixture that
+-- cannot be used must not be created at all, because removing it afterwards
+-- also fails and would replace the skip with its own error.
+local function windows_link_failure(): string?
+  if checked then return reason end
+  checked = true
+  if ffi.VSCODE_TITAN_WINDOWS == 0 then return nil end
+  local scratch = fs.tmpname()
+  fs.unlink(scratch)
+  fs.mkdir(scratch)
+  local source = scratch .. "/source"
+  fs.mkdir(source)
+  local link = scratch .. "/link"
+  local code = spawn_link(source, link)
+  if code == 1314 then
+    reason = "Windows account cannot create directory symbolic links (Win32 1314)"
+  elseif code ~= 0 then
+    reason = "Windows account cannot create directory symbolic links (Win32 " ..
+      strings.tostring(code) .. ")"
+  else
+    do
+      fs.realpath(link)
+    catch
+      if error is async.CancellationReason then raise end
+      reason = "Windows refuses to traverse the created directory link " ..
+        "(untrusted mount point)"
     end
-    if status.code == 0 then traversable(link) end
   end
-  test.assert(status.code == 0 and status.signal == nil, message)
+  do
+    fs.unlink(link)
+  catch
+  end
+  do
+    fs.rmdir(source)
+    fs.rmdir(scratch)
+  catch
+  end
+  return reason
+end
+
+--- Link `source` to `link`, or skip while the host cannot provide a usable
+--- directory link.
+function directory(source: string, link: string, message: string)
+  local failure? = windows_link_failure()
+  if failure ~= nil then test.skip(failure as string) end
+  local code = spawn_link(source, link)
+  test.assert(code == 0, message)
 end
