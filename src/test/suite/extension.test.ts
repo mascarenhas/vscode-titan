@@ -697,7 +697,7 @@ suite("Titan extension", () => {
       let nestedFolder: vscode.WorkspaceFolder | undefined;
       let document: vscode.TextDocument | undefined;
 
-      await rm(nestedRoot, { force: true, recursive: true });
+      await removeTree(nestedRoot);
       await mkdir(path.join(nestedRoot, ".vscode"), { recursive: true });
       await writeFile(
         path.join(nestedRoot, "sample.titan"),
@@ -887,7 +887,7 @@ suite("Titan extension", () => {
           await vscode.commands.executeCommand("workbench.action.files.revert");
           await vscode.commands.executeCommand("workbench.action.closeActiveEditor");
         }
-        await rm(nestedRoot, { force: true, recursive: true });
+        await removeTree(nestedRoot);
       }
     }
   );
@@ -1027,7 +1027,7 @@ suite("Titan extension", () => {
           }
         }
         await rm(lexicalRoot, { force: true });
-        await rm(physicalRoot, { force: true, recursive: true });
+        await removeTree(physicalRoot);
         await rm(lifecycleMarker, { force: true });
         await rm(semanticMarker, { force: true });
       }
@@ -1582,8 +1582,20 @@ function assertNativePathEqual(
   assert.equal(normalize(actual as string), normalize(expected));
 }
 
+// Windows refuses to remove a directory while a just-exited child or a watcher
+// still holds it open, which surfaces as a transient EBUSY. Node's own retries
+// cover that; the assertions around the teardown stay unchanged.
+async function removeTree(target: string): Promise<void> {
+  await rm(target, {
+    recursive: true,
+    force: true,
+    maxRetries: 10,
+    retryDelay: 100
+  });
+}
+
 async function resetMarker(markerPath: string): Promise<void> {
-  await rm(path.dirname(markerPath), { force: true, recursive: true });
+  await removeTree(path.dirname(markerPath));
   await mkdir(path.dirname(markerPath), { recursive: true });
 }
 
