@@ -91,6 +91,19 @@ function assertScope(
   );
 }
 
+function assertNoScope(
+  tokenizedLine: TokenizedLine,
+  text: string,
+  unexpectedScope: string
+): void {
+  assert.ok(
+    !tokenizedLine.scopesAt(text).includes(unexpectedScope),
+    `${JSON.stringify(text)} should not include ${unexpectedScope}`
+  );
+}
+
+const foreignFunctionScope = "meta.function.foreign.titan";
+
 describe("Titan TextMate grammar", () => {
   test("recognizes declarations, primitive types, literals, and operators", () => {
     const [declaration, expression] = tokenizeLines([
@@ -180,6 +193,201 @@ describe("Titan TextMate grammar", () => {
     assertScope(module, "M", "variable.language.module.titan");
     assertScope(module, "type", "variable.other.member.titan");
     assertScope(state, "L", "variable.language.lua-state.titan");
+  });
+
+  test("scopes unprefixed C types in a foreign function signature and body", () => {
+    const lines = tokenizeLines([
+      "foreign function count_nodes(context: *void, limit: unsigned long): unsigned long long",
+      "  local nodes = context as const *Node",
+      "  local total: unsigned long long = 0",
+      "  const step: size_t = 1",
+      "  for index: unsigned long = 0, limit do",
+      "    total = total + nodes[index].weight as unsigned long long",
+      "  end",
+      "  return total",
+      "end",
+      "local function after(value: integer): Node"
+    ]);
+
+    assertScope(lines[0], "foreign", "storage.modifier.titan");
+    assertScope(lines[0], "function", "storage.type.function.titan");
+    assertScope(lines[0], "count_nodes", "entity.name.function.titan");
+    assertScope(lines[0], "*void", "storage.modifier.titan");
+    assertScope(lines[0], "void", "entity.name.type.titan");
+    assertScope(lines[0], "unsigned long)", "entity.name.type.titan");
+    assertScope(lines[0], "unsigned long long", "entity.name.type.titan");
+    assertScope(lines[1], "nodes", "variable.other.readwrite.titan");
+    assertScope(lines[1], "as", "keyword.operator.type.titan");
+    assertScope(lines[1], "const", "storage.modifier.titan");
+    assertScope(lines[1], "*Node", "storage.modifier.titan");
+    assertScope(lines[1], "Node", "entity.name.type.titan");
+    assertScope(lines[2], "total", "variable.other.readwrite.titan");
+    assertScope(lines[2], "unsigned long long", "entity.name.type.titan");
+    assertScope(lines[3], "const", "storage.modifier.titan");
+    assertScope(lines[3], "step", "variable.other.readwrite.titan");
+    assertScope(lines[3], "size_t", "entity.name.type.titan");
+    assertScope(lines[4], "for", "keyword.control.titan");
+    assertScope(lines[4], "unsigned long", "entity.name.type.titan");
+    assertScope(lines[4], "do", "keyword.control.titan");
+    assertScope(lines[5], "weight", "variable.other.member.titan");
+    assertScope(lines[5], "unsigned long long", "entity.name.type.titan");
+    for (const [index, text] of [[6, "end"], [7, "return"], [8, "end"]] as const) {
+      assertScope(lines[index], text, "keyword.control.titan");
+      assertScope(lines[index], text, foreignFunctionScope);
+    }
+
+    // The region ends with the function: the next declaration keeps Titan
+    // type scopes and leaves a C-looking name unscoped.
+    assertScope(lines[9], "after", "entity.name.function.titan");
+    assertScope(lines[9], "integer", "storage.type.primitive.titan");
+    for (const text of ["local", "integer", "Node"]) {
+      assertNoScope(lines[9], text, foreignFunctionScope);
+    }
+    assertNoScope(lines[9], "Node", "entity.name.type.titan");
+  });
+
+  test("keeps foreign pseudo-expressions and grouped pointers in a foreign body", () => {
+    const lines = tokenizeLines([
+      "local foreign function fill(out: *(*char), count: int): void",
+      "  local cell = foreign Cell.new()",
+      "  local cells = foreign Cell.new_array(8)",
+      "  local width = foreign unsigned char.sizeof + foreign Cell.alignof",
+      "  out[0] = ffi.malloc(foreign long double.sizeof) as *char",
+      "  local stale: foreign int = count",
+      "end"
+    ]);
+
+    assertScope(lines[0], "local", "storage.modifier.titan");
+    assertScope(lines[0], "fill", "entity.name.function.titan");
+    assertScope(lines[0], "(*char", "punctuation.section.group.begin.titan");
+    assertScope(lines[0], "char", "entity.name.type.titan");
+    assertScope(lines[0], "), count", "punctuation.section.group.end.titan");
+    assertScope(lines[0], "int", "entity.name.type.titan");
+    assertScope(lines[0], "void", "entity.name.type.titan");
+    for (const [index, member] of [[1, "new"], [2, "new_array"], [3, "sizeof"],
+      [3, "alignof"], [4, "sizeof"]] as const) {
+      assertScope(lines[index], "foreign", "storage.modifier.titan");
+      assertScope(lines[index], member, "variable.other.member.titan");
+    }
+    assertScope(lines[1], "Cell", "entity.name.type.titan");
+    assertScope(lines[2], "Cell", "entity.name.type.titan");
+    assertScope(lines[3], "unsigned char", "entity.name.type.titan");
+    assertScope(lines[3], "Cell", "entity.name.type.titan");
+    assertScope(lines[4], "ffi", "variable.language.ffi.titan");
+    assertScope(lines[4], "long double", "entity.name.type.titan");
+    assertScope(lines[4], "as", "keyword.operator.type.titan");
+    assertScope(lines[4], "char", "entity.name.type.titan");
+    // `foreign` before a body type is a compiler syntax error; it keeps the
+    // ordinary foreign-type scopes rather than becoming a type name.
+    assertScope(lines[5], "foreign", "storage.modifier.titan");
+    assertScope(lines[5], "int", "entity.name.type.titan");
+    assertScope(lines[6], "end", foreignFunctionScope);
+  });
+
+  test("ends a foreign function at the end that balances its blocks", () => {
+    const lines = tokenizeLines([
+      "foreign function walk(list: *Node): int",
+      "  local count: int = 0",
+      "  while list ~= nil do",
+      "    if list.end ~= nil then",
+      "      count = count + 1",
+      "    elseif list.repeat then",
+      "      repeat",
+      "        list = list.next",
+      "      until list == nil",
+      "    end",
+      "    -- end is comment text",
+      '    ffi.log("end")',
+      "    ffi.visit { start = 0, end = count }",
+      "  end",
+      "  return count",
+      "end",
+      "local after: integer = 1"
+    ]);
+
+    assertScope(lines[3], "if", "keyword.control.titan");
+    assertScope(lines[3], "end", "variable.other.member.titan");
+    assertScope(lines[5], "elseif", "keyword.control.titan");
+    assertScope(lines[5], "repeat", "variable.other.member.titan");
+    assertScope(lines[6], "repeat", "keyword.control.titan");
+    assertScope(lines[8], "until", "keyword.control.titan");
+    assertScope(lines[9], "end", "keyword.control.titan");
+    assertScope(lines[10], "end", "comment.line.double-dash.titan");
+    assertScope(lines[11], "end", "string.quoted.double.titan");
+    assertScope(lines[12], "start", "variable.other.member.titan");
+    assertScope(lines[12], "end", "variable.other.member.titan");
+    assertScope(lines[12], "count", foreignFunctionScope);
+    for (const [index, text] of [[13, "end"], [14, "return"], [15, "end"]] as const) {
+      assertScope(lines[index], text, "keyword.control.titan");
+      assertScope(lines[index], text, foreignFunctionScope);
+    }
+    assertScope(lines[16], "after", "variable.other.readwrite.titan");
+    assertScope(lines[16], "integer", "storage.type.primitive.titan");
+    assertNoScope(lines[16], "integer", foreignFunctionScope);
+    assertNoScope(lines[16], "integer", "entity.name.type.titan");
+  });
+
+  test("leaves ordinary function types and casts unchanged", () => {
+    const lines = tokenizeLines([
+      "local function plain(context: Node, limit: integer): integer",
+      "  local value: integer = context as integer",
+      "  local count: int = limit",
+      "  for index: integer = 1, limit do end",
+      "  return value",
+      "end"
+    ]);
+
+    assertScope(lines[0], "integer", "storage.type.primitive.titan");
+    assertNoScope(lines[0], "Node", "entity.name.type.titan");
+    assertScope(lines[1], "integer =", "storage.type.primitive.titan");
+    assertScope(lines[1], "as", "keyword.operator.type.titan");
+    assertNoScope(lines[2], "int", "entity.name.type.titan");
+    assertScope(lines[3], "integer", "storage.type.primitive.titan");
+    for (const line of lines) {
+      assertNoScope(line, line.line.trim().split(" ")[0], foreignFunctionScope);
+    }
+  });
+
+  test("bounds how far an unbalanced or malformed foreign function extends", () => {
+    // TextMate cannot parse: an unclosed block inside a foreign function lets
+    // the region run to the next unbalanced `end`, usually the end of the
+    // following function, and an unterminated one runs to the end of the file.
+    const unbalanced = tokenizeLines([
+      "foreign function broken(input: int): int",
+      "  if input > 0 then",
+      "    return input",
+      "end",
+      "function after(value: integer): integer",
+      "  return value",
+      "end",
+      "local tail: integer = 2"
+    ]);
+    assertScope(unbalanced[3], "end", foreignFunctionScope);
+    assertScope(unbalanced[4], "integer", foreignFunctionScope);
+    assertScope(unbalanced[4], "integer", "entity.name.type.titan");
+    assertScope(unbalanced[6], "end", foreignFunctionScope);
+    assertNoScope(unbalanced[7], "tail", foreignFunctionScope);
+    assertScope(unbalanced[7], "integer", "storage.type.primitive.titan");
+
+    const unterminated = tokenizeLines([
+      "foreign function open_ended(input: int): int",
+      "  return input",
+      "local tail: integer = 2"
+    ]);
+    assertScope(unterminated[2], "integer", foreignFunctionScope);
+
+    // A header split before its name opens no region at all.
+    const split = tokenizeLines([
+      "foreign function",
+      "  split(input: int): int",
+      "  return input",
+      "end",
+      "local tail: integer = 2"
+    ]);
+    for (const [index, text] of [[1, "int"], [3, "end"], [4, "integer"]] as const) {
+      assertNoScope(split[index], text, foreignFunctionScope);
+    }
+    assertScope(split[4], "integer", "storage.type.primitive.titan");
   });
 
   test("recognizes multiple union parts, constructors, and both case forms", () => {

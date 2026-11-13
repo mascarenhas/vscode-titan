@@ -51,6 +51,20 @@ within their module, but they have no definition or rename target. Foreign
 types use their own unqualified namespace (`foreign int`, `foreign *Name`,
 `foreign type Name = ...`) and are not selected through the `ffi` value.
 
+A `foreign function` writes C types without `foreign` in its signature and
+body, as in `local count: *int = context as *int`. Highlighting gives the C type
+after an annotation's `:` or a cast's `as` the same colors as a
+`foreign`-prefixed type, multiword primitives such as `unsigned long` included.
+The `foreign T.new()`, `foreign T.new_array(N)`, `foreign T.sizeof` and
+`foreign T.alignof` forms keep their prefix. The highlighter reads one line at a
+time and does not parse, so it finds the end of the function the same way the
+compiler's completion transform does: the `if`, `do` and `repeat` blocks inside
+consume their own `end` or `until`, and the next `end` closes the function.
+Member names and named-argument labels spelled like these keywords do not
+count. An unclosed block therefore extends the C-type coloring to the next
+unmatched `end`, usually the end of the following function. Parameter types
+inside a C function-pointer type are not colored as types.
+
 Navigation to FFI definitions or to external source, and watching external
 source trees, are out of scope for version 1.
 
