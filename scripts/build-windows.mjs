@@ -234,7 +234,7 @@ export async function buildWindows(target, {
       run(clang, [...flags.cppflags, ...flags.cflags, "-municode",
         "test/fixtures/compiler-io-process.c", ...flags.ldflags, "-o", fixture]);
       compile(windowsApplicationArguments({
-        sourceRoot: `${sourceRoot};${path.join(repository, "test/fixtures")}`,
+        sourceRoot: `${path.join(repository, "src")};${path.join(repository, "test/fixtures")}`,
         directory: routerFixtureDirectory, embeddedSource, sdk,
         entry: "router_worker_fixture", executable: "router_worker_fixture.exe"
       }), repository);

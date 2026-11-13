@@ -285,10 +285,11 @@ server-build: $(EMBEDDED_INTERFACES_SOURCE) | $(TITANC)
 		$(TITAN_LINK_FLAGS) titan_language_server
 
 # Like the server, let Titan own incremental products in a private output tree.
+# It always imports this checkout, not an application's SOURCE_ROOT override.
 .PHONY: $(ROUTER_WORKER_FIXTURE)
 $(ROUTER_WORKER_FIXTURE): $(EMBEDDED_INTERFACES_SOURCE) | $(TITANC)
 	+$(COMPILER_ENV) $(call shell_quote,$(TITANC)) $(TITAN_FLAGS) \
-		--tree $(call shell_quote,$(SOURCE_ROOT);$(abspath test/fixtures)) $(TITAN_COMPILE_OPTIONS) \
+		--tree $(call shell_quote,$(abspath src);$(abspath test/fixtures)) $(TITAN_COMPILE_OPTIONS) \
 		--output $(call shell_quote,$(BUILD_ROOT)/router-worker) \
 		--exe $(call shell_quote,$(ROUTER_WORKER_FIXTURE)) $(TITAN_LINK_FLAGS) router_worker_fixture
 

@@ -170,6 +170,8 @@ outputs under `BUILD_ROOT/router-worker`, and puts the executable at
 `BUILD_ROOT/native/router_worker_fixture`. Native, protocol and coverage build
 targets build this prerequisite; their execution environments pass its path as
 `TITAN_ROUTER_WORKER_FIXTURE`. Direct filtered runs need that path too.
+The peer always imports this checkout's server sources, even when `SOURCE_ROOT`
+selects another application for an incremental-build test.
 
 The final component of the worker's existing `--root` argument selects its
 scenario: accept/reject initialize, exit before/during initialize, withhold
