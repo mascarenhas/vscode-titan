@@ -39,7 +39,7 @@ case "$(uname -s)" in
     fi
     runtime_dependencies=$dependencies
     if [[ "$bundled_openssl" == 0 ]]; then
-      runtime_dependencies=$(grep -Ev '^[[:space:]]*lib(ssl|crypto)[.]so[.]3[[:space:]]' \
+      runtime_dependencies=$(grep -Ev '^[[:space:]]*lib(ssl|crypto)[.]so[.](3|4)[[:space:]]' \
         <<<"$dependencies" || true)
     fi
     required_glibc=$(
@@ -82,7 +82,7 @@ case "$(uname -s)" in
     printf '%s\n' "$dependencies"
     runtime_dependencies=$dependencies
     if [[ "$bundled_openssl" == 0 ]]; then
-      runtime_dependencies=$(grep -Ev '^[[:space:]]+([^[:space:]]*/)?lib(ssl|crypto)[.]3[.]dylib[[:space:]]+[(]' \
+      runtime_dependencies=$(grep -Ev '^[[:space:]]+([^[:space:]]*/)?lib(ssl|crypto)[.](3|4)[.]dylib[[:space:]]+[(]' \
         <<<"$dependencies" || true)
     fi
     if grep -Eiq 'lib(lua|uv|ssl|crypto|lpeg|pcre)' <<<"$runtime_dependencies"; then

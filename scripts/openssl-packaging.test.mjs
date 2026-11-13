@@ -147,22 +147,27 @@ for (const host of ["Linux", "Darwin"]) {
   const dependencies = (ssl, crypto, extra = "") => host === "Linux"
     ? `\t${ssl} => /usr/lib/${ssl} (0x0000)\n\t${crypto} => /usr/lib/${crypto} (0x0000)\n${extra}`
     : `server:\n\t/opt/openssl/lib/${ssl} (compatibility version 3.0.0, current version 3.0.0)\n\t/opt/openssl/lib/${crypto} (compatibility version 3.0.0, current version 3.0.0)\n${extra}`;
+  for (const major of [3, 4]) {
+    const libraries = host === "Linux"
+      ? [`libssl.so.${major}`, `libcrypto.so.${major}`]
+      : [`libssl.${major}.dylib`, `libcrypto.${major}.dylib`];
+    test(`${host} system SDK inspection accepts exact OpenSSL ${major} dependencies`, async (context) => {
+      const inspect = await nativeInspection(context, host, false);
+      const result = inspect(dependencies(...libraries));
+      assert.equal(result.status, 0, result.stderr);
+    });
+    test(`${host} bundled SDK inspection rejects dynamic OpenSSL ${major}`, async (context) => {
+      const inspect = await nativeInspection(context, host, true);
+      const result = inspect(dependencies(...libraries));
+      assert.notEqual(result.status, 0);
+      assert.match(result.stderr, /unexpected dynamic language\/runtime dependency/);
+    });
+  }
   const libraries = host === "Linux" ? ["libssl.so.3", "libcrypto.so.3"] : ["libssl.3.dylib", "libcrypto.3.dylib"];
-  test(`${host} system SDK inspection accepts exact OpenSSL 3 dependencies`, async (context) => {
-    const inspect = await nativeInspection(context, host, false);
-    const result = inspect(dependencies(...libraries));
-    assert.equal(result.status, 0, result.stderr);
-  });
-  test(`${host} bundled SDK inspection rejects dynamic OpenSSL`, async (context) => {
-    const inspect = await nativeInspection(context, host, true);
-    const result = inspect(dependencies(...libraries));
-    assert.notEqual(result.status, 0);
-    assert.match(result.stderr, /unexpected dynamic language\/runtime dependency/);
-  });
   test(`${host} system SDK inspection rejects wrong OpenSSL versions and unrelated runtimes`, async (context) => {
     const inspect = await nativeInspection(context, host, false);
-    for (const name of host === "Linux" ? ["libssl.so.1.1", "libcrypto.so.30", "liblua.so.5.5", "libuv.so.1"]
-      : ["libssl.1.1.dylib", "libcrypto.30.dylib", "liblua.5.5.dylib", "libuv.1.dylib"]) {
+    for (const name of host === "Linux" ? ["libssl.so.1.1", "libcrypto.so.30", "libssl.so.40", "liblua.so.5.5", "libuv.so.1"]
+      : ["libssl.1.1.dylib", "libcrypto.30.dylib", "libssl.40.dylib", "liblua.5.5.dylib", "libuv.1.dylib"]) {
       const result = inspect(dependencies(name, libraries[1]));
       assert.notEqual(result.status, 0, name);
       assert.match(result.stderr, /unexpected dynamic language\/runtime dependency/);

@@ -31,7 +31,7 @@ installation workflow. On Linux that workflow needs Readline development
 headers, or `LUA_PLATFORM=linux` to omit Readline. Use separate prefixes and
 Titan build checkouts for production and validation SDKs.
 
-Titan's system OpenSSL mode needs the host's OpenSSL 3 development files and
+Titan's system OpenSSL mode needs the host's OpenSSL 3 or 4 development files and
 `pkg-config`. Set `OPENSSL_PKG_CONFIG` to use another pkg-config command. An
 SDK with an `include/openssl` directory is a bundled-OpenSSL SDK: its provider
 already carries the OpenSSL archive, and system SDKs omit that directory. For
@@ -59,7 +59,7 @@ VSIX and Extension Host smoke tests. Use an SDK built for the host architecture.
 
 ## Object and link ownership
 
-Authored sources stay under `src/`. Every compiler invocation uses `--tree`
+Authored server sources stay under `src/`. Every compiler invocation uses `--tree`
 for those original sources and `--output` for an owned generated tree:
 `BUILD_ROOT/server` or `BUILD_ROOT/tests` (default `BUILD_ROOT=.build`).
 There are no source mirrors, generated Make includes, module targets, Windows
@@ -163,6 +163,26 @@ unassigned or assigned twice. Per-shard logs and `summary.json` go to
 `.build/test-shards`. `server-test-run` runs the current aggregate without
 rebuilding it.
 
+Router lifecycle tests also use `test/fixtures/router_worker_fixture.titan`, a
+framed child peer built with the server's `framing` and `wire` modules. Make
+invokes Titan with `--tree 'src;test/fixtures' --source-first --incremental`,
+outputs under `BUILD_ROOT/router-worker`, and puts the executable at
+`BUILD_ROOT/native/router_worker_fixture`. Native, protocol and coverage build
+targets build this prerequisite; their execution environments pass its path as
+`TITAN_ROUTER_WORKER_FIXTURE`. Direct filtered runs need that path too.
+The peer always imports this checkout's server sources, even when `SOURCE_ROOT`
+selects another application for an incremental-build test.
+
+The final component of the worker's existing `--root` argument selects its
+scenario: accept/reject initialize, exit before/during initialize, withhold
+indexing, fail the first diagnostic replay, or withhold replay or shutdown.
+The `refresh-blocked` scenario holds a pull request until an outer-root hover,
+allowing deterministic nested discovery and release/reclaim during busy.
+`--router` serves the production router with this executable as its worker.
+Neither the fixture nor its scenarios add a shipped-server option or an
+environment-selected behavior. It is a test-only build product and is never
+installed or included in the VSIX.
+
 ## Rebuild behavior
 
 An unchanged compiler invocation certifies and reuses module objects, native C
@@ -205,7 +225,10 @@ tree: the standard modules are native providers, not Lua sources. No
 collects licenses from the installation, using the rock versions and license
 files in `compilerRocks` (`scripts/compiler-rocks.mjs`). `scripts/inspect-vsix.sh` and
 `scripts/inspect-server.sh` check the package and the executable's native
-linkage. `inspect-server` enforces `TITAN_MAX_GLIBC_VERSION` when it is set.
+linkage. `inspect-server` rejects dynamic language/runtime dependencies. A
+system-OpenSSL SDK may link the OpenSSL 3 or 4 system libraries; a bundled-OpenSSL
+SDK must not link OpenSSL dynamically. The inspection also enforces
+`TITAN_MAX_GLIBC_VERSION` when it is set.
 
 ## Build regressions
 
@@ -373,6 +396,13 @@ nonzero-exit, delayed and large output, and cancellation fixtures. On Windows
 it keeps the cancellation marker path in UTF-16 through `wmain` and `_wfopen`,
 and the CLANG64 link uses `-municode`. Test execution passes the fixture's path
 in `TITAN_COMPILER_IO_PROCESS_FIXTURE`.
+
+The driver also builds the Titan router peer as a normal compiler-owned Windows
+application under `tests/native/router-worker`, with its runtime/provider DLLs.
+`server-test-run` passes `TITAN_ROUTER_WORKER_FIXTURE` to the native router cases.
+Portable driver tests exercise compiler argument and environment construction;
+the native Windows aggregate has not been run. The Unix protocol target also
+uses the peer's `--router` harness for controlled failures.
 
 ### Windows embedded interfaces
 

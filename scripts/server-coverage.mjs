@@ -210,10 +210,11 @@ export async function buildCoverage(options, { run = execute, environment = proc
   const clock = path.join(root, "src/server/compiler_io_clock.c");
   const embedded = path.join(nativeDir, "embedded_interfaces_native.c");
   const processFixture = path.join(nativeDir, "compiler_io_process_fixture");
+  const routerFixture = path.join(nativeDir, "router_worker_fixture");
   const provider = path.join(prefix, "lib/titan/0.6/titan.a");
   const titanc = path.join(prefix, "bin/titanc");
   const lua = path.join(prefix, "bin/lua");
-  for (const filename of [clock, embedded, processFixture, provider, titanc, lua]) assert.ok((await stat(filename)).isFile(), `missing coverage build input: ${filename}`);
+  for (const filename of [clock, embedded, processFixture, routerFixture, provider, titanc, lua]) assert.ok((await stat(filename)).isFile(), `missing coverage build input: ${filename}`);
   // A fresh copied tree keeps source-adjacent .coverage files out of src and
   // independent of ordinary/instrumented builds in other directories.
   await mkdir(path.dirname(options.buildDir), { recursive: true });
@@ -251,7 +252,7 @@ export async function buildCoverage(options, { run = execute, environment = proc
   runtimeEnvironment.TITAN_EXTRA_CPPFLAGS = [runtimeEnvironment.TITAN_EXTRA_CPPFLAGS, ...(options.cflags ?? []).map(quote)].filter(Boolean).join(" ");
   Object.assign(runtimeEnvironment, { CC: options.cc, AR: runtimeEnvironment.AR || "ar", RANLIB: runtimeEnvironment.RANLIB || "ranlib" });
   const build = { root, prefix, buildDir, reportDir, formats, lua, executable: path.join(buildDir, "server/tests"),
-    processFixture, runtimeEnvironment, modules: production.map((module) => {
+    processFixture, routerFixture, runtimeEnvironment, modules: production.map((module) => {
       const stem = path.join(buildDir, "out", path.dirname(module.main), ".coverage", path.basename(module.main, ".titan"));
       return { name: module.name, object: stem + ".o", generated: stem + ".c", sources: module.sources.map((source) => path.join(stage, source)) };
     }) };
@@ -277,7 +278,8 @@ export async function runCoverage(options, { run = execute, environment = proces
   for (const name of reportFiles) await rm(path.join(build.reportDir, name), { force: true });
   const env = { ...cleanEnvironment(environment), ...build.runtimeEnvironment, BUILD_PROFILE: "validation", TITAN_BUILD_PROFILE: "validation",
     TITAN_ROOT: build.prefix, TITAN_PREFIX: path.join(build.buildDir, "compiler-cache"),
-    CCACHE_DISABLE: "1", TITAN_COMPILER_IO_PROCESS_FIXTURE: build.processFixture };
+    CCACHE_DISABLE: "1", TITAN_COMPILER_IO_PROCESS_FIXTURE: build.processFixture,
+    TITAN_ROUTER_WORKER_FIXTURE: build.routerFixture };
   await auditModules(build, run, env);
   env.LUA_PATH_5_5 = await run(build.lua, ["-E", "-e", "io.write(package.path)"], { cwd: build.root, env, quiet: true });
   env.LUA_CPATH_5_5 = await run(build.lua, ["-E", "-e", "io.write(package.cpath)"], { cwd: build.root, env, quiet: true });

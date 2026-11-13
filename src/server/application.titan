@@ -1164,6 +1164,7 @@ local function Application:start_refresh(force: boolean, reason: string):
         raise
       end
       -- Terminal cleanup must not depend on any best-effort output path.
+      self.failed_epoch = target_epoch
       do self.diagnostic_publisher:clear() catch end
       -- An unexpected exception must still close this chain's progress period;
       -- otherwise the reporter stays busy and every later chain is silent.
@@ -1200,12 +1201,17 @@ function Application:set_diagnostics_listener(listener: diagnostics.Listener?)
   if self.closed then return end
   self.diagnostic_publisher:set_listener(listener)
   local completed? = self.completed_view
-  if not self.closed and listener ~= nil and completed ~= nil then
+  -- A retained semantic View does not validate diagnostics cleared by failure.
+  if not self.closed and listener ~= nil and completed ~= nil and
+     self.failed_epoch == nil then
     do
       local service = self.service as project_service.Service
       local publications = published_diagnostics.read(
         service:workspace_store(), completed.published_generation)
-      if not self.closed then self.diagnostic_publisher:publish(publications) end
+      -- Reading can yield while a failed saved refresh clears the current set.
+      if not self.closed and self.failed_epoch == nil then
+        self.diagnostic_publisher:publish(publications)
+      end
     catch
       -- A publication which overtook listener replay owns its replacement.
       if not (error is semantic_index.StaleView) then raise end

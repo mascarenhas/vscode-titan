@@ -7,6 +7,7 @@ local async = import "async"
 local dispatcher = import "server.dispatcher"
 local documents = import "server.document_buffers"
 local fs = import "fs"
+local indexing_status = import "server.indexing_status"
 local iteration = import "iteration"
 local json = import "json"
 local logging = import "server.logging"
@@ -127,14 +128,15 @@ record Slot
   local probe_prefix: string?
   -- The worker reported background indexing; it is not idle then.
   local indexing: boolean
-  -- Session timeline for titan/indexingStatus. A replacement worker restarts
-  -- its own epochs, and the client rejects anything below what it already saw.
-  local epoch_base: integer?
-  local epoch_offset: integer
-  local indexing_watermark: integer
+  -- Latest worker snapshot; the router aggregates claimed roots for the client.
+  local indexing_status: indexing_status.Status?
   local diagnosed_file: string?
   -- URIs this root published diagnostics for, and the document each names.
   local published: {string: string}
+  -- A warm worker replays when its root gains ownership.
+  local replay_diagnostics: boolean
+  -- A timed-out replay is not retried against that same worker.
+  local replay_unavailable_generation: integer
   local transitioning: boolean
   local waiter: async.Task?
   local token: async.ResumeToken
@@ -176,6 +178,9 @@ record Router
   -- Memoized nearest-ancestor configuration per owner root and directory.
   local discovered: {string: string}
   local closed: boolean
+  local indexing_status: indexing_status.Status?
+  -- Strict clients keep one initial cycle open until the first session ready.
+  local initial_pending: boolean
 end
 
 type Finish = function (): ()
@@ -287,6 +292,8 @@ function create(options: LaunchOptions, output: response_queue.ResponseQueue): R
     unowned_logged = {},
     discovered = {},
     closed = false,
+    indexing_status = nil,
+    initial_pending = true,
   }
 end
 
@@ -311,11 +318,11 @@ local function slot_for_root(router: Router, entry: roots.Root): Slot
     titan_root = nil,
     probe_prefix = nil,
     indexing = false,
-    epoch_base = nil,
-    epoch_offset = 0,
-    indexing_watermark = 0,
+    indexing_status = nil,
     diagnosed_file = nil,
     published = {},
+    replay_diagnostics = false,
+    replay_unavailable_generation = 0,
     transitioning = false,
     waiter = nil,
     token = async.ResumeToken.new("server.router.slot"),
@@ -369,6 +376,7 @@ local function owner_root(router: Router, canonical: string): roots.Root?
   local discovered? = nested_configuration(router, canonical, owner_path)
   if discovered ~= nil then
     local entry = router.registry:attach_discovery(discovered as string)
+    router:publish_indexing { reset = false, completed = false }
     logging.emit("info", "root.discovered", {
       ["root"] = entry.path,
       ["path"] = canonical,
@@ -528,8 +536,6 @@ local function still_owned(router: Router, slot: Slot): boolean
   return router.slots[slot.root.path] == slot
 end
 
--- Stop one slot's worker after its in-flight requests finish. The caller owns
--- the slot transition, so a restart can stop and start inside one transition.
 -- Publish an empty diagnostic set: the one publication that clears whatever a
 -- previous owner said about this document.
 local function publish_empty_diagnostics(router: Router, uri: string)
@@ -543,6 +549,213 @@ local function publish_empty_diagnostics(router: Router, uri: string)
   router.output:push(wire.encode(envelope))
 end
 
+-- One session timeline, not one watermark per root: clients display one status
+-- item. A changed busy workset starts a new epoch and a zero-count baseline,
+-- including when another root finishes while this one is still indexing.
+local function Router:publish_indexing(reset: boolean, completed: boolean)
+  local busy = false
+  local initial = false
+  local counted = true
+  local completed_files = 0
+  local total_files = 0
+  local claimed = 0
+  local failure_slot: Slot? = nil
+  for index = 1, #self.order do
+    local slot = self.slots[self.order[index]]
+    if slot.root:claimed() then
+      claimed = claimed + 1
+      local status? = slot.indexing_status
+      if status ~= nil then
+        case status.state
+        when indexing() then
+          busy = true
+          initial = initial or status.initial
+          if status.completed_files == nil then
+            counted = false
+          else
+            completed_files = completed_files + status.completed_files
+            total_files = total_files + status.total_files
+          end
+        when failed() then
+          if failure_slot == nil then failure_slot = slot end
+        else
+        end
+      elseif slot.indexing then
+        -- Startup precedes the first worker frame and is already non-idle.
+        busy = true
+        initial = true
+        counted = false
+      end
+    end
+  end
+  initial = self.initial_pending or initial
+  local previous? = self.indexing_status
+  if previous == nil and not busy and failure_slot == nil then return end
+  if previous == nil and not busy then
+    -- Settings or admission can fail before any worker starts. Strict clients
+    -- still require the initial busy frame before the terminal failure.
+    previous = indexing_status.Status {
+      state = indexing_status.State.indexing(), initial = true,
+      epoch = 1, generation = 0,
+    }
+    self.indexing_status = previous
+    self.output:push(indexing_status.notification(previous))
+  end
+  local epoch = 0
+  local generation = 0
+  if previous ~= nil then
+    epoch = previous.epoch
+    generation = previous.generation or 0
+  end
+  -- Session generations count completed root publications, never a worker's
+  -- restartable generation or the current number of roots.
+  if completed then generation = generation + 1 end
+  if busy then
+    -- Aggregate counters have the same safe-integer bound as worker counters.
+    counted = counted and total_files <= 9007199254740991
+    if previous == nil then
+      reset = true
+    else
+      reset = reset or
+        indexing_status.state_name(previous.state) ~= "indexing" or
+        previous.initial ~= initial
+      if previous.completed_files ~= nil then
+        reset = reset or not counted or previous.total_files ~= total_files or
+          completed_files < previous.completed_files
+      end
+    end
+    if not reset and previous ~= nil and previous.generation == generation and
+       ((not counted and previous.completed_files == nil) or
+        (counted and previous.completed_files == completed_files and
+         previous.total_files == total_files)) then return end
+    -- Even a generation-only change needs a fresh epoch without counters.
+    reset = reset or not counted
+    if reset then
+      epoch = epoch + 1
+      local status = indexing_status.Status {
+        state = indexing_status.State.indexing(), initial = initial,
+        epoch = epoch, generation = generation,
+      }
+      self.indexing_status = status
+      self.output:push(indexing_status.notification(status))
+    end
+    if not counted then return end
+    if reset or previous == nil or previous.completed_files == nil then
+      local baseline = indexing_status.Status {
+        state = indexing_status.State.indexing(), initial = initial,
+        epoch = epoch, generation = generation,
+        completed_files = 0, total_files = total_files,
+      }
+      self.indexing_status = baseline
+      self.output:push(indexing_status.notification(baseline))
+      if completed_files == 0 then return end
+    end
+    local status = indexing_status.Status {
+      state = indexing_status.State.indexing(), initial = initial,
+      epoch = epoch, generation = generation,
+      completed_files = completed_files, total_files = total_files,
+    }
+    self.indexing_status = status
+    self.output:push(indexing_status.notification(status))
+    return
+  end
+  if previous ~= nil then initial = previous.initial end
+  local state = indexing_status.State.ready()
+  local message: string? = nil
+  if failure_slot ~= nil then
+    state = indexing_status.State.failed()
+    message = failure_slot.indexing_status.message
+    if claimed > 1 then
+      message = failure_slot.root.path .. ": " .. (message or "Titan indexing failed")
+    end
+  end
+  if previous ~= nil and
+     indexing_status.state_name(previous.state) == indexing_status.state_name(state) and
+     previous.initial == initial and previous.generation == generation and
+     previous.message == message then return end
+  epoch = epoch + 1
+  if failure_slot == nil then self.initial_pending = false end
+  local status = indexing_status.Status {
+    state = state, initial = initial, epoch = epoch, generation = generation,
+    message = message,
+  }
+  self.indexing_status = status
+  self.output:push(indexing_status.notification(status))
+end
+
+local function Slot:set_failure(router: Router, message: string)
+  self.state = WorkerState.failed(message)
+  self.failure = message
+  self.indexing = false
+  local previous? = self.indexing_status
+  if previous ~= nil and indexing_status.state_name(previous.state) == "failed" and
+     previous.message == message then return end
+  self.indexing_status = indexing_status.Status {
+    state = indexing_status.State.failed(),
+    initial = previous == nil or previous.initial,
+    epoch = 0, message = message,
+  }
+  if self.root:claimed() then
+    router:publish_indexing { reset = false, completed = false }
+  end
+end
+
+local function Slot:clear_failure(router: Router, next_state: WorkerState)
+  self.state = next_state
+  self.failure = nil
+  local previous? = self.indexing_status
+  if previous ~= nil and indexing_status.state_name(previous.state) == "failed" then
+    self.indexing_status = nil
+    self.indexing = false
+    if self.root:claimed() then
+      router:publish_indexing { reset = false, completed = false }
+    end
+  end
+end
+
+local function Slot:require_diagnostic_replay()
+  self.replay_diagnostics = self.worker ~= nil and
+    self.replay_unavailable_generation ~= self.generation
+end
+
+local function Slot:on_indexing(router: Router, params: wire.Object)
+  local name? = wire.as_string(params["state"])
+  local epoch? = wire.as_integer(params["epoch"])
+  local initial? = wire.as_boolean(params["initial"])
+  if name == nil or epoch == nil or initial == nil then return end
+  local state = indexing_status.State.indexing()
+  if name == "ready" then
+    state = indexing_status.State.ready()
+  elseif name == "failed" then
+    state = indexing_status.State.failed()
+  elseif name ~= "indexing" then
+    return
+  end
+  local previous? = self.indexing_status
+  -- A worker's own stream is ordered; ignore an obsolete snapshot rather than
+  -- allowing it to roll back the root before aggregating it.
+  if previous ~= nil and epoch < previous.epoch then return end
+  local status = indexing_status.Status {
+    state = state, initial = initial, epoch = epoch,
+    generation = wire.as_integer(params["generation"]),
+    message = wire.as_string(params["message"]),
+    completed_files = wire.as_integer(params["completed_files"]),
+    total_files = wire.as_integer(params["total_files"]),
+  }
+  self.indexing_status = status
+  self.indexing = name == "indexing"
+  if not self.root:claimed() then return end
+  local reset = name == "indexing" and status.completed_files == nil
+  if previous ~= nil then
+    reset = reset or
+      (indexing_status.state_name(previous.state) == "indexing") ~= self.indexing
+  end
+  local completed = name == "ready" and
+    (previous == nil or indexing_status.state_name(previous.state) ~= "ready" or
+     previous.generation ~= status.generation)
+  router:publish_indexing { reset = reset, completed = completed }
+end
+
 -- Clear every publication this root made for a document another root now owns.
 local function clear_stale_diagnostics(router: Router, slot: Slot)
   local stale: {string} = {}
@@ -554,8 +767,8 @@ local function clear_stale_diagnostics(router: Router, slot: Slot)
   end
   for index = 1, #stale do
     local uri = stale[index]
-    slot.published[uri] = nil
     publish_empty_diagnostics(router, uri)
+    slot.published[uri] = nil
     logging.emit("info", "diagnostics.cleared", {
       ["root"] = slot.root.path,
       ["uri"] = uri,
@@ -563,14 +776,36 @@ local function clear_stale_diagnostics(router: Router, slot: Slot)
   end
 end
 
+-- Worker loss must not forget uncleared rows. Leave transferred URIs for ordered
+-- ownership reconciliation; clear owned or unowned URIs without yielding.
+local function Slot:clear_worker_diagnostics(router: Router)
+  for uri, path in iteration.pairs(self.published) do
+    local current? = router.registry:owner(path)
+    if current == nil or current.path == self.root.path then
+      publish_empty_diagnostics(router, uri)
+      self.published[uri] = nil
+    end
+  end
+end
+
+-- Stop one worker while holding its slot transition. The caller decides when
+-- to publish: a restart replaces busy without an intermediate ready frame.
 local function stop_worker_locked(router: Router, slot: Slot, reason: string)
   drain_requests(router, slot.root.path)
   local worker? = slot.worker
   slot.worker = nil
+  defer slot:clear_worker_diagnostics(router)
   slot.worker_pid = nil
   slot.titan_root = nil
   slot.probe_prefix = nil
   slot.indexing = false
+  -- Stopping ends busy, but idle eviction must not dismiss a latest failure.
+  local status? = slot.indexing_status
+  if status ~= nil and
+     indexing_status.state_name(status.state) == "indexing" then
+    slot.indexing_status = nil
+  end
+  slot.replay_diagnostics = false
   if worker ~= nil then
     local actual_worker = worker as worker_process.WorkerProcess
     -- Ownership moves to the router before any suspension point: a caller
@@ -578,6 +813,7 @@ local function stop_worker_locked(router: Router, slot: Slot, reason: string)
     -- the child or its relay Tasks, so the terminal paths can still release it.
     router.retired[#router.retired + 1] = actual_worker
     slot.stopping = true
+    defer slot.stopping = false
     do
       actual_worker:stop(SHUTDOWN_TIMEOUT_MILLISECONDS)
     catch
@@ -587,7 +823,6 @@ local function stop_worker_locked(router: Router, slot: Slot, reason: string)
         ["message"] = strings.tostring(error),
       })
     end
-    slot.stopping = false
   end
   fail_forwarded(router, slot.root.path,
     "Titan worker for " .. slot.root.path .. " stopped: " .. reason)
@@ -627,14 +862,21 @@ end
 local function stop_slot(router: Router, slot: Slot, reason: string)
   begin_transition(slot)
   defer end_transition(slot)
+  local was_indexing = slot.indexing
+  defer if was_indexing and slot.root:claimed() then
+    router:publish_indexing { reset = false, completed = false }
+  end
   stop_worker_locked(router, slot, reason)
   forget_released(router, slot)
 end
 
 local function worker_listener(router: Router, slot: Slot): worker_process.Listener
   local owner = slot
+  local generation = slot.generation
   return worker_process.Listener.new(
     function (method: string, params: value, body: string)
+      if owner.generation ~= generation or
+         (owner.worker == nil and not owner.stopping) then return end
       if method == WORKER_INFO_METHOD then
         local object? = wire.as_object(params)
         if object ~= nil then
@@ -653,47 +895,10 @@ local function worker_listener(router: Router, slot: Slot): worker_process.Liste
         return
       end
       if method == "titan/indexingStatus" then
-        -- Idleness observes the publication, and the router owns one session
-        -- timeline per root: a replacement worker restarts its own epochs at 1
-        -- and the client drops anything below the epoch it already saw, so the
-        -- forwarded epoch is translated into that timeline. The publication
-        -- carries no root identity, so only this slot's state uses it.
+        if owner.stopping then return end
         local object? = wire.as_object(params)
-        if object ~= nil then
-          local actual_params = object as wire.Object
-          local state? = wire.as_string(actual_params["state"])
-          if state ~= nil then
-            local name: string = state
-            owner.indexing = name == "indexing"
-          end
-          local epoch? = wire.as_integer(actual_params["epoch"])
-          if epoch ~= nil then
-            local worker_epoch: integer = epoch
-            local base? = owner.epoch_base
-            if base == nil then
-              owner.epoch_base = worker_epoch
-              owner.epoch_offset = owner.indexing_watermark
-            end
-            local actual_base: integer = owner.epoch_base as integer
-            local session_epoch =
-              owner.epoch_offset + (worker_epoch - actual_base) + 1
-            if session_epoch > owner.indexing_watermark then
-              owner.indexing_watermark = session_epoch
-            end
-            local rewritten: wire.Object = {}
-            for key, value in iteration.pairs(actual_params) do
-              rewritten[key] = value
-            end
-            rewritten["epoch"] = session_epoch
-            local envelope: wire.Object = {
-              ["jsonrpc"] = "2.0",
-              ["method"] = "titan/indexingStatus",
-              ["params"] = rewritten,
-            }
-            router.output:push(wire.encode(envelope))
-            return
-          end
-        end
+        if object ~= nil then owner:on_indexing(router, object) end
+        return
       end
       if method == "textDocument/publishDiagnostics" then
         local object? = wire.as_object(params)
@@ -706,6 +911,11 @@ local function worker_listener(router: Router, slot: Slot): worker_process.Liste
             if path ~= nil then
               local canonical = roots.canonical(path as string)
               local current? = owner_root(router, canonical)
+              -- Canonicalization/discovery can suspend while the process exit
+              -- Task clears its rows, or a replacement takes this slot. A late
+              -- frame must not resurrect diagnostics after that retirement.
+              if owner.generation ~= generation or
+                 (owner.worker == nil and not owner.stopping) then return end
               local current_path = ""
               if current ~= nil then
                 current_path = (current as roots.Root).path
@@ -720,10 +930,14 @@ local function worker_listener(router: Router, slot: Slot): worker_process.Liste
               -- Remember what this root told the client, so an ownership change
               -- can clear exactly those publications.
               local published? = wire.as_array(actual_params["diagnostics"])
-              if published ~= nil and #(published as wire.Array) > 0 then
-                owner.published[text_uri] = canonical
-              else
-                owner.published[text_uri] = nil
+              if published ~= nil then
+                router.output:push(body)
+                if #published > 0 then
+                  owner.published[text_uri] = canonical
+                else
+                  owner.published[text_uri] = nil
+                end
+                return
               end
             end
           end
@@ -732,6 +946,8 @@ local function worker_listener(router: Router, slot: Slot): worker_process.Liste
       router.output:push(body)
     end,
     function (id: value, method: string, params: value, body: string)
+      if owner.generation ~= generation or
+         (owner.worker == nil and not owner.stopping) then return end
       router.next_outbound = router.next_outbound + 1
       local generated = "titan-ls:" .. strings.tostring(router.next_outbound)
       router.outbound[worker_process.id_key(generated as value)] =
@@ -745,6 +961,8 @@ local function worker_listener(router: Router, slot: Slot): worker_process.Liste
       router.output:push(wire.encode(envelope))
     end,
     function (body: string)
+      if owner.generation ~= generation or
+         (owner.worker == nil and not owner.stopping) then return end
       do
         local parsed = wire.decode(body)
         local object? = wire.as_object(parsed)
@@ -760,7 +978,9 @@ local function worker_listener(router: Router, slot: Slot): worker_process.Liste
       router.output:push(body)
     end,
     function (message: string)
-      if owner.stopping or owner.worker == nil then return end
+      if owner.generation ~= generation or
+         owner.stopping or owner.worker == nil then return end
+      local previous_state = owner.state
       -- The process is gone, so its transport Tasks and pipes must be released
       -- even though this listener cannot yield: the housekeeping Task drains
       -- `retired` on its next pass.
@@ -770,24 +990,24 @@ local function worker_listener(router: Router, slot: Slot): worker_process.Liste
       owner.worker_pid = nil
       owner.titan_root = nil
       owner.probe_prefix = nil
-      owner.indexing = false
+      owner:clear_worker_diagnostics(router)
+      owner.replay_diagnostics = false
+      owner:set_failure(router, message)
       -- The process is gone, so the requests it owed the client can never be
       -- answered; forget them before any early return below.
       forget_outbound(router, owner.root.path)
-      if not state_ready(owner.state) then
+      if not state_ready(previous_state) then
         -- Activation owns the failure for a worker that never became ready: its
         -- initialize reply carries this same exit, and counting it here too
         -- would burn two crash slots for one exit.
         logging.emit("info", "root.worker.exited", {
           ["root"] = owner.root.path,
           ["message"] = message,
-          ["state"] = state_name(owner.state),
+          ["state"] = state_name(previous_state),
         })
         return
       end
       record_crash(owner)
-      owner.state = WorkerState.failed(message)
-      owner.failure = message
       fail_forwarded(router, owner.root.path, message)
       logging.emit("error", "root.worker.exited", {
         ["root"] = owner.root.path,
@@ -1042,9 +1262,8 @@ local function clear_configuration_diagnostic(router: Router, slot: Slot)
   router.output:push(wire.encode(envelope))
 end
 
-local function fail_slot(slot: Slot, message: string)
-  slot.state = WorkerState.failed(message)
-  slot.failure = message
+local function fail_slot(router: Router, slot: Slot, message: string)
+  slot:set_failure(router, message)
   logging.emit("error", "root.failed", {
     ["root"] = slot.root.path,
     ["message"] = message,
@@ -1061,6 +1280,7 @@ local function start_worker(router: Router, slot: Slot,
   end
   local probe = root_settings.probe_prefix(
     router.options.probe_prefix, slot.root.path)
+  slot.generation = slot.generation + 1
   local worker = worker_process.spawn(
     router.options.executable, arguments, slot.root.path, probe,
     worker_listener(router, slot))
@@ -1068,12 +1288,16 @@ local function start_worker(router: Router, slot: Slot,
   slot.worker_pid = nil
   slot.last_used = now_milliseconds()
   slot.stopping = false
-  slot.state = WorkerState.starting()
   -- A freshly started worker is not idle: it indexes before its first
   -- titan/indexingStatus frame arrives, and stopping it would discard that pass.
   slot.indexing = true
-  slot.epoch_base = nil
-  slot.generation = slot.generation + 1
+  slot.indexing_status = nil
+  slot:clear_failure(router, WorkerState.starting())
+  -- An unclaimed worker's first pass is filtered until ownership returns.
+  if not slot.root:claimed() then slot:require_diagnostic_replay() end
+  if slot.root:claimed() then
+    router:publish_indexing { reset = true, completed = false }
+  end
   local outcome = worker:request(
     "initialize", worker_initialize_params(router, slot.root.path),
     ACTIVATION_TIMEOUT_MILLISECONDS)
@@ -1084,7 +1308,6 @@ local function start_worker(router: Router, slot: Slot,
     local initialized_params: wire.Object = {}
     worker:notify("initialized", initialized_params)
     slot.state = WorkerState.ready()
-    slot.failure = nil
     replay_overlays(router, slot, worker)
     logging.emit("info", "root.start", {
       ["root"] = slot.root.path,
@@ -1095,28 +1318,26 @@ local function start_worker(router: Router, slot: Slot,
     return true
   when failed(error_value) then
     slot.worker = nil
-    slot.indexing = false
     -- Ownership moves before any suspension, so a cancelled caller still
     -- leaves the child and its relay Tasks to the terminal paths.
     router.retired[#router.retired + 1] = worker
+    record_crash(slot)
+    fail_slot(router, slot, "Titan worker for " .. slot.root.path ..
+      " rejected initialize: " .. wire.encode(error_value))
     do
       worker:stop(SHUTDOWN_TIMEOUT_MILLISECONDS)
     catch
       if error is async.CancellationReason then raise end
     end
-    record_crash(slot)
-    fail_slot(slot, "Titan worker for " .. slot.root.path ..
-      " rejected initialize: " .. strings.tostring(error_value))
     return false
   when unavailable(message) then
     -- The exit listener already retired this worker; releasing it twice is
     -- harmless because release is idempotent.
     slot.worker = nil
-    slot.indexing = false
+    fail_slot(router, slot, message)
     router.retired[#router.retired + 1] = worker
     worker:kill()
     record_crash(slot)
-    fail_slot(slot, message)
     return false
   end
   return false
@@ -1133,7 +1354,7 @@ local function restart_worker(router: Router, slot: Slot, reason: string)
   if settings ~= nil then
     start_worker(router, slot, settings as root_settings.Settings)
   else
-    slot.state = WorkerState.inactive()
+    slot:clear_failure(router, WorkerState.inactive())
   end
 end
 
@@ -1202,8 +1423,7 @@ local function revalidate(router: Router, slot: Slot, force: boolean): boolean
     if slot.worker ~= nil then
       stop_worker_locked(router, slot, "settings error")
     end
-    slot.state = WorkerState.failed(message)
-    slot.failure = message
+    slot:set_failure(router, message)
     if selection_refused(error_value.reason) then
       publish_configuration_diagnostic(router, slot, error_value.path, message)
     end
@@ -1228,22 +1448,20 @@ local function revalidate(router: Router, slot: Slot, force: boolean): boolean
     -- An explicit client reload is a deliberate retry: it clears the restart
     -- suppression a crash loop installed.
     slot.crashes = {}
-    if state_failure(slot.state) ~= nil then
-      slot.failure = nil
-      slot.state = WorkerState.inactive()
+    if slot.failure ~= nil then
+      slot:clear_failure(router, WorkerState.inactive())
     end
   end
   if changed then
     slot.crashes = {}
-    slot.failure = nil
     if slot.worker ~= nil then
       logging.emit("info", "root.restart", {
         ["root"] = slot.root.path,
         ["reason"] = "settings changed",
       })
       restart_worker(router, slot, "settings changed")
-    elseif not state_ready(slot.state) then
-      slot.state = WorkerState.inactive()
+    else
+      slot:clear_failure(router, WorkerState.inactive())
     end
   end
   return changed
@@ -1279,7 +1497,7 @@ local function activate(router: Router, slot: Slot): (Slot?, string?)
         strings.tostring(router.max_workers) ..
         ") reached; close another Titan root or raise " ..
         MAX_WORKERS_ENVIRONMENT_VARIABLE
-      fail_slot(slot, cap_message)
+      fail_slot(router, slot, cap_message)
       return nil, cap_message
     end
     local started = start_worker(router, slot, settings as root_settings.Settings)
@@ -1501,6 +1719,16 @@ end
 -- stopped only by idle eviction or the worker cap.
 local function Router:remove_root(canonical: string)
   local released = self.registry:remove_folder(canonical)
+  if released then
+    local slot? = self.slots[canonical]
+    if slot ~= nil then slot:require_diagnostic_replay() end
+    local heir? = self.registry:owner(canonical)
+    if heir ~= nil then
+      local gaining? = self.slots[heir.path]
+      if gaining ~= nil then gaining:require_diagnostic_replay() end
+    end
+    self:publish_indexing { reset = false, completed = false }
+  end
   logging.emit("info", "root.release", {
     ["root"] = canonical,
     ["released"] = released,
@@ -1548,6 +1776,7 @@ local function Router:on_folders(params: value)
           else
             local canonical = roots.canonical(path as string)
             slot_for_root(self, self.registry:add_folder(canonical))
+            self:publish_indexing { reset = false, completed = false }
             logging.emit("info", "root.added", {["root"] = canonical})
           end
         end
@@ -1654,7 +1883,38 @@ local function Router:reconcile()
   local paths = self:root_paths()
   for index = 1, #paths do
     local slot? = self.slots[paths[index]]
-    if slot ~= nil then clear_stale_diagnostics(self, slot as Slot) end
+    if slot ~= nil then
+      clear_stale_diagnostics(self, slot as Slot)
+      if slot.worker == nil then slot:clear_worker_diagnostics(self) end
+    end
+  end
+  -- Clear every old owner's rows before a worker that gained ownership replays.
+  for index = 1, #paths do
+    local slot? = self.slots[paths[index]]
+    if slot ~= nil and slot.replay_diagnostics and slot.root:claimed() then
+      begin_transition(slot)
+      defer end_transition(slot)
+      local worker? = slot.worker
+      if worker ~= nil and state_ready(slot.state) then
+        local params: wire.Object = {}
+        local outcome = worker:request("titan/republishDiagnostics",
+          params, UNAVAILABLE_DELIVERY_TIMEOUT_MILLISECONDS)
+        case outcome
+        when answered() then
+          slot.replay_diagnostics = false
+        when failed(failure) then
+          logging.emit("error", "diagnostics.replay.failure", {
+            ["root"] = slot.root.path, ["message"] = wire.encode(failure),
+          })
+        when unavailable(message) then
+          slot.replay_diagnostics = false
+          slot.replay_unavailable_generation = slot.generation
+          logging.emit("error", "diagnostics.replay.failure", {
+            ["root"] = slot.root.path, ["message"] = message,
+          })
+        end
+      end
+    end
   end
 end
 
@@ -1790,9 +2050,16 @@ local function Router:activate_initial_roots()
           end
         catch
           if error is async.CancellationReason then raise end
+          local message = strings.tostring(error)
+          begin_transition(slot)
+          defer end_transition(slot)
+          if slot.worker ~= nil then
+            stop_worker_locked(self, slot, "activation failure")
+          end
+          fail_slot(self, slot, message)
           logging.emit("error", "root.activation.failure", {
             ["root"] = root_path,
-            ["message"] = strings.tostring(error),
+            ["message"] = message,
           })
         end
       end

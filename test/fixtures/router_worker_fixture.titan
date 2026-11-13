@@ -1,0 +1,139 @@
+-- A real framed child peer for router lifecycle tests. The --root argument's
+-- final component selects the scenario; no environment variable selects behavior.
+local framing = import "server.framing"
+local fs = import "fs"
+local io = import "io"
+local os = import "os"
+local paths = import "path"
+local router = import "server.router"
+local source_text = import "server.source_text"
+local wire = import "server.wire"
+
+local function send(envelope: wire.Object)
+  os.stdout:write(framing.frame(wire.encode(envelope)))
+end
+
+local function notify(method: string, params: wire.Object)
+  send({["jsonrpc"] = "2.0", ["method"] = method, ["params"] = params})
+end
+
+local function answer(id: value, result: value)
+  send({["jsonrpc"] = "2.0", ["id"] = id, ["result"] = result})
+end
+
+local function reject(id: value, message: string)
+  local failure: wire.Object = { ["code"] = -32803, ["message"] = message }
+  send({["jsonrpc"] = "2.0", ["id"] = id, ["error"] = failure})
+end
+
+local function diagnostics(root: string)
+  local position: wire.Object = { ["line"] = 0, ["character"] = 0 }
+  local range: wire.Object = { ["start"] = position, ["end"] = position }
+  local diagnostic: wire.Object = {
+    ["range"] = range, ["severity"] = 1, ["message"] = "worker peer diagnostic",
+    ["code"] = "compiler", ["source"] = "Titan",
+  }
+  local items: wire.Array = {diagnostic}
+  notify("textDocument/publishDiagnostics", {
+    ["uri"] = source_text.path_to_file_uri(root .. "/main.titan"),
+    ["diagnostics"] = items,
+  })
+end
+
+local function serve(root: string): integer
+  local mode = paths.basename(root)
+  if mode ~= "accept" and mode ~= "indexing" and mode ~= "quiet" and
+     mode ~= "reject-initialize" and mode ~= "exit-before-initialize" and
+     mode ~= "exit-on-initialize" and mode ~= "replay-failed-once" and
+     mode ~= "shutdown-hang" and mode ~= "refresh-blocked" and
+     mode ~= "replay-unavailable" and mode ~= "nested-diagnostics" then
+    raise "unknown worker fixture scenario: " .. mode
+  end
+  local diagnostic_root = root
+  if mode == "nested-diagnostics" then diagnostic_root = root .. "/accept" end
+  if mode == "exit-before-initialize" then return 0 end
+  notify("titan/workerInfo", { ["pid"] = os.pid() })
+  local reader = framing.reader()
+  local replay_count = 0
+  local pending_pull: value = nil
+  while true do
+    local body? = reader:read(os.stdin)
+    if body == nil then return 0 end
+    local object = wire.as_object(wire.decode(body))
+    local method? = wire.as_string(object["method"])
+    local id = object["id"]
+    if method == "initialize" then
+      if mode == "exit-on-initialize" then return 0 end
+      if mode == "reject-initialize" then
+        reject(id, "fixture rejected initialize")
+      else
+        local capabilities: wire.Object = {}
+        answer(id, { ["capabilities"] = capabilities } as wire.Object)
+      end
+    elseif method == "initialized" then
+      if mode ~= "quiet" then
+        notify("titan/indexingStatus", {
+          ["state"] = "indexing", ["initial"] = true, ["epoch"] = 1,
+        })
+        if mode ~= "indexing" then
+          diagnostics(diagnostic_root)
+          notify("titan/indexingStatus", {
+            ["state"] = "ready", ["initial"] = true, ["epoch"] = 1,
+            ["generation"] = 1,
+          })
+        end
+      end
+    elseif method == "titan/republishDiagnostics" then
+      replay_count = replay_count + 1
+      if mode == "replay-unavailable" then
+        -- Keep serving other requests without answering this replay.
+      elseif mode == "replay-failed-once" and replay_count == 1 then
+        reject(id, "fixture rejected first replay")
+      else
+        diagnostics(diagnostic_root)
+        answer(id, wire.null())
+      end
+    elseif method == "textDocument/hover" and mode == "replay-unavailable" then
+      answer(id, replay_count)
+    elseif method == "textDocument/diagnostic" and mode == "refresh-blocked" then
+      pending_pull = id
+      notify("titan/indexingStatus", {
+        ["state"] = "indexing", ["initial"] = false, ["epoch"] = 2,
+      })
+    elseif method == "textDocument/hover" and mode == "refresh-blocked" then
+      -- The next outer-root hover releases a saved refresh, so the client can
+      -- discover/release/reclaim another root while this pass is provably busy.
+      if pending_pull ~= nil then
+        notify("titan/indexingStatus", {
+          ["state"] = "ready", ["initial"] = false, ["epoch"] = 2, ["generation"] = 2,
+        })
+        local items: wire.Array = {}
+        answer(pending_pull, {["kind"] = "full", ["items"] = items} as wire.Object)
+        pending_pull = nil
+      end
+      answer(id, wire.null())
+    elseif method == "shutdown" then
+      if mode ~= "shutdown-hang" then answer(id, wire.null()) end
+    elseif method == "exit" then
+      return 0
+    elseif id ~= nil then
+      reject(id, "unsupported fixture request: " .. (method or "<absent>"))
+    end
+  end
+  return 0
+end
+
+function main(args: {string}): integer
+  -- This harness runs the production router over client stdio with this same
+  -- executable as its worker, without a seam in the shipped server.
+  if #args == 1 and args[1] == "--router" then
+    return router.run(os.stdin, os.stdout, router.LaunchOptions {
+      executable = os.exepath(), root = fs.pwd(),
+    })
+  end
+  if #args ~= 3 or args[1] ~= "--worker" or args[2] ~= "--root" then
+    io.print("expected --router or --worker --root <scenario-directory>")
+    return 2
+  end
+  return serve(args[3])
+end

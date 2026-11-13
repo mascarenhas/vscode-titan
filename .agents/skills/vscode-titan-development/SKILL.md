@@ -244,8 +244,11 @@ Read [native-build.md](../../../docs/native-build.md) before changing native
 build commands. One `titanc --tree src --output ... --source-first --incremental`
 invocation owns the requested module graph, object and link certification,
 folder membership and parallel scheduling. Make owns custom embedding
-generation, the pure-C process-fixture executable, packaging and test execution,
-not module dependencies or SDK/header/configuration inventories.
+generation, the pure-C process-fixture executable, test prerequisites, packaging
+and test execution, not module dependencies or SDK/header/configuration
+inventories. Native, protocol and coverage tests also require the framed Titan
+router-worker peer: Titan owns its graph in a separate output tree under
+`BUILD_ROOT`; its executable is never installed or packaged.
 
 Use `make -j2 server server-test-build`; `TITAN_JOBS` or `TITAN_FLAGS=--jobs=N`
 bounds the compiler, which joins supported parent Make jobservers.
