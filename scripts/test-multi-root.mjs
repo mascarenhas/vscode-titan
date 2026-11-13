@@ -800,9 +800,17 @@ async function testSecondSdk() {
     await pollHover(session, defaultSource, ROOT_A_SOURCE, "doubled", /integer/,
       "the default SDK root");
     // `encoded` returns what `json.encode` declares, so its hover type proves
-    // the standard library resolved from the selected SDK's own archive.
-    await pollHover(session, sdkSource, SDK_SOURCE, "encoded", /string/,
-      "the selected SDK standard library");
+    // the standard library resolved from the selected SDK's own archive. That
+    // needs the selected provider to be loaded: a Windows SDK has no static
+    // archive, and loading a selected SDK's provider DLL on Windows is not
+    // implemented, so this one assertion stays Unix-only.
+    if (process.platform === "win32") {
+      console.log("multi-root: skipped the selected SDK's standard-library " +
+        "assertion (loading a selected SDK's provider DLL on Windows is not implemented)");
+    } else {
+      await pollHover(session, sdkSource, SDK_SOURCE, "encoded", /string/,
+        "the selected SDK standard library");
+    }
     assert.ok(await exists(path.join(sdkRootDir, ".titan-ls", "index.sqlite3")),
       "the selected root wrote no workspace cache below its own root");
     assert.equal(await exists(path.join(sdk, ".titan-ls")), false,
