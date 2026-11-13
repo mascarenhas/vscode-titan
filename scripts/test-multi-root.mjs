@@ -1587,11 +1587,21 @@ async function testOwnershipMigration() {
     await pollStatus(session, (roots) =>
       rootEntry(roots, outerRoot).state === "ready",
       "the outer root did not start");
+    const publications = session.responses.diagnosticPublications;
+    const reportsInner = (nonEmpty) => (publication) =>
+      publication.uri === uri(innerSource) &&
+        (publication.diagnostics.length > 0) === nonEmpty;
+    await waitNotification(session, publications, 0, reportsInner(true),
+      "the enclosing root's saved diagnostic for the nested document");
+    const originalOuter = rootEntry(await session.status(), outerRoot);
+    const addedAt = publications.length;
 
     // The nested folder is its own root while it is a folder.
     session.notify("workspace/didChangeWorkspaceFolders", {
       event: { added: [{ uri: uri(innerRoot), name: "inner" }], removed: [] }
     });
+    await waitNotification(session, publications, addedAt, reportsInner(false),
+      "clearing the enclosing root's diagnostics after nested-folder ownership");
     session.notify("textDocument/didOpen", {
       textDocument: {
         uri: uri(innerSource), languageId: "titan", version: 1, text: overlay
@@ -1601,12 +1611,24 @@ async function testOwnershipMigration() {
       "the unsaved buffer in the nested folder");
     assert.ok(inInner.some((item) => item.label === "overlay_marker"),
       "the nested folder did not see its own unsaved buffer");
+    await waitNotification(session, publications, addedAt, reportsInner(true),
+      "the nested root's saved diagnostic");
+    const releasedAt = publications.length;
 
     // Removing the folder moves the document to the enclosing root, whose
     // already-running worker must receive the buffer.
     session.notify("workspace/didChangeWorkspaceFolders", {
       event: { added: [], removed: [{ uri: uri(innerRoot), name: "inner" }] }
     });
+    await waitNotification(session, publications, releasedAt, reportsInner(false),
+      "clearing the released nested root's diagnostics");
+    await waitNotification(session, publications, releasedAt, reportsInner(true),
+      "the enclosing warm worker's diagnostic after regaining ownership");
+    const restoredOuter = rootEntry(await session.status(), outerRoot);
+    assert.equal(restoredOuter.workerPid, originalOuter.workerPid,
+      "ownership regain restarted the enclosing worker");
+    assert.equal(restoredOuter.generation, originalOuter.generation,
+      "ownership regain changed the enclosing worker's generation");
     await pollStatus(session, (roots) => {
       const entry = roots.find((candidate) => candidate.root === innerRoot);
       return entry?.origin === "released" ? { accepted: roots } : { rejected: roots };

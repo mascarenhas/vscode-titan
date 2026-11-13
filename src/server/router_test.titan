@@ -12,19 +12,18 @@ local test_paths = import "server.test_paths"
 local test_runtime = import "server.test_runtime"
 local timer = import "timer"
 local wire = import "server.wire"
-local worker_process = import "server.worker_process.titan"
 
 local function response(body: string): wire.Object
   local object? = wire.as_object(wire.decode(body))
   test.assert(object ~= nil, "the rewritten worker response is not a JSON object")
-  return object as wire.Object
+  return object
 end
 
 function test_router_remaps_worker_requests_under_a_router_identity(
     _context: test.Context)
   local result_body: wire.Object = {["result"] = 42}
   local forwarded = response(
-    router.worker_response_body("client-17" as value, result_body))
+    router.worker_response_body("client-17", result_body))
   test.assert(forwarded["id"] == "client-17",
     "the worker's original request id was not restored")
   test.assert(forwarded["result"] == 42,
@@ -36,7 +35,7 @@ function test_router_remaps_worker_requests_under_a_router_identity(
     ["code"] = -32601, ["message"] = "Method not found",
   }
   local error_body: wire.Object = {["error"] = error_object}
-  local failed = response(router.worker_response_body(19 as value, error_body))
+  local failed = response(router.worker_response_body(19, error_body))
   test.assert(failed["id"] == 19,
     "an integer worker request id was not restored")
   test.assert(failed["result"] == nil,
@@ -44,7 +43,7 @@ function test_router_remaps_worker_requests_under_a_router_identity(
   local forwarded_error? = wire.as_object(failed["error"])
   test.assert(forwarded_error ~= nil,
     "the worker's error object was not forwarded")
-  test.assert((forwarded_error as wire.Object)["code"] == -32601,
+  test.assert(forwarded_error["code"] == -32601,
     "the forwarded error code changed")
 end
 
@@ -82,7 +81,7 @@ local function take_status(subject: router.Router): wire.Object
   while subject.output:pending() > 0 do
     local envelope = response(subject.output:take())
     if envelope["method"] == "titan/indexingStatus" then
-      return wire.as_object(envelope["params"]) as wire.Object
+      return wire.as_object(envelope["params"])
     end
   end
   raise "the router emitted no indexing status"
@@ -111,7 +110,7 @@ end
 
 local function with_root(body: Body)
   test_runtime.run(function ()
-    local base = fs.realpath(test_paths.temporary_name())
+    local base = test_paths.canonical_path(test_paths.temporary_name())
     fs.unlink(base)
     fs.mkdir(base)
     defer remove_tree(base)
@@ -131,7 +130,7 @@ local function fixture_router(base: string): router.Router
   local executable? = os.getenv("TITAN_ROUTER_WORKER_FIXTURE")
   test.assert(executable ~= nil, "TITAN_ROUTER_WORKER_FIXTURE is required")
   return router.create(router.LaunchOptions {
-    executable = executable as string, root = base,
+    executable = executable, root = base,
     probe_prefix = base .. "/probe",
   }, response_queue.create())
 end
@@ -320,28 +319,31 @@ function test_router_rejects_non_boolean_initial_status(_context: test.Context)
     "a valid false initial flag was rejected")
 end
 
-function test_router_activation_failures_end_optimistic_indexing(_context: test.Context)
+function test_router_activation_failures_end_optimistic_indexing(context: test.Context)
   local modes = {"reject-initialize", "exit-before-initialize", "exit-on-initialize"}
   for index = 1, #modes do
-    with_root(function (base: string)
-      local subject = fixture_router(base)
-      defer subject:close()
-      local slot = add_root(subject, base, modes[index])
-      local active?, message? = router.activate(subject, slot)
-      test.assert(active == nil and message ~= nil and not slot.indexing,
-        "a failed initialize retained its optimistic busy contribution")
-      local observed = statuses(subject)
-      test.assert(#observed == 2 and observed[1]["state"] == "indexing" and
-        observed[1]["initial"] == true and
-        observed[1]["completed_files"] == nil and observed[2]["state"] == "failed",
-        "an initialize failure omitted initial busy or repeated its terminal frame")
-      test.assert(observed[2]["generation"] == 0 and
-        wire.as_integer(observed[2]["epoch"]) > wire.as_integer(observed[1]["epoch"]),
-        "an initialize failure advanced completed generation or rolled back epoch")
-      if modes[index] == "reject-initialize" then
-        test.assert(strings.find(wire.as_string(observed[2]["message"]) as string,
-          "fixture rejected initialize") ~= nil, "initialize lost the worker's error")
-      end
+    local mode = modes[index]
+    context:run(mode, function (_child: test.Context)
+      with_root(function (base: string)
+        local subject = fixture_router(base)
+        defer subject:close()
+        local slot = add_root(subject, base, mode)
+        local active?, message? = router.activate(subject, slot)
+        test.assert(active == nil and message ~= nil and not slot.indexing,
+          "a failed initialize retained its optimistic busy contribution")
+        local observed = statuses(subject)
+        test.assert(#observed == 2 and observed[1]["state"] == "indexing" and
+          observed[1]["initial"] == true and
+          observed[1]["completed_files"] == nil and observed[2]["state"] == "failed",
+          "an initialize failure omitted initial busy or repeated its terminal frame")
+        test.assert(observed[2]["generation"] == 0 and
+          wire.as_integer(observed[2]["epoch"]) > wire.as_integer(observed[1]["epoch"]),
+          "an initialize failure advanced completed generation or rolled back epoch")
+        if mode == "reject-initialize" then
+          test.assert(strings.find(wire.as_string(observed[2]["message"]),
+            "fixture rejected initialize") ~= nil, "initialize lost the worker's error")
+        end
+      end)
     end)
   end
 end
@@ -404,7 +406,7 @@ function test_router_changed_settings_replace_ready_with_failed(_context: test.C
     test.assert(failed["state"] == "failed" and
       failed["generation"] == ready["generation"] and slot.worker == nil,
       "a settings failure retained the ready aggregate or counted a completion")
-    test.assert(strings.find(wire.as_string(failed["message"]) as string,
+    test.assert(strings.find(wire.as_string(failed["message"]),
       "compiler_root") ~= nil, "settings failure omitted its cause")
   end)
 end
@@ -417,7 +419,7 @@ function test_router_restart_forgets_worker_epoch_and_fences_every_old_callback(
     local slot = add_root(subject, base, "accept")
     test.assert(router.activate(subject, slot) ~= nil, "the worker did not activate")
     wait_ready(slot)
-    local old = slot.worker as worker_process.WorkerProcess
+    local old = slot.worker
     old.listener.on_notification("titan/indexingStatus", {
       ["state"] = "indexing", ["initial"] = false, ["epoch"] = 12,
     } as wire.Object, "")
@@ -431,7 +433,7 @@ function test_router_restart_forgets_worker_epoch_and_fences_every_old_callback(
     test.assert(current["generation"] == wire.as_integer(prior["generation"]) + 1 and
       wire.as_integer(current["epoch"]) > wire.as_integer(prior["epoch"]),
       "a real replacement did not accept its worker-local epoch and generation")
-    local replacement = slot.worker as worker_process.WorkerProcess
+    local replacement = slot.worker
     local uri = source_text.path_to_file_uri(slot.root.path .. "/main.titan")
     test.assert(slot.published[uri] ~= nil, "the replacement published no diagnostic")
     local empty: wire.Array = {}
@@ -442,7 +444,7 @@ function test_router_restart_forgets_worker_epoch_and_fences_every_old_callback(
     old.listener.on_notification("textDocument/publishDiagnostics", {
       ["uri"] = uri, ["diagnostics"] = empty,
     } as wire.Object, "obsolete diagnostics")
-    old.listener.on_request(1 as value, "fixture/request", wire.null(), "")
+    old.listener.on_request(1, "fixture/request", wire.null(), "")
     old.listener.on_response("{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":null}")
     old.listener.on_exit("retired worker exit delivered after replacement")
     test.assert(slot.worker == replacement and slot.worker_pid ~= -1 and
@@ -544,7 +546,7 @@ function test_router_release_and_reclaim_restore_busy_and_crashed_snapshots(
     subject:remove_root(slot.root.path)
     take_status(subject)
     local epoch = subject.indexing_status.epoch
-    local worker = slot.worker as worker_process.WorkerProcess
+    local worker = slot.worker
     worker:kill()
     wait_until(function (): boolean return slot.worker == nil end)
     test.assert(#statuses(subject) == 0 and subject.indexing_status.epoch == epoch,
@@ -557,11 +559,12 @@ function test_router_release_and_reclaim_restore_busy_and_crashed_snapshots(
       "a sole claimed root decorated its failure message")
     test.assert(subject.indexing_status.generation == 0,
       "membership changes counted a completed worker publication")
-    local failed = subject.indexing_status
-    local failed_root = slot.indexing_status
+    local message = subject.indexing_status.message
     router.stop_slot(subject, slot, "idle")
-    test.assert(slot.indexing_status == failed_root and
-      subject.indexing_status == failed and #statuses(subject) == 0,
+    test.assert(indexing_status.state_name(slot.indexing_status.state) == "failed" and
+      slot.indexing_status.message == message and
+      indexing_status.state_name(subject.indexing_status.state) == "failed" and
+      subject.indexing_status.message == message and #statuses(subject) == 0,
       "stopping a failed worker dismissed its latest failure")
     subject:remove_root(slot.root.path)
     local released = take_status(subject)
@@ -617,5 +620,140 @@ function test_router_cancelled_stop_restores_stopping_flag(_context: test.Contex
     local terminal = async.join<|nil, value|>(stopping)
     test.assert(terminal:as_string() == "cancelled" and not slot.stopping and
       not slot.transitioning, "cancellation stranded stopping or its transition")
+  end)
+end
+
+local function revalidate_now(subject: router.Router, slot: router.Slot,
+                              force: boolean): boolean
+  router.begin_transition(slot)
+  defer router.end_transition(slot)
+  return router.revalidate(subject, slot, force)
+end
+
+function test_router_repaired_settings_retract_the_failed_snapshot(context: test.Context)
+  local modes = {"explicit_reload", "periodic_sweep"}
+  for index = 1, #modes do
+    local mode = modes[index]
+    context:run(mode, function (_child: test.Context)
+      with_root(function (base: string)
+        local subject = fixture_router(base)
+        defer subject:close()
+        local slot = add_root(subject, base, "accept")
+        test.assert(router.activate(subject, slot) ~= nil, "the worker did not activate")
+        wait_ready(slot)
+        local ready = last_status(subject)
+        fs.write_file(slot.root.path .. "/titan-config.lua", "compiler_root = 3\n")
+        revalidate_now(subject, slot, true)
+        local failed = last_status(subject)
+        test.assert(failed["state"] == "failed" and slot.failure ~= nil,
+          "invalid settings did not publish their failure")
+        fs.unlink(slot.root.path .. "/titan-config.lua")
+        if mode == "explicit_reload" then
+          revalidate_now(subject, slot, true)
+        else
+          wait_until(function (): boolean
+            return revalidate_now(subject, slot, false)
+          end)
+        end
+        local repaired = last_status(subject)
+        test.assert(slot.failure == nil and router.state_name(slot.state) == "inactive" and
+          slot.indexing_status == nil and not slot.indexing,
+          "repaired settings left a failed slot snapshot")
+        test.assert(repaired["state"] == "ready" and repaired["message"] == nil and
+          repaired["generation"] == ready["generation"] and
+          wire.as_integer(repaired["epoch"]) > wire.as_integer(failed["epoch"]),
+          "repaired settings left the session reporting its old failure")
+      end)
+    end)
+  end
+end
+
+function test_router_worker_cap_failure_recovers_after_room_is_available(
+    _context: test.Context)
+  with_root(function (base: string)
+    local subject = fixture_router(base)
+    defer subject:close()
+    subject.max_workers = 1
+    fs.mkdir(base .. "/a")
+    fs.mkdir(base .. "/b")
+    local busy = add_root(subject, base .. "/a", "indexing")
+    local waiting = add_root(subject, base .. "/b", "accept")
+    test.assert(router.activate(subject, busy) ~= nil, "the first worker did not activate")
+    local active?, message? = router.activate(subject, waiting)
+    test.assert(active == nil and message ~= nil and
+      router.state_name(waiting.state) == "failed" and
+      waiting.failure == message and waiting.indexing_status.message == message,
+      "worker-cap refusal did not record one consistent failure")
+    statuses(subject)
+    subject:remove_root(busy.root.path)
+    router.stop_slot(subject, busy, "released")
+    test.assert(last_status(subject)["state"] == "failed",
+      "the waiting root's failure disappeared before a retry")
+    test.assert(router.activate(subject, waiting) ~= nil,
+      "the waiting worker did not activate after capacity became available")
+    wait_ready(waiting)
+    local recovered = last_status(subject)
+    test.assert(waiting.failure == nil and router.state_name(waiting.state) == "ready" and
+      indexing_status.state_name(waiting.indexing_status.state) == "ready" and
+      recovered["state"] == "ready" and recovered["message"] == nil,
+      "a successful worker-cap retry retained its old failure")
+  end)
+end
+
+function test_router_unanswered_stop_clears_worker_diagnostics(_context: test.Context)
+  with_root(function (base: string)
+    local subject = fixture_router(base)
+    defer subject:close()
+    local slot = add_root(subject, base, "shutdown-hang")
+    test.assert(router.activate(subject, slot) ~= nil, "the worker did not activate")
+    wait_ready(slot)
+    local uri = source_text.path_to_file_uri(slot.root.path .. "/main.titan")
+    test.assert(slot.published[uri] ~= nil, "the worker published no diagnostic")
+    while subject.output:pending() > 0 do subject.output:take() end
+    router.stop_slot(subject, slot, "unanswered shutdown")
+    local cleared = false
+    while subject.output:pending() > 0 do
+      local envelope = response(subject.output:take())
+      if envelope["method"] == "textDocument/publishDiagnostics" then
+        local params = wire.as_object(envelope["params"])
+        local diagnostics = wire.as_array(params["diagnostics"])
+        if params["uri"] == uri and #diagnostics == 0 then cleared = true end
+      end
+    end
+    test.assert(slot.worker == nil and slot.published[uri] == nil and cleared,
+      "a worker killed after unanswered shutdown left its diagnostics in the client")
+  end)
+end
+
+local function replay_attempts(slot: router.Slot): integer
+  local params: wire.Object = {}
+  local outcome = slot.worker:request("textDocument/hover", params, 1000)
+  case outcome
+  when answered(count) then return wire.as_integer(count)
+  else raise "the replay peer did not report its request count"
+  end
+end
+
+function test_router_unavailable_replay_is_not_retried_for_the_same_worker(
+    _context: test.Context)
+  with_root(function (base: string)
+    local subject = fixture_router(base)
+    defer subject:close()
+    local slot = add_root(subject, base, "replay-unavailable")
+    test.assert(router.activate(subject, slot) ~= nil, "the worker did not activate")
+    wait_ready(slot)
+    local worker = slot.worker
+    subject:remove_root(slot.root.path)
+    subject:reconcile()
+    reclaim(subject, slot)
+    subject:reconcile()
+    test.assert(replay_attempts(slot) == 1, "the first replay was not attempted")
+    subject:reconcile()
+    subject:remove_root(slot.root.path)
+    subject:reconcile()
+    reclaim(subject, slot)
+    subject:reconcile()
+    test.assert(slot.worker == worker and replay_attempts(slot) == 1,
+      "another client message or ownership gain retried an unavailable worker")
   end)
 end

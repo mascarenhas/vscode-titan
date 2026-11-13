@@ -190,6 +190,9 @@ restart replaces the old workset without an intermediate ready frame.
 An initialization or settings failure ends the root's busy contribution with a
 failed snapshot; an exit that already published terminal is not published again.
 If admission fails before any worker starts, initial bare busy precedes failed.
+Slot failure transitions keep the lifecycle state, failure message and indexing
+snapshot together. Repairing settings retracts their prior failure even before
+another worker starts.
 
 The notification's session `generation` counts completed root publications.
 It is monotonic across worker restarts and root release, reclaim and eviction;
@@ -209,18 +212,21 @@ nested discovery, a worker that stops), and every such change ends in one
 reconciliation step (`Router:reconcile`): a document the client still has open is
 closed in the old owner and opened in the new one with the router's latest text,
 and diagnostics a root published for a document it no longer owns are cleared
-with an empty publication. An unexpectedly exited worker's tracked publications
-are cleared immediately for URIs it still owns, so a file fixed or deleted
-before replacement startup cannot retain a stale diagnostic. Every worker
-callback is fenced by its captured generation, including a diagnostic frame
-whose path lookup suspended across process exit or replacement. A released warm
-root that regains ownership replays its completed diagnostics after old-owner
-clearing: the router requests `titan/republishDiagnostics`, and the worker
-reattaches its listener through `Application:set_diagnostics_listener`. Replay
-remains pending until the worker answers successfully; failure or unavailability
-leaves it eligible for the next reconciliation. The completed view's persisted
-rows remain the single diagnostic source, with no router-side snapshot. The
-router retains each open document's text under the
+with an empty publication. Whenever a slot loses its worker, its tracked
+publications are cleared for URIs it still owns, including when a controlled stop
+must kill an unanswered worker. A file fixed or deleted before replacement
+startup therefore cannot retain a stale diagnostic. Every worker callback is
+fenced by its captured generation, including a diagnostic frame whose path lookup
+suspended across process exit or replacement. A warm worker replays its completed
+diagnostics when its root gains ownership, whether its own folder is re-added or
+an enclosing root regains documents from a released nested folder. After
+old-owner clearing, the router requests `titan/republishDiagnostics`, and the
+worker reattaches its listener through `Application:set_diagnostics_listener`.
+A rejected replay remains pending for the next reconciliation. Replay uses the
+short delivery timeout; an unavailable reply stops retries against that worker,
+including after another ownership change. A new worker can replay normally.
+The completed view's persisted rows remain the single diagnostic source, with no
+router-side snapshot. The router retains each open document's text under the
 same limits the worker applies (`document_buffers.limits`); a buffer it cannot
 retain is replayed as an unavailable contributor (`titan/documentUnavailable`),
 never as the saved bytes. It forwards `$/cancelRequest` to the worker that owns the request id,

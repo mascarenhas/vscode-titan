@@ -45,7 +45,8 @@ local function serve(root: string): integer
   if mode ~= "accept" and mode ~= "indexing" and mode ~= "quiet" and
      mode ~= "reject-initialize" and mode ~= "exit-before-initialize" and
      mode ~= "exit-on-initialize" and mode ~= "replay-failed-once" and
-     mode ~= "shutdown-hang" and mode ~= "refresh-blocked" then
+     mode ~= "shutdown-hang" and mode ~= "refresh-blocked" and
+     mode ~= "replay-unavailable" then
     raise "unknown worker fixture scenario: " .. mode
   end
   if mode == "exit-before-initialize" then return 0 end
@@ -56,7 +57,7 @@ local function serve(root: string): integer
   while true do
     local body? = reader:read(os.stdin)
     if body == nil then return 0 end
-    local object = wire.as_object(wire.decode(body as string)) as wire.Object
+    local object = wire.as_object(wire.decode(body))
     local method? = wire.as_string(object["method"])
     local id = object["id"]
     if method == "initialize" then
@@ -82,12 +83,16 @@ local function serve(root: string): integer
       end
     elseif method == "titan/republishDiagnostics" then
       replay_count = replay_count + 1
-      if mode == "replay-failed-once" and replay_count == 1 then
+      if mode == "replay-unavailable" then
+        -- Keep serving other requests without answering this replay.
+      elseif mode == "replay-failed-once" and replay_count == 1 then
         reject(id, "fixture rejected first replay")
       else
         diagnostics(root)
         answer(id, wire.null())
       end
+    elseif method == "textDocument/hover" and mode == "replay-unavailable" then
+      answer(id, replay_count)
     elseif method == "textDocument/diagnostic" and mode == "refresh-blocked" then
       pending_pull = id
       notify("titan/indexingStatus", {

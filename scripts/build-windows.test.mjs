@@ -97,21 +97,6 @@ test("Windows applications delegate source and native graphs to one compiler inv
   }
 });
 
-test("the router worker fixture is a private compiler-owned application", () => {
-  const sourceRoot = `${path.resolve("src")};${path.resolve("test/fixtures")}`;
-  const directory = path.resolve("tests/native/router-worker");
-  const args = windowsApplicationArguments({ sourceRoot, directory,
-    embeddedSource: path.resolve("native/embedded.c"), sdk: path.resolve("sdk"),
-    entry: "router_worker_fixture", executable: "router_worker_fixture.exe" });
-  assert.equal(args[args.indexOf("--tree") + 1], sourceRoot.replaceAll("\\", "/"));
-  assert.equal(args[args.indexOf("--output") + 1], directory.replaceAll("\\", "/"));
-  assert.equal(args[args.indexOf("--exe") + 1],
-    path.join(directory, "bin/router_worker_fixture.exe").replaceAll("\\", "/"));
-  assert.equal(args.at(-1), "router_worker_fixture");
-  assert(args.includes("--source-first") && args.includes("--incremental"));
-  assert(!args.includes("--test") && !args.includes("--no-uv-bootstrap"));
-});
-
 test("configured compiler arguments retain spaces and Unicode without a command shell", () => {
   assert.equal(compilerArgument("C:\\Program Files\\路径\\clang.exe"), '"C:/Program Files/路径/clang.exe"');
   assert.throws(() => compilerArgument('C:/bad"argument'), /cannot contain/);

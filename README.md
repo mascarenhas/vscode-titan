@@ -331,9 +331,10 @@ watchers and caches, so roots cannot see each other's facts.
   retained under the same size limits the worker applies, and a document too
   large to retain is reported as unavailable rather than analysed from its saved
   bytes.
-- A worker that exits unexpectedly fails its pending requests. Three crashes of
-  one root within a minute stop automatic restarts until that root's settings
-  change or the client sends `workspace/didChangeConfiguration`.
+- A worker that exits unexpectedly fails its pending requests. Its diagnostics
+  are cleared until its replacement publishes. Three crashes of one root within
+  a minute stop automatic restarts until that root's settings change or the
+  client sends `workspace/didChangeConfiguration`.
 - Changing a root's configuration, or reinstalling its SDK, restarts only that
   root's worker, immediately and without client action. A tracked
   `titan-config.lua` edit that leaves `compiler_root` unchanged needs no
@@ -341,7 +342,9 @@ watchers and caches, so roots cannot see each other's facts.
 - Removing a folder releases its root; it does not stop it. The warm worker is
   kept, the released root owns only documents that its own `titan-config.lua`
   claims, and adding the same folder again reuses that worker without a restart
-  or a fresh index. Only idle eviction and the worker cap stop a released root.
+  or a fresh index and restores its diagnostics. An enclosing warm worker also
+  republishes when it regains documents from a released nested folder. Only idle
+  eviction and the worker cap stop a released root.
   A client that adds a sibling checkout for one call and removes it afterwards
   therefore pays the index cost once, not once per call.
 
@@ -357,12 +360,13 @@ the root path.
 
 ## Indexing and diagnostics
 
-While claimed roots build or refresh their saved-file state, one session-wide
-**Titan indexing N/M files** language-status item stays busy until no claimed
-root is indexing. Counts appear only when every busy root reports its workset.
-It disappears when the session is ready. A claimed root's latest indexing
-failure stays visible as an error, and selecting it opens the language-server
-output.
+A root is claimed while a workspace folder or a discovered configuration keeps
+it in the session. While claimed roots build or refresh their saved-file state,
+one session-wide **Titan indexing N/M files** language-status item stays busy
+until no claimed root is indexing. Counts appear only when every busy root
+reports its workset. It disappears when the session is ready. A claimed root's
+latest indexing failure stays visible as an error, and selecting it opens the
+language-server output.
 Read-only features stay responsive during indexing. Until the first generation
 is ready they return their ordinary empty result. Afterward an unchanged
 request uses the most recent completed generation without rescanning, also
