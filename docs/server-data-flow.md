@@ -179,8 +179,9 @@ otherwise ready. Busy stays initial until the first session ready; afterward it
 is initial if any indexing root is initial. File counters are summed only when
 every indexing root reports them; otherwise busy has no counters. A changed
 workset or busy-root membership starts a newer bare-busy
-epoch and a zero-count baseline before counted progress. Failure messages
-identify the failed root when more than one root is claimed.
+epoch and a zero-count baseline before counted progress. Every counterless busy
+frame advances the session epoch. Failure messages identify the failed root when
+more than one root is claimed.
 Terminal snapshots survive idle worker eviction; releasing a root excludes its
 snapshot until that root is claimed again, independently of diagnostic replay.
 Lifecycle changes publish only when the visible aggregate changes: an unchanged

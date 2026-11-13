@@ -490,8 +490,17 @@ function test_router_initial_scope_survives_another_roots_refresh(_context: test
     first:on_indexing(subject, {
       ["state"] = "ready", ["initial"] = true, ["epoch"] = 1, ["generation"] = 1,
     })
-    test.assert(last_status(subject)["initial"] == true,
+    local initial_busy = last_status(subject)
+    test.assert(initial_busy["initial"] == true,
       "one ready root ended initial scope while another awaited its first frame")
+    first:on_indexing(subject, {
+      ["state"] = "ready", ["initial"] = true, ["epoch"] = 1, ["generation"] = 2,
+    })
+    local duplicate = take_status(subject)
+    test.assert(duplicate["state"] == "indexing" and
+      duplicate["completed_files"] == nil and duplicate["total_files"] == nil and
+      wire.as_integer(duplicate["epoch"]) > wire.as_integer(initial_busy["epoch"]),
+      "a duplicate ready frame republished counterless busy without a fresh epoch")
     first:on_indexing(subject, {
       ["state"] = "indexing", ["initial"] = false, ["epoch"] = 2,
     })
@@ -544,10 +553,20 @@ function test_router_release_and_reclaim_restore_busy_and_crashed_snapshots(
     reclaim(subject, slot)
     test.assert(take_status(subject)["state"] == "failed",
       "reclaim hid the crashed snapshot when diagnostic replay was absent")
+    test.assert(subject.indexing_status.message == slot.indexing_status.message,
+      "a sole claimed root decorated its failure message")
     test.assert(subject.indexing_status.generation == 0,
       "membership changes counted a completed worker publication")
+    local failed = subject.indexing_status
+    local failed_root = slot.indexing_status
+    router.stop_slot(subject, slot, "idle")
+    test.assert(slot.indexing_status == failed_root and
+      subject.indexing_status == failed and #statuses(subject) == 0,
+      "stopping a failed worker dismissed its latest failure")
     subject:remove_root(slot.root.path)
-    take_status(subject)
+    local released = take_status(subject)
+    test.assert(released["state"] == "ready" and released["message"] == nil,
+      "release retained an excluded root's failure")
     fs.write_file(slot.root.path .. "/titan-config.lua", "")
     local discovered? = router.owner_root(subject, slot.root.path .. "/main.titan")
     test.assert(discovered ~= nil and take_status(subject)["state"] == "failed",
