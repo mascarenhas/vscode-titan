@@ -198,7 +198,8 @@ Slot failure transitions keep the lifecycle state, failure message and indexing
 snapshot together. Repairing settings retracts their prior failure even before
 another worker starts.
 
-The notification's session `generation` counts completed root publications.
+The notification's session `generation` counts completed publications from claimed
+roots when their snapshots are accepted, even before the first visible frame.
 It is monotonic across worker restarts and root release, reclaim and eviction;
 replaying a warm root does not count another completion. Completions hidden
 behind unchanged busy are retained for the next ready frame without a

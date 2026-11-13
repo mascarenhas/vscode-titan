@@ -241,6 +241,51 @@ function test_router_aggregates_overlapping_indexing_worksets(_context: test.Con
     "an unchanged failed aggregate was published again")
 end
 
+function test_router_counts_completions_before_its_first_visible_frame(
+    _context: test.Context)
+  local subject = indexing_router()
+  local outer = router.slot_for_root(subject, subject.registry:add_folder("/outer"))
+  outer:on_indexing(subject, {
+    ["state"] = "ready", ["initial"] = true, ["epoch"] = 1, ["generation"] = 1,
+  })
+  outer:on_indexing(subject, {
+    ["state"] = "ready", ["initial"] = true, ["epoch"] = 1, ["generation"] = 1,
+  })
+  outer:on_indexing(subject, {
+    ["state"] = "ready", ["initial"] = true, ["epoch"] = 0, ["generation"] = 2,
+  })
+  test.assert(subject.output:pending() == 0,
+    "a completion before the first busy workset manufactured a frame")
+  outer:on_indexing(subject, {
+    ["state"] = "indexing", ["initial"] = false, ["epoch"] = 2,
+  })
+  local started = take_status(subject)
+  test.assert(started["state"] == "indexing" and started["generation"] == 1,
+    "the first visible frame lost or duplicated the earlier completion")
+  outer:on_indexing(subject, {
+    ["state"] = "ready", ["initial"] = false, ["epoch"] = 2, ["generation"] = 2,
+  })
+  local ready = take_status(subject)
+  test.assert(ready["state"] == "ready" and ready["generation"] == 2,
+    "session ready lost a completion observed before the first frame")
+end
+
+function test_router_first_failure_retains_earlier_completions(_context: test.Context)
+  local subject = indexing_router()
+  local outer = router.slot_for_root(subject, subject.registry:add_folder("/outer"))
+  outer:on_indexing(subject, {
+    ["state"] = "ready", ["initial"] = true, ["epoch"] = 1, ["generation"] = 1,
+  })
+  outer:set_failure(subject, "broken")
+  local observed = statuses(subject)
+  test.assert(#observed == 2 and observed[1]["state"] == "indexing" and
+    observed[1]["generation"] == 1,
+    "the synthetic first busy frame lost an earlier completion")
+  test.assert(observed[2]["state"] == "failed" and
+    observed[2]["generation"] == 1 and observed[2]["message"] == "broken",
+    "the first failure lost an earlier completion")
+end
+
 function test_router_busy_precedes_failure(_context: test.Context)
   local subject = indexing_router()
   local outer = router.slot_for_root(subject, subject.registry:add_folder("/outer"))
