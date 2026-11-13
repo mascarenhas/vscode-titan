@@ -2274,7 +2274,7 @@ async function testNestedIndexingStatus() {
     await waitNotification(session, session.responses.indexingStatuses, failureStart,
       (status) => status.state === "failed", "the nested root's failure");
     assert.ok(consume().some((display) => display.kind === "failed" &&
-      display.message.includes(innerRoot) &&
+      display.message.includes(serverPath(innerRoot)) &&
       /cannot evaluate titan-config\.lua/.test(display.message)),
     "the extension hid the nested root's qualified failure");
     // Another root's successful refresh must not dismiss that failure.
