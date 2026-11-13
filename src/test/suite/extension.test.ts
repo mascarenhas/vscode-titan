@@ -930,6 +930,27 @@ suite("Titan extension", () => {
           }
           throw cause;
         }
+        // A link this account created may still be untraversable: Windows marks
+        // a link made without SeCreateSymbolicLinkPrivilege as an untrusted
+        // mount point and refuses to resolve it, and the client then falls back
+        // to the lexical root. Skip instead of asserting against that fallback.
+        let resolvedLink: string;
+        try {
+          resolvedLink = await realpath(lexicalRoot);
+        } catch (cause) {
+          const code = (cause as NodeJS.ErrnoException).code ?? "";
+          if (process.platform === "win32" &&
+              ["EPERM", "EACCES", "UNKNOWN", "ENOSYS"].includes(code)) {
+            console.log("skipping the lexical symlink workspace case: Windows " +
+              "refuses to traverse the created directory link " +
+              "(untrusted mount point)");
+            this.skip();
+            return;
+          }
+          throw cause;
+        }
+        assert.equal(resolvedLink, canonicalRoot,
+          "the lexical link did not resolve to the physical root");
         await mkdir(path.join(physicalRoot, ".vscode"), { recursive: true });
         await writeFile(
           path.join(physicalRoot, "sample.titan"),
