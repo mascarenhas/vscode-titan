@@ -224,6 +224,7 @@ describe("Titan language configuration", () => {
     );
     assert.match("local interface Reader", increasesIndent);
     assert.match("foreign function fs_realpath_cb(request: *uv_fs_t)", increasesIndent);
+    assert.match("local foreign function release_handle(handle: *void)", increasesIndent);
     // Foreign function bodies write unprefixed, possibly multiword C types.
     assert.match("  for index: unsigned long = 0, count do", increasesIndent);
     assert.doesNotMatch("  local wide: unsigned long = count as unsigned long", increasesIndent);
