@@ -767,8 +767,8 @@ local function clear_stale_diagnostics(router: Router, slot: Slot)
   end
   for index = 1, #stale do
     local uri = stale[index]
-    slot.published[uri] = nil
     publish_empty_diagnostics(router, uri)
+    slot.published[uri] = nil
     logging.emit("info", "diagnostics.cleared", {
       ["root"] = slot.root.path,
       ["uri"] = uri,
@@ -776,18 +776,16 @@ local function clear_stale_diagnostics(router: Router, slot: Slot)
   end
 end
 
--- A replacement cannot clear its predecessor's publications. Use registry
--- ownership without yielding so a newer owner's rows are left alone.
+-- Worker loss must not forget uncleared rows. Leave transferred URIs for ordered
+-- ownership reconciliation; clear owned or unowned URIs without yielding.
 local function Slot:clear_worker_diagnostics(router: Router)
-  local published = false
   for uri, path in iteration.pairs(self.published) do
-    published = true
     local current? = router.registry:owner(path)
-    if current ~= nil and current.path == self.root.path then
+    if current == nil or current.path == self.root.path then
       publish_empty_diagnostics(router, uri)
+      self.published[uri] = nil
     end
   end
-  if published then self.published = {} end
 end
 
 -- Stop one worker while holding its slot transition. The caller decides when
@@ -932,10 +930,14 @@ local function worker_listener(router: Router, slot: Slot): worker_process.Liste
               -- Remember what this root told the client, so an ownership change
               -- can clear exactly those publications.
               local published? = wire.as_array(actual_params["diagnostics"])
-              if published ~= nil and #(published as wire.Array) > 0 then
-                owner.published[text_uri] = canonical
-              else
-                owner.published[text_uri] = nil
+              if published ~= nil then
+                router.output:push(body)
+                if #published > 0 then
+                  owner.published[text_uri] = canonical
+                else
+                  owner.published[text_uri] = nil
+                end
+                return
               end
             end
           end

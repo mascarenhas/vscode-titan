@@ -93,6 +93,17 @@ local function last_status(subject: router.Router): wire.Object
   return observed[#observed]
 end
 
+local function take_diagnostics(subject: router.Router, uri: string): wire.Array
+  while subject.output:pending() > 0 do
+    local envelope = response(subject.output:take())
+    if envelope["method"] == "textDocument/publishDiagnostics" then
+      local params = wire.as_object(envelope["params"])
+      if params["uri"] == uri then return wire.as_array(params["diagnostics"]) end
+    end
+  end
+  raise "the router emitted no diagnostic publication for " .. uri
+end
+
 local type Body = function (string): ()
 local type Predicate = function (): boolean
 
@@ -574,6 +585,74 @@ function test_router_release_and_reclaim_restore_busy_and_crashed_snapshots(
     local discovered? = router.owner_root(subject, slot.root.path .. "/main.titan")
     test.assert(discovered ~= nil and take_status(subject)["state"] == "failed",
       "config discovery hid a reclaimed crashed snapshot without replay")
+  end)
+end
+
+function test_router_released_worker_exit_clears_unowned_diagnostics(
+    _context: test.Context)
+  with_root(function (base: string)
+    local subject = fixture_router(base)
+    defer subject:close()
+    local slot = add_root(subject, base, "accept")
+    test.assert(router.activate(subject, slot) ~= nil, "the worker did not activate")
+    wait_ready(slot)
+    local uri = source_text.path_to_file_uri(slot.root.path .. "/main.titan")
+    test.assert(#take_diagnostics(subject, uri) > 0 and slot.published[uri] ~= nil,
+      "the peer did not publish the diagnostic to be cleared")
+    local worker = slot.worker
+    local malformed: wire.Object = {["uri"] = uri}
+    local envelope: wire.Object = {
+      ["jsonrpc"] = "2.0", ["method"] = "textDocument/publishDiagnostics",
+      ["params"] = malformed,
+    }
+    worker.listener.on_notification("textDocument/publishDiagnostics",
+      malformed, wire.encode(envelope))
+    test.assert(slot.published[uri] ~= nil,
+      "a notification without an empty diagnostic array forgot a publication")
+    while subject.output:pending() > 0 do subject.output:take() end
+    subject:remove_root(slot.root.path)
+    test.assert(subject.registry:owner(slot.root.path .. "/main.titan") == nil,
+      "the released config-less document still had an owner")
+    -- No reconciliation runs between release and this real peer's exit.
+    worker:kill()
+    wait_until(function (): boolean return slot.worker == nil end)
+    test.assert(#take_diagnostics(subject, uri) == 0 and slot.published[uri] == nil,
+      "a released worker exit forgot its diagnostic without clearing the client")
+    subject:reconcile()
+    test.assert(subject.output:pending() == 0,
+      "reconciliation cleared an already-cleared publication again")
+  end)
+end
+
+function test_router_exited_worker_retains_transferred_diagnostics_until_reconcile(
+    _context: test.Context)
+  with_root(function (base: string)
+    local subject = fixture_router(base)
+    defer subject:close()
+    local outer = add_root(subject, base, "nested-diagnostics")
+    local inner = add_root(subject, outer.root.path, "accept")
+    test.assert(router.activate(subject, outer) ~= nil, "outer worker did not activate")
+    wait_ready(outer)
+    test.assert(router.activate(subject, inner) ~= nil, "inner worker did not activate")
+    wait_ready(inner)
+    local uri = source_text.path_to_file_uri(inner.root.path .. "/main.titan")
+    test.assert(#take_diagnostics(subject, uri) > 0 and inner.published[uri] ~= nil,
+      "the inner peer did not publish its diagnostic")
+    while subject.output:pending() > 0 do subject.output:take() end
+    local worker = inner.worker
+    subject:remove_root(inner.root.path)
+    test.assert(subject.registry:owner(inner.root.path .. "/main.titan") == outer.root,
+      "the enclosing root did not regain ownership")
+    worker:kill()
+    wait_until(function (): boolean return inner.worker == nil end)
+    test.assert(inner.published[uri] ~= nil and subject.output:pending() == 0,
+      "worker exit forgot a transferred publication before ordered clearing")
+    subject:reconcile()
+    test.assert(#take_diagnostics(subject, uri) == 0,
+      "ownership reconciliation did not clear the old worker's publication first")
+    test.assert(#take_diagnostics(subject, uri) > 0 and
+      inner.published[uri] == nil and outer.published[uri] ~= nil,
+      "the enclosing warm peer did not republish after old-owner clearing")
   end)
 end
 
