@@ -70,6 +70,12 @@ interface CapturedSyntaxToken {
 
 const extensionIdentifier = "mascarenhas.titan";
 
+// A call keeps TypeScript from narrowing process.platform across the early
+// Windows skip below, where the case returns before its POSIX-only fixture.
+function isWindows(): boolean {
+  return process.platform === "win32";
+}
+
 suite("Titan extension", () => {
   const configuredLuaPath = "/fixture/compiler/?.lua";
   const configuredLuaCPath = "/fixture/compiler/?.so";
@@ -895,6 +901,16 @@ suite("Titan extension", () => {
   test("maps a lexical symlink workspace to one physical server root",
     async function () {
       this.timeout(30_000);
+      // The Extension Host itself reports the lexical root for a symlinked
+      // workspace on Windows, even where Node resolves the link, so the case
+      // would assert against that Windows behaviour rather than this mapping.
+      if (isWindows()) {
+        console.log("skipping the lexical symlink workspace case: the " +
+          "Extension Host sends the lexical root for a symlinked workspace " +
+          "on Windows (vscode-titan#135)");
+        this.skip();
+        return;
+      }
       const repositoryRoot = path.resolve(__dirname, "../../../..");
       const fakeServer = path.join(
         repositoryRoot,
@@ -924,7 +940,7 @@ suite("Titan extension", () => {
         try {
           await symlink(physicalRoot, lexicalRoot, "dir");
         } catch (cause) {
-          if (process.platform === "win32" &&
+          if (isWindows() &&
               (cause as NodeJS.ErrnoException).code === "EPERM") {
             this.skip();
           }
@@ -939,7 +955,7 @@ suite("Titan extension", () => {
           resolvedLink = await realpath(lexicalRoot);
         } catch (cause) {
           const code = (cause as NodeJS.ErrnoException).code ?? "";
-          if (process.platform === "win32" &&
+          if (isWindows() &&
               ["EPERM", "EACCES", "UNKNOWN", "ENOSYS"].includes(code)) {
             console.log("skipping the lexical symlink workspace case: Windows " +
               "refuses to traverse the created directory link " +
