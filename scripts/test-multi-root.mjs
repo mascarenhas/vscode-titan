@@ -812,7 +812,8 @@ async function testSecondSdk() {
     // implemented, so this one assertion stays Unix-only.
     if (process.platform === "win32") {
       console.log("multi-root: skipped the selected SDK's standard-library " +
-        "assertion (loading a selected SDK's provider DLL on Windows is not implemented)");
+        "assertion (loading a selected SDK's provider DLL on Windows is not " +
+        "implemented; vscode-titan#136)");
     } else {
       await pollHover(session, sdkSource, SDK_SOURCE, "encoded", /string/,
         "the selected SDK standard library");
