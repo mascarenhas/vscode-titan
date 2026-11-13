@@ -174,8 +174,10 @@ The peer always imports this checkout's server sources, even when `SOURCE_ROOT`
 selects another application for an incremental-build test.
 
 The final component of the worker's existing `--root` argument selects its
-scenario: accept/reject initialize, exit before/during initialize, withhold
-indexing, fail the first diagnostic replay, or withhold replay or shutdown.
+scenario: accept/reject initialize, exit before/during initialize or shutdown,
+withhold indexing or shutdown, fail the first replay, exit during replay, or
+keep alive after input EOF. `progress-controlled` advances
+counted initial and refresh passes with hover barriers.
 The `refresh-blocked` scenario holds a pull request until an outer-root hover,
 allowing deterministic nested discovery and release/reclaim during busy.
 `--router` serves the production router with this executable as its worker.
@@ -400,9 +402,6 @@ in `TITAN_COMPILER_IO_PROCESS_FIXTURE`.
 The driver also builds the Titan router peer as a normal compiler-owned Windows
 application under `tests/native/router-worker`, with its runtime/provider DLLs.
 `server-test-run` passes `TITAN_ROUTER_WORKER_FIXTURE` to the native router cases.
-Portable driver tests exercise compiler argument and environment construction;
-the native Windows aggregate has not been run. The Unix protocol target also
-uses the peer's `--router` harness for controlled failures.
 
 ### Windows embedded interfaces
 
@@ -444,14 +443,38 @@ Native process tests, SQLite cache reopen tests, stdio protocol tests, package
 inspection and an interactive Extension Host (F5) session are separate gates. A
 successful compilation, a DLL helper test or an SSH-launched `code` command does
 not establish them. Symlink checks skip when the account lacks symlink privilege.
+The multi-root transcript's per-root SDK cases skip on Windows: a selected
+root's `compiler_root` needs the bridge to load that SDK's provider, the Unix
+path loads the `titan.a` archive provider, and a Windows SDK ships `titan.dll`
+instead ([vscode-titan#136](https://github.com/mascarenhas/vscode-titan/issues/136)).
+
+`scripts/test-server-protocol.mjs`, `scripts/test-multi-root.mjs` and
+`scripts/test-completion-protocol.mjs` each take the built server executable as
+their first argument, and need the environment the Unix `SERVER_TEST_ENV`
+supplies. Set `TITAN_ROOT` to the selected SDK, `TITAN_LS_LUA_PATH` to
+`<sdk>/share/lua/5.5/?.lua;<sdk>/share/lua/5.5/?/init.lua`,
+`TITAN_LS_LUA_CPATH` to `<sdk>/lib/lua/5.5/?.dll`, and
+`TITAN_ROUTER_WORKER_FIXTURE` to the peer that `server-test-build` links at
+`.build/windows/tests/native/router-worker/bin/router_worker_fixture.exe`.
+`server-test-run` already gives the native aggregate `TITAN_ROOT` and both
+fixtures, and the driver exports `LUA_PATH_5_5` and `LUA_CPATH_5_5` for it;
+the stdio suites instead read the two `TITAN_LS_LUA_*` variables above. Clear
+`TITAN_PREFIX`, which the server reads as an inherited probe prefix, so each
+root keeps its own `.titan-ls` cache. The multi-root suite accepts one group
+name as its second argument, so a failure can be rerun alone.
 
 For F5, the interactive account needs read and execute access to the SDK and
 the tool prefix. It also needs its own writable workspace, build output, Node
 dependencies, VS Code user state and analysis cache. Use a protected shared
 tool installation or per-user copies; do not broaden another account's profile
 permissions. Set `TITAN_PREFIX`, `CC`, `AR`, `RANLIB`, `RC` and the native Node
-and tool `PATH` in the process that launches Code. The `npm: compile`
-pre-launch task then stages the selected SDK's compiler payload. The Windows
+and tool `PATH` in the process that launches Code. Titan parses those four tool
+settings as shell words, so every value is a quoted forward-slash path such as
+`"C:/tools/clang64/bin/clang.exe"`; a backslash path escapes the next character
+instead of separating it ([Windows
+compilation](https://github.com/mascarenhas/titan/blob/master/doc/language/modules.md#experimental-windows-compilation)).
+The `npm: compile` pre-launch task then stages the selected SDK's compiler
+payload. The Windows
 launch configuration in `.vscode/launch.json` clears `TITAN_PREFIX` only in the
 Extension Host, so the server uses its normal `.titan-ls` probe cache. Keep the
 workspace on writable guest-local NTFS, and build the native server first.

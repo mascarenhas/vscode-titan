@@ -13,23 +13,40 @@ local roots = import "server.roots"
 
 -- An installed Titan SDK prefix carries these exact entries. The router checks
 -- them before it starts a worker so a missing or partial installation is a
--- root-scoped error instead of a worker crash.
+-- root-scoped error instead of a worker crash. The standard provider is a
+-- static archive on Unix and a DLL on Windows, so its entry is resolved by
+-- platform; the entries before and after it keep one spelling across platforms.
 local const SDK_FILES: const {string} = {
   "share/lua/5.5/titan-compiler/driver.lua",
-  "lib/titan/0.6/titan.a",
 }
 local const SDK_DIRECTORIES: const {string} = {
   "lib/lua/5.5",
 }
-local const IDENTITY_FILES: const {string} = {
+local const IDENTITY_FILES_HEAD: const {string} = {
   "share/lua/5.5/titan-compiler/driver.lua",
-  "lib/titan/0.6/titan.a",
+}
+local const IDENTITY_FILES_TAIL: const {string} = {
   "lib/titan/0.6/sdk-digests",
 }
 local const PROBE_ROOTS_DIRECTORY = "roots"
 local const PROBE_ROOT_DIGEST_BYTES = 16
 local PATH_LIST_SEPARATOR_LINUX = 58
 local PATH_LIST_SEPARATOR_WINDOWS = 59
+
+-- One required SDK file, or the root-scoped error that names it.
+local function missing_file(prefix: string, entry: string): Error?
+  local metadata? = fs.stat(join(prefix, entry))
+  if metadata ~= nil and metadata.kind == "file" then return nil end
+  return Error.new(prefix,
+    "compiler_root '" .. prefix .. "' is not an installed Titan SDK: " ..
+    "missing " .. entry, Reason.invalid_prefix())
+end
+
+--- The selected SDK's standard provider, relative to its prefix.
+function provider_entry(): string
+  if ffi.VSCODE_TITAN_WINDOWS ~= 0 then return "lib/titan/0.6/titan.dll" end
+  return "lib/titan/0.6/titan.a"
+end
 
 --- Why a root's settings cannot be accepted.
 -- The router reacts structurally, not by matching a message.
@@ -152,13 +169,12 @@ end
 --- Validate the layout of an installed Titan SDK prefix.
 function validate_prefix(prefix: string): Error?
   for index = 1, #SDK_FILES do
-    local entry = join(prefix, SDK_FILES[index])
-    local metadata? = fs.stat(entry)
-    if metadata == nil or metadata.kind ~= "file" then
-      return Error.new(prefix,
-        "compiler_root '" .. prefix .. "' is not an installed Titan SDK: " ..
-        "missing " .. SDK_FILES[index], Reason.invalid_prefix())
-    end
+    local failure? = missing_file(prefix, SDK_FILES[index])
+    if failure ~= nil then return failure end
+  end
+  do
+    local failure? = missing_file(prefix, provider_entry())
+    if failure ~= nil then return failure end
   end
   for index = 1, #SDK_DIRECTORIES do
     local entry = join(prefix, SDK_DIRECTORIES[index])
@@ -222,8 +238,14 @@ function sdk_identity(compiler_root: string?, titan_root: string?): string
   if prefix == nil then prefix = titan_root end
   if prefix == nil then return "" end
   local output = strings.writer()
-  for index = 1, #IDENTITY_FILES do
-    local entry = join(prefix as string, IDENTITY_FILES[index])
+  for index = 1, #IDENTITY_FILES_HEAD do
+    local entry = join(prefix as string, IDENTITY_FILES_HEAD[index])
+    output:write(content_identity.stat_identity(entry))
+  end
+  output:write(content_identity.stat_identity(
+    join(prefix as string, provider_entry())))
+  for index = 1, #IDENTITY_FILES_TAIL do
+    local entry = join(prefix as string, IDENTITY_FILES_TAIL[index])
     output:write(content_identity.stat_identity(entry))
   end
   return content_identity.digest(output:drain())

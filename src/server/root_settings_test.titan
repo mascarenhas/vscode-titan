@@ -24,10 +24,12 @@ local function remove_tree(path: string)
 end
 
 -- Filesystem work is a Runtime operation, so every case owns one Runtime
--- session exactly as the other server test owners do.
+-- session exactly as the other server test owners do. Root settings compare
+-- canonical slash spellings, so the fixture root uses that same spelling;
+-- fs.realpath alone keeps the host's separators (backslashes on Windows).
 local function with_root(body: Body)
   test_runtime.run(function ()
-    local base = fs.realpath(test_paths.temporary_name())
+    local base = test_paths.canonical_path(test_paths.temporary_name())
     fs.unlink(base)
     fs.mkdir(base)
     defer remove_tree(base)
@@ -47,13 +49,13 @@ local function make_prefix(base: string, name: string): string
   for index = 1, #directories do fs.mkdir(prefix .. directories[index]) end
   fs.write_file(prefix .. "/share/lua/5.5/titan-compiler/driver.lua",
     "return {}\n")
-  fs.write_file(prefix .. "/lib/titan/0.6/titan.a", "archive\n")
+  fs.write_file(prefix .. "/" .. root_settings.provider_entry(), "archive\n")
   fs.write_file(prefix .. "/lib/titan/0.6/sdk-digests", "digests\n")
   return prefix
 end
 
 local function trusted_root(base: string): root_settings.Trust
-  return root_settings.create({fs.realpath(base)})
+  return root_settings.create({base})
 end
 
 local function run_absent(base: string)
@@ -74,11 +76,11 @@ end
 
 local function run_trust_containment(base: string)
   local trust = trusted_root(base)
-  test.assert(trust:allows(fs.realpath(base)),
+  test.assert(trust:allows(base),
     "a trusted directory did not trust itself")
-  test.assert(trust:allows(fs.realpath(base) .. "/slice"),
+  test.assert(trust:allows(base .. "/slice"),
     "a trusted directory did not trust its child")
-  test.assert(not trust:allows(fs.realpath(base) .. "sibling"),
+  test.assert(not trust:allows(base .. "sibling"),
     "a trusted directory trusted a prefix-sharing sibling")
   test.assert(not trust:allows("/elsewhere"),
     "a trusted directory trusted an unrelated path")
@@ -289,14 +291,14 @@ local function run_layout_validation(base: string)
   test.assert(missing ~= nil and failure == nil,
     "a complete SDK layout failed root settings")
 
-  fs.unlink(prefix .. "/lib/titan/0.6/titan.a")
+  fs.unlink(prefix .. "/" .. root_settings.provider_entry())
   local rejected?, layout_failure? =
     root_settings.load(roots.canonical(base), trust)
   test.assert(rejected == nil and layout_failure ~= nil,
     "a prefix without its provider archive was accepted")
   local layout_error = layout_failure as root_settings.Error
   test.assert(strings.find(layout_error.message,
-    "lib/titan/0.6/titan.a") ~= nil,
+    root_settings.provider_entry()) ~= nil,
     "the layout failure did not name the missing archive")
   do
     local invalid = false
@@ -338,7 +340,8 @@ local function run_identity(base: string)
   test.assert(#identity > 0, "the SDK identity was empty")
   test.assert(identity == root_settings.sdk_identity(actual.compiler_root, nil),
     "the SDK identity was not stable")
-  fs.write_file(first .. "/lib/titan/0.6/titan.a", "reinstalled archive\n")
+  fs.write_file(first .. "/" .. root_settings.provider_entry(),
+    "reinstalled archive\n")
   test.assert(identity ~= root_settings.sdk_identity(actual.compiler_root, nil),
     "reinstalling the SDK did not change its identity")
   local before = root_settings.fingerprint(actual)

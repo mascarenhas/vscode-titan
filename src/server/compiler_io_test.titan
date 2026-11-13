@@ -99,10 +99,23 @@ local function link_fixture(strategy: compiler_io.CompilerIO, source: string,
   return strategy:run({[1] = "ln", [2] = source, [3] = link}, nil)
 end
 
-local function require_symlink(result: {string: value})
-  if ffi.VSCODE_TITAN_WINDOWS ~= 0 and bool_field(result, "started") and
-     integer_field(result, "status") == 1314 then
-    test.skip("Windows account cannot create symbolic links (Win32 1314)")
+local function require_symlink(result: {string: value}, link: string)
+  if ffi.VSCODE_TITAN_WINDOWS ~= 0 then
+    if bool_field(result, "started") and
+       integer_field(result, "status") == 1314 then
+      test.skip("Windows account cannot create symbolic links (Win32 1314)")
+    end
+    -- A link created without the privilege is an untrusted mount point that
+    -- Windows will not traverse, so creation alone does not make it usable.
+    if bool_field(result, "ok") then
+      do
+        fs.realpath(link)
+      catch
+        if error is async.CancellationReason then raise end
+        test.skip("Windows refuses to traverse the created symbolic link " ..
+          "(untrusted mount point)")
+      end
+    end
   end
   test.assert(bool_field(result, "ok"),
               "could not create symlink fixture: " .. string_field(result, "diagnostic"))
@@ -264,7 +277,7 @@ local function filesystem_symlink_contract()
   local canonical_path = fs.realpath(source)
   local link = directory .. "/source-link"
   defer remove_path(link)
-  require_symlink(link_fixture(strategy, source, link, true))
+  require_symlink(link_fixture(strategy, source, link, true), link)
   local followed? = strategy:stat(link)
   local unlinked? = strategy:lstat(link)
   test.assert(followed ~= nil and unlinked ~= nil,
@@ -590,7 +603,7 @@ local function symlink_lstat_observation_contract()
   fs.write_file(target, "first target")
   defer remove_path(target)
   defer remove_path(link)
-  require_symlink(link_fixture(strategy, target, link, true))
+  require_symlink(link_fixture(strategy, target, link, true), link)
 
   compiler_io.begin_lstat_observations(strategy)
   local raw_link? = strategy:lstat(link)

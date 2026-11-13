@@ -133,6 +133,56 @@ function uri(filename) {
   return pathToFileURL(filename).href;
 }
 
+// The server publishes roots, SDK paths and probe caches in canonical slash
+// spelling (roots.canonical); a host path names the same file with the
+// platform separators, so comparisons normalise separators, not spelling.
+const serverPath = (value) => value.replaceAll("\\", "/");
+function samePath(left, right) {
+  return typeof left === "string" && typeof right === "string" &&
+    serverPath(left) === serverPath(right);
+}
+function findRoot(roots, rootPath) {
+  return roots.find((candidate) => samePath(candidate.root, rootPath));
+}
+
+// Fixture configuration is Lua, so a path must become a Lua string literal: a
+// Windows path's backslashes would otherwise start escapes and name another
+// path. Escape them (and any quote) so the literal is the exact host path.
+const luaString = (value) =>
+  `"${value.replaceAll("\\", "\\\\").replaceAll('"', '\\"')}"`;
+
+// Windows records a symbolic link's kind when it is created, and a link made
+// with the file kind cannot be resolved once its target is a directory, so
+// directory links must be created with the directory kind.
+async function linkDirectory(target, pathname) {
+  await symlink(target, pathname, process.platform === "win32" ? "dir" : undefined);
+}
+
+// The cases that prove symlink semantics need links the server can resolve, not
+// just links this account can create. Windows refuses to create one without
+// SeCreateSymbolicLinkPrivilege unless Developer Mode allows it, and marks
+// links created that way as untrusted mount points whose paths it will not
+// traverse; both failures skip the cases, as the native suite's own symlink
+// cases do.
+let symlinkCapability;
+async function symlinksUsable() {
+  if (symlinkCapability !== undefined) return symlinkCapability;
+  const probe = await mkdtemp(path.join(os.tmpdir(), "titan-multi-link-"));
+  try {
+    const target = path.join(probe, "target");
+    const link = path.join(probe, "link");
+    await mkdir(target);
+    await symlink(target, link, process.platform === "win32" ? "dir" : undefined);
+    symlinkCapability = (await stat(link)).isDirectory();
+  } catch (error) {
+    if (!["EPERM", "EACCES", "ENOSYS", "EINVAL", "UNKNOWN"].includes(error.code)) throw error;
+    symlinkCapability = false;
+  } finally {
+    await rm(probe, { recursive: true, force: true }).catch(() => undefined);
+  }
+  return symlinkCapability;
+}
+
 function positionOf(text, token, occurrence = 0) {
   let offset = -1;
   for (let index = 0; index <= occurrence; index += 1) {
@@ -238,7 +288,7 @@ async function pollSettled(session, count, label) {
 }
 
 function rootEntry(roots, rootPath) {
-  const entry = roots.find((candidate) => candidate.root === rootPath);
+  const entry = findRoot(roots, rootPath);
   assert.ok(entry, `workspaceStatus omitted ${rootPath}: ${JSON.stringify(roots)}`);
   return entry;
 }
@@ -405,9 +455,10 @@ async function testIndependentRoots() {
     assert.ok(typeof probeA === "string" && probeA.length > 0,
       "a root reported no probe prefix");
     assert.notEqual(probeA, probeB, "two roots shared one probe prefix");
-    assert.equal(probeA, path.join(await realpath(rootA), ".titan-ls"),
+    assert.equal(probeA, serverPath(path.join(await realpath(rootA), ".titan-ls")),
       "a root's probe prefix escaped its own root");
-    assert.equal(rootEntry(roots, rootA).titanRoot, process.env.TITAN_ROOT,
+    assert.equal(serverPath(rootEntry(roots, rootA).titanRoot),
+      serverPath(process.env.TITAN_ROOT ?? ""),
       "a default root did not inherit the server's own SDK");
 
     const hoverA = await pollHover(session, sourceA, ROOT_A_SOURCE, "doubled",
@@ -495,7 +546,8 @@ async function testFolderChanges() {
       textDocument: { uri: uri(sourceB), languageId: "titan", version: 1, text: ROOT_B_SOURCE }
     });
     const twoRoots = await pollStatus(session, (roots) =>
-      roots.length === 2 && roots.some((entry) => entry.root === rootB && entry.state === "ready"),
+      roots.length === 2 && roots.some((entry) => samePath(entry.root, rootB) &&
+        entry.state === "ready"),
       "the added folder did not activate");
     assert.equal(rootEntry(twoRoots, rootB).origin, "folder");
     await pollHover(session, sourceB, ROOT_B_SOURCE, "tripled", /integer/,
@@ -503,7 +555,7 @@ async function testFolderChanges() {
     // The omp order: a status request that follows a completed request for a
     // root must report that root.
     const afterServing = await session.status();
-    assert.equal(afterServing.filter((entry) => entry.root === rootB).length, 1,
+    assert.equal(afterServing.filter((entry) => samePath(entry.root, rootB)).length, 1,
       `workspaceStatus omitted a root that just served a request: ${
         JSON.stringify(afterServing.map((entry) => entry.root))}`);
 
@@ -514,7 +566,7 @@ async function testFolderChanges() {
       event: { added: [], removed: [{ uri: uri(rootB), name: "b" }] }
     });
     const released = await pollStatus(session, (roots) => {
-      const entry = roots.find((candidate) => candidate.root === rootB);
+      const entry = findRoot(roots, rootB);
       return entry?.origin === "released" && entry.state === "ready"
         ? { accepted: roots }
         : { rejected: roots };
@@ -534,7 +586,7 @@ async function testFolderChanges() {
     await pollHover(session, sourceB, ROOT_B_SOURCE, "tripled", /integer/,
       "the released root's document");
     const rediscovered = await pollStatus(session, (roots) => {
-      const entry = roots.find((candidate) => candidate.root === rootB);
+      const entry = findRoot(roots, rootB);
       return entry?.origin === "discovered"
         ? { accepted: roots }
         : { rejected: roots };
@@ -548,7 +600,7 @@ async function testFolderChanges() {
       event: { added: [{ uri: uri(rootB), name: "b" }], removed: [] }
     });
     const readded = await pollStatus(session, (roots) =>
-      roots.some((entry) => entry.root === rootB && entry.origin === "folder"),
+      roots.some((entry) => samePath(entry.root, rootB) && entry.origin === "folder"),
       "the re-added folder did not reclaim its root");
     assert.equal(rootEntry(readded, rootB).state, "ready",
       "a re-added root lost its worker");
@@ -560,15 +612,20 @@ async function testFolderChanges() {
       "the re-added root");
 
     // A symlinked folder canonicalizes onto the root it names.
-    const linkPath = path.join(base, "a-link");
-    await symlink(rootA, linkPath);
-    session.notify("workspace/didChangeWorkspaceFolders", {
-      event: { added: [{ uri: uri(linkPath), name: "a-link" }], removed: [] }
-    });
-    const linked = await pollStatus(session, (roots) => roots.length === 2,
-      "a symlinked folder created a third root");
-    assert.equal(linked.length, 2,
-      "a symlinked folder did not share its physical root");
+    if (await symlinksUsable()) {
+      const linkPath = path.join(base, "a-link");
+      await linkDirectory(rootA, linkPath);
+      session.notify("workspace/didChangeWorkspaceFolders", {
+        event: { added: [{ uri: uri(linkPath), name: "a-link" }], removed: [] }
+      });
+      const linked = await pollStatus(session, (roots) => roots.length === 2,
+        "a symlinked folder created a third root");
+      assert.equal(linked.length, 2,
+        "a symlinked folder did not share its physical root");
+    } else {
+      console.log("multi-root: skipped the symlinked folder case " +
+        "(this account has no usable symbolic links)");
+    }
 
     // A nested folder narrows routing to itself without disturbing the outer
     // root that also contains it. An added folder activates on its first routed
@@ -581,7 +638,7 @@ async function testFolderChanges() {
     await pollHover(session, nestedSource, ROOT_B_SOURCE, "tripled", /integer/,
       "the nested root");
     const nestedRoots = await pollStatus(session, (roots) => {
-      const entry = roots.find((candidate) => candidate.root === nestedRoot);
+      const entry = findRoot(roots, nestedRoot);
       return entry?.state === "ready" && entry.origin === "folder"
         ? { accepted: roots }
         : { rejected: roots };
@@ -620,7 +677,7 @@ async function testLazyDiscovery() {
     await fallback.initialize({ workspaceFolders: [], rootPath: plain });
     fallback.notify("initialized", {});
     const fallbackRoots = await pollStatus(fallback, (roots) =>
-      roots.length === 1 && roots[0].root === plain && roots[0].state === "ready",
+      roots.length === 1 && samePath(roots[0].root, plain) && roots[0].state === "ready",
       "an empty folder list did not fall back to rootPath");
     assert.equal(rootEntry(fallbackRoots, plain).origin, "folder");
     await fallback.shutdown();
@@ -633,7 +690,7 @@ async function testLazyDiscovery() {
     await session.initialize({});
     session.notify("initialized", {});
     await pollStatus(session, (roots) =>
-      roots.length === 1 && roots[0].root === sessionRoot,
+      roots.length === 1 && samePath(roots[0].root, sessionRoot),
       "the launch directory did not become the initial root");
 
     // No client folder support: the first routed message discovers the nearest
@@ -644,7 +701,7 @@ async function testLazyDiscovery() {
     await pollHover(session, deepSource, ROOT_B_SOURCE, "tripled", /integer/,
       "the deepest discovered root");
     const deepest = await pollStatus(session, (roots) => {
-      const entry = roots.find((candidate) => candidate.root === deep);
+      const entry = findRoot(roots, deep);
       return entry?.origin === "discovered"
         ? { accepted: roots }
         : { rejected: roots };
@@ -656,15 +713,16 @@ async function testLazyDiscovery() {
     await pollHover(session, innerSource, ROOT_A_SOURCE, "doubled", /integer/,
       "the enclosing discovered root");
     const nested = await pollStatus(session, (roots) => {
-      const entry = roots.find((candidate) => candidate.root === inner);
+      const entry = findRoot(roots, inner);
       return entry?.origin === "discovered"
         ? { accepted: roots }
         : { rejected: roots };
     }, "the enclosing configuration was not discovered");
-    assert.ok(inner.startsWith(deep.slice(0, deep.lastIndexOf("/"))));
+    assert.ok(serverPath(deep).startsWith(`${serverPath(inner)}/`),
+      "the deeper discovered root is not inside the enclosing one");
     assert.equal(nested.filter((entry) => entry.origin === "discovered").length, 2,
       "discovery registered an unexpected number of roots");
-    assert.equal(nested.some((entry) => entry.root === path.join(base, "slice")), false,
+    assert.equal(nested.some((entry) => samePath(entry.root, path.join(base, "slice"))), false,
       "discovery claimed a directory without its own configuration");
 
     // The deeper root still owns its own document.
@@ -691,6 +749,15 @@ async function testLazyDiscovery() {
   }
 }
 
+// A selected root's compiler_root is honoured only when the bridge can load
+// that SDK's provider. The Unix SDK carries the `titan.a` archive provider the
+// bridge loads in archive mode; a Windows SDK carries `titan.dll`, and loading
+// a selected provider in dynamic mode is not implemented.
+const PER_ROOT_SDK_SKIP =
+  "compiler_bridge loads the selected SDK's titan.a archive provider and " +
+  "Windows SDKs ship titan.dll; per-root compiler_root needs a dynamic " +
+  "provider mode (vscode-titan#136)";
+
 async function testSecondSdk() {
   const base = await makeBase("sdk");
   const sdk = path.join(base, "sdk");
@@ -699,16 +766,24 @@ async function testSecondSdk() {
   const sdkRootDir = path.join(base, "selected");
   const defaultSource = await writeRoot(defaultRoot, ROOT_A_SOURCE);
   const sdkSource = await writeRoot(sdkRootDir, SDK_SOURCE,
-    `include = { "./src" }\nsource_module_roots = { "./src" }\ncompiler_root = "${sdk}"\n`);
+    `include = { "./src" }\nsource_module_roots = { "./src" }\ncompiler_root = ${luaString(sdk)}\n`);
   // A selected SDK reads interfaces from its archive; a broken dynamic
-  // provider proves the server never prefers loading native code from it.
-  const farmedProvider = path.join(sdk, "lib", "titan", "0.6", "titan.so");
+  // provider proves the server never prefers loading native code from it. That
+  // provider is a Unix-only object: on Windows the provider itself is the
+  // loaded DLL, so there is no second provider to corrupt.
+  const providerName = process.platform === "win32" ? "titan.dll" : "titan.so";
+  const farmedProvider = path.join(sdk, "lib", "titan", "0.6", providerName);
   const farmedParent = await lstat(path.dirname(farmedProvider));
   assert.equal(farmedParent.isSymbolicLink(), false,
     "the SDK farm must not alias the session SDK");
-  await assertFarmedFile(sdk, farmedProvider);
-  await rm(farmedProvider, { force: true });
-  await writeFile(farmedProvider, "not a loadable provider object\n", "utf8");
+  if (process.platform === "win32") {
+    console.log("multi-root: kept the farmed provider DLL " +
+      "(Windows has no unused dynamic provider)");
+  } else {
+    await assertFarmedFile(sdk, farmedProvider);
+    await rm(farmedProvider, { force: true });
+    await writeFile(farmedProvider, "not a loadable provider object\n", "utf8");
+  }
   const session = new Session(launch(defaultRoot, "error"));
   try {
     await session.initialize({
@@ -724,9 +799,11 @@ async function testSecondSdk() {
     assertReady(roots, defaultRoot, "default SDK root");
     assertReady(roots, sdkRootDir, "selected SDK root");
     assert.equal(rootEntry(roots, defaultRoot).compilerRoot, null);
-    assert.equal(rootEntry(roots, sdkRootDir).compilerRoot, await realpath(sdk),
+    assert.equal(rootEntry(roots, sdkRootDir).compilerRoot,
+      serverPath(await realpath(sdk)),
       "the selected root did not report its compiler_root");
-    assert.equal(rootEntry(roots, sdkRootDir).titanRoot, await realpath(sdk),
+    assert.equal(rootEntry(roots, sdkRootDir).titanRoot,
+      serverPath(await realpath(sdk)),
       "the selected worker did not run the selected SDK");
     assert.notEqual(rootEntry(roots, defaultRoot).workerPid,
       rootEntry(roots, sdkRootDir).workerPid,
@@ -748,38 +825,38 @@ async function testSecondSdk() {
 
     // A configuration reload that leaves the effective selection alone must
     // not restart anything.
-    const generated = new Map(roots.map((entry) => [entry.root, entry.generation]));
+    const generated = new Map(roots.map((entry) => [serverPath(entry.root), entry.generation]));
     const localOverride = path.join(sdkRootDir, "titan-config.local.lua");
-    await writeFile(localOverride, `compiler_root = "${sdk}"\n`, "utf8");
+    await writeFile(localOverride, `compiler_root = ${luaString(sdk)}\n`, "utf8");
     session.notify("workspace/didChangeConfiguration", { settings: {} });
     const unchanged = await session.status();
     assert.equal(rootEntry(unchanged, sdkRootDir).generation,
-      generated.get(sdkRootDir), "an unchanged local override restarted a worker");
+      generated.get(serverPath(sdkRootDir)), "an unchanged local override restarted a worker");
     assert.equal(rootEntry(unchanged, defaultRoot).generation,
-      generated.get(defaultRoot), "an unrelated root restarted");
+      generated.get(serverPath(defaultRoot)), "an unrelated root restarted");
 
     // A local override that selects a different prefix restarts only its root.
     const secondSdk = path.join(base, "second-sdk");
     await farmSdk(sdkRoot(), secondSdk);
     const beforeSelection = rootEntry(await session.status(), sdkRootDir).generation;
-    await writeFile(localOverride, `compiler_root = "${secondSdk}"\n`, "utf8");
+    await writeFile(localOverride, `compiler_root = ${luaString(secondSdk)}\n`, "utf8");
     session.notify("workspace/didChangeConfiguration", { settings: {} });
     const reselected = await pollStatus(session, (entries) => {
-      const entry = entries.find((candidate) => candidate.root === sdkRootDir);
-      return entry?.compilerRoot === path.normalize(secondSdk) &&
+      const entry = findRoot(entries, sdkRootDir);
+      return samePath(entry?.compilerRoot, secondSdk) &&
         entry.generation > beforeSelection && entry.state === "ready"
         ? { accepted: entries }
         : { rejected: entries };
     }, "the local override did not restart the root with the second SDK");
     assert.equal(rootEntry(reselected, sdkRootDir).titanRoot,
-      path.normalize(secondSdk),
+      serverPath(secondSdk),
       "the restarted worker did not adopt the second SDK");
     assert.equal(rootEntry(reselected, defaultRoot).generation,
-      generated.get(defaultRoot), "a per-root SDK change restarted an unrelated root");
+      generated.get(serverPath(defaultRoot)), "a per-root SDK change restarted an unrelated root");
     // The tracked configuration is untouched: only the local override moved.
     const trackedConfig = await readFile(
       path.join(sdkRootDir, "titan-config.lua"), "utf8");
-    assert.ok(trackedConfig.includes(`compiler_root = "${sdk}"`),
+    assert.ok(trackedConfig.includes(`compiler_root = ${luaString(sdk)}`),
       "the local override rewrote the tracked configuration");
     await pollHover(session, sdkSource, SDK_SOURCE, "tripled", /integer/,
       "the root with the second SDK");
@@ -792,14 +869,14 @@ async function testSecondSdk() {
     await replaceWithCopy(archive);
     await writeFile(archive, "reinstalled digests\n", "utf8");
     const restarted = await pollStatus(session, (entries) => {
-      const entry = entries.find((candidate) => candidate.root === sdkRootDir);
+      const entry = findRoot(entries, sdkRootDir);
       return entry !== undefined && entry.generation > beforeReinstall &&
         entry.state === "ready" && entry.workerPid !== null
         ? { accepted: entries }
         : { rejected: entries };
     }, "the reinstalled SDK did not restart its worker");
     assert.equal(rootEntry(restarted, defaultRoot).generation,
-      generated.get(defaultRoot),
+      generated.get(serverPath(defaultRoot)),
       "an SDK reinstall restarted an unrelated root");
     await pollHover(session, sdkSource, SDK_SOURCE, "tripled", /integer/,
       "the root after the SDK reinstall");
@@ -807,10 +884,10 @@ async function testSecondSdk() {
     // A local override exists only to select an SDK, so a broken one refuses an
     // already-ready root instead of quietly serving the router's own SDK.
     await writeFile(localOverride,
-      `compiler_root = "${secondSdk}"\ninclude = { "./src" }\n`, "utf8");
+      `compiler_root = ${luaString(secondSdk)}\ninclude = { "./src" }\n`, "utf8");
     session.notify("workspace/didChangeConfiguration", { settings: {} });
     const broken = await pollStatus(session, (entries) => {
-      const entry = entries.find((candidate) => candidate.root === sdkRootDir);
+      const entry = findRoot(entries, sdkRootDir);
       return entry?.state === "failed" && entry.workerPid === null
         ? { accepted: entries }
         : { rejected: entries };
@@ -835,7 +912,7 @@ async function testSecondSdk() {
     await rm(localOverride, { force: true });
     session.notify("workspace/didChangeConfiguration", { settings: {} });
     const recovered = await pollStatus(session, (entries) => {
-      const entry = entries.find((candidate) => candidate.root === sdkRootDir);
+      const entry = findRoot(entries, sdkRootDir);
       return entry?.state === "ready" &&
         entry.compilerRoot === path.normalize(sdk)
         ? { accepted: entries }
@@ -894,19 +971,19 @@ async function testRootScopedSdkErrors() {
   const untrustedRoot = path.join(base, "untrusted-root");
   const brokenOverrideRoot = path.join(base, "broken-override-root");
   const incompatibleSource = await writeRoot(incompatibleRoot, ROOT_A_SOURCE,
-    `include = { "./src" }\nsource_module_roots = { "./src" }\ncompiler_root = "${incompatible}"\n`);
+    `include = { "./src" }\nsource_module_roots = { "./src" }\ncompiler_root = ${luaString(incompatible)}\n`);
   const abiRootSource = await writeRoot(abiRoot, ROOT_A_SOURCE,
-    `include = { "./src" }\nsource_module_roots = { "./src" }\ncompiler_root = "${incompatibleAbi}"\n`);
+    `include = { "./src" }\nsource_module_roots = { "./src" }\ncompiler_root = ${luaString(incompatibleAbi)}\n`);
   const missingSource = await writeRoot(missingRoot, ROOT_A_SOURCE,
-    `include = { "./src" }\nsource_module_roots = { "./src" }\ncompiler_root = "${path.join(base, "absent-sdk")}"\n`);
+    `include = { "./src" }\nsource_module_roots = { "./src" }\ncompiler_root = ${luaString(path.join(base, "absent-sdk"))}\n`);
   const untrustedSource = await writeRoot(untrustedRoot, ROOT_A_SOURCE,
-    `include = { "./src" }\nsource_module_roots = { "./src" }\ncompiler_root = "${untrusted}"\n`);
+    `include = { "./src" }\nsource_module_roots = { "./src" }\ncompiler_root = ${luaString(untrusted)}\n`);
   // An untrusted root whose override cannot even be read must still never load
   // the SDK: there is no selection to trust and none to fall back to.
   const brokenOverrideSource = await writeRoot(brokenOverrideRoot, ROOT_A_SOURCE,
-    `include = { "./src" }\nsource_module_roots = { "./src" }\ncompiler_root = "${untrusted}"\n`);
+    `include = { "./src" }\nsource_module_roots = { "./src" }\ncompiler_root = ${luaString(untrusted)}\n`);
   await writeFile(path.join(brokenOverrideRoot, "titan-config.local.lua"),
-    `compiler_root = "${untrusted}"\ninclude = { "./src" }\n`, "utf8");
+    `compiler_root = ${luaString(untrusted)}\ninclude = { "./src" }\n`, "utf8");
 
   const session = new Session(launch(incompatibleRoot, "error"));
   try {
@@ -934,7 +1011,8 @@ async function testRootScopedSdkErrors() {
     assert.equal(brokenOverrideEntry.workerPid, null,
       "an untrusted root with an unreadable override started a worker");
     const incompatibleEntry = rootEntry(roots, incompatibleRoot);
-    assert.equal(incompatibleEntry.compilerRoot, await realpath(incompatible));
+    assert.equal(incompatibleEntry.compilerRoot,
+      serverPath(await realpath(incompatible)));
     const untrustedEntry = rootEntry(roots, untrustedRoot);
     assert.equal(untrustedEntry.compilerRoot, null,
       "an untrusted root still reported a selected SDK");
@@ -1136,7 +1214,7 @@ async function testCapAndIdleEviction() {
       textDocument: { uri: uri(firstSource) }
     });
     const taken = await pollStatus(session, (roots) =>
-      roots.some((entry) => entry.root === first && entry.state === "evicted"),
+      roots.some((entry) => samePath(entry.root, first) && entry.state === "evicted"),
       "the idle worker was not evicted for the new root");
     assert.ok(taken.length > 0);
     await pollHover(session, secondSource, ROOT_B_SOURCE, "tripled", /integer/,
@@ -1219,7 +1297,7 @@ async function testOverlayOwnership() {
   const sourceA = await writeRoot(rootA, ROOT_A_SOURCE);
   const sourceB = await writeRoot(rootB, ROOT_B_SOURCE);
   const linkPath = path.join(base, "a-link");
-  await symlink(rootA, linkPath);
+  await linkDirectory(rootA, linkPath);
   // The client spells a document through the symlinked folder.
   const linkedDraft = path.join(linkPath, "src", "draft.titan");
   // A buffer inside the physical tree is what a worker can analyse.
@@ -1238,7 +1316,7 @@ async function testOverlayOwnership() {
     session.notify("initialized", {});
     const first = await pollStatus(session, (roots) =>
       roots.length === 2 && roots.some((entry) =>
-        entry.root === rootA && entry.state === "ready"),
+        samePath(entry.root, rootA) && entry.state === "ready"),
       "the symlinked folder did not activate its physical root");
     assert.equal(rootEntry(first, rootA).origin, "folder");
     assert.equal(rootEntry(first, rootB).workerPid, null,
@@ -1267,7 +1345,7 @@ async function testOverlayOwnership() {
     await pollHover(session, sourceB, ROOT_B_SOURCE, "tripled", /integer/,
       "the root that reused the released slot");
     await pollStatus(session, (roots) =>
-      roots.some((entry) => entry.root === rootA && entry.workerPid === null),
+      roots.some((entry) => samePath(entry.root, rootA) && entry.workerPid === null),
       "closing the symlink-spelled buffer did not release the root");
     await pollHover(session, sourceA, ROOT_A_SOURCE, "doubled", /integer/,
       "the root that gave up its slot");
@@ -1385,7 +1463,7 @@ async function testNestedProjects() {
       event: { added: [{ uri: uri(configlessRoot), name: "home" }], removed: [] }
     });
     const added = await pollStatus(session, (roots) =>
-      roots.length === 2 && roots.some((entry) => entry.root === configlessRoot),
+      roots.length === 2 && roots.some((entry) => samePath(entry.root, configlessRoot)),
       "the added folder root was not registered");
     assert.equal(rootEntry(added, configlessRoot).workerPid, null,
       "an added folder with no configuration started a worker before a document");
@@ -1395,7 +1473,7 @@ async function testNestedProjects() {
     await pollHover(session, projectSource, ROOT_B_SOURCE, "tripled", /integer/,
       "the nested configured project");
     const nested = await pollStatus(session, (entries) => {
-      const entry = entries.find((candidate) => candidate.root === projectRoot);
+      const entry = findRoot(entries, projectRoot);
       return entry?.origin === "discovered" && entry.state === "ready"
         ? { accepted: entries }
         : { rejected: entries };
@@ -1429,7 +1507,7 @@ async function testNestedProjects() {
     await pollHover(nestedSession, innerSource, ROOT_B_SOURCE, "tripled",
       /integer/, "the nested project inside a configured folder root");
     const nested = await pollStatus(nestedSession, (entries) => {
-      const entry = entries.find((candidate) => candidate.root === innerRoot);
+      const entry = findRoot(entries, innerRoot);
       return entry?.origin === "discovered" && entry.state === "ready"
         ? { accepted: entries }
         : { rejected: entries };
@@ -1473,14 +1551,14 @@ async function testReleasedRoots() {
       event: { added: [], removed: [{ uri: uri(rootB), name: "b" }] }
     });
     await pollStatus(session, (roots) => {
-      const entry = roots.find((candidate) => candidate.root === rootB);
+      const entry = findRoot(roots, rootB);
       return entry?.origin === "released" ? { accepted: roots } : { rejected: roots };
     }, "the removed folder did not release its root");
 
     // Idle eviction is what stops a released root, and the registry drops it
     // once no worker, folder or discovered configuration keeps it alive.
     await pollStatus(session, (roots) =>
-      roots.every((entry) => entry.root !== rootB),
+      roots.every((entry) => !samePath(entry.root, rootB)),
       "idle eviction kept a released root");
     session.notify("workspace/didChangeWorkspaceFolders", {
       event: { added: [{ uri: uri(rootB), name: "b" }], removed: [] }
@@ -1524,7 +1602,7 @@ async function testReleasedRoots() {
       event: { added: [{ uri: uri(plainRoot), name: "plain" }], removed: [] }
     });
     await pollStatus(plainSession, (roots) => {
-      const entry = roots.find((candidate) => candidate.root === plainRoot);
+      const entry = findRoot(roots, plainRoot);
       return entry !== undefined && entry.workerPid === null
         ? { accepted: roots } : { rejected: roots };
     }, "the added config-less folder started a worker");
@@ -1532,7 +1610,7 @@ async function testReleasedRoots() {
       event: { added: [], removed: [{ uri: uri(plainRoot), name: "plain" }] }
     });
     const released = await pollStatus(plainSession, (roots) => {
-      const entry = roots.find((candidate) => candidate.root === plainRoot);
+      const entry = findRoot(roots, plainRoot);
       return entry?.origin === "released"
         ? { accepted: roots } : { rejected: roots };
     }, "the config-less folder was not released");
@@ -1630,7 +1708,7 @@ async function testOwnershipMigration() {
     assert.equal(restoredOuter.generation, originalOuter.generation,
       "ownership regain changed the enclosing worker's generation");
     await pollStatus(session, (roots) => {
-      const entry = roots.find((candidate) => candidate.root === innerRoot);
+      const entry = findRoot(roots, innerRoot);
       return entry?.origin === "released" ? { accepted: roots } : { rejected: roots };
     }, "the nested folder was not released");
     const inOuter = await pollCompletion(session, innerSource, overlayPosition,
@@ -1684,7 +1762,7 @@ async function testOwnershipMigration() {
       event: { added: [], removed: [{ uri: uri(homeRoot), name: "home" }] }
     });
     await pollStatus(plainSession, (roots) => {
-      const entry = roots.find((candidate) => candidate.root === homeRoot);
+      const entry = findRoot(roots, homeRoot);
       return entry?.origin === "released" ? { accepted: roots } : { rejected: roots };
     }, "the config-less folder was not released");
     // The document is unowned now, so nobody republishes: the router owes the
@@ -1882,7 +1960,7 @@ async function testShutdownDuringRestart() {
   await replaceWithCopy(digests);
   const root = path.join(base, "slice");
   await writeRoot(root, ROOT_A_SOURCE,
-    `include = { "./src" }\nsource_module_roots = { "./src" }\ncompiler_root = "${sdk}"\n`);
+    `include = { "./src" }\nsource_module_roots = { "./src" }\ncompiler_root = ${luaString(sdk)}\n`);
   const delays = [0, 40, 90, 150, 240];
   for (let attempt = 0; attempt < delays.length; attempt += 1) {
     const session = new Session(launch(root, "error"));
@@ -2232,7 +2310,7 @@ async function testNestedIndexingStatus() {
     await waitNotification(session, session.responses.indexingStatuses, failureStart,
       (status) => status.state === "failed", "the nested root's failure");
     assert.ok(consume().some((display) => display.kind === "failed" &&
-      display.message.includes(innerRoot) &&
+      display.message.includes(serverPath(innerRoot)) &&
       /cannot evaluate titan-config\.lua/.test(display.message)),
     "the extension hid the nested root's qualified failure");
     // Another root's successful refresh must not dismiss that failure.
@@ -2523,6 +2601,102 @@ async function testNestedDiscoveryDuringBlockedRefresh() {
   }
 }
 
+async function testAggregateCountedProgress() {
+  const base = await makeBase("aggregate-progress");
+  const firstRoot = path.join(base, "a", "progress-controlled");
+  const secondRoot = path.join(base, "b", "progress-controlled");
+  const firstSource = await writeRoot(firstRoot, ROOT_A_SOURCE);
+  const secondSource = await writeRoot(secondRoot, ROOT_B_SOURCE);
+  const session = peerSession(firstRoot);
+  const statuses = session.responses.indexingStatuses;
+  const advance = async (source) => {
+    const start = statuses.length;
+    assert.equal(await session.result("textDocument/hover", {
+      textDocument: { uri: uri(source) }, position: { line: 0, character: 0 }
+    }), null);
+    return statuses.slice(start);
+  };
+  try {
+    await session.initialize({
+      workspaceFolders: [
+        { uri: uri(firstRoot), name: "first" },
+        { uri: uri(secondRoot), name: "second" }
+      ],
+      initializationOptions: { trustedRoots: [base] }
+    });
+    session.notify("initialized", {});
+    assert.equal((await session.status()).length, 2);
+    assert.equal(statuses.length, 1, "startup repeated an unchanged busy aggregate");
+    assert.equal(statuses[0].state, "indexing");
+    assert.equal(statuses[0].initial, true);
+    assert.equal(statuses[0].completed_files, undefined);
+    assert.equal(statuses[0].total_files, undefined);
+    const initialEpoch = statuses[0].epoch;
+
+    // Another unknown root hides this root's progress and completed generation.
+    // Each hover reply is a barrier after that peer's indexing notification.
+    assert.deepEqual(await advance(firstSource), []);
+    assert.deepEqual(await advance(firstSource), []);
+    assert.deepEqual(await advance(firstSource), [],
+      "a hidden completion published a generation-only busy frame");
+    const baseline = await advance(secondSource);
+    assert.equal(baseline.length, 1);
+    assert.deepEqual([baseline[0].completed_files, baseline[0].total_files,
+      baseline[0].epoch], [0, 4, initialEpoch]);
+    const progress = await advance(secondSource);
+    assert.equal(progress.length, 1);
+    assert.deepEqual([progress[0].completed_files, progress[0].total_files,
+      progress[0].epoch], [1, 4, initialEpoch]);
+
+    const unknown = await advance(firstSource);
+    assert.equal(unknown.length, 1);
+    assert.equal(unknown[0].state, "indexing");
+    assert.equal(unknown[0].completed_files, undefined);
+    assert.equal(unknown[0].total_files, undefined);
+    assert.ok(unknown[0].epoch > initialEpoch,
+      "unknown work retained the preceding counted workset");
+    const summed = await advance(firstSource);
+    assert.deepEqual(summed.map((status) =>
+      [status.completed_files, status.total_files, status.epoch]),
+    [[0, 8, unknown[0].epoch], [1, 8, unknown[0].epoch]]);
+
+    // Finishing one root changes the denominator, not initial session scope.
+    const reduced = await advance(secondSource);
+    assert.equal(reduced.length, 2);
+    assert.equal(reduced[0].completed_files, undefined);
+    assert.equal(reduced[0].total_files, undefined);
+    assert.ok(reduced[0].epoch > unknown[0].epoch);
+    assert.deepEqual([reduced[1].completed_files, reduced[1].total_files,
+      reduced[1].epoch], [0, 4, reduced[0].epoch]);
+    const remaining = await advance(firstSource);
+    assert.equal(remaining.length, 1);
+    assert.deepEqual([remaining[0].completed_files, remaining[0].total_files,
+      remaining[0].epoch], [2, 4, reduced[0].epoch]);
+    const ready = await advance(firstSource);
+    assert.equal(ready.length, 1);
+    assert.equal(ready[0].state, "ready");
+    assert.equal(ready[0].generation, 3,
+      "the final generation lost a completion hidden behind busy");
+    assert.ok(statuses.every((status) => status.initial &&
+      status.message === undefined), "the initial cycle changed scope or gained a message");
+    assertAcceptedTimeline(session);
+    await session.shutdown();
+  } finally {
+    await session.abort();
+  }
+}
+
+// These cases prove symlink semantics: a farmed SDK is a tree of links into the
+// session SDK, and one workspace folder is reached through a link.
+const SYMLINK_GROUPS = new Set(["sdk", "sdk-errors", "overlays", "shutdown-restart"]);
+
+// Cases that cannot run on one platform report it here, so the runner counts
+// them as skipped and never prints them as passed.
+const WINDOWS_SKIPS = new Map([
+  ["sdk", PER_ROOT_SDK_SKIP],
+  ["sdk-errors", PER_ROOT_SDK_SKIP]
+]);
+
 const groups = [
   ["independent", testIndependentRoots, "independent roots"],
   ["folders", testFolderChanges, "folder changes"],
@@ -2543,6 +2717,7 @@ const groups = [
   ["warm-diagnostics", testWarmDiagnosticReplay, "warm diagnostic replay"],
   ["activation-transitions", testRouterActivationTransitions, "framed activation failure transitions"],
   ["busy-membership", testNestedDiscoveryDuringBlockedRefresh, "nested discovery and busy membership transitions"],
+  ["aggregate-progress", testAggregateCountedProgress, "aggregate counted progress and hidden completions"],
   ["shutdown-restart", testShutdownDuringRestart, "shutdown during a restart"],
   ["diagnostics", testProgressAndPullPerRoot, "progress and pull per root"],
   ["diagnostics-optout", testRouterPullOptOut, "router pull opt-out"]
@@ -2555,8 +2730,18 @@ async function main() {
     assert.ok(groups.some(([name]) => name === only),
       `unknown group ${only}; known groups: ${groups.map(([name]) => name).join(", ")}`);
   }
+  const symlinks = await symlinksUsable();
   for (const [name, run, label] of groups) {
     if (only !== undefined && only !== name) continue;
+    if (process.platform === "win32" && WINDOWS_SKIPS.has(name)) {
+      console.log(`multi-root: ${label} skipped (${WINDOWS_SKIPS.get(name)})`);
+      continue;
+    }
+    if (!symlinks && SYMLINK_GROUPS.has(name)) {
+      console.log(`multi-root: ${label} skipped ` +
+        "(this account has no usable symbolic links)");
+      continue;
+    }
     await run();
     console.log(`multi-root: ${label} passed`);
   }

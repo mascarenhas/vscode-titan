@@ -7,6 +7,7 @@ local os = import "os"
 local paths = import "path"
 local router = import "server.router"
 local source_text = import "server.source_text"
+local timer = import "timer"
 local wire = import "server.wire"
 
 local function send(envelope: wire.Object)
@@ -40,13 +41,42 @@ local function diagnostics(root: string)
   })
 end
 
+-- Each hover advances the controlled peer through an initial pass and refresh.
+local function advance_indexing(step: integer)
+  local initial = step <= 3
+  local epoch = 1
+  if not initial then epoch = 2 end
+  if step == 3 or step == 7 then
+    notify("titan/indexingStatus", {
+      ["state"] = "ready", ["initial"] = initial, ["epoch"] = epoch,
+      ["generation"] = epoch,
+    })
+  elseif step == 4 then
+    notify("titan/indexingStatus", {
+      ["state"] = "indexing", ["initial"] = false, ["epoch"] = epoch,
+    })
+  elseif step == 1 or step == 2 or step == 5 or step == 6 then
+    local completed = 0
+    if step == 2 then completed = 1 end
+    if step == 6 then completed = 2 end
+    notify("titan/indexingStatus", {
+      ["state"] = "indexing", ["initial"] = initial, ["epoch"] = epoch,
+      ["completed_files"] = completed, ["total_files"] = 4,
+    })
+  else
+    raise "unexpected controlled indexing step"
+  end
+end
+
 local function serve(root: string): integer
   local mode = paths.basename(root)
   if mode ~= "accept" and mode ~= "indexing" and mode ~= "quiet" and
      mode ~= "reject-initialize" and mode ~= "exit-before-initialize" and
      mode ~= "exit-on-initialize" and mode ~= "replay-failed-once" and
-     mode ~= "shutdown-hang" and mode ~= "refresh-blocked" and
-     mode ~= "replay-unavailable" and mode ~= "nested-diagnostics" then
+     mode ~= "shutdown-hang" and mode ~= "shutdown-exit" and
+     mode ~= "refresh-blocked" and mode ~= "replay-exit" and
+     mode ~= "replay-unavailable" and mode ~= "progress-controlled" and
+     mode ~= "nested-diagnostics" then
     raise "unknown worker fixture scenario: " .. mode
   end
   local diagnostic_root = root
@@ -55,10 +85,18 @@ local function serve(root: string): integer
   notify("titan/workerInfo", { ["pid"] = os.pid() })
   local reader = framing.reader()
   local replay_count = 0
+  local progress_step = 0
   local pending_pull: value = nil
   while true do
     local body? = reader:read(os.stdin)
-    if body == nil then return 0 end
+    if body == nil then
+      if mode == "replay-unavailable" then
+        -- The test closes the parent's channel and kills us after checking the
+        -- live-worker replay latch; it never waits out this keepalive sleep.
+        timer.sleep(60000)
+      end
+      return 0
+    end
     local object = wire.as_object(wire.decode(body))
     local method? = wire.as_string(object["method"])
     local id = object["id"]
@@ -75,7 +113,7 @@ local function serve(root: string): integer
         notify("titan/indexingStatus", {
           ["state"] = "indexing", ["initial"] = true, ["epoch"] = 1,
         })
-        if mode ~= "indexing" then
+        if mode ~= "indexing" and mode ~= "progress-controlled" then
           diagnostics(diagnostic_root)
           notify("titan/indexingStatus", {
             ["state"] = "ready", ["initial"] = true, ["epoch"] = 1,
@@ -85,14 +123,18 @@ local function serve(root: string): integer
       end
     elseif method == "titan/republishDiagnostics" then
       replay_count = replay_count + 1
-      if mode == "replay-unavailable" then
-        -- Keep serving other requests without answering this replay.
+      if mode == "replay-exit" then
+        return 0
       elseif mode == "replay-failed-once" and replay_count == 1 then
         reject(id, "fixture rejected first replay")
       else
         diagnostics(diagnostic_root)
         answer(id, wire.null())
       end
+    elseif method == "textDocument/hover" and mode == "progress-controlled" then
+      progress_step = progress_step + 1
+      advance_indexing(progress_step)
+      answer(id, wire.null())
     elseif method == "textDocument/hover" and mode == "replay-unavailable" then
       answer(id, replay_count)
     elseif method == "textDocument/diagnostic" and mode == "refresh-blocked" then
@@ -113,6 +155,7 @@ local function serve(root: string): integer
       end
       answer(id, wire.null())
     elseif method == "shutdown" then
+      if mode == "shutdown-exit" then return 0 end
       if mode ~= "shutdown-hang" then answer(id, wire.null()) end
     elseif method == "exit" then
       return 0
