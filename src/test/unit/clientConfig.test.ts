@@ -301,6 +301,20 @@ describe("server launch validation", () => {
       }
       throw cause;
     }
+    // A link this account created may still be untraversable: Windows marks a
+    // link made without SeCreateSymbolicLinkPrivilege as an untrusted mount
+    // point, so the fixture, not the resolver, decides that this case skips.
+    try {
+      await realpath(lexical);
+    } catch (cause) {
+      const code = (cause as NodeJS.ErrnoException).code ?? "";
+      if (process.platform === "win32" &&
+          ["EPERM", "EACCES", "UNKNOWN", "ENOSYS"].includes(code)) {
+        context.skip("Windows cannot traverse the created directory symlink");
+        return;
+      }
+      throw cause;
+    }
 
     assert.equal(
       await resolvePhysicalWorkspaceRoot(lexical),
