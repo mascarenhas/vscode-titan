@@ -1,6 +1,7 @@
 foreign import "compiler_io_platform.h"
 local test = import "test"
 local router = import "server.router.titan"
+local response_queue = import "server.response_queue"
 local wire = import "server.wire"
 
 local function response(body: string): wire.Object
@@ -48,4 +49,190 @@ function test_router_reports_each_worker_state_name(_context: test.Context)
     "the evicted state had the wrong name")
   test.assert(router.state_name(router.WorkerState.failed("broken")) == "failed",
     "the failed state had the wrong name")
+end
+
+local function indexing_router(): router.Router
+  return router.create(router.LaunchOptions {
+    executable = "/server", root = "/outer",
+  }, response_queue.create())
+end
+
+local function take_status(subject: router.Router): wire.Object
+  test.assert(subject.output:pending() > 0, "the router emitted no status")
+  local params = response(subject.output:take())["params"]
+  return wire.as_object(params)
+end
+
+local function last_status(subject: router.Router): wire.Object
+  local status = take_status(subject)
+  while subject.output:pending() > 0 do status = take_status(subject) end
+  return status
+end
+
+function test_router_aggregates_overlapping_indexing_worksets(_: test.Context)
+  local subject = indexing_router()
+  local outer = router.slot_for_root(subject, subject.registry:add_folder("/outer"))
+  local inner = router.slot_for_root(subject, subject.registry:add_folder("/outer/inner"))
+  outer:on_indexing(subject, {
+    ["state"] = "indexing", ["initial"] = false, ["epoch"] = 7,
+  })
+  local started = take_status(subject)
+  outer:on_indexing(subject, {
+    ["state"] = "indexing", ["initial"] = false, ["epoch"] = 7,
+    ["completed_files"] = 0, ["total_files"] = 4,
+  })
+  last_status(subject)
+  outer:on_indexing(subject, {
+    ["state"] = "indexing", ["initial"] = false, ["epoch"] = 7,
+    ["completed_files"] = 2, ["total_files"] = 4,
+  })
+  last_status(subject)
+  inner:on_indexing(subject, {
+    ["state"] = "indexing", ["initial"] = true, ["epoch"] = 1,
+  })
+  local unknown = take_status(subject)
+  test.assert(unknown["state"] == "indexing" and unknown["initial"] == true,
+    "a new initial root did not keep the session busy")
+  test.assert(unknown["completed_files"] == nil and unknown["total_files"] == nil,
+    "a partial sum misrepresented an unknown root's workset")
+  test.assert(wire.as_integer(unknown["epoch"]) > wire.as_integer(started["epoch"]),
+    "the inner root restarted below the session watermark")
+  inner:on_indexing(subject, {
+    ["state"] = "indexing", ["initial"] = true, ["epoch"] = 1,
+    ["completed_files"] = 0, ["total_files"] = 3,
+  })
+  local baseline = take_status(subject)
+  local summed = take_status(subject)
+  test.assert(baseline["completed_files"] == 0 and baseline["total_files"] == 7,
+    "the aggregate omitted its zero-count workset baseline")
+  test.assert(summed["completed_files"] == 2 and summed["total_files"] == 7,
+    "the aggregate did not sum every busy root")
+  outer:on_indexing(subject, {
+    ["state"] = "ready", ["initial"] = false, ["epoch"] = 7, ["generation"] = 9,
+  })
+  local remaining = last_status(subject)
+  test.assert(remaining["state"] == "indexing" and remaining["total_files"] == 3,
+    "one root's completion hid another root's indexing")
+  test.assert(wire.as_integer(remaining["epoch"]) > wire.as_integer(summed["epoch"]),
+    "a changed aggregate denominator retained the workset epoch")
+  inner:on_indexing(subject, {
+    ["state"] = "failed", ["initial"] = true, ["epoch"] = 1,
+    ["message"] = "bad config",
+  })
+  local failed = take_status(subject)
+  test.assert(failed["state"] == "failed" and
+    failed["message"] == "/outer/inner: bad config",
+    "the session did not identify its failed root")
+  outer:on_indexing(subject, {
+    ["state"] = "ready", ["initial"] = false, ["epoch"] = 7, ["generation"] = 9,
+  })
+  test.assert(take_status(subject)["state"] == "failed",
+    "an unrelated ready root hid the latest failure")
+end
+
+function test_router_session_generation_survives_restart_and_root_churn(
+    _: test.Context)
+  local subject = indexing_router()
+  local outer = router.slot_for_root(subject, subject.registry:add_folder("/outer"))
+  outer:on_indexing(subject, {
+    ["state"] = "indexing", ["initial"] = true, ["epoch"] = 12,
+  })
+  last_status(subject)
+  outer:on_indexing(subject, {
+    ["state"] = "ready", ["initial"] = true, ["epoch"] = 12, ["generation"] = 20,
+  })
+  local completed = take_status(subject)
+  test.assert(completed["generation"] == 1,
+    "session generation leaked the worker-local generation")
+  -- Starting a replacement forgets only the worker's snapshot.
+  outer.indexing_status = nil
+  outer:on_indexing(subject, {
+    ["state"] = "indexing", ["initial"] = true, ["epoch"] = 1,
+  })
+  local restarted = take_status(subject)
+  test.assert(wire.as_integer(restarted["epoch"]) > wire.as_integer(completed["epoch"]),
+    "a replacement worker rolled back the session epoch")
+  outer:on_indexing(subject, {
+    ["state"] = "ready", ["initial"] = true, ["epoch"] = 1, ["generation"] = 1,
+  })
+  local ready = take_status(subject)
+  test.assert(ready["generation"] == 2, "worker restart reset session generation")
+  subject.registry:remove_folder("/outer")
+  subject:publish_indexing(true, false)
+  test.assert(take_status(subject)["generation"] == 2,
+    "root release reset session generation")
+  subject.registry:add_folder("/outer")
+  subject:publish_indexing(true, false)
+  test.assert(take_status(subject)["generation"] == 2,
+    "warm reclaim counted a completed publication twice")
+end
+
+function test_router_busy_precedes_failure_and_release_removes_it(_: test.Context)
+  local subject = indexing_router()
+  local outer = router.slot_for_root(subject, subject.registry:add_folder("/outer"))
+  local inner = router.slot_for_root(subject, subject.registry:add_folder("/outer/inner"))
+  outer:on_indexing(subject, {
+    ["state"] = "indexing", ["initial"] = false, ["epoch"] = 4,
+  })
+  take_status(subject)
+  inner:on_indexing(subject, {
+    ["state"] = "failed", ["initial"] = true, ["epoch"] = 2,
+    ["message"] = "nested failure",
+  })
+  case subject.indexing_status.state
+  when indexing() then
+  else test.assert(false, "a failed root displaced another root's active indexing")
+  end
+  test.assert(subject.indexing_status.message == nil,
+    "busy indexing retained another root's failure message")
+  outer:on_indexing(subject, {
+    ["state"] = "ready", ["initial"] = false, ["epoch"] = 4, ["generation"] = 1,
+  })
+  test.assert(take_status(subject)["state"] == "failed",
+    "finishing the busy root hid the retained failure")
+  inner:on_indexing(subject, {
+    ["state"] = "ready", ["initial"] = true, ["epoch"] = 1, ["generation"] = 0,
+  })
+  test.assert(subject.output:pending() == 0,
+    "a stale worker snapshot replaced its latest failure")
+  subject.registry:remove_folder("/outer/inner")
+  subject:publish_indexing(true, false)
+  test.assert(take_status(subject)["state"] == "ready",
+    "a released root's failure remained in the session")
+  subject.registry:add_folder("/outer/inner")
+  subject:publish_indexing(true, false)
+  test.assert(take_status(subject)["message"] == "/outer/inner: nested failure",
+    "a reclaimed root lost its latest failure")
+  subject.registry:remove_folder("/outer")
+  subject:publish_indexing(true, false)
+  test.assert(take_status(subject)["message"] == "nested failure",
+    "a lone claimed root's failure gained an unnecessary root prefix")
+  router.stop_worker_locked(subject, inner, "idle")
+  test.assert(take_status(subject)["message"] == "nested failure",
+    "idle eviction dismissed the root's latest indexing failure")
+end
+
+function test_router_rejects_retired_worker_notifications(_: test.Context)
+  local subject = indexing_router()
+  local outer = router.slot_for_root(subject, subject.registry:add_folder("/outer"))
+  local listener = router.worker_listener(subject, outer)
+  outer.generation = 1
+  local busy: wire.Object = {
+    ["state"] = "indexing", ["initial"] = true, ["epoch"] = 1,
+  }
+  listener.on_notification("titan/indexingStatus", busy, "retired status")
+  local diagnostics: wire.Array = {}
+  local publication: wire.Object = {
+    ["uri"] = "file:///outer/main.titan", ["diagnostics"] = diagnostics,
+  }
+  listener.on_notification("textDocument/publishDiagnostics",
+    publication, "retired diagnostics")
+  test.assert(subject.output:pending() == 0 and outer.indexing_status == nil,
+    "a dead worker's queued notifications survived its exit")
+  -- Graceful shutdown permits its own final empty rows, not a prior worker's.
+  outer.generation = 2
+  outer.stopping = true
+  listener.on_notification("titan/indexingStatus", busy, "obsolete status")
+  test.assert(subject.output:pending() == 0,
+    "an older worker's relay reached its replacement")
 end

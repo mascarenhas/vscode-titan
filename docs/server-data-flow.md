@@ -172,12 +172,26 @@ requests, completion and document notifications. `lifecycle` owns the
 `initialize`/`shutdown`/`exit` states and the advertised capabilities; the
 router enables its workspace-folder capability and only the router advertises
 it. The custom `titan/indexingStatus` notification (`indexing_status`) drives
-the extension's language-status item; because a replacement worker restarts its
-own epochs and the client drops anything below the epoch it already saw, the
-router forwards each root's epochs on one session timeline
-(`Slot.indexing_watermark`). A worker detached from its slot is owned by the
-router (`Router.retired`) before any suspension, so a shutdown that cancels a
-restart still releases its process and relay Tasks.
+the extension's language-status item. `Router:publish_indexing` aggregates the
+latest snapshots of claimed roots onto one session timeline: busy while any
+root indexes, otherwise failed while any root's latest snapshot failed,
+otherwise ready. Busy is initial if any indexing root is initial. File counters
+are summed only when every indexing root reports them; otherwise busy has no
+counters. A changed workset or busy-root membership starts a newer bare-busy
+epoch and a zero-count baseline before counted progress. Failure messages
+identify the failed root when more than one root is claimed.
+Terminal snapshots survive idle worker eviction; releasing a root excludes its
+snapshot until that root is claimed again.
+
+The notification's session `generation` counts completed root publications.
+It is monotonic across worker restarts and root release, reclaim and eviction;
+replaying a warm root does not count another completion. It is not a worker's
+saved generation: pull-diagnostic generations and work-done progress tokens
+remain worker-local. Session epochs likewise never restart when another root
+or replacement worker starts, so clients with one watermark accept every root.
+A worker detached from its slot is owned by the router (`Router.retired`)
+before any suspension, so a shutdown that cancels a restart still releases its
+process and relay Tasks.
 
 The router also filters diagnostics by ownership: a worker's
 `textDocument/publishDiagnostics` for a URI is forwarded only when that worker
@@ -187,7 +201,16 @@ nested discovery, a worker that stops), and every such change ends in one
 reconciliation step (`Router:reconcile`): a document the client still has open is
 closed in the old owner and opened in the new one with the router's latest text,
 and diagnostics a root published for a document it no longer owns are cleared
-with an empty publication. The router retains each open document's text under the
+with an empty publication. An unexpectedly exited worker's tracked publications
+are cleared immediately for URIs it still owns, so a file fixed or deleted
+before replacement startup cannot retain a stale diagnostic. Retired worker
+notifications are rejected, including a diagnostic frame whose path lookup
+suspended across process exit or replacement. A released warm
+root that regains ownership replays its completed diagnostics after old-owner
+clearing: the router requests `titan/republishDiagnostics`, and the worker
+reattaches its listener through `Application:set_diagnostics_listener`. The
+completed view's persisted rows remain the single diagnostic source, with no
+router-side snapshot. The router retains each open document's text under the
 same limits the worker applies (`document_buffers.limits`); a buffer it cannot
 retain is replayed as an unavailable contributor (`titan/documentUnavailable`),
 never as the saved bytes. It forwards `$/cancelRequest` to the worker that owns the request id,

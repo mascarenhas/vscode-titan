@@ -132,11 +132,18 @@ local function serve(root: string): integer
   do
     local server = application.create(root)
     defer server:close()
+    local diagnostic_listener: diagnostics.Listener? = nil
     result = protocol.run(
       os.stdin, os.stdout,
       function (request: dispatcher.SemanticRequest): dispatcher.SemanticOutcome
         if request.method == UNAVAILABLE_DOCUMENT_METHOD then
           return unavailable_document(request, server)
+        end
+        if request.method == "titan/republishDiagnostics" then
+          -- Reattachment replays the completed view's persisted rows, using
+          -- exactly the same publication path as initial protocol attachment.
+          server:set_diagnostics_listener(diagnostic_listener)
+          return dispatcher.SemanticOutcome.result(wire.null())
         end
         return server:handle(request)
       end,
@@ -145,10 +152,10 @@ local function serve(root: string): integer
         server:set_indexing_listener(function (status: indexing_status.Status)
           sink(indexing_status.notification(status))
         end)
-        server:set_diagnostics_listener(
-          function (publication: diagnostics.Publication)
-            sink(diagnostics.notification(publication))
-          end)
+        diagnostic_listener = function (publication: diagnostics.Publication)
+          sink(diagnostics.notification(publication))
+        end
+        server:set_diagnostics_listener(diagnostic_listener)
       end,
       function () server:stop_diagnostics() end,
       function (notification: lsp.DocumentNotification)
