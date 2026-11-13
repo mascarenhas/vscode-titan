@@ -145,6 +145,25 @@ function findRoot(roots, rootPath) {
   return roots.find((candidate) => samePath(candidate.root, rootPath));
 }
 
+// Creating symbolic links needs SeCreateSymbolicLinkPrivilege or Developer Mode
+// on Windows. When the account has neither, the cases that prove symlink
+// semantics skip, exactly as the native suite's own symlink cases do.
+let symlinkCapability;
+async function canCreateSymlinks() {
+  if (symlinkCapability !== undefined) return symlinkCapability;
+  const probe = await mkdtemp(path.join(os.tmpdir(), "titan-multi-link-"));
+  try {
+    await symlink(probe, path.join(probe, "link"));
+    symlinkCapability = true;
+  } catch (error) {
+    if (!["EPERM", "EACCES", "ENOSYS", "EINVAL"].includes(error.code)) throw error;
+    symlinkCapability = false;
+  } finally {
+    await rm(probe, { recursive: true, force: true });
+  }
+  return symlinkCapability;
+}
+
 function positionOf(text, token, occurrence = 0) {
   let offset = -1;
   for (let index = 0; index <= occurrence; index += 1) {
@@ -574,15 +593,20 @@ async function testFolderChanges() {
       "the re-added root");
 
     // A symlinked folder canonicalizes onto the root it names.
-    const linkPath = path.join(base, "a-link");
-    await symlink(rootA, linkPath);
-    session.notify("workspace/didChangeWorkspaceFolders", {
-      event: { added: [{ uri: uri(linkPath), name: "a-link" }], removed: [] }
-    });
-    const linked = await pollStatus(session, (roots) => roots.length === 2,
-      "a symlinked folder created a third root");
-    assert.equal(linked.length, 2,
-      "a symlinked folder did not share its physical root");
+    if (await canCreateSymlinks()) {
+      const linkPath = path.join(base, "a-link");
+      await symlink(rootA, linkPath);
+      session.notify("workspace/didChangeWorkspaceFolders", {
+        event: { added: [{ uri: uri(linkPath), name: "a-link" }], removed: [] }
+      });
+      const linked = await pollStatus(session, (roots) => roots.length === 2,
+        "a symlinked folder created a third root");
+      assert.equal(linked.length, 2,
+        "a symlinked folder did not share its physical root");
+    } else {
+      console.log("multi-root: skipped the symlinked folder case " +
+        "(this account cannot create symbolic links)");
+    }
 
     // A nested folder narrows routing to itself without disturbing the outer
     // root that also contains it. An added folder activates on its first routed
@@ -2625,6 +2649,10 @@ async function testAggregateCountedProgress() {
   }
 }
 
+// These cases prove symlink semantics: a farmed SDK is a tree of links into the
+// session SDK, and one workspace folder is reached through a link.
+const SYMLINK_GROUPS = new Set(["sdk", "sdk-errors", "overlays", "shutdown-restart"]);
+
 const groups = [
   ["independent", testIndependentRoots, "independent roots"],
   ["folders", testFolderChanges, "folder changes"],
@@ -2658,8 +2686,14 @@ async function main() {
     assert.ok(groups.some(([name]) => name === only),
       `unknown group ${only}; known groups: ${groups.map(([name]) => name).join(", ")}`);
   }
+  const symlinks = await canCreateSymlinks();
   for (const [name, run, label] of groups) {
     if (only !== undefined && only !== name) continue;
+    if (!symlinks && SYMLINK_GROUPS.has(name)) {
+      console.log(`multi-root: ${label} skipped ` +
+        "(this account cannot create symbolic links)");
+      continue;
+    }
     await run();
     console.log(`multi-root: ${label} passed`);
   }
