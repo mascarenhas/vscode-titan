@@ -1,6 +1,21 @@
 foreign import "compiler_io_platform.h"
+local async = import "async"
+local fs = import "fs"
 local os = import "os"
 local test = import "test"
+
+-- Windows marks a link created without SeCreateSymbolicLinkPrivilege as an
+-- untrusted mount point and refuses to traverse it, so creation alone does not
+-- make the fixture usable.
+local function traversable(link: string)
+  do
+    fs.realpath(link)
+  catch
+    if error is async.CancellationReason then raise end
+    test.skip("Windows refuses to traverse the created directory link " ..
+      "(untrusted mount point)")
+  end
+end
 
 -- Directory-link fixtures retain their native path arguments and report a
 -- missing Windows privilege only after the actual creation attempt.
@@ -22,9 +37,11 @@ function directory(source: string, link: string, message: string)
   if link_output ~= nil then link_output:close() end
   local link_error? = linker.stderr
   if link_error ~= nil then link_error:close() end
-  if ffi.VSCODE_TITAN_WINDOWS ~= 0 and
-     status.code == 1314 and status.signal == nil then
-    test.skip("Windows account cannot create directory symbolic links (Win32 1314)")
+  if ffi.VSCODE_TITAN_WINDOWS ~= 0 and status.signal == nil then
+    if status.code == 1314 then
+      test.skip("Windows account cannot create directory symbolic links (Win32 1314)")
+    end
+    if status.code == 0 then traversable(link) end
   end
   test.assert(status.code == 0 and status.signal == nil, message)
 end
