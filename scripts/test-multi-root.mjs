@@ -145,6 +145,12 @@ function findRoot(roots, rootPath) {
   return roots.find((candidate) => samePath(candidate.root, rootPath));
 }
 
+// Fixture configuration is Lua, so a path must become a Lua string literal: a
+// Windows path's backslashes would otherwise start escapes and name another
+// path. Escape them (and any quote) so the literal is the exact host path.
+const luaString = (value) =>
+  `"${value.replaceAll("\\", "\\\\").replaceAll('"', '\\"')}"`;
+
 // Windows records a symbolic link's kind when it is created, and a link made
 // with the file kind cannot be resolved once its target is a directory, so
 // directory links must be created with the directory kind.
@@ -751,7 +757,7 @@ async function testSecondSdk() {
   const sdkRootDir = path.join(base, "selected");
   const defaultSource = await writeRoot(defaultRoot, ROOT_A_SOURCE);
   const sdkSource = await writeRoot(sdkRootDir, SDK_SOURCE,
-    `include = { "./src" }\nsource_module_roots = { "./src" }\ncompiler_root = "${sdk}"\n`);
+    `include = { "./src" }\nsource_module_roots = { "./src" }\ncompiler_root = ${luaString(sdk)}\n`);
   // A selected SDK reads interfaces from its archive; a broken dynamic
   // provider proves the server never prefers loading native code from it. That
   // provider is a Unix-only object: on Windows the provider itself is the
@@ -820,7 +826,7 @@ async function testSecondSdk() {
     // not restart anything.
     const generated = new Map(roots.map((entry) => [serverPath(entry.root), entry.generation]));
     const localOverride = path.join(sdkRootDir, "titan-config.local.lua");
-    await writeFile(localOverride, `compiler_root = "${sdk}"\n`, "utf8");
+    await writeFile(localOverride, `compiler_root = ${luaString(sdk)}\n`, "utf8");
     session.notify("workspace/didChangeConfiguration", { settings: {} });
     const unchanged = await session.status();
     assert.equal(rootEntry(unchanged, sdkRootDir).generation,
@@ -832,7 +838,7 @@ async function testSecondSdk() {
     const secondSdk = path.join(base, "second-sdk");
     await farmSdk(sdkRoot(), secondSdk);
     const beforeSelection = rootEntry(await session.status(), sdkRootDir).generation;
-    await writeFile(localOverride, `compiler_root = "${secondSdk}"\n`, "utf8");
+    await writeFile(localOverride, `compiler_root = ${luaString(secondSdk)}\n`, "utf8");
     session.notify("workspace/didChangeConfiguration", { settings: {} });
     const reselected = await pollStatus(session, (entries) => {
       const entry = findRoot(entries, sdkRootDir);
@@ -849,7 +855,7 @@ async function testSecondSdk() {
     // The tracked configuration is untouched: only the local override moved.
     const trackedConfig = await readFile(
       path.join(sdkRootDir, "titan-config.lua"), "utf8");
-    assert.ok(trackedConfig.includes(`compiler_root = "${sdk}"`),
+    assert.ok(trackedConfig.includes(`compiler_root = ${luaString(sdk)}`),
       "the local override rewrote the tracked configuration");
     await pollHover(session, sdkSource, SDK_SOURCE, "tripled", /integer/,
       "the root with the second SDK");
@@ -877,7 +883,7 @@ async function testSecondSdk() {
     // A local override exists only to select an SDK, so a broken one refuses an
     // already-ready root instead of quietly serving the router's own SDK.
     await writeFile(localOverride,
-      `compiler_root = "${secondSdk}"\ninclude = { "./src" }\n`, "utf8");
+      `compiler_root = ${luaString(secondSdk)}\ninclude = { "./src" }\n`, "utf8");
     session.notify("workspace/didChangeConfiguration", { settings: {} });
     const broken = await pollStatus(session, (entries) => {
       const entry = findRoot(entries, sdkRootDir);
@@ -964,19 +970,19 @@ async function testRootScopedSdkErrors() {
   const untrustedRoot = path.join(base, "untrusted-root");
   const brokenOverrideRoot = path.join(base, "broken-override-root");
   const incompatibleSource = await writeRoot(incompatibleRoot, ROOT_A_SOURCE,
-    `include = { "./src" }\nsource_module_roots = { "./src" }\ncompiler_root = "${incompatible}"\n`);
+    `include = { "./src" }\nsource_module_roots = { "./src" }\ncompiler_root = ${luaString(incompatible)}\n`);
   const abiRootSource = await writeRoot(abiRoot, ROOT_A_SOURCE,
-    `include = { "./src" }\nsource_module_roots = { "./src" }\ncompiler_root = "${incompatibleAbi}"\n`);
+    `include = { "./src" }\nsource_module_roots = { "./src" }\ncompiler_root = ${luaString(incompatibleAbi)}\n`);
   const missingSource = await writeRoot(missingRoot, ROOT_A_SOURCE,
-    `include = { "./src" }\nsource_module_roots = { "./src" }\ncompiler_root = "${path.join(base, "absent-sdk")}"\n`);
+    `include = { "./src" }\nsource_module_roots = { "./src" }\ncompiler_root = ${luaString(path.join(base, "absent-sdk"))}\n`);
   const untrustedSource = await writeRoot(untrustedRoot, ROOT_A_SOURCE,
-    `include = { "./src" }\nsource_module_roots = { "./src" }\ncompiler_root = "${untrusted}"\n`);
+    `include = { "./src" }\nsource_module_roots = { "./src" }\ncompiler_root = ${luaString(untrusted)}\n`);
   // An untrusted root whose override cannot even be read must still never load
   // the SDK: there is no selection to trust and none to fall back to.
   const brokenOverrideSource = await writeRoot(brokenOverrideRoot, ROOT_A_SOURCE,
-    `include = { "./src" }\nsource_module_roots = { "./src" }\ncompiler_root = "${untrusted}"\n`);
+    `include = { "./src" }\nsource_module_roots = { "./src" }\ncompiler_root = ${luaString(untrusted)}\n`);
   await writeFile(path.join(brokenOverrideRoot, "titan-config.local.lua"),
-    `compiler_root = "${untrusted}"\ninclude = { "./src" }\n`, "utf8");
+    `compiler_root = ${luaString(untrusted)}\ninclude = { "./src" }\n`, "utf8");
 
   const session = new Session(launch(incompatibleRoot, "error"));
   try {
@@ -1953,7 +1959,7 @@ async function testShutdownDuringRestart() {
   await replaceWithCopy(digests);
   const root = path.join(base, "slice");
   await writeRoot(root, ROOT_A_SOURCE,
-    `include = { "./src" }\nsource_module_roots = { "./src" }\ncompiler_root = "${sdk}"\n`);
+    `include = { "./src" }\nsource_module_roots = { "./src" }\ncompiler_root = ${luaString(sdk)}\n`);
   const delays = [0, 40, 90, 150, 240];
   for (let attempt = 0; attempt < delays.length; attempt += 1) {
     const session = new Session(launch(root, "error"));
