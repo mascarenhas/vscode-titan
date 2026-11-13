@@ -28,7 +28,8 @@ sources, so installing it requires no separate Titan compiler.
 - Definition, references, rename, folding, hover and diagnostics for saved
   files.
 - Completion from unsaved editor buffers, triggered by `.` and `:` or the
-  usual completion command, including after `foreign` in a type annotation.
+  usual completion command, including after `foreign` in a type annotation
+  and at the unprefixed C types of a `foreign function`.
   Callable candidates show named signatures and insert parameter-name call
   placeholders. After a completion request, hover follows edits to the active
   module. See [completion](docs/completion.md).
@@ -50,6 +51,25 @@ headers. Written `ffi` roots and C value members support hover and references
 within their module, but they have no definition or rename target. Foreign
 types use their own unqualified namespace (`foreign int`, `foreign *Name`,
 `foreign type Name = ...`) and are not selected through the `ffi` value.
+
+A `foreign function` writes C types without `foreign` in its signature and
+body, as in `local count: *int = context as *int`. Highlighting gives the C type
+after an annotation's `:` or a cast's `as` the same colors as a
+`foreign`-prefixed type, multiword primitives such as `unsigned long` included.
+The `foreign T.new()`, `foreign T.new_array(N)`, `foreign T.sizeof` and
+`foreign T.alignof` forms keep their prefix. The highlighter reads one line at a
+time and does not parse. It finds the end of the function with the rule the
+compiler's completion transform uses: the `if`, `do` and `repeat` blocks inside
+consume their own `end` or `until`, and the next `end` closes the function. A
+keyword written as a name does not count: a member name, a named-argument
+label, or a C type such as a typedef named `repeat`, also when a comment or a
+line break separates it from the `.`, `:`, `as`, `foreign`, `(`, `,` or type
+prefix before it. Three limits remain. The header must write
+`foreign function Name` on one line with only spaces between the words, or no
+region opens. An unclosed block extends the C-type coloring to the next
+unmatched `end`, usually the end of the following function. Inside a C
+function-pointer type, only parameter types spelled like block keywords are
+colored as types.
 
 Navigation to FFI definitions or to external source, and watching external
 source trees, are out of scope for version 1.

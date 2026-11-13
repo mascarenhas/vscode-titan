@@ -1022,6 +1022,149 @@ function test_completion_service_ignores_open_inactive_variants_and_completes_se
   end)
 end
 
+-- Serves one completion at the end of `needle` from the prepared snapshot of
+-- an unsaved module, through capture, preparation and SQL selection.
+local function prepared_completion(text: string, needle: string): dispatcher.SemanticOutcome
+  local store = sql.open(":memory:")
+  defer store:close()
+  seed(store, {bridge.ProjectModule("app", {bridge.SourceFile(PATH, "local saved = 1\n")})})
+  local documents = buffers.create()
+  local completion = service.create(store, documents)
+  defer completion:close()
+  open(documents, PATH, 1, text)
+  local work = completion:capture(request(PATH, text, needle))
+  work()
+  await_preparation(completion)
+  return work()
+end
+
+-- The C typedefs share the `fixture_` prefix with a Titan record, so a type
+-- position shows which namespace completion offered.
+local function foreign_completion(body: string, needle: string): (dispatcher.SemanticOutcome, string)
+  local header = fs.tmpname()
+  defer fs.unlink(header)
+  fs.write_file(header, "typedef int fixture_count;\n" ..
+    "typedef struct fixture_node { fixture_count weight; } fixture_node;\n")
+  local text = "foreign import " .. strings.format("%q", header) .. "\n" ..
+    "record fixture_record\n  weight: integer\nend\n" .. body
+  return prepared_completion(text, needle), text
+end
+
+local function assert_c_type_names(names: {string}, position: string)
+  test.assert(contains(names, "int") and contains(names, "unsigned long long") and
+              contains(names, "fixture_count") and contains(names, "fixture_node"),
+              position .. " did not offer the C primitives and typedefs")
+  test.assert(not contains(names, "integer") and not contains(names, "string") and
+              not contains(names, "fixture_record") and not contains(names, "ffi"),
+              position .. " offered Titan names in a C type position")
+end
+
+local function assert_prefixed_c_type_names(names: {string}, position: string)
+  test.assert(contains(names, "fixture_count") and contains(names, "fixture_node"),
+              position .. " did not offer the C typedefs")
+  test.assert(not contains(names, "fixture_record"),
+              position .. " offered a Titan record in a C type position")
+end
+
+function test_completion_service_offers_c_types_in_foreign_function_positions(context: test.Context)
+  context:run("signature_parameter", function (_child: test.Context)
+    runtime.run(function ()
+      local outcome = foreign_completion(
+        "foreign function count_of(node: ): int\n  return 0\nend\n", "count_of(node: ")
+      assert_c_type_names(labels(outcome), "signature parameter")
+    end)
+  end)
+  context:run("body_annotation", function (_child: test.Context)
+    runtime.run(function ()
+      local outcome = foreign_completion(
+        "foreign function first_weight(node: *fixture_node): int\n" ..
+        "  local weight:  = node.weight\n" ..
+        "  return weight\n" ..
+        "end\n", "local weight: ")
+      assert_c_type_names(labels(outcome), "body annotation")
+    end)
+  end)
+  context:run("numeric_for", function (_child: test.Context)
+    runtime.run(function ()
+      local outcome = foreign_completion(
+        "foreign function total(node: *fixture_node, count: int): int\n" ..
+        "  local sum: int = 0\n" ..
+        "  for index: fixture_ = 0, count - 1 do\n" ..
+        "    sum = sum + node[index].weight\n" ..
+        "  end\n" ..
+        "  return sum\n" ..
+        "end\n", "for index: fixture_")
+      assert_prefixed_c_type_names(labels(outcome), "numeric for")
+    end)
+  end)
+  context:run("cast", function (_child: test.Context)
+    runtime.run(function ()
+      local outcome = foreign_completion(
+        "foreign function first_weight(context: *void): int\n" ..
+        "  local node = context as *fixture_\n" ..
+        "  return node.weight\n" ..
+        "end\n", "as *fixture_")
+      assert_prefixed_c_type_names(labels(outcome), "cast")
+    end)
+  end)
+  context:run("multiword_primitive", function (_child: test.Context)
+    runtime.run(function ()
+      local outcome, text = foreign_completion(
+        "foreign function widen(count: int): unsigned long long\n" ..
+        "  local wide: unsigned long = count\n" ..
+        "  return wide\n" ..
+        "end\n", "local wide: unsigned lo")
+      local prefix = "unsigned lo"
+      local names = labels(outcome)
+      test.assert(contains(names, "unsigned long") and contains(names, "unsigned long long"),
+        "multiword primitive prefix did not offer its completions")
+      for index = 1, #names do
+        test.assert(strings.sub(names[index], 1, #prefix) == prefix,
+          "multiword primitive prefix admitted " .. names[index])
+      end
+      -- The edit replaces the whole written leaf, including the word after
+      -- the caret, and keeps the annotation's `:`.
+      local leaf = "unsigned long"
+      local first? = strings.find(text, leaf .. " =", 1, true)
+      local expected_start? = source_text.position_for_offset(text, first - 1)
+      local expected_finish? = source_text.position_for_offset(text, first - 1 + #leaf)
+      local item = selected_item(outcome, "unsigned long long")
+      local edit? = wire.as_object(item["textEdit"])
+      local range? = wire.as_object(edit["range"])
+      local start? = wire.as_object(range["start"])
+      local finish? = wire.as_object(range["end"])
+      test.assert(wire.as_integer(start["line"]) == expected_start.line and
+                  wire.as_integer(start["character"]) == expected_start.character and
+                  wire.as_integer(finish["line"]) == expected_finish.line and
+                  wire.as_integer(finish["character"]) == expected_finish.character,
+        "multiword primitive edit did not cover the written leaf")
+    end)
+  end)
+  context:run("ordinary_function_after_end", function (_child: test.Context)
+    runtime.run(function ()
+      -- The foreign function's nested block closes first; the ordinary
+      -- function after its `end` completes Titan types again.
+      local outcome = foreign_completion(
+        "foreign function first_weight(node: *fixture_node): int\n" ..
+        "  if node ~= nil then\n" ..
+        "    return node.weight\n" ..
+        "  end\n" ..
+        "  return 0\n" ..
+        "end\n" ..
+        "function plain(input: fixture_record): integer\n" ..
+        "  local weight:  = input.weight\n" ..
+        "  return weight\n" ..
+        "end\n", "local weight: ")
+      local names = labels(outcome)
+      test.assert(contains(names, "integer") and contains(names, "fixture_record"),
+        "ordinary annotation after a foreign function lost its Titan types")
+      test.assert(not contains(names, "int") and not contains(names, "fixture_count") and
+                  not contains(names, "fixture_node"),
+        "foreign function context leaked past its end")
+    end)
+  end)
+end
+
 do
   if ffi.VSCODE_TITAN_WINDOWS ~= 0 then
     ROOT = "C:/completion-fixture"

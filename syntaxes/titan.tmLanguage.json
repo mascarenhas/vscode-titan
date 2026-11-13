@@ -10,6 +10,9 @@
       "include": "#strings"
     },
     {
+      "include": "#foreign-functions"
+    },
+    {
       "include": "#declarations"
     },
     {
@@ -310,13 +313,165 @@
     "foreign-types": {
       "patterns": [
         {
-          "match": "\\b(foreign)(\\s+)(?!import\\b|type\\b|function\\b)((?:const\\s+)?(?:\\*\\s*)*)([A-Za-z_][A-Za-z0-9_]*(?:\\s+(?:char|short|int|long|double))*)",
+          "comment": "The type part (qualifier, pointer and group prefix, then the base name with the parser's multiword C primitives) is the same as in the type context of foreign-function-names. This match is anchored at `foreign`, so each attempt scans one prefix once.",
+          "match": "\\b(foreign)(\\s+)(?!import\\b|type\\b|function\\b)((?:(?:const\\b|\\*|\\()\\s*)*)(unsigned\\s+(?:long(?:\\s+long)?|char|short|int)\\b|signed\\s+char\\b|long(?:\\s+(?:long|double))?\\b|(?!function\\b)[A-Za-z_][A-Za-z0-9_]*)",
           "captures": {
             "1": { "name": "storage.modifier.titan" },
-            "3": { "name": "storage.modifier.titan" },
+            "3": { "patterns": [{ "include": "#foreign-type-prefix" }] },
             "4": { "name": "entity.name.type.titan" }
           }
         }
+      ]
+    },
+    "foreign-type-prefix": {
+      "patterns": [
+        {
+          "match": "\\bconst\\b|\\*",
+          "name": "storage.modifier.titan"
+        },
+        {
+          "match": "\\(",
+          "name": "punctuation.section.group.begin.titan"
+        }
+      ]
+    },
+    "foreign-functions": {
+      "comment": "A foreign function writes C types without `foreign` in its signature and body. TextMate cannot parse, so the region follows the compiler's completion transform: `[local] foreign function Name` opens it, nested if/do/repeat blocks consume their own end/until, and the next end closes it. A block word written as a name (foreign-function-names) does not count.",
+      "name": "meta.function.foreign.titan",
+      "begin": "\\b(foreign)(\\s+)(function)(\\s+)([A-Za-z_][A-Za-z0-9_]*)",
+      "beginCaptures": {
+        "1": { "name": "storage.modifier.titan" },
+        "3": { "name": "storage.type.function.titan" },
+        "5": { "name": "entity.name.function.titan" }
+      },
+      "end": "\\bend\\b",
+      "endCaptures": {
+        "0": { "name": "keyword.control.titan" }
+      },
+      "patterns": [
+        { "include": "#foreign-function-body" }
+      ]
+    },
+    "foreign-function-body": {
+      "comment": "The raw-C subset has no lambdas, case, type arguments or constructors, so ordinary expression blocks stay out and cannot consume the function's end.",
+      "patterns": [
+        { "include": "#comments" },
+        { "include": "#strings" },
+        { "include": "#foreign-function-blocks" },
+        { "include": "#foreign-function-arguments" },
+        { "include": "#bindings" },
+        { "include": "#foreign-function-names" },
+        { "include": "#qualified-members" },
+        { "include": "#keywords" },
+        { "include": "#numbers" },
+        { "include": "#operators" },
+        { "include": "#punctuation" }
+      ]
+    },
+    "foreign-function-names": {
+      "comment": "The compiler's completion transform (`written_as_name`) reads a block word after `.`, `:`, `as`, `foreign`, `(`, `,` or a qualifier or pointer prefix as a name, across whitespace, comments and line breaks. The contexts below start at the separator and consume comments and prefix tokens one at a time, so a long prefix is scanned once; no lookahead reaches past the prefix tokens and the following name, comment or line end. Same-line members are matched by qualified-members.",
+      "patterns": [
+        {
+          "comment": "A member name after `.` that follows a comment or line break.",
+          "begin": "(?<!\\.)(\\.)(?!\\.)(?=\\s*(?:--|$))",
+          "beginCaptures": {
+            "1": { "name": "punctuation.accessor.titan" }
+          },
+          "end": "([A-Za-z_][A-Za-z0-9_]*)|(?=[^\\s-]|-(?!-))",
+          "endCaptures": {
+            "1": { "name": "variable.other.member.titan" }
+          },
+          "patterns": [
+            { "include": "#comments" }
+          ]
+        },
+        {
+          "comment": "The C type after an annotation's `:`, a cast's `as` or a pseudo-expression's `foreign` gets the scopes of a `foreign`-prefixed type. `foreign` and `owned` after `:` or `as` are syntax errors; they end the context and keep their ordinary scopes.",
+          "begin": "(?<!:)(:)(?!:)|\\b(as)\\b|\\b(foreign)\\b",
+          "beginCaptures": {
+            "1": { "name": "punctuation.separator.titan" },
+            "2": { "name": "keyword.operator.type.titan" },
+            "3": { "name": "storage.modifier.titan" }
+          },
+          "end": "(?!foreign\\b|owned\\b|const\\b)(unsigned\\s+(?:long(?:\\s+long)?|char|short|int)\\b|signed\\s+char\\b|long(?:\\s+(?:long|double))?\\b|(?!function\\b)[A-Za-z_][A-Za-z0-9_]*)|(?=(?!const\\b)[^\\s\\-*(]|-(?!-))",
+          "endCaptures": {
+            "1": { "name": "entity.name.type.titan" }
+          },
+          "patterns": [
+            { "include": "#comments" },
+            { "include": "#foreign-type-prefix" }
+          ]
+        },
+        {
+          "comment": "After `(` or `,`, a block word is a C type of a function-pointer parameter list; any other token ends the context.",
+          "begin": "(\\()|(,)",
+          "beginCaptures": {
+            "1": { "name": "punctuation.section.group.begin.titan" },
+            "2": { "name": "punctuation.separator.titan" }
+          },
+          "end": "\\b(if|do|repeat|end|until)\\b(?!\\s*=(?!=))|(?=(?!const\\b)[^\\s\\-*(]|-(?!-))",
+          "endCaptures": {
+            "1": { "name": "entity.name.type.titan" }
+          },
+          "patterns": [
+            { "include": "#comments" },
+            { "include": "#foreign-type-prefix" }
+          ]
+        }
+      ]
+    },
+    "foreign-function-blocks": {
+      "patterns": [
+        {
+          "begin": "\\b(?:if|do)\\b",
+          "beginCaptures": {
+            "0": { "name": "keyword.control.titan" }
+          },
+          "end": "\\bend\\b",
+          "endCaptures": {
+            "0": { "name": "keyword.control.titan" }
+          },
+          "patterns": [
+            { "include": "#foreign-function-body" }
+          ]
+        },
+        {
+          "begin": "\\brepeat\\b",
+          "beginCaptures": {
+            "0": { "name": "keyword.control.titan" }
+          },
+          "end": "\\buntil\\b",
+          "endCaptures": {
+            "0": { "name": "keyword.control.titan" }
+          },
+          "patterns": [
+            { "include": "#foreign-function-body" }
+          ]
+        }
+      ]
+    },
+    "foreign-function-arguments": {
+      "comment": "Named call arguments. A label is a name even when its `=` follows on a later line, so a block word here never opens or closes a block.",
+      "begin": "\\{",
+      "beginCaptures": {
+        "0": { "name": "punctuation.section.group.begin.titan" }
+      },
+      "end": "\\}",
+      "endCaptures": {
+        "0": { "name": "punctuation.section.group.end.titan" }
+      },
+      "patterns": [
+        { "include": "#comments" },
+        { "include": "#strings" },
+        {
+          "match": "\\b[A-Za-z_][A-Za-z0-9_]*(?=\\s*=(?!=))",
+          "name": "variable.other.member.titan"
+        },
+        {
+          "match": "\\b(?:if|do|repeat|end|until)\\b",
+          "name": "variable.other.member.titan"
+        },
+        { "include": "#foreign-function-body" }
       ]
     },
     "keywords": {

@@ -9,7 +9,12 @@ The server enables completion at startup through
 `src/server/lifecycle.titan` then advertises full-document synchronization
 (`change: 1`), `.` and `:` trigger characters and `labelDetailsSupport`.
 The usual editor completion command also works in lexical, import-name,
-qualified-type and foreign-type positions.
+qualified-type and foreign-type positions. Inside a `foreign function`, whose
+signature and body write C types without `foreign`, the C type after an
+annotation's `:` (parameters, results, locals, numeric `for`) or a cast's `as`
+is a foreign-type position too; the compiler finds the enclosing function from
+the tokens before the caret. These positions offer only C primitives and the
+types of the module's C environment, not Titan types.
 
 Candidates come from compiler lookup at the caret: lexical bindings, visible
 module members, constructors and static functions, record and interface
