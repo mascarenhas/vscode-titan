@@ -177,16 +177,20 @@ latest snapshots of claimed roots onto one session timeline: busy while any
 root indexes, otherwise failed while any root's latest snapshot failed,
 otherwise ready. Busy stays initial until the first session ready; afterward it
 is initial if any indexing root is initial. File counters are summed only when
-every indexing root reports them; otherwise busy has no counters. A changed
-workset or busy-root membership starts a newer bare-busy
-epoch and a zero-count baseline before counted progress. Every counterless busy
-frame advances the session epoch. Failure messages identify the failed root when
-more than one root is claimed.
+every indexing root reports them; otherwise busy has no counters. Publication
+follows the visible state, initial scope and counters: an unchanged busy aggregate
+emits nothing, including when another root completes. The first counted snapshot
+after bare busy establishes a zero-count baseline in that epoch. Once counted,
+only progress over the same total without regression continues the epoch;
+other visible busy changes start a newer bare-busy epoch. Failure messages
+identify the failed root when more than one root is claimed.
 Terminal snapshots survive idle worker eviction; releasing a root excludes its
 snapshot until that root is claimed again, independently of diagnostic replay.
 Lifecycle changes publish only when the visible aggregate changes: an unchanged
 release, reclaim, replay or unclaimed exit does not manufacture an epoch. A busy
 restart replaces the old workset without an intermediate ready frame.
+The slot's snapshot also drives idle admission: startup installs a synthetic busy
+snapshot until the worker reports its first frame.
 An initialization or settings failure ends the root's busy contribution with a
 failed snapshot; an exit that already published terminal is not published again.
 If admission fails before any worker starts, initial bare busy precedes failed.
@@ -196,7 +200,9 @@ another worker starts.
 
 The notification's session `generation` counts completed root publications.
 It is monotonic across worker restarts and root release, reclaim and eviction;
-replaying a warm root does not count another completion. It is not a worker's
+replaying a warm root does not count another completion. Completions hidden
+behind unchanged busy are retained for the next ready frame without a
+generation-only busy publication. Session generation is not a worker's
 saved generation: pull-diagnostic generations and work-done progress tokens
 remain worker-local. Session epochs likewise never restart when another root
 or replacement worker starts, so clients with one watermark accept every root.

@@ -174,8 +174,10 @@ The peer always imports this checkout's server sources, even when `SOURCE_ROOT`
 selects another application for an incremental-build test.
 
 The final component of the worker's existing `--root` argument selects its
-scenario: accept/reject initialize, exit before/during initialize, withhold
-indexing, fail the first diagnostic replay, or withhold replay or shutdown.
+scenario: accept/reject initialize, exit before/during initialize or shutdown,
+withhold indexing or shutdown, fail the first replay, exit during replay, or
+keep alive after input EOF. `progress-controlled` advances
+counted initial and refresh passes with hover barriers.
 The `refresh-blocked` scenario holds a pull request until an outer-root hover,
 allowing deterministic nested discovery and release/reclaim during busy.
 `--router` serves the production router with this executable as its worker.
@@ -400,9 +402,6 @@ in `TITAN_COMPILER_IO_PROCESS_FIXTURE`.
 The driver also builds the Titan router peer as a normal compiler-owned Windows
 application under `tests/native/router-worker`, with its runtime/provider DLLs.
 `server-test-run` passes `TITAN_ROUTER_WORKER_FIXTURE` to the native router cases.
-Portable driver tests exercise compiler argument and environment construction;
-the native Windows aggregate has not been run. The Unix protocol target also
-uses the peer's `--router` harness for controlled failures.
 
 ### Windows embedded interfaces
 

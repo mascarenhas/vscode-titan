@@ -73,14 +73,6 @@ local function state_ready(state: WorkerState): boolean
   return false
 end
 
-local function state_failure(state: WorkerState): string?
-  case state
-  when failed(message) then return message
-  else return nil
-  end
-  return nil
-end
-
 --- One open editor buffer retained for replay into its owner's worker.
 -- `text` is nil when the buffer is over the limits the worker applies
 -- (`documents.limits`): the document is then delivered as an unavailable
@@ -126,9 +118,7 @@ record Slot
   -- The worker's own report of the SDK and probe prefix it resolved.
   local titan_root: string?
   local probe_prefix: string?
-  -- The worker reported background indexing; it is not idle then.
-  local indexing: boolean
-  -- Latest worker snapshot; the router aggregates claimed roots for the client.
+  -- Latest worker or startup snapshot; also owns the slot's busy/idle state.
   local indexing_status: indexing_status.Status?
   local diagnosed_file: string?
   -- URIs this root published diagnostics for, and the document each names.
@@ -178,6 +168,8 @@ record Router
   -- Memoized nearest-ancestor configuration per owner root and directory.
   local discovered: {string: string}
   local closed: boolean
+  -- Completed root publications count even when no visible frame changes.
+  local indexing_generation: integer
   local indexing_status: indexing_status.Status?
   -- Strict clients keep one initial cycle open until the first session ready.
   local initial_pending: boolean
@@ -292,6 +284,7 @@ function create(options: LaunchOptions, output: response_queue.ResponseQueue): R
     unowned_logged = {},
     discovered = {},
     closed = false,
+    indexing_generation = 0,
     indexing_status = nil,
     initial_pending = true,
   }
@@ -317,7 +310,6 @@ local function slot_for_root(router: Router, entry: roots.Root): Slot
     worker_pid = nil,
     titan_root = nil,
     probe_prefix = nil,
-    indexing = false,
     indexing_status = nil,
     diagnosed_file = nil,
     published = {},
@@ -330,6 +322,11 @@ local function slot_for_root(router: Router, entry: roots.Root): Slot
   router.slots[entry.path] = slot
   router.order[#router.order + 1] = entry.path
   return slot
+end
+
+local function Slot:is_indexing(): boolean
+  local status? = self.indexing_status
+  return status ~= nil and indexing_status.state_name(status.state) == "indexing"
 end
 
 -- One observation of "this root was used", ordered without clock resolution.
@@ -376,7 +373,7 @@ local function owner_root(router: Router, canonical: string): roots.Root?
   local discovered? = nested_configuration(router, canonical, owner_path)
   if discovered ~= nil then
     local entry = router.registry:attach_discovery(discovered as string)
-    router:publish_indexing { reset = false, completed = false }
+    router:publish_indexing { completed = false }
     logging.emit("info", "root.discovered", {
       ["root"] = entry.path,
       ["path"] = canonical,
@@ -550,9 +547,9 @@ local function publish_empty_diagnostics(router: Router, uri: string)
 end
 
 -- One session timeline, not one watermark per root: clients display one status
--- item. A changed busy workset starts a new epoch and a zero-count baseline,
--- including when another root finishes while this one is still indexing.
-local function Router:publish_indexing(reset: boolean, completed: boolean)
+-- item. Only counted progress over an unchanged total continues an epoch;
+-- other visible busy changes start a bare-busy epoch and a zero-count baseline.
+local function Router:publish_indexing(completed: boolean)
   local busy = false
   local initial = false
   local counted = true
@@ -580,11 +577,6 @@ local function Router:publish_indexing(reset: boolean, completed: boolean)
           if failure_slot == nil then failure_slot = slot end
         else
         end
-      elseif slot.indexing then
-        -- Startup precedes the first worker frame and is already non-idle.
-        busy = true
-        initial = true
-        counted = false
       end
     end
   end
@@ -602,34 +594,29 @@ local function Router:publish_indexing(reset: boolean, completed: boolean)
     self.output:push(indexing_status.notification(previous))
   end
   local epoch = 0
-  local generation = 0
   if previous ~= nil then
     epoch = previous.epoch
-    generation = previous.generation or 0
   end
-  -- Session generations count completed root publications, never a worker's
-  -- restartable generation or the current number of roots.
-  if completed then generation = generation + 1 end
+  -- Session generations include completions hidden behind an unchanged busy
+  -- aggregate, independently of the last published snapshot.
+  if completed then self.indexing_generation = self.indexing_generation + 1 end
+  local generation = self.indexing_generation
   if busy then
     -- Aggregate counters have the same safe-integer bound as worker counters.
     counted = counted and total_files <= 9007199254740991
-    if previous == nil then
-      reset = true
-    else
-      reset = reset or
-        indexing_status.state_name(previous.state) ~= "indexing" or
+    local reset = previous == nil
+    if previous ~= nil then
+      reset = indexing_status.state_name(previous.state) ~= "indexing" or
         previous.initial ~= initial
       if previous.completed_files ~= nil then
         reset = reset or not counted or previous.total_files ~= total_files or
           completed_files < previous.completed_files
       end
     end
-    if not reset and previous ~= nil and previous.generation == generation and
+    if not reset and previous ~= nil and
        ((not counted and previous.completed_files == nil) or
         (counted and previous.completed_files == completed_files and
          previous.total_files == total_files)) then return end
-    -- Even a generation-only change needs a fresh epoch without counters.
-    reset = reset or not counted
     if reset then
       epoch = epoch + 1
       local status = indexing_status.Status {
@@ -686,7 +673,6 @@ end
 local function Slot:set_failure(router: Router, message: string)
   self.state = WorkerState.failed(message)
   self.failure = message
-  self.indexing = false
   local previous? = self.indexing_status
   if previous ~= nil and indexing_status.state_name(previous.state) == "failed" and
      previous.message == message then return end
@@ -696,7 +682,7 @@ local function Slot:set_failure(router: Router, message: string)
     epoch = 0, message = message,
   }
   if self.root:claimed() then
-    router:publish_indexing { reset = false, completed = false }
+    router:publish_indexing { completed = false }
   end
 end
 
@@ -706,9 +692,8 @@ local function Slot:clear_failure(router: Router, next_state: WorkerState)
   local previous? = self.indexing_status
   if previous ~= nil and indexing_status.state_name(previous.state) == "failed" then
     self.indexing_status = nil
-    self.indexing = false
     if self.root:claimed() then
-      router:publish_indexing { reset = false, completed = false }
+      router:publish_indexing { completed = false }
     end
   end
 end
@@ -743,17 +728,11 @@ local function Slot:on_indexing(router: Router, params: wire.Object)
     total_files = wire.as_integer(params["total_files"]),
   }
   self.indexing_status = status
-  self.indexing = name == "indexing"
   if not self.root:claimed() then return end
-  local reset = name == "indexing" and status.completed_files == nil
-  if previous ~= nil then
-    reset = reset or
-      (indexing_status.state_name(previous.state) == "indexing") ~= self.indexing
-  end
   local completed = name == "ready" and
     (previous == nil or indexing_status.state_name(previous.state) ~= "ready" or
      previous.generation ~= status.generation)
-  router:publish_indexing { reset = reset, completed = completed }
+  router:publish_indexing { completed = completed }
 end
 
 -- Clear every publication this root made for a document another root now owns.
@@ -798,7 +777,6 @@ local function stop_worker_locked(router: Router, slot: Slot, reason: string)
   slot.worker_pid = nil
   slot.titan_root = nil
   slot.probe_prefix = nil
-  slot.indexing = false
   -- Stopping ends busy, but idle eviction must not dismiss a latest failure.
   local status? = slot.indexing_status
   if status ~= nil and
@@ -862,9 +840,9 @@ end
 local function stop_slot(router: Router, slot: Slot, reason: string)
   begin_transition(slot)
   defer end_transition(slot)
-  local was_indexing = slot.indexing
+  local was_indexing = slot:is_indexing()
   defer if was_indexing and slot.root:claimed() then
-    router:publish_indexing { reset = false, completed = false }
+    router:publish_indexing { completed = false }
   end
   stop_worker_locked(router, slot, reason)
   forget_released(router, slot)
@@ -1290,13 +1268,14 @@ local function start_worker(router: Router, slot: Slot,
   slot.stopping = false
   -- A freshly started worker is not idle: it indexes before its first
   -- titan/indexingStatus frame arrives, and stopping it would discard that pass.
-  slot.indexing = true
-  slot.indexing_status = nil
+  slot.indexing_status = indexing_status.Status {
+    state = indexing_status.State.indexing(), initial = true, epoch = 0,
+  }
   slot:clear_failure(router, WorkerState.starting())
   -- An unclaimed worker's first pass is filtered until ownership returns.
   if not slot.root:claimed() then slot:require_diagnostic_replay() end
   if slot.root:claimed() then
-    router:publish_indexing { reset = true, completed = false }
+    router:publish_indexing { completed = false }
   end
   local outcome = worker:request(
     "initialize", worker_initialize_params(router, slot.root.path),
@@ -1360,7 +1339,7 @@ end
 
 local function slot_idle(router: Router, slot: Slot): boolean
   if slot.worker == nil or not state_ready(slot.state) then return false end
-  if slot.indexing then return false end
+  if slot:is_indexing() then return false end
   if in_flight_for(router, slot.root.path) > 0 then return false end
   for index = 1, #router.overlay_order do
     local overlay = router.overlays[router.overlay_order[index]] as Overlay
@@ -1727,7 +1706,7 @@ local function Router:remove_root(canonical: string)
       local gaining? = self.slots[heir.path]
       if gaining ~= nil then gaining:require_diagnostic_replay() end
     end
-    self:publish_indexing { reset = false, completed = false }
+    self:publish_indexing { completed = false }
   end
   logging.emit("info", "root.release", {
     ["root"] = canonical,
@@ -1776,7 +1755,7 @@ local function Router:on_folders(params: value)
           else
             local canonical = roots.canonical(path as string)
             slot_for_root(self, self.registry:add_folder(canonical))
-            self:publish_indexing { reset = false, completed = false }
+            self:publish_indexing { completed = false }
             logging.emit("info", "root.added", {["root"] = canonical})
           end
         end

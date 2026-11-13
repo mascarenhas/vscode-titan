@@ -2523,6 +2523,91 @@ async function testNestedDiscoveryDuringBlockedRefresh() {
   }
 }
 
+async function testAggregateCountedProgress() {
+  const base = await makeBase("aggregate-progress");
+  const firstRoot = path.join(base, "a", "progress-controlled");
+  const secondRoot = path.join(base, "b", "progress-controlled");
+  const firstSource = await writeRoot(firstRoot, ROOT_A_SOURCE);
+  const secondSource = await writeRoot(secondRoot, ROOT_B_SOURCE);
+  const session = peerSession(firstRoot);
+  const statuses = session.responses.indexingStatuses;
+  const advance = async (source) => {
+    const start = statuses.length;
+    assert.equal(await session.result("textDocument/hover", {
+      textDocument: { uri: uri(source) }, position: { line: 0, character: 0 }
+    }), null);
+    return statuses.slice(start);
+  };
+  try {
+    await session.initialize({
+      workspaceFolders: [
+        { uri: uri(firstRoot), name: "first" },
+        { uri: uri(secondRoot), name: "second" }
+      ],
+      initializationOptions: { trustedRoots: [base] }
+    });
+    session.notify("initialized", {});
+    assert.equal((await session.status()).length, 2);
+    assert.equal(statuses.length, 1, "startup repeated an unchanged busy aggregate");
+    assert.equal(statuses[0].state, "indexing");
+    assert.equal(statuses[0].initial, true);
+    assert.equal(statuses[0].completed_files, undefined);
+    assert.equal(statuses[0].total_files, undefined);
+    const initialEpoch = statuses[0].epoch;
+
+    // Another unknown root hides this root's progress and completed generation.
+    // Each hover reply is a barrier after that peer's indexing notification.
+    assert.deepEqual(await advance(firstSource), []);
+    assert.deepEqual(await advance(firstSource), []);
+    assert.deepEqual(await advance(firstSource), [],
+      "a hidden completion published a generation-only busy frame");
+    const baseline = await advance(secondSource);
+    assert.equal(baseline.length, 1);
+    assert.deepEqual([baseline[0].completed_files, baseline[0].total_files,
+      baseline[0].epoch], [0, 4, initialEpoch]);
+    const progress = await advance(secondSource);
+    assert.equal(progress.length, 1);
+    assert.deepEqual([progress[0].completed_files, progress[0].total_files,
+      progress[0].epoch], [1, 4, initialEpoch]);
+
+    const unknown = await advance(firstSource);
+    assert.equal(unknown.length, 1);
+    assert.equal(unknown[0].state, "indexing");
+    assert.equal(unknown[0].completed_files, undefined);
+    assert.equal(unknown[0].total_files, undefined);
+    assert.ok(unknown[0].epoch > initialEpoch,
+      "unknown work retained the preceding counted workset");
+    const summed = await advance(firstSource);
+    assert.deepEqual(summed.map((status) =>
+      [status.completed_files, status.total_files, status.epoch]),
+    [[0, 8, unknown[0].epoch], [1, 8, unknown[0].epoch]]);
+
+    // Finishing one root changes the denominator, not initial session scope.
+    const reduced = await advance(secondSource);
+    assert.equal(reduced.length, 2);
+    assert.equal(reduced[0].completed_files, undefined);
+    assert.equal(reduced[0].total_files, undefined);
+    assert.ok(reduced[0].epoch > unknown[0].epoch);
+    assert.deepEqual([reduced[1].completed_files, reduced[1].total_files,
+      reduced[1].epoch], [0, 4, reduced[0].epoch]);
+    const remaining = await advance(firstSource);
+    assert.equal(remaining.length, 1);
+    assert.deepEqual([remaining[0].completed_files, remaining[0].total_files,
+      remaining[0].epoch], [2, 4, reduced[0].epoch]);
+    const ready = await advance(firstSource);
+    assert.equal(ready.length, 1);
+    assert.equal(ready[0].state, "ready");
+    assert.equal(ready[0].generation, 3,
+      "the final generation lost a completion hidden behind busy");
+    assert.ok(statuses.every((status) => status.initial &&
+      status.message === undefined), "the initial cycle changed scope or gained a message");
+    assertAcceptedTimeline(session);
+    await session.shutdown();
+  } finally {
+    await session.abort();
+  }
+}
+
 const groups = [
   ["independent", testIndependentRoots, "independent roots"],
   ["folders", testFolderChanges, "folder changes"],
@@ -2543,6 +2628,7 @@ const groups = [
   ["warm-diagnostics", testWarmDiagnosticReplay, "warm diagnostic replay"],
   ["activation-transitions", testRouterActivationTransitions, "framed activation failure transitions"],
   ["busy-membership", testNestedDiscoveryDuringBlockedRefresh, "nested discovery and busy membership transitions"],
+  ["aggregate-progress", testAggregateCountedProgress, "aggregate counted progress and hidden completions"],
   ["shutdown-restart", testShutdownDuringRestart, "shutdown during a restart"],
   ["diagnostics", testProgressAndPullPerRoot, "progress and pull per root"],
   ["diagnostics-optout", testRouterPullOptOut, "router pull opt-out"]
