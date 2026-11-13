@@ -152,21 +152,27 @@ async function linkDirectory(target, pathname) {
   await symlink(target, pathname, process.platform === "win32" ? "dir" : undefined);
 }
 
-// Creating symbolic links needs SeCreateSymbolicLinkPrivilege or Developer Mode
-// on Windows. When the account has neither, the cases that prove symlink
-// semantics skip, exactly as the native suite's own symlink cases do.
+// The cases that prove symlink semantics need links the server can resolve, not
+// just links this account can create. Windows refuses to create one without
+// SeCreateSymbolicLinkPrivilege unless Developer Mode allows it, and marks
+// links created that way as untrusted mount points whose paths it will not
+// traverse; both failures skip the cases, as the native suite's own symlink
+// cases do.
 let symlinkCapability;
-async function canCreateSymlinks() {
+async function symlinksUsable() {
   if (symlinkCapability !== undefined) return symlinkCapability;
   const probe = await mkdtemp(path.join(os.tmpdir(), "titan-multi-link-"));
   try {
-    await symlink(probe, path.join(probe, "link"));
-    symlinkCapability = true;
+    const target = path.join(probe, "target");
+    const link = path.join(probe, "link");
+    await mkdir(target);
+    await symlink(target, link, process.platform === "win32" ? "dir" : undefined);
+    symlinkCapability = (await stat(link)).isDirectory();
   } catch (error) {
-    if (!["EPERM", "EACCES", "ENOSYS", "EINVAL"].includes(error.code)) throw error;
+    if (!["EPERM", "EACCES", "ENOSYS", "EINVAL", "UNKNOWN"].includes(error.code)) throw error;
     symlinkCapability = false;
   } finally {
-    await rm(probe, { recursive: true, force: true });
+    await rm(probe, { recursive: true, force: true }).catch(() => undefined);
   }
   return symlinkCapability;
 }
@@ -600,7 +606,7 @@ async function testFolderChanges() {
       "the re-added root");
 
     // A symlinked folder canonicalizes onto the root it names.
-    if (await canCreateSymlinks()) {
+    if (await symlinksUsable()) {
       const linkPath = path.join(base, "a-link");
       await linkDirectory(rootA, linkPath);
       session.notify("workspace/didChangeWorkspaceFolders", {
@@ -612,7 +618,7 @@ async function testFolderChanges() {
         "a symlinked folder did not share its physical root");
     } else {
       console.log("multi-root: skipped the symlinked folder case " +
-        "(this account cannot create symbolic links)");
+        "(this account has no usable symbolic links)");
     }
 
     // A nested folder narrows routing to itself without disturbing the outer
@@ -2694,12 +2700,12 @@ async function main() {
     assert.ok(groups.some(([name]) => name === only),
       `unknown group ${only}; known groups: ${groups.map(([name]) => name).join(", ")}`);
   }
-  const symlinks = await canCreateSymlinks();
+  const symlinks = await symlinksUsable();
   for (const [name, run, label] of groups) {
     if (only !== undefined && only !== name) continue;
     if (!symlinks && SYMLINK_GROUPS.has(name)) {
       console.log(`multi-root: ${label} skipped ` +
-        "(this account cannot create symbolic links)");
+        "(this account has no usable symbolic links)");
       continue;
     }
     await run();
