@@ -213,11 +213,13 @@ reconciliation step (`Router:reconcile`): a document the client still has open i
 closed in the old owner and opened in the new one with the router's latest text,
 and diagnostics a root published for a document it no longer owns are cleared
 with an empty publication. A tracked publication is forgotten only after its
-empty diagnostic publication is emitted. Worker loss clears owned or unowned
-URIs immediately, including when a controlled stop kills an unanswered worker;
-transferred URIs stay tracked for reconciliation's old-owner clearing before replay.
-A file fixed or deleted before replacement startup cannot retain a stale diagnostic.
-Every worker callback is
+empty diagnostic publication is emitted. After reconciliation, a slot without a
+worker tracks no publications. Every worker started while its root is released
+owes a replay when ownership returns. Worker loss clears owned or unowned URIs
+immediately, including when a controlled stop kills an unanswered worker.
+Transferred URIs stay tracked until reconciliation clears the old publication
+before replay. A file fixed or deleted before replacement startup cannot retain
+a stale diagnostic. Every worker callback is
 fenced by its captured generation, including a diagnostic frame whose path lookup
 suspended across process exit or replacement. A warm worker replays its completed
 diagnostics when its root gains ownership, whether its own folder is re-added or

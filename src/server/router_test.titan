@@ -656,6 +656,62 @@ function test_router_exited_worker_retains_transferred_diagnostics_until_reconci
   end)
 end
 
+function test_router_returned_ownership_clears_a_dead_workers_diagnostics(
+    _context: test.Context)
+  with_root(function (base: string)
+    local subject = fixture_router(base)
+    defer subject:close()
+    local outer = add_root(subject, base, "nested-diagnostics")
+    local inner = add_root(subject, outer.root.path, "accept")
+    test.assert(router.activate(subject, outer) ~= nil, "outer worker did not activate")
+    wait_ready(outer)
+    test.assert(router.activate(subject, inner) ~= nil, "inner worker did not activate")
+    wait_ready(inner)
+    local uri = source_text.path_to_file_uri(inner.root.path .. "/main.titan")
+    test.assert(#take_diagnostics(subject, uri) > 0 and inner.published[uri] ~= nil,
+      "the inner peer did not publish its diagnostic")
+    while subject.output:pending() > 0 do subject.output:take() end
+    local worker = inner.worker
+    subject:remove_root(inner.root.path)
+    worker:kill()
+    wait_until(function (): boolean return inner.worker == nil end)
+    test.assert(inner.published[uri] ~= nil and subject.output:pending() == 0,
+      "worker exit did not retain the transferred publication")
+    -- One folder message removes, then re-adds; no reconciliation runs between.
+    reclaim(subject, inner)
+    test.assert(inner.worker == nil and
+      subject.registry:owner(inner.root.path .. "/main.titan") == inner.root,
+      "ownership did not return to the workerless inner root")
+    subject:reconcile()
+    test.assert(#take_diagnostics(subject, uri) == 0 and inner.published[uri] == nil,
+      "reconciliation retained a dead worker's diagnostic after ownership returned")
+  end)
+end
+
+function test_router_restarted_released_worker_replays_when_ownership_returns(
+    _context: test.Context)
+  with_root(function (base: string)
+    local subject = fixture_router(base)
+    defer subject:close()
+    local slot = add_root(subject, base, "accept")
+    test.assert(router.activate(subject, slot) ~= nil, "the worker did not activate")
+    wait_ready(slot)
+    local uri = source_text.path_to_file_uri(slot.root.path .. "/main.titan")
+    test.assert(#take_diagnostics(subject, uri) > 0, "the peer published no diagnostic")
+    subject:remove_root(slot.root.path)
+    subject:reconcile()
+    test.assert(#take_diagnostics(subject, uri) == 0, "release did not clear the row")
+    restart(subject, slot)
+    wait_ready(slot)
+    while subject.output:pending() > 0 do subject.output:take() end
+    reclaim(subject, slot)
+    subject:reconcile()
+    test.assert(#take_diagnostics(subject, uri) > 0 and slot.published[uri] ~= nil and
+      not slot.replay_diagnostics,
+      "a worker restarted while released did not replay after ownership returned")
+  end)
+end
+
 function test_router_failed_replay_remains_pending_without_status_churn(
     _context: test.Context)
   with_root(function (base: string)

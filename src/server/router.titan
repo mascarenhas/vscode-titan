@@ -1293,6 +1293,8 @@ local function start_worker(router: Router, slot: Slot,
   slot.indexing = true
   slot.indexing_status = nil
   slot:clear_failure(router, WorkerState.starting())
+  -- An unclaimed worker's first pass is filtered until ownership returns.
+  if not slot.root:claimed() then slot:require_diagnostic_replay() end
   if slot.root:claimed() then
     router:publish_indexing { reset = true, completed = false }
   end
@@ -1881,7 +1883,10 @@ local function Router:reconcile()
   local paths = self:root_paths()
   for index = 1, #paths do
     local slot? = self.slots[paths[index]]
-    if slot ~= nil then clear_stale_diagnostics(self, slot as Slot) end
+    if slot ~= nil then
+      clear_stale_diagnostics(self, slot as Slot)
+      if slot.worker == nil then slot:clear_worker_diagnostics(self) end
+    end
   end
   -- Clear every old owner's rows before a worker that gained ownership replays.
   for index = 1, #paths do
