@@ -64,7 +64,7 @@ consume their own `end` or `until`, and the next `end` closes the function. A
 keyword written as a name does not count: a member name, a named-argument
 label, or a C type such as a typedef named `repeat`, also when a comment or a
 line break separates it from the `.`, `:`, `as`, `foreign`, `(`, `,` or type
-prefix before it. Two limits remain. The header must write
+prefix before it. Three limits remain. The header must write
 `foreign function Name` on one line with only spaces between the words, or no
 region opens. An unclosed block extends the C-type coloring to the next
 unmatched `end`, usually the end of the following function. Inside a C
