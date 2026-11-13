@@ -753,14 +753,22 @@ async function testSecondSdk() {
   const sdkSource = await writeRoot(sdkRootDir, SDK_SOURCE,
     `include = { "./src" }\nsource_module_roots = { "./src" }\ncompiler_root = "${sdk}"\n`);
   // A selected SDK reads interfaces from its archive; a broken dynamic
-  // provider proves the server never prefers loading native code from it.
-  const farmedProvider = path.join(sdk, "lib", "titan", "0.6", "titan.so");
+  // provider proves the server never prefers loading native code from it. That
+  // provider is a Unix-only object: on Windows the provider itself is the
+  // loaded DLL, so there is no second provider to corrupt.
+  const providerName = process.platform === "win32" ? "titan.dll" : "titan.so";
+  const farmedProvider = path.join(sdk, "lib", "titan", "0.6", providerName);
   const farmedParent = await lstat(path.dirname(farmedProvider));
   assert.equal(farmedParent.isSymbolicLink(), false,
     "the SDK farm must not alias the session SDK");
-  await assertFarmedFile(sdk, farmedProvider);
-  await rm(farmedProvider, { force: true });
-  await writeFile(farmedProvider, "not a loadable provider object\n", "utf8");
+  if (process.platform === "win32") {
+    console.log("multi-root: kept the farmed provider DLL " +
+      "(Windows has no unused dynamic provider)");
+  } else {
+    await assertFarmedFile(sdk, farmedProvider);
+    await rm(farmedProvider, { force: true });
+    await writeFile(farmedProvider, "not a loadable provider object\n", "utf8");
+  }
   const session = new Session(launch(defaultRoot, "error"));
   try {
     await session.initialize({
