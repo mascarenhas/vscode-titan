@@ -206,6 +206,17 @@ local function leaf_name(subject: string): string
   return name
 end
 
+--- Render a raised value for a client or log message. A nominal error such as
+--- async.OperationError reports the operation and message it carries instead of
+--- its record address.
+function failure_message(problem: value): string
+  if problem is async.OperationError then
+    local failure = problem as async.OperationError
+    return failure.operation .. ": " .. failure.message
+  end
+  return strings.tostring(problem)
+end
+
 local function router_publish(router: Router, message: string)
   router.output:push(message)
 end
@@ -797,7 +808,7 @@ local function stop_worker_locked(router: Router, slot: Slot, reason: string)
       if error is async.CancellationReason then raise end
       logging.emit("error", "root.worker.stop_failure", {
         ["root"] = slot.root.path,
-        ["message"] = strings.tostring(error),
+        ["message"] = failure_message(error),
       })
     end
   end
@@ -1789,7 +1800,7 @@ local function Router:revalidate_all(force: boolean)
           if error is async.CancellationReason then raise end
           logging.emit("error", "root.revalidate.failure", {
             ["root"] = actual.root.path,
-            ["message"] = strings.tostring(error),
+            ["message"] = failure_message(error),
           })
         end
       end
@@ -1907,7 +1918,7 @@ local function housekeeping(router: Router): nil
     catch
       if error is async.CancellationReason then raise end
       logging.emit("error", "router.housekeeping.failure", {
-        ["message"] = strings.tostring(error),
+        ["message"] = failure_message(error),
       })
     end
   end
@@ -2028,7 +2039,7 @@ local function Router:activate_initial_roots()
           end
         catch
           if error is async.CancellationReason then raise end
-          local message = strings.tostring(error)
+          local message = failure_message(error)
           begin_transition(slot)
           defer end_transition(slot)
           if slot.worker ~= nil then
