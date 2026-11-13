@@ -31,7 +31,7 @@ installation workflow. On Linux that workflow needs Readline development
 headers, or `LUA_PLATFORM=linux` to omit Readline. Use separate prefixes and
 Titan build checkouts for production and validation SDKs.
 
-Titan's system OpenSSL mode needs the host's OpenSSL 3 development files and
+Titan's system OpenSSL mode needs the host's OpenSSL 3 or 4 development files and
 `pkg-config`. Set `OPENSSL_PKG_CONFIG` to use another pkg-config command. An
 SDK with an `include/openssl` directory is a bundled-OpenSSL SDK: its provider
 already carries the OpenSSL archive, and system SDKs omit that directory. For
@@ -205,7 +205,10 @@ tree: the standard modules are native providers, not Lua sources. No
 collects licenses from the installation, using the rock versions and license
 files in `compilerRocks` (`scripts/compiler-rocks.mjs`). `scripts/inspect-vsix.sh` and
 `scripts/inspect-server.sh` check the package and the executable's native
-linkage. `inspect-server` enforces `TITAN_MAX_GLIBC_VERSION` when it is set.
+linkage. `inspect-server` rejects dynamic language/runtime dependencies. A
+system-OpenSSL SDK may link the OpenSSL 3 or 4 system libraries; a bundled-OpenSSL
+SDK must not link OpenSSL dynamically. The inspection also enforces
+`TITAN_MAX_GLIBC_VERSION` when it is set.
 
 ## Build regressions
 
