@@ -444,6 +444,19 @@ inspection and an interactive Extension Host (F5) session are separate gates. A
 successful compilation, a DLL helper test or an SSH-launched `code` command does
 not establish them. Symlink checks skip when the account lacks symlink privilege.
 
+`scripts/test-server-protocol.mjs`, `scripts/test-multi-root.mjs` and
+`scripts/test-completion-protocol.mjs` each take the built server executable as
+their first argument, and need the environment the Unix `SERVER_TEST_ENV`
+supplies. Set `TITAN_ROOT` to the selected SDK, `TITAN_LS_LUA_PATH` to
+`<sdk>/share/lua/5.5/?.lua;<sdk>/share/lua/5.5/?/init.lua`,
+`TITAN_LS_LUA_CPATH` to `<sdk>/lib/lua/5.5/?.dll`, and
+`TITAN_ROUTER_WORKER_FIXTURE` to the peer that `server-test-build` links at
+`.build/windows/tests/native/router-worker/bin/router_worker_fixture.exe`;
+`server-test-run` already passes those paths and both fixtures to the native
+aggregate. Clear `TITAN_PREFIX`, which the server reads as an inherited probe
+prefix, so each root keeps its own `.titan-ls` cache. The multi-root suite
+accepts one group name as its second argument, so a failure can be rerun alone.
+
 For F5, the interactive account needs read and execute access to the SDK and
 the tool prefix. It also needs its own writable workspace, build output, Node
 dependencies, VS Code user state and analysis cache. Use a protected shared
