@@ -508,6 +508,29 @@ describe("Titan TextMate grammar", () => {
     assertNoScope(lines[14], "integer", foreignFunctionScope);
   });
 
+  test("tokenizes long prefixes in a foreign function within a budget", () => {
+    // VS Code tokenizes lines of up to 20,000 characters by default. Each line
+    // takes tens of milliseconds when every prefix token is consumed once;
+    // rescanning the remaining prefix from every `(` took seconds and stopped
+    // early. The budget leaves a wide margin for a slow runner.
+    const budgetMs = 1000;
+    const inside = grammar.tokenizeLine("foreign function f(): void", INITIAL).ruleStack;
+    for (const line of [
+      "  local x: " + "*(".repeat(6600) + "int" + ")".repeat(6600) + " = nil",
+      "  local x = " + "(".repeat(9900) + "1" + ")".repeat(9900) + " -- end",
+      "  local x = f(" + "*(".repeat(9900) + "!"
+    ]) {
+      const result = grammar.tokenizeLine(line, inside, budgetMs);
+      assert.equal(result.stoppedEarly, false,
+        `a ${line.length}-character line stopped early`);
+      const last = result.tokens[result.tokens.length - 1];
+      assert.ok(last.endIndex >= line.length,
+        `a ${line.length}-character line was not tokenized to its end`);
+      assert.ok(last.scopes.includes(foreignFunctionScope),
+        "a long prefix left the foreign function");
+    }
+  });
+
   test("recognizes multiple union parts, constructors, and both case forms", () => {
     const [declaration, parts, , positional, named, prefix, selected, empty] =
       tokenizeLines([
