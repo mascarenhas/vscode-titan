@@ -699,7 +699,8 @@ async function testLazyDiscovery() {
         ? { accepted: roots }
         : { rejected: roots };
     }, "the enclosing configuration was not discovered");
-    assert.ok(inner.startsWith(deep.slice(0, deep.lastIndexOf("/"))));
+    assert.ok(serverPath(deep).startsWith(`${serverPath(inner)}/`),
+      "the deeper discovered root is not inside the enclosing one");
     assert.equal(nested.filter((entry) => entry.origin === "discovered").length, 2,
       "discovery registered an unexpected number of roots");
     assert.equal(nested.some((entry) => samePath(entry.root, path.join(base, "slice"))), false,
