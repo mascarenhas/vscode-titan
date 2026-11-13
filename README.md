@@ -28,7 +28,8 @@ sources, so installing it requires no separate Titan compiler.
 - Definition, references, rename, folding, hover and diagnostics for saved
   files.
 - Completion from unsaved editor buffers, triggered by `.` and `:` or the
-  usual completion command, including after `foreign` in a type annotation.
+  usual completion command, including after `foreign` in a type annotation
+  and at the unprefixed C types of a `foreign function`.
   Callable candidates show named signatures and insert parameter-name call
   placeholders. After a completion request, hover follows edits to the active
   module. See [completion](docs/completion.md).
