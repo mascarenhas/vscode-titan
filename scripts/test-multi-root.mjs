@@ -759,10 +759,6 @@ const PER_ROOT_SDK_SKIP =
   "provider mode (vscode-titan#136)";
 
 async function testSecondSdk() {
-  if (process.platform === "win32") {
-    console.log("multi-root: second SDK skipped (" + PER_ROOT_SDK_SKIP + ")");
-    return;
-  }
   const base = await makeBase("sdk");
   const sdk = path.join(base, "sdk");
   await farmSdk(sdkRoot(), sdk);
@@ -930,11 +926,6 @@ async function testSecondSdk() {
 }
 
 async function testRootScopedSdkErrors() {
-  if (process.platform === "win32") {
-    console.log("multi-root: root-scoped SDK errors skipped (" +
-      PER_ROOT_SDK_SKIP + ")");
-    return;
-  }
   const base = await makeBase("sdk-errors");
   const marker = path.join(base, "driver-loaded");
   const incompatible = path.join(base, "incompatible");
@@ -2699,6 +2690,13 @@ async function testAggregateCountedProgress() {
 // session SDK, and one workspace folder is reached through a link.
 const SYMLINK_GROUPS = new Set(["sdk", "sdk-errors", "overlays", "shutdown-restart"]);
 
+// Cases that cannot run on one platform report it here, so the runner counts
+// them as skipped and never prints them as passed.
+const WINDOWS_SKIPS = new Map([
+  ["sdk", PER_ROOT_SDK_SKIP],
+  ["sdk-errors", PER_ROOT_SDK_SKIP]
+]);
+
 const groups = [
   ["independent", testIndependentRoots, "independent roots"],
   ["folders", testFolderChanges, "folder changes"],
@@ -2735,6 +2733,10 @@ async function main() {
   const symlinks = await symlinksUsable();
   for (const [name, run, label] of groups) {
     if (only !== undefined && only !== name) continue;
+    if (process.platform === "win32" && WINDOWS_SKIPS.has(name)) {
+      console.log(`multi-root: ${label} skipped (${WINDOWS_SKIPS.get(name)})`);
+      continue;
+    }
     if (!symlinks && SYMLINK_GROUPS.has(name)) {
       console.log(`multi-root: ${label} skipped ` +
         "(this account has no usable symbolic links)");
