@@ -145,6 +145,13 @@ function findRoot(roots, rootPath) {
   return roots.find((candidate) => samePath(candidate.root, rootPath));
 }
 
+// Windows records a symbolic link's kind when it is created, and a link made
+// with the file kind cannot be resolved once its target is a directory, so
+// directory links must be created with the directory kind.
+async function linkDirectory(target, pathname) {
+  await symlink(target, pathname, process.platform === "win32" ? "dir" : undefined);
+}
+
 // Creating symbolic links needs SeCreateSymbolicLinkPrivilege or Developer Mode
 // on Windows. When the account has neither, the cases that prove symlink
 // semantics skip, exactly as the native suite's own symlink cases do.
@@ -595,7 +602,7 @@ async function testFolderChanges() {
     // A symlinked folder canonicalizes onto the root it names.
     if (await canCreateSymlinks()) {
       const linkPath = path.join(base, "a-link");
-      await symlink(rootA, linkPath);
+      await linkDirectory(rootA, linkPath);
       session.notify("workspace/didChangeWorkspaceFolders", {
         event: { added: [{ uri: uri(linkPath), name: "a-link" }], removed: [] }
       });
@@ -1261,7 +1268,7 @@ async function testOverlayOwnership() {
   const sourceA = await writeRoot(rootA, ROOT_A_SOURCE);
   const sourceB = await writeRoot(rootB, ROOT_B_SOURCE);
   const linkPath = path.join(base, "a-link");
-  await symlink(rootA, linkPath);
+  await linkDirectory(rootA, linkPath);
   // The client spells a document through the symlinked folder.
   const linkedDraft = path.join(linkPath, "src", "draft.titan");
   // A buffer inside the physical tree is what a worker can analyse.
