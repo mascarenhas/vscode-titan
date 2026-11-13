@@ -2331,6 +2331,43 @@ async function testWarmDiagnosticReplay() {
     const reclaimed = rootEntry(await session.status(), plainRoot);
     assert.equal(reclaimed.workerPid, running.workerPid, "warm reclaim restarted its worker");
     assert.equal(reclaimed.generation, running.generation, "warm reclaim reactivated its worker");
+
+    const config = path.join(plainRoot, "titan-config.lua");
+    const failureAt = session.responses.diagnosticPublications.length;
+    await writeFile(config, "include = 42\n", "utf8");
+    const failure = await session.failure("textDocument/diagnostic", {
+      textDocument: { uri: uri(source) }
+    });
+    assert.match(failure.message, /include/,
+      "the saved refresh did not fail on the invalid configuration");
+    await waitNotification(session, session.responses.diagnosticPublications, failureAt,
+      (item) => item.uri === uri(source) && item.diagnostics.length === 0,
+      "the failed saved refresh's diagnostic clearing");
+
+    const failedReplayAt = session.responses.diagnosticPublications.length;
+    session.notify("workspace/didChangeWorkspaceFolders", {
+      event: { added: [], removed: [folder] }
+    });
+    await session.status();
+    session.notify("workspace/didChangeWorkspaceFolders", {
+      event: { added: [folder], removed: [] }
+    });
+    const failedReclaim = rootEntry(await session.status(), plainRoot);
+    assert.equal(failedReclaim.workerPid, running.workerPid,
+      "failed saved refresh replaced the warm worker");
+    assert.equal(failedReclaim.generation, running.generation,
+      "failed saved refresh reactivated the warm worker");
+    assert.ok(!session.responses.diagnosticPublications.slice(failedReplayAt).some(
+      (item) => item.uri === uri(source) && item.diagnostics.length > 0),
+    "warm reclaim resurrected diagnostics cleared by a failed saved refresh");
+
+    const repairAt = session.responses.diagnosticPublications.length;
+    await writeFile(config,
+      "include = { 'src' }\nsource_module_roots = { 'src' }\n", "utf8");
+    await pullDiagnostics(session, uri(source));
+    await waitNotification(session, session.responses.diagnosticPublications, repairAt,
+      (item) => item.uri === uri(source) && item.diagnostics.length > 0,
+      "diagnostic publication after repairing the saved configuration");
     await session.shutdown();
   } finally {
     await session.abort();

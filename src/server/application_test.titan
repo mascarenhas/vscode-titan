@@ -4142,3 +4142,109 @@ function test_application_pull_revalidates_a_folder_contributor_change(
     _context: test.Context)
   test_runtime.run(pulls_a_folder_contributor_change)
 end
+
+local function diagnostic_replay_after_failed_saved_refresh(
+    context: test.Context, first_attach: boolean, unexpected: boolean)
+  local root = test_paths.canonical_path(test_paths.temporary_name())
+  fs.unlink(root)
+  fs.mkdir(root)
+  local filename = root .. "/main.titan"
+  local config_file = root .. "/titan-config.lua"
+  local configuration = "include = { '.' }\nsource_module_roots = { '.' }\n"
+  fs.write_file(filename, "function answer(): integer return 'broken' end\n")
+  fs.write_file(config_file, configuration)
+  defer do
+    remove_application_cache(workspace_cache.directory(root))
+    fs.unlink(config_file)
+    fs.unlink(filename)
+    fs.rmdir(root)
+  end
+  local app = application.create(root)
+  defer app:close()
+  local uri = source_text.path_to_file_uri(filename)
+  local observed: {string: diagnostics.Publication} = {}
+  local listener = function (publication: diagnostics.Publication)
+    observed[publication.uri] = publication
+  end
+  if not first_attach then app:set_diagnostics_listener(listener) end
+  app:start_indexing()
+  wait_until(function (): boolean
+    return app.completed_view ~= nil and
+      not app:indexing_metrics().refresh_chain_active
+  end, "the saved diagnostic generation did not finish")
+  local initial? = app:published_items(app.completed_view, uri)
+  test.assert(initial ~= nil and #initial > 0,
+    "the real compiler did not persist the initial error")
+  use_manual_watch_delivery(app)
+
+  if unexpected then
+    app:set_indexing_listener(function (status: indexing_status.Status)
+      if indexing_status.state_name(status.state) == "ready" then
+        raise "deliberate saved-refresh publication failure"
+      end
+    end)
+    context:log("BEGIN expected saved-refresh Task failure")
+    app:note_saved_change()
+    local refresh = app.refresh_task
+    case async.join(refresh)
+    when failed(failure) then
+      test.assert(failure.error == "deliberate saved-refresh publication failure",
+        "the refresh reported a different exceptional failure")
+    else
+      test.assert(false, "the refresh did not fail its publication")
+    end
+    context:log("END expected saved-refresh Task failure")
+    app:set_indexing_listener(nil)
+  else
+    fs.write_file(config_file, "include = 42\n")
+    app:note_saved_change()
+    wait_until(function (): boolean
+      return app.refresh_failure ~= nil and
+        not app:indexing_metrics().refresh_chain_active
+    end, "the invalid saved configuration did not fail")
+  end
+  local retained? = app:published_items(app.completed_view, uri)
+  test.assert(retained ~= nil and #retained > 0,
+    "failure discarded the retained semantic generation")
+  if not first_attach then
+    test.assert(observed[uri] ~= nil and #observed[uri].items == 0,
+      "failed refresh did not clear the currently published error")
+  end
+
+  observed = {}
+  app:set_diagnostics_listener(listener)
+  local replayed? = observed[uri]
+  test.assert(replayed == nil or #replayed.items == 0,
+    "listener attachment resurrected diagnostics cleared by a failed refresh")
+
+  fs.write_file(config_file, configuration)
+  app:note_saved_change()
+  wait_until(function (): boolean
+    return observed[uri] ~= nil and #observed[uri].items > 0 and
+      not app:indexing_metrics().refresh_chain_active
+  end, "successful repair did not restore diagnostic publication")
+  app:set_diagnostics_listener(nil)
+  observed = {}
+  app:set_diagnostics_listener(listener)
+  test.assert(observed[uri] ~= nil and #observed[uri].items > 0,
+    "successful repair did not restore listener replay")
+end
+
+function test_application_diagnostic_replay_respects_failed_saved_epoch(
+    context: test.Context)
+  context:run("reattach", function (child: test.Context)
+    test_runtime.run(function ()
+      diagnostic_replay_after_failed_saved_refresh(child, false, false)
+    end)
+  end)
+  context:run("first_attach", function (child: test.Context)
+    test_runtime.run(function ()
+      diagnostic_replay_after_failed_saved_refresh(child, true, false)
+    end)
+  end)
+  context:run("exceptional_cleanup", function (child: test.Context)
+    test_runtime.run(function ()
+      diagnostic_replay_after_failed_saved_refresh(child, false, true)
+    end)
+  end)
+end

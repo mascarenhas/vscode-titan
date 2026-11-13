@@ -229,8 +229,11 @@ worker reattaches its listener through `Application:set_diagnostics_listener`.
 A rejected replay remains pending for the next reconciliation. Replay uses the
 short delivery timeout; an unavailable reply stops retries against that worker,
 including after another ownership change. A new worker can replay normally.
-The completed view's persisted rows remain the single diagnostic source, with no
-router-side snapshot. The router retains each open document's text under the
+The completed view's persisted rows remain the single diagnostic source.
+A failed saved refresh clears diagnostics and suppresses listener replay until
+a refresh succeeds; retaining the completed view does not validate its old rows.
+This applies to first attachment and warm reattachment, with no router-side
+snapshot. The router retains each open document's text under the
 same limits the worker applies (`document_buffers.limits`); a buffer it cannot
 retain is replayed as an unavailable contributor (`titan/documentUnavailable`),
 never as the saved bytes. It forwards `$/cancelRequest` to the worker that owns the request id,
