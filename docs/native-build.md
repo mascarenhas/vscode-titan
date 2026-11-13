@@ -464,8 +464,13 @@ the tool prefix. It also needs its own writable workspace, build output, Node
 dependencies, VS Code user state and analysis cache. Use a protected shared
 tool installation or per-user copies; do not broaden another account's profile
 permissions. Set `TITAN_PREFIX`, `CC`, `AR`, `RANLIB`, `RC` and the native Node
-and tool `PATH` in the process that launches Code. The `npm: compile`
-pre-launch task then stages the selected SDK's compiler payload. The Windows
+and tool `PATH` in the process that launches Code. Titan parses those four tool
+settings as shell words, so every value is a quoted forward-slash path such as
+`"C:/tools/clang64/bin/clang.exe"`; a backslash path escapes the next character
+instead of separating it ([Windows
+compilation](https://github.com/mascarenhas/titan/blob/master/doc/language/modules.md#experimental-windows-compilation)).
+The `npm: compile` pre-launch task then stages the selected SDK's compiler
+payload. The Windows
 launch configuration in `.vscode/launch.json` clears `TITAN_PREFIX` only in the
 Extension Host, so the server uses its normal `.titan-ls` probe cache. Keep the
 workspace on writable guest-local NTFS, and build the native server first.
