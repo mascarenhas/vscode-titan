@@ -749,7 +749,20 @@ async function testLazyDiscovery() {
   }
 }
 
+// A selected root's compiler_root is honoured only when the bridge can load
+// that SDK's provider. The Unix SDK carries the `titan.a` archive provider the
+// bridge loads in archive mode; a Windows SDK carries `titan.dll`, and loading
+// a selected provider in dynamic mode is not implemented.
+const PER_ROOT_SDK_SKIP =
+  "compiler_bridge loads the selected SDK's titan.a archive provider and " +
+  "Windows SDKs ship titan.dll; per-root compiler_root needs a dynamic " +
+  "provider mode (vscode-titan#136)";
+
 async function testSecondSdk() {
+  if (process.platform === "win32") {
+    console.log("multi-root: second SDK skipped (" + PER_ROOT_SDK_SKIP + ")");
+    return;
+  }
   const base = await makeBase("sdk");
   const sdk = path.join(base, "sdk");
   await farmSdk(sdkRoot(), sdk);
@@ -806,18 +819,9 @@ async function testSecondSdk() {
     await pollHover(session, defaultSource, ROOT_A_SOURCE, "doubled", /integer/,
       "the default SDK root");
     // `encoded` returns what `json.encode` declares, so its hover type proves
-    // the standard library resolved from the selected SDK's own archive. That
-    // needs the selected provider to be loaded: a Windows SDK has no static
-    // archive, and loading a selected SDK's provider DLL on Windows is not
-    // implemented, so this one assertion stays Unix-only.
-    if (process.platform === "win32") {
-      console.log("multi-root: skipped the selected SDK's standard-library " +
-        "assertion (loading a selected SDK's provider DLL on Windows is not " +
-        "implemented; vscode-titan#136)");
-    } else {
-      await pollHover(session, sdkSource, SDK_SOURCE, "encoded", /string/,
-        "the selected SDK standard library");
-    }
+    // the standard library resolved from the selected SDK's own archive.
+    await pollHover(session, sdkSource, SDK_SOURCE, "encoded", /string/,
+      "the selected SDK standard library");
     assert.ok(await exists(path.join(sdkRootDir, ".titan-ls", "index.sqlite3")),
       "the selected root wrote no workspace cache below its own root");
     assert.equal(await exists(path.join(sdk, ".titan-ls")), false,
@@ -926,6 +930,11 @@ async function testSecondSdk() {
 }
 
 async function testRootScopedSdkErrors() {
+  if (process.platform === "win32") {
+    console.log("multi-root: root-scoped SDK errors skipped (" +
+      PER_ROOT_SDK_SKIP + ")");
+    return;
+  }
   const base = await makeBase("sdk-errors");
   const marker = path.join(base, "driver-loaded");
   const incompatible = path.join(base, "incompatible");
