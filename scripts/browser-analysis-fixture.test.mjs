@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { copyFile, lstat, mkdtemp, readFile, rm } from "node:fs/promises";
+import { copyFile, lstat, mkdir, mkdtemp, readFile, rm, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { test } from "node:test";
@@ -29,10 +29,15 @@ function compiler(mode, root, error) {
   return result.stdout;
 }
 
-async function stagedFixture(context) {
+async function temporaryRoot(context) {
   const root = await mkdtemp(join(tmpdir(), "titan browser fixture "));
   context.after(() => rm(root, { recursive: true, force: true }));
-  await stageBrowserFixture(join(root, "sdk"), join(root, "providers"));
+  return root;
+}
+
+async function stagedFixture(context) {
+  const root = await temporaryRoot(context);
+  await stageBrowserFixture(root);
   return root;
 }
 
@@ -52,7 +57,29 @@ test("the browser fixture hashes cover the exact SDK, provider, source and notic
 test("the relocated Wasm fixture resolves the real SDK and explicit archive offline", async (context) => {
   const root = await stagedFixture(context);
   assert.match(compiler("verify", root), /validated browser semantic fixture/);
-  await assert.rejects(stageBrowserFixture(join(root, "sdk"), join(root, "providers")), { code: "EEXIST" });
+  await assert.rejects(stageBrowserFixture(root), { code: "EEXIST" });
+});
+
+test("fixture staging refuses a protected SDK even before it contains browser assets", async (context) => {
+  const shared = await temporaryRoot(context);
+  const previous = process.env.TITAN_PREFIX;
+  context.after(() => {
+    if (previous === undefined) delete process.env.TITAN_PREFIX;
+    else process.env.TITAN_PREFIX = previous;
+  });
+  process.env.TITAN_PREFIX = shared;
+  await assert.rejects(stageBrowserFixture(shared), /fixture root is not disposable/);
+  await assert.rejects(lstat(join(shared, "sdk")), { code: "ENOENT" });
+});
+
+test("fixture staging cannot create files through an interior directory link", async (context) => {
+  const root = await temporaryRoot(context);
+  const shared = await temporaryRoot(context);
+  await mkdir(join(root, "sdk"));
+  await symlink(shared, join(root, "sdk", "lib"),
+    process.platform === "win32" ? "junction" : "dir");
+  await assert.rejects(stageBrowserFixture(root), /fixture destination is not an owned directory/);
+  await assert.rejects(lstat(join(shared, "titan-browser")), { code: "ENOENT" });
 });
 
 test("browser SDK admission rejects a missing descriptor, not an absent import", async (context) => {
