@@ -13,6 +13,9 @@ local content_identity = import "server.content_identity"
 local compiler_io = import "server.compiler_io"
 local compiler_scheduler = import "server.compiler_scheduler"
 local embedded_interfaces = import "server.embedded_interfaces"
+local root_settings = import "server.root_settings"
+local selected_interfaces = import "server.selected_interfaces"
+local source_text = import "server.source_text"
 local wire = import "server.wire"
 local logging = import "server.logging"
 local completion_types = import "server.completion_types"
@@ -21,8 +24,6 @@ local documentation = import "server.documentation"
 local COMPILER_ABI = "2"
 local COMPILER_LANGUAGE_SERVER_API = 1
 local COMPILER_LANGUAGE_SERVER_API_MARKER = "LANGUAGE_SERVER_API_VERSION"
--- The 0.6 SDK layout names this archive under its library version directory.
-local SDK_PROVIDER_ARCHIVE = "lib/titan/0.6/titan.a"
 local PARSER_MODULE = "titan-compiler.parser"
 local CHECKER_MODULE = "titan-compiler.checker"
 local TYPES_MODULE = "titan-compiler.types"
@@ -484,7 +485,7 @@ record Compiler
   local types: {string: value}
   local driver: {string: value}
   local type_of: TypeOfFunction
-  local embedded_interface_provider: {string: value}
+  local interface_inventory: {string: value}?
   local embedded_provider_file: string
   local embedded_provider_identity: compiler_io.LstatIdentity
   local io: compiler_io.CompilerIO
@@ -496,9 +497,10 @@ record Compiler
   local cache_adapter: {string: value}?
   local completion_exports: {string: CompletionExport}
   local completion_binaries: {CompletionBinary}
-  -- True when embedded_interface_provider describes this executable's build
-  -- SDK. A selected SDK supplies none: its inventory comes from its own archive.
-  local const embedded_provider: boolean
+  -- An interface snapshot and a mapped-image identity are independent facts.
+  local const mapped_provider: boolean
+  local selected_prefix: string?
+  local snapshot_directory: string?
 end
 
 local function fail<|T|>(module_name: string, message: string): T
@@ -1094,10 +1096,10 @@ function Compiler:log_cache_stats()
 end
 
 local function load_with(require_function: RequireFunction,
-                         embedded_interface_provider: {string: value},
+                         interface_inventory: {string: value}?,
                          provider_file: string,
                          embedded_identity: compiler_io.LstatIdentity,
-                         embedded_provider: boolean): Compiler
+                         mapped_provider: boolean): Compiler
   local type_of = make_type_of()
   local parser = require_compiler_module(
     require_function, type_of, PARSER_MODULE)
@@ -1182,31 +1184,29 @@ local function load_with(require_function: RequireFunction,
 
   local baseline = capture_driver_configuration(driver)
   return Compiler.new(
-    parser, checker, types, driver, type_of, embedded_interface_provider,
+    parser, checker, types, driver, type_of, interface_inventory,
     provider_file,
     embedded_identity, compiler_io.create(),
     {}, CompilerConfiguration.new(), baseline, baseline, {}, nil, {}, {},
-    embedded_provider)
+    mapped_provider, nil, nil)
 end
 
--- The selected-SDK path names the same file the embedded provider's identity
--- stands for: the standard provider archive. Its stat tuple fences provider
--- selection just as the executable's identity fences the embedded inventory.
-local function archive_provider_identity(
+-- An ordinary selected file never uses the mapped application's identity.
+local function selected_file_identity(
     provider_file: string): compiler_io.LstatIdentity
   local metadata? = fs.stat(provider_file)
-  if metadata == nil then
+  if metadata == nil or metadata.kind ~= "file" then
     return fail<|compiler_io.LstatIdentity|>(DRIVER_MODULE,
       "selected compiler provider '" .. provider_file .. "' is missing")
   end
-  local actual = metadata as fs.Stat
+  local actual = metadata
   return compiler_io.LstatIdentity.new(
     provider_file, actual.size, actual.kind, actual.device, actual.inode,
     actual.modified_seconds, actual.modified_nanoseconds)
 end
 
 local function selected_provider_file(compiler_root: string): string
-  return paths.to_slash(paths.join(compiler_root, SDK_PROVIDER_ARCHIVE))
+  return paths.to_slash(paths.join(compiler_root, root_settings.provider_entry()))
 end
 
 -- One process hosts exactly one compiler. The worker selects an installed SDK
@@ -1214,9 +1214,65 @@ end
 -- every later load derives its provider mode from it.
 local selected_compiler_root: string? = nil
 
+local record SelectedSnapshot
+  const prefix: string
+  const driver: {string: value}
+  const identity: compiler_io.LstatIdentity
+  const inventory: {string: value}
+end
+
+local selected_snapshot: SelectedSnapshot? = nil
+
+local function physical_directory(path: string): string?
+  local stat? = fs.stat(path)
+  if stat == nil or stat.kind ~= "directory" then return nil end
+  local canonical = fs.realpath(path)
+  return source_text.normalize_absolute_path(canonical)
+end
+
+local function Compiler:read_selected_snapshot(prefix: string): {string: value}
+  local identity = self.embedded_provider_identity
+  local file = self.embedded_provider_file
+  if not compiler_io.same_lstat_identity(identity, selected_file_identity(file)) then
+    raise "selected provider changed before interface extraction"
+  end
+  local cached? = selected_snapshot
+  if cached ~= nil and cached.prefix == prefix and cached.driver == self.driver then
+    if not compiler_io.same_lstat_identity(cached.identity, identity) then
+      raise "selected provider changed; restart the language server"
+    end
+    return cached.inventory
+  end
+  local started = logging.wall_clock()
+  local inventory = selected_interfaces.read(prefix, file)
+  if not compiler_io.same_lstat_identity(identity, selected_file_identity(file)) then
+    raise "selected provider changed during interface extraction"
+  end
+  selected_snapshot = SelectedSnapshot.new(prefix, self.driver, identity, inventory)
+  -- The cache entry is process-owned; only matching SDK search roots use it.
+  logging.emit("debug", "compiler.selected_interfaces", {
+    ["provider_file"] = file, ["wall_ms"] = logging.elapsed_wall_ms(started),
+  })
+  return inventory
+end
+
+local function Compiler:selected_inventory(): {string: value}?
+  local prefix? = self.selected_prefix
+  if prefix == nil or self.snapshot_directory == nil then return nil end
+  if self.configuration.binary_root ~= nil and
+     self.effective.binary_path ~= self.snapshot_directory then return nil end
+  return self:read_selected_snapshot(prefix)
+catch
+  if error is async.CancellationReason then raise end
+  raise BridgeError.new(DRIVER_MODULE, "Cannot read selected Titan standard interfaces from '" ..
+    self.embedded_provider_file .. "' (compiler_root '" .. self.selected_prefix ..
+    "'): " .. strings.tostring(error))
+end
+
 --- Select an installed SDK whose compiler Lua modules this process will load.
 function select_compiler_root(compiler_root: string?)
   selected_compiler_root = compiler_root
+  selected_snapshot = nil
 end
 
 --- Report the SDK prefix selected for this process, or nil for the build SDK.
@@ -1232,9 +1288,13 @@ function load(): Compiler
   local configured? = selected_compiler_root
   if configured ~= nil then
     local provider_file = selected_provider_file(configured)
-    return load_with(
-      lua.require, {}, provider_file,
-      archive_provider_identity(provider_file), false)
+    local compiler = load_with(
+      lua.require, nil, provider_file, selected_file_identity(provider_file), false)
+    if ffi.VSCODE_TITAN_WINDOWS ~= 0 then
+      compiler.selected_prefix = configured
+      compiler.snapshot_directory = physical_directory(paths.dirname(provider_file))
+    end
+    return compiler
   end
   local provider: {string: value} = {}
   local raw_identity: {string: value} = {}
@@ -1326,6 +1386,12 @@ function Compiler:configure(configuration: CompilerConfiguration)
   end
   local binary_path: value = self.baseline.binary_path
   if configuration.binary_root ~= nil then binary_path = configuration.binary_root end
+  local sdk_directory? = self.snapshot_directory
+  if sdk_directory ~= nil and configuration.binary_root ~= nil and
+     (configuration.binary_root == sdk_directory or
+      physical_directory(configuration.binary_root) == sdk_directory) then
+    binary_path = sdk_directory
+  end
   local includes: {integer: value} = {}
   if configuration.include_roots ~= nil then
     for index = 1, #configuration.include_roots do
@@ -1382,12 +1448,12 @@ local function Compiler:new_context(supplied: {string: value}?): value
   local options: {string: value} = {}
   if supplied ~= nil then options = supplied end
   options["io"] = self.io
-  if self.embedded_provider then
-    options["embedded_interface_provider"] = self.embedded_interface_provider
-  else
-    -- The embedded inventory describes this executable's build SDK, never the
-    -- selected one. Parse the selected SDK's static archive instead, which
-    -- reads metadata without running another build's native provider code.
+  local inventory? = self.interface_inventory
+  if inventory == nil then inventory = self:selected_inventory() end
+  if inventory ~= nil then
+    options["embedded_interface_provider"] = inventory
+  elseif self.selected_prefix == nil then
+    -- Unix selected SDKs continue to resolve passive static archives.
     options["prefer_static"] = true
   end
   if self.cache_adapter ~= nil then options["cache_adapter"] = self.cache_adapter end
@@ -4270,11 +4336,8 @@ end
 
 local function validate_embedded_provider_baseline(
     compiler: Compiler): compiler_io.LstatIdentity
-  if not compiler.embedded_provider then
-    -- A selected SDK's provider is its standard-library archive. Re-observe
-    -- the same stat tuple so a reinstalled prefix cannot keep a stale resolver
-    -- inventory inside a running worker.
-    local observed = archive_provider_identity(compiler.embedded_provider_file)
+  if not compiler.mapped_provider then
+    local observed = selected_file_identity(compiler.embedded_provider_file)
     if not compiler_io.same_lstat_identity(
         compiler.embedded_provider_identity, observed) then
       raise BridgeError.new(
@@ -4303,6 +4366,9 @@ end
 function Compiler:installed_binary_modules_root(): string
   local permit = compiler_scheduler.acquire()
   defer permit:release()
+  if self.selected_prefix ~= nil and self.snapshot_directory ~= nil then
+    return self.snapshot_directory
+  end
 
   local context = self:new_context(nil)
   defer close_context(self, context)
@@ -5583,7 +5649,7 @@ end
   end
   -- This image owns the complete static provider and embedded target/interface
   -- inventory, including libraries not linked by application declarations.
-  if self.embedded_provider then
+  if self.mapped_provider then
     output:write(fingerprint(self.embedded_provider_file))
   else
     -- A selected SDK's provider archive is far larger than this executable and

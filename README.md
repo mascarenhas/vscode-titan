@@ -588,6 +588,14 @@ a DLL application and a controlled shared Lua DLL. The extension looks for
 [Windows builds](docs/native-build.md#experimental-windows-build) for setup,
 validation gates and limitations.
 
+A trusted root's `compiler_root` selects the Windows SDK's compiler and
+standard interfaces. The selected SDK must include `bin/lua.exe` and
+`lib/titan/0.6/titan.dll`; an incomplete or incompatible installation fails
+that root, without using the extension's default SDK instead. The language
+server keeps its own runtime DLLs. See
+[selected SDK behavior](docs/server-data-flow.md#compiler-compatibility)
+for the source-overlap and explicit binary-root rules.
+
 Windows source paths must be fully qualified drive paths (`C:/project`,
 including a mapped share such as `W:/project`) or UNC paths
 (`//server/share/project`). Drive-relative, current-drive-rooted and device

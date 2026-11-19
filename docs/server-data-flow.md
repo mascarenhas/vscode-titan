@@ -85,22 +85,26 @@ project-entry codecs. `AGENTS.md` states the rule for keeping the API version
 at `1`.
 
 The check is the same for the executable's build SDK and for a root's selected
-SDK, so a mismatch is a root-scoped error naming the prefix. The bridge records
-which provider mode it loaded (`Compiler.embedded_provider`). A selected SDK
-supplies no embedded interface inventory — that inventory describes the build
-SDK — so the resolver parses the selected installation's `lib/titan/0.6/titan.a`
-(`prefer_static`) and never loads another build's native provider. Its cache
-compatibility fingerprints that archive by stat identity instead of content, and
-revalidates the archive on every analysis attempt. Residual risk: the `titan`
-support table comes from this executable's build, so an SDK whose compiler calls
-a support function this build lacks fails that root with a clear error; running
-a server built from a matching SDK fixes it.
+SDK, so a mismatch is a root-scoped error naming the prefix. A selected Unix
+SDK uses its ordinary static archive (`prefer_static`). A selected Windows
+SDK uses `Compiler:selected_inventory` in `src/server/compiler_bridge.titan`
+to query `lib/titan/0.6/titan.dll` in a separate interpreter, once per worker.
+The resolver receives the interface inventory without the build SDK's C
+profile. The selected DLL is reobserved as an ordinary file, not as the
+server's mapped provider. An explicitly different `binary_modules_root`
+keeps ordinary filesystem lookup. If project source overlaps the inventory,
+the compiler rejects the whole inventory and may inspect that SDK's DLL
+through ordinary lookup. The DLL then stays mapped until worker exit; the
+worker's own native runtime never changes.
 
-`scripts/generate-embedded-interfaces.lua` accepts two exact standard-module
-inventories: the published 0.6 SDK's original 23 modules, or the current master
-SDK's 26, which add `titan.protobuf`, `titan.thread` and `titan.transfer`.
-`EXPECTED_MODULES` and `validate_inventory` define the reviewed sets; partial
-additional groups and unexpected modules are rejected.
+The compiler's `titan` support table in the worker still comes from this
+executable. If the selected compiler requires a newer support function,
+that root fails; use a server built from a matching SDK.
+
+`inventory.validate` in `scripts/standard-interface-inventory.lua` accepts
+the original 23 modules or all 26, including `titan.protobuf`, `titan.thread`
+and `titan.transfer`. Partial additional groups and unexpected modules are
+rejected.
 
 On Unix, the script generates the embedded metadata-only interface provider
 from the SDK's `lib/titan/0.6/titan.a`, including the build target's C type

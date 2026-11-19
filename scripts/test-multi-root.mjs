@@ -3,6 +3,7 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import {
+  copyFile,
   lstat,
   mkdir,
   mkdtemp,
@@ -17,6 +18,7 @@ import {
 import * as os from "node:os";
 import { stripTypeScriptTypes } from "node:module";
 import * as path from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { pathToFileURL } from "node:url";
 import {
   FrameReader,
@@ -357,10 +359,8 @@ async function exists(filename) {
   }
 }
 
-// Every file of an installed SDK is a symlink to the session SDK; the files a
-// case changes are copied so the session SDK stays immutable.
-// Only the trees an installed SDK's compiler reads are farmed; the case copies
-// the few files it changes so the session SDK stays immutable.
+// Keep the session SDK immutable. Copy only the files that must physically
+// belong to a selected SDK or that a test is going to change.
 const SDK_FARM_DIRECTORIES = ["share", "lib", "include", "src"];
 
 async function farmDirectory(source, target) {
@@ -388,6 +388,18 @@ async function farmSdk(source, target) {
     } else {
       await symlink(from, path.join(target, name));
     }
+  }
+  if (process.platform === "win32") {
+    const bin = path.join(target, "bin");
+    await mkdir(bin);
+    for (const name of await readdir(path.join(source, "bin"))) {
+      if (name === "lua.exe" || name.endsWith(".dll")) {
+        await copyFile(path.join(source, "bin", name), path.join(bin, name));
+      }
+    }
+    const dll = path.join(target, "lib", "titan", "0.6", "titan.dll");
+    await assertFarmedFile(target, dll);
+    await replaceWithCopy(dll);
   }
 }
 
@@ -752,14 +764,56 @@ async function testLazyDiscovery() {
   }
 }
 
-// A selected root's compiler_root is honoured only when the bridge can load
-// that SDK's provider. The Unix SDK carries the `titan.a` archive provider the
-// bridge loads in archive mode; a Windows SDK carries `titan.dll`, and loading
-// a selected provider in dynamic mode is not implemented.
-const PER_ROOT_SDK_SKIP =
-  "compiler_bridge loads the selected SDK's titan.a archive provider and " +
-  "Windows SDKs ship titan.dll; per-root compiler_root needs a dynamic " +
-  "provider mode (vscode-titan#136)";
+function sdkDescriptor(root, module) {
+  const db = new DatabaseSync(path.join(root, ".titan-ls", "index.sqlite3"), {
+    readOnly: true
+  });
+  try {
+    const row = db.prepare(
+      "SELECT provenance, main_file FROM completion_descriptors WHERE module_name=?"
+    ).get(Buffer.from(module));
+    assert.ok(row, `no saved descriptor for ${module}: ${root}`);
+    return { provenance: row.provenance, file: Buffer.from(row.main_file).toString("utf8") };
+  } finally {
+    db.close();
+  }
+}
+
+function extractionRecords(session) {
+  const stderr = session.stderr().toString("utf8");
+  const complete = stderr.slice(0, stderr.lastIndexOf("\n") + 1);
+  return structuredLogRecords(Buffer.from(complete)).filter(
+    (record) => record.event === "compiler.selected_interfaces");
+}
+
+async function assertSelectedSdkUsesProvider(session, project, source, provider) {
+  await pullDiagnostics(session, uri(source));
+  const json = sdkDescriptor(project, "titan.json");
+  assert.ok(samePath(json.file, provider), `selected titan.json came from ${json.file}`);
+  const sibling = sdkDescriptor(project, "titan.math");
+  assert.ok(samePath(sibling.file, provider), `selected sibling came from ${sibling.file}`);
+  for (const symbol of ["encode", "tripled"]) {
+    await pollCompletion(session, source, positionOf(SDK_SOURCE, symbol),
+      "repeated selected-compiler completion");
+  }
+  for (let iteration = 0; iteration < 2; iteration++) {
+    const rename = await session.result("textDocument/rename", {
+      textDocument: { uri: uri(source) },
+      position: positionOf(SDK_SOURCE, "tripled"),
+      newName: "scaled"
+    });
+    assert.ok(rename.documentChanges?.length > 0 || Object.keys(rename.changes ?? {}).length > 0);
+  }
+  const records = extractionRecords(session);
+  assert.equal(records.length, 1,
+    "indexing, private completion and rename did not share one selected DLL inventory");
+  const [record] = records;
+  assert.ok(samePath(record.provider_file, provider), `extracted ${record.provider_file}`);
+  assert.ok(Number.isFinite(record.wall_ms) && record.wall_ms >= 0);
+  const worker = rootEntry(await session.status(), project);
+  console.log(`multi-root: selected SDK worker ${worker.workerPid} read ${provider}` +
+    ` once in ${record.wall_ms} ms`);
+}
 
 async function testSecondSdk() {
   const base = await makeBase("sdk");
@@ -779,15 +833,12 @@ async function testSecondSdk() {
   const farmedParent = await lstat(path.dirname(farmedProvider));
   assert.equal(farmedParent.isSymbolicLink(), false,
     "the SDK farm must not alias the session SDK");
-  if (process.platform === "win32") {
-    console.log("multi-root: kept the farmed provider DLL " +
-      "(Windows has no unused dynamic provider)");
-  } else {
+  if (process.platform !== "win32") {
     await assertFarmedFile(sdk, farmedProvider);
     await rm(farmedProvider, { force: true });
     await writeFile(farmedProvider, "not a loadable provider object\n", "utf8");
   }
-  const session = new Session(launch(defaultRoot, "error"));
+  const session = new Session(launch(defaultRoot, "trace"));
   try {
     await session.initialize({
       workspaceFolders: [
@@ -812,13 +863,13 @@ async function testSecondSdk() {
       rootEntry(roots, sdkRootDir).workerPid,
       "the selected SDK shared an unselected worker");
 
-    // The selected worker runs the second SDK's own compiler and archive.
+    // The selected worker runs the second SDK's own compiler and interfaces.
     await pollHover(session, sdkSource, SDK_SOURCE, "tripled", /integer/,
       "the selected SDK root");
     await pollHover(session, defaultSource, ROOT_A_SOURCE, "doubled", /integer/,
       "the default SDK root");
     // `encoded` returns what `json.encode` declares, so its hover type proves
-    // the standard library resolved from the selected SDK's own archive.
+    // the standard library resolved with the selected SDK.
     await pollHover(session, sdkSource, SDK_SOURCE, "encoded", /string/,
       "the selected SDK standard library");
     assert.ok(await exists(path.join(sdkRootDir, ".titan-ls", "index.sqlite3")),
@@ -826,9 +877,33 @@ async function testSecondSdk() {
     assert.equal(await exists(path.join(sdk, ".titan-ls")), false,
       "a worker wrote a cache inside the read-only SDK prefix");
 
+    if (process.platform === "win32") {
+      await assertSelectedSdkUsesProvider(session, sdkRootDir, sdkSource, farmedProvider);
+      const generation = rootEntry(await session.status(), sdkRootDir).generation;
+      // This DLL is a regular copy in a new farm, never the session SDK.
+      assert.ok((await lstat(farmedProvider)).isFile());
+      await writeFile(farmedProvider, "not a Windows PE image\n", "utf8");
+      session.notify("workspace/didChangeConfiguration", {});
+      const failure = await pollFailure(session, "textDocument/hover", {
+        textDocument: { uri: uri(sdkSource) },
+        position: positionOf(SDK_SOURCE, "encoded")
+      }, "the invalid selected DLL");
+      assert.equal(failure.code, -32803);
+      assert.ok(failure.message.includes(serverPath(farmedProvider)), failure.message);
+      assert.match(failure.message, /Cannot read selected Titan standard interfaces/);
+      assert.equal(rootEntry(await session.status(), defaultRoot).workerPid,
+        rootEntry(roots, defaultRoot).workerPid);
+      await copyFile(path.join(sdkRoot(), "lib", "titan", "0.6", "titan.dll"), farmedProvider);
+      session.notify("workspace/didChangeConfiguration", {});
+      await pollHover(session, sdkSource, SDK_SOURCE, "encoded", /string/,
+        "the repaired selected DLL");
+      assert.ok(rootEntry(await session.status(), sdkRootDir).generation > generation);
+    }
+
     // A configuration reload that leaves the effective selection alone must
     // not restart anything.
-    const generated = new Map(roots.map((entry) => [serverPath(entry.root), entry.generation]));
+    const generated = new Map((await session.status())
+      .map((entry) => [serverPath(entry.root), entry.generation]));
     const localOverride = path.join(sdkRootDir, "titan-config.local.lua");
     await writeFile(localOverride, `compiler_root = ${luaString(sdk)}\n`, "utf8");
     session.notify("workspace/didChangeConfiguration", { settings: {} });
@@ -917,11 +992,87 @@ async function testSecondSdk() {
     const recovered = await pollStatus(session, (entries) => {
       const entry = findRoot(entries, sdkRootDir);
       return entry?.state === "ready" &&
-        entry.compilerRoot === path.normalize(sdk)
+        samePath(entry.compilerRoot, sdk)
         ? { accepted: entries }
         : { rejected: entries };
     }, "the root did not recover after the broken override was removed");
     assert.ok(recovered);
+    await session.shutdown();
+  } finally {
+    await session.abort();
+  }
+}
+
+async function testSelectedProviderOverlap() {
+  const base = await makeBase("sdk-overlap");
+  const sdk = path.join(base, "selected sdk é");
+  await farmSdk(sdkRoot(), sdk);
+  const native = process.platform === "win32" ? "titan.dll" : "titan.a";
+  const provider = path.join(sdk, "lib", "titan", "0.6", native);
+  const project = path.join(base, "overlap");
+  const projectSource = [
+    'local math = import "titan.math"',
+    'local private_math = import "titan.math.titan"',
+    'local json = import "titan.json"',
+    "function local_math(): integer",
+    "  return math.special_answer() + private_math.secret_value()",
+    "end",
+    "function encoded(): string return json.encode(local_math()) end",
+    ""
+  ].join("\n");
+  const main = await writeRoot(project, projectSource,
+    `${ROOT_CONFIG}compiler_root = ${luaString(sdk)}\n`);
+  const mathSource = path.join(project, "src", "titan", "math.titan");
+  await mkdir(path.dirname(mathSource), { recursive: true });
+  await writeFile(mathSource,
+    "function special_answer(): integer return 7 end\n" +
+    "local function secret_value(): integer return 4 end\n", "utf8");
+
+  const override = path.join(base, "override");
+  const customProviderRoot = path.join(base, "providers");
+  await mkdir(customProviderRoot);
+  const customProvider = path.join(customProviderRoot, native);
+  await copyFile(provider, customProvider);
+  const overrideSource = await writeRoot(override, SDK_SOURCE,
+    `${ROOT_CONFIG}compiler_root = ${luaString(sdk)}\n` +
+    `binary_modules_root = ${luaString(customProviderRoot)}\n`);
+  const session = new Session(launch(project, "trace"));
+  try {
+    await session.initialize({
+      workspaceFolders: [
+        { uri: uri(project), name: "overlap" },
+        { uri: uri(override), name: "override" }
+      ],
+      initializationOptions: { trustedRoots: [base] }
+    });
+    session.notify("initialized", {});
+    await pollHover(session, main, projectSource, "special_answer", /integer/,
+      "the overlapping project declaration");
+    await pollHover(session, main, projectSource, "secret_value", /integer/,
+      "the overlapping explicit source import");
+    const definition = await session.result("textDocument/definition", {
+      textDocument: { uri: uri(main) },
+      position: positionOf(projectSource, "special_answer")
+    });
+    assert.equal(definition?.uri, uri(mathSource));
+    await pollHover(session, main, projectSource, "encode", /string/,
+      "the selected SDK's ordinary disk fallback");
+    await pullDiagnostics(session, uri(main));
+    const fallback = sdkDescriptor(project, "titan.json");
+    const fallbackFile = process.platform === "win32" ? provider :
+      path.join(path.dirname(provider), "titan.so");
+    assert.equal(fallback.provenance, "dynamic");
+    assert.ok(samePath(fallback.file, fallbackFile), `overlap fell back to ${fallback.file}`);
+    assert.equal(sdkDescriptor(project, "titan.math").provenance, "project");
+    await pollHover(session, overrideSource, SDK_SOURCE, "encoded", /string/,
+      "an explicit different SDK binary search root");
+    await pullDiagnostics(session, uri(overrideSource));
+    const explicit = sdkDescriptor(override, "titan.json");
+    assert.ok(samePath(explicit.file, customProvider), `explicit root fell back to ${explicit.file}`);
+    if (process.platform === "win32") {
+      assert.equal(extractionRecords(session).filter((record) => samePath(record.provider_file, provider)).length,
+        1, "the explicit binary root invoked the selected SDK's inventory query");
+    }
     await session.shutdown();
   } finally {
     await session.abort();
@@ -2821,18 +2972,14 @@ async function testAggregateCountedProgress() {
 // session SDK, and one workspace folder is reached through a link.
 const SYMLINK_GROUPS = new Set(["sdk", "sdk-errors", "overlays", "shutdown-restart"]);
 
-// Cases that cannot run on one platform report it here, so the runner counts
-// them as skipped and never prints them as passed.
-const WINDOWS_SKIPS = new Map([
-  ["sdk", PER_ROOT_SDK_SKIP],
-  ["sdk-errors", PER_ROOT_SDK_SKIP]
-]);
-
 const groups = [
   ["independent", testIndependentRoots, "independent roots"],
   ["folders", testFolderChanges, "folder changes"],
   ["discovery", testLazyDiscovery, "lazy discovery"],
-  ["sdk", testSecondSdk, "second SDK"],
+  ["sdk", async () => {
+    await testSecondSdk();
+    await testSelectedProviderOverlap();
+  }, "second SDK"],
   ["sdk-errors", testRootScopedSdkErrors, "root-scoped SDK errors"],
   ["crash", testWorkerCrashAndOverlay, "crash and overlay replay"],
   ["cap", testCapAndIdleEviction, "worker cap and idle eviction"],
@@ -2867,10 +3014,6 @@ async function main() {
   const symlinks = await symlinksUsable();
   for (const [name, run, label] of groups) {
     if (only !== undefined && only !== name) continue;
-    if (process.platform === "win32" && WINDOWS_SKIPS.has(name)) {
-      console.log(`multi-root: ${label} skipped (${WINDOWS_SKIPS.get(name)})`);
-      continue;
-    }
     if (!symlinks && SYMLINK_GROUPS.has(name)) {
       console.log(`multi-root: ${label} skipped ` +
         "(this account has no usable symbolic links)");
