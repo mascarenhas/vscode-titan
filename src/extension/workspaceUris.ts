@@ -1,5 +1,6 @@
 import * as vscode from "vscode";
 import type { LanguageClientOptions } from "vscode-languageclient/node";
+import { relativeWorkspaceUriPath, workspaceRootPath } from "./uriPaths";
 
 const TITAN_DOCUMENT_GLOB = "**/*.titan";
 
@@ -31,8 +32,8 @@ export function createWorkspaceUriConverters(
 ): NonNullable<LanguageClientOptions["uriConverters"]> {
   const workspaceScheme = folder.uri.scheme;
   const workspaceAuthority = folder.uri.authority;
-  const lexicalRoot = normalizedRootUri(folder.uri);
-  const physicalRoot = normalizedRootUri(vscode.Uri.file(physicalWorkspaceRoot));
+  const lexicalRoot = folder.uri;
+  const physicalRoot = vscode.Uri.file(physicalWorkspaceRoot);
 
   return {
     code2Protocol: (uri) => {
@@ -101,40 +102,21 @@ export function createWorkspaceMiddleware(
   };
 }
 
-function normalizedRootUri(uri: vscode.Uri): vscode.Uri {
-  let rootPath = uri.path;
-  while (rootPath.length > 1 && rootPath.endsWith("/")) {
-    rootPath = rootPath.slice(0, -1);
-  }
-  return uri.with({ path: rootPath, query: "", fragment: "" });
-}
-
 function mapUriRoot(
   uri: vscode.Uri,
   sourceRoot: vscode.Uri,
   targetRoot: vscode.Uri
 ): vscode.Uri | undefined {
-  if (uri.scheme !== sourceRoot.scheme ||
-      uri.authority !== sourceRoot.authority) {
+  const relativePath = relativeWorkspaceUriPath(sourceRoot, uri);
+  if (relativePath === undefined) {
     return undefined;
   }
-
-  let relativePath: string;
-  if (uri.path === sourceRoot.path) {
-    relativePath = "";
-  } else {
-    const prefix = sourceRoot.path === "/" ? "/" : `${sourceRoot.path}/`;
-    if (!uri.path.startsWith(prefix)) {
-      return undefined;
-    }
-    relativePath = uri.path.slice(prefix.length);
-  }
-
+  const rootPath = workspaceRootPath(targetRoot.path);
   const targetPath = relativePath.length === 0
-    ? targetRoot.path
-    : targetRoot.path === "/"
+    ? rootPath
+    : rootPath === "/"
       ? `/${relativePath}`
-      : `${targetRoot.path}/${relativePath}`;
+      : `${rootPath}/${relativePath}`;
   return targetRoot.with({
     path: targetPath,
     query: uri.query,

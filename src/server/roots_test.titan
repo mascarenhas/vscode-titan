@@ -2,6 +2,8 @@ foreign import "compiler_io_platform.h"
 local fs = import "fs"
 local test = import "test"
 local roots = import "server.roots.titan"
+local source_text = import "server.source_text"
+local strings = import "string"
 local test_links = import "server.test_links"
 local test_paths = import "server.test_paths"
 local test_runtime = import "server.test_runtime"
@@ -85,6 +87,35 @@ end
 
 function test_roots_route_to_the_most_specific_root(_context: test.Context)
   with_tree(run_most_specific)
+end
+
+function test_roots_route_mixed_case_windows_drive_uris(_context: test.Context)
+  if ffi.VSCODE_TITAN_WINDOWS == 0 then test.skip("native Windows paths") end
+  with_tree(function (base: string)
+    local expected = roots.canonical(base .. "/outer")
+    local upper_uri: string = source_text.path_to_file_uri(expected)
+    local drive = strings.sub(upper_uri, 9, 9)
+    local lower_uri = strings.sub(upper_uri, 1, 8) ..
+      strings.lower(drive) .. "%3A" .. strings.sub(upper_uri, 11)
+    test.assert(lower_uri ~= upper_uri and
+                strings.lower(drive) ~= drive,
+                "fixture must exercise a mixed-case drive")
+    local registry = roots.create()
+    local root_path: string = source_text.file_uri_to_path(lower_uri)
+    local document_path: string = source_text.file_uri_to_path(
+      upper_uri .. "/src/NewFile.titan")
+    registry:add_folder(roots.canonical(root_path))
+    local document = roots.canonical(document_path)
+    test.assert(document == expected .. "/src/NewFile.titan",
+                "canonicalization changed the path suffix")
+    test.assert(describe(registry:owner(document)) == expected,
+                "a document spelled with the opposite drive case lost its root")
+    local removed_path: string = source_text.file_uri_to_path(upper_uri)
+    test.assert(registry:remove_folder(roots.canonical(removed_path)),
+                "the equivalent folder spelling did not release the root")
+    test.assert(registry:owner(document) == nil,
+                "the released folder still owns the document")
+  end)
 end
 
 local function run_folder_claims(base: string)

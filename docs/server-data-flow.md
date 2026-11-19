@@ -33,8 +33,15 @@ re-add (`Router:remove_root`), so only idle eviction or the worker cap stops it.
 edit that leaves the effective selection alone restarts nothing, because the
 worker rescans it.
 
-The extension translates remote and symlinked workspace URIs at the protocol
-boundary (`src/extension/workspaceUris.ts`).
+The extension maps symlinked workspace roots and their documents to physical
+paths on the wire and maps returned locations back to the editor's workspace
+spelling (`src/extension/workspaceUris.ts`). On Windows, the mapper compares
+only the drive letter case-insensitively in local file URIs. The same rule
+applies when finding nested workspace clients. On the server,
+`source_text.file_uri_to_path` normalizes the drive and separators before the
+router resolves physical paths and uses them for root and document ownership.
+The remainder of each path is case-sensitive.
+Remote workspace URIs are translated at the same protocol boundary.
 
 Completion has a separate [unsaved input and TEMP publication path](completion.md).
 Its dependency baseline is the committed saved publication. The saved-file

@@ -34,6 +34,7 @@ import {
   createWorkspaceMiddleware,
   createWorkspaceUriConverters
 } from "./workspaceUris";
+import { relativeWorkspaceUriPath } from "./uriPaths";
 
 const LANGUAGE_SERVER_CONFIGURATION_SECTION = "titan.languageServer";
 const COMPILER_CONFIGURATION_SECTION = "titan.compiler";
@@ -527,11 +528,8 @@ function diagnosticCollectionName(folder: vscode.WorkspaceFolder): string {
 }
 
 function isNestedWorkspace(ancestor: vscode.Uri, candidate: vscode.Uri): boolean {
-  const rootPath = ancestor.path.replace(/\/+$/, "");
-  return ancestor.scheme === candidate.scheme &&
-    ancestor.authority === candidate.authority &&
-    candidate.path.startsWith(`${rootPath}/`) &&
-    candidate.path.replace(/\/+$/, "") !== rootPath;
+  const relative = relativeWorkspaceUriPath(ancestor, candidate);
+  return relative !== undefined && relative !== "";
 }
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
