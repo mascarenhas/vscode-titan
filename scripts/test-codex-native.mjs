@@ -17,14 +17,16 @@ const repositoryRoot = path.resolve(
 );
 const server = path.resolve(serverArgument);
 const projectRoot = repositoryRoot;
-const relativeSourceFile = path.join("src", "server", "application.titan");
+const relativeSourceFile = path.join(
+  "src", "server", "application", "indexing_lifecycle.titan"
+);
 const sourceFile = path.join(projectRoot, relativeSourceFile);
 const sourceLines = (await readFile(sourceFile, "utf8")).split("\n");
 const callLine = sourceLines.findIndex((line) => line.includes("service:latest()"));
 assert.ok(callLine >= 0, "workspace fixture has no Service:latest call");
 const callCharacter = sourceLines[callLine].indexOf("latest") + 1;
 const declarationFile = path.join(
-  projectRoot, "src", "server", "project_service.titan"
+  projectRoot, "src", "server", "project_service", "project_service.titan"
 );
 const declarationLines = (await readFile(declarationFile, "utf8")).split("\n");
 const declarationLine = declarationLines.findIndex((line) =>
