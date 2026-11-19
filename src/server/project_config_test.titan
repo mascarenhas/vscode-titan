@@ -1,6 +1,7 @@
 foreign import "compiler_io_platform.h"
 local test_paths = import "server.test_paths"
 local fs = import "fs"
+local lua = import "lua"
 local test = import "test"
 local strings = import "string"
 local config = import "server.project_config.titan"
@@ -264,5 +265,53 @@ function test_project_config_native_windows_absolute_roots(context: test.Context
                 "configured UNC root changed its established identity")
     test.assert(config.configuration_path("//server/share") == "//server/share/titan-config.lua",
                 "UNC config lookup lost its share root")
+  end)
+end
+
+function test_project_config_observes_provider_alias_without_changing_its_path(_: test.Context)
+  if ffi.VSCODE_TITAN_WINDOWS ~= 0 then
+    test.skip("native Windows alias traversal is covered by the elevated SDK transcript")
+  end
+  test_runtime.run(function ()
+    with_temporary_project(function (temporary: string)
+      local root = test_paths.canonical_path(temporary)
+      local sdk = root .. "/sdk"
+      local empty = root .. "/empty"
+      local alias = root .. "/providers"
+      local filename = root .. "/titan-config.lua"
+      fs.mkdir(sdk)
+      defer fs.rmdir(sdk)
+      fs.mkdir(empty)
+      defer fs.rmdir(empty)
+      fs.write_file(filename, 'binary_modules_root = "./providers"\n')
+      defer fs.unlink(filename)
+      local link = lua.load([[
+        return function(source, alias) assert(require("lfs").link(source, alias, true)) end
+      ]], "=provider-alias-fixture", nil)() as function (string, string): ()
+      local selection = function (expected: boolean): string
+        local settings?, failure? = config.load(root, sdk, sdk)
+        test.assert(settings ~= nil and failure == nil, "could not load the aliased provider configuration")
+        test.assert(settings.binary_modules_root == alias)
+        test.assert(settings.use_selected_inventory == expected)
+        local identity = settings:semantic_identity()
+        test.assert(settings:copy():semantic_identity() == identity)
+        return identity
+      end
+      local missing = selection(false)
+      link(sdk, alias)
+      defer do
+        if fs.lstat(alias) ~= nil then fs.unlink(alias) end
+      end
+      local selected = selection(true)
+      test.assert(missing ~= selected)
+      fs.unlink(alias)
+      link(empty, alias)
+      test.assert(selection(false) == missing)
+      fs.unlink(alias)
+      link(sdk, alias)
+      test.assert(selection(true) == selected)
+      fs.unlink(alias)
+      test.assert(selection(false) == missing)
+    end)
   end)
 end

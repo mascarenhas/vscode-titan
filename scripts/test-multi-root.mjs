@@ -1149,6 +1149,11 @@ async function testSelectedProviderAliasRetarget() {
     await linkDirectory(sdkProviders, alias);
     assert.deepEqual((await pullDiagnostics(session, uri(source))).items, []);
     assert.ok(samePath(sdkDescriptor(project, "titan.json").file, provider));
+    await rm(alias);
+    assert.match(JSON.stringify((await pullDiagnostics(session, uri(source))).items),
+      /module 'titan\.json' not found/, "removing the alias retained a saved import");
+    await linkDirectory(sdkProviders, alias);
+    assert.deepEqual((await pullDiagnostics(session, uri(source))).items, []);
     const recovered = rootEntry(await session.status(), project);
     assert.equal(recovered.workerPid, running.workerPid);
     assert.equal(recovered.generation, running.generation);
@@ -1157,6 +1162,106 @@ async function testSelectedProviderAliasRetarget() {
     await session.shutdown();
   } finally {
     await session.abort();
+  }
+}
+
+async function testSelectedProviderAliasCatalog() {
+  const base = await makeBase("sdk-alias-catalog");
+  const sdk = path.join(base, "sdk");
+  await farmSdk(sdkRoot(), sdk);
+  const selected = path.join(sdk, "lib", "titan", "0.6");
+  const provider = path.join(selected, "titan.dll");
+  const empty = path.join(base, "empty");
+  await mkdir(empty);
+  const project = path.join(base, "project");
+  const alias = path.join(project, "providers");
+  const settings = `${ROOT_CONFIG}compiler_root = ${luaString(sdk)}\n` +
+    'binary_modules_root = "./providers"\n';
+  const source = await writeRoot(project, ROOT_A_SOURCE, settings);
+  await writeFile(path.join(project, "src", "helper.titan"), "function helper(): integer return 42 end\n");
+  const overlay = 'local candidate = import ""\n';
+  const position = endOfToken(overlay, 'import "');
+
+  async function retarget(next) {
+    await rm(alias, { force: true });
+    if (next !== null) await linkDirectory(next, alias);
+  }
+  async function assertCatalog(session, enabled, label) {
+    // Pull explicitly goes through a saved refresh. The source and tracked
+    // configuration are untouched and no external importer can cause work.
+    assert.deepEqual((await pullDiagnostics(session, uri(source))).items, [], label);
+    const db = new DatabaseSync(path.join(project, ".titan-ls", "index.sqlite3"), { readOnly: true });
+    try {
+      assert.equal(db.prepare("SELECT count(*) AS total FROM external_observations").get().total, 0,
+        `${label}: the fixture must not have external fingerprints`);
+      const rows = db.prepare(
+        "SELECT main_file FROM completion_descriptors WHERE provenance='embedded'"
+      ).all();
+      if (enabled) {
+        assert.ok([23, 26].includes(rows.length), `${label}: expected the full SDK catalog, got ${rows.length}`);
+        assert.ok(rows.every((row) => samePath(Buffer.from(row.main_file).toString("utf8"), provider)));
+      } else {
+        assert.equal(rows.length, 0, `${label}: stale saved SDK catalog`);
+      }
+    } finally {
+      db.close();
+    }
+    const items = await poll(`${label}: open-buffer catalog not published`, async () => {
+      const result = await session.result("textDocument/completion", {
+        textDocument: { uri: uri(source) }, position, context: { triggerKind: 1 }
+      });
+      const offered = result?.items ?? [];
+      return offered.some((item) => item.label === "helper") ? { accepted: offered } : { rejected: result };
+    });
+    assert.equal(items.some((item) => item.label === "titan.json"), enabled, label);
+    assert.equal(await readFile(path.join(project, "titan-config.lua"), "utf8"), settings, label);
+  }
+  async function withWorker(check) {
+    const session = new Session(launch(project, "debug"));
+    try {
+      await session.initialize({
+        workspaceFolders: [{ uri: uri(project), name: "selected SDK catalog" }],
+        initializationOptions: { trustedRoots: [base] }
+      });
+      session.notify("initialized", {});
+      const running = assertReady(await pollSettled(session, 1, "selected catalog worker"), project, "catalog root");
+      session.notify("textDocument/didOpen", {
+        textDocument: { uri: uri(source), languageId: "titan", version: 1, text: overlay }
+      });
+      await check(session, running);
+      await session.shutdown();
+    } catch (error) {
+      throw new Error(`${error.message}\n${session.stderr().toString("utf8").slice(-15000)}`, { cause: error });
+    } finally {
+      await session.abort();
+    }
+  }
+
+  const states = [selected, empty, selected, null, selected];
+  await retarget(selected);
+  await withWorker(async (session, running) => {
+    for (let index = 0; index < states.length; index++) {
+      const next = states[index];
+      if (index > 0) await retarget(next);
+      await assertCatalog(session, next === selected, `live alias state ${index}`);
+      const current = rootEntry(await session.status(), project);
+      assert.equal(current.workerPid, running.workerPid);
+      assert.equal(current.generation, running.generation);
+    }
+    assert.equal(extractionRecords(session).length, 1, "live alias changes reacquired the SDK snapshot");
+  });
+
+  // Change the physical alias while stopped, leaving the previous selection
+  // and its descriptors in SQLite. Each new worker must reject those rows
+  // before answering requests; a successful preceding live refresh cannot
+  // conceal a bad warm identity.
+  for (let index = 1; index < states.length; index++) {
+    const next = states[index];
+    await retarget(next);
+    await withWorker(async (session) => {
+      await assertCatalog(session, next === selected, `warm alias state ${index}`);
+      assert.equal(extractionRecords(session).length, next === selected ? 1 : 0);
+    });
   }
 }
 
@@ -3061,6 +3166,7 @@ const groups = [
     await testSecondSdk();
     await testSelectedProviderOverlap();
     if (process.platform === "win32") await testSelectedProviderAliasRetarget();
+    if (process.platform === "win32") await testSelectedProviderAliasCatalog();
   }, "second SDK"],
   ["sdk-errors", testRootScopedSdkErrors, "root-scoped SDK errors"],
   ["crash", testWorkerCrashAndOverlay, "crash and overlay replay"],

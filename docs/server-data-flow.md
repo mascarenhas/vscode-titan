@@ -92,10 +92,14 @@ to query `lib/titan/0.6/titan.dll` in a separate interpreter, once per worker.
 The resolver receives the interface inventory without the build SDK's C
 profile. The selected DLL is reobserved as an ordinary file, not as the
 server's mapped provider. An explicitly different `binary_modules_root`
-keeps ordinary filesystem lookup. Saved revalidation resolves directory
-aliases again without replacing the configured path. If project source
-overlaps the inventory, the compiler rejects the whole inventory and may
-inspect that SDK's DLL through ordinary lookup. The DLL stays mapped until
+keeps ordinary filesystem lookup. Every saved refresh resolves directory
+aliases without replacing the configured path. Whether the alias still
+names the SDK directory is part of the saved configuration and cache
+identities. A retarget or removal rechecks the project and replaces its
+completion catalog, even if no saved file imports the provider. Detached
+completion reads the catalog from the accepted saved generation. If project
+source overlaps the inventory, the compiler rejects it and may inspect that
+SDK's DLL through ordinary lookup. The DLL stays mapped until
 worker exit; the worker's own native runtime never changes.
 
 The default worker gets its bare `titan` compiler support table from the

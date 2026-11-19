@@ -14,6 +14,7 @@ local compiler_io = import "server.compiler_io"
 local compiler_scheduler = import "server.compiler_scheduler"
 local embedded_interfaces = import "server.embedded_interfaces"
 local root_settings = import "server.root_settings"
+local project_config = import "server.project_config"
 local selected_interfaces = import "server.selected_interfaces"
 local source_text = import "server.source_text"
 local wire = import "server.wire"
@@ -477,6 +478,18 @@ record CompilerConfiguration
   const binary_root: string?
   const include_roots: {string}?
   const cppflags: string?
+  const use_selected_inventory: boolean?
+end
+
+--- Translate one observed project configuration for saved compiler work.
+function project_configuration(config: project_config.ProjectConfig): CompilerConfiguration
+  return CompilerConfiguration {
+    source_roots = config.source_module_roots,
+    binary_root = config.binary_modules_root,
+    include_roots = config.extra_ffi_include_dirs,
+    cppflags = config.extra_ffi_cppflags,
+    use_selected_inventory = config.use_selected_inventory,
+  }
 end
 
 record Compiler
@@ -501,7 +514,6 @@ record Compiler
   local const mapped_provider: boolean
   local selected_prefix: string?
   local snapshot_directory: string?
-  local use_selected_inventory: boolean
 end
 
 local function fail<|T|>(module_name: string, message: string): T
@@ -1189,7 +1201,7 @@ local function load_with(require_function: RequireFunction,
     provider_file,
     embedded_identity, compiler_io.create(),
     {}, CompilerConfiguration.new(), baseline, baseline, {}, nil, {}, {},
-    mapped_provider, nil, nil, false)
+    mapped_provider, nil, nil)
 end
 
 -- An ordinary selected file never uses the mapped application's identity.
@@ -1224,13 +1236,6 @@ end
 
 local selected_snapshot: SelectedSnapshot? = nil
 
-local function physical_directory(path: string): string?
-  local stat? = fs.stat(path)
-  if stat == nil or stat.kind ~= "directory" then return nil end
-  local canonical = fs.realpath(path)
-  return source_text.normalize_absolute_path(canonical)
-end
-
 local function Compiler:read_selected_snapshot(prefix: string): {string: value}
   local identity = self.embedded_provider_identity
   local file = self.embedded_provider_file
@@ -1260,10 +1265,7 @@ end
 local function Compiler:selected_inventory(): {string: value}?
   local prefix? = self.selected_prefix
   if prefix == nil then return nil end
-  if self.snapshot_directory == nil then
-    raise "selected provider directory cannot be resolved"
-  end
-  if not self.use_selected_inventory then return nil end
+  if self.configuration.use_selected_inventory ~= true then return nil end
   return self:read_selected_snapshot(prefix)
 catch
   if error is async.CancellationReason then raise end
@@ -1295,8 +1297,10 @@ function load(): Compiler
       lua.require, nil, provider_file, selected_file_identity(provider_file), false)
     if ffi.VSCODE_TITAN_WINDOWS ~= 0 then
       compiler.selected_prefix = configured
-      compiler.snapshot_directory = physical_directory(paths.dirname(provider_file))
-      compiler.use_selected_inventory = true
+      compiler.snapshot_directory = project_config.physical_directory(paths.dirname(provider_file))
+      if compiler.snapshot_directory == nil then
+        return fail<|Compiler|>(DRIVER_MODULE, "selected provider directory cannot be resolved: " .. provider_file)
+      end
     end
     return compiler
   end
@@ -1316,6 +1320,11 @@ function load(): Compiler
   return load_with(
     lua.require, provider, provider_file,
     embedded_provider_identity(raw_identity, provider_file), true)
+end
+
+--- The physical SDK directory eligible for a selected Windows inventory.
+function Compiler:selected_inventory_directory(): string?
+  return self.snapshot_directory
 end
 
 function Compiler:compiler_abi(): string
@@ -1348,19 +1357,11 @@ end
 
 function Compiler:configure(configuration: CompilerConfiguration)
   local current = self.configuration
-  local sdk_directory? = self.snapshot_directory
-  local root? = configuration.binary_root
-  local use_selected = sdk_directory ~= nil and
-    (root == nil or root == sdk_directory or physical_directory(root) == sdk_directory)
-  local provider_changed = self.use_selected_inventory ~= use_selected
-  self.use_selected_inventory = use_selected
   if current.binary_root == configuration.binary_root and
+     current.use_selected_inventory == configuration.use_selected_inventory and
      current.cppflags == configuration.cppflags and
      same_roots(current.source_roots, configuration.source_roots) and
-     same_roots(current.include_roots, configuration.include_roots) then
-    if provider_changed then self.completion_binaries = {} end
-    return
-  end
+     same_roots(current.include_roots, configuration.include_roots) then return end
 
   local cppflags? = configuration.cppflags
   local effective_cppflags: value = self.effective.cppflags
@@ -1412,6 +1413,7 @@ function Compiler:configure(configuration: CompilerConfiguration)
     binary_root = configuration.binary_root,
     include_roots = copy_optional_roots(configuration.include_roots),
     cppflags = cppflags,
+    use_selected_inventory = configuration.use_selected_inventory,
   }
   local effective = DriverConfiguration.new(
     self.driver, source_path, binary_path, effective_cppflags)
@@ -1456,7 +1458,11 @@ local function Compiler:new_context(supplied: {string: value}?): value
   if supplied ~= nil then options = supplied end
   options["io"] = self.io
   local inventory? = self.interface_inventory
-  if inventory == nil then inventory = self:selected_inventory() end
+  -- Detached completion imports only the serialized interfaces in its
+  -- captured SQLite catalog, including previously selected SDK entries.
+  if inventory == nil and options["completion_closed_world"] ~= true then
+    inventory = self:selected_inventory()
+  end
   if inventory ~= nil then
     options["embedded_interface_provider"] = inventory
   elseif self.selected_prefix == nil then
@@ -5611,7 +5617,12 @@ function Compiler:native_cache_identity(): string
     return fail<|string|>(DRIVER_MODULE,"cannot identify compiler cache context: " .. strings.tostring(failure))
   end
   emit_cache_stats(self)
-  return content_identity.digest(raw as string)
+  local identity = raw as string
+  if self.selected_prefix ~= nil then
+    identity = identity .. (self.configuration.use_selected_inventory == true
+      and "\0selected inventory" or "\0ordinary lookup")
+  end
+  return content_identity.digest(identity)
 end
 
 -- Resolve the inventory before any C probing. This namespace is sufficient to
