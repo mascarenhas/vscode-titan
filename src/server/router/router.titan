@@ -1,0 +1,410 @@
+--- One client session serving several independent Titan roots through workers.
+-- @module server.router
+
+foreign import "compiler_io_clock.h"
+
+local async = import "async"
+local dispatcher = import "server.dispatcher"
+local documents = import "server.document_buffers"
+local fs = import "fs"
+local indexing_status = import "server.indexing_status"
+local io = import "io"
+local iteration = import "iteration"
+local json = import "json"
+local logging = import "server.logging"
+local lsp = import "server.lsp_types"
+local math = import "math"
+local os = import "os"
+local protocol = import "server.protocol"
+local reflect = import "reflect"
+local response_queue = import "server.response_queue"
+local root_settings = import "server.root_settings"
+local roots = import "server.roots"
+local source_text = import "server.source_text"
+local strings = import "string"
+local timer = import "timer"
+local wire = import "server.wire"
+local worker_process = import "server.worker_process"
+
+local const DEFAULT_MAX_WORKERS = 4
+local const DEFAULT_IDLE_TIMEOUT_SECONDS = 600.0
+local const CRASH_WINDOW_MILLISECONDS = 60000
+local const CRASH_LIMIT = 3
+local const ACTIVATION_TIMEOUT_MILLISECONDS = 60000
+local const SHUTDOWN_TIMEOUT_MILLISECONDS = 15000
+local const REVALIDATE_INTERVAL_MILLISECONDS = 1000
+local const DRAIN_TIMEOUT_MILLISECONDS = 5000
+local const DRAIN_POLL_MILLISECONDS = 20
+local const HOUSEKEEPING_INTERVAL_MILLISECONDS = 500
+local const UNAVAILABLE_DELIVERY_TIMEOUT_MILLISECONDS = 5000
+local const MAX_WORKERS_ENVIRONMENT_VARIABLE = "TITAN_LS_MAX_WORKERS"
+local const TRUSTED_ROOTS_ENVIRONMENT_VARIABLE = "TITAN_LS_TRUSTED_ROOTS"
+local const WORKER_INFO_METHOD = "titan/workerInfo"
+local const REQUEST_FAILED = -32803
+local const PARSE_ERROR = -32700
+local const INVALID_REQUEST = -32600
+local const METHOD_NOT_FOUND = -32601
+
+--- Worker lifecycle state reported by titan/workspaceStatus.
+union WorkerState
+  inactive()
+  starting()
+  ready()
+  failed(string)
+  evicted()
+end
+
+--- Return the protocol spelling of one worker state.
+function state_name(state: WorkerState): string
+  case state
+  when inactive() then return "inactive"
+  when starting() then return "starting"
+  when ready() then return "ready"
+  when failed() then return "failed"
+  when evicted() then return "evicted"
+  end
+  return "inactive"
+end
+
+local function state_ready(state: WorkerState): boolean
+  case state
+  when ready() then return true
+  else return false
+  end
+  return false
+end
+
+--- One open editor buffer retained for replay into its owner's worker.
+-- `text` is nil when the buffer is over the limits the worker applies
+-- (`documents.limits`): the document is then delivered as an unavailable
+-- contributor rather than as saved bytes. `owner` is the root whose worker
+-- currently holds it open, or nil when delivery is still pending.
+record Overlay
+  const uri: string
+  const path: string
+  local version: integer
+  local text: string?
+  local owner: string?
+end
+
+--- One forwarded client request awaiting its worker's response.
+record Forwarded
+  const root: string
+  const id: value
+end
+
+--- One client request a worker asked this session to originate.
+record Outbound
+  const root: string
+  const id: value
+end
+
+--- Per-root worker ownership, settings identity, and lifecycle state.
+record Slot
+  const root: roots.Root
+  local worker: worker_process.WorkerProcess?
+  local state: WorkerState
+  local stopping: boolean
+  local failure: string?
+  local generation: integer
+  local last_used: float
+  -- Monotonic use counter: two uses inside one clock tick still order.
+  local use_serial: integer
+  local settings: root_settings.Settings?
+  local settings_fingerprint: string
+  local sdk_identity: string
+  local checked: float
+  local crashes: {float}
+  local worker_pid: integer?
+  -- The worker's own report of the SDK and probe prefix it resolved.
+  local titan_root: string?
+  local probe_prefix: string?
+  -- Latest worker or startup snapshot; also owns the slot's busy/idle state.
+  local indexing_status: indexing_status.Status?
+  local diagnosed_file: string?
+  -- URIs this root published diagnostics for, and the document each names.
+  local const published: {string: string}
+  -- A warm worker replays when its root gains ownership.
+  local replay_diagnostics: boolean
+  -- A timed-out replay is not retried against that same worker.
+  local replay_unavailable_generation: integer
+  local transitioning: boolean
+  local waiter: async.Task?
+  local const token: async.ResumeToken
+end
+
+--- Launch inputs fixed before the client's initialize request arrives.
+record LaunchOptions
+  const executable: string
+  const root: string
+  const probe_prefix: string?
+  const titan_root: string?
+end
+
+--- Router session state: roots, workers, overlays, and request ownership.
+record Router
+  const options: LaunchOptions
+  const output: response_queue.ResponseQueue
+  local const registry: roots.Roots
+  local trust: root_settings.Trust
+  local const slots: {string: Slot}
+  local order: {string}
+  local const overlays: {string: Overlay}
+  local overlay_order: {string}
+  local overlay_bytes: integer
+  local const forwarded: {string: Forwarded}
+  local const outbound: {string: Outbound}
+  local retired: {worker_process.WorkerProcess}
+  local const envelope: dispatcher.Dispatcher
+  local const initial_roots: {string}
+  local client_capabilities: value
+  local client_initialization_options: value
+  local max_workers: integer
+  local idle_timeout_seconds: float
+  local next_use: integer
+  local next_outbound: integer
+  local initial_activated: boolean
+  local housekeeping: async.Task<|nil, value|>?
+  local const unowned_logged: {string: boolean}
+  -- Memoized nearest-ancestor configuration per owner root and directory.
+  local discovered: {string: string}
+  local closed: boolean
+  -- Completed root publications count even when no visible frame changes.
+  local indexing_generation: integer
+  local indexing_status: indexing_status.Status?
+  -- Strict clients keep one initial cycle open until the first session ready.
+  local initial_pending: boolean
+end
+
+-- Elapsed-time decisions must not read the calendar clock: whole seconds make
+-- two uses tie, quantize a fractional idle timeout, and can step backwards.
+local function now_milliseconds(): float
+  return ffi.vscode_titan_monotonic_ms()
+end
+
+-- A configured duration arrives as a JSON number: an integer second count or a
+-- fraction. Anything else keeps the default.
+local function seconds_value(item: value): float?
+  case reflect.inspect(item)
+  when is_integer(whole) then
+    local seconds: float = whole
+    return seconds
+  when is_float(fraction) then
+    return fraction
+  else
+    return nil
+  end
+end
+
+--- Render a raised value for a client or log message. A nominal error such as
+--- async.OperationError reports the operation and message it carries instead of
+--- its record address.
+function failure_message(problem: value): string
+  if problem is async.OperationError then
+    local failure: async.OperationError = problem
+    return failure.operation .. ": " .. failure.message
+  end
+  return strings.tostring(problem)
+end
+
+local function Router:slot_for_root(entry: roots.Root): Slot
+  local existing? = self.slots[entry.path]
+  if existing ~= nil then return existing end
+  local slot = Slot {
+    root = entry,
+    state = WorkerState.inactive(),
+    stopping = false,
+    generation = 0,
+    last_used = now_milliseconds(),
+    use_serial = 0,
+    settings_fingerprint = "",
+    sdk_identity = "",
+    checked = 0,
+    crashes = {},
+    published = {},
+    replay_diagnostics = false,
+    replay_unavailable_generation = 0,
+    transitioning = false,
+    token = async.ResumeToken("server.router.slot"),
+  }
+  self.slots[entry.path] = slot
+  self.order[#self.order + 1] = entry.path
+  return slot
+end
+
+-- One observation of "this root was used", ordered without clock resolution.
+local function Router:note_use(slot: Slot)
+  self.next_use = self.next_use + 1
+  slot.use_serial = self.next_use
+  slot.last_used = now_milliseconds()
+end
+
+-- A snapshot keeps one root's removal during an awaited restart from
+-- reindexing the remaining roots out of the live order array.
+local function Router:root_paths(): {string}
+  return {...self.order}
+end
+
+--- Create a router session over one client stream pair.
+function create(options: LaunchOptions, output: response_queue.ResponseQueue): Router
+  local max_workers = DEFAULT_MAX_WORKERS
+  local configured? = os.getenv(MAX_WORKERS_ENVIRONMENT_VARIABLE)
+  if configured ~= nil and configured ~= "" then
+    local parsed? = math.tointeger(configured)
+    if parsed ~= nil and parsed > 0 then
+      max_workers = parsed
+    end
+  end
+  local envelope = dispatcher.create(true)
+  -- The router always serves completion, exactly as the single-root server did,
+  -- so the advertised capabilities must include it.
+  envelope:enable_completion()
+  return Router {
+    options = options,
+    output = output,
+    registry = roots.create(),
+    trust = root_settings.create({}),
+    slots = {},
+    order = {},
+    overlays = {},
+    overlay_order = {},
+    overlay_bytes = 0,
+    forwarded = {},
+    outbound = {},
+    retired = {},
+    envelope = envelope,
+    initial_roots = {},
+    max_workers = max_workers,
+    idle_timeout_seconds = DEFAULT_IDLE_TIMEOUT_SECONDS,
+    next_use = 1,
+    next_outbound = 1,
+    initial_activated = false,
+    unowned_logged = {},
+    discovered = {},
+    closed = false,
+    indexing_generation = 0,
+    initial_pending = true,
+  }
+end
+
+--- Route one framed client message, returning a requested process exit code.
+function Router:handle(body: string): integer?
+  local parsed: value = nil
+  do
+    parsed = wire.decode(body)
+  catch
+    if error is json.Error then
+      self.output:push(dispatcher.failure_body(nil, PARSE_ERROR, "Parse error"))
+      return nil
+    end
+    raise
+  end
+  local object? = wire.as_object(parsed)
+  if object == nil then
+    self.output:push(
+      dispatcher.failure_body(nil, INVALID_REQUEST, "Invalid Request"))
+    return nil
+  end
+  local method? = wire.as_string(object["method"])
+  if method == "initialize" and
+     self.envelope:phase_name() == "before_initialize" then
+    -- Trust, limits and initial roots are captured once: a replayed or hostile
+    -- second initialize is answered by the lifecycle and must not widen this
+    -- session's trust.
+    self:capture_initialize(object["params"])
+  elseif method == "workspace/didChangeWorkspaceFolders" then
+    if self.envelope:phase_name() ~= "before_initialize" then
+      self:on_folders(object["params"])
+    end
+    return nil
+  elseif method == "workspace/didChangeConfiguration" then
+    if self.envelope:phase_name() ~= "before_initialize" then
+      self:revalidate_all(true)
+    end
+    return nil
+  end
+  case self.envelope:route_value(parsed)
+  when immediate(result) then
+    local response? = result.response
+    if response ~= nil then self.output:push(response) end
+    return nil
+  when initialized() then
+    self:activate_initial_roots()
+    return nil
+  when semantic(request) then
+    self:route_request(request, body)
+    return nil
+  when completion(request) then
+    self:route_completion(request, body)
+    return nil
+  when document(notification) then
+    self:route_document(notification, body)
+    return nil
+  when cancel(id) then
+    self:route_cancel(id)
+    return nil
+  when shutdown(result) then
+    self:shutdown_all()
+    local response? = result.response
+    if response ~= nil then self.output:push(response) end
+    self:drain_retired()
+    return nil
+  when client_response(response) then
+    -- A client answers one of this session's worker requests: the envelope
+    -- owner is the single classifier, so an invalid body never reaches here and
+    -- a response is never answered as a request.
+    self:on_client_response(object, response)
+    return nil
+  when exit(code) then
+    return code
+  end
+  return nil
+end
+
+--- Finish relay Tasks and every worker before the process exits.
+function Router:close()
+  self:stop_all()
+end
+
+--- Serve one client session until its exit notification or a transport failure.
+function run(source: io.Reader, target: io.Writer,
+             options: LaunchOptions): integer
+  local input = protocol.new_input_queue()
+  local output = response_queue.create()
+  local writer = async.run(function (): nil
+    return protocol.write_messages(target, output)
+  end)
+  local reader = async.run(function (): nil
+    return protocol.read_messages(source, input)
+  end)
+  local router = create(options, output)
+  router.housekeeping = async.run(router:run_housekeeping)
+  logging.emit("debug", "router.session.start", nil)
+  defer do
+    router:close()
+    if not reader:status():has_finished() then
+      reader:cancel(async.CancellationReason.simple("router stopped reading"))
+    end
+    async.join(reader)
+    output:stop()
+    async.join(writer)
+  end
+  while true do
+    case input:take()
+    when message(delivery) then
+      local exit_code? = router:handle(delivery.body)
+      delivery:acknowledge()
+      if exit_code ~= nil then return exit_code end
+      -- One place turns any ownership change made by this message into migrated
+      -- buffers and cleared publications.
+      router:reconcile()
+      async.yield()
+    when eof() then
+      raise protocol.ProtocolError(
+        "stdin closed before the exit notification")
+    when failure(message) then
+      raise protocol.ProtocolError(message)
+    end
+  end
+  return 1
+end

@@ -1,0 +1,466 @@
+-- Root ownership lookup, workspace status, request forwarding, and folder changes.
+
+-- The report is derived from the root registry, which is the one structure that
+-- decides ownership: every registered root is reported whether or not its slot
+-- has been touched yet, and a root that just served a request is always in the
+-- registry. A root with no slot has no worker and reports `inactive`.
+-- The owner of a canonical document path is the most specific of the known
+-- roots that contain it and its nearest ancestor configuration directory. A
+-- project nested inside a folder root is therefore its own root, and a folder
+-- root with no titan-config.lua cannot claim a configured project below it.
+-- The walk is memoized per directory and containing root: configuration files
+-- appear and disappear rarely, and an explicit reload clears the memo.
+local function Router:nested_configuration(canonical: string,
+                                           owner_path: string): string?
+  local directory = source_text.parent_directory(canonical)
+  local key = owner_path .. "|" .. directory
+  local cached? = self.discovered[key]
+  if cached ~= nil then
+    if cached == "" then return nil end
+    return cached
+  end
+  local found? = roots.discover(canonical)
+  if found == nil or (owner_path ~= "" and #found <= #owner_path) then
+    self.discovered[key] = ""
+    return nil
+  end
+  self.discovered[key] = found
+  return found
+end
+
+local function Router:owner_root(canonical: string): roots.Root?
+  local owner? = self.registry:owner(canonical)
+  local owner_path = ""
+  if owner ~= nil then owner_path = owner.path end
+  local discovered? = self:nested_configuration(canonical, owner_path)
+  if discovered ~= nil then
+    local entry = self.registry:attach_discovery(discovered)
+    self:publish_indexing()
+    logging.emit("info", "root.discovered", {
+      ["root"] = entry.path,
+      ["path"] = canonical,
+    })
+    return entry
+  end
+  return owner
+end
+
+local function Router:status_value(): value
+  local result: wire.Array = {}
+  local entries = self.registry:list()
+  for index = 1, #entries do
+    local root_entry = entries[index]
+    local slot? = self.slots[root_entry.path]
+    local item: wire.Object = {
+      ["root"] = root_entry.path,
+      ["state"] = "inactive",
+      ["generation"] = 0,
+    }
+    case root_entry:origin()
+    when folder() then item["origin"] = "folder"
+    when discovered() then item["origin"] = "discovered"
+    when released() then item["origin"] = "released"
+    end
+    -- Trust is a containment fact, not a consequence of a usable configuration:
+    -- a root whose settings were refused still reports whether its directory is
+    -- trusted.
+    local trusted = self.trust:allows(root_entry.path)
+    local compiler_root: string? = nil
+    local failure: string? = nil
+    local worker_pid: integer? = nil
+    local titan_root: string? = nil
+    local probe_prefix: string? = nil
+    if slot ~= nil then
+      item["state"] = state_name(slot.state)
+      item["generation"] = slot.generation
+      failure = slot.failure
+      worker_pid = slot.worker_pid
+      titan_root = slot.titan_root
+      probe_prefix = slot.probe_prefix
+      local settings? = slot.settings
+      if settings ~= nil then
+        trusted = settings.trusted
+        compiler_root = settings.compiler_root
+        item["target"] = settings.target or "native"
+      end
+    end
+    item["trusted"] = trusted
+    if compiler_root ~= nil then
+      item["compilerRoot"] = compiler_root
+    else
+      item["compilerRoot"] = wire.null()
+    end
+    if failure ~= nil then
+      item["failure"] = failure
+    end
+    if worker_pid ~= nil then
+      item["workerPid"] = worker_pid
+    else
+      item["workerPid"] = wire.null()
+    end
+    if titan_root ~= nil then
+      item["titanRoot"] = titan_root
+    else
+      item["titanRoot"] = wire.null()
+    end
+    if probe_prefix ~= nil then
+      item["probePrefix"] = probe_prefix
+    else
+      item["probePrefix"] = wire.null()
+    end
+    result[index] = item
+  end
+  return {["roots"] = result}
+end
+
+local function document_path(params: value): string?
+  local object? = wire.as_object(params)
+  if object == nil then return nil end
+  local document? = wire.as_object(object["textDocument"])
+  if document == nil then return nil end
+  local uri? = wire.as_string(document["uri"])
+  if uri == nil then return nil end
+  local path? = source_text.file_uri_to_path(uri)
+  return path
+end
+
+local function Router:note_unowned(path: string, uri: string, action: string)
+  if self.unowned_logged[path] == nil then
+    self.unowned_logged[path] = true
+    logging.emit("info", "document.unowned", {
+      ["uri"] = uri,
+      ["detail"] = action,
+    })
+  end
+end
+
+local function Router:forward_request(slot: Slot, id: value, body: string)
+  local key = worker_process.id_key(id)
+  self.forwarded[key] = Forwarded(slot.root.path, id)
+  self:note_use(slot)
+  local worker? = slot.worker
+  if worker ~= nil and worker:send(body) then return end
+  -- The request never reached the worker, so this root owes the client an
+  -- answer: dropping it would leave the request open forever.
+  self.forwarded[key] = nil
+  self.output:push(dispatcher.failure_body(id, REQUEST_FAILED,
+    "Titan worker for " .. slot.root.path .. " is unavailable"))
+end
+
+local function Router:route_request(request: dispatcher.SemanticRequest,
+                                    body: string)
+  if request.method == "titan/workspaceStatus" then
+    self.output:push(dispatcher.result_body(
+      request.id:to_json(), self:status_value()))
+    return
+  end
+  local path? = document_path(request.params)
+  if path == nil then
+    self.output:push(dispatcher.failure_body(
+      request.id:to_json(), METHOD_NOT_FOUND, "Method not found"))
+    return
+  end
+  local slot?, message? = self:ensure_slot(roots.canonical(path))
+  if slot == nil then
+    self.output:push(dispatcher.failure_body(
+      request.id:to_json(), REQUEST_FAILED, message))
+    return
+  end
+  self:forward_request(slot, request.id:to_json(), body)
+end
+
+local function Router:route_completion(request: dispatcher.CompletionRequest,
+                                       body: string)
+  local slot?, message? = self:ensure_slot(
+    roots.canonical(request.params.document.path))
+  if slot == nil then
+    self.output:push(dispatcher.failure_body(
+      request.id:to_json(), REQUEST_FAILED, message))
+    return
+  end
+  self:forward_request(slot, request.id:to_json(), body)
+end
+
+local function notification_identity(notification: lsp.DocumentNotification):
+    (string, string)
+  case notification
+  when opened(item) then return item.document.uri, item.document.path
+  when changed(item) then return item.document.uri, item.document.path
+  when closed(item) then return item.uri, item.path
+  when saved(item) then return item.uri, item.path
+  end
+  return "", ""
+end
+
+local function notification_closes(notification: lsp.DocumentNotification): boolean
+  case notification
+  when closed() then return true
+  else return false
+  end
+  return false
+end
+
+local function Router:route_document(notification: lsp.DocumentNotification,
+                                     body: string)
+  local uri, path = notification_identity(notification)
+  if path == "" then return end
+  local canonical = roots.canonical(path)
+  self:set_overlay(notification, canonical)
+  local current? = self:owner_root(canonical)
+  if current == nil then
+    self:note_unowned(canonical, uri, "notification")
+    return
+  end
+  local slot = self:slot_for_root(current)
+  if notification_closes(notification) and slot.worker == nil then return end
+  local live?, message? = self:activate(slot)
+  if live == nil then
+    self:note_unowned(canonical, uri, message)
+    return
+  end
+  self:note_use(live)
+  local worker? = live.worker
+  if worker ~= nil and worker:send(body) and not notification_closes(notification) then
+    local stored? = self.overlays[canonical]
+    if stored ~= nil then stored.owner = live.root.path end
+  end
+end
+
+local function Router:route_cancel(id: dispatcher.RequestId)
+  local raw_id = id:to_json()
+  local entry? = self.forwarded[worker_process.id_key(raw_id)]
+  if entry == nil then return end
+  local slot? = self.slots[entry.root]
+  if slot == nil then return end
+  local worker? = slot.worker
+  if worker == nil then return end
+  local params: wire.Object = {["id"] = raw_id}
+  worker:notify("$/cancelRequest", params)
+end
+
+--- Rewrite a client response for a router-allocated id into the worker's reply.
+function worker_response_body(original: value, object: wire.Object): string
+  local envelope: wire.Object = {
+    ["jsonrpc"] = "2.0", ["id"] = original,
+  }
+  local failure = object["error"]
+  if failure ~= nil then
+    envelope["error"] = failure
+  else
+    envelope["result"] = object["result"]
+  end
+  return wire.encode(envelope)
+end
+
+local function Router:on_client_response(object: wire.Object,
+                                         response: dispatcher.ClientResponse)
+  local raw_id: value = response.id
+  local key = worker_process.id_key(raw_id)
+  local entry? = self.outbound[key]
+  if entry == nil then
+    logging.emit("debug", "worker.request.unmatched", {["id"] = raw_id})
+    return
+  end
+  self.outbound[key] = nil
+  local slot? = self.slots[entry.root]
+  if slot == nil then return end
+  local worker? = slot.worker
+  if worker == nil then return end
+  worker:send(worker_response_body(entry.id, object))
+end
+
+-- A folder removal releases its root instead of stopping it: a client that adds
+-- a sibling checkout for one call and removes it afterwards would otherwise
+-- restart and re-index that root on every call. The warm worker is reused by a
+-- later add, owns nothing until discovery or a folder claims it again, and is
+-- stopped only by idle eviction or the worker cap.
+local function Router:remove_root(canonical: string)
+  local released = self.registry:remove_folder(canonical)
+  if released then
+    local slot? = self.slots[canonical]
+    if slot ~= nil then slot:require_diagnostic_replay() end
+    local heir? = self.registry:owner(canonical)
+    if heir ~= nil then
+      local gaining? = self.slots[heir.path]
+      if gaining ~= nil then gaining:require_diagnostic_replay() end
+    end
+    self:publish_indexing()
+  end
+  logging.emit("info", "root.release", {
+    ["root"] = canonical,
+    ["released"] = released,
+  })
+end
+
+local function Router:on_folders(params: value)
+  local object? = wire.as_object(params)
+  if object == nil then return end
+  -- Folder membership changes what "the containing root" is for every memoized
+  -- directory, and a client reload is the documented way to re-observe
+  -- configuration files.
+  self.discovered = {}
+  local event? = wire.as_object(object["event"])
+  if event == nil then return end
+  local removed? = wire.as_array(event["removed"])
+  if removed ~= nil then
+    local items = removed
+    for index = 1, #items do
+      local folder? = wire.as_object(items[index])
+      if folder ~= nil then
+        local uri? = wire.as_string(folder["uri"])
+        if uri ~= nil then
+          local path? = source_text.file_uri_to_path(uri)
+          if path ~= nil then
+            self:remove_root(roots.canonical(path))
+          end
+        end
+      end
+    end
+  end
+  local added? = wire.as_array(event["added"])
+  if added ~= nil then
+    local items = added
+    for index = 1, #items do
+      local folder? = wire.as_object(items[index])
+      if folder ~= nil then
+        local uri? = wire.as_string(folder["uri"])
+        if uri ~= nil then
+          local path? = source_text.file_uri_to_path(uri)
+          if path == nil then
+            logging.emit("info", "root.folder_ignored", {["uri"] = uri})
+          else
+            local canonical = roots.canonical(path)
+            self:slot_for_root(self.registry:add_folder(canonical))
+            self:publish_indexing()
+            logging.emit("info", "root.added", {["root"] = canonical})
+          end
+        end
+      end
+    end
+  end
+end
+
+local function Router:capture_initialize(params: value)
+  local object? = wire.as_object(params)
+  local options: value = nil
+  if object ~= nil then
+    self.client_capabilities = object["capabilities"]
+    options = object["initializationOptions"]
+    self.client_initialization_options = options
+  end
+  if options ~= nil then
+    local options_object? = wire.as_object(options)
+    if options_object ~= nil then
+      local max_workers? = wire.as_integer(options_object["maxWorkers"])
+      if max_workers ~= nil and max_workers > 0 then
+        self.max_workers = max_workers
+      end
+      local idle? = seconds_value(options_object["idleTimeoutSeconds"])
+      if idle ~= nil and idle > 0.0 then
+        -- A fractional timeout is what makes idle eviction observable in a
+        -- protocol test without minutes of waiting.
+        self.idle_timeout_seconds = idle
+      end
+    end
+  end
+  self.trust = root_settings.create(root_settings.trust_directories(
+    options, os.getenv(TRUSTED_ROOTS_ENVIRONMENT_VARIABLE)))
+  local declared: {string} = {}
+  if object ~= nil then
+    local folders? = wire.as_array(object["workspaceFolders"])
+    if folders ~= nil then
+      local items = folders
+      for index = 1, #items do
+        local folder? = wire.as_object(items[index])
+        if folder ~= nil then
+          local uri? = wire.as_string(folder["uri"])
+          if uri ~= nil then
+            local path? = source_text.file_uri_to_path(uri)
+            if path ~= nil then
+              declared[#declared + 1] = path
+            else
+              logging.emit("info", "root.folder_ignored", {["uri"] = uri})
+            end
+          end
+        end
+      end
+    end
+    -- An empty folder list selects nothing, so the deprecated single-root
+    -- parameters still get their chance before the launch directory.
+    if #declared == 0 then
+      local root_uri? = wire.as_string(object["rootUri"])
+      if root_uri ~= nil then
+        local path? = source_text.file_uri_to_path(root_uri)
+        if path ~= nil then declared[#declared + 1] = path end
+      else
+        local root_path? = wire.as_string(object["rootPath"])
+        if root_path ~= nil then
+          local absolute? = source_text.resolve_path(self.options.root, root_path)
+          if absolute ~= nil then declared[#declared + 1] = absolute end
+        end
+      end
+    end
+  end
+  if #declared == 0 then declared[1] = self.options.root end
+  local seen: {string: boolean} = {}
+  for index = 1, #declared do
+    local canonical = roots.canonical(declared[index])
+    local entry = self.registry:add_folder(canonical)
+    -- Every known root is visible in titan/workspaceStatus from the start, even
+    -- when the worker cap leaves it inactive until its first routed message.
+    self:slot_for_root(entry)
+    if seen[canonical] == nil then
+      seen[canonical] = true
+      self.initial_roots[#self.initial_roots + 1] = canonical
+    end
+  end
+  logging.emit("info", "router.initialize", {
+    ["roots"] = #self.initial_roots,
+    ["trusted_roots"] = self.trust:count(),
+    ["max_workers"] = self.max_workers,
+  })
+end
+
+local function Router:activate_initial_roots()
+  if self.initial_activated then return end
+  self.initial_activated = true
+  for index = 1, #self.initial_roots do
+    local root_path = self.initial_roots[index]
+    if self:live_workers() >= self.max_workers then
+      -- "Up to the worker cap": a root beyond it stays inactive and activates
+      -- on its first routed message. Starting it now would either evict a
+      -- just-started initial root or refuse it outright.
+      logging.emit("info", "root.activation.deferred", {
+        ["root"] = root_path,
+        ["max_workers"] = self.max_workers,
+      })
+    else
+      local entry? = self.registry:find(root_path)
+      if entry ~= nil then
+        local slot = self:slot_for_root(entry)
+        do
+          local actual?, message? = self:activate(slot)
+          if actual == nil and message ~= nil then
+            logging.emit("error", "root.activation.failure", {
+              ["root"] = root_path,
+              ["message"] = message,
+            })
+          end
+        catch
+          if error is async.CancellationReason then raise end
+          local message = failure_message(error)
+          slot:begin_transition()
+          defer slot:end_transition()
+          if slot.worker ~= nil then
+            self:stop_worker_locked(slot, "activation failure")
+          end
+          self:fail_slot(slot, message)
+          logging.emit("error", "root.activation.failure", {
+            ["root"] = root_path,
+            ["message"] = message,
+          })
+        end
+      end
+    end
+  end
+end
