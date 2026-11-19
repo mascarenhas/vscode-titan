@@ -39,6 +39,7 @@ local record View
   const published_generation: integer
   const dirty_signature: string
   const features: semantic_features.Features
+  const configuration: string
 end
 
 local union RefreshOutcome
@@ -784,6 +785,7 @@ end
 local function Application:publish_view(service: project_service.Service,
     snapshot: project_service.Snapshot, reuse: View?): View
   local store = service:workspace_store()
+  local configuration = service:semantic_configuration()
   local revision = ""
   local plan?: semantic_index.PublicationPlan = nil
   do
@@ -854,7 +856,7 @@ local function Application:publish_view(service: project_service.Service,
   local features = semantic_features.open(store, generation)
   if reuse ~= nil then features = reuse.features end
   return View.new(snapshot.generation, generation,
-    dirty_signature(snapshot.dirty_modules), features)
+    dirty_signature(snapshot.dirty_modules), features, configuration)
 end
 
 local function Application:install_view(snapshot: project_service.Snapshot): View
@@ -912,6 +914,7 @@ local function Application:refresh_once(): RefreshOutcome
     if completed ~= nil and completed.work_generation ==
          report.generation and #report.committed_modules == 0 and
        #report.failed_modules == 0 and
+       completed.configuration == service:semantic_configuration() and
        completed.dirty_signature == dirty_signature(snapshot.dirty_modules) then
       -- A refresh still rediscovers directories and external inputs. When its
       -- semantic generation and pending-work membership did not change and no
@@ -1083,9 +1086,14 @@ local function Application:start_refresh(force: boolean, reason: string):
         -- Publish every successful pass even when a later hint arrived. Retain
         -- and serve that immutable generation while the single coalesced
         -- follow-up runs.
+        local previous? = self.completed_view
+        -- A warm SQL catalog can seed private work before the first View.
+        -- It cannot authorize retention across that first accepted publication.
+        local configuration_boundary = previous == nil or
+          previous.configuration ~= view.configuration
         self.completed_view = view
         if self.completion ~= nil then
-          self.completion:saved_changed(view.published_generation)
+          self.completion:saved_changed(view.published_generation, configuration_boundary)
         end
         self.completed_epoch = target_epoch
         self.refresh_failure = nil
@@ -1554,12 +1562,7 @@ local function default_rename_analyzer(
     snapshot: project_service.Snapshot,
     projects: {bridge.ProjectModule}): bridge.Analysis
   local compiler = bridge.load()
-  compiler:configure(bridge.CompilerConfiguration.new {
-    source_roots = snapshot.config.source_module_roots,
-    binary_root = snapshot.config.binary_modules_root,
-    include_roots = snapshot.config.extra_ffi_include_dirs,
-    cppflags = snapshot.config.extra_ffi_cppflags,
-  })
+  compiler:configure(bridge.project_configuration(snapshot.config))
   return compiler:analyze(snapshot.project_modules[1].module_name, projects)
 end
 

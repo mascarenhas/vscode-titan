@@ -420,16 +420,13 @@ local function load_or_raise(project_root: string,
   local wall = ffi.vscode_titan_monotonic_ms()
   local compiler = bridge.load()
   local installed_root = compiler:installed_binary_modules_root()
-  local settings?, config_error? = config.load(project_root,installed_root)
+  local selected_inventory_directory? = compiler:selected_inventory_directory()
+  local settings?, config_error? = config.load(
+    project_root, installed_root, selected_inventory_directory)
   if settings == nil then
     return nil,service.Error.new(config_error.path,config_error.message),nil
   end
-  compiler:configure(bridge.CompilerConfiguration.new {
-    source_roots = settings.source_module_roots,
-    binary_root = settings.binary_modules_root,
-    include_roots = settings.extra_ffi_include_dirs,
-    cppflags = settings.extra_ffi_cppflags,
-  })
+  compiler:configure(bridge.project_configuration(settings))
   local cache = caches.open_for_inventory(settings.project_root)
   local loaded?: service.Service
   local restoring: Restoration? = nil
@@ -470,24 +467,14 @@ local function load_or_raise(project_root: string,
   local analyzer: service.Analyzer = function (
       request: service.AnalysisRequest): bridge.Analysis
     if restoring ~= nil and loaded ~= nil then restoring:finish(loaded) end
-    compiler:configure(bridge.CompilerConfiguration.new {
-      source_roots = request.config.source_module_roots,
-      binary_root = request.config.binary_modules_root,
-      include_roots = request.config.extra_ffi_include_dirs,
-      cppflags = request.config.extra_ffi_cppflags,
-    })
+    compiler:configure(bridge.project_configuration(request.config))
     return compiler:analyze_incremental(request.project_modules,request.dirty_modules,
       request.cached_sources,progress_listener,analysis_header_inputs(request))
   end
   local resolver: service.ExternalResolver = function (
       current: config.ProjectConfig,projects: {string},
       requests: {bridge.ExternalResolutionRequest}): {bridge.ExternalResolution}
-    compiler:configure(bridge.CompilerConfiguration.new {
-      source_roots = current.source_module_roots,
-      binary_root = current.binary_modules_root,
-      include_roots = current.extra_ffi_include_dirs,
-      cppflags = current.extra_ffi_cppflags,
-    })
+    compiler:configure(bridge.project_configuration(current))
     return compiler:resolve_external_modules(projects,requests)
   end
   local restater: service.HeaderRestater = function (
@@ -505,6 +492,7 @@ local function load_or_raise(project_root: string,
     external_resolver = resolver,
     header_restater = restater,
     store = cache.store,
+    selected_inventory_directory = selected_inventory_directory,
   }
   if loaded == nil then return nil,failure,nil end
   phase("input_validation",cpu,wall)
@@ -519,14 +507,9 @@ local function load_or_raise(project_root: string,
   local completion_inactive: {string} = {}
   loaded:set_publication_hooks(service.PublicationHooks.new(
     function (snapshot: service.Snapshot): boolean
-      local next_configuration = snapshot.config:semantic_identity()
+      local next_configuration = loaded:semantic_configuration()
       if next_configuration ~= current_configuration then
-        compiler:configure(bridge.CompilerConfiguration.new {
-          source_roots = snapshot.config.source_module_roots,
-          binary_root = snapshot.config.binary_modules_root,
-          include_roots = snapshot.config.extra_ffi_include_dirs,
-          cppflags = snapshot.config.extra_ffi_cppflags,
-        })
+        compiler:configure(bridge.project_configuration(snapshot.config))
         native_context = compiler:native_cache_identity()
         current_configuration = next_configuration
       end
@@ -541,12 +524,7 @@ local function load_or_raise(project_root: string,
       end
       completion_descriptors, completion_modules =
         prepare_completion_descriptors(snapshot, loaded, compiler, reusable)
-      completion_configuration = bridge.CompilerConfiguration.new {
-        source_roots = snapshot.config.source_module_roots,
-        binary_root = snapshot.config.binary_modules_root,
-        include_roots = snapshot.config.extra_ffi_include_dirs,
-        cppflags = snapshot.config.extra_ffi_cppflags,
-      }
+      completion_configuration = bridge.project_configuration(snapshot.config)
       completion_include = snapshot.config.include
       completion_exclude = snapshot.config.exclude
       local inactive: {string} = {}

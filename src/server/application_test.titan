@@ -28,7 +28,7 @@ local logging = import "server.logging"
 local project_config = import "server.project_config"
 local project_graph = import "server.project_graph"
 local project_watcher = import "server.project_watcher.titan"
-local project_service = import "server.project_service"
+local project_service = import "server.project_service.titan"
 local project_loader = import "server.project_loader"
 local semantic_features = import "server.semantic_features"
 local source_text = import "server.source_text"
@@ -2793,7 +2793,7 @@ local function rejects_query_captured_before_sql_publication()
     stores.execute(access.connection,
       "UPDATE main.store_state SET published_generation=? WHERE singleton=1", generation)
     app.completed_view = application.View.new(before.work_generation, generation,
-      before.dirty_signature, semantic_features.open(store, generation))
+      before.dirty_signature, semantic_features.open(store, generation), before.configuration)
     access:release()
     local rejected = false
     case join_outcome(queued, "query queued behind publication")
@@ -4403,5 +4403,109 @@ function test_application_diagnostic_replay_rechecks_epoch_after_store_wait(
     _context: test.Context)
   test_runtime.run(function ()
     with_diagnostic_replay_cache(replay_after_hint_while_store_is_held)
+  end)
+end
+
+function test_application_first_publication_revokes_retained_hover_from_another_configuration(
+    _: test.Context)
+  test_runtime.run(function ()
+    local root = test_paths.canonical_path(test_paths.temporary_name())
+    fs.unlink(root)
+    fs.mkdir(root)
+    defer remove_application_cache(root)
+    fs.mkdir(root .. "/src")
+    fs.mkdir(root .. "/first")
+    fs.mkdir(root .. "/second")
+    local filename = root .. "/src/main.titan"
+    local configfile = root .. "/titan-config.lua"
+    local configuration = function (directory: string): string
+      return "include = {'./src'}\nsource_module_roots = {'./src','./" .. directory .. "'}\n"
+    end
+    fs.write_file(configfile, configuration("first"))
+    fs.write_file(filename,
+      "local dep = import \"dependency\"\nfunction answer(): integer return 1 end\n")
+    fs.write_file(root .. "/first/dependency.titan",
+      "function oldValue(): integer return 1 end\n")
+    fs.write_file(root .. "/second/dependency.titan",
+      "function newValue(): integer return 2 end\n")
+    local old = application.create(root)
+    defer old:close()
+    old:start_indexing()
+    local first?, cold_error? = application.joined_view(old.refresh_task)
+    test.assert(first ~= nil and cold_error == nil, "the warm fixture did not publish its original view")
+    old:close()
+
+    local flipped = false
+    local entered = false
+    local proceed = false
+    local replacement = application.create(root, function (directory: string,
+        progress: bridge.ProgressListener?, listener: project_service.SnapshotListener?):
+        (project_service.Service?, project_service.Error?, project_loader.Restoration?)
+      local loaded?, failure?, restoration? = project_loader.load(directory, progress,
+        function (snapshot: project_service.Snapshot)
+          if listener ~= nil then listener(snapshot) end
+          -- Swap the source roots after watcher registration and before the
+          -- real startup rescan, leaving the original SQL publication intact.
+          if not flipped then
+            flipped = true
+            fs.write_file(configfile, configuration("second"))
+          end
+        end)
+      if loaded ~= nil then
+        local hooks = loaded.publication_hooks
+        loaded:set_publication_hooks(project_service.PublicationHooks(
+          function (snapshot: project_service.Snapshot): boolean
+            if not entered then
+              entered = true
+              wait_until(function (): boolean return proceed end,
+                "startup fixture did not release the publication")
+            end
+            return hooks.prepare(snapshot)
+          end, hooks.publish, hooks.committed))
+      end
+      return loaded, failure, restoration
+    end)
+    defer do
+      proceed = true
+      replacement:close()
+    end
+    use_manual_watch_delivery(replacement)
+    local overlay =
+      "local dep = import \"dependency\"\nfunction answer(): integer return dep.oldValue() end\n"
+    local uri = source_text.path_to_file_uri(filename)
+    replacement:on_document(lsp.DocumentNotification.opened(
+      lsp.OpenDocument(lsp.TextDocument(uri, filename), 1, overlay)))
+    replacement:start_indexing()
+    wait_until(function (): boolean return entered end, "replacement did not reach its first publication")
+    test.assert(replacement.completed_view == nil and flipped)
+    local caret = source_text.Position(1, #"function answer(): integer return dep.")
+    local request = dispatcher.CompletionRequest(
+      dispatcher.RequestId.integer_id(670),
+      lsp.CompletionParams(lsp.DocumentPosition(uri, filename, caret), 1, nil))
+    local work = replacement:capture_completion(request)
+    work()
+    local completion = replacement.completion as completion_service.Service
+    join_hover_owner(completion)
+    case replacement:handle(position_request_for(filename, 671, "textDocument/hover", 7))
+    when result(value) then
+      test.assert(strings.find(wire.encode(value), "oldValue", 1, true) ~= nil,
+        "the fixture did not retain a private hover from the old saved configuration")
+    when failure{message} then raise message
+    end
+
+    proceed = true
+    wait_until(function (): boolean return replacement.completed_view ~= nil end,
+      "the new first view never published")
+    local published = replacement.completed_view as application.View
+    test.assert(published.published_generation > first.published_generation,
+      "the changing configuration did not advance the saved generation")
+    test.assert(published.configuration ~= first.configuration,
+      "the new first view kept the old configuration")
+    case replacement:handle(position_request_for(filename, 672, "textDocument/hover", 7))
+    when result(value) then
+      test.assert(strings.find(wire.encode(value), "oldValue", 1, true) == nil,
+        "stale startup hover survived the first new publication: " .. wire.encode(value))
+    when failure{message} then raise message
+    end
   end)
 end

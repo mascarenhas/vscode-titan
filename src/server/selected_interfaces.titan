@@ -1,0 +1,186 @@
+--- Extract standard interfaces in the selected SDK's own Lua process.
+-- @module server.selected_interfaces
+
+local async = import "async"
+local fs = import "fs"
+local lua = import "lua"
+local os = import "os"
+local paths = import "path"
+local strings = import "string"
+local content_identity = import "server.content_identity"
+foreign import "compiler_io_platform.h"
+foreign import "embedded_interfaces_native.h"
+
+local TRANSPORT_LIMIT = 8 * 1024 * 1024 + 64
+local DIAGNOSTIC_LIMIT = 8192
+
+local union ExtractionResult
+  bytes(string)
+  failed(async.Error)
+end
+
+local record Extraction
+  process: os.Process?
+  abandoned: boolean
+end
+
+local function Extraction:cancel()
+  self.abandoned = true
+  local process? = self.process
+  if process ~= nil then
+    -- The waiter still owns retirement if the process exits before the kill.
+    do if process:is_running() then process:kill("kill") end catch end
+  end
+end
+
+local function helper_source(): string
+  local length: foreign size_t = 0
+  local bytes = ffi.titan_ls_standard_interfaces_helper(length)
+  return bytes as string(length)
+end
+
+local function read_diagnostic(input: os.InputStream): string
+  defer input:close()
+  local output = strings.writer()
+  local remaining = DIAGNOSTIC_LIMIT
+  for chunk in input:read do
+    if remaining > 0 then
+      local section = strings.sub(chunk, 1, remaining)
+      output:write(section)
+      remaining = remaining - #section
+    end
+  end
+  return output:drain()
+end
+
+local function payload(path: string): string
+  local file = fs.open(path, "r")
+  defer file:close()
+  local output = strings.writer()
+  local remaining = TRANSPORT_LIMIT
+  while true do
+    local chunk? = file:read(remaining + 1)
+    if chunk == nil then break end
+    if #chunk > remaining then raise "selected interface result exceeds its byte limit" end
+    output:write(chunk)
+    remaining = remaining - #chunk
+  end
+  return output:drain()
+end
+
+local function Extraction:read(prefix: string, provider_file: string,
+                                program: string): string
+  if self.abandoned then return "" end
+  local output = fs.tmpname()
+  defer fs.unlink(output)
+  if self.abandoned then return "" end
+  local interpreter = "bin/lua"
+  if ffi.VSCODE_TITAN_WINDOWS ~= 0 then interpreter = "bin/lua.exe" end
+  local process = os.spawn(paths.join(prefix, interpreter),
+    {"-E", "-", prefix, provider_file, output}, os.with_merged_output,
+    os.with_env("TITAN_ROOT", prefix))
+  self.process = process
+  defer self:cancel()
+  if self.abandoned then self:cancel() end
+  local input = process.stdin
+  local output_pipe = process.stdout
+  local reader = async.run<|string, value|>(function (): string
+    return read_diagnostic(output_pipe)
+  end)
+  local writer = async.run<|nil, value|>(function (): nil
+    defer input:close()
+    input:write(program)
+    return nil
+  end)
+  local waiter = async.run<|os.ExitStatus, value|>(process:wait)
+  local sent, read, exited = async.join_three(writer, reader, waiter)
+  self.process = nil
+  if self.abandoned then return "" end
+  local diagnostic = ""
+  case read
+  when succeeded(summary) then diagnostic = summary
+  when failed(failure) then failure:raise()
+  else raise "selected interface diagnostic reader did not finish"
+  end
+  case exited
+  when succeeded(status) then
+    if status.code ~= 0 or status.signal_number ~= 0 then
+      raise "SDK Lua exited with code " .. status.code .. ": " .. diagnostic
+    end
+  when failed(failure) then failure:raise()
+  else raise "selected interface helper did not finish"
+  end
+  case sent
+  when succeeded() then
+  when failed(failure) then failure:raise()
+  else raise "selected interface helper did not receive its program"
+  end
+  return payload(output)
+end
+
+-- The child Task owns its temporary file and never inherits the caller's
+-- cancellation. On cancellation, kill the exact published Process and wait
+-- without a checkpoint until the child has closed every stream and unlinked.
+local function wait_for_retirement(task: async.Task<|ExtractionResult, value|>)
+  if task:status():has_finished() then return end
+  local remove: (function (): ())? = nil
+  defer do if remove ~= nil then remove() end end
+  async.await_cleanup<|nil, nil|>(function (resolve: function (nil): (),
+      _: function (nil): (), _fatal: function (value, string): ())
+    remove = task:add_terminal_listener(function (_: async.TaskStatus<|ExtractionResult, value|>)
+      resolve(nil)
+    end)
+  end)
+end
+
+local function extract(prefix: string, path: string, source: string): string
+  local program = "local inventory = (function()\n" .. source ..
+    "\nend)()\ninventory.extract(arg[1], arg[2], arg[3])\n"
+  local job = Extraction.new(nil, false)
+  local task = async.run<|ExtractionResult, value|>(function (): ExtractionResult
+    return ExtractionResult.bytes(job:read(prefix, path, program))
+  catch
+    return ExtractionResult.failed(async.Error.new(error, traceback))
+  end)
+  do
+    case async.join(task)
+    when succeeded(result) then
+      case result
+      when bytes(bytes) then return bytes
+      when failed(failure) then failure:raise()
+      end
+    when failed(failure) then failure:raise()
+    else raise "selected interface helper was cancelled"
+    end
+  catch
+    job:cancel()
+    wait_for_retirement(task)
+    raise
+  end
+  return ""
+end
+
+local function decode(bytes: string, provider_file: string, source: string): {string: value}
+  local raw = lua.load([[
+return function(payload, provider_file, source, digest)
+  local inventory = assert(load(source, "=standard-interface-inventory", "t"))()
+  local codec = require "titan-compiler.graphcodec"
+  inventory.limits.sha256_binary = digest
+  local snapshot = assert(codec.decode(payload, inventory.limits))
+  assert(type(snapshot) == "table" and snapshot.provider_file == provider_file and
+         snapshot.target_profile == nil, "selected interface result has unexpected provenance")
+  for key in pairs(snapshot) do
+    assert(key == "provider_file" or key == "entries", "unexpected selected interface field")
+  end
+  assert(inventory.validate(snapshot.entries, true))
+  return snapshot
+end
+]], "=server.selected_interfaces.decode", nil)()
+  local unpack = raw as function (string, string, string, function (string): string): {string: value}
+  return unpack(bytes, provider_file, source, content_identity.digest)
+end
+
+function read(prefix: string, provider_file: string): {string: value}
+  local source = helper_source()
+  return decode(extract(prefix, provider_file, source), provider_file, source)
+end

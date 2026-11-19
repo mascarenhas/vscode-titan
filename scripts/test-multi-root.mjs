@@ -3,6 +3,7 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import {
+  copyFile,
   lstat,
   mkdir,
   mkdtemp,
@@ -17,6 +18,7 @@ import {
 import * as os from "node:os";
 import { stripTypeScriptTypes } from "node:module";
 import * as path from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { pathToFileURL } from "node:url";
 import {
   FrameReader,
@@ -357,10 +359,8 @@ async function exists(filename) {
   }
 }
 
-// Every file of an installed SDK is a symlink to the session SDK; the files a
-// case changes are copied so the session SDK stays immutable.
-// Only the trees an installed SDK's compiler reads are farmed; the case copies
-// the few files it changes so the session SDK stays immutable.
+// Keep the session SDK immutable. Copy only the files that must physically
+// belong to a selected SDK or that a test is going to change.
 const SDK_FARM_DIRECTORIES = ["share", "lib", "include", "src"];
 
 async function farmDirectory(source, target) {
@@ -388,6 +388,18 @@ async function farmSdk(source, target) {
     } else {
       await symlink(from, path.join(target, name));
     }
+  }
+  if (process.platform === "win32") {
+    const bin = path.join(target, "bin");
+    await mkdir(bin);
+    for (const name of await readdir(path.join(source, "bin"))) {
+      if (name === "lua.exe" || name.endsWith(".dll")) {
+        await copyFile(path.join(source, "bin", name), path.join(bin, name));
+      }
+    }
+    const dll = path.join(target, "lib", "titan", "0.6", "titan.dll");
+    await assertFarmedFile(target, dll);
+    await replaceWithCopy(dll);
   }
 }
 
@@ -752,14 +764,79 @@ async function testLazyDiscovery() {
   }
 }
 
-// A selected root's compiler_root is honoured only when the bridge can load
-// that SDK's provider. The Unix SDK carries the `titan.a` archive provider the
-// bridge loads in archive mode; a Windows SDK carries `titan.dll`, and loading
-// a selected provider in dynamic mode is not implemented.
-const PER_ROOT_SDK_SKIP =
-  "compiler_bridge loads the selected SDK's titan.a archive provider and " +
-  "Windows SDKs ship titan.dll; per-root compiler_root needs a dynamic " +
-  "provider mode (vscode-titan#136)";
+function sdkDescriptor(root, module) {
+  const db = new DatabaseSync(path.join(root, ".titan-ls", "index.sqlite3"), {
+    readOnly: true
+  });
+  try {
+    const row = db.prepare(
+      "SELECT provenance, main_file FROM completion_descriptors WHERE module_name=?"
+    ).get(Buffer.from(module));
+    assert.ok(row, `no saved descriptor for ${module}: ${root}`);
+    return { provenance: row.provenance, file: Buffer.from(row.main_file).toString("utf8") };
+  } finally {
+    db.close();
+  }
+}
+
+function extractionRecords(session) {
+  const stderr = session.stderr().toString("utf8");
+  const complete = stderr.slice(0, stderr.lastIndexOf("\n") + 1);
+  return structuredLogRecords(Buffer.from(complete)).filter(
+    (record) => record.event === "compiler.selected_interfaces");
+}
+
+async function assertSelectedSdkUsesProvider(session, project, source, provider) {
+  await pullDiagnostics(session, uri(source));
+  const json = sdkDescriptor(project, "titan.json");
+  assert.ok(samePath(json.file, provider), `selected titan.json came from ${json.file}`);
+  const sibling = sdkDescriptor(project, "titan.math");
+  assert.ok(samePath(sibling.file, provider), `selected sibling came from ${sibling.file}`);
+  session.notify("textDocument/didOpen", {
+    textDocument: { uri: uri(source), languageId: "titan", version: 1, text: SDK_SOURCE }
+  });
+  for (const [symbol, occurrence] of [["encode", 1], ["tripled", 1]]) {
+    const items = await pollCompletion(session, source, endOfToken(SDK_SOURCE, symbol, occurrence),
+      `selected SDK completion of ${symbol}`);
+    assert.ok(items.some((item) => item.label === symbol));
+  }
+  session.notify("textDocument/didClose", { textDocument: { uri: uri(source) } });
+  for (let iteration = 0; iteration < 2; iteration++) {
+    const rename = await session.result("textDocument/rename", {
+      textDocument: { uri: uri(source) },
+      position: positionOf(SDK_SOURCE, "tripled"),
+      newName: "scaled"
+    });
+    assert.ok(rename.documentChanges?.length > 0 || Object.keys(rename.changes ?? {}).length > 0);
+  }
+  const records = extractionRecords(session);
+  assert.equal(records.length, 1,
+    "indexing, private completion and rename did not share one selected DLL inventory");
+  const [record] = records;
+  assert.ok(samePath(record.provider_file, provider), `extracted ${record.provider_file}`);
+  assert.ok(Number.isFinite(record.wall_ms) && record.wall_ms >= 0);
+  const worker = rootEntry(await session.status(), project);
+  console.log(`multi-root: selected SDK worker ${worker.workerPid} read ${provider}` +
+    ` once in ${record.wall_ms} ms`);
+}
+
+async function observeCompilerSupport(sdk, marker) {
+  const parser = path.join(sdk, "share", "lua", "5.5", "titan-compiler", "parser.lua");
+  await assertFarmedFile(sdk, parser);
+  const source = await readFile(parser, "utf8");
+  await rm(parser);
+  await writeFile(parser, [
+    'local cwd = assert(require("lfs").currentdir())',
+    `if cwd ~= ${luaString(path.join(sdk, "bin"))} and cwd ~= ${luaString(serverPath(path.join(sdk, "bin")))} then`,
+    '  local _, origin = require "titan"',
+    '  if package.preload.titan ~= nil then origin = "embedded" end',
+    '  assert(type(origin) == "string", "compiler support was loaded before the probe")',
+    `  local marker <close> = assert(io.open(${luaString(marker)}, "ab"))`,
+    '  marker:write(cwd, "\\t", origin, "\\n")',
+    "end",
+    source
+  ].join("\n"));
+}
 
 async function testSecondSdk() {
   const base = await makeBase("sdk");
@@ -779,15 +856,17 @@ async function testSecondSdk() {
   const farmedParent = await lstat(path.dirname(farmedProvider));
   assert.equal(farmedParent.isSymbolicLink(), false,
     "the SDK farm must not alias the session SDK");
-  if (process.platform === "win32") {
-    console.log("multi-root: kept the farmed provider DLL " +
-      "(Windows has no unused dynamic provider)");
-  } else {
+  if (process.platform !== "win32") {
     await assertFarmedFile(sdk, farmedProvider);
     await rm(farmedProvider, { force: true });
     await writeFile(farmedProvider, "not a loadable provider object\n", "utf8");
   }
-  const session = new Session(launch(defaultRoot, "error"));
+  const supportMarker = path.join(base, "compiler-support.txt");
+  await observeCompilerSupport(sdk, supportMarker);
+  const share = path.join(sdk, "share", "lua", "5.5");
+  const session = new Session(launch(defaultRoot, "trace", {
+    TITAN_LS_LUA_PATH: `${share}/?.lua;${share}/?/init.lua`
+  }));
   try {
     await session.initialize({
       workspaceFolders: [
@@ -812,23 +891,54 @@ async function testSecondSdk() {
       rootEntry(roots, sdkRootDir).workerPid,
       "the selected SDK shared an unselected worker");
 
-    // The selected worker runs the second SDK's own compiler and archive.
+    // The selected worker runs the second SDK's own compiler and interfaces.
     await pollHover(session, sdkSource, SDK_SOURCE, "tripled", /integer/,
       "the selected SDK root");
     await pollHover(session, defaultSource, ROOT_A_SOURCE, "doubled", /integer/,
       "the default SDK root");
     // `encoded` returns what `json.encode` declares, so its hover type proves
-    // the standard library resolved from the selected SDK's own archive.
+    // the standard library resolved with the selected SDK.
     await pollHover(session, sdkSource, SDK_SOURCE, "encoded", /string/,
       "the selected SDK standard library");
+    const supportRows = (await readFile(supportMarker, "utf8")).trimEnd()
+      .split("\n").map((line) => line.split("\t"));
+    const supportOrigin = (root) => supportRows.find(([from]) => samePath(from, root))?.[1];
+    assert.equal(supportOrigin(defaultRoot), "embedded");
+    const support = path.join(sdk, "lib", "lua", "5.5", providerName);
+    assert.ok(samePath(supportOrigin(sdkRootDir), support),
+      `selected worker's compiler support came from ${supportOrigin(sdkRootDir)}`);
     assert.ok(await exists(path.join(sdkRootDir, ".titan-ls", "index.sqlite3")),
       "the selected root wrote no workspace cache below its own root");
     assert.equal(await exists(path.join(sdk, ".titan-ls")), false,
       "a worker wrote a cache inside the read-only SDK prefix");
 
+    if (process.platform === "win32") {
+      await assertSelectedSdkUsesProvider(session, sdkRootDir, sdkSource, farmedProvider);
+      const generation = rootEntry(await session.status(), sdkRootDir).generation;
+      // This DLL is a regular copy in a new farm, never the session SDK.
+      assert.ok((await lstat(farmedProvider)).isFile());
+      await writeFile(farmedProvider, "not a Windows PE image\n", "utf8");
+      session.notify("workspace/didChangeConfiguration", {});
+      const failure = await pollFailure(session, "textDocument/hover", {
+        textDocument: { uri: uri(sdkSource) },
+        position: positionOf(SDK_SOURCE, "encoded")
+      }, "the invalid selected DLL");
+      assert.equal(failure.code, -32803);
+      assert.ok(failure.message.includes(serverPath(farmedProvider)), failure.message);
+      assert.match(failure.message, /Cannot read selected Titan standard interfaces/);
+      assert.equal(rootEntry(await session.status(), defaultRoot).workerPid,
+        rootEntry(roots, defaultRoot).workerPid);
+      await copyFile(path.join(sdkRoot(), "lib", "titan", "0.6", "titan.dll"), farmedProvider);
+      session.notify("workspace/didChangeConfiguration", {});
+      await pollHover(session, sdkSource, SDK_SOURCE, "encoded", /string/,
+        "the repaired selected DLL");
+      assert.ok(rootEntry(await session.status(), sdkRootDir).generation > generation);
+    }
+
     // A configuration reload that leaves the effective selection alone must
     // not restart anything.
-    const generated = new Map(roots.map((entry) => [serverPath(entry.root), entry.generation]));
+    const generated = new Map((await session.status())
+      .map((entry) => [serverPath(entry.root), entry.generation]));
     const localOverride = path.join(sdkRootDir, "titan-config.local.lua");
     await writeFile(localOverride, `compiler_root = ${luaString(sdk)}\n`, "utf8");
     session.notify("workspace/didChangeConfiguration", { settings: {} });
@@ -917,7 +1027,7 @@ async function testSecondSdk() {
     const recovered = await pollStatus(session, (entries) => {
       const entry = findRoot(entries, sdkRootDir);
       return entry?.state === "ready" &&
-        entry.compilerRoot === path.normalize(sdk)
+        samePath(entry.compilerRoot, sdk)
         ? { accepted: entries }
         : { rejected: entries };
     }, "the root did not recover after the broken override was removed");
@@ -925,6 +1035,233 @@ async function testSecondSdk() {
     await session.shutdown();
   } finally {
     await session.abort();
+  }
+}
+
+async function testSelectedProviderOverlap() {
+  const base = await makeBase("sdk-overlap");
+  const sdk = path.join(base, "selected sdk é");
+  await farmSdk(sdkRoot(), sdk);
+  const native = process.platform === "win32" ? "titan.dll" : "titan.a";
+  const provider = path.join(sdk, "lib", "titan", "0.6", native);
+  const project = path.join(base, "overlap");
+  const projectSource = [
+    'local math = import "titan.math"',
+    'local private_math = import "titan.math.titan"',
+    'local json = import "titan.json"',
+    "function local_math(): integer",
+    "  return math.special_answer() + private_math.secret_value()",
+    "end",
+    "function encoded(): string return json.encode(local_math()) end",
+    ""
+  ].join("\n");
+  const main = await writeRoot(project, projectSource,
+    `${ROOT_CONFIG}compiler_root = ${luaString(sdk)}\n`);
+  const mathSource = path.join(project, "src", "titan", "math.titan");
+  await mkdir(path.dirname(mathSource), { recursive: true });
+  await writeFile(mathSource,
+    "function special_answer(): integer return 7 end\n" +
+    "local function secret_value(): integer return 4 end\n", "utf8");
+
+  const override = path.join(base, "override");
+  const customProviderRoot = path.join(base, "providers");
+  await mkdir(customProviderRoot);
+  const customProvider = path.join(customProviderRoot, native);
+  await copyFile(provider, customProvider);
+  const overrideSource = await writeRoot(override, SDK_SOURCE,
+    `${ROOT_CONFIG}compiler_root = ${luaString(sdk)}\n` +
+    `binary_modules_root = ${luaString(customProviderRoot)}\n`);
+  const session = new Session(launch(project, "trace"));
+  try {
+    await session.initialize({
+      workspaceFolders: [
+        { uri: uri(project), name: "overlap" },
+        { uri: uri(override), name: "override" }
+      ],
+      initializationOptions: { trustedRoots: [base] }
+    });
+    session.notify("initialized", {});
+    await pollHover(session, main, projectSource, "special_answer", /integer/,
+      "the overlapping project declaration");
+    await pollHover(session, main, projectSource, "secret_value", /integer/,
+      "the overlapping explicit source import");
+    const definition = await session.result("textDocument/definition", {
+      textDocument: { uri: uri(main) },
+      position: positionOf(projectSource, "special_answer")
+    });
+    assert.equal(definition?.uri, uri(mathSource));
+    await pollHover(session, main, projectSource, "encode", /string/,
+      "the selected SDK's ordinary disk fallback");
+    await pullDiagnostics(session, uri(main));
+    const fallback = sdkDescriptor(project, "titan.json");
+    const fallbackFile = process.platform === "win32" ? provider :
+      path.join(path.dirname(provider), "titan.so");
+    assert.equal(fallback.provenance, "dynamic");
+    assert.ok(samePath(fallback.file, fallbackFile), `overlap fell back to ${fallback.file}`);
+    assert.equal(sdkDescriptor(project, "titan.math").provenance, "project");
+    await pollHover(session, overrideSource, SDK_SOURCE, "encoded", /string/,
+      "an explicit different SDK binary search root");
+    await pullDiagnostics(session, uri(overrideSource));
+    const explicit = sdkDescriptor(override, "titan.json");
+    assert.ok(samePath(explicit.file, customProvider), `explicit root fell back to ${explicit.file}`);
+    if (process.platform === "win32") {
+      assert.equal(extractionRecords(session).filter((record) => samePath(record.provider_file, provider)).length,
+        1, "the explicit binary root invoked the selected SDK's inventory query");
+    }
+    await session.shutdown();
+  } finally {
+    await session.abort();
+  }
+}
+
+async function testSelectedProviderAliasRetarget() {
+  const base = await makeBase("sdk-alias");
+  const sdk = path.join(base, "sdk");
+  await farmSdk(sdkRoot(), sdk);
+  const sdkProviders = path.join(sdk, "lib", "titan", "0.6");
+  const provider = path.join(sdkProviders, "titan.dll");
+  const empty = path.join(base, "empty");
+  await mkdir(empty);
+  const project = path.join(base, "project");
+  const alias = path.join(project, "providers");
+  const config = `${ROOT_CONFIG}compiler_root = ${luaString(sdk)}\n` +
+    'binary_modules_root = "./providers"\n';
+  const source = await writeRoot(project, SDK_SOURCE, config);
+  await linkDirectory(sdkProviders, alias);
+  const session = new Session(launch(project, "debug"));
+  try {
+    await session.initialize({
+      workspaceFolders: [{ uri: uri(project), name: "selected SDK alias" }],
+      initializationOptions: { trustedRoots: [base] }
+    });
+    session.notify("initialized", {});
+    await pollHover(session, source, SDK_SOURCE, "encoded", /string/, "initial selected SDK alias");
+    const running = rootEntry(await session.status(), project);
+    assert.deepEqual((await pullDiagnostics(session, uri(source))).items, []);
+    assert.ok(samePath(sdkDescriptor(project, "titan.json").file, provider));
+
+    await rm(alias);
+    await linkDirectory(empty, alias);
+    const rejected = await pullDiagnostics(session, uri(source));
+    assert.match(JSON.stringify(rejected.items), /module 'titan\.json' not found/);
+
+    await rm(alias);
+    await linkDirectory(sdkProviders, alias);
+    assert.deepEqual((await pullDiagnostics(session, uri(source))).items, []);
+    assert.ok(samePath(sdkDescriptor(project, "titan.json").file, provider));
+    await rm(alias);
+    assert.match(JSON.stringify((await pullDiagnostics(session, uri(source))).items),
+      /module 'titan\.json' not found/, "removing the alias retained a saved import");
+    await linkDirectory(sdkProviders, alias);
+    assert.deepEqual((await pullDiagnostics(session, uri(source))).items, []);
+    const recovered = rootEntry(await session.status(), project);
+    assert.equal(recovered.workerPid, running.workerPid);
+    assert.equal(recovered.generation, running.generation);
+    assert.equal(await readFile(path.join(project, "titan-config.lua"), "utf8"), config);
+    assert.equal(extractionRecords(session).length, 1, "alias recovery reacquired the SDK snapshot");
+    await session.shutdown();
+  } finally {
+    await session.abort();
+  }
+}
+
+async function testSelectedProviderAliasCatalog() {
+  const base = await makeBase("sdk-alias-catalog");
+  const sdk = path.join(base, "sdk");
+  await farmSdk(sdkRoot(), sdk);
+  const selected = path.join(sdk, "lib", "titan", "0.6");
+  const provider = path.join(selected, "titan.dll");
+  const empty = path.join(base, "empty");
+  await mkdir(empty);
+  const project = path.join(base, "project");
+  const alias = path.join(project, "providers");
+  const settings = `${ROOT_CONFIG}compiler_root = ${luaString(sdk)}\n` +
+    'binary_modules_root = "./providers"\n';
+  const source = await writeRoot(project, ROOT_A_SOURCE, settings);
+  await writeFile(path.join(project, "src", "helper.titan"), "function helper(): integer return 42 end\n");
+  const overlay = 'local candidate = import ""\n';
+  const position = endOfToken(overlay, 'import "');
+
+  async function retarget(next) {
+    await rm(alias, { force: true });
+    if (next !== null) await linkDirectory(next, alias);
+  }
+  async function assertCatalog(session, enabled, label) {
+    // Pull explicitly goes through a saved refresh. The source and tracked
+    // configuration are untouched and no external importer can cause work.
+    assert.deepEqual((await pullDiagnostics(session, uri(source))).items, [], label);
+    const db = new DatabaseSync(path.join(project, ".titan-ls", "index.sqlite3"), { readOnly: true });
+    try {
+      assert.equal(db.prepare("SELECT count(*) AS total FROM external_observations").get().total, 0,
+        `${label}: the fixture must not have external fingerprints`);
+      const rows = db.prepare(
+        "SELECT main_file FROM completion_descriptors WHERE provenance='embedded'"
+      ).all();
+      if (enabled) {
+        assert.ok([23, 26].includes(rows.length), `${label}: expected the full SDK catalog, got ${rows.length}`);
+        assert.ok(rows.every((row) => samePath(Buffer.from(row.main_file).toString("utf8"), provider)));
+      } else {
+        assert.equal(rows.length, 0, `${label}: stale saved SDK catalog`);
+      }
+    } finally {
+      db.close();
+    }
+    const items = await poll(`${label}: open-buffer catalog not published`, async () => {
+      const result = await session.result("textDocument/completion", {
+        textDocument: { uri: uri(source) }, position, context: { triggerKind: 1 }
+      });
+      const offered = result?.items ?? [];
+      return offered.some((item) => item.label === "helper") ? { accepted: offered } : { rejected: result };
+    });
+    assert.equal(items.some((item) => item.label === "titan.json"), enabled, label);
+    assert.equal(await readFile(path.join(project, "titan-config.lua"), "utf8"), settings, label);
+  }
+  async function withWorker(check) {
+    const session = new Session(launch(project, "debug"));
+    try {
+      await session.initialize({
+        workspaceFolders: [{ uri: uri(project), name: "selected SDK catalog" }],
+        initializationOptions: { trustedRoots: [base] }
+      });
+      session.notify("initialized", {});
+      const running = assertReady(await pollSettled(session, 1, "selected catalog worker"), project, "catalog root");
+      session.notify("textDocument/didOpen", {
+        textDocument: { uri: uri(source), languageId: "titan", version: 1, text: overlay }
+      });
+      await check(session, running);
+      await session.shutdown();
+    } catch (error) {
+      throw new Error(`${error.message}\n${session.stderr().toString("utf8").slice(-15000)}`, { cause: error });
+    } finally {
+      await session.abort();
+    }
+  }
+
+  const states = [selected, empty, selected, null, selected];
+  await retarget(selected);
+  await withWorker(async (session, running) => {
+    for (let index = 0; index < states.length; index++) {
+      const next = states[index];
+      if (index > 0) await retarget(next);
+      await assertCatalog(session, next === selected, `live alias state ${index}`);
+      const current = rootEntry(await session.status(), project);
+      assert.equal(current.workerPid, running.workerPid);
+      assert.equal(current.generation, running.generation);
+    }
+    assert.equal(extractionRecords(session).length, 1, "live alias changes reacquired the SDK snapshot");
+  });
+
+  // Change the physical alias while stopped, leaving the previous selection
+  // and its descriptors in SQLite. Each new worker must reject those rows
+  // before answering requests; a successful preceding live refresh cannot
+  // conceal a bad warm identity.
+  for (let index = 1; index < states.length; index++) {
+    const next = states[index];
+    await retarget(next);
+    await withWorker(async (session) => {
+      await assertCatalog(session, next === selected, `warm alias state ${index}`);
+      assert.equal(extractionRecords(session).length, next === selected ? 1 : 0);
+    });
   }
 }
 
@@ -2817,23 +3154,71 @@ async function testAggregateCountedProgress() {
   }
 }
 
+async function testCompletionConfigurationBoundary() {
+  const root = await makeBase("completion-configuration");
+  const configuration = (directory) => `${ROOT_CONFIG}source_module_roots = {"./src", "./${directory}"}\n`;
+  const saved = 'local dep = import "dependency"\nfunction answer(): integer return 1 end\n';
+  const source = await writeRoot(root, saved, configuration("first"));
+  const configFile = path.join(root, "titan-config.lua");
+  for (const [directory, member] of [["first", "oldValue"], ["second", "newValue"]]) {
+    await mkdir(path.join(root, directory));
+    await writeFile(path.join(root, directory, "dependency.titan"),
+      `--- Provider ${member}.\nfunction ${member}(): integer return 1 end\n`);
+  }
+  const overlay = 'local dep = import "dependency"\nfunction answer(): integer return dep.oldValue() end\n';
+  const member = endOfToken(overlay, "dep.");
+  const dependency = positionOf(overlay, "dep");
+  const params = { textDocument: { uri: uri(source) } };
+  const session = new Session(launch(root, "debug"));
+  try {
+    await session.initialize({ workspaceFolders: [{ uri: uri(root), name: "completion configuration" }] });
+    session.notify("initialized", {});
+    assert.deepEqual((await pullDiagnostics(session, uri(source))).items, []);
+    session.notify("textDocument/didOpen", {
+      textDocument: { uri: uri(source), languageId: "titan", version: 1, text: overlay }
+    });
+    const prior = await pollCompletion(session, source, member, "first config provider");
+    assert.ok(prior.some((item) => item.label === "oldValue"));
+    await pollHover(session, source, overlay, "dep", /oldValue/, "retained private import hover");
+
+    await writeFile(configFile, configuration("second"));
+    assert.deepEqual((await pullDiagnostics(session, uri(source))).items, []);
+    const hover = await session.result("textDocument/hover", { ...params, position: dependency });
+    assert.doesNotMatch(hover?.contents?.value ?? "", /oldValue/);
+    await poll("completion should adopt the edited config without stale candidates", async () => {
+      const result = await session.result("textDocument/completion", {
+        ...params, position: member, context: { triggerKind: 1 }
+      });
+      const items = result?.items ?? [];
+      assert.ok(!items.some((item) => item.label === "oldValue"),
+        "a committed semantic configuration change retained old provisional candidates");
+      return items.some((item) => item.label === "newValue") ? { accepted: items } : { rejected: result };
+    });
+    await pollHover(session, source, overlay, "dep", /newValue/, "private hover after config edit");
+    await session.shutdown();
+  } catch (error) {
+    throw new Error(`${error.message}\n${session.stderr().toString("utf8").slice(-12000)}`, { cause: error });
+  } finally {
+    await session.abort();
+  }
+}
+
 // These cases prove symlink semantics: a farmed SDK is a tree of links into the
 // session SDK, and one workspace folder is reached through a link.
 const SYMLINK_GROUPS = new Set(["sdk", "sdk-errors", "overlays", "shutdown-restart"]);
-
-// Cases that cannot run on one platform report it here, so the runner counts
-// them as skipped and never prints them as passed.
-const WINDOWS_SKIPS = new Map([
-  ["sdk", PER_ROOT_SDK_SKIP],
-  ["sdk-errors", PER_ROOT_SDK_SKIP]
-]);
 
 const groups = [
   ["independent", testIndependentRoots, "independent roots"],
   ["folders", testFolderChanges, "folder changes"],
   ["discovery", testLazyDiscovery, "lazy discovery"],
-  ["sdk", testSecondSdk, "second SDK"],
+  ["sdk", async () => {
+    await testSecondSdk();
+    await testSelectedProviderOverlap();
+    if (process.platform === "win32") await testSelectedProviderAliasRetarget();
+    if (process.platform === "win32") await testSelectedProviderAliasCatalog();
+  }, "second SDK"],
   ["sdk-errors", testRootScopedSdkErrors, "root-scoped SDK errors"],
+  ["completion-config", testCompletionConfigurationBoundary, "private completion across a saved configuration change"],
   ["crash", testWorkerCrashAndOverlay, "crash and overlay replay"],
   ["cap", testCapAndIdleEviction, "worker cap and idle eviction"],
   ["cancel", testCancellation, "request cancellation"],
@@ -2867,10 +3252,6 @@ async function main() {
   const symlinks = await symlinksUsable();
   for (const [name, run, label] of groups) {
     if (only !== undefined && only !== name) continue;
-    if (process.platform === "win32" && WINDOWS_SKIPS.has(name)) {
-      console.log(`multi-root: ${label} skipped (${WINDOWS_SKIPS.get(name)})`);
-      continue;
-    }
     if (!symlinks && SYMLINK_GROUPS.has(name)) {
       console.log(`multi-root: ${label} skipped ` +
         "(this account has no usable symbolic links)");

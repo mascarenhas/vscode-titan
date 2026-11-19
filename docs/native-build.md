@@ -418,8 +418,9 @@ application under `tests/native/router-worker`, with its runtime/provider DLLs.
 
 ### Windows embedded interfaces
 
-On Windows the generator emits only the C type profile
-(`--windows-profile`). `src/server/embedded_interfaces_windows.c` reads the
+On Windows the generator emits the build C type profile and the source of the
+selected-SDK interface query (`--windows-profile`).
+`src/server/embedded_interfaces_windows.c:ls_push_cache` reads the
 callable metadata from the standard-provider DLL that is actually loaded. It
 checks every interface's ABI value before it invokes any Lua metadata callback.
 It opens the provider with `FILE_SHARE_READ` only, which denies write and delete
@@ -431,6 +432,14 @@ is closed immediately. The support table itself does not come from that DLL:
 so the linker extracts the metadata-free support member from the SDK's
 `lib/titan/0.6/libtitan.a`. Restart the server before you update or replace its
 loaded standard provider.
+
+`scripts/standard-interface-inventory.lua` owns the canonical module list and
+queries ABI exports before type exports. The generator and the standalone
+server use the same query. `selected_interfaces.read` runs the embedded
+program in the selected SDK's `bin/lua.exe -E`. Results use a bounded binary
+file and are decoded only after the helper exits successfully; stdout and
+stderr are diagnostic streams, not metadata transport. The caller waits for
+process and file retirement even on cancellation.
 
 ### Windows packaging
 
@@ -459,10 +468,8 @@ not establish them. Symlink checks skip when the account cannot create or
 traverse the fixture links.
 To qualify the Windows symlink case, run the Extension Host suite elevated
 on local NTFS so the test can create and traverse its directory link.
-The multi-root transcript's per-root SDK cases skip on Windows: a selected
-root's `compiler_root` needs the bridge to load that SDK's provider, the Unix
-path loads the `titan.a` archive provider, and a Windows SDK ships `titan.dll`
-instead ([vscode-titan#136](https://github.com/mascarenhas/vscode-titan/issues/136)).
+Run the multi-root SDK cases in an elevated session on local NTFS so their
+SDK farm symlinks can be created and traversed.
 
 `scripts/test-server-protocol.mjs`, `scripts/test-workspace-cache.mjs`,
 `scripts/test-multi-root.mjs` and `scripts/test-completion-protocol.mjs` each

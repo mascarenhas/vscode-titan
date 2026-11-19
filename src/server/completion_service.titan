@@ -48,6 +48,7 @@ local record Ready
   const filename: string
   const session: integer
   const anchor: string
+  const generation: integer
 end
 
 local record ByteChange
@@ -195,6 +196,7 @@ record Service
   local hover_session: integer
   local debounce: async.Task<|nil, value|>?
   local saved_generation: integer
+  local minimum_saved_generation: integer
 end
 
 local HOVER_DEBOUNCE_MS = 200
@@ -206,7 +208,7 @@ end
 
 function create(store: sql.Store, documents: buffers.BufferStore): Service
   return Service.new(storage.open(store), documents, nil, nil, nil, nil, nil, nil, false, false, nil, 0, nil, nil,
-    nil, 0, nil, 0)
+    nil, 0, nil, 0, 0)
 end
 
 local function open_paths(capture: buffers.Capture): {string}
@@ -368,6 +370,11 @@ catch
   return {}, false
 end
 
+local function Service:request_current(request: Request): boolean
+  return not self.closed and request.generation >= self.minimum_saved_generation and
+    self.buffers:current(request.capture)
+end
+
 local function Service:prepare(request: Request): Prepared?
   local started = logging.clock()
   local wall = ffi.vscode_titan_monotonic_ms()
@@ -390,12 +397,14 @@ local function Service:prepare(request: Request): Prepared?
     local validator = bridge.load()
     validator:configure(request.baseline.configuration)
     local _, changed = validator:restat_c_header_dependencies(reusable.volatile_headers)
-    if not changed and self.buffers:current(request.capture) and
-        self.store:current_generation(request.generation) then
+    if not changed and self:request_current(request) and
+        self.store:current_generation(request.generation) and self:request_current(request) then
       self.ready = Ready.new(reusable.id, reusable.key, reusable.prefix, reusable.range,
-        reusable.volatile_headers, self.requests, reusable.filename, reusable.session, reusable.anchor)
+        reusable.volatile_headers, self.requests, reusable.filename, reusable.session,
+        reusable.anchor, reusable.generation)
       return nil
     end
+    if not self:request_current(request) then return nil end
     self.previous_ready = reusable
     self.ready = nil
   end
@@ -577,7 +586,7 @@ local function Service:run(): nil
           "", input.session, input.version, input.text)
       end
       local current = function (): boolean
-        return not self.closed and self.buffers:current(request.capture) and
+        return self:request_current(request) and
           (not request.hover_only or request.capture.document.path == self.hover_path and
             request.capture.document.session == self.hover_session)
       end
@@ -609,7 +618,8 @@ local function Service:run(): nil
               self.ready = Ready.new(prepared.snapshot.id, request.key,
                 prepared.snapshot.prefix, prepared.range, prepared.volatile_headers, self.requests,
                 request.capture.document.path, request.capture.document.session,
-                strings.sub(request.capture.document.text, 1, prepared.snapshot.replace_start))
+                strings.sub(request.capture.document.text, 1, prepared.snapshot.replace_start),
+                request.generation)
               self.previous_ready = self.ready
             end
           end
@@ -681,10 +691,18 @@ function Service:changed()
   end
 end
 
--- The watcher remains the sole saved publisher. A new committed baseline
--- queues private reanalysis without retiring the last accepted hover snapshot.
-function Service:saved_changed(generation: integer)
-  if self.closed or generation == self.saved_generation then return end
+-- Ordinary saves retain usable provisional facts. The first accepted view
+-- and subsequent configuration changes cannot borrow an earlier baseline.
+function Service:saved_changed(generation: integer, configuration_boundary: boolean)
+  if self.closed then return end
+  if configuration_boundary then
+    self.minimum_saved_generation = generation
+    self.ready = nil
+    self.previous_ready = nil
+    self.hover_context = nil
+  elseif generation == self.saved_generation then
+    return
+  end
   self.saved_generation = generation
   self:changed()
 end
@@ -712,7 +730,8 @@ end
 local function Service:provisional(request: Request): dispatcher.SemanticOutcome?
   local ready?: Ready = self.ready
   if ready == nil then ready = self.previous_ready end
-  if ready == nil or ready.filename ~= request.capture.document.path or
+  if ready == nil or ready.generation < self.minimum_saved_generation or
+      ready.filename ~= request.capture.document.path or
       ready.session ~= request.capture.document.session then return nil end
   local span? = buffers.identifier_span(request.capture)
   if span == nil or strings.sub(request.capture.document.text, 1, span.bytes.start) ~= ready.anchor then
@@ -720,7 +739,7 @@ local function Service:provisional(request: Request): dispatcher.SemanticOutcome
   end
   local selected? = self.store:select_provisional(ready.id, ready.filename, ready.session,
     span.prefix, 200, function (): boolean
-      return not self.closed and self.buffers:current(request.capture)
+      return ready.generation >= self.minimum_saved_generation and self:request_current(request)
     end)
   if selected == nil then return nil end
   logging.emit("debug", "completion.provisional", {["items"] = #selected.candidates})
@@ -728,7 +747,7 @@ local function Service:provisional(request: Request): dispatcher.SemanticOutcome
 end
 
 local function Service:answer(request: Request): dispatcher.SemanticOutcome
-  if self.closed or not self.buffers:current(request.capture) then return empty() end
+  if not self:request_current(request) then return empty() end
   if self.ready == nil or not self.ready:valid_for(request) then
     if self.active == nil or self.active.key ~= request.key then self.pending = request end
     if self.worker == nil or self.worker:status():has_finished() then
@@ -740,7 +759,7 @@ local function Service:answer(request: Request): dispatcher.SemanticOutcome
     -- permit therefore yields a bounded, truthful retryable response.
     for attempt = 1, 15 do
       if self.ready ~= nil and self.ready:valid_for(request) then break end
-      if not self.buffers:current(request.capture) then return empty() end
+      if not self:request_current(request) then return empty() end
       if self.worker:status():has_finished() then break end
       timer.sleep(10)
     end
@@ -750,7 +769,7 @@ local function Service:answer(request: Request): dispatcher.SemanticOutcome
   local started = logging.clock()
   local wall = ffi.vscode_titan_monotonic_ms()
   local selected? = self.store:select(ready.id, ready.key, ready.prefix, 200,
-    function (): boolean return not self.closed and self.buffers:current(request.capture) end)
+    function (): boolean return self:request_current(request) end)
   logging.emit("debug", "completion.select", {
     ["cpu_ms"] = logging.elapsed_ms(started),
     ["wall_ms"] = ffi.vscode_titan_monotonic_ms() - wall,
@@ -809,7 +828,10 @@ local function Service:read_hover(capture: buffers.Capture,
   if original_offset == nil then return nil end
   local row? = self.store:hover_retained(context.id, capture.document.path,
     capture.document.session, original_offset,
-    function (): boolean return not self.closed and self.buffers:current(capture) end)
+    function (): boolean
+      return not self.closed and context.generation >= self.minimum_saved_generation and
+        self.buffers:current(capture)
+    end)
   if row == nil then return nil end
   local bytes? = file:current_span(row)
   if bytes == nil then return nil end

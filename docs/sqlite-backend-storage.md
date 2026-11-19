@@ -30,9 +30,9 @@ key. The key digests the physical root with `Compiler:cache_identity` and
 `ProjectConfig:semantic_identity`. The first fingerprints the compiler Lua
 trees as this process loaded them, their native Lua dependencies and the
 interface provider: the executable's embedded provider for the server's own
-SDK, or the selected installation's standard-provider archive by stat identity
-for a root that selects its own. Reinstalling either SDK therefore invalidates
-only the roots that used it. The second
+SDK, or the selected installation's standard archive (Unix) or provider DLL
+(Windows) by ordinary stat identity. Reinstalling either SDK invalidates only
+the roots that used it. The second
 covers the project configuration, except watcher policy. The key carries no
 schema number: `PRAGMA user_version` alone decides schema compatibility. A
 missing key is recorded, and a different stored key triggers `Cache:rebuild`.

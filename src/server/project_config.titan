@@ -42,6 +42,7 @@ record ProjectConfig
   extra_ffi_cppflags: string?
   compiler_root: string?
   compiler_root_file: string?
+  const use_selected_inventory: boolean?
 end
 
 local function copy_paths(source: {string}): {string}
@@ -62,6 +63,7 @@ function ProjectConfig:copy(): ProjectConfig
     extra_ffi_cppflags = self.extra_ffi_cppflags,
     compiler_root = self.compiler_root,
     compiler_root_file = self.compiler_root_file,
+    use_selected_inventory = self.use_selected_inventory,
   }
 end
 
@@ -82,6 +84,9 @@ function ProjectConfig:semantic_identity(): string
     local group = groups[group_index]
     output:write(#group .. ":")
     for index = 1, #group do output:write(#group[index] .. ":" .. group[index]) end
+  end
+  if self.use_selected_inventory ~= nil then
+    output:write(self.use_selected_inventory == true and "selected inventory" or "ordinary lookup")
   end
   return content_identity.digest(output:drain())
 end
@@ -115,6 +120,19 @@ local function resolve_config_path(config_file: string, base: string,
     return fail<|string|>(config_file, field .. ": " .. failure.message)
   end
   return resolved
+end
+
+--- Resolve a directory alias without changing the lexical configuration path.
+function physical_directory(path: string): string?
+  local metadata? = fs.stat(path)
+  if metadata == nil or metadata.kind ~= "directory" then return nil end
+  return source_text.normalize_absolute_path(fs.realpath(path))
+catch
+  if error is async.OperationError then
+    local failure = error as async.OperationError
+    if failure.name == "ENOENT" or failure.name == "ENOTDIR" then return nil end
+  end
+  raise
 end
 
 local function optional_path(config_file: string, base: string,
@@ -218,6 +236,7 @@ local function normalize_environment(config_file: string?,
                                      compiler_root_file: string?,
                                      project_root: string,
                                      default_binary_root: string,
+                                     selected_inventory_directory: string?,
                                      environment: Environment):
     ProjectConfig
   -- Invalid defaults still belong to the expected configuration pathname,
@@ -266,6 +285,11 @@ local function normalize_environment(config_file: string?,
   local binary_root = optional_path(
     error_path, project_root, raw_binary_root,
     "binary_modules_root", default_binary_root)
+  local use_selected_inventory: boolean? = nil
+  if selected_inventory_directory ~= nil then
+    use_selected_inventory = binary_root == selected_inventory_directory or
+      physical_directory(binary_root) == selected_inventory_directory
+  end
   local include_dirs = normalize_paths(
     error_path, project_root, raw_include_dirs,
     "extra_ffi_include_dirs", {})
@@ -279,7 +303,8 @@ local function normalize_environment(config_file: string?,
   end
   return ProjectConfig.new(
     project_root, config_file, include, exclude, source_module_roots,
-    binary_root, include_dirs, cppflags, compiler_root, compiler_root_file)
+    binary_root, include_dirs, cppflags, compiler_root, compiler_root_file,
+    use_selected_inventory)
 end
 
 -- Configuration is data, not an extension hook. Evaluate it with an empty
@@ -332,7 +357,8 @@ local function evaluate_local(config_file: string): Environment?
 end
 
 local function load_or_raise(project_root: string,
-                             installed_binary_modules_root: string):
+                             installed_binary_modules_root: string,
+                             selected_inventory_directory: string?):
     ProjectConfig
   local root = absolute_project_root(project_root)
   local default_binary_root = resolve_config_path(
@@ -357,7 +383,7 @@ local function load_or_raise(project_root: string,
   end
   return normalize_environment(
     actual_config_file, compiler_root_file, root, default_binary_root,
-    environment)
+    selected_inventory_directory, environment)
 end
 
 --- Compiler SDK selection the router reads before any worker process exists.
@@ -437,10 +463,12 @@ end
 -- testable.
 --- Evaluate optional titan-config.lua assignments and normalize paths against the project root.
 function load(project_root: string,
-              installed_binary_modules_root: string):
+              installed_binary_modules_root: string,
+              selected_inventory_directory: string?):
     (ProjectConfig?, Error?)
   do
-    return load_or_raise(project_root, installed_binary_modules_root), nil
+    return load_or_raise(project_root, installed_binary_modules_root,
+      selected_inventory_directory), nil
   catch
     if error is async.CancellationReason then raise end
     if error is Error then return nil, error as Error end
