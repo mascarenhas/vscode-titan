@@ -400,6 +400,9 @@ static int titan_ls_push_current_executable(lua_State *L) {
 #endif
 
 int titan_ls_push_server_image(lua_State *L) {
+    /* At most two rooted path buffers (Darwin), then one result or
+     * luaL_error's two formatted strings; success leaves just the path. */
+    luaL_checkstack(L, 4, "Titan language-server image");
     return titan_ls_push_current_executable(L);
 }
 

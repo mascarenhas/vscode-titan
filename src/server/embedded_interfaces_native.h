@@ -7,7 +7,8 @@
  * native target profile or any standard-library interfaces. */
 void titan_ls_preload_compiler_support(lua_State *L);
 
-/* Push the running server image's path without loading native interfaces. */
+/* Reserve scratch and push one path for the running server image without
+ * loading native interfaces. Errors unwind through the caller's Lua state. */
 int titan_ls_push_server_image(lua_State *L);
 
 /* Register compiler support and push the metadata-only standard-library

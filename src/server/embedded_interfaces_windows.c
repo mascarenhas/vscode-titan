@@ -281,7 +281,9 @@ void titan_ls_preload_compiler_support(lua_State *L) {
 int titan_ls_push_server_image(lua_State *L) {
     static const char image_anchor = 0;
     HMODULE module;
-    luaL_checkstack(L, 3, "Titan language-server image");
+    /* Two rooted conversion buffers, then one result or luaL_error's
+     * two formatted strings. The caller receives only the UTF-8 path. */
+    luaL_checkstack(L, 4, "Titan language-server image");
     if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
                            GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
                            (LPCWSTR)&image_anchor, &module))
