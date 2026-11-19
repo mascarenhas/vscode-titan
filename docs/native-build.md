@@ -173,6 +173,9 @@ workspace after VS Code closes. A killed run may leave its directory behind,
 but subsequent invocations never reuse it. Set `TITAN_LSP_TEST_CODE` to the
 absolute path of an existing VS Code executable to run the same config
 without downloading VS Code (for example in the Windows guest).
+Lifecycle tests identify the fake server instance by its private loopback
+listener and a per-process token, not by a PID which the OS may reuse. The
+prepared native-server test uses the proxy's joined child-close receipt.
 
 Router lifecycle tests also use `test/fixtures/router_worker_fixture.titan`, a
 framed child peer built with the server's `framing` and `wire` modules. Make

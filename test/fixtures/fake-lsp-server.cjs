@@ -2,7 +2,9 @@
 
 "use strict";
 
+const { randomUUID } = require("node:crypto");
 const fs = require("node:fs");
+const net = require("node:net");
 const path = require("node:path");
 const { pathToFileURL } = require("node:url");
 
@@ -32,6 +34,7 @@ const hangInitializeAndStayAlive =
 const initializeDelayMilliseconds =
   process.env.TITAN_LSP_FIXTURE_INITIALIZE_DELAY_ROOT === process.cwd() ? 500 : 0;
 let input = Buffer.alloc(0);
+let identity;
 
 for (const signal of ["SIGINT", "SIGTERM"]) {
   process.on(signal, () => {
@@ -40,12 +43,30 @@ for (const signal of ["SIGINT", "SIGTERM"]) {
   });
 }
 
-process.stdin.on("data", (chunk) => {
-  input = Buffer.concat([input, chunk]);
-  drainMessages();
-});
+function readProtocol() {
+  process.stdin.on("data", (chunk) => {
+    input = Buffer.concat([input, chunk]);
+    drainMessages();
+  });
+  process.stdin.on("end", () => process.exit(0));
+}
 
-process.stdin.on("end", () => process.exit(0));
+if (process.env.TITAN_LSP_TEST_FIXTURE_LEASE === "1") {
+  // A recycled PID or port does not identify this fixture instance. Prove
+  // liveness using its own nonce on a process-owned loopback listener.
+  const token = randomUUID();
+  const lease = net.createServer((socket) => {
+    socket.on("error", () => socket.destroy());
+    socket.end(token);
+  });
+  lease.listen(0, "127.0.0.1", () => {
+    identity = { port: lease.address().port, token };
+    lease.unref();
+    readProtocol();
+  });
+} else {
+  readProtocol();
+}
 
 function drainMessages() {
   while (true) {
@@ -267,6 +288,7 @@ function appendEvent(targetPath, details) {
   try {
     fs.appendFileSync(targetPath, `${JSON.stringify({
       pid: process.pid,
+      identity,
       cwd: process.cwd(),
       arguments: fixtureArguments,
       luaPath: process.env.TITAN_LS_LUA_PATH,

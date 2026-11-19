@@ -8,6 +8,7 @@ import {
   symlink,
   writeFile
 } from "node:fs/promises";
+import { connect } from "node:net";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import * as vscode from "vscode";
@@ -24,6 +25,7 @@ import {
 interface FixtureEvent {
   event: "initialize" | "shutdown" | "exit" | "terminate";
   pid: number;
+  identity: { port: number; token: string };
   cwd: string;
   arguments: string[];
   luaPath?: string;
@@ -44,7 +46,7 @@ interface FixtureEvent {
 }
 
 // Windows child.kill() terminates the process without delivering a catchable
-// SIGTERM. The child PID must still disappear on every platform.
+// SIGTERM. The specific fixture instance must still exit on every platform.
 const forcedTerminationEvents: FixtureEvent["event"][] =
   process.platform === "win32" ? [] : ["terminate"];
 
@@ -129,6 +131,7 @@ suite("Titan extension", () => {
       vscode.ConfigurationTarget.Global
     );
 
+    process.env.TITAN_LSP_TEST_FIXTURE_LEASE = "1";
     const extension = vscode.extensions.getExtension(extensionIdentifier);
     assert.ok(extension, `${extensionIdentifier} should be installed`);
     await extension.activate();
@@ -1090,8 +1093,7 @@ suite("Titan extension", () => {
         ["shutdown", "exit", "initialize", ...forcedTerminationEvents],
         10_000
       );
-      const failedPid = failed[2].pid;
-      await assertForcedTermination(failed, failedPid, 10_000);
+      await assertForcedTermination(failed, failed[2], 10_000);
 
       await vscode.workspace.getConfiguration(
         "titan.languageServer",
@@ -1112,13 +1114,11 @@ suite("Titan extension", () => {
         ["shutdown", "exit", "initialize", ...forcedTerminationEvents,
           "initialize"]
       );
-      const retryPid = retried.at(-1)!.pid;
-      assert.notEqual(retryPid, failedPid);
-      const livingPids = [...new Set(retried.map((event) => event.pid))]
-        .filter(isProcessAlive);
+      const retry = retried.at(-1)!;
+      assert.notEqual(retry.identity.token, failed[2].identity.token);
       assert.deepEqual(
-        livingPids,
-        [retryPid],
+        await livingFixtureTokens(retried),
+        [retry.identity.token],
         "retry should own exactly one living language-server process"
       );
     }
@@ -1155,7 +1155,6 @@ suite("Titan extension", () => {
         ["shutdown", "exit", "initialize"],
         10_000
       );
-      const ignoredShutdownPid = ignoring[2].pid;
 
       await vscode.workspace.getConfiguration(
         "titan.languageServer",
@@ -1182,16 +1181,14 @@ suite("Titan extension", () => {
           "initialize"
         ]
       );
-      assert.equal(replaced[3].pid, ignoredShutdownPid);
-      const replacementPid = replaced.at(-1)!.pid;
-      assert.notEqual(replacementPid, ignoredShutdownPid);
-      await assertForcedTermination(replaced, ignoredShutdownPid, 10_000);
-
-      const livingPids = [...new Set(replaced.map((event) => event.pid))]
-        .filter(isProcessAlive);
+      const terminating = ignoring[2];
+      const replacement = replaced.at(-1)!;
+      assert.equal(replaced[3].identity.token, terminating.identity.token);
+      assert.notEqual(replacement.identity.token, terminating.identity.token);
+      await assertForcedTermination(replaced, terminating, 10_000);
       assert.deepEqual(
-        livingPids,
-        [replacementPid],
+        await livingFixtureTokens(replaced),
+        [replacement.identity.token],
         "shutdown recovery should own exactly one living server process"
       );
     }
@@ -1240,7 +1237,7 @@ suite("Titan extension", () => {
           ["shutdown", "exit", "initialize"],
           "beta should start before alpha reaches its startup timeout"
         );
-        assert.equal(isProcessAlive(alphaBeforeTimeout[2].pid), true,
+        assert.ok(await isFixtureAlive(alphaBeforeTimeout[2]),
           "hanging alpha should remain alive when beta becomes ready");
         assert.equal(betaStarted[2].luaCPath, globalLuaCPath);
       } finally {
@@ -1256,8 +1253,8 @@ suite("Titan extension", () => {
         ["shutdown", "exit", "initialize", ...forcedTerminationEvents],
         35_000
       );
-      const hangingPid = alphaTimedOut[2].pid;
-      await assertForcedTermination(alphaTimedOut, hangingPid, 35_000);
+      const hanging = alphaTimedOut[2];
+      await assertForcedTermination(alphaTimedOut, hanging, 35_000);
 
       await vscode.workspace.getConfiguration(
         "titan.languageServer",
@@ -1282,20 +1279,12 @@ suite("Titan extension", () => {
         betaMarkerPath,
         ["shutdown", "exit", "initialize"]
       );
-      const retryPid = alphaRetried.at(-1)!.pid;
-      const betaPid = betaStable[2].pid;
-      assert.notEqual(retryPid, hangingPid);
-
-      const observedPids = new Set([
-        ...alphaRetried.map((event) => event.pid),
-        ...betaStable.map((event) => event.pid)
-      ]);
-      const livingPids = [...observedPids]
-        .filter(isProcessAlive)
-        .sort((left, right) => left - right);
+      const retry = alphaRetried.at(-1)!;
+      const betaCurrent = betaStable[2];
+      assert.notEqual(retry.identity.token, hanging.identity.token);
       assert.deepEqual(
-        livingPids,
-        [retryPid, betaPid].sort((left, right) => left - right),
+        await livingFixtureTokens([...alphaRetried, ...betaStable]),
+        [retry.identity.token, betaCurrent.identity.token].sort(),
         "the retry and beta should be the only living language-server processes"
       );
     }
@@ -1493,7 +1482,6 @@ async function assertNativeServerClosed(
       assert.deepEqual(events[1], {
         event: "close", pid: events[0].pid, code: 0, signal: null
       }, "native server was terminated before graceful exit");
-      await assertProcessExited(events[0].pid, timeoutMilliseconds);
       return;
     }
     await delay(50);
@@ -1864,44 +1852,59 @@ function delay(milliseconds: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
-async function assertProcessExited(
-  pid: number,
-  timeoutMilliseconds: number
-): Promise<void> {
-  const deadline = Date.now() + timeoutMilliseconds;
-  while (Date.now() < deadline) {
-    if (!isProcessAlive(pid)) {
-      return;
-    }
-    await delay(50);
-  }
-  assert.fail(`language-server process ${pid} remained alive after cleanup`);
+function isFixtureAlive(event: FixtureEvent): Promise<boolean> {
+  const { port, token } = event.identity;
+  // The suite's ES2022 library has no Promise.withResolvers declaration.
+  return new Promise((resolve, reject) => {
+    const socket = connect(port, "127.0.0.1");
+    let received = "";
+    socket.setEncoding("ascii");
+    // Bound a real socket check; a fake clock cannot drive its I/O.
+    socket.setTimeout(2_000, () => socket.destroy(
+      new Error(`fixture ${event.pid} did not answer its liveness check`)
+    ));
+    socket.on("data", (chunk: string) => {
+      received += chunk;
+      if (!token.startsWith(received)) {
+        socket.destroy();
+        resolve(false);
+      }
+    });
+    socket.once("end", () => resolve(received === token));
+    socket.once("error", (error: NodeJS.ErrnoException) => {
+      if (error.code === "ECONNREFUSED" || error.code === "ECONNRESET") {
+        resolve(false);
+      } else {
+        reject(error);
+      }
+    });
+  });
+}
+
+async function livingFixtureTokens(events: FixtureEvent[]): Promise<string[]> {
+  const instances = new Map(events.map((event) => [event.identity.token, event]));
+  const living = await Promise.all([...instances.values()].map(async (event) =>
+    await isFixtureAlive(event) ? event.identity.token : undefined));
+  return living.filter((token) => token !== undefined).sort();
 }
 
 async function assertForcedTermination(
   events: FixtureEvent[],
-  pid: number,
+  fixture: FixtureEvent,
   timeoutMilliseconds: number
 ): Promise<void> {
   if (process.platform !== "win32") {
     const termination = events.find((event) =>
-      event.event === "terminate" && event.pid === pid);
+      event.event === "terminate" && event.identity.token === fixture.identity.token);
     assert.ok(termination, "the fixture should receive forced SIGTERM");
     assert.equal(termination.signal, "SIGTERM");
   }
-  await assertProcessExited(pid, timeoutMilliseconds);
-}
-
-function isProcessAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    if (error instanceof Error && "code" in error && error.code === "ESRCH") {
-      return false;
-    }
-    throw error;
+  const deadline = Date.now() + timeoutMilliseconds;
+  while (Date.now() < deadline) {
+    if (!await isFixtureAlive(fixture)) return;
+    await delay(50);
   }
+  assert.fail(`language-server fixture ${fixture.pid} remained alive after cleanup`);
 }
 
 async function waitForDefinitions(
