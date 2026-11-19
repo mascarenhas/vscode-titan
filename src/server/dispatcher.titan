@@ -7,8 +7,8 @@ local lifecycle = import "server.lifecycle"
 local lsp = import "server.lsp_types"
 
 record DispatchResult
-  response: string?
-  exit_code: integer?
+  const response: string?
+  const exit_code: integer?
 end
 
 -- LSP narrows JSON-RPC request ids to strings and signed 32-bit integers.
@@ -22,23 +22,23 @@ end
 
 --- Saved-source language request with typed parameters.
 record SemanticRequest
-  id: RequestId
-  method: string
-  params: value
+  const id: RequestId
+  const method: string
+  const params: value
 end
 
 --- Client response to a server-initiated request, identified by its string id.
 record ClientResponse
-  id: string
-  result: value
-  failure: string?
+  const id: string
+  const result: value
+  const failure: string?
 end
 
 --- Completion request whose editor inputs are captured before deferred preparation.
 record CompletionRequest
-  id: RequestId
-  params: lsp.CompletionParams
-  options: lsp.CompletionOptions?
+  const id: RequestId
+  const params: lsp.CompletionParams
+  const options: lsp.CompletionOptions?
 end
 
 --- Successful semantic result or structured JSON-RPC failure.
@@ -62,21 +62,21 @@ end
 
 --- Stateful envelope validator and LSP lifecycle router.
 record Dispatcher
-  local lifecycle_state: lifecycle.Lifecycle
+  local const lifecycle_state: lifecycle.Lifecycle
   local completion_options: lsp.CompletionOptions?
 end
 
-local PARSE_ERROR = -32700
-local INVALID_REQUEST = -32600
-local METHOD_NOT_FOUND = -32601
-local INTERNAL_ERROR = -32603
-local MIN_REQUEST_ID = -2147483648
-local MAX_REQUEST_ID = 2147483647
+local const PARSE_ERROR = -32700
+local const INVALID_REQUEST = -32600
+local const METHOD_NOT_FOUND = -32601
+local const INTERNAL_ERROR = -32603
+local const MIN_REQUEST_ID = -2147483648
+local const MAX_REQUEST_ID = 2147483647
 
 --- Create the stateful envelope validator and lifecycle router.
 -- @param workspace_folders Advertise multi-root folder support to the client.
 function create(workspace_folders: boolean?): Dispatcher
-  return Dispatcher.new(lifecycle.create(workspace_folders), nil)
+  return Dispatcher { lifecycle_state = lifecycle.create(workspace_folders) }
 end
 
 function Dispatcher:phase_name(): string
@@ -117,50 +117,18 @@ function RequestId:to_json(): value
 end
 
 local function no_response(): DispatchResult
-  return DispatchResult.new(nil, nil)
+  return DispatchResult {}
 end
 
 function result_response(id: RequestId, result: value): DispatchResult
-  local response_result = result
-  if response_result == nil then response_result = wire.null() end
-  local envelope: wire.Object = {
-    ["jsonrpc"] = "2.0",
-    ["id"] = id:to_json(),
-    ["result"] = response_result,
-  }
-  return DispatchResult.new(wire.encode(envelope), nil)
-catch
-  if error is json.Error then
-    return failure_response(id, INTERNAL_ERROR, "Internal error")
-  end
-  raise
+  return DispatchResult { response = result_body(id:to_json(), result) }
 end
 
 function failure_response(id: RequestId?, code: integer,
                           message: string): DispatchResult
-  local failure: wire.Object = {["code"] = code, ["message"] = message}
-  local response_id = wire.null()
+  local response_id: value = nil
   if id ~= nil then response_id = id:to_json() end
-  local envelope: wire.Object = {
-    ["jsonrpc"] = "2.0", ["id"] = response_id, ["error"] = failure,
-  }
-  return DispatchResult.new(wire.encode(envelope), nil)
-catch
-  if error is json.Error then
-    -- Semantic error text may contain arbitrary filesystem/native bytes.
-    -- Use a fixed message, retaining the validated request ID. The wire output
-    -- budget reserves room for this envelope around any accepted string ID.
-    local response_id = wire.null()
-    if id ~= nil then response_id = id:to_json() end
-    local failure: wire.Object = {
-      ["code"] = INTERNAL_ERROR, ["message"] = "Internal error",
-    }
-    local envelope: wire.Object = {
-      ["jsonrpc"] = "2.0", ["id"] = response_id, ["error"] = failure,
-    }
-    return DispatchResult.new(wire.encode(envelope), nil)
-  end
-  raise
+  return DispatchResult { response = failure_body(response_id, code, message) }
 end
 
 local function object_string(object: wire.Object, key: string): string?
@@ -172,9 +140,8 @@ end
 local function request_id(item: value): RequestId?
   local number? = wire.as_integer(item)
   if number ~= nil then
-    local actual: integer = number
-    if actual < MIN_REQUEST_ID or actual > MAX_REQUEST_ID then return nil end
-    return RequestId.integer_id(actual)
+    if number < MIN_REQUEST_ID or number > MAX_REQUEST_ID then return nil end
+    return RequestId.integer_id(number)
   end
   local text? = wire.as_string(item)
   if text ~= nil then return RequestId.string_id(text) end
@@ -247,11 +214,11 @@ local function client_response(object: wire.Object): ClientResponse?
     failure_message = "client request failed"
     local failure? = wire.as_object(raw_error)
     if failure ~= nil then
-      local message? = wire.as_string((failure as wire.Object)["message"])
+      local message? = wire.as_string(failure["message"])
       if message ~= nil then failure_message = message end
     end
   end
-  return ClientResponse.new(id, object["result"], failure_message)
+  return ClientResponse(id, object["result"], failure_message)
 end
 
 local function Dispatcher:route_call(object: wire.Object): Route
@@ -270,7 +237,6 @@ local function Dispatcher:route_call(object: wire.Object): Route
       nil, INVALID_REQUEST, "Invalid Request"))
   end
 
-  local actual_method: string = method
   local id: RequestId? = nil
   if raw_id ~= nil then
     id = request_id(raw_id)
@@ -281,7 +247,7 @@ local function Dispatcher:route_call(object: wire.Object): Route
   end
   local is_request = id ~= nil
   local params = object["params"]
-  if not valid_envelope_params(actual_method, params) then
+  if not valid_envelope_params(method, params) then
     if not is_request then return immediate(no_response()) end
     return immediate(failure_response(
       id, INVALID_REQUEST, "Invalid Request"))
@@ -289,22 +255,22 @@ local function Dispatcher:route_call(object: wire.Object): Route
 
   -- Exit is a void notification. Reject structured params before mutating the
   -- lifecycle, while still accepting the interoperable omitted/null forms.
-  if actual_method == "exit" and params ~= nil and not wire.is_null(params) then
+  if method == "exit" and params ~= nil and not wire.is_null(params) then
     if not is_request then return immediate(no_response()) end
     return immediate(failure_response(
       id, INVALID_REQUEST, "Invalid Request"))
   end
 
   local decision = self.lifecycle_state:dispatch(
-    actual_method, is_request, params)
+    method, is_request, params)
   case decision
   when result(result) then
     if not is_request then return immediate(no_response()) end
-    if actual_method == "initialize" then
+    if method == "initialize" then
       self.completion_options = lsp.completion_options(params)
     end
     local reply = result_response(id, result)
-    if actual_method == "shutdown" then return Route.shutdown(reply) end
+    if method == "shutdown" then return Route.shutdown(reply) end
     return immediate(reply)
   when failure{code; message} then
     if not is_request then return immediate(no_response()) end
@@ -314,7 +280,7 @@ local function Dispatcher:route_call(object: wire.Object): Route
   when exit(code) then
     return Route.exit(code)
   when unhandled() then
-    if actual_method == "$/cancelRequest" then
+    if method == "$/cancelRequest" then
       if is_request then
         return immediate(failure_response(
           id, METHOD_NOT_FOUND, "Method not found"))
@@ -326,15 +292,16 @@ local function Dispatcher:route_call(object: wire.Object): Route
       end
       return Route.cancel(target)
     end
-    if not is_request then return document_notification(actual_method, params) end
-    if actual_method == "textDocument/completion" then
+    if not is_request then return document_notification(method, params) end
+    if method == "textDocument/completion" then
       local parsed?, failure? = lsp.parse_completion(params)
       if parsed == nil then
         return immediate(failure_response(id, failure.code, failure.message))
       end
-      return Route.completion(CompletionRequest.new(id, parsed, self.completion_options))
+      return Route.completion(
+        CompletionRequest(id, parsed, self.completion_options))
     end
-    return Route.semantic(SemanticRequest.new(id, actual_method, params))
+    return Route.semantic(SemanticRequest(id, method, params))
   end
   return immediate(no_response())
 end
@@ -345,7 +312,7 @@ function Dispatcher:route_value(parsed: value): Route
   if object == nil then
     return immediate(failure_response(nil, INVALID_REQUEST, "Invalid Request"))
   end
-  return self:route_call(object as wire.Object)
+  return self:route_call(object)
 end
 
 -- The router forwards original message bytes, so it needs the same response
@@ -379,6 +346,9 @@ function failure_body(id: value, code: integer, message: string): string
   return wire.encode(envelope)
 catch
   if error is json.Error then
+    -- Semantic error text may contain arbitrary filesystem/native bytes.
+    -- Use a fixed message, retaining the validated request ID. The wire output
+    -- budget reserves room for this envelope around any accepted string ID.
     local response_id = id
     if response_id == nil then response_id = wire.null() end
     local failure: wire.Object = {
@@ -425,7 +395,7 @@ function Dispatcher:dispatch(source: string): DispatchResult
   when client_response() then return no_response()
   when cancel() then return no_response()
   when shutdown(result) then return result
-  when exit(code) then return DispatchResult.new(nil, code)
+  when exit(code) then return DispatchResult { exit_code = code }
   end
   return no_response()
 end

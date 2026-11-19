@@ -13,7 +13,7 @@ local response_queue = import "server.response_queue"
 
 --- Transport or response-drain failure raised by the server protocol owner.
 record ProtocolError
-  message: string
+  const message: string
 end
 
 type NotificationSink = function (string): ()
@@ -25,10 +25,10 @@ type ClientChannelBinder = function (
 
 --- One framed client body whose acknowledged delivery resumes the reader.
 record InputDelivery
-  body: string
+  const body: string
   acknowledged: boolean
   reader: async.Task?
-  resume_token: async.ResumeToken
+  const resume_token: async.ResumeToken
 end
 
 --- Next framed client body, clean end of input, or transport failure.
@@ -41,24 +41,28 @@ end
 --- Ordered client-input queue with one reserved consumer.
 record InputQueue
   items: {InputEvent}
+  head: integer
   waiter: async.Task?
-  resume_token: async.ResumeToken
+  const resume_token: async.ResumeToken
 end
 
 local record Session
-  input: InputQueue
-  output: response_queue.ResponseQueue
-  requests: outbound_requests.OutboundRequests
-  coordinator: coordinator.Coordinator
-  reader: async.Task<|nil, value|>
-  writer: async.Task<|nil, value|>
+  const input: InputQueue
+  const output: response_queue.ResponseQueue
+  const requests: outbound_requests.OutboundRequests
+  const coordinator: coordinator.Coordinator
+  const reader: async.Task<|nil, value|>
+  const writer: async.Task<|nil, value|>
   closed: boolean
 end
 
 --- Create an empty framed-input queue for one client stream.
 function new_input_queue(): InputQueue
-  return InputQueue.new(
-    {}, nil, async.ResumeToken.new("server.protocol.input_queue"))
+  return InputQueue {
+    items = {},
+    head = 1,
+    resume_token = async.ResumeToken("server.protocol.input_queue"),
+  }
 end
 
 --- Release the client reader to submit the next framed body.
@@ -95,7 +99,7 @@ end
 
 --- Take the next input event, suspending while the queue is empty.
 function InputQueue:take(): InputEvent
-  if #self.items == 0 then
+  if self.head > #self.items then
     if self.waiter ~= nil then
       raise "protocol input queue already has a waiting consumer"
     end
@@ -108,12 +112,14 @@ function InputQueue:take(): InputEvent
     async.suspend(self.resume_token, detach)
   end
 
-  local count = #self.items
-  local event = self.items[1]
-  for index = 1, count - 1 do
-    self.items[index] = self.items[index + 1]
+  local index = self.head
+  local event = self.items[index]
+  self.items[index] = nil
+  self.head = index + 1
+  if self.head > #self.items then
+    self.items = {}
+    self.head = 1
   end
-  self.items[count] = nil
   return event
 end
 
@@ -131,9 +137,11 @@ function read_messages(source: io.Reader, queue: InputQueue): nil
     logging.emit("trace", "protocol.receive", {
       ["bytes"] = #body,
     })
-    local delivery = InputDelivery.new(
-      body, false, nil,
-      async.ResumeToken.new("server.protocol.input_delivery"))
+    local delivery = InputDelivery {
+      body = body,
+      acknowledged = false,
+      resume_token = async.ResumeToken("server.protocol.input_delivery"),
+    }
     queue:push(InputEvent.message(delivery))
     -- Do not submit another stdin read until the coordinator has processed
     -- this envelope. In particular, exit leaves the reader explicitly
@@ -144,7 +152,7 @@ function read_messages(source: io.Reader, queue: InputQueue): nil
   return nil
 catch
   if error is framing.FrameError then
-    local failure = error as framing.FrameError
+    local failure: framing.FrameError = error
     queue:push(InputEvent.failure(failure.message))
   else
     queue:push(InputEvent.failure(strings.tostring(error)))
@@ -192,7 +200,15 @@ local function new_session(source: io.Reader, target: io.Writer,
   local reader = async.run<|nil, value|>(function (): nil
     return read_messages(source, input)
   end)
-  return Session.new(input, output, requests, server, reader, writer, false)
+  return Session {
+    input = input,
+    output = output,
+    requests = requests,
+    coordinator = server,
+    reader = reader,
+    writer = writer,
+    closed = false,
+  }
 end
 
 local function rethrow_failed(status: async.TaskStatus<|nil, value|>,
@@ -254,15 +270,12 @@ function run(source: io.Reader, target: io.Writer,
     end)
   end
   if startup_notification ~= nil then
-    session.output:push(startup_notification as string)
+    session.output:push(startup_notification)
   end
   if client_binder ~= nil then
     -- The channel outlives this call's notification window: a server-initiated
     -- request is answered through the coordinator's already validated routing.
-    client_binder(session.requests,
-      function (): lsp.ClientCapabilities?
-        return session.coordinator:client_capabilities()
-      end)
+    client_binder(session.requests, session.coordinator:client_capabilities)
   end
 
   while true do
@@ -276,9 +289,9 @@ function run(source: io.Reader, target: io.Writer,
       -- others.
       async.yield()
     when eof() then
-      raise ProtocolError.new("stdin closed before the exit notification")
+      raise ProtocolError("stdin closed before the exit notification")
     when failure(message) then
-      raise ProtocolError.new(message)
+      raise ProtocolError(message)
     end
   end
   return 1

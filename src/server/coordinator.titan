@@ -20,35 +20,35 @@ type DocumentHandler = function (lsp.DocumentNotification): ()
 local type RemoveListener = function (): ()
 
 local record ActiveRequest
-  id: dispatcher.RequestId
-  method: string
-  task: async.Task<|dispatcher.SemanticOutcome, value|>
+  const id: dispatcher.RequestId
+  const method: string
+  const task: async.Task<|dispatcher.SemanticOutcome, value|>
   remove_listener: RemoveListener?
   responded: boolean
-  started: float
+  const started: float
 end
 
 --- Own in-flight request Tasks, dispatch state, and response-queue publication.
 record Coordinator
-  local router: dispatcher.Dispatcher
-  local output: response_queue.ResponseQueue
-  local handler: SemanticHandler
-  local initialized_handler: InitializedHandler?
-  local shutdown_handler: ShutdownHandler?
-  local active: {ActiveRequest}
+  local const router: dispatcher.Dispatcher
+  local const output: response_queue.ResponseQueue
+  local const handler: SemanticHandler
+  local const initialized_handler: InitializedHandler?
+  local const shutdown_handler: ShutdownHandler?
+  local const active: {ActiveRequest}
   local document_handler: DocumentHandler?
   local completion_capture: CompletionCapture?
   local hover_capture: HoverCapture?
   local outbound: outbound_requests.OutboundRequests?
 end
 
-local REQUEST_CANCELLED = -32800
-local INTERNAL_ERROR = -32603
-local INVALID_REQUEST = -32600
-local METHOD_NOT_FOUND = -32601
+local const REQUEST_CANCELLED = -32800
+local const INTERNAL_ERROR = -32603
+local const INVALID_REQUEST = -32600
+local const METHOD_NOT_FOUND = -32601
 
 local function method_not_found(
-    _request: dispatcher.SemanticRequest): dispatcher.SemanticOutcome
+    _: dispatcher.SemanticRequest): dispatcher.SemanticOutcome
   return dispatcher.SemanticOutcome.failure(METHOD_NOT_FOUND, "Method not found")
 end
 
@@ -57,11 +57,15 @@ function create(output: response_queue.ResponseQueue,
                 handler: SemanticHandler?,
                 initialized_handler: InitializedHandler?,
                 shutdown_handler: ShutdownHandler?): Coordinator
-  local actual = method_not_found
-  if handler ~= nil then actual = handler end
-  return Coordinator.new(
-    dispatcher.create(), output, actual, initialized_handler,
-    shutdown_handler, {}, nil, nil, nil, nil)
+  local actual = handler or method_not_found
+  return Coordinator {
+    router = dispatcher.create(),
+    output = output,
+    handler = actual,
+    initialized_handler = initialized_handler,
+    shutdown_handler = shutdown_handler,
+    active = {},
+  }
 end
 
 function Coordinator:configure_hover(capture: HoverCapture)
@@ -170,11 +174,8 @@ local function Coordinator:start(id: dispatcher.RequestId,
     return
   end
 
-  local task = async.run<|dispatcher.SemanticOutcome, value|>(
-    function (): dispatcher.SemanticOutcome
-      return work()
-    end)
-  local active = ActiveRequest.new(
+  local task = async.run(work)
+  local active = ActiveRequest(
     id, method, task, nil, false, logging.clock())
   self.active[#self.active + 1] = active
   logging.emit("debug", "request.start", {
@@ -231,10 +232,7 @@ end
 
 --- Cancel and drain every active request before lifecycle teardown.
 function Coordinator:cancel_all(reason: string)
-  local snapshot: {ActiveRequest} = {}
-  for index = 1, #self.active do
-    snapshot[index] = self.active[index]
-  end
+  local snapshot: {ActiveRequest} = {...self.active}
 
   for index = 1, #snapshot do
     local task = snapshot[index].task
@@ -316,8 +314,7 @@ function Coordinator:handle(source: string): integer?
     -- a waiting owner resumes now instead of when the writer finally stops.
     local outbound? = self.outbound
     if outbound ~= nil then
-      local requests = outbound as outbound_requests.OutboundRequests
-      requests:close()
+      outbound:close()
     end
     local handler? = self.shutdown_handler
     if handler ~= nil then handler() end

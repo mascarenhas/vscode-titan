@@ -48,10 +48,6 @@ record BufferStore
   local capacity_exceeded: boolean
 end
 
-local MAX_DOCUMENT_BYTES = 4 * 1024 * 1024
-local MAX_WORKSPACE_BYTES = 32 * 1024 * 1024
-local MAX_DOCUMENTS = 256
-
 --- Editor-text limits one workspace applies to retained buffers.
 -- The router retains open documents for replay and applies the same limits, so
 -- this is the one owner of the numbers.
@@ -61,13 +57,25 @@ record Limits
   const documents: integer
 end
 
+local const DEFAULT_LIMITS = Limits {
+  document_bytes = 4 * 1024 * 1024,
+  workspace_bytes = 32 * 1024 * 1024,
+  documents = 256,
+}
+
 --- Return the limits every retained editor buffer obeys.
 function limits(): Limits
-  return Limits.new(MAX_DOCUMENT_BYTES, MAX_WORKSPACE_BYTES, MAX_DOCUMENTS)
+  return DEFAULT_LIMITS
 end
 
 function create(): BufferStore
-  return BufferStore.new({}, 0, 0, 0, false)
+  return BufferStore {
+    documents = {},
+    next_session = 0,
+    revision = 0,
+    retained_bytes = 0,
+    capacity_exceeded = false,
+  }
 end
 
 function BufferStore:epoch(): integer
@@ -98,11 +106,16 @@ local function BufferStore:replace(state: DocumentState,
   end
   state.version = version
   state.input = nil
-  local bounded = limits()
-  if #text <= bounded.document_bytes and
-     self.retained_bytes + #text <= bounded.workspace_bytes then
+  if #text <= DEFAULT_LIMITS.document_bytes and
+     self.retained_bytes + #text <= DEFAULT_LIMITS.workspace_bytes then
     local uri? = source_text.path_to_file_uri(document.path)
-    state.input = Input.new(uri, document.path, state.session, version, text)
+    state.input = Input {
+      uri = uri,
+      path = document.path,
+      session = state.session,
+      version = version,
+      text = text,
+    }
     self.retained_bytes = self.retained_bytes + #text
   end
   -- Even an over-budget version obsoletes old edits. Retain its version
@@ -116,14 +129,18 @@ function BufferStore:apply(notification: lsp.DocumentNotification): boolean
   when opened(opened) then
     local state? = self:find(opened.document.path)
     if state == nil then
-      if #self.documents >= limits().documents then
+      if #self.documents >= DEFAULT_LIMITS.documents then
         -- We cannot forget an open contributor and silently reuse its saved
         -- bytes. Stop completion until this workspace store is recreated.
         self.capacity_exceeded = true
         self.revision = self.revision + 1
         return true
       end
-      state = DocumentState.new(opened.document.path, 0, opened.version, nil)
+      state = DocumentState {
+        path = opened.document.path,
+        session = 0,
+        version = opened.version,
+      }
       self.documents[#self.documents + 1] = state
     end
     self.next_session = self.next_session + 1
@@ -165,7 +182,7 @@ function BufferStore:observe_unavailable(document: lsp.TextDocument,
                                          version: integer): boolean
   local state? = self:find(document.path)
   if state == nil then
-    if #self.documents >= limits().documents then
+    if #self.documents >= DEFAULT_LIMITS.documents then
       -- The workspace store cannot take another document; completion stops
       -- until it is recreated, exactly as for an over-count open.
       self.capacity_exceeded = true
@@ -173,17 +190,16 @@ function BufferStore:observe_unavailable(document: lsp.TextDocument,
       return true
     end
     self.documents[#self.documents + 1] =
-      DocumentState.new(document.path, 0, version, nil)
+      DocumentState { path = document.path, session = 0, version = version }
     self.revision = self.revision + 1
     return true
   end
-  local actual = state as DocumentState
-  local previous? = actual.input
+  local previous? = state.input
   if previous ~= nil then
-    self.retained_bytes = self.retained_bytes - #((previous as Input).text)
+    self.retained_bytes = self.retained_bytes - #previous.text
   end
-  actual.input = nil
-  actual.version = version
+  state.input = nil
+  state.version = version
   self.revision = self.revision + 1
   return true
 end
@@ -208,8 +224,14 @@ function BufferStore:capture(path: string, position: source_text.Position): Capt
       unavailable[#unavailable + 1] = self.documents[index].path
     end
   end
-  return Capture.new(state.input, self:inputs(), unavailable as const {string}, self.revision,
-    source_text.Position.new(position.line, position.character))
+  local unavailable_paths = unavailable as const {string}
+  return Capture {
+    document = state.input,
+    inputs = self:inputs(),
+    unavailable_paths = unavailable_paths,
+    epoch = self.revision,
+    position = position,
+  }
 end
 
 --- Check that a retained capture still matches its document session and version.
@@ -244,6 +266,10 @@ function identifier_span(capture: Capture): (IdentifierSpan?, source_text.Error?
   end
   local range?, range_error? = coordinates:span_for_offsets(first, finish)
   if range == nil then return nil, range_error end
-  return IdentifierSpan.new(caret, source_text.ByteSpan.new(first, finish),
-    range, strings.sub(source, first + 1, caret)), nil
+  return IdentifierSpan {
+    caret_byte = caret,
+    bytes = source_text.ByteSpan(first, finish),
+    range = range,
+    prefix = strings.sub(source, first + 1, caret),
+  }, nil
 end

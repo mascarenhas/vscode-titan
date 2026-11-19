@@ -15,7 +15,7 @@ record PendingRequest
   local result: value
   local failure: string?
   local waiter: async.Task?
-  local resume_token: async.ResumeToken
+  local const resume_token: async.ResumeToken
 end
 
 --- Identifier allocation, outbound envelopes, and client-response routing.
@@ -28,7 +28,7 @@ end
 
 --- Create the outbound request owner over the session's sole writer.
 function create(output: response_queue.ResponseQueue): OutboundRequests
-  return OutboundRequests.new(output, 0, {}, false)
+  return OutboundRequests(output, 0, {}, false)
 end
 
 function OutboundRequests:is_closed(): boolean
@@ -83,9 +83,12 @@ function OutboundRequests:start(method: string, params: value):
   if self.closed then return nil, "language server session ended" end
   self.sequence = self.sequence + 1
   local id = "titan/" .. self.sequence
-  local pending = PendingRequest.new(
-    id, method, false, nil, nil, nil,
-    async.ResumeToken.new("server.outbound_requests"))
+  local pending = PendingRequest {
+    id = id,
+    method = method,
+    settled = false,
+    resume_token = async.ResumeToken("server.outbound_requests"),
+  }
   local envelope: wire.Object = {
     ["jsonrpc"] = "2.0",
     ["id"] = id,
@@ -187,11 +190,10 @@ function PendingRequest:wait(milliseconds: integer?): (value?, string?)
   -- its native timer handle are terminal before the caller continues.
   local pending_deadline? = deadline
   if pending_deadline ~= nil then
-    local retired = pending_deadline as async.Task<|nil, value|>
-    if not retired:status():has_finished() then
-      retired:cancel(async.CancellationReason.simple("request settled"))
+    if not pending_deadline:status():has_finished() then
+      pending_deadline:cancel(async.CancellationReason.simple("request settled"))
     end
-    async.join(retired)
+    async.join(pending_deadline)
   end
   return self.result, self.failure
 end

@@ -10,7 +10,7 @@ local math = import "math"
 -- prefix of the next message when the operating system returns both at once.
 --- Malformed, truncated, or oversized protocol frame.
 record FrameError
-  message: string
+  const message: string
 end
 
 --- Incremental framing buffer preserving incomplete headers and bodies.
@@ -18,16 +18,16 @@ record FrameReader
   local buffer: string
 end
 
-local MAX_HEADER_BYTES = 65536
-local MAX_CONTENT_BYTES = 16777216
+local const MAX_HEADER_BYTES = 65536
+local const MAX_CONTENT_BYTES = 16777216
 
 local function reject<|T|>(message: string): T
-  raise FrameError.new(message)
+  raise FrameError(message)
 end
 
 --- Create an empty incremental protocol frame reader.
 function reader(): FrameReader
-  return FrameReader.new("")
+  return FrameReader("")
 end
 
 --- Prefix a JSON body with Content-Length measured in bytes.
@@ -65,10 +65,10 @@ local function valid_header_name(name: string): boolean
   if #name == 0 then return false end
   for index = 1, #name do
     local byte: integer = strings.byte(name, index)
-    local alpha: boolean = (byte >= 65 and byte <= 90) or
-                           (byte >= 97 and byte <= 122)
-    local digit: boolean = byte >= 48 and byte <= 57
-    local punctuation: boolean = byte == 33 or byte == 35 or byte == 36 or
+    local alpha = (byte >= 65 and byte <= 90) or
+                  (byte >= 97 and byte <= 122)
+    local digit = byte >= 48 and byte <= 57
+    local punctuation = byte == 33 or byte == 35 or byte == 36 or
       byte == 37 or byte == 38 or byte == 39 or byte == 42 or
       byte == 43 or byte == 45 or byte == 46 or byte == 94 or
       byte == 95 or byte == 96 or byte == 124 or byte == 126
@@ -119,7 +119,7 @@ local function valid_header_value(subject: string): boolean
 end
 
 local function validate_content_type(subject: string)
-  local semicolon?: integer = strings.find(subject, ";")
+  local semicolon? = strings.find(subject, ";")
   local mime = subject
   local parameter: string? = nil
   if semicolon ~= nil then
@@ -135,7 +135,7 @@ local function validate_content_type(subject: string)
     reject<|value|>("unsupported LSP Content-Type parameter")
   end
 
-  local equals?: integer = strings.find(parameter, "=")
+  local equals? = strings.find(parameter, "=")
   if equals == nil then
     reject<|value|>("invalid LSP Content-Type parameter")
   end
@@ -154,7 +154,7 @@ local function parse_headers(headers: string): integer
   local content_type_seen = false
   local position = 1
   while position <= #headers do
-    local line_end?: integer = strings.find(headers, "\r\n", position)
+    local line_end? = strings.find(headers, "\r\n", position)
     local line = ""
     if line_end then
       line = strings.sub(headers, position, line_end - 1)
@@ -171,7 +171,7 @@ local function parse_headers(headers: string): integer
       return reject<|integer|>("LSP header lines must end with CRLF")
     end
 
-    local colon?: integer = strings.find(line, ":")
+    local colon? = strings.find(line, ":")
     if colon == nil then
       return reject<|integer|>("LSP header line is missing ':'")
     end
@@ -206,9 +206,8 @@ end
 
 --- Extract one complete body, return nil while incomplete, or raise FrameError.
 function FrameReader:next(): string?
-  local header_first?: integer, header_last?: integer =
-    strings.find(self.buffer, "\r\n\r\n")
-  if header_first == nil then
+  local first?, last? = strings.find(self.buffer, "\r\n\r\n")
+  if first == nil then
     validate_partial_header_line_endings(self.buffer)
     if #self.buffer > MAX_HEADER_BYTES then
       return reject<|string|>("LSP header block exceeds 65536 bytes")
@@ -216,8 +215,6 @@ function FrameReader:next(): string?
     return nil
   end
 
-  local first: integer = header_first
-  local last: integer = header_last
   if first - 1 > MAX_HEADER_BYTES then
     return reject<|string|>("LSP header block exceeds 65536 bytes")
   end
