@@ -589,6 +589,9 @@ including a mapped share such as `W:/project`) or UNC paths
 (`//server/share/project`). Drive-relative, current-drive-rooted and device
 namespace paths are rejected. UNC server names must be bounded ASCII host
 names. Drive letters are normalized, but whole paths are not case-folded.
+A workspace opened through a traversable directory symlink is sent to the
+server as its physical root, even if VS Code spells the drive letter
+differently in its workspace and document URIs.
 
 File notifications on shared folders are best effort. The supported watcher
 location is a guest-local NTFS folder.

@@ -442,16 +442,20 @@ publishing are separate operations.
 Native process tests, SQLite cache reopen tests, stdio protocol tests, package
 inspection and an interactive Extension Host (F5) session are separate gates. A
 successful compilation, a DLL helper test or an SSH-launched `code` command does
-not establish them. Symlink checks skip when the account lacks symlink privilege.
+not establish them. Symlink checks skip when the account cannot create or
+traverse the fixture links.
+To qualify the Windows symlink case, run the Extension Host suite elevated
+on local NTFS so the test can create and traverse its directory link.
 The multi-root transcript's per-root SDK cases skip on Windows: a selected
 root's `compiler_root` needs the bridge to load that SDK's provider, the Unix
 path loads the `titan.a` archive provider, and a Windows SDK ships `titan.dll`
 instead ([vscode-titan#136](https://github.com/mascarenhas/vscode-titan/issues/136)).
 
-`scripts/test-server-protocol.mjs`, `scripts/test-multi-root.mjs` and
-`scripts/test-completion-protocol.mjs` each take the built server executable as
-their first argument, and need the environment the Unix `SERVER_TEST_ENV`
-supplies. Set `TITAN_ROOT` to the selected SDK, `TITAN_LS_LUA_PATH` to
+`scripts/test-server-protocol.mjs`, `scripts/test-workspace-cache.mjs`,
+`scripts/test-multi-root.mjs` and `scripts/test-completion-protocol.mjs` each
+take the built server executable as their first argument and need the
+environment the Unix `SERVER_TEST_ENV` supplies. Set `TITAN_ROOT` to the
+selected SDK, `TITAN_LS_LUA_PATH` to
 `<sdk>/share/lua/5.5/?.lua;<sdk>/share/lua/5.5/?/init.lua`,
 `TITAN_LS_LUA_CPATH` to `<sdk>/lib/lua/5.5/?.dll`, and
 `TITAN_ROUTER_WORKER_FIXTURE` to the peer that `server-test-build` links at

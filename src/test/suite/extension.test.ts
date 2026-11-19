@@ -70,12 +70,6 @@ interface CapturedSyntaxToken {
 
 const extensionIdentifier = "mascarenhas.titan";
 
-// A call keeps TypeScript from narrowing process.platform across the early
-// Windows skip below, where the case returns before its POSIX-only fixture.
-function isWindows(): boolean {
-  return process.platform === "win32";
-}
-
 suite("Titan extension", () => {
   const configuredLuaPath = "/fixture/compiler/?.lua";
   const configuredLuaCPath = "/fixture/compiler/?.so";
@@ -901,16 +895,6 @@ suite("Titan extension", () => {
   test("maps a lexical symlink workspace to one physical server root",
     async function () {
       this.timeout(30_000);
-      // The Extension Host itself reports the lexical root for a symlinked
-      // workspace on Windows, even where Node resolves the link, so the case
-      // would assert against that Windows behaviour rather than this mapping.
-      if (isWindows()) {
-        console.log("skipping the lexical symlink workspace case: the " +
-          "Extension Host sends the lexical root for a symlinked workspace " +
-          "on Windows (vscode-titan#135)");
-        this.skip();
-        return;
-      }
       const repositoryRoot = path.resolve(__dirname, "../../../..");
       const fakeServer = path.join(
         repositoryRoot,
@@ -940,7 +924,7 @@ suite("Titan extension", () => {
         try {
           await symlink(physicalRoot, lexicalRoot, "dir");
         } catch (cause) {
-          if (isWindows() &&
+          if (process.platform === "win32" &&
               (cause as NodeJS.ErrnoException).code === "EPERM") {
             this.skip();
           }
@@ -948,14 +932,14 @@ suite("Titan extension", () => {
         }
         // A link this account created may still be untraversable: Windows marks
         // a link made without SeCreateSymbolicLinkPrivilege as an untrusted
-        // mount point and refuses to resolve it, and the client then falls back
-        // to the lexical root. Skip instead of asserting against that fallback.
+        // mount point and refuses to resolve it. Skip only if the account
+        // cannot exercise the mapping with this fixture.
         let resolvedLink: string;
         try {
           resolvedLink = await realpath(lexicalRoot);
         } catch (cause) {
           const code = (cause as NodeJS.ErrnoException).code ?? "";
-          if (isWindows() &&
+          if (process.platform === "win32" &&
               ["EPERM", "EACCES", "UNKNOWN", "ENOSYS"].includes(code)) {
             console.log("skipping the lexical symlink workspace case: Windows " +
               "refuses to traverse the created directory link " +
@@ -1011,6 +995,10 @@ suite("Titan extension", () => {
         );
         const canonicalUri = vscode.Uri.file(canonicalRoot).toString();
         assertNativePathEqual(initialization.cwd, canonicalRoot);
+        assertNativePathEqual(
+          initialization.initializationOptions?.trustedRoots?.[0], canonicalRoot
+        );
+        assert.equal(initialization.initializationOptions?.trustedRoots?.length, 1);
         // vscode-languageclient keeps the deprecated rootPath lexical, but the
         // authoritative rootUri and every document URI use our converter.
         assertNativePathEqual(initialization.rootPath, lexicalRoot);
@@ -1019,6 +1007,33 @@ suite("Titan extension", () => {
           uri: canonicalUri,
           name: "symlink"
         }]);
+
+        const converters = createWorkspaceUriConverters(symlinkFolder, canonicalRoot);
+        const components = { query: "selection=1", fragment: "line-2" };
+        const lexicalDocument = vscode.Uri.joinPath(symlinkFolder.uri, "sample.titan")
+          .with(components);
+        const physicalDocument = vscode.Uri.joinPath(
+          vscode.Uri.file(canonicalRoot), "sample.titan"
+        ).with(components);
+        let outgoing = lexicalDocument;
+        let serverUri = physicalDocument.toString();
+        if (process.platform === "win32") {
+          const drive = lexicalDocument.path[1];
+          const opposite = drive === drive.toUpperCase() ? drive.toLowerCase() : drive.toUpperCase();
+          outgoing = lexicalDocument.with({ path: `/${opposite}${lexicalDocument.path.slice(2)}` });
+          assert.notEqual(outgoing.path, lexicalDocument.path);
+          // The native server writes an uppercase drive and an unescaped colon.
+          serverUri = serverUri.replace(/^file:\/\/\/([a-z])%3A\//,
+            (_, letter: string) => `file:///${letter.toUpperCase()}:/`);
+          assert.match(serverUri, /^file:\/\/\/[A-Z]:\//);
+        }
+        assert.equal(converters.code2Protocol(outgoing), physicalDocument.toString());
+        const returned = converters.protocol2Code(serverUri);
+        assert.equal(returned.scheme, lexicalDocument.scheme);
+        assert.equal(returned.authority, lexicalDocument.authority);
+        assert.equal(returned.path, lexicalDocument.path);
+        assert.equal(returned.query, lexicalDocument.query);
+        assert.equal(returned.fragment, lexicalDocument.fragment);
 
         const document = await vscode.workspace.openTextDocument(
           vscode.Uri.joinPath(symlinkFolder.uri, "sample.titan")

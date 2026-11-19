@@ -2,6 +2,8 @@ foreign import "compiler_io_platform.h"
 local async = import "async"
 local fs = import "fs"
 local indexing_status = import "server.indexing_status"
+local iteration = import "iteration"
+local lsp = import "server.lsp_types"
 local os = import "os"
 local test = import "test"
 local router = import "server.router.titan"
@@ -680,6 +682,39 @@ function test_router_released_worker_exit_clears_unowned_diagnostics(
     subject:reconcile()
     test.assert(subject.output:pending() == 0,
       "reconciliation cleared an already-cleared publication again")
+  end)
+end
+
+function test_router_deduplicates_equivalent_unowned_document_uris(
+    _context: test.Context)
+  with_root(function (base: string)
+    local subject = fixture_router(base)
+    defer subject:close()
+    local filename = base .. "/unclaimed.titan"
+    local canonical = source_text.path_to_file_uri(filename)
+    local equivalent = "file://localhost" .. strings.sub(canonical, 8)
+    if ffi.VSCODE_TITAN_WINDOWS ~= 0 then
+      equivalent = strings.sub(canonical, 1, 8) ..
+        strings.lower(strings.sub(canonical, 9, 9)) .. "%3A" ..
+        strings.sub(canonical, 11)
+    end
+    test.assert(equivalent ~= canonical, "the fixture used the same URI twice")
+    local send_open = function (uri: string)
+      local document: wire.Object = {
+        ["uri"] = uri, ["languageId"] = "titan", ["version"] = 1, ["text"] = "",
+      }
+      local params: wire.Object = {["textDocument"] = document}
+      local notification = lsp.parse_open(params)
+      subject:route_document(lsp.DocumentNotification.opened(notification), "")
+    end
+    send_open(canonical)
+    send_open(equivalent)
+    local observed = 0
+    for key in iteration.pairs(subject.unowned_logged) do
+      test.assert(key == filename, "an unowned URI was keyed by its wire spelling")
+      observed = observed + 1
+    end
+    test.assert(observed == 1, "equivalent document URIs did not share log suppression")
   end)
 end
 

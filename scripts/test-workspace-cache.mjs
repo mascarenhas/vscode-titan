@@ -346,8 +346,12 @@ try {
   const explicitProbePrefix = path.join(root, ".titan-ls", "explicit-probe-prefix");
   // An inherited probe prefix is namespaced per root: roots never share probe
   // results, which depend on each root's SDK headers and flags.
+  // The server hashes the registered path, not Node's native realpath spelling.
+  const registeredRoot = process.platform === "win32"
+    ? root.replaceAll("\\", "/").replace(/^[a-z]:/, (drive) => drive.toUpperCase())
+    : root;
   const rootProbePrefix = path.join(explicitProbePrefix, "roots",
-    createHash("sha256").update(root, "utf8").digest("hex").slice(0, 16));
+    createHash("sha256").update(registeredRoot, "utf8").digest("hex").slice(0, 16));
   const changedHeader = await withServer("changed-header", featureSnapshot,
     { TITAN_PREFIX: explicitProbePrefix });
   assert.deepEqual(changedHeader.result, cold.result);
