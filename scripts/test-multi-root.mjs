@@ -26,6 +26,7 @@ import {
   frame,
   launch,
   request,
+  structuredLogRecords,
   withTimeout
 } from "./test-server-protocol.mjs";
 
@@ -2452,6 +2453,131 @@ async function testWarmDiagnosticReplay() {
   }
 }
 
+async function testReplacementHoldsOldDiagnostics() {
+  const root = await makeBase("warm-diagnostics-restart");
+  const oldSource = "function answer(): integer\n  return 'broken'\nend\n";
+  const nextSource = "function answer(): integer\n  local n = 1\n  return true\nend\n";
+  const source = await writeRoot(root, oldSource);
+  const stable = path.join(path.dirname(source), "stable.titan");
+  await writeFile(stable, "function stable(): integer return 7 end\n", "utf8");
+  const config = path.join(root, "titan-config.lua");
+  // With the default settings restored, no config ancestor can convert the
+  // removed folder to a discovered root while an editor document stays open.
+  await rm(config);
+  const session = new Session(launch(root, "trace"));
+  const folder = { uri: uri(root), name: "project" };
+  const sourceUri = uri(source);
+  const folders = (added, removed) => session.notify(
+    "workspace/didChangeWorkspaceFolders", { event: { added, removed } });
+  const nonempty = (item) => item.uri === sourceUri && item.diagnostics.length > 0;
+  const answer = (message) => session.child.stdin.write(frame({
+    jsonrpc: "2.0", id: message.id, result: null
+  }));
+  let holdProgress = false;
+  let held;
+  session.responses.serverRequestHandler = (message) => {
+    assert.equal(message.method, "window/workDoneProgress/create");
+    if (holdProgress) {
+      assert.equal(held, undefined, "replacement requested progress twice");
+      held = message;
+    } else {
+      answer(message);
+    }
+  };
+  try {
+    await session.initialize({
+      workspaceFolders: [folder],
+      capabilities: { window: { workDoneProgress: true } },
+      initializationOptions: { trustedRoots: [root] }
+    });
+    session.notify("initialized", {});
+    const old = await waitNotification(session,
+      session.responses.diagnosticPublications, 0, nonempty,
+      "the initial persisted diagnostic");
+    const running = rootEntry(await session.status(), root);
+    const failedAt = session.responses.diagnosticPublications.length;
+    await writeFile(config, "include = 42\n", "utf8");
+    const failure = await session.failure("textDocument/diagnostic", {
+      textDocument: { uri: sourceUri }
+    });
+    assert.match(failure.message, /include/);
+    await waitNotification(session, session.responses.diagnosticPublications, failedAt,
+      (item) => item.uri === sourceUri && item.diagnostics.length === 0,
+      "the failed refresh's diagnostic clearing");
+
+    process.kill(running.workerPid, "SIGKILL");
+    await pollStatus(session, (entries) => rootEntry(entries, root).workerPid === null,
+      "the failed worker's observed exit");
+    await rm(config);
+    await writeFile(source, nextSource, "utf8");
+    const start = session.responses.diagnosticPublications.length;
+    const progressStart = session.responses.progress.length;
+    const logsStart = session.stderr().length;
+
+    // didOpen starts the replacement without leaving a pending pull behind
+    // the first-pass barrier. Keep the real progress-create request open.
+    holdProgress = true;
+    session.notify("textDocument/didOpen", {
+      textDocument: { uri: sourceUri, languageId: "titan", version: 1, text: nextSource }
+    });
+    const replacing = rootEntry(await pollStatus(session, (entries) =>
+      held !== undefined && rootEntry(entries, root).workerPid !== null,
+    "the replacement worker's held progress request"), root);
+    assert.notEqual(replacing.workerPid, running.workerPid);
+    assert.ok(replacing.generation > running.generation);
+    folders([], [folder]);
+    assert.equal(rootEntry(await session.status(), root).origin, "released");
+    folders([folder], []);
+    const reclaimed = rootEntry(await session.status(), root);
+    assert.equal(reclaimed.origin, "folder");
+    assert.equal(reclaimed.workerPid, replacing.workerPid);
+    assert.equal(reclaimed.generation, replacing.generation);
+    assert.equal(session.responses.progress.slice(progressStart).some(
+      (item) => item.token === held.params.token), false,
+    "the replacement finished its progress barrier before the response");
+    assert.ok(!session.responses.diagnosticPublications.slice(start).some(nonempty),
+      "reclaim published stale diagnostics while replacement indexing was blocked");
+
+    holdProgress = false;
+    answer(held);
+    const fresh = await waitNotification(session, session.responses.diagnosticPublications,
+      start, nonempty, "the replacement's current saved diagnostic");
+    assert.notDeepEqual(fresh.diagnostics, old.diagnostics);
+    assert.equal(fresh.diagnostics[0].range.start.line, 2);
+    assert.ok(!session.responses.diagnosticPublications.slice(start).some(
+      (item) => nonempty(item) && JSON.stringify(item.diagnostics) === JSON.stringify(old.diagnostics)),
+    "the replacement published the stale type error before the current one");
+    await pollStatus(session, () => session.responses.progress.slice(progressStart).some(
+      (item) => item.token === held.params.token && item.value.kind === "end"),
+    "replacement indexing and diagnostic publication to finish");
+
+    const releaseAt = session.responses.diagnosticPublications.length;
+    folders([], [folder]);
+    await waitNotification(session, session.responses.diagnosticPublications, releaseAt,
+      (item) => item.uri === sourceUri && item.diagnostics.length === 0,
+      "the replacement's diagnostic clearing on release");
+    const reclaimAt = session.responses.diagnosticPublications.length;
+    folders([folder], []);
+    const replay = await waitNotification(session, session.responses.diagnosticPublications,
+      reclaimAt, nonempty, "the replacement's later warm replay");
+    assert.deepEqual(replay, fresh);
+    assert.equal(rootEntry(await session.status(), root).workerPid, replacing.workerPid);
+    await session.shutdown();
+    const records = structuredLogRecords(session.stderr().subarray(logsStart));
+    assert.ok(records.some((record) =>
+      record.event === "cache.projects.restore" && record.restored >= 1),
+    "the replacement did not restore any reusable project module");
+    assert.ok(records.some((record) =>
+      record.event === "compiler.source_module.profile" && record.module_name === "main"),
+    "the replacement did not check the changed file");
+    assert.ok(!records.some((record) =>
+      record.event === "compiler.source_module.profile" && record.module_name === "stable"),
+    "the replacement rechecked the unchanged cache fixture module");
+  } finally {
+    await session.abort();
+  }
+}
+
 function peerSession(root) {
   const executable = process.env.TITAN_ROUTER_WORKER_FIXTURE;
   assert.ok(executable, "build the router peer and set TITAN_ROUTER_WORKER_FIXTURE");
@@ -2714,7 +2840,10 @@ const groups = [
   ["indexing-epochs", testIndexingEpochs, "indexing epochs"],
   ["nested-status", testNestedIndexingStatus, "nested indexing and failure status"],
   ["crash-diagnostics", testCrashDiagnosticClearing, "crashed diagnostic clearing"],
-  ["warm-diagnostics", testWarmDiagnosticReplay, "warm diagnostic replay"],
+  ["warm-diagnostics", async () => {
+    await testWarmDiagnosticReplay();
+    await testReplacementHoldsOldDiagnostics();
+  }, "warm diagnostic replay"],
   ["activation-transitions", testRouterActivationTransitions, "framed activation failure transitions"],
   ["busy-membership", testNestedDiscoveryDuringBlockedRefresh, "nested discovery and busy membership transitions"],
   ["aggregate-progress", testAggregateCountedProgress, "aggregate counted progress and hidden completions"],
