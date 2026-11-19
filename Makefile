@@ -341,6 +341,7 @@ shard-runner-test:
 	node --test scripts/makefile-contract.test.mjs
 	node --test scripts/build-windows.test.mjs scripts/inspect-windows-package.test.mjs \
 		scripts/compiler-rocks.test.mjs scripts/stage-lua-modules.test.mjs scripts/stage-notices.test.mjs
+	node --test scripts/browser-semantic-pack.test.mjs
 
 incremental-build-test:
 	node scripts/test-incremental-build.mjs --prefix $(call shell_quote,$(TITAN_PREFIX))

@@ -93,6 +93,11 @@ standard-library providers together, and they never modify it. The SDK must
 include Titan's installed license at `share/titan/LICENSE`, and its compiler
 must provide compiler-owned incremental builds (certified object, native-C,
 and final-link reuse, native input switches, `--output`, and `--exe`).
+Building the extension (including plain `make`) or packaging a VSIX also
+requires the three files from the matching
+[browser semantic companion](docs/native-build.md#paired-browser-semantic-pack)
+in that SDK. A native-only SDK suffices for `make server`.
+
 Installing a packaged VSIX needs none of this toolchain.
 
 Native packages build on Linux and macOS. Windows is
@@ -109,7 +114,9 @@ make test
 `make` builds `bin/titan-language-server` and `dist/extension.js`. It also
 stages the SDK's compiler modules under `dist/titan/share/lua/5.5` and
 `dist/titan/lib/lua/5.5`, the SDK include tree under `dist/titan/include`, and
-the matching Lua sources under `dist/titan/src`. To use a specific SDK:
+the matching Lua sources under `dist/titan/src`. It stages `analysis-target`,
+`absent-modules` and `titan.a` under `dist/titan/lib/titan-browser/0.6`.
+To use a specific SDK:
 
 ```sh
 make -j2 TITAN_PREFIX="$HOME/.local/titan"
@@ -286,11 +293,11 @@ available on `PATH` or set `EMSDK` in the environment launching VS Code.
 Without it, only the affected source gets a diagnostic; the server never uses
 the native C compiler for browser analysis.
 
-If you set `compiler_root`, that SDK must supply its own matching files in
-`lib/titan-browser/0.6`. Install the SDK's browser component or choose a
-complete SDK. An incomplete or mismatched SDK is an error for that root;
-the server does not substitute the packaged provider. A standalone server
-similarly needs `TITAN_ROOT` to name an SDK that supplies those files.
+An explicit `compiler_root` must supply its own matching `analysis-target`,
+`absent-modules` and Wasm `titan.a` under `lib/titan-browser/0.6`. Install the
+SDK's browser component or choose a complete SDK. An incomplete or mismatched
+SDK fails that root; the server does not substitute the default VSIX's staged
+pack. For a standalone server, use `TITAN_ROOT` to name an SDK with those files.
 
 ### Choosing an SDK per root
 
