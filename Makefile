@@ -346,6 +346,7 @@ incremental-build-test:
 	node scripts/test-incremental-build.mjs --prefix $(call shell_quote,$(TITAN_PREFIX))
 
 server-protocol-test: $(SERVER) $(ROUTER_WORKER_FIXTURE) completion-protocol-test
+	$(SERVER_TEST_ENV) node --test scripts/browser-analysis-fixture.test.mjs
 	$(SERVER_TEST_ENV) node scripts/test-server-protocol.mjs "$(SERVER)"
 	$(SERVER_TEST_ENV) node scripts/test-workspace-cache.mjs "$(SERVER)"
 	$(SERVER_TEST_ENV) node scripts/test-multi-root.mjs "$(SERVER)"

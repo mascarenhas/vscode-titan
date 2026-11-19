@@ -198,6 +198,11 @@ Neither the fixture nor its scenarios add a shipped-server option or an
 environment-selected behavior. It is a test-only build product and is never
 installed or included in the VSIX.
 
+The protocol suite also verifies the [browser analysis fixture](../test/fixtures/browser-analysis/README.md).
+It checks genuine Wasm interface metadata in a disposable SDK directory,
+without running Emscripten. The fixture is for tests only and is excluded
+from the VSIX.
+
 ## Rebuild behavior
 
 An unchanged compiler invocation certifies and reuses module objects, native C
