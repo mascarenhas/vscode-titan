@@ -1,0 +1,483 @@
+-- Canonical watch paths, event disposition, directory probes, and watcher reconciliation.
+
+local union WatchDisposition
+  irrelevant()
+  relevant()
+  possible_directory(string)
+end
+
+local function canonical_directory(path: string): string
+  local canonical = fs.realpath(path)
+  if ffi.VSCODE_TITAN_WINDOWS ~= 0 then
+    local normalized?, normalize_error? = source_text.normalize_absolute_path(canonical)
+    if normalized == nil then raise normalize_error end
+    return normalized
+  end
+  return canonical
+catch
+  if error is async.CancellationReason then raise end
+  return path
+end
+
+-- File events preserve the watched directory's canonical identity even for a
+-- create/delete whose leaf cannot itself be resolved. Canonicalize the parent
+-- and retain that leaf instead of calling realpath on the event target.
+local function canonical_file_path(path: string): string
+  return source_text.join_path(
+    canonical_directory(source_text.parent_directory(path)),
+    source_text.leaf_name(path))
+end
+
+local function watch_path_array(changes: const? {project_watcher.PathChange}):
+    wire.Array
+  local values: wire.Array = {}
+  local limit = #changes
+  if limit > MAX_LOGGED_WATCH_PATHS then limit = MAX_LOGGED_WATCH_PATHS end
+  for index = 1, limit do
+    values[index] = project_watcher.change_path(changes[index])
+  end
+  return values
+end
+
+-- Mirror project discovery's lexical directory boundary. Names such as build
+-- and tmp are valid module components and must remain observable; their
+-- non-Titan artifacts are filtered separately by WatchFilter:disposition.
+local function valid_relative_directory(root: string, path: string): boolean
+  if path == root then return true end
+  local start = #root + 2
+  if strings.sub(root, -1) == "/" then
+    start = #root + 1
+  end
+  local component_start = start
+  for index = start, #path + 1 do
+    if index == #path + 1 or strings.byte(path, index) == 47 then
+      if not project_discovery.valid_module_component(
+          strings.sub(path, component_start, index - 1)) then
+        return false
+      end
+      component_start = index + 1
+    end
+  end
+  return true
+end
+
+local function mapped_source_path(path: string,
+                                  source_roots: const? {string}): boolean
+  for index = 1, #source_roots do
+    if source_text.path_within(source_roots[index], path) then return true end
+  end
+  return false
+end
+
+local function included_directory_path(root: string, path: string,
+                                       source_roots: const? {string}): boolean
+  if not source_text.path_within(root, path) then return false end
+  for index = 1, #source_roots do
+    local source_root = source_roots[index]
+    -- Keep ancestors of a configured nested source root observable even when
+    -- an include-relative component (for example vendor.foo) is not a module
+    -- component. Once inside that root, validate the reset logical path.
+    if source_text.path_within(path, source_root) then return true end
+    if source_text.path_within(source_root, path) and
+       valid_relative_directory(source_root, path) then
+      return true
+    end
+  end
+  return mapped_source_path(path, source_roots) and
+         valid_relative_directory(root, path)
+end
+
+local function cache_watch_paths(project_root: string,
+                                 include_roots: const? {string},
+                                 canonical_includes: const? {string}):
+    const {string}
+  local cache = source_text.join_path(project_root, ".titan-ls")
+  local canonical = roots.canonical(cache)
+  local result: {string} = {cache, canonical, canonical_file_path(cache)}
+  for index = 1, #include_roots do
+    local include_root = include_roots[index]
+    local observed_root = canonical_includes[index]
+    if source_text.path_within(canonical, observed_root) then
+      -- A source/include alias pointing into the private cache stays private.
+      result[#result + 1] = include_root
+    elseif source_text.path_within(observed_root, canonical) then
+      result[#result + 1] = source_text.rebase_path(
+        canonical, observed_root, include_root)
+    end
+  end
+  return result as const {string}
+end
+
+local function build_watch_filter(snapshot: project_service.Snapshot):
+    WatchFilter
+  local include_roots: {string} = {}
+  local canonical_includes: {string} = {}
+  for index = 1, #snapshot.config.include do
+    local include_root = snapshot.config.include[index]
+    include_roots[#include_roots + 1] = include_root
+    local canonical_include_root = canonical_directory(include_root)
+    canonical_includes[index] = canonical_include_root
+    if canonical_include_root ~= include_root then
+      include_roots[#include_roots + 1] = canonical_include_root
+    end
+  end
+
+  local source_roots: {string} = {}
+  for index = 1, #snapshot.config.source_module_roots do
+    local source_root = snapshot.config.source_module_roots[index]
+    source_roots[#source_roots + 1] = source_root
+    local canonical_source_root = roots.canonical(source_root)
+    if canonical_source_root ~= source_root then
+      source_roots[#source_roots + 1] = canonical_source_root
+    end
+    -- Discovery accepts lexical source ancestry across an include symlink.
+    -- Carry that same mapped coverage into the native watcher's namespace,
+    -- even when the symlink target is outside the source root's physical tree.
+    for include_index = 1, #snapshot.config.include do
+      local include_root = snapshot.config.include[include_index]
+      local canonical_include = canonical_includes[include_index]
+      if canonical_include ~= include_root then
+        if source_text.path_within(source_root, include_root) then
+          source_roots[#source_roots + 1] = canonical_include
+        elseif source_text.path_within(include_root, source_root) then
+          source_roots[#source_roots + 1] = source_text.rebase_path(
+            source_root, include_root, canonical_include)
+        end
+        if source_text.path_within(canonical_source_root, canonical_include) then
+          source_roots[#source_roots + 1] = include_root
+        elseif source_text.path_within(canonical_include, canonical_source_root) then
+          source_roots[#source_roots + 1] = source_text.rebase_path(
+            canonical_source_root, canonical_include, include_root)
+        end
+      end
+    end
+  end
+
+  local excluded_paths: {string} = {}
+  for index = 1, #snapshot.config.exclude do
+    local excluded = snapshot.config.exclude[index]
+    excluded_paths[#excluded_paths + 1] = excluded
+    local canonical = canonical_directory(excluded)
+    if canonical ~= excluded then
+      excluded_paths[#excluded_paths + 1] = canonical
+    end
+    local canonical_leaf = canonical_file_path(excluded)
+    if canonical_leaf ~= excluded and canonical_leaf ~= canonical then
+      excluded_paths[#excluded_paths + 1] = canonical_leaf
+    end
+    for root_index = 1, #snapshot.config.include do
+      local include_root = snapshot.config.include[root_index]
+      local canonical_include = canonical_includes[root_index]
+      if canonical_include ~= include_root and
+         source_text.path_within(include_root, excluded) then
+        local observed = source_text.rebase_path(
+          excluded, include_root, canonical_include)
+        if observed ~= excluded and observed ~= canonical and
+           observed ~= canonical_leaf then
+          excluded_paths[#excluded_paths + 1] = observed
+        end
+      end
+    end
+  end
+
+  local configuration_paths: {string: boolean} = {}
+  local expected_config = source_text.join_path(
+    snapshot.config.project_root, "titan-config.lua")
+  configuration_paths[expected_config] = true
+  configuration_paths[canonical_file_path(expected_config)] = true
+  local config_file? = snapshot.config.config_file
+  if config_file ~= nil then
+    configuration_paths[config_file] = true
+    configuration_paths[canonical_file_path(config_file)] = true
+  end
+
+  local known_directories: {string: boolean} = {}
+  for index = 1, #snapshot.project_directories do
+    local directory = snapshot.project_directories[index]
+    known_directories[directory] = true
+    known_directories[canonical_directory(directory)] = true
+    for root_index = 1, #snapshot.config.include do
+      local include_root = snapshot.config.include[root_index]
+      local canonical_include = canonical_includes[root_index]
+      if canonical_include ~= include_root and
+         source_text.path_within(include_root, directory) then
+        known_directories[source_text.rebase_path(
+          directory, include_root, canonical_include)] = true
+      end
+    end
+  end
+
+  local frozen_includes = include_roots as const {string}
+  local frozen_sources = source_roots as const {string}
+  local frozen_excluded = excluded_paths as const {string}
+  return WatchFilter {
+    include_roots = frozen_includes,
+    source_roots = frozen_sources,
+    excluded_paths = frozen_excluded,
+    cache_paths = cache_watch_paths(
+      snapshot.config.project_root, snapshot.config.include,
+      canonical_includes),
+    configuration_paths = configuration_paths,
+    known_directories = known_directories,
+  }
+end
+
+-- A failed configuration load or source discovery cannot provide a Snapshot
+-- from which to derive the full watcher scope. Keep the project directory and
+-- its conventional configuration path observable from before the first load;
+-- a later save can then repair the project without requiring an unrelated LSP
+-- request to retry indexing.
+local function provisional_watch_filter(project_root: string): WatchFilter
+  local expected_config = source_text.join_path(project_root, "titan-config.lua")
+  local configuration_paths: {string: boolean} = {}
+  configuration_paths[expected_config] = true
+  configuration_paths[canonical_file_path(expected_config)] = true
+  local include_roots = {project_root}
+  local canonical_root = canonical_directory(project_root)
+  if canonical_root ~= project_root then include_roots[2] = canonical_root end
+  local known_directories: {string: boolean} = {}
+  known_directories[project_root] = true
+  known_directories[canonical_root] = true
+  local frozen_roots = include_roots as const {string}
+  local root_includes: const {string} = {project_root}
+  local root_canonical: const {string} = {canonical_root}
+  return WatchFilter {
+    include_roots = frozen_roots,
+    source_roots = frozen_roots,
+    excluded_paths = {},
+    cache_paths = cache_watch_paths(
+      project_root, root_includes, root_canonical),
+    configuration_paths = configuration_paths,
+    known_directories = known_directories,
+  }
+end
+
+-- The directory watcher is intentionally broader than the saved project: it
+-- must observe a new source directory or a newly created configuration file.
+-- A created extensionless valid component needs an asynchronous kind probe;
+-- subsequent modifications are ignored unless discovery cached it as a
+-- directory. Dotted/editor paths and non-Titan artifacts remain irrelevant
+-- because discovery would prune the same component. Classification itself is
+-- non-yielding so every hint is either accepted or copied into Application-
+-- owned probe state before the ProjectWatcher callback returns.
+local function WatchFilter:disposition(
+    change: project_watcher.PathChange): WatchDisposition
+  local path = project_watcher.change_path(change)
+  for index = 1, #self.cache_paths do
+    if source_text.path_within(self.cache_paths[index], path) then
+      return WatchDisposition.irrelevant()
+    end
+  end
+  if self.configuration_paths[path] then
+    return WatchDisposition.relevant()
+  end
+  for index = 1, #self.excluded_paths do
+    if source_text.path_within(self.excluded_paths[index], path) then
+      return WatchDisposition.irrelevant()
+    end
+  end
+  for index = 1, #self.include_roots do
+    local include_root = self.include_roots[index]
+    if source_text.path_within(include_root, path) then
+      if source_text.titan_source_path(path) and
+         mapped_source_path(path, self.source_roots) and
+         included_directory_path(
+           include_root, source_text.parent_directory(path),
+           self.source_roots) then
+        return WatchDisposition.relevant()
+      end
+      -- A configured source-root ancestor may itself end in .titan. Treat its
+      -- creation as a possible directory, so an actual unmapped regular file
+      -- still cannot trigger discovery after the asynchronous kind probe.
+      if included_directory_path(include_root, path, self.source_roots) then
+        if self.known_directories[path] then
+          return WatchDisposition.relevant()
+        end
+        case change
+        when created() then
+          return WatchDisposition.possible_directory(path)
+        else
+        end
+      end
+    end
+  end
+  return WatchDisposition.irrelevant()
+end
+
+local function WatchFilter:relevant(
+    change: project_watcher.PathChange): boolean
+  case self:disposition(change)
+  when irrelevant() then return false
+  else return true
+  end
+end
+
+-- Source-imported tests validate lexical and canonical eligibility through the
+-- same immutable filter construction used by reconciliation. A possible new
+-- directory counts as eligible here; production verifies its kind first.
+local function relevant_watch_change(snapshot: project_service.Snapshot,
+                                     change: project_watcher.PathChange):
+    boolean
+  return build_watch_filter(snapshot):relevant(change)
+end
+
+local function watcher_scope(snapshot: project_service.Snapshot):
+    project_watcher.DirectoryScope
+  local configuration = {snapshot.config.project_root}
+  if snapshot.config.config_file ~= nil then
+    configuration[#configuration + 1] =
+      source_text.parent_directory(snapshot.config.config_file)
+  end
+  return project_watcher.DirectoryScope(
+    snapshot.project_directories, configuration)
+end
+
+local function log_watch_failure(watch_error: project_watcher.WatchFailure)
+  logging.emit("error", "project.watch.failure", {
+    ["operation"] = watch_error.operation,
+    ["name"] = watch_error.name,
+    ["code"] = watch_error.code,
+    ["message"] = watch_error.message,
+  })
+end
+
+local function Application:run_directory_probes(): nil
+  local probes = self.directory_probes
+  defer probes:reset()
+
+  while not self.closed and probes.next_index <= #probes.order do
+    -- Bound each wave before its first yield. Continuous compiler-temporary
+    -- churn can append another wave, but cannot postpone a confirmed source
+    -- directory's invalidation indefinitely.
+    local wave_finish = #probes.order
+    local relevant = false
+    while not self.closed and probes.next_index <= wave_finish do
+      local path = probes.order[probes.next_index]
+      probes.next_index = probes.next_index + 1
+      probes.pending[path] = nil
+
+      -- An absent path was an ephemeral create/delete and cannot contribute to
+      -- the saved project. Discovery also uses lstat and ignores symlinks, so
+      -- only an extant directory needs a refresh. Metadata failures remain
+      -- conservative; cancellation belongs to Application.close.
+      local possible_directory = true
+      do
+        local metadata? = fs.lstat(path)
+        possible_directory = metadata ~= nil and
+                             metadata.kind == "directory"
+      catch
+        if error is async.CancellationReason then raise end
+      end
+      if possible_directory then relevant = true end
+    end
+
+    if relevant and not self.closed then self:note_saved_change() end
+  end
+  return nil
+end
+
+local function Application:probe_possible_directory(path: string)
+  if self.closed then return end
+  local probes = self.directory_probes
+  if probes.pending[path] then return end
+  probes.pending[path] = true
+  probes.order[#probes.order + 1] = path
+  if probes.task ~= nil then return end
+  probes.task = async.run<|nil, value|>(self:run_directory_probes)
+end
+
+local function Application:watch_callback(
+    batch: project_watcher.RediscoveryBatch)
+  if self.closed then return end
+  local relevant = batch.watch_set_changed
+  local possible_directories: {string} = {}
+  local filter? = self.watch_filter
+  if not relevant and filter ~= nil then
+    for index = 1, #batch.changes do
+      case filter:disposition(batch.changes[index])
+      when relevant() then
+        relevant = true
+        break
+      when possible_directory(path) then
+        possible_directories[#possible_directories + 1] = path
+      when irrelevant() then
+      end
+    end
+  elseif not relevant and #batch.changes > 0 then
+    -- A watcher should never exist without its prepared filter. If lifecycle
+    -- code changes that invariant, prefer a bounded extra refresh to losing a
+    -- saved-file invalidation.
+    relevant = true
+  end
+  local queued_directory_probes = 0
+  if not relevant then
+    for index = 1, #possible_directories do
+      self:probe_possible_directory(possible_directories[index])
+    end
+    queued_directory_probes = #possible_directories
+  end
+  if logging.enabled("debug") then
+    logging.emit("debug", "project.watch.batch", {
+      ["changes"] = #batch.changes,
+      ["paths"] = watch_path_array(batch.changes),
+      ["paths_truncated"] = #batch.changes > MAX_LOGGED_WATCH_PATHS,
+      ["failures"] = #batch.failures,
+      ["watch_set_changed"] = batch.watch_set_changed,
+      ["directory_probes"] = queued_directory_probes,
+      ["relevant"] = relevant,
+    })
+  end
+  if relevant then
+    -- Watch events are hints only. Start rediscovery of the complete saved
+    -- project immediately and never consume editor notification text.
+    self:note_saved_change()
+  end
+  for index = 1, #batch.failures do
+    log_watch_failure(batch.failures[index])
+  end
+end
+
+local function Application:ensure_provisional_watcher()
+  if self.closed or self.watcher ~= nil then return end
+  -- Publish the filter before starting the poll Task so even a callback on the
+  -- first scheduler turn classifies project-root noise conservatively.
+  self.watch_filter = provisional_watch_filter(self.project_root)
+  self.watcher = project_watcher.start(
+    project_watcher.DirectoryScope({}, {self.project_root}),
+    self:watch_callback)
+end
+
+local function Application:reconcile_watcher(
+    snapshot: project_service.Snapshot)
+  if self.closed then return end
+  -- Canonicalization may yield or fail, so finish it before changing watcher
+  -- registrations. The callback retains the preceding immutable filter until
+  -- a complete replacement is ready.
+  local next_filter = build_watch_filter(snapshot)
+  local scope = watcher_scope(snapshot)
+  if self.closed then return end
+  if self.watcher == nil then
+    self.watcher = project_watcher.start(scope, self:watch_callback)
+  else
+    self.watcher:reconcile(scope)
+  end
+  -- Cooperative scheduling cannot run the newly started poll callback between
+  -- the successful reconcile return and this non-yielding assignment.
+  if not self.closed then self.watch_filter = next_filter end
+end
+
+local function Application:watched_directories_for_testing(): {string}
+  local watcher? = self.watcher
+  if watcher == nil then return {} end
+  return watcher:watched_directories()
+end
+
+local function Application:directory_probe_active_for_testing(): boolean
+  return self.directory_probes.task ~= nil
+end
+
+local function Application:stop_watching_for_testing()
+  local watcher? = self.watcher
+  self.watcher = nil
+  if watcher ~= nil then watcher:stop() end
+end

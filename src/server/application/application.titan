@@ -1,0 +1,415 @@
+--- Language-server application ownership, project indexing, editor captures, and semantic dispatch.
+-- @module server.application
+
+foreign import "compiler_io_platform.h"
+local async = import "async"
+local fs = import "fs"
+local json = import "json"
+local sqlite3 = import "sqlite3"
+local strings = import "string"
+local bridge = import "server.compiler_bridge"
+local completion_service = import "server.completion_service"
+local coordinator = import "server.coordinator"
+local diagnostics = import "server.diagnostics"
+local dispatcher = import "server.dispatcher"
+local document_buffers = import "server.document_buffers"
+local indexing_progress = import "server.indexing_progress"
+local indexing_status = import "server.indexing_status"
+local logging = import "server.logging"
+local lsp = import "server.lsp_types"
+local outbound_requests = import "server.outbound_requests"
+local project_discovery = import "server.project_discovery"
+local project_loader = import "server.project_loader"
+local project_service = import "server.project_service"
+local project_watcher = import "server.project_watcher"
+local published_diagnostics = import "server.published_diagnostics"
+local roots = import "server.roots"
+local semantic_features = import "server.semantic_features"
+local semantic_index = import "server.semantic_index"
+local source_text = import "server.source_text"
+local stores = import "server.workspace_store"
+local wire = import "server.wire"
+
+local const INVALID_PARAMS = -32602
+local const METHOD_NOT_FOUND = -32601
+local const INTERNAL_ERROR = -32603
+local const REQUEST_FAILED = -32803
+local const MAX_LOGGED_WATCH_PATHS = 32
+local const MAX_LOGGED_MESSAGE_BYTES = 4096
+
+record Error
+  const message: string
+end
+
+local record View
+  const work_generation: integer
+  const published_generation: integer
+  const dirty_signature: string
+  const features: semantic_features.Features
+  const configuration: string
+end
+
+local union RefreshOutcome
+  ready(View)
+  failure(Error)
+end
+
+-- Watch backends publish canonical paths, while project configuration retains
+-- its lexical identity (including configured symlinks). Build both identities
+-- while reconciling registrations so the poll callback itself only performs
+-- bounded string/table work and cannot be cancelled between a hint and its
+-- epoch increment.
+local record WatchFilter
+  const include_roots: const {string}
+  const source_roots: const {string}
+  const excluded_paths: const {string}
+  const cache_paths: const {string}
+  const configuration_paths: {string: boolean}
+  const known_directories: {string: boolean}
+end
+
+-- A raw create hint does not carry a file kind. Own possible new-directory
+-- paths independently of the watcher poll Task so asynchronous lstat cannot
+-- lose an already-published hint when registrations are reconciled.
+local record DirectoryProbes
+  pending: {string: boolean}
+  order: {string}
+  next_index: integer
+  task: async.Task<|nil, value|>?
+end
+
+local function DirectoryProbes.new(): DirectoryProbes
+  return { pending = {}, order = {}, next_index = 1 }
+end
+
+local function DirectoryProbes:reset()
+  self.pending = {}
+  self.order = {}
+  self.next_index = 1
+  self.task = nil
+end
+
+type RenameAnalyzer = function (
+  project_service.Snapshot, {bridge.ProjectModule}): bridge.Analysis
+type ProjectLoader = function (
+  string, bridge.ProgressListener?, project_service.SnapshotListener?):
+  (project_service.Service?, project_service.Error?, project_loader.Restoration?)
+
+local record RefreshChain
+  const id: integer
+  const reason: string
+  const first_pass: integer
+  const started_wall: integer
+  const started_cpu: float
+end
+
+--- Own one workspace service, background indexing, and editor-buffer lifecycle.
+record Application
+  local const project_root: string
+  local const project_loader: ProjectLoader
+  local service: project_service.Service?
+  local watcher: project_watcher.ProjectWatcher?
+  local watch_filter: WatchFilter?
+  local refresh_task: async.Task<|RefreshOutcome, value|>?
+  local completed_view: View?
+  local refresh_failure: Error?
+  local failed_epoch: integer?
+  local change_epoch: integer
+  local completed_epoch: integer
+  local active_refresh_epoch: integer?
+  local refresh_chain: RefreshChain?
+  local refresh_chain_initial: boolean
+  local refresh_chains: integer
+  local refresh_passes: integer
+  local view_builds: integer
+  local indexing_listener: indexing_status.Listener?
+  local closed: boolean
+  local const directory_probes: DirectoryProbes
+  local const rename_analyzer: RenameAnalyzer
+  local const diagnostic_publisher: diagnostics.Publisher
+  local restoration: project_loader.Restoration?
+  local const buffers: document_buffers.BufferStore
+  local completion: completion_service.Service?
+  local const progress: indexing_progress.Reporter
+end
+
+-- Source-imported application tests use these counters to assert coalescing and
+-- immutable View reuse without timing or compiler-performance assumptions.
+local record IndexingMetrics
+  const refresh_passes: integer
+  const view_builds: integer
+  const refresh_chain_active: boolean
+end
+
+local function failure(code: integer, message: string):
+    dispatcher.SemanticOutcome
+  return dispatcher.SemanticOutcome.failure(code, message)
+end
+
+local function runtime_error(candidate: value): Error
+  if candidate is Error then return candidate end
+  if candidate is project_service.Error then
+    local item: project_service.Error = candidate
+    return Error(item.path .. ": " .. item.message)
+  end
+  if candidate is bridge.BridgeError then
+    local item: bridge.BridgeError = candidate
+    return Error(item.module_name .. ": " .. item.message)
+  end
+  if candidate is sqlite3.Error then
+    local item: sqlite3.Error = candidate
+    return Error(item.operation .. ": " .. item.message)
+  end
+  if candidate is semantic_index.Error then
+    local item: semantic_index.Error = candidate
+    return Error(item.message)
+  end
+  if candidate is semantic_features.Error then
+    local item: semantic_features.Error = candidate
+    return Error(item.message)
+  end
+  if candidate is async.OperationError then
+    local item: async.OperationError = candidate
+    return Error(item.operation .. ": " .. item.message ..
+                 " (" .. item.name .. ")")
+  end
+  return Error(strings.tostring(candidate))
+end
+
+local function unavailable_completion(): dispatcher.SemanticOutcome
+  return dispatcher.SemanticOutcome.result(
+    lsp.completion_list_value(lsp.CompletionList(true, {})))
+end
+
+--- Create a workspace application with injectable project loading and rename analysis.
+function create(project_root: string, loader: ProjectLoader?,
+    rename_analyzer: RenameAnalyzer?): Application
+  if ffi.VSCODE_TITAN_WINDOWS ~= 0 and
+     source_text.is_absolute_path(project_root) then
+    local normalized?, normalize_error? = source_text.normalize_absolute_path(project_root)
+    if normalized == nil then raise normalize_error end
+    project_root = normalized
+  end
+  return Application {
+    project_root = project_root,
+    project_loader = loader or project_loader.load,
+    change_epoch = 1,
+    completed_epoch = 0,
+    refresh_chain_initial = false,
+    refresh_chains = 0,
+    refresh_passes = 0,
+    view_builds = 0,
+    closed = false,
+    directory_probes = DirectoryProbes(),
+    rename_analyzer = rename_analyzer or default_rename_analyzer,
+    diagnostic_publisher = diagnostics.create(),
+    buffers = document_buffers.create(),
+    progress = indexing_progress.create(),
+  }
+end
+
+-- Source-imported tests own preloaded Services. All construction still passes
+-- through create, so new Application state has one initialization authority.
+local function create_unindexed_with_service(
+    project_root: string, service: project_service.Service): Application
+  local application = create(project_root)
+  application.service = service
+  return application
+end
+
+local function create_with_service(project_root: string,
+    service: project_service.Service, rename_analyzer: RenameAnalyzer?): Application
+  local application = create(project_root, nil, rename_analyzer)
+  application.service = service
+  application.change_epoch = 0
+  application.completed_view = application:install_view(service:latest())
+  return application
+end
+
+function Application:set_indexing_listener(listener: indexing_status.Listener?)
+  self.indexing_listener = listener
+end
+
+--- Attach the protocol client channel used for server-initiated progress.
+function Application:set_client_channel(
+    requests: outbound_requests.OutboundRequests?,
+    capabilities: lsp.CapabilitiesReader?)
+  self.progress:configure(requests, capabilities)
+end
+
+function Application:set_diagnostics_listener(listener: diagnostics.Listener?)
+  if self.closed then return end
+  self.diagnostic_publisher:set_listener(listener)
+  local completed? = self.completed_view
+  local epoch = self.completed_epoch
+  if listener ~= nil and completed ~= nil and self.failed_epoch == nil and
+     epoch == self.change_epoch then
+    local publications = published_diagnostics.read(
+      self.service:workspace_store(), completed.published_generation)
+    -- A new save can invalidate this replay even if its SQL generation
+    -- has not yet been replaced.
+    if not self.closed and self.failed_epoch == nil and
+       self.completed_view == completed and self.completed_epoch == epoch and
+       self.change_epoch == epoch then
+      self.diagnostic_publisher:publish(publications)
+    end
+  catch
+    -- A publication which overtook listener replay owns its replacement.
+    if not (error is semantic_index.StaleView) then raise end
+  end
+end
+
+-- The LSP shutdown request must empty active Problems entries before the
+-- protocol writer is stopped. Disable the listener after that replacement so
+-- a still-unwinding refresh cannot republish after shutdown.
+function Application:stop_diagnostics()
+  self.diagnostic_publisher:stop()
+end
+
+function Application:on_document(notification: lsp.DocumentNotification)
+  if self.closed then return end
+  local path = ""
+  case notification
+  when opened(item) then path = item.document.path
+  when changed(item) then path = item.document.path
+  when closed(item) then path = item.path
+  when saved(item) then path = item.path
+  end
+  if not source_text.path_within(self.project_root, path) or
+     not source_text.titan_source_path(path) then
+    return
+  end
+  -- This bookkeeping is synchronous, including before saved indexing starts.
+  -- Completion prepares ephemeral hover context from these bytes; didSave
+  -- never publishes either kind of unsaved fact.
+  if self.buffers:apply(notification) then
+    local completion? = self.completion
+    if completion ~= nil then completion:changed() end
+  end
+end
+
+-- The router keeps editor text for replay under the same limits this process
+-- applies. When it could not retain a buffer, the document is still open: record
+-- it as an unavailable contributor so completion never falls back to saved bytes
+-- for a document the editor is editing unsaved.
+--- Record one open document whose text this process does not have.
+function Application:on_unavailable_document(document: lsp.TextDocument,
+                                             version: integer)
+  if self.closed then return end
+  local path = document.path
+  if not source_text.path_within(self.project_root, path) or
+     not source_text.titan_source_path(path) then
+    return
+  end
+  if self.buffers:observe_unavailable(document, version) then
+    local completion? = self.completion
+    if completion ~= nil then completion:changed() end
+  end
+end
+
+--- Capture completion inputs before later editor notifications can change them.
+function Application:capture_completion(request: dispatcher.CompletionRequest):
+    coordinator.CompletionWork
+  if self.closed or self.service == nil then return unavailable_completion end
+  if self.completion == nil then
+    self.completion = completion_service.create(
+      self.service:workspace_store(), self.buffers)
+  end
+  -- A completion request does not wait for saved indexing or compiler manifest
+  -- restoration. Its service captures the current committed SQL baseline.
+  return self.completion:capture(request)
+end
+
+-- Called synchronously by the coordinator, before dispatch creates a Task.
+-- A nil capture still records its receipt epoch so later open/reopen messages
+-- cannot attach a new editor session to an earlier hover position.
+--- Capture exact current hover inputs before deferred request work begins.
+function Application:capture_hover(request: dispatcher.SemanticRequest):
+    coordinator.CompletionWork
+  local params?, params_error? = lsp.parse_document_position(request.params)
+  if params == nil then
+    return function (): dispatcher.SemanticOutcome
+      return parse_error(params_error)
+    end
+  end
+  local captured = self:snapshot_hover(params)
+  return function (): dispatcher.SemanticOutcome
+    return self:handle_hover(request, captured)
+  end
+end
+
+--- Answer a saved-source semantic request from its accepted project generation.
+function Application:handle(
+    request: dispatcher.SemanticRequest): dispatcher.SemanticOutcome
+  if request.method == "textDocument/definition" then
+    return self:handle_definition(request)
+  elseif request.method == "textDocument/references" then
+    return self:handle_references(request)
+  elseif request.method == "textDocument/rename" then
+    return self:handle_rename(request)
+  elseif request.method == "textDocument/hover" then
+    return self:handle_hover(request)
+  elseif request.method == "textDocument/foldingRange" then
+    return self:handle_folding(request)
+  elseif request.method == "textDocument/diagnostic" then
+    return self:handle_diagnostic(request)
+  end
+  return failure(METHOD_NOT_FOUND, "Method not found")
+catch
+  if error is async.CancellationReason then raise end
+  if error is semantic_index.StaleView then
+    return failure(REQUEST_FAILED, "saved Titan project changed while reading; retry")
+  end
+  return failure(INTERNAL_ERROR, runtime_error(error).message)
+end
+
+--- Cancel and drain owned work before closing workspace resources.
+function Application:close()
+  if self.closed then return end
+  self.closed = true
+  local completion? = self.completion
+  self.completion = nil
+  if completion ~= nil then completion:close() end
+  self.diagnostic_publisher:stop()
+  self.indexing_listener = nil
+  -- Stop accepting hints immediately. A reconciliation may already be inside
+  -- its watcher lifecycle operation, so stop that backend after its owner joins.
+  self.watch_filter = nil
+
+  local directory_probe? = self.directory_probes.task
+  if directory_probe ~= nil then
+    if not directory_probe:status():has_finished() then
+      directory_probe:cancel(async.CancellationReason.simple(
+        "language server application is closing"))
+    end
+    async.join(directory_probe)
+  end
+  self.directory_probes:reset()
+
+  local attempted_epoch? = self.active_refresh_epoch
+  local restoration? = self.restoration
+  if restoration ~= nil then restoration:cancel() end
+  local refresh? = self.refresh_task
+  if refresh ~= nil then
+    -- Cancellation cannot submit ordinary SQLite rollback. Drain the updater
+    -- after stopping hints, then close the Store after all readers release it.
+    async.join(refresh)
+    self.refresh_task = nil
+  end
+  if self.refresh_chain ~= nil then
+    self:complete_refresh_chain(
+      "cancelled", attempted_epoch or self.change_epoch)
+  end
+  self.progress:reset()
+  self.active_refresh_epoch = nil
+  if restoration ~= nil then restoration:close() end
+  self.restoration = nil
+
+  local watcher? = self.watcher
+  self.watcher = nil
+  self.watch_filter = nil
+  if watcher ~= nil then watcher:stop() end
+  local service? = self.service
+  if service ~= nil then service:close() end
+  self.completed_view = nil
+end
