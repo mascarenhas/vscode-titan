@@ -264,13 +264,31 @@ static void ls_push_cache(lua_State *L) {
         lua_setfield(L, -2, entry->name);
     }
     lua_setfield(L, cache_index, "types");
-    /* Install the same metadata-free support preload used by Unix. */
-    luaL_getsubtable(L, LUA_REGISTRYINDEX, LUA_PRELOAD_TABLE);
-    lua_pushcfunction(L, luaopen_titan); lua_setfield(L, -2, "titan"); lua_pop(L, 1);
     lua_pushvalue(L, cache_index); lua_setfield(L, LUA_REGISTRYINDEX, LS_PROVIDER_CACHE);
     owner->file = guard->file; guard->file = INVALID_HANDLE_VALUE;
     lua_closeslot(L, guard_index);
     lua_pushvalue(L, cache_index); lua_replace(L, base + 1); lua_settop(L, base + 1);
+}
+
+void titan_ls_preload_compiler_support(lua_State *L) {
+    luaL_checkstack(L, 2, "embedded Titan compiler support");
+    luaL_getsubtable(L, LUA_REGISTRYINDEX, LUA_PRELOAD_TABLE);
+    lua_pushcfunction(L, luaopen_titan);
+    lua_setfield(L, -2, "titan");
+    lua_pop(L, 1);
+}
+
+int titan_ls_push_server_image(lua_State *L) {
+    static const char image_anchor = 0;
+    HMODULE module;
+    luaL_checkstack(L, 3, "Titan language-server image");
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                           GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           (LPCWSTR)&image_anchor, &module))
+        return luaL_error(L, "cannot locate mapped language-server image (Win32 %d)", (int)GetLastError());
+    ls_push_provider_path(L, module);
+    lua_remove(L, -2);
+    return 1;
 }
 
 int titan_ls_push_embedded_provider_identity(lua_State *L) {
@@ -288,6 +306,7 @@ int titan_ls_push_embedded_provider_identity(lua_State *L) {
 
 int titan_ls_push_embedded_interface_provider(lua_State *L) {
     int cache, result, entries, types;
+    titan_ls_preload_compiler_support(L);
     ls_push_cache(L); cache = lua_gettop(L);
     lua_getfield(L, cache, "types"); types = lua_gettop(L);
     lua_createtable(L, 0, 3); result = lua_gettop(L);

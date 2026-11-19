@@ -492,6 +492,17 @@ function project_configuration(config: project_config.ProjectConfig): CompilerCo
   }
 end
 
+local type BrowserForeignIdentity = function (value): (value, value)
+
+local record BrowserAnalysis
+  const driver: {string: value}
+  const handle: value
+  const directory: string
+  const identity: string
+  const provider: compiler_io.LstatIdentity
+  const foreign_identity: BrowserForeignIdentity
+end
+
 record Compiler
   local parser: {string: value}
   local checker: {string: value}
@@ -514,6 +525,8 @@ record Compiler
   local const mapped_provider: boolean
   local selected_prefix: string?
   local snapshot_directory: string?
+  local const browser: BrowserAnalysis?
+  local saved_browser_foreign: string?
 end
 
 local function fail<|T|>(module_name: string, message: string): T
@@ -1108,11 +1121,43 @@ function Compiler:log_cache_stats()
   emit_cache_stats(self)
 end
 
+-- One compiler and semantic target live in a worker. The opaque driver handle
+-- remains valid across independent bridge loads, including saved rename.
+local browser_analysis: BrowserAnalysis? = nil
+
+local function accept_browser_analysis(driver: {string: value}, type_of: TypeOfFunction,
+    strategy: compiler_io.CompilerIO, prefix: string?): BrowserAnalysis
+  if browser_analysis ~= nil and browser_analysis.driver == driver then
+    return browser_analysis
+  end
+  local acquire = checked_function(driver, DRIVER_MODULE, "browser_analysis_target",
+    type_of) as function (string?, value): (value, value)
+  local foreign_identity: BrowserForeignIdentity = checked_function(driver, DRIVER_MODULE,
+    "browser_foreign_cache_identity", type_of)
+  local adapter: {string: value} = {["sha256_binary"] = content_identity.digest}
+  local options: {string: value} = {["io"] = strategy, ["cache_adapter"] = adapter}
+  local handle, failure = acquire(prefix, options)
+  if handle == nil then
+    return fail<|BrowserAnalysis|>(DRIVER_MODULE, strings.tostring(failure))
+  end
+  -- The public fields are exposed by __index on the compiler-owned handle.
+  local view = required_map(handle, DRIVER_MODULE, "browser analysis target")
+  local directory = required_string(view["directory"], DRIVER_MODULE, "browser provider directory")
+  local identity = required_string(view["identity"], DRIVER_MODULE, "browser target identity")
+  local file = required_string(view["provider_file"], DRIVER_MODULE, "browser provider file")
+  local provider = selected_file_identity(file)
+  local accepted = BrowserAnalysis(driver, handle, directory, identity, provider, foreign_identity)
+  browser_analysis = accepted
+  return accepted
+end
+
 local function load_with(require_function: RequireFunction,
                          interface_inventory: {string: value}?,
-                         provider_file: string,
-                         embedded_identity: compiler_io.LstatIdentity,
-                         mapped_provider: boolean): Compiler
+                         provider_file: string?,
+                         embedded_identity: compiler_io.LstatIdentity?,
+                         mapped_provider: boolean,
+                         browser_target: boolean?,
+                         prefix: string?): Compiler
   local type_of = make_type_of()
   local parser = require_compiler_module(
     require_function, type_of, PARSER_MODULE)
@@ -1196,12 +1241,33 @@ local function load_with(require_function: RequireFunction,
   required_map(types["registry"], TYPES_MODULE, "types.registry")
 
   local baseline = capture_driver_configuration(driver)
-  return Compiler.new(
-    parser, checker, types, driver, type_of, interface_inventory,
-    provider_file,
-    embedded_identity, compiler_io.create(),
-    {}, CompilerConfiguration.new(), baseline, baseline, {}, nil, {}, {},
-    mapped_provider, nil, nil)
+  local strategy = compiler_io.create()
+  local browser: BrowserAnalysis? = nil
+  if browser_target then
+    browser = accept_browser_analysis(driver, type_of, strategy, prefix)
+    embedded_identity = browser.provider
+    provider_file = browser.provider.path
+  end
+  return Compiler {
+    parser = parser,
+    checker = checker,
+    types = types,
+    driver = driver,
+    type_of = type_of,
+    interface_inventory = interface_inventory,
+    embedded_provider_file = provider_file,
+    embedded_provider_identity = embedded_identity,
+    io = strategy,
+    project_entries = {},
+    configuration = CompilerConfiguration(),
+    baseline = baseline,
+    effective = baseline,
+    include_dirs = {},
+    completion_exports = {},
+    completion_binaries = {},
+    mapped_provider = mapped_provider,
+    browser = browser,
+  }
 end
 
 -- An ordinary selected file never uses the mapped application's identity.
@@ -1226,6 +1292,7 @@ end
 -- before any compiler module loads, so the bridge keeps that selection and
 -- every later load derives its provider mode from it.
 local selected_compiler_root: string? = nil
+local selected_target: string? = nil
 
 local record SelectedSnapshot
   const prefix: string
@@ -1275,14 +1342,21 @@ catch
 end
 
 --- Select an installed SDK whose compiler Lua modules this process will load.
-function select_compiler_root(compiler_root: string?)
+function select_compiler_root(compiler_root: string?, target: string?)
   selected_compiler_root = compiler_root
   selected_snapshot = nil
+  selected_target = target
+  browser_analysis = nil
 end
 
 --- Report the SDK prefix selected for this process, or nil for the build SDK.
 function compiler_root(): string?
   return selected_compiler_root
+end
+
+--- Return the worker's accepted non-native analysis target.
+function analysis_target(): string?
+  return selected_target
 end
 
 function load(): Compiler
@@ -1291,6 +1365,17 @@ function load(): Compiler
   local permit = compiler_scheduler.acquire()
   defer permit:release()
   local configured? = selected_compiler_root
+  if selected_target == "browser" then
+    if configured == nil and browser_analysis == nil then
+      embedded_interfaces.preload_compiler_support()
+    end
+    return load_with {
+      require_function = lua.require,
+      mapped_provider = false,
+      browser_target = true,
+      prefix = configured,
+    }
+  end
   if configured ~= nil then
     local provider_file = selected_provider_file(configured)
     local compiler = load_with(
@@ -1457,17 +1542,23 @@ local function Compiler:new_context(supplied: {string: value}?): value
   local options: {string: value} = {}
   if supplied ~= nil then options = supplied end
   options["io"] = self.io
-  local inventory? = self.interface_inventory
-  -- Detached completion imports only the serialized interfaces in its
-  -- captured SQLite catalog, including previously selected SDK entries.
-  if inventory == nil and options["completion_closed_world"] ~= true then
-    inventory = self:selected_inventory()
-  end
-  if inventory ~= nil then
-    options["embedded_interface_provider"] = inventory
-  elseif self.selected_prefix == nil then
-    -- Unix selected SDKs continue to resolve passive static archives.
-    options["prefer_static"] = true
+  local browser? = self.browser
+  if browser ~= nil then
+    options["target"] = "browser"
+    options["analysis_only"] = true
+    options["browser_analysis_target"] = browser.handle
+  else
+    local inventory? = self.interface_inventory
+    -- Detached completion uses only its captured SQLite catalog.
+    if inventory == nil and options["completion_closed_world"] ~= true then
+      inventory = self:selected_inventory()
+    end
+    if inventory ~= nil then
+      options["embedded_interface_provider"] = inventory
+    elseif self.selected_prefix == nil then
+      -- Unix selected SDKs continue to resolve passive static archives.
+      options["prefer_static"] = true
+    end
   end
   if self.cache_adapter ~= nil then options["cache_adapter"] = self.cache_adapter end
   options["extra_ffi_include_dirs"] = self.include_dirs
@@ -1478,6 +1569,37 @@ local function Compiler:new_context(supplied: {string: value}?): value
       describe(context, self.type_of) .. " instead of a table")
   end
   return context
+end
+
+local function Compiler:context_browser_foreign(context: value, validate: boolean): string?
+  local browser? = self.browser
+  if browser == nil then return nil end
+  local options: {string: value} = {["context"] = context, ["validate"] = validate}
+  local identity, failure = browser.foreign_identity(options)
+  if failure ~= nil then
+    return fail<|string?|>(DRIVER_MODULE, strings.tostring(failure))
+  end
+  if identity == nil then return nil end
+  return required_string(identity, DRIVER_MODULE, "browser foreign cache identity")
+end
+
+function Compiler:restore_browser_foreign(previous: string?): boolean
+  if previous == nil then return true end
+  if self.browser == nil then return false end
+  local permit = compiler_scheduler.acquire()
+  defer permit:release()
+  local configuration = self:install_configuration()
+  defer configuration:apply()
+  local context = self:new_context(nil)
+  defer close_context(self, context)
+  local observed? = self:context_browser_foreign(context, true)
+  if observed ~= previous then return false end
+  self.saved_browser_foreign = previous
+  return true
+end
+
+function Compiler:browser_foreign_identity(): string?
+  return self.saved_browser_foreign
 end
 
 local function close_loader_now(compiler: Compiler, loader: value)
@@ -1547,6 +1669,8 @@ function Compiler:restat_c_header_dependencies(
   if #dependencies == 0 then return {},false end
   local permit = compiler_scheduler.acquire()
   defer permit:release()
+  local previous_configuration = self:install_configuration()
+  defer previous_configuration:apply()
   local context = self:new_context(nil)
   defer close_context(self, context)
   local raw_restat = checked_function(
@@ -4200,7 +4324,8 @@ local function selected_provider_identity(
     compiler: Compiler, embedded_identity: compiler_io.LstatIdentity,
     provider_file: string,
     embedded_provider: boolean): compiler_io.LstatIdentity?
-  if embedded_provider then
+  if embedded_provider or (compiler.browser ~= nil and
+     provider_file == compiler.embedded_provider_file) then
     if provider_file ~= compiler.embedded_provider_file then
       return fail<|compiler_io.LstatIdentity?|>(
         DRIVER_MODULE,
@@ -4379,6 +4504,7 @@ end
 function Compiler:installed_binary_modules_root(): string
   local permit = compiler_scheduler.acquire()
   defer permit:release()
+  if self.browser ~= nil then return self.browser.directory end
   if self.selected_prefix ~= nil and self.snapshot_directory ~= nil then
     return self.snapshot_directory
   end
@@ -4663,6 +4789,8 @@ local function Compiler:run_attempt_inner(
   local diagnostics: {Diagnostic} = {}
   local invoke = loader as function (string): (value, value, value, value)
   local raw_ok, interface_or_error, raw_errors = invoke(root_module)
+  local browser_foreign? = self:context_browser_foreign(context, false)
+  if browser_foreign ~= nil then self.saved_browser_foreign = browser_foreign end
   local ok = required_boolean(
     raw_ok, DRIVER_MODULE, "compiler loader result")
   if not ok then
@@ -5665,7 +5793,7 @@ end
     output:write(#path .. ":" .. path)
     output:write(fingerprint(path))
   end
-  if not self.mapped_provider then
+  if not self.mapped_provider and (self.browser == nil or selected_compiler_root ~= nil) then
     local support?, failure? = resolve("titan", true)
     if support == nil then
       return fail<|string|>(DRIVER_MODULE,
@@ -5676,7 +5804,12 @@ end
   end
   -- This image owns the complete static provider and embedded target/interface
   -- inventory, including libraries not linked by application declarations.
-  if self.mapped_provider then
+  if self.browser ~= nil then
+    output:write(self.browser.identity)
+    output:write(#self.embedded_provider_file .. ":" .. self.embedded_provider_file)
+    output:write(content_identity.stat_identity(self.embedded_provider_file))
+    output:write(fingerprint(embedded_interfaces.server_image()))
+  elseif self.mapped_provider then
     output:write(fingerprint(self.embedded_provider_file))
   else
     -- A selected SDK's provider archive is far larger than this executable and

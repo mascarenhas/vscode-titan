@@ -331,6 +331,58 @@ function test_root_settings_validate_the_selected_sdk_layout(
   with_root(run_layout_validation)
 end
 
+local function run_browser_selection(base: string)
+  local sdk = make_prefix(base, "selected")
+  local directory = sdk .. "/lib/titan-browser"
+  fs.mkdir(directory)
+  directory = directory .. "/0.6/"
+  fs.mkdir(directory)
+  local config_file = base .. "/titan-config.lua"
+  local trust = trusted_root(base)
+  fs.write_file(config_file, "compiler_root = \"selected\"\n")
+  local omitted?, omitted_failure? = root_settings.load(base, trust)
+  test.assert(omitted ~= nil and omitted_failure == nil)
+  fs.write_file(config_file, "compiler_root = \"selected\"\ntarget = \"native\"\n")
+  local native?, native_failure? = root_settings.load(base, trust)
+  test.assert(native ~= nil and native_failure == nil)
+  test.assert(omitted.target == nil and native.target == nil)
+  test.assert(root_settings.fingerprint(omitted) == root_settings.fingerprint(native),
+    "explicit native did not share the omitted selector's worker identity")
+  local native_identity = root_settings.sdk_identity(sdk, nil, nil)
+
+  fs.write_file(config_file, "compiler_root = \"selected\"\ntarget = \"browser\"\n")
+  local names = {"analysis-target", "absent-modules", "titan.a"}
+  for index = 1, #names do
+    local settings?, failure? = root_settings.load(base, trust)
+    test.assert(settings == nil and failure ~= nil)
+    case failure.reason
+    when invalid_target() then
+      test.assert(failure.path == config_file)
+      test.assert(strings.find(failure.message, directory .. names[index], 1, true) ~= nil)
+    else
+      raise "browser layout error was not attributed to the tracked target"
+    end
+    fs.write_file(directory .. names[index], "browser fixture\n")
+  end
+  local browser?, browser_failure? = root_settings.load(base, trust)
+  test.assert(browser ~= nil and browser_failure == nil)
+  test.assert(browser.target == "browser")
+  test.assert(root_settings.fingerprint(browser) ~= root_settings.fingerprint(native))
+  local browser_identity = root_settings.sdk_identity(sdk, nil, "browser")
+  fs.write_file(directory .. "absent-modules", "changed browser fixture\n")
+  test.assert(root_settings.sdk_identity(sdk, nil, "browser") ~= browser_identity)
+  test.assert(root_settings.sdk_identity(sdk, nil, nil) == native_identity,
+    "replacing a browser asset changed the native installation identity")
+  fs.unlink(sdk .. "/" .. root_settings.provider_entry())
+  local browser_only?, browser_only_failure? = root_settings.load(base, trust)
+  test.assert(browser_only ~= nil and browser_only_failure == nil)
+  test.assert(browser_only.target == "browser", "browser analysis required a native provider")
+end
+
+function test_root_settings_validate_and_observe_only_browser_assets(_: test.Context)
+  with_root(run_browser_selection)
+end
+
 local function run_identity(base: string)
   local first = make_prefix(base, "first")
   local second = make_prefix(base, "second")

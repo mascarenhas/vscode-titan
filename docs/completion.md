@@ -33,6 +33,14 @@ unrelated string literals have no candidates. Unresolved receivers and
 unrelated syntax errors can produce empty or incomplete lists. General recovery
 from malformed source is out of scope.
 
+Private completion uses the current worker's accepted target and the same
+committed baseline as saved analysis. Shadowed and inactive variants never
+contribute candidates. For a browser root, import completion includes the
+selected archive's eligible module inventory, even siblings not yet imported;
+member completion reads its Wasm interfaces through the captured catalog.
+Changing the target starts a new worker and replays the open documents, not
+the previous worker's temporary completion or hover facts.
+
 ## Callable presentation and insertion
 
 `Compiler:completion_presentation` in `src/server/compiler_bridge.titan`

@@ -31,14 +31,24 @@ key. The key digests the physical root with `Compiler:cache_identity` and
 trees as this process loaded them, their native Lua dependencies and the
 interface provider: the executable's embedded provider for the server's own
 SDK, or the selected installation's standard archive (Unix) or provider DLL
-(Windows) by ordinary stat identity. Reinstalling either SDK invalidates only
-the roots that used it. The second
-covers the project configuration, except watcher policy. The key carries no
-schema number: `PRAGMA user_version` alone decides schema compatibility. A
-missing key is recorded, and a different stored key triggers `Cache:rebuild`.
+(Windows) by ordinary stat identity. Browser workers instead key on the
+validated target descriptor, absent-module list and Wasm provider identity.
+Reinstalling a provider invalidates only roots using it. The second key
+covers project configuration, including the target but excluding watcher
+policy. The key carries no schema number: `PRAGMA user_version` alone decides
+schema compatibility. A missing key is recorded, and a different stored key
+triggers `Cache:rebuild`.
 `Cache:accept_native_context` likewise compares the stored `native_context`
-with `Compiler:native_cache_identity` and rebuilds on a mismatch. A rejected
-file, or one that SQLite reports as corrupt (`SQLITE_CORRUPT` or
+with `Compiler:native_cache_identity` and rebuilds on a mismatch.
+
+A browser cache whose saved analysis used a real C probe also stores that
+probe environment's identity, or its recorded unavailability. Reopening
+validates this marker before restoring the saved view. Installing or removing
+the pinned toolchain, or changing its C environment, rejects incompatible
+cached facts. Browser caches without such a marker never start Emscripten
+for ordinary typechecking or startup.
+
+A rejected file, or one that SQLite reports as corrupt (`SQLITE_CORRUPT` or
 `SQLITE_NOTADB`), is deleted and recreated. Any other open failure logs
 `cache.memory_fallback` and uses the same schema in an in-memory database.
 Tables are created with `CREATE TABLE IF NOT EXISTS` on every open, so a

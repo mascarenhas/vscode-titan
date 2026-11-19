@@ -3,6 +3,7 @@ local test_paths = import "server.test_paths"
 local fs = import "fs"
 local lua = import "lua"
 local test = import "test"
+local iteration = import "iteration"
 local strings = import "string"
 local config = import "server.project_config.titan"
 local source_text = import "server.source_text"
@@ -312,6 +313,41 @@ function test_project_config_observes_provider_alias_without_changing_its_path(_
       test.assert(selection(true) == selected)
       fs.unlink(alias)
       test.assert(selection(false) == missing)
+    end)
+  end)
+end
+
+function test_project_config_accepts_one_tracked_analysis_target(
+    _context: test.Context)
+  test_runtime.run(function ()
+    with_temporary_project(function (root: string)
+      local tracked = root .. "/titan-config.lua"
+      local overrides = root .. "/titan-config.local.lua"
+      fs.write_file(tracked, "")
+      defer fs.unlink(tracked)
+      local default = config.load(root, test_paths.sdk_binary_root())
+      fs.write_file(tracked, 'target = "native"\n')
+      local native = config.load(root, test_paths.sdk_binary_root())
+      test.assert(native.target == nil and
+        native:semantic_identity() == default:semantic_identity())
+
+      fs.write_file(tracked, 'target = "browser"\n')
+      local browser = config.load(root, test_paths.sdk_binary_root())
+      test.assert(browser.target == "browser" and browser:copy().target == "browser" and
+        browser:semantic_identity() ~= default:semantic_identity())
+      local selected = config.load_compiler_root(root)
+      test.assert(selected.target == "browser")
+
+      fs.write_file(overrides, 'target = "native"\n')
+      defer fs.unlink(overrides)
+      local refused?, problem? = config.load_compiler_root(root)
+      test.assert(refused == nil and problem.path == overrides)
+      fs.write_file(overrides, "")
+      for _, bad in iteration.ipairs({'""', '"linux"', "false", "{}"}) do
+        fs.write_file(tracked, "target = " .. bad .. "\n")
+        local rejected?, failure? = config.load_compiler_root(root)
+        test.assert(rejected == nil and failure.path == tracked and failure.target_selection)
+      end
     end)
   end)
 end

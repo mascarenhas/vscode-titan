@@ -18,6 +18,7 @@ local logging = import "server.logging"
 local lua_paths = import "server.lua_paths"
 local outbound_requests = import "server.outbound_requests"
 local protocol = import "server.protocol"
+local project_config = import "server.project_config"
 local root_settings = import "server.root_settings"
 local roots = import "server.roots"
 local router = import "server.router"
@@ -33,32 +34,41 @@ local record Options
   const root: string?
   const compiler_root: string?
   const print_paths: boolean
+  const target: string?
 end
 
 local function parse_options(args: {string}): Options
-  local options = Options.new(false, nil, nil, false)
+  local options = Options(false, nil, nil, false, nil)
   local index = 1
   while index <= #args do
     local argument = args[index]
     if argument == "--print-paths" then
       options = Options.new(
-        options.worker, options.root, options.compiler_root, true)
+        options.worker, options.root, options.compiler_root, true, options.target)
     elseif argument == "--worker" then
       options = Options.new(
-        true, options.root, options.compiler_root, options.print_paths)
+        true, options.root, options.compiler_root, options.print_paths, options.target)
     elseif argument == "--root" then
       index = index + 1
       if index <= #args then
         options = Options.new(
           options.worker, args[index], options.compiler_root,
-          options.print_paths)
+          options.print_paths, options.target)
       end
     elseif argument == "--compiler-root" then
       index = index + 1
       if index <= #args then
         options = Options.new(
-          options.worker, options.root, args[index], options.print_paths)
+          options.worker, options.root, args[index], options.print_paths, options.target)
       end
+    elseif argument == "--target" then
+      index = index + 1
+      local target? = args[index]
+      if target ~= "native" and target ~= "browser" then
+        raise "--target must be native or browser"
+      end
+      options = Options(options.worker, options.root, options.compiler_root,
+        options.print_paths, target)
     end
     index = index + 1
   end
@@ -290,11 +300,21 @@ function main(args: {string}): integer
     -- single-root server this mode replaces.
     os.chdir(root)
     local selected? = options.compiler_root
+    local target? = options.target
+    if target == nil then
+      -- Direct --worker launches do not have a router's accepted selection.
+      -- Only --compiler-root opts that launcher into loading another SDK.
+      local configuration? = project_config.load_compiler_root(root)
+      if configuration ~= nil then target = configuration.target end
+    elseif target == "native" then
+      target = nil
+    end
     if selected ~= nil then
       lua_paths.select_compiler_root(selected as string)
-      bridge.select_compiler_root(selected as string)
+      bridge.select_compiler_root(selected, target)
     else
       lua_paths.configure()
+      bridge.select_compiler_root(nil, target)
     end
     local probe_prefix? = os.getenv("TITAN_PREFIX")
     if probe_prefix == nil or probe_prefix == "" then

@@ -72,8 +72,8 @@ local function with_fixture(body: FixtureBody)
   body(fixture)
 end
 
-local function require_discovery(root: string): discovery.Discovery
-  local found?, failure? = discovery.discover({root}, {}, {root})
+local function require_discovery(root: string, target: string?): discovery.Discovery
+  local found?, failure? = discovery.discover({root}, {}, {root}, target)
   test.assert(failure == nil and found ~= nil,
               "valid project source tree was not discovered")
   return found
@@ -795,11 +795,11 @@ local function assert_inactive_issue(issues: {discovery.Issue}, path: string,
     test.assert(false,
       "inactive variant received wrong issue kind: " .. issue.message)
   end
-  local expected = "not analyzed: inactive for host target '" .. target ..
-    "'; '" .. logical .. "' has no active variant"
+  local prefix = "not analyzed: inactive for host target '"
+  if target == "browser" then prefix = "not analyzed: inactive for target '" end
+  local expected = prefix .. target .. "'; '" .. logical .. "' has no active variant"
   if selected ~= nil then
-    expected = "not analyzed: inactive for host target '" .. target ..
-      "'; '" .. logical .. "' selects '" .. (selected as string) .. "'"
+    expected = prefix .. target .. "'; '" .. logical .. "' selects '" .. selected .. "'"
   end
   test.assert(issue.message == expected,
     "unexpected inactive variant diagnostic '" .. issue.message ..
@@ -924,20 +924,17 @@ local function selects_host_variants_and_composes_folders()
         "native", "host_label.titan", "host_label.native.titan")
     end)
 
-    with_target_override("browser", function ()
-      local browser = require_discovery(fixture.root)
-      local browser_example? = browser:find_module("titan.example")
-      test.assert(browser_example ~= nil and #browser_example.files == 7 and
-                  browser_example.files[1] ==
-                    fixture:path("titan/example/example.titan") and
-                  browser_example.files[5] ==
-                    fixture:path("titan/example/browser-helpers.browser.titan") and
-                  browser_example.files[7] ==
-                    fixture:path("titan/example/operations.browser.titan"),
-                  "browser target did not select browser contributors and omit native-only ones")
-      test.assert(browser:find_module("browser_only") ~= nil,
-                  "browser target did not select browser-only flat module")
-    end)
+    local browser = require_discovery(fixture.root, "browser")
+    local browser_example? = browser:find_module("titan.example")
+    test.assert(browser_example ~= nil and #browser_example.files == 7 and
+                browser_example.files[1] == fixture:path("titan/example/example.titan") and
+                browser_example.files[5] == fixture:path("titan/example/browser-helpers.browser.titan") and
+                browser_example.files[7] == fixture:path("titan/example/operations.browser.titan"),
+                "browser target did not select browser contributors and omit native-only ones")
+    test.assert(browser:find_module("browser_only") ~= nil,
+                "browser target did not select browser-only flat module")
+    assert_inactive_issue(browser.issues, fixture:path("titan/example/operations.native.titan"),
+      "browser", "operations.titan", "operations.browser.titan")
 
     if host ~= "native" then
       fixture:remove(expected_host_file)

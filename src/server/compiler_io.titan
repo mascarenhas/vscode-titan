@@ -6,6 +6,7 @@ local fs = import "fs"
 local iteration = import "iteration"
 local wire = import "server.wire"
 local embedded_interfaces = import "server.embedded_interfaces"
+local lua = import "lua"
 local logging = import "server.logging"
 local math = import "math"
 local system = import "os"
@@ -312,6 +313,18 @@ function CompilerIO:readable(path: string): boolean
 catch
   failure_message(error)
   return false
+end
+
+function CompilerIO:executable(path: string): (boolean?, string?)
+  local valid?, path_error? = checked_path(path)
+  if not valid then return nil, path_error end
+  local support: {string: value} = lua.require("titan")
+  local check: value = support["_executable_access"]
+  if check == nil then
+    return nil, "installed Titan native support lacks _executable_access"
+  end
+  local query = check as function (string): (boolean?, string?)
+  return query(path)
 end
 
 local function read_bounded_chunks(reader: function (integer): string?,
@@ -817,15 +830,29 @@ local function spawn_and_capture_untimed(
     env_arguments: {string}, command: string,
     merged: boolean): {string: value}
   if ffi.VSCODE_TITAN_WINDOWS ~= 0 then
+    local first = 3
+    local clear_emcc_flags = env_arguments[3] == "env" and
+      env_arguments[4] == "EMCC_CFLAGS=" and #env_arguments >= 5
+    if clear_emcc_flags then first = 5 end
     local arguments: {string} = {}
-    for index = 4, #env_arguments do
+    for index = first + 1, #env_arguments do
       arguments[#arguments + 1] = env_arguments[index]
     end
     local output_option = system.with_parent_stderr
     if merged then output_option = system.with_merged_output end
-    local process = system.spawn(env_arguments[3], arguments,
-      system.with_env("LANG", "C"), system.with_env("LC_ALL", "C"),
-      output_option)
+    local program = env_arguments[first]
+    local process: system.Process? = nil
+    if clear_emcc_flags then
+      -- The browser compiler prefixes argv with this fixed env assignment.
+      -- Keep the real compiler child under the existing cancellation owner.
+      process = system.spawn(program, arguments,
+        system.with_env("LANG", "C"), system.with_env("LC_ALL", "C"),
+        system.with_env("EMCC_CFLAGS", ""), output_option)
+    else
+      process = system.spawn(program, arguments,
+        system.with_env("LANG", "C"), system.with_env("LC_ALL", "C"),
+        output_option)
+    end
     local result = capture_spawned_process(process, command)
     -- A directly launched program can legitimately exit with 126 or 127.
     -- There is no env wrapper whose exit status means executable lookup failed.

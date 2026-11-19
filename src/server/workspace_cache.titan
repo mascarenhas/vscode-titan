@@ -79,6 +79,7 @@ record Cache
   local publication_key: string?
   local publication_compatibility: string?
   local publication_native_context: string?
+  local publication_browser_foreign: string?
   local inventory: {InventoryInput}
   local inventory_reads: integer
   local inventory_hashes: integer
@@ -140,7 +141,7 @@ local function open_compatible(path: string, compatibility: string?): Cache?
   end
   if compatibility ~= nil then write_metadata(connection,"compatibility",compatibility) end
   accepted = true
-  return Cache.new(store, path, {}, nil, nil, nil, nil, {}, 0, 0, 0)
+  return Cache.new(store, path, {}, nil, nil, nil, nil, nil, {}, 0, 0, 0)
 end
 
 -- Native startup and SQLite persistence share this workspace-local root.
@@ -341,6 +342,12 @@ function Cache:accept_native_context(context: string): boolean
   if previous ~= nil then return previous == context end
   write_metadata(access.connection,"native_context",context)
   return true
+end
+
+function Cache:browser_foreign_identity(): string?
+  local access = self.store:acquire()
+  defer access:release()
+  return metadata(access.connection, "browser_foreign")
 end
 
 -- The preliminary inventory can match while PATH, CC, or the native SDK has
@@ -607,9 +614,11 @@ end
 
 -- Publish the context which produced these rows, including live configuration
 -- transitions. Keeping the startup key would mislabel a later completed view.
-function Cache:stage_context(root: string,compatibility: string,native_context: string)
+function Cache:stage_context(root: string, compatibility: string, native_context: string,
+                             browser_foreign: string?)
   self.publication_compatibility = identity.digest(fs.realpath(root) .. "\0" .. compatibility)
   self.publication_native_context = native_context
+  self.publication_browser_foreign = browser_foreign
 end
 
 --- Publish staged cache state within the shared semantic transaction.
@@ -649,6 +658,12 @@ function Cache:publish(connection: sqlite3.Connection)
   if self.publication_compatibility ~= nil then
     write_metadata(connection,"compatibility",self.publication_compatibility)
     write_metadata(connection,"native_context",self.publication_native_context)
+    if self.publication_browser_foreign == nil then
+      sql.execute(connection, "DELETE FROM main.cache_meta WHERE key=?",
+        sqlite3.Blob.new("browser_foreign"))
+    else
+      write_metadata(connection, "browser_foreign", self.publication_browser_foreign)
+    end
   end
   -- Keep staged immutable records until the next prepare so a caller rolling
   -- back this transaction can retry the same complete publication.
@@ -661,4 +676,5 @@ function Cache:publication_committed()
   self.publication_key = nil
   self.publication_compatibility = nil
   self.publication_native_context = nil
+  self.publication_browser_foreign = nil
 end

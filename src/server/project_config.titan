@@ -13,6 +13,7 @@ local content_identity = import "server.content_identity"
 record Error
   path: string
   message: string
+  target_selection: boolean?
 end
 
 --- One evaluated configuration file's global assignments.
@@ -43,6 +44,8 @@ record ProjectConfig
   compiler_root: string?
   compiler_root_file: string?
   const use_selected_inventory: boolean?
+  -- Nil selects the compiler's native host label, not the label "native".
+  target: string?
 end
 
 local function copy_paths(source: {string}): {string}
@@ -64,6 +67,7 @@ function ProjectConfig:copy(): ProjectConfig
     compiler_root = self.compiler_root,
     compiler_root_file = self.compiler_root_file,
     use_selected_inventory = self.use_selected_inventory,
+    target = self.target,
   }
 end
 
@@ -88,6 +92,7 @@ function ProjectConfig:semantic_identity(): string
   if self.use_selected_inventory ~= nil then
     output:write(self.use_selected_inventory == true and "selected inventory" or "ordinary lookup")
   end
+  if self.target ~= nil then output:write(#self.target .. ":" .. self.target) end
   return content_identity.digest(output:drain())
 end
 
@@ -232,6 +237,12 @@ local function normalize_compiler_root(config_file: string,
   return resolve_config_path(config_file, project_root, text, "compiler_root")
 end
 
+local function normalize_target(config_file: string, candidate: value): string?
+  if candidate == nil or candidate == "native" then return nil end
+  if candidate == "browser" then return "browser" end
+  raise Error(config_file, "target must be \"native\" or \"browser\"", true)
+end
+
 local function normalize_environment(config_file: string?,
                                      compiler_root_file: string?,
                                      project_root: string,
@@ -249,6 +260,7 @@ local function normalize_environment(config_file: string?,
   local raw_include_dirs: value = nil
   local raw_cppflags: value = nil
   local raw_compiler_root: value = nil
+  local raw_target: value = nil
   for key, item in iteration.pairs(environment) do
     if not (key is string) then
       return fail<|ProjectConfig|>(
@@ -269,6 +281,8 @@ local function normalize_environment(config_file: string?,
       raw_cppflags = item
     elseif name == "compiler_root" then
       raw_compiler_root = item
+    elseif name == "target" then
+      raw_target = item
     else
       return fail<|ProjectConfig|>(
         error_path, "unknown titan-config.lua field '" .. name .. "'")
@@ -304,7 +318,7 @@ local function normalize_environment(config_file: string?,
   return ProjectConfig.new(
     project_root, config_file, include, exclude, source_module_roots,
     binary_root, include_dirs, cppflags, compiler_root, compiler_root_file,
-    use_selected_inventory)
+    use_selected_inventory, normalize_target(error_path, raw_target))
 end
 
 -- Configuration is data, not an extension hook. Evaluate it with an empty
@@ -386,16 +400,17 @@ local function load_or_raise(project_root: string,
     selected_inventory_directory, environment)
 end
 
---- Compiler SDK selection the router reads before any worker process exists.
+--- Compiler SDK and analysis target selection, read before a worker exists.
 record CompilerRoot
   compiler_root: string?
   compiler_root_file: string?
+  target: string?
 end
 
 -- The router must select an SDK and evaluate trust before a worker exists, and
 -- it must not load the compiler to do it. This reads only the two configuration
--- files' compiler_root assignment; every other key stays the worker's business,
--- which reports unknown or malformed fields as its own project error.
+-- files' compiler_root and tracked target. Every other key stays the worker's
+-- business, which reports unknown or malformed fields as its own project error.
 --
 -- Three outcomes are distinct on purpose:
 --   * no local override and a tracked file this server cannot evaluate means no
@@ -405,7 +420,7 @@ end
 --     a root-scoped selection error, never a silent default SDK;
 --   * a present but unusable compiler_root value selects nothing verifiable, so
 --     it is also a selection error.
---- Read the effective compiler_root from the tracked file and local override.
+--- Read the effective compiler_root and associated tracked analysis target.
 function load_compiler_root(project_root: string): (CompilerRoot?, Error?)
   do
     local root = absolute_project_root(project_root)
@@ -439,17 +454,19 @@ function load_compiler_root(project_root: string): (CompilerRoot?, Error?)
     end
     local tracked_root: string? = nil
     local tracked_file: string? = nil
+    local target: string? = nil
     if tracked ~= nil then
       local raw = (tracked as Environment)["compiler_root"]
       if raw ~= nil then
         tracked_root = normalize_compiler_root(config_file, root, raw)
         tracked_file = config_file
       end
+      target = normalize_target(config_file, tracked["target"])
     end
     if override_root ~= nil then
-      return CompilerRoot.new(override_root, local_file), nil
+      return CompilerRoot.new(override_root, local_file, target), nil
     end
-    return CompilerRoot.new(tracked_root, tracked_file), nil
+    return CompilerRoot.new(tracked_root, tracked_file, target), nil
   catch
     if error is async.CancellationReason then raise end
     if error is Error then return nil, error as Error end

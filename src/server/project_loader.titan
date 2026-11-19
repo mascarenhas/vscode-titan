@@ -418,13 +418,26 @@ local function load_or_raise(project_root: string,
     snapshot_listener: service.SnapshotListener?): (service.Service?,service.Error?,Restoration?)
   local cpu = logging.clock()
   local wall = ffi.vscode_titan_monotonic_ms()
-  local compiler = bridge.load()
+  local compiler: bridge.Compiler?
+  do
+    compiler = bridge.load()
+  catch
+    if error is bridge.BridgeError and bridge.analysis_target() == "browser" then
+      local failure = error as bridge.BridgeError
+      return nil, service.Error(project_root .. "/titan-config.lua", failure.message), nil
+    end
+    raise
+  end
   local installed_root = compiler:installed_binary_modules_root()
   local selected_inventory_directory? = compiler:selected_inventory_directory()
   local settings?, config_error? = config.load(
     project_root, installed_root, selected_inventory_directory)
   if settings == nil then
     return nil,service.Error.new(config_error.path,config_error.message),nil
+  end
+  if settings.target ~= bridge.analysis_target() then
+    return nil, service.Error(settings.config_file or project_root,
+      "analysis target changed; restart this root's language-server worker"), nil
   end
   compiler:configure(bridge.project_configuration(settings))
   local cache = caches.open_for_inventory(settings.project_root)
@@ -457,7 +470,8 @@ local function load_or_raise(project_root: string,
   cpu = logging.clock()
   wall = ffi.vscode_titan_monotonic_ms()
   local native_context = compiler:native_cache_identity()
-  if not cache:accept_native_context(native_context) then
+  if not cache:accept_native_context(native_context) or
+     not compiler:restore_browser_foreign(cache:browser_foreign_identity()) then
     cache = cache:rebuild()
     if not cache:accept_native_context(native_context) then
       raise "fresh workspace cache rejected its native context"
@@ -514,7 +528,7 @@ local function load_or_raise(project_root: string,
         current_configuration = next_configuration
       end
       cache:stage_context(snapshot.config.project_root,
-        inventory .. current_configuration,native_context)
+        inventory .. current_configuration, native_context, compiler:browser_foreign_identity())
       local reusable = cache:prepare()
       if not reusable then
         local selected = cache:projects_to_export()
