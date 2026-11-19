@@ -1,9 +1,10 @@
 // Client transcripts over framed stdio. Most cases launch the real server;
 // controlled lifecycle cases use the production router with a framed test peer.
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import {
   copyFile,
+  cp,
   lstat,
   mkdir,
   mkdtemp,
@@ -19,7 +20,8 @@ import * as os from "node:os";
 import { stripTypeScriptTypes } from "node:module";
 import * as path from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import { browserDirectory, stageBrowserFixture } from "./browser-analysis-fixture.mjs";
 import {
   FrameReader,
   collect,
@@ -1262,6 +1264,333 @@ async function testSelectedProviderAliasCatalog() {
       await assertCatalog(session, next === selected, `warm alias state ${index}`);
       assert.equal(extractionRecords(session).length, next === selected ? 1 : 0);
     });
+  }
+}
+
+const BROWSER_MAIN = [
+  'local support = import "browser"',
+  'local external = import "browser_external"',
+  "local function choose(): support.BrowserHandle",
+  '  return support.binding("fixture")',
+  "end",
+  "function platform_value(): support.BrowserHandle",
+  "  return choose()",
+  "end",
+  "function provider_value(): string",
+  "  return external.explicit_archive(7)",
+  "end",
+  ""
+].join("\n");
+const BROWSER_FALLBACK = "function platform_value(): integer return 5 end\n";
+
+function assertBrowserContributors(project, fixture, name) {
+  const installed = sdkRoot();
+  const script = fileURLToPath(new URL("./browser-analysis-fixture.lua", import.meta.url));
+  const lua = path.join(installed, "bin", process.platform === "win32" ? "lua.exe" : "lua");
+  const db = new DatabaseSync(path.join(project, ".titan-ls", "index.sqlite3"), { readOnly: true });
+  try {
+    const files = db.prepare("SELECT filename FROM completion_source_files WHERE module_name=? ORDER BY position")
+      .all(Buffer.from(name)).map(({ filename }) => Buffer.from(filename).toString("utf8"));
+    for (const prefix of [fixture, installed]) {
+      const resolved = spawnSync(lua, ["-E", script, "sources", installed,
+        path.join(project, "src"), name, prefix], { encoding: "utf8", windowsHide: true });
+      assert.ifError(resolved.error);
+      assert.equal(resolved.status, 0, resolved.stderr);
+      const expected = resolved.stdout.trimEnd().split(/\r?\n/);
+      assert.equal(files.length, expected.length, JSON.stringify({ files, expected }));
+      assert.ok(files.every((filename, index) => samePath(filename, expected[index])),
+        JSON.stringify({ files, expected }));
+    }
+  } finally {
+    db.close();
+  }
+}
+
+async function testBrowserTarget() {
+  const base = await makeBase("browser-target");
+  await stageBrowserFixture(base);
+  const sdk = path.join(base, "sdk");
+  const providers = path.join(base, "providers");
+  for (const folder of ["share/lua/5.5", "lib/lua/5.5"]) {
+    await cp(path.join(sdkRoot(), folder), path.join(sdk, folder), { recursive: true, dereference: true });
+  }
+  const native = path.join(base, "native");
+  const browser = path.join(base, "browser");
+  const nativeSource = await writeRoot(native, BROWSER_FALLBACK);
+  const browserConfig = `${ROOT_CONFIG}compiler_root = ${luaString(sdk)}\n` +
+    `binary_modules_root = ${luaString(providers)}\n`;
+  const fallback = await writeRoot(browser, BROWSER_FALLBACK, `${browserConfig}target = "browser"\n`);
+  const active = path.join(browser, "src", "main.browser.titan");
+  const absent = path.join(browser, "src", "unsupported.browser.titan");
+  await writeFile(active, BROWSER_MAIN);
+  await writeFile(path.join(native, "src", "main.browser.titan"), BROWSER_MAIN);
+  const pair = path.join(browser, "src", "pair");
+  await mkdir(pair);
+  for (const file of ["pair.browser.titan", "pair.native.titan", "z.browser.titan", "z.titan", "a.titan"]) {
+    await writeFile(path.join(pair, file), `local ${file.replaceAll(".", "_")}: integer = 1\n`);
+  }
+  const configFile = path.join(browser, "titan-config.lua");
+  const library = path.join(sdk, browserDirectory, "titan.a");
+  const external = path.join(providers, "browser_external.a");
+  const initialize = async (session) => {
+    await session.initialize({
+      workspaceFolders: [{ uri: uri(browser), name: "wasm" }, { uri: uri(native), name: "host" }],
+      initializationOptions: { trustedRoots: [base] }
+    });
+    session.notify("initialized", {});
+    const status = await pollSettled(session, 2, "native and browser roots did not settle");
+    assertReady(status, native, "native root");
+    assertReady(status, browser, "browser root");
+    return status;
+  };
+  const env = { TITAN_TARGET: "wasm-is-not-an-ambient-selector", EMSDK: path.join(base, "no emsdk") };
+  const session = new Session(launch(native, "debug", env));
+  try {
+    const status = await initialize(session);
+    assert.equal(rootEntry(status, browser).target, "browser");
+    assert.equal(rootEntry(status, native).target, "native");
+    await pollHover(session, active, BROWSER_MAIN, "binding", /BrowserHandle/, "browser SDK");
+    await pollHover(session, active, BROWSER_MAIN, "explicit_archive", /string/, "explicit Wasm provider");
+    await pollHover(session, nativeSource, BROWSER_FALLBACK, "platform_value", /integer/, "native root");
+    assert.deepEqual((await pullDiagnostics(session, uri(active))).items, []);
+    assertBrowserContributors(browser, sdk, "main");
+    assertBrowserContributors(browser, sdk, "pair");
+    const inactive = await pullDiagnostics(session, uri(fallback));
+    assert.ok(inactive.items.some((entry) => entry.code === "inactive-variant"));
+    const nativeInactive = await pullDiagnostics(session, uri(path.join(native, "src", "main.browser.titan")));
+    assert.ok(nativeInactive.items.some((entry) => entry.code === "inactive-variant"));
+    assert.ok(!nativeInactive.items.some((entry) => entry.severity === 1),
+      "native worker analyzed the inactive browser declarations");
+    assert.ok(samePath(sdkDescriptor(browser, "titan.browser").file, library));
+    assert.ok(samePath(sdkDescriptor(browser, "titan.gc").file, library), "unused browser SDK sibling missing");
+    assert.ok(samePath(sdkDescriptor(browser, "browser_external").file, external));
+    const definition = await pollDefinition(session, active, positionOf(BROWSER_MAIN, "choose", 1),
+      "browser saved definition");
+    assert.equal(definition.uri ?? definition[0].uri, uri(active));
+    const request = { textDocument: { uri: uri(active) }, position: positionOf(BROWSER_MAIN, "choose", 1) };
+    const references = await session.result("textDocument/references", {
+      ...request, context: { includeDeclaration: true }
+    });
+    assert.deepEqual(references.map((location) => location.uri), [uri(active), uri(active)]);
+    const folds = await session.result("textDocument/foldingRange", { textDocument: request.textDocument });
+    assert.ok(folds.some((range) => range.startLine === 2 && range.endLine === 3),
+      JSON.stringify(folds));
+    const renamed = await session.result("textDocument/rename", { ...request, newName: "chosen" });
+    assert.match(JSON.stringify(renamed), /chosen/);
+    assert.ok(JSON.stringify(renamed).includes(uri(active)), "rename did not address the active variant");
+    assert.ok(!JSON.stringify(renamed).includes(uri(fallback)), "rename edited the inactive variant");
+    await writeFile(absent, 'local missing = import "fs"\n');
+    assert.match(JSON.stringify((await pullDiagnostics(session, uri(absent))).items), /requires a filesystem/);
+    await rm(absent);
+    await pullDiagnostics(session, uri(active));
+
+    session.notify("textDocument/didOpen", {
+      textDocument: { uri: uri(active), languageId: "titan", version: 1, text: BROWSER_MAIN }
+    });
+    const items = await pollCompletion(session, active, endOfToken(BROWSER_MAIN, "binding"), "browser members");
+    assert.ok(items.some((item) => item.label === "binding"));
+    const catalogFile = path.join(browser, "src", "catalog.browser.titan");
+    const catalog = 'local dependency = import "titan."';
+    session.notify("textDocument/didOpen", {
+      textDocument: { uri: uri(catalogFile), languageId: "titan", version: 1, text: catalog }
+    });
+    const imports = await pollCompletion(session, catalogFile, endOfToken(catalog, "titan."), "browser archive catalog");
+    assert.ok(imports.some((item) => item.label === "titan.gc"), "an unimported archive sibling was absent");
+    assert.ok(!imports.some((item) => item.label === "titan.fs"), "native filesystem leaked into browser imports");
+    session.notify("textDocument/didClose", { textDocument: { uri: uri(catalogFile) } });
+    const dirty = BROWSER_MAIN.replaceAll("choose", "dirty_choice");
+    session.notify("textDocument/didChange", {
+      textDocument: { uri: uri(active), version: 2 }, contentChanges: [{ text: dirty }]
+    });
+    await pollCompletion(session, active, endOfToken(dirty, "dirty_choice", 1), "browser private locals");
+    await pollHover(session, active, dirty, "dirty_choice", /dirty_choice/, "browser private hover");
+
+    // The watcher, not a pull request, must notice a newly added variant.
+    const watched = path.join(browser, "src", "watched.browser.titan");
+    const watchedSource = "function browser_watch(): string return 'watched' end\n";
+    await writeFile(watched, watchedSource);
+    await pollHover(session, watched, watchedSource, "browser_watch", /string/, "watched browser variant");
+    await rm(watched);
+    await poll("removed browser variant still has saved hover", async () => {
+      const response = await session.send("textDocument/hover", {
+        textDocument: { uri: uri(watched) }, position: positionOf(watchedSource, "browser_watch")
+      });
+      return response.result === null ? { accepted: true } : { rejected: response };
+    });
+
+    const original = rootEntry(status, browser);
+    // A native selector uses the default SDK, not the browser-only SDK farm.
+    await writeFile(configFile, `${ROOT_CONFIG}target = "native"\n`);
+    session.notify("workspace/didChangeConfiguration", {});
+    await pollHover(session, fallback, BROWSER_FALLBACK, "platform_value", /integer/, "switched native target");
+    const changed = await session.status();
+    assert.equal(rootEntry(changed, browser).target, "native");
+    assert.ok(rootEntry(changed, browser).generation > original.generation);
+    assert.equal(rootEntry(changed, native).workerPid, rootEntry(status, native).workerPid);
+    assert.equal(rootEntry(changed, native).generation, rootEntry(status, native).generation);
+    await pollHover(session, nativeSource, BROWSER_FALLBACK, "platform_value", /integer/, "unchanged native root");
+    assert.deepEqual((await pullDiagnostics(session, uri(fallback))).items, []);
+    await writeFile(configFile, `${browserConfig}target = "browser"\n`);
+    session.notify("workspace/didChangeConfiguration", {});
+    await pollCompletion(session, active, endOfToken(dirty, "dirty_choice", 1), "replayed browser overlay");
+    await pollHover(session, active, dirty, "dirty_choice", /dirty_choice/, "restored browser target");
+
+    const descriptor = path.join(sdk, browserDirectory, "analysis-target");
+    const savedDescriptor = await readFile(descriptor);
+    await rm(descriptor);
+    session.notify("workspace/didChangeConfiguration", {});
+    const refused = await pollStatus(session, (entries) =>
+      rootEntry(entries, browser).state === "failed", "a missing selected browser descriptor was accepted");
+    assert.equal(rootEntry(refused, browser).workerPid, null);
+    assert.match(rootEntry(refused, browser).failure, /analysis-target/);
+    await poll("selected browser SDK error was not attributed to the tracked configuration", async () => {
+      const report = lastPublicationFor(session, uri(configFile));
+      return report?.diagnostics.some((entry) => entry.code === "configuration" &&
+        entry.message.includes("analysis-target")) ? { accepted: report } : { rejected: report };
+    });
+    await writeFile(descriptor, "not a browser descriptor\n");
+    session.notify("workspace/didChangeConfiguration", {});
+    const malformed = await pollFailure(session, "textDocument/hover", {
+      textDocument: request.textDocument, position: positionOf(dirty, "dirty_choice")
+    }, "malformed selected browser descriptor");
+    assert.match(malformed.message, /analysis-target/);
+    assert.match(malformed.message, /titan-config[.]lua/);
+    await pollHover(session, nativeSource, BROWSER_FALLBACK, "platform_value", /integer/, "native sibling during SDK failure");
+    await writeFile(descriptor, savedDescriptor);
+    session.notify("workspace/didChangeConfiguration", {});
+    await pollCompletion(session, active, endOfToken(dirty, "dirty_choice", 1), "browser overlay after SDK repair");
+    await pollHover(session, active, dirty, "dirty_choice", /dirty_choice/, "repaired browser SDK");
+    await session.shutdown();
+  } catch (error) {
+    throw new Error(`${error.message}\n${session.stderr().toString("utf8").slice(-18000)}`, { cause: error });
+  } finally {
+    await session.abort();
+  }
+
+  const warm = new Session(launch(native, "debug", env));
+  try {
+    await initialize(warm);
+    await pollHover(warm, active, BROWSER_MAIN, "binding", /BrowserHandle/, "warm browser target");
+    assert.ok(samePath(sdkDescriptor(browser, "titan.browser").file, library));
+    await warm.shutdown();
+  } finally {
+    await warm.abort();
+  }
+}
+
+function cachedBrowserForeign(root) {
+  const db = new DatabaseSync(path.join(root, ".titan-ls", "index.sqlite3"), { readOnly: true });
+  try {
+    const row = db.prepare("SELECT value FROM cache_meta WHERE key=?").get(Buffer.from("browser_foreign"));
+    return row && Buffer.from(row.value).toString("utf8");
+  } finally {
+    db.close();
+  }
+}
+
+async function testPackagedBrowser() {
+  const sdk = sdkRoot();
+  const nativeSuffix = process.platform === "win32" ? "dll" : "so";
+  assert.equal(await exists(path.join(sdk, "lib", "lua", "5.5", `titan.${nativeSuffix}`)), false,
+    "the extracted default installation must not supply bare Titan on package.cpath");
+  assert.deepEqual((await readdir(path.join(sdk, browserDirectory))).sort(),
+    ["absent-modules", "analysis-target", "titan.a"]);
+  const base = await makeBase("browser-packaged");
+  const hostSdk = process.env.TITAN_TEST_HOST_SDK;
+  assert.ok(hostSdk, "the package smoke needs the verified packaging SDK for a native-only selection");
+  const partial = path.join(base, "native-only-sdk");
+  for (const folder of ["share/lua/5.5", "lib/lua/5.5"]) {
+    await cp(path.join(hostSdk, folder), path.join(partial, folder), { recursive: true, dereference: true });
+  }
+  const other = path.join(base, "unusable-selection");
+  const noTools = path.join(base, "no toolchain");
+  await mkdir(noTools);
+  const config = `${ROOT_CONFIG}target = "browser"\n`;
+  const pure = 'local browser = import "browser"\n' +
+    'local json = import "json"\n' +
+    "function use_browser(): browser.BrowserHandle\n  return browser.binding('package')\nend\n" +
+    'function use_full_pack(): string\n  return json.encode(1)\nend\n';
+  const source = await writeRoot(base, pure, config);
+  await writeRoot(other, pure, config + `compiler_root = ${luaString(partial)}\n`);
+  const foreign = path.join(base, "src", "foreign.browser.titan");
+  const foreignSource = 'foreign import "for_browser.h"\n' +
+    "function narrow(x: foreign test_browser_long): integer return x end\n";
+  const header = path.join(base, "src", "for_browser.h");
+  const headerSource = "#if !defined(__EMSCRIPTEN__) || !defined(TITAN_TARGET_BROWSER) || __SIZEOF_POINTER__ != 4\n" +
+    "#error wrong target for the browser-only header\n#endif\n" +
+    "#include <titan/browser.h>\n#include <titan/ffi.h>\ntypedef unsigned long test_browser_long;\n";
+  const exercise = async (environment, check) => {
+    const session = new Session(launch(base, "debug", environment));
+    try {
+      await session.initialize({
+        workspaceFolders: [{ uri: uri(base), name: "packaged browser" },
+          { uri: uri(other), name: "incomplete explicit SDK" }],
+        initializationOptions: { trustedRoots: [base] }
+      });
+      session.notify("initialized", {});
+      const roots = await pollSettled(session, 2, "packaged browser and explicit SDK did not settle");
+      assertReady(roots, base, "packaged browser");
+      assert.equal(rootEntry(roots, base).compilerRoot, null);
+      assert.equal(rootEntry(roots, base).target, "browser");
+      const refused = rootEntry(roots, other);
+      assert.equal(refused.state, "failed");
+      assert.equal(refused.workerPid, null);
+      assert.match(refused.failure, /native-only-sdk.*analysis-target/);
+      await pollHover(session, source, pure, "binding", /BrowserHandle/, "default browser pack");
+      await pollHover(session, source, pure, "use_full_pack", /string/, "module outside the protocol fixture");
+      assert.deepEqual((await pullDiagnostics(session, uri(source))).items, []);
+      const filename = path.join(sdk, browserDirectory, "titan.a");
+      assert.ok(samePath(sdkDescriptor(base, "titan.browser").file, filename));
+      assert.ok(samePath(sdkDescriptor(base, "titan.gc").file, filename));
+      assert.ok(samePath(sdkDescriptor(base, "titan.json").file, filename));
+      const definition = await session.result("textDocument/definition", {
+        textDocument: { uri: uri(source) }, position: positionOf(pure, "binding")
+      });
+      assert.ok(definition === null || definition.length === 0, "binary interface supplied a source location");
+      await check(session);
+      await session.shutdown();
+    } catch (error) {
+      throw new Error(`${error.message}\n${session.stderr().toString("utf8").slice(-14000)}`, { cause: error });
+    } finally {
+      await session.abort();
+    }
+  };
+  const offline = { EMSDK: noTools, PATH: noTools, CC: path.join(noTools, "not-host-cc") };
+  await exercise(offline, async () => assert.equal(cachedBrowserForeign(base), undefined));
+  await writeFile(header, headerSource);
+  await writeFile(foreign, foreignSource);
+  const missing = /needs Emscripten 6\.0\.13/;
+  const assertOffline = async () => exercise(offline, async (session) => {
+    const report = await pullDiagnostics(session, uri(foreign));
+    assert.match(JSON.stringify(report.items), missing);
+    await poll("missing Emscripten was not published for the affected file", async () => {
+      const publication = lastPublicationFor(session, uri(foreign));
+      return publication?.diagnostics.some((entry) => missing.test(entry.message))
+        ? { accepted: publication } : { rejected: publication };
+    });
+    assert.equal(cachedBrowserForeign(base), "browser-foreign-unavailable");
+  });
+  await assertOffline();
+  if (process.env.TITAN_LS_TEST_BROWSER_LIVE === "1") {
+    assert.ok(process.env.EMSDK, "a live browser receipt requires the pinned emsdk");
+    const live = { CC: path.join(noTools, "not-host-cc") };
+    const assertLive = async () => exercise(live, async (session) => {
+      assert.deepEqual((await pullDiagnostics(session, uri(foreign))).items, []);
+      await pollHover(session, foreign, foreignSource, "narrow", /test_browser_long/,
+        "Wasm C typedef in the checked function signature");
+      assert.match(cachedBrowserForeign(base), /^browser-foreign:sha256:/);
+    });
+    await assertLive();
+    await assertLive();
+    await assertOffline();
+    await assertLive();
+    await writeFile(header, headerSource.replace("test_browser_long", "replacement_browser_long"));
+    await exercise(live, async (session) => {
+      const report = await pullDiagnostics(session, uri(foreign));
+      assert.match(JSON.stringify(report.items), /foreign type 'test_browser_long' is not declared/);
+    });
+    await writeFile(header, headerSource);
+    await assertLive();
   }
 }
 
@@ -3219,6 +3548,7 @@ const groups = [
   }, "second SDK"],
   ["sdk-errors", testRootScopedSdkErrors, "root-scoped SDK errors"],
   ["completion-config", testCompletionConfigurationBoundary, "private completion across a saved configuration change"],
+  ["browser-target", testBrowserTarget, "browser target and native target isolation"],
   ["crash", testWorkerCrashAndOverlay, "crash and overlay replay"],
   ["cap", testCapAndIdleEviction, "worker cap and idle eviction"],
   ["cancel", testCancellation, "request cancellation"],
@@ -3242,15 +3572,20 @@ const groups = [
   ["diagnostics-optout", testRouterPullOptOut, "router pull opt-out"]
 ];
 
+// Requires a real extracted VSIX, so it is run by the package gates, not by
+// the source-tree protocol suite that exercises the smaller fixture.
+const packagedBrowser = ["browser-packaged", testPackagedBrowser, "packaged browser without tools"];
+
 async function main() {
   assert.ok(process.argv[2], "usage: node scripts/test-multi-root.mjs PATH-TO-SERVER [GROUP]");
   const only = process.argv[3];
+  const selected = only === packagedBrowser[0] ? [packagedBrowser] : groups;
   if (only !== undefined) {
-    assert.ok(groups.some(([name]) => name === only),
-      `unknown group ${only}; known groups: ${groups.map(([name]) => name).join(", ")}`);
+    assert.ok(selected.some(([name]) => name === only),
+      `unknown group ${only}; known groups: ${[...groups, packagedBrowser].map(([name]) => name).join(", ")}`);
   }
   const symlinks = await symlinksUsable();
-  for (const [name, run, label] of groups) {
+  for (const [name, run, label] of selected) {
     if (only !== undefined && only !== name) continue;
     if (!symlinks && SYMLINK_GROUPS.has(name)) {
       console.log(`multi-root: ${label} skipped ` +

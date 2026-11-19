@@ -1,6 +1,7 @@
 -- The editor fixture uses the compiler's real browser metadata readers.
 local mode, sdk, fixture, reference = ...
-assert(mode == "encode" or mode == "verify" or mode == "wrong-target", "invalid fixture operation")
+assert(mode == "encode" or mode == "verify" or mode == "wrong-target" or mode == "sources",
+    "invalid fixture operation")
 local share = sdk .. "/share/lua/5.5/"
 local native = package.config:sub(1, 1) == "\\" and "dll" or "so"
 package.path = share .. "?.lua;" .. share .. "?/init.lua"
@@ -15,6 +16,21 @@ local sha256 = require "titan-compiler.sha256"
 local metadata = require "titan-compiler.staticmetadata"
 local support = require "titan"
 local strategy = compiler_io.new_sync()
+
+if mode == "sources" then
+    function strategy:run() error("source selection must not invoke a toolchain") end
+    local source_root, module, prefix = fixture, reference, select(5, ...)
+    local target = assert(driver.browser_analysis_target(prefix, { io = strategy }))
+    local context = driver.new_resolver_context {
+        target = "browser", analysis_only = true, browser_analysis_target = target, io = strategy,
+    }
+    local source = assert(driver.resolve_source(context, module, source_root))
+    assert(source.kind ~= "blocked")
+    for _, filename in ipairs(source.files) do print(filename) end
+    assert(driver.close_resolver_context(context))
+    return
+end
+
 local fixture_directory = driver.installed_paths(fixture .. "/sdk", "browser").titan_bin
 local archive_file = path.join(fixture_directory, "titan.a")
 local absent_file = path.join(fixture_directory, "absent-modules")
