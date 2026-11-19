@@ -246,6 +246,7 @@ test("embedded interface generation acknowledges unchanged output and keeps inpu
   const calls = path.join(state.root, "generator-calls");
   const failure = path.join(state.root, "generator-failure");
   const generator = await state.put("scripts/generate-embedded-interfaces.lua");
+  const inventory = await state.put("scripts/standard-interface-inventory.lua");
   const provider = await state.put("sdk/lib/titan/0.6/titan.a", "metadata\n");
   const output = await state.put("build/native/embedded_interfaces_native.c", "metadata\n");
   await state.put("sdk/bin/titanc", "#!/bin/sh\nexit 0\n", true);
@@ -268,6 +269,7 @@ if ! cmp -s "$2" "$3"; then cp "$2" "$3"; fi
   await utimes(output, older, older);
   await utimes(provider, newer, newer);
   await utimes(generator, newer, newer);
+  await utimes(inventory, newer, newer);
   let result = generate();
   assert.equal(result.status, 0, result.stderr);
   assert.equal(await readFile(output, "utf8"), "metadata\n");
@@ -292,6 +294,12 @@ if ! cmp -s "$2" "$3"; then cp "$2" "$3"; fi
   assert.equal(result.status, 0, result.stderr);
   assert.equal(await count(), 3);
 
+  await writeFile(inventory, "changed inventory query\n");
+  await utimes(output, older, older);
+  result = generate();
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(await count(), 4, "changed interface query must rerun generation");
+
   await writeFile(failure, "");
   await utimes(output, older, older);
   const staleOutputTime = (await lstat(output)).mtimeMs;
@@ -301,7 +309,7 @@ if ! cmp -s "$2" "$3"; then cp "$2" "$3"; fi
   await rm(failure);
   result = generate();
   assert.equal(result.status, 0, result.stderr);
-  assert.equal(await count(), 5);
+  assert.equal(await count(), 6);
 });
 
 test("missing installed compiler fails without bootstrapping or changing the SDK", {
