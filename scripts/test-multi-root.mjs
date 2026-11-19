@@ -3154,6 +3154,55 @@ async function testAggregateCountedProgress() {
   }
 }
 
+async function testCompletionConfigurationBoundary() {
+  const root = await makeBase("completion-configuration");
+  const configuration = (directory) => `${ROOT_CONFIG}source_module_roots = {"./src", "./${directory}"}\n`;
+  const saved = 'local dep = import "dependency"\nfunction answer(): integer return 1 end\n';
+  const source = await writeRoot(root, saved, configuration("first"));
+  const configFile = path.join(root, "titan-config.lua");
+  for (const [directory, member] of [["first", "oldValue"], ["second", "newValue"]]) {
+    await mkdir(path.join(root, directory));
+    await writeFile(path.join(root, directory, "dependency.titan"),
+      `--- Provider ${member}.\nfunction ${member}(): integer return 1 end\n`);
+  }
+  const overlay = 'local dep = import "dependency"\nfunction answer(): integer return dep.oldValue() end\n';
+  const member = endOfToken(overlay, "dep.");
+  const dependency = positionOf(overlay, "dep");
+  const params = { textDocument: { uri: uri(source) } };
+  const session = new Session(launch(root, "debug"));
+  try {
+    await session.initialize({ workspaceFolders: [{ uri: uri(root), name: "completion configuration" }] });
+    session.notify("initialized", {});
+    assert.deepEqual((await pullDiagnostics(session, uri(source))).items, []);
+    session.notify("textDocument/didOpen", {
+      textDocument: { uri: uri(source), languageId: "titan", version: 1, text: overlay }
+    });
+    const prior = await pollCompletion(session, source, member, "first config provider");
+    assert.ok(prior.some((item) => item.label === "oldValue"));
+    await pollHover(session, source, overlay, "dep", /oldValue/, "retained private import hover");
+
+    await writeFile(configFile, configuration("second"));
+    assert.deepEqual((await pullDiagnostics(session, uri(source))).items, []);
+    const hover = await session.result("textDocument/hover", { ...params, position: dependency });
+    assert.doesNotMatch(hover?.contents?.value ?? "", /oldValue/);
+    await poll("completion should adopt the edited config without stale candidates", async () => {
+      const result = await session.result("textDocument/completion", {
+        ...params, position: member, context: { triggerKind: 1 }
+      });
+      const items = result?.items ?? [];
+      assert.ok(!items.some((item) => item.label === "oldValue"),
+        "a committed semantic configuration change retained old provisional candidates");
+      return items.some((item) => item.label === "newValue") ? { accepted: items } : { rejected: result };
+    });
+    await pollHover(session, source, overlay, "dep", /newValue/, "private hover after config edit");
+    await session.shutdown();
+  } catch (error) {
+    throw new Error(`${error.message}\n${session.stderr().toString("utf8").slice(-12000)}`, { cause: error });
+  } finally {
+    await session.abort();
+  }
+}
+
 // These cases prove symlink semantics: a farmed SDK is a tree of links into the
 // session SDK, and one workspace folder is reached through a link.
 const SYMLINK_GROUPS = new Set(["sdk", "sdk-errors", "overlays", "shutdown-restart"]);
@@ -3169,6 +3218,7 @@ const groups = [
     if (process.platform === "win32") await testSelectedProviderAliasCatalog();
   }, "second SDK"],
   ["sdk-errors", testRootScopedSdkErrors, "root-scoped SDK errors"],
+  ["completion-config", testCompletionConfigurationBoundary, "private completion across a saved configuration change"],
   ["crash", testWorkerCrashAndOverlay, "crash and overlay replay"],
   ["cap", testCapAndIdleEviction, "worker cap and idle eviction"],
   ["cancel", testCancellation, "request cancellation"],

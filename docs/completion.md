@@ -231,9 +231,11 @@ transaction owner completes or rolls back before shutdown drains it.
 Saving never promotes TEMP facts: the watcher reindexes disk while the editor
 keeps its version. Closing retires editor state, and reopening gets a new
 session. A changed saved generation makes old snapshots ineligible for fresh
-selection. Bounded retention can still serve provisional candidates until
-replacement. Closed sessions cannot reuse them. Other database connections
-cannot see TEMP content.
+selection. Bounded retention can still serve provisional candidates across
+ordinary saves. A committed semantic configuration change retires both
+provisional completion and retained private hover from the preceding
+configuration. Closed sessions cannot reuse their snapshots. Other database
+connections cannot see TEMP content.
 
 ## Bounds and checks
 
