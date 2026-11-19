@@ -820,6 +820,24 @@ async function assertSelectedSdkUsesProvider(session, project, source, provider)
     ` once in ${record.wall_ms} ms`);
 }
 
+async function observeCompilerSupport(sdk, marker) {
+  const parser = path.join(sdk, "share", "lua", "5.5", "titan-compiler", "parser.lua");
+  await assertFarmedFile(sdk, parser);
+  const source = await readFile(parser, "utf8");
+  await rm(parser);
+  await writeFile(parser, [
+    'local cwd = assert(require("lfs").currentdir())',
+    `if cwd ~= ${luaString(path.join(sdk, "bin"))} and cwd ~= ${luaString(serverPath(path.join(sdk, "bin")))} then`,
+    '  local _, origin = require "titan"',
+    '  if package.preload.titan ~= nil then origin = "embedded" end',
+    '  assert(type(origin) == "string", "compiler support was loaded before the probe")',
+    `  local marker <close> = assert(io.open(${luaString(marker)}, "ab"))`,
+    '  marker:write(cwd, "\\t", origin, "\\n")',
+    "end",
+    source
+  ].join("\n"));
+}
+
 async function testSecondSdk() {
   const base = await makeBase("sdk");
   const sdk = path.join(base, "sdk");
@@ -843,7 +861,12 @@ async function testSecondSdk() {
     await rm(farmedProvider, { force: true });
     await writeFile(farmedProvider, "not a loadable provider object\n", "utf8");
   }
-  const session = new Session(launch(defaultRoot, "trace"));
+  const supportMarker = path.join(base, "compiler-support.txt");
+  await observeCompilerSupport(sdk, supportMarker);
+  const share = path.join(sdk, "share", "lua", "5.5");
+  const session = new Session(launch(defaultRoot, "trace", {
+    TITAN_LS_LUA_PATH: `${share}/?.lua;${share}/?/init.lua`
+  }));
   try {
     await session.initialize({
       workspaceFolders: [
@@ -877,6 +900,13 @@ async function testSecondSdk() {
     // the standard library resolved with the selected SDK.
     await pollHover(session, sdkSource, SDK_SOURCE, "encoded", /string/,
       "the selected SDK standard library");
+    const supportRows = (await readFile(supportMarker, "utf8")).trimEnd()
+      .split("\n").map((line) => line.split("\t"));
+    const supportOrigin = (root) => supportRows.find(([from]) => samePath(from, root))?.[1];
+    assert.equal(supportOrigin(defaultRoot), "embedded");
+    const support = path.join(sdk, "lib", "lua", "5.5", providerName);
+    assert.ok(samePath(supportOrigin(sdkRootDir), support),
+      `selected worker's compiler support came from ${supportOrigin(sdkRootDir)}`);
     assert.ok(await exists(path.join(sdkRootDir, ".titan-ls", "index.sqlite3")),
       "the selected root wrote no workspace cache below its own root");
     assert.equal(await exists(path.join(sdk, ".titan-ls")), false,
@@ -1078,6 +1108,52 @@ async function testSelectedProviderOverlap() {
       assert.equal(extractionRecords(session).filter((record) => samePath(record.provider_file, provider)).length,
         1, "the explicit binary root invoked the selected SDK's inventory query");
     }
+    await session.shutdown();
+  } finally {
+    await session.abort();
+  }
+}
+
+async function testSelectedProviderAliasRetarget() {
+  const base = await makeBase("sdk-alias");
+  const sdk = path.join(base, "sdk");
+  await farmSdk(sdkRoot(), sdk);
+  const sdkProviders = path.join(sdk, "lib", "titan", "0.6");
+  const provider = path.join(sdkProviders, "titan.dll");
+  const empty = path.join(base, "empty");
+  await mkdir(empty);
+  const project = path.join(base, "project");
+  const alias = path.join(project, "providers");
+  const config = `${ROOT_CONFIG}compiler_root = ${luaString(sdk)}\n` +
+    'binary_modules_root = "./providers"\n';
+  const source = await writeRoot(project, SDK_SOURCE, config);
+  await linkDirectory(sdkProviders, alias);
+  const session = new Session(launch(project, "debug"));
+  try {
+    await session.initialize({
+      workspaceFolders: [{ uri: uri(project), name: "selected SDK alias" }],
+      initializationOptions: { trustedRoots: [base] }
+    });
+    session.notify("initialized", {});
+    await pollHover(session, source, SDK_SOURCE, "encoded", /string/, "initial selected SDK alias");
+    const running = rootEntry(await session.status(), project);
+    assert.deepEqual((await pullDiagnostics(session, uri(source))).items, []);
+    assert.ok(samePath(sdkDescriptor(project, "titan.json").file, provider));
+
+    await rm(alias);
+    await linkDirectory(empty, alias);
+    const rejected = await pullDiagnostics(session, uri(source));
+    assert.match(JSON.stringify(rejected.items), /module 'titan\.json' not found/);
+
+    await rm(alias);
+    await linkDirectory(sdkProviders, alias);
+    assert.deepEqual((await pullDiagnostics(session, uri(source))).items, []);
+    assert.ok(samePath(sdkDescriptor(project, "titan.json").file, provider));
+    const recovered = rootEntry(await session.status(), project);
+    assert.equal(recovered.workerPid, running.workerPid);
+    assert.equal(recovered.generation, running.generation);
+    assert.equal(await readFile(path.join(project, "titan-config.lua"), "utf8"), config);
+    assert.equal(extractionRecords(session).length, 1, "alias recovery reacquired the SDK snapshot");
     await session.shutdown();
   } finally {
     await session.abort();
@@ -2984,6 +3060,7 @@ const groups = [
   ["sdk", async () => {
     await testSecondSdk();
     await testSelectedProviderOverlap();
+    if (process.platform === "win32") await testSelectedProviderAliasRetarget();
   }, "second SDK"],
   ["sdk-errors", testRootScopedSdkErrors, "root-scoped SDK errors"],
   ["crash", testWorkerCrashAndOverlay, "crash and overlay replay"],

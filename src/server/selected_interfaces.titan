@@ -7,6 +7,7 @@ local lua = import "lua"
 local os = import "os"
 local paths = import "path"
 local strings = import "string"
+local content_identity = import "server.content_identity"
 foreign import "compiler_io_platform.h"
 foreign import "embedded_interfaces_native.h"
 
@@ -161,9 +162,10 @@ end
 
 local function decode(bytes: string, provider_file: string, source: string): {string: value}
   local raw = lua.load([[
-return function(payload, provider_file, source)
+return function(payload, provider_file, source, digest)
   local inventory = assert(load(source, "=standard-interface-inventory", "t"))()
   local codec = require "titan-compiler.graphcodec"
+  inventory.limits.sha256_binary = digest
   local snapshot = assert(codec.decode(payload, inventory.limits))
   assert(type(snapshot) == "table" and snapshot.provider_file == provider_file and
          snapshot.target_profile == nil, "selected interface result has unexpected provenance")
@@ -174,8 +176,8 @@ return function(payload, provider_file, source)
   return snapshot
 end
 ]], "=server.selected_interfaces.decode", nil)()
-  local unpack = raw as function (string, string, string): {string: value}
-  return unpack(bytes, provider_file, source)
+  local unpack = raw as function (string, string, string, function (string): string): {string: value}
+  return unpack(bytes, provider_file, source, content_identity.digest)
 end
 
 function read(prefix: string, provider_file: string): {string: value}

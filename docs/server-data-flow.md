@@ -92,14 +92,19 @@ to query `lib/titan/0.6/titan.dll` in a separate interpreter, once per worker.
 The resolver receives the interface inventory without the build SDK's C
 profile. The selected DLL is reobserved as an ordinary file, not as the
 server's mapped provider. An explicitly different `binary_modules_root`
-keeps ordinary filesystem lookup. If project source overlaps the inventory,
-the compiler rejects the whole inventory and may inspect that SDK's DLL
-through ordinary lookup. The DLL then stays mapped until worker exit; the
-worker's own native runtime never changes.
+keeps ordinary filesystem lookup. Saved revalidation resolves directory
+aliases again without replacing the configured path. If project source
+overlaps the inventory, the compiler rejects the whole inventory and may
+inspect that SDK's DLL through ordinary lookup. The DLL stays mapped until
+worker exit; the worker's own native runtime never changes.
 
-The compiler's `titan` support table in the worker still comes from this
-executable. If the selected compiler requires a newer support function,
-that root fails; use a server built from a matching SDK.
+The default worker gets its bare `titan` compiler support table from the
+executable. A selected worker instead loads `lib/lua/5.5/titan.so` or
+`titan.dll` from its SDK, just like the selected SDK's other compiler
+dependencies. This support module must match the worker's Lua/Titan ABI.
+The router observes its file identity for restarts and the worker includes
+its bytes in cache compatibility. It does not select the worker's Titan
+runtime or standard-library provider.
 
 `inventory.validate` in `scripts/standard-interface-inventory.lua` accepts
 the original 23 modules or all 26, including `titan.protobuf`, `titan.thread`

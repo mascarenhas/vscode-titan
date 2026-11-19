@@ -139,6 +139,9 @@ function inventory.extract(prefix, provider_file, output)
     local provider = assert(inventory.query(provider_file))
     for _, entry in pairs(provider.entries) do entry.module = nil end
     local codec = require "titan-compiler.graphcodec"
+    local digest = require("titan")._sha256_binary
+    assert(type(digest) == "function", "selected SDK Lua is missing native SHA-256")
+    inventory.limits.sha256_binary = digest
     local payload = assert(codec.encode(provider, inventory.limits))
     local file <close> = assert(io.open(output, "wb"))
     assert(file:write(payload))

@@ -501,6 +501,7 @@ record Compiler
   local const mapped_provider: boolean
   local selected_prefix: string?
   local snapshot_directory: string?
+  local use_selected_inventory: boolean
 end
 
 local function fail<|T|>(module_name: string, message: string): T
@@ -1188,7 +1189,7 @@ local function load_with(require_function: RequireFunction,
     provider_file,
     embedded_identity, compiler_io.create(),
     {}, CompilerConfiguration.new(), baseline, baseline, {}, nil, {}, {},
-    mapped_provider, nil, nil)
+    mapped_provider, nil, nil, false)
 end
 
 -- An ordinary selected file never uses the mapped application's identity.
@@ -1262,8 +1263,7 @@ local function Compiler:selected_inventory(): {string: value}?
   if self.snapshot_directory == nil then
     raise "selected provider directory cannot be resolved"
   end
-  if self.configuration.binary_root ~= nil and
-     self.effective.binary_path ~= self.snapshot_directory then return nil end
+  if not self.use_selected_inventory then return nil end
   return self:read_selected_snapshot(prefix)
 catch
   if error is async.CancellationReason then raise end
@@ -1296,6 +1296,7 @@ function load(): Compiler
     if ffi.VSCODE_TITAN_WINDOWS ~= 0 then
       compiler.selected_prefix = configured
       compiler.snapshot_directory = physical_directory(paths.dirname(provider_file))
+      compiler.use_selected_inventory = true
     end
     return compiler
   end
@@ -1347,10 +1348,19 @@ end
 
 function Compiler:configure(configuration: CompilerConfiguration)
   local current = self.configuration
+  local sdk_directory? = self.snapshot_directory
+  local root? = configuration.binary_root
+  local use_selected = sdk_directory ~= nil and
+    (root == nil or root == sdk_directory or physical_directory(root) == sdk_directory)
+  local provider_changed = self.use_selected_inventory ~= use_selected
+  self.use_selected_inventory = use_selected
   if current.binary_root == configuration.binary_root and
      current.cppflags == configuration.cppflags and
      same_roots(current.source_roots, configuration.source_roots) and
-     same_roots(current.include_roots, configuration.include_roots) then return end
+     same_roots(current.include_roots, configuration.include_roots) then
+    if provider_changed then self.completion_binaries = {} end
+    return
+  end
 
   local cppflags? = configuration.cppflags
   local effective_cppflags: value = self.effective.cppflags
@@ -1389,12 +1399,6 @@ function Compiler:configure(configuration: CompilerConfiguration)
   end
   local binary_path: value = self.baseline.binary_path
   if configuration.binary_root ~= nil then binary_path = configuration.binary_root end
-  local sdk_directory? = self.snapshot_directory
-  if sdk_directory ~= nil and configuration.binary_root ~= nil and
-     (configuration.binary_root == sdk_directory or
-      physical_directory(configuration.binary_root) == sdk_directory) then
-    binary_path = sdk_directory
-  end
   local includes: {integer: value} = {}
   if configuration.include_roots ~= nil then
     for index = 1, #configuration.include_roots do
@@ -5649,6 +5653,15 @@ end
     end
     output:write(#path .. ":" .. path)
     output:write(fingerprint(path))
+  end
+  if not self.mapped_provider then
+    local support?, failure? = resolve("titan", true)
+    if support == nil then
+      return fail<|string|>(DRIVER_MODULE,
+        "cannot identify selected Titan compiler support: " .. strings.tostring(failure))
+    end
+    output:write(#support .. ":" .. support)
+    output:write(fingerprint(support))
   end
   -- This image owns the complete static provider and embedded target/interface
   -- inventory, including libraries not linked by application declarations.
