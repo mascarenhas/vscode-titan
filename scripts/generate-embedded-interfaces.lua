@@ -9,7 +9,6 @@ end
 local inventory = assert(load(helper_source, "@standard-interface-inventory.lua", "t"))()
 local EXPECTED_ABI = inventory.abi
 local EXPECTED_MODULES = inventory.modules
-local MODERN_MODULES = inventory.modern
 local validate_inventory = inventory.validate
 
 local function script_error(message)

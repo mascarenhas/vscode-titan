@@ -294,8 +294,15 @@ if ! cmp -s "$2" "$3"; then cp "$2" "$3"; fi
   assert.equal(result.status, 0, result.stderr);
   assert.equal(await count(), 3);
 
+  // Make this the only newer prerequisite. Otherwise the test also passes
+  // when Make ignores the shared query.
+  const middle = new Date(Date.now() - 30_000);
+  const latest = new Date(Date.now() - 15_000);
+  await utimes(provider, older, older);
+  await utimes(generator, older, older);
+  await utimes(output, middle, middle);
   await writeFile(inventory, "changed inventory query\n");
-  await utimes(output, older, older);
+  await utimes(inventory, latest, latest);
   result = generate();
   assert.equal(result.status, 0, result.stderr);
   assert.equal(await count(), 4, "changed interface query must rerun generation");
