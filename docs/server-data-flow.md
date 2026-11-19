@@ -35,9 +35,10 @@ worker rescans it.
 
 The extension maps symlinked workspace roots and their documents to physical
 paths on the wire and maps returned locations back to the editor's workspace
-spelling (`src/extension/workspaceUris.ts`). On Windows, the mapper compares
-only the drive letter case-insensitively in local file URIs. The same rule
-applies when finding nested workspace clients. On the server,
+spelling (`createWorkspaceUriConverters` in `src/extension/workspaceUris.ts`).
+On Windows, `relativeWorkspaceUriPath` in `src/extension/uriPaths.ts` compares
+only the drive letter case-insensitively in local file URIs. `isNestedWorkspace`
+in `src/extension/extension.ts` uses the same rule. On the server,
 `source_text.file_uri_to_path` normalizes the drive and separators before the
 router resolves physical paths and uses them for root and document ownership.
 The remainder of each path is case-sensitive.

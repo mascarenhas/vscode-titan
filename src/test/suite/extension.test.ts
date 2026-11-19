@@ -1015,10 +1015,25 @@ suite("Titan extension", () => {
         const physicalDocument = vscode.Uri.joinPath(
           vscode.Uri.file(canonicalRoot), "sample.titan"
         ).with(components);
-        assert.equal(converters.code2Protocol(lexicalDocument),
-          physicalDocument.toString());
-        assert.equal(converters.protocol2Code(physicalDocument.toString()).toString(),
-          lexicalDocument.toString());
+        let outgoing = lexicalDocument;
+        let serverUri = physicalDocument.toString();
+        if (process.platform === "win32") {
+          const drive = lexicalDocument.path[1];
+          const opposite = drive === drive.toUpperCase() ? drive.toLowerCase() : drive.toUpperCase();
+          outgoing = lexicalDocument.with({ path: `/${opposite}${lexicalDocument.path.slice(2)}` });
+          assert.notEqual(outgoing.path, lexicalDocument.path);
+          // The native server writes an uppercase drive and an unescaped colon.
+          serverUri = serverUri.replace(/^file:\/\/\/([a-z])%3A\//,
+            (_, letter: string) => `file:///${letter.toUpperCase()}:/`);
+          assert.match(serverUri, /^file:\/\/\/[A-Z]:\//);
+        }
+        assert.equal(converters.code2Protocol(outgoing), physicalDocument.toString());
+        const returned = converters.protocol2Code(serverUri);
+        assert.equal(returned.scheme, lexicalDocument.scheme);
+        assert.equal(returned.authority, lexicalDocument.authority);
+        assert.equal(returned.path, lexicalDocument.path);
+        assert.equal(returned.query, lexicalDocument.query);
+        assert.equal(returned.fragment, lexicalDocument.fragment);
 
         const document = await vscode.workspace.openTextDocument(
           vscode.Uri.joinPath(symlinkFolder.uri, "sample.titan")

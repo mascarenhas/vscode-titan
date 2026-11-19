@@ -1,9 +1,14 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { relativeWorkspaceUriPath } from "../../extension/uriPaths";
+import { mapUriRoot, relativeWorkspaceUriPath } from "../../extension/uriPaths";
 
-function file(path: string, authority = "") {
-  return { scheme: "file", authority, path };
+function file(path: string, authority = "", query = "", fragment = "") {
+  return {
+    scheme: "file", authority, path, query, fragment,
+    with(change: { path: string; query: string; fragment: string }) {
+      return { scheme: "file", authority, ...change };
+    }
+  };
 }
 
 for (const drive of ["C", "c"]) {
@@ -55,4 +60,40 @@ test("distinguishes a drive root itself from its descendants", () => {
   assert.equal(relativeWorkspaceUriPath(file("/c:/"), file("/C:/"), "win32"), "");
   assert.equal(relativeWorkspaceUriPath(file("/c:/"), file("/C:/Work"), "win32"),
     "Work");
+});
+
+test("maps drive roots and descendants without losing or duplicating the slash", () => {
+  const lexical = file("/c:/");
+  const physical = file("/W:/");
+  const incomingRoot = file("/C://", "", "selected=1", "section");
+  const mapped = mapUriRoot(incomingRoot, lexical, physical, "win32");
+  assert.deepEqual(mapped, {
+    scheme: "file", authority: "", path: "/W:/", query: "selected=1", fragment: "section"
+  });
+  assert.deepEqual(mapUriRoot({ ...mapped!, path: "/w:/" }, physical, lexical, "win32"), {
+    scheme: "file", authority: "", path: "/c:/", query: "selected=1", fragment: "section"
+  });
+  const document = mapUriRoot(file("/C:/Dir/Main.titan"), lexical, physical, "win32");
+  assert.equal(document?.path, "/W:/Dir/Main.titan");
+  assert.equal(mapUriRoot(document!, physical, lexical, "win32")?.path, "/c:/Dir/Main.titan");
+  assert.equal(mapUriRoot(file("/C:"), lexical, physical, "win32"), undefined);
+  assert.equal(relativeWorkspaceUriPath(file("/C:/"), file("/C:"), "linux"), "");
+});
+
+test("maps UNC share roots and descendants, retaining each authority and share", () => {
+  const lexical = file("/Share/", "editor");
+  const physical = file("/Storage", "server");
+  const root = mapUriRoot(lexical, lexical, physical, "win32");
+  assert.deepEqual(root, {
+    scheme: "file", authority: "server", path: "/Storage", query: "", fragment: ""
+  });
+  assert.deepEqual(mapUriRoot(root!, physical, lexical, "win32"), {
+    scheme: "file", authority: "editor", path: "/Share", query: "", fragment: ""
+  });
+  const document = mapUriRoot(file("/Share/Dir/Main.titan", "editor"), lexical,
+    physical, "win32");
+  assert.equal(document?.path, "/Storage/Dir/Main.titan");
+  assert.equal(mapUriRoot(document!, physical, lexical, "win32")?.path, "/Share/Dir/Main.titan");
+  assert.equal(mapUriRoot(file("/ShareCopy/file.titan", "editor"), lexical, physical, "win32"),
+    undefined);
 });

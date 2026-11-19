@@ -1,6 +1,6 @@
 import * as vscode from "vscode";
 import type { LanguageClientOptions } from "vscode-languageclient/node";
-import { relativeWorkspaceUriPath, workspaceRootPath } from "./uriPaths";
+import { mapUriRoot } from "./uriPaths";
 
 const TITAN_DOCUMENT_GLOB = "**/*.titan";
 
@@ -100,26 +100,4 @@ export function createWorkspaceMiddleware(
     provideFoldingRanges: (document, context, token, next) =>
       owns(document) ? next(document, context, token) : undefined
   };
-}
-
-function mapUriRoot(
-  uri: vscode.Uri,
-  sourceRoot: vscode.Uri,
-  targetRoot: vscode.Uri
-): vscode.Uri | undefined {
-  const relativePath = relativeWorkspaceUriPath(sourceRoot, uri);
-  if (relativePath === undefined) {
-    return undefined;
-  }
-  const rootPath = workspaceRootPath(targetRoot.path);
-  const targetPath = relativePath.length === 0
-    ? rootPath
-    : rootPath === "/"
-      ? `/${relativePath}`
-      : `${rootPath}/${relativePath}`;
-  return targetRoot.with({
-    path: targetPath,
-    query: uri.query,
-    fragment: uri.fragment
-  });
 }

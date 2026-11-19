@@ -444,6 +444,8 @@ inspection and an interactive Extension Host (F5) session are separate gates. A
 successful compilation, a DLL helper test or an SSH-launched `code` command does
 not establish them. Symlink checks skip when the account cannot create or
 traverse the fixture links.
+To qualify the Windows symlink case, run the Extension Host suite elevated
+on local NTFS so the test can create and traverse its directory link.
 The multi-root transcript's per-root SDK cases skip on Windows: a selected
 root's `compiler_root` needs the bridge to load that SDK's provider, the Unix
 path loads the `titan.a` archive provider, and a Windows SDK ships `titan.dll`
