@@ -34,8 +34,9 @@ local function fixture(connection: sqlite3.Connection)
 end
 
 local function publish(connection: sqlite3.Connection, current: service.Snapshot,
-    binaries: {bridge.CompletionBinary}, reusable: boolean)
-  local descriptors, retained = loader.completion_catalog(connection, current, binaries, reusable)
+    binaries: {bridge.CompletionBinary}, reusable: boolean, browser_provider: string?)
+  local descriptors, retained = loader.completion_catalog(
+    connection, current, binaries, reusable, browser_provider)
   storage.publish_saved(connection, descriptors, retained, bridge.CompilerConfiguration.new())
 end
 
@@ -126,6 +127,35 @@ function test_project_loader_catalog_retains_warm_embedded_and_rejects_whole_sou
     publish(connection, current, binaries, false)
     test.assert(count(connection, "titan.string") == 0,
       "one source overlap did not reject the complete pending embedded provider")
+  end)
+end
+
+function test_project_loader_catalog_seeds_only_the_accepted_browser_provider(_: test.Context)
+  runtime.run(function ()
+    local store = sql.open(":memory:")
+    defer store:close()
+    local access = store:acquire()
+    defer access:release()
+    local connection = access.connection
+    fixture(connection)
+    local current = snapshot({})
+    local browser_provider = "/sdk/lib/titan-browser/0.6/titan.a"
+    local binaries = {
+      bridge.CompletionBinary("titan.browser", "browser", "static", browser_provider),
+      bridge.CompletionBinary("titan.gc", "gc", "static", browser_provider),
+      bridge.CompletionBinary("titan.other", "other", "static", "/other/titan.a"),
+    }
+    publish(connection, current, binaries, false, browser_provider)
+    test.assert(count(connection, "titan.browser") == 1 and count(connection, "titan.gc") == 1,
+      "browser SDK catalog needed a saved standard-library import")
+    test.assert(count(connection, "titan.other") == 0,
+      "an arbitrary archive received implicit browser SDK eligibility")
+    publish(connection, current, {}, true, browser_provider)
+    test.assert(count(connection, "titan.gc") == 1, "a reusable publication dropped the browser SDK")
+    module(connection, "titan.browser", 0, 2)
+    publish(connection, current, {}, false, browser_provider)
+    test.assert(count(connection, "titan.gc") == 0,
+      "project source overlap retained siblings of the rejected browser SDK")
   end)
 end
 

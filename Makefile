@@ -341,11 +341,13 @@ shard-runner-test:
 	node --test scripts/makefile-contract.test.mjs
 	node --test scripts/build-windows.test.mjs scripts/inspect-windows-package.test.mjs \
 		scripts/compiler-rocks.test.mjs scripts/stage-lua-modules.test.mjs scripts/stage-notices.test.mjs
+	node --test scripts/browser-semantic-pack.test.mjs
 
 incremental-build-test:
 	node scripts/test-incremental-build.mjs --prefix $(call shell_quote,$(TITAN_PREFIX))
 
 server-protocol-test: $(SERVER) $(ROUTER_WORKER_FIXTURE) completion-protocol-test
+	$(SERVER_TEST_ENV) node --test scripts/browser-analysis-fixture.test.mjs
 	$(SERVER_TEST_ENV) node scripts/test-server-protocol.mjs "$(SERVER)"
 	$(SERVER_TEST_ENV) node scripts/test-workspace-cache.mjs "$(SERVER)"
 	$(SERVER_TEST_ENV) node scripts/test-multi-root.mjs "$(SERVER)"

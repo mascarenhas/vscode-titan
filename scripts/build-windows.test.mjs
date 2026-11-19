@@ -3,7 +3,8 @@ import test from "node:test";
 import path from "node:path";
 import { lstat, mkdir, mkdtemp, readdir, readlink, realpath, rm, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { compilerArgument, runtimeDlls, childEnvironment, windowsPathContains, assertBuildRootOutsideSdk,
+import { childEnvironment } from "./titan-sdk.mjs";
+import { compilerArgument, runtimeDlls, windowsPathContains, assertBuildRootOutsideSdk,
   buildProfileEnvironment, nativeBuildFlags, nativeBuildDirectory, windowsCompilerCommand,
   windowsApplicationArguments } from "./build-windows.mjs";
 
@@ -105,10 +106,11 @@ test("configured compiler arguments retain spaces and Unicode without a command 
 });
 
 test("child build environment overrides all Windows spellings and leaves its parent untouched", () => {
-  const parent = { Path: "old", PATH: "also old", cc: "old-cc", CC: "other-cc", Lua_Path_5_5: "ambient", Unrelated: "keep" };
+  const parent = { Path: "old", PATH: "also old", cc: "old-cc", CC: "other-cc",
+    Lua_Path_5_5: "ambient", Unrelated: "before", UNRELATED: "keep" };
   const snapshot = { ...parent };
-  assert.deepEqual(childEnvironment(parent, { PATH: "new", CC: "new-cc" }, ["LUA_PATH_5_5"]),
-    { Unrelated: "keep", PATH: "new", CC: "new-cc" });
+  assert.deepEqual(childEnvironment(parent, { PATH: "new", CC: "new-cc" }, ["LUA_PATH_5_5"], "win32"),
+    { UNRELATED: "keep", PATH: "new", CC: "new-cc" });
   assert.deepEqual(parent, snapshot);
 });
 

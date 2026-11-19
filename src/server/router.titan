@@ -432,6 +432,7 @@ local function status_value(router: Router): value
         local loaded = settings as root_settings.Settings
         trusted = loaded.trusted
         compiler_root = loaded.compiler_root
+        item["target"] = loaded.target or "native"
       end
     end
     item["trusted"] = trusted
@@ -1266,6 +1267,10 @@ local function start_worker(router: Router, slot: Slot,
     arguments[#arguments + 1] = "--compiler-root"
     arguments[#arguments + 1] = compiler_root as string
   end
+  -- Pass the native choice too: a direct worker may otherwise reload the
+  -- tracked selector while the router is accepting a different generation.
+  arguments[#arguments + 1] = "--target"
+  arguments[#arguments + 1] = settings.target or "native"
   local probe = root_settings.probe_prefix(
     router.options.probe_prefix, slot.root.path)
   slot.generation = slot.generation + 1
@@ -1384,11 +1389,11 @@ local function make_room(router: Router): boolean
   return true
 end
 
--- Only a trust refusal gets a configuration diagnostic; every other settings
--- failure is reported by the requests that need the root.
-local function selection_refused(reason: root_settings.Reason): boolean
+-- Configuration errors for trust and browser target admission are owned here.
+local function reports_configuration_diagnostic(reason: root_settings.Reason): boolean
   case reason
   when untrusted_selection() then return true
+  when invalid_target() then return true
   else return false
   end
   return false
@@ -1404,7 +1409,8 @@ local function revalidate(router: Router, slot: Slot, force: boolean): boolean
     return false
   end
   slot.checked = now
-  local settings?, failure? = root_settings.load(slot.root.path, router.trust)
+  local settings?, failure? = root_settings.load(
+    slot.root.path, router.trust, router.options.titan_root)
   if settings == nil then
     local error_value = failure as root_settings.Error
     local message = error_value.message
@@ -1413,8 +1419,10 @@ local function revalidate(router: Router, slot: Slot, force: boolean): boolean
       stop_worker_locked(router, slot, "settings error")
     end
     slot:set_failure(router, message)
-    if selection_refused(error_value.reason) then
+    if reports_configuration_diagnostic(error_value.reason) then
       publish_configuration_diagnostic(router, slot, error_value.path, message)
+    else
+      clear_configuration_diagnostic(router, slot)
     end
     logging.emit("error", "root.settings.failure", {
       ["root"] = slot.root.path,
@@ -1425,7 +1433,7 @@ local function revalidate(router: Router, slot: Slot, force: boolean): boolean
   local actual = settings as root_settings.Settings
   local fingerprint = root_settings.fingerprint(actual)
   local identity = root_settings.sdk_identity(
-    actual.compiler_root, router.options.titan_root)
+    actual.compiler_root, router.options.titan_root, actual.target)
   local changed = slot.settings == nil or
     fingerprint ~= slot.settings_fingerprint or
     identity ~= slot.sdk_identity

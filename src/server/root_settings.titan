@@ -22,6 +22,11 @@ local const SDK_FILES: const {string} = {
 local const SDK_DIRECTORIES: const {string} = {
   "lib/lua/5.5",
 }
+local const BROWSER_FILES: const {string} = {
+  "lib/titan-browser/0.6/analysis-target",
+  "lib/titan-browser/0.6/absent-modules",
+  "lib/titan-browser/0.6/titan.a",
+}
 local const IDENTITY_FILES_HEAD: const {string} = {
   "share/lua/5.5/titan-compiler/driver.lua",
 }
@@ -60,6 +65,7 @@ union Reason
   untrusted_selection()
   invalid_prefix()
   invalid_configuration()
+  invalid_target()
 end
 
 --- One root-scoped configuration or selection failure.
@@ -170,21 +176,22 @@ record Settings
   const compiler_root: string?
   const compiler_root_file: string?
   const trusted: boolean
+  const target: string?
 end
 
 --- Validate the layout of an installed Titan SDK prefix.
-function validate_prefix(prefix: string): Error?
+function validate_prefix(prefix: string, target: string?): Error?
   for index = 1, #SDK_FILES do
     local failure? = missing_file(prefix, SDK_FILES[index])
     if failure ~= nil then return failure end
   end
-  do
+  if target == nil then
     local failure? = missing_file(prefix, provider_entry())
     if failure ~= nil then return failure end
-    local support_failure? = missing_file(prefix, support_entry())
-    if support_failure ~= nil then return support_failure end
   end
-  if ffi.VSCODE_TITAN_WINDOWS ~= 0 then
+  local support_failure? = missing_file(prefix, support_entry())
+  if support_failure ~= nil then return support_failure end
+  if target == nil and ffi.VSCODE_TITAN_WINDOWS ~= 0 then
     local failure? = missing_file(prefix, "bin/lua.exe")
     if failure ~= nil then return failure end
   end
@@ -201,7 +208,7 @@ function validate_prefix(prefix: string): Error?
 end
 
 --- Resolve one root's effective SDK selection, trust decision and layout check.
-function load(root: string, trust: Trust): (Settings?, Error?)
+function load(root: string, trust: Trust, titan_root: string?): (Settings?, Error?)
   local allowed = trust:allows(root)
   local selection?, selection_failure? = project_config.load_compiler_root(root)
   if selection == nil then
@@ -209,6 +216,9 @@ function load(root: string, trust: Trust): (Settings?, Error?)
     -- selects nothing verifiable, so the root is refused instead of falling
     -- back to the router's own SDK.
     local problem = selection_failure as project_config.Error
+    if problem.target_selection then
+      return nil, Error(problem.path, problem.message, Reason.invalid_target())
+    end
     return nil, Error.new(problem.path, problem.message,
       Reason.invalid_configuration())
   end
@@ -225,11 +235,27 @@ function load(root: string, trust: Trust): (Settings?, Error?)
         "initializationOptions.trustedRoots or TITAN_LS_TRUSTED_ROOTS",
         Reason.untrusted_selection())
     end
-    local invalid? = validate_prefix(compiler_root as string)
-    if invalid ~= nil then return nil, invalid end
+    local invalid? = validate_prefix(compiler_root, selected.target)
+    if invalid ~= nil then
+      if selected.target == nil then return nil, invalid end
+      return nil, Error(join(root, "titan-config.lua"),
+        invalid.message, Reason.invalid_target())
+    end
+  end
+  local prefix? = compiler_root or titan_root
+  if selected.target == "browser" and prefix ~= nil then
+    for index = 1, #BROWSER_FILES do
+      local entry = join(prefix, BROWSER_FILES[index])
+      local metadata? = fs.stat(entry)
+      if metadata == nil or metadata.kind ~= "file" then
+        return nil, Error(join(root, "titan-config.lua"),
+          "browser target requires the installed SDK asset '" .. entry .. "'",
+          Reason.invalid_target())
+      end
+    end
   end
   return Settings.new(
-    root, compiler_root, selected.compiler_root_file, allowed), nil
+    root, compiler_root, selected.compiler_root_file, allowed, selected.target), nil
 end
 
 --- Return the configuration identity that decides whether a worker must restart.
@@ -237,7 +263,7 @@ function fingerprint(settings: Settings): string
   local compiler_root = settings.compiler_root or ""
   local trusted = "untrusted"
   if settings.trusted then trusted = "trusted" end
-  return #compiler_root .. ":" .. compiler_root .. trusted
+  return #compiler_root .. ":" .. compiler_root .. trusted .. (settings.target or "")
 end
 
 -- Installation identity is the stat tuple of the files that decide the
@@ -245,7 +271,7 @@ end
 -- large belongs to the worker's own cache compatibility, not to a restart
 -- check the router repeats.
 --- Observe the selected SDK installation identity for reinstall detection.
-function sdk_identity(compiler_root: string?, titan_root: string?): string
+function sdk_identity(compiler_root: string?, titan_root: string?, target: string?): string
   local prefix? = compiler_root
   if prefix == nil then prefix = titan_root end
   if prefix == nil then return "" end
@@ -254,11 +280,16 @@ function sdk_identity(compiler_root: string?, titan_root: string?): string
     local entry = join(prefix as string, IDENTITY_FILES_HEAD[index])
     output:write(content_identity.stat_identity(entry))
   end
-  output:write(content_identity.stat_identity(
-    join(prefix as string, provider_entry())))
   if compiler_root ~= nil then
     output:write(content_identity.stat_identity(join(prefix, support_entry())))
-    if ffi.VSCODE_TITAN_WINDOWS ~= 0 then
+  end
+  if target == "browser" then
+    for index = 1, #BROWSER_FILES do
+      output:write(content_identity.stat_identity(join(prefix, BROWSER_FILES[index])))
+    end
+  else
+    output:write(content_identity.stat_identity(join(prefix, provider_entry())))
+    if ffi.VSCODE_TITAN_WINDOWS ~= 0 and compiler_root ~= nil then
       output:write(content_identity.stat_identity(join(prefix, "bin/lua.exe")))
     end
   end

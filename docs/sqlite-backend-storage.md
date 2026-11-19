@@ -31,14 +31,31 @@ key. The key digests the physical root with `Compiler:cache_identity` and
 trees as this process loaded them, their native Lua dependencies and the
 interface provider: the executable's embedded provider for the server's own
 SDK, or the selected installation's standard archive (Unix) or provider DLL
-(Windows) by ordinary stat identity. Reinstalling either SDK invalidates only
-the roots that used it. The second
-covers the project configuration, except watcher policy. The key carries no
-schema number: `PRAGMA user_version` alone decides schema compatibility. A
-missing key is recorded, and a different stored key triggers `Cache:rebuild`.
+(Windows) by ordinary stat identity. Browser workers instead key on the
+validated target descriptor, absent-module list and Wasm provider identity.
+Reinstalling a provider invalidates only roots using it. The second key
+covers project configuration, including the target but excluding watcher
+policy. The key carries no schema number: `PRAGMA user_version` alone decides
+schema compatibility. A missing key is recorded, and a different stored key
+triggers `Cache:rebuild`.
 `Cache:accept_native_context` likewise compares the stored `native_context`
-with `Compiler:native_cache_identity` and rebuilds on a mismatch. A rejected
-file, or one that SQLite reports as corrupt (`SQLITE_CORRUPT` or
+with `Compiler:native_cache_identity` and rebuilds on a mismatch.
+
+Saved browser source revisions that reach the lazy C probe record the probe
+environment's identity or its unavailability in `cache_meta`. Failed checks
+own this observation too, even when they produced no header inputs. Ownership
+changes with accepted source revisions; a pure replacement or removal
+retires the old owner, even if a failed external check retains an import
+edge for recovery. The completed view records one identity only for
+compatible owners. A new, incompatible observation invalidates the affected
+revisions and their dependants before the next view is committed.
+
+Reopening validates the probe environment only if retained revisions still
+own it. A different environment rechecks the incompatible contributors
+rather than reusing their saved diagnostics or facts. A pure warm start does
+not invoke Emscripten.
+
+A rejected file, or one that SQLite reports as corrupt (`SQLITE_CORRUPT` or
 `SQLITE_NOTADB`), is deleted and recreated. Any other open failure logs
 `cache.memory_fallback` and uses the same schema in an in-memory database.
 Tables are created with `CREATE TABLE IF NOT EXISTS` on every open, so a

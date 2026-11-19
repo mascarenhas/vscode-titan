@@ -1,10 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { spawnSync } from "node:child_process";
-import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { semanticDirectory, semanticFiles } from "./browser-semantic-pack.mjs";
 import { nativeRootInventory, requiredShareFiles, stageLuaModules, validateStagedLuaModules } from "./stage-lua-modules.mjs";
 import { validateSdkIncludeInventory } from "./sdk-include-inventory.mjs";
 
@@ -58,6 +59,7 @@ test("staging requires and copies the portable compiler path helper", async (con
     "sqlite3.h", "titan.h", "transfer.h", "uv.h"]) await put(`include/${file}`);
   for (const directory of ["include/titan", "include/uv", "src/lua-5.5.1"])
     await mkdir(path.join(sdk, directory), { recursive: true });
+  for (const name of semanticFiles) await put(`${semanticDirectory}/${name}`, `${name}\n`);
   const script = fileURLToPath(new URL("./stage-lua-modules.mjs", import.meta.url));
   const run = () => spawnSync(process.execPath, [script], {
     cwd: root, env: { ...process.env, TITAN_PREFIX: sdk }, encoding: "utf8", shell: false
@@ -72,6 +74,8 @@ test("staging requires and copies the portable compiler path helper", async (con
     "return { portable = true }\n");
   assert.equal(await readFile(path.join(root, "dist/titan/include/transfer.h"), "utf8"), "fixture\n");
   await rm(path.join(sdk, "include/transfer.h"));
+  assert.equal(await readFile(path.join(root, "dist/titan", semanticDirectory, "analysis-target"), "utf8"),
+    "analysis-target\n");
   const legacyDestination = path.join(root, "legacy");
   await stageLuaModules({ sdk, destination: legacyDestination });
   await validateStagedLuaModules(sdk, legacyDestination);
@@ -81,7 +85,8 @@ test("staging requires and copies the portable compiler path helper", async (con
   // The installed compiler tree can contain LuaRocks itself and other packages;
   // only the reviewed compiler and SDK roots belong in the delivered payload.
   for (const extra of ["share/lua/5.5/luarocks/core/cfg.lua", "share/lua/5.5/unrelated.lua",
-    "lib/lua/5.5/unrelated.so", "include/unrelated.h", "src/unrelated/source.c"]) await put(extra);
+    "lib/lua/5.5/unrelated.so", "include/unrelated.h", "src/unrelated/source.c",
+    `${semanticDirectory}/sdk-digests`]) await put(extra);
   const destination = path.join(root, "selected");
   await stageLuaModules({ sdk, destination });
   await validateStagedLuaModules(sdk, destination);
@@ -91,7 +96,7 @@ test("staging requires and copies the portable compiler path helper", async (con
   const inspected = inspect();
   assert.equal(inspected.status, 0, inspected.stderr);
   for (const extra of ["share/lua/5.5/luarocks", "share/lua/5.5/unrelated.lua",
-    "lib/lua/5.5/unrelated.so", "include/unrelated.h", "src/unrelated"]) {
+    "lib/lua/5.5/unrelated.so", "include/unrelated.h", "src/unrelated", `${semanticDirectory}/sdk-digests`]) {
     await assert.rejects(readFile(path.join(destination, extra)), { code: "ENOENT" });
   }
   await writeFile(path.join(destination, "share/lua/5.5/unrelated.lua"), "unrelated\n");
@@ -102,12 +107,43 @@ test("staging requires and copies the portable compiler path helper", async (con
   const changed = inspect();
   assert.notEqual(changed.status, 0);
   assert.match(changed.stderr, /does not exactly match selected inputs/);
+  await context.test("semantic payload rejects missing, altered and extra files", async () => {
+    const pack = path.join(destination, semanticDirectory);
+    const archive = path.join(pack, "titan.a");
+    const original = await readFile(archive);
+    const compiler = path.join(destination, "share/lua/5.5/titan-compiler/path.lua");
+    const changedLua = await readFile(compiler);
+    const originalLua = await readFile(path.join(sdk, "share/lua/5.5/titan-compiler/path.lua"));
+    await writeFile(compiler, originalLua);
+    try {
+      await rm(archive);
+      await assert.rejects(validateStagedLuaModules(sdk, destination), /does not exactly match selected inputs/);
+      await writeFile(archive, "changed\n");
+      await assert.rejects(validateStagedLuaModules(sdk, destination), /does not exactly match selected inputs/);
+      await writeFile(archive, original);
+      await writeFile(path.join(pack, "sdk-digests"), "not shipped\n");
+      await assert.rejects(validateStagedLuaModules(sdk, destination), /does not exactly match selected inputs/);
+      await rm(path.join(pack, "sdk-digests"));
+      const unexpectedDirectory = path.join(pack, "unused");
+      await mkdir(unexpectedDirectory);
+      await assert.rejects(validateStagedLuaModules(sdk, destination), /unexpected staged browser semantic directory/);
+      await rm(unexpectedDirectory, { recursive: true });
+      await rm(path.join(sdk, semanticDirectory, "analysis-target"));
+      await assert.rejects(stageLuaModules({ sdk, destination }), /browser semantic pack inventory changed/);
+      await put(`${semanticDirectory}/analysis-target`, "analysis-target\n");
+    } finally {
+      await writeFile(compiler, changedLua);
+    }
+  });
   await context.test("payload CLI follows an absolute script symlink", async (aliasContext) => {
     const alias = path.join(root, "stage-alias.mjs");
-    try { await symlink(script, alias); }
-    catch (error) {
-      if (["EACCES", "EPERM", "ENOSYS"].includes(error.code)) {
-        aliasContext.skip("file symlink fixture creation is unavailable"); return;
+    try {
+      await symlink(script, alias);
+      assert.equal(path.relative(script, await realpath(alias)), "");
+      await readFile(alias);
+    } catch (error) {
+      if (["EACCES", "EPERM", "ENOSYS", "EINVAL", "UNKNOWN"].includes(error.code)) {
+        aliasContext.skip("file symlink fixture cannot be created or traversed"); return;
       }
       throw error;
     }

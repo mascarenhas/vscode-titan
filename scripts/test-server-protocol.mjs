@@ -6,6 +6,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { childEnvironment } from "./titan-sdk.mjs";
 
 const server = process.argv[2];
 const mode = process.argv[3] ?? "full";
@@ -142,11 +143,7 @@ function structuredLogRecords(buffer) {
 function launch(cwd = process.cwd(), logLevel = "off", environment = {}) {
   return spawn(path.resolve(server), [], {
     cwd,
-    env: {
-      ...process.env,
-      ...environment,
-      TITAN_LANGUAGE_SERVER_LOG_LEVEL: logLevel
-    },
+    env: childEnvironment(process.env, { ...environment, TITAN_LANGUAGE_SERVER_LOG_LEVEL: logLevel }),
     stdio: ["pipe", "pipe", "pipe"]
   });
 }

@@ -26,6 +26,12 @@ fi
 
 unzip -tqq "$vsix"
 contents=$(unzip -Z1 "$vsix")
+if [[ -n "$(LC_ALL=C sort <<<"$contents" | uniq -d)" ]] ||
+   grep -Eq '(^/|(^|/)\.\.(/|$)|\\)' <<<"$contents" ||
+   unzip -Z -l "$vsix" | grep -E '^l[rwx-]{9} ' >/dev/null; then
+  echo "VSIX contains a duplicate, unsafe or symbolic-link entry" >&2
+  exit 1
+fi
 
 for required in \
   extension/bin/titan-language-server \
@@ -43,6 +49,12 @@ for required in \
   extension/dist/notices/titan/LICENSES/libuv-tree-LICENSE \
   extension/dist/notices/titan/LICENSES/libuv-inet-LICENSE \
   extension/dist/notices/titan/LICENSES/openssl-LICENSE \
+  extension/dist/notices/titan/LICENSES/go-LICENSE \
+  extension/dist/notices/titan/LICENSES/lpeg-LICENSE \
+  extension/dist/notices/titan/LICENSES/lpeg-patterns-LICENSE \
+  extension/dist/notices/titan/LICENSES/lpeglabel-LICENSE \
+  extension/dist/notices/titan/LICENSES/lua-LICENSE \
+  extension/dist/notices/titan/LICENSES/ta-regex-LICENSE \
   extension/dist/notices/lua/argparse/LICENSE \
   extension/dist/notices/lua/inspect/LICENSE \
   extension/dist/notices/lua/lpeglabel/LICENSE \
@@ -63,6 +75,9 @@ for required in \
   extension/dist/titan/lib/lua/5.5/lfs.so \
   extension/dist/titan/lib/lua/5.5/lpeglabel.so \
   extension/dist/titan/lib/lua/5.5/luv.so \
+  extension/dist/titan/lib/titan-browser/0.6/absent-modules \
+  extension/dist/titan/lib/titan-browser/0.6/analysis-target \
+  extension/dist/titan/lib/titan-browser/0.6/titan.a \
   extension/dist/titan/include/titan.h \
   extension/dist/titan/include/titan/ffi.h \
   extension/dist/titan/include/minicoro.h \
@@ -104,7 +119,8 @@ if grep -Eq '[.]map$' <<<"$contents"; then
   exit 1
 fi
 
-if grep -Eq '^extension/.*([.]a|[.]so[.][^/]*)$' <<<"$contents"; then
+if grep -Fxv 'extension/dist/titan/lib/titan-browser/0.6/titan.a' <<<"$contents" |
+    grep -E '^extension/.*([.]a|[.]so[.][^/]*)$' >/dev/null; then
   echo "VSIX contains an unexpected archive or versioned native library" >&2
   exit 1
 fi
@@ -131,6 +147,7 @@ unexpected_titan_payload=$(
   grep -E '^extension/dist/titan(/|$)' <<<"$contents" |
     grep -Ev \
       '^extension/dist/titan/?$|^extension/dist/titan/(share|lib|src)/?$|^extension/dist/titan/(share|lib)/lua/?$|^extension/dist/titan/(share|lib)/lua/5[.]5(/.*)?$|^extension/dist/titan/include(/.*)?$|^extension/dist/titan/src/lua-5[.]5[.]1(/.*)?$' \
+    | grep -Ev '^extension/dist/titan/lib/titan-browser(/0[.]6)?/?$|^extension/dist/titan/lib/titan-browser/0[.]6/(absent-modules|analysis-target|titan[.]a)$' \
     || true
 )
 if [[ -n "$unexpected_titan_payload" ]]; then
@@ -150,6 +167,7 @@ trap 'rm -rf -- "$extract_root"' EXIT
 unzip -qq "$vsix" \
   extension/bin/titan-language-server \
   'extension/dist/titan/*' \
+  'extension/dist/notices/titan/*' \
   -d "$extract_root"
 if [[ ! -x "$extract_root/extension/bin/titan-language-server" ]]; then
   echo "VSIX did not preserve the native server executable mode" >&2
@@ -158,6 +176,10 @@ fi
 
 node "$repository_root/scripts/stage-lua-modules.mjs" --check-payload \
   "$titan_prefix" "$extract_root/extension/dist/titan"
+node "$repository_root/scripts/browser-semantic-pack.mjs" --check-prefix \
+  "$titan_prefix" "$extract_root/extension/dist/titan"
+node "$repository_root/scripts/browser-semantic-pack.mjs" --check-notices \
+  "$titan_prefix" "$extract_root/extension/dist/notices/titan"
 
 inspect_native_module() {
   local module=$1
@@ -262,6 +284,10 @@ mkdir -p \
   # the extension names it at launch; SDK-backed C imports read its headers and
   # Lua sources instead of deriving them from a Lua path.
   export TITAN_ROOT="$extract_root/extension/dist/titan"
+  TITAN_TEST_HOST_SDK="$titan_prefix" "$node_executable" \
+    "$repository_root/scripts/test-multi-root.mjs" \
+    "$extract_root/extension/bin/titan-language-server" browser-packaged
+
   export CC="$sdk_compiler"
   export TITAN_PROBE_CACHE_DISABLE=1
   if [[ "$bundled_openssl" == 0 ]]; then

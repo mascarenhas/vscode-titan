@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
+import { semanticDirectory, semanticFiles } from "./browser-semantic-pack.mjs";
 
 const scripts = path.dirname(fileURLToPath(import.meta.url));
 const repositoryMakefile = path.join(scripts, "..", "Makefile");
@@ -50,6 +51,7 @@ async function compilerSDK(context) {
     }
   }
   await result.put("sdk/src/lua-5.5.1/lobject.h");
+  for (const name of semanticFiles) await result.put(`sdk/${semanticDirectory}/${name}`);
   return result;
 }
 

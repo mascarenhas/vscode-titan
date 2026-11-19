@@ -181,6 +181,8 @@ export async function stageNotices() {
       "",
       "Titan-owned Lua modules are covered by `titan/LICENSE`; Titan's native",
       "third-party notices and license texts are under `titan/`.",
+      "The browser semantic provider under `dist/titan/lib/titan-browser/0.6`",
+      "uses these same notices. It supplies type metadata, not an Emscripten toolchain.",
       ...(process.platform === "win32" ? ["",
         "The Windows compiler's luv module also includes libuv; its license is",
         "preserved at `titan/LICENSES/libuv-LICENSE`, `libuv-LICENSE-extra`,",

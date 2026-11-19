@@ -12,21 +12,22 @@ SQLite. OpenSSL follows the selected Titan SDK: by default it uses the
 system's OpenSSL 3 or 4 libraries, while a bundled-OpenSSL SDK links its own
 archive.
 The executable also embeds
-metadata-only interfaces for all SDK-selected canonical Titan standard
-modules, so ordinary project typechecking needs no SDK at run time.
+metadata-only native interfaces for all SDK-selected standard modules, so
+ordinary native project typechecking needs no SDK at run time.
 
 The Titan compiler is not linked into the executable. The embedded Lua state
 loads the ordinary `titan-compiler` modules through `package.path`, and their
 native dependencies through `package.cpath`. The executable exports its Lua C
 API so those dependencies bind to the same Lua state. A target-specific VSIX
-carries compatible compiler module trees, the SDK headers and the matching Lua
-sources, so installing it requires no separate Titan compiler.
+carries compatible compiler module trees, SDK headers, the matching Lua
+sources and a browser semantic pack. It needs no separate Titan compiler.
 
 ## Features
 
 - Syntax highlighting for `.titan` files.
 - Definition, references, rename, folding, hover and diagnostics for saved
   files.
+- Native and browser typechecking in separate roots of the same workspace.
 - Completion from unsaved editor buffers, triggered by `.` and `:` or the
   usual completion command, including after `foreign` in a type annotation
   and at the unprefixed C types of a `foreign function`.
@@ -92,6 +93,11 @@ standard-library providers together, and they never modify it. The SDK must
 include Titan's installed license at `share/titan/LICENSE`, and its compiler
 must provide compiler-owned incremental builds (certified object, native-C,
 and final-link reuse, native input switches, `--output`, and `--exe`).
+Building the extension (including plain `make`) or packaging a VSIX also
+requires the three files from the matching
+[browser semantic companion](docs/native-build.md#paired-browser-semantic-pack)
+in that SDK. A native-only SDK suffices for `make server`.
+
 Installing a packaged VSIX needs none of this toolchain.
 
 Native packages build on Linux and macOS. Windows is
@@ -108,7 +114,9 @@ make test
 `make` builds `bin/titan-language-server` and `dist/extension.js`. It also
 stages the SDK's compiler modules under `dist/titan/share/lua/5.5` and
 `dist/titan/lib/lua/5.5`, the SDK include tree under `dist/titan/include`, and
-the matching Lua sources under `dist/titan/src`. To use a specific SDK:
+the matching Lua sources under `dist/titan/src`. It stages `analysis-target`,
+`absent-modules` and `titan.a` under `dist/titan/lib/titan-browser/0.6`.
+To use a specific SDK:
 
 ```sh
 make -j2 TITAN_PREFIX="$HOME/.local/titan"
@@ -199,11 +207,11 @@ function references.
 The bundled compiler must report Titan ABI `2` and
 `LANGUAGE_SERVER_API_VERSION == 1`; a matching ABI alone is not enough. See
 [compiler compatibility](docs/server-data-flow.md#compiler-compatibility).
-Ordinary semantic analysis needs no C compiler. Importing C headers needs a
-configured C toolchain. The VSIX supplies the Titan and Lua SDK headers and the
-bundled libuv, llhttp and SQLite headers; a bundled-OpenSSL SDK also supplies
-OpenSSL's headers. With system OpenSSL, its headers come from the C toolchain.
-Supply headers of other libraries through the project configuration.
+Ordinary semantic analysis needs no C compiler. A native root that imports C
+headers needs a configured native C toolchain. The VSIX supplies Titan, Lua,
+libuv, llhttp and SQLite headers, plus OpenSSL headers when the SDK bundles
+OpenSSL. With system OpenSSL, its headers come from the C toolchain. Supply
+other library headers through project configuration.
 
 ## Project configuration
 
@@ -215,6 +223,7 @@ include = { "./titan", "./spec/stdlib/titan" }
 exclude = { "./examples", "./spec/fixtures" }
 source_module_roots = { ".", "./spec/stdlib/titan", "./vendor/titan" }
 binary_modules_root = ".titan/lib/titan/0.6"
+target = "native"
 extra_ffi_include_dirs = { "include", "vendor/include" }
 extra_ffi_cppflags = "-DPROJECT_FFI=1 '-Ivendor path/include'"
 ```
@@ -232,8 +241,10 @@ Every field is optional:
   ordered source-module search path, and it determines logical module names.
   It normally starts with the project roots and may add external source
   folders that should not be watched. Its entries cannot contain `;`.
-- `binary_modules_root` defaults to the bundled compiler's installed provider
-  root.
+- `target` selects `"native"` (the default) or `"browser"` for this root.
+  Set it in tracked `titan-config.lua`, not in the local override.
+- `binary_modules_root` defaults to the selected SDK's provider directory for
+  that target.
 - `extra_ffi_include_dirs` (default empty) adds C include directories.
 - `extra_ffi_cppflags` takes `-I` and `-D` preprocessing arguments in the same
   shell-word syntax as `TITAN_EXTRA_CPPFLAGS`. They are appended to the
@@ -254,7 +265,7 @@ identity. The server checks that identity against the compiler's root order and
 its folder-before-flat rule. It reports a shadowed, blocked or ambiguous
 provider as a configuration issue instead of analyzing the file under an
 identity that `titanc` would not use. Target variants (`name.<label>.titan`)
-are grouped under their logical filename and selected for the host target
+are grouped under their logical filename and selected for the root's target
 (`TITAN_TARGET` is ignored); an unselected variant is excluded from analysis and
 receives an information-severity `inactive-variant` diagnostic. An included file
 outside every source root gets an `unmapped-source` warning. Such a file is
@@ -267,6 +278,26 @@ roots; use ordinary files and directories for project modules. Opening the
 workspace root itself through a symlink works. A path listed only in
 `source_module_roots` is external source: the compiler resolves it, but it is
 not watched, indexed or a navigation target.
+
+### Browser roots
+
+`target = "browser"` selects `.browser.titan` variants ahead of unlabeled
+files and reads type interfaces from Wasm provider archives. Use the same
+target for command-line builds. The language server stops at type checking:
+it does not build, link, or launch browser programs.
+
+The default VSIX includes the matching browser provider, so ordinary editor
+features work without Emscripten. If a browser root imports C headers or
+otherwise needs a real C probe, install Emscripten **6.0.13** and make `emcc`
+available on `PATH` or set `EMSDK` in the environment launching VS Code.
+Without it, only the affected source gets a diagnostic; the server never uses
+the native C compiler for browser analysis.
+
+An explicit `compiler_root` must supply its own matching `analysis-target`,
+`absent-modules` and Wasm `titan.a` under `lib/titan-browser/0.6`. Install the
+SDK's browser component or choose a complete SDK. An incomplete or mismatched
+SDK fails that root; the server does not substitute the default VSIX's staged
+pack. For a standalone server, use `TITAN_ROOT` to name an SDK with those files.
 
 ### Choosing an SDK per root
 
@@ -518,11 +549,11 @@ required GLIBC symbol version, and fails when it exceeds
 `TITAN_MAX_GLIBC_VERSION` if that is set.
 
 The VSIX contains the native server and the private compiler module trees
-under `dist/titan`. It also has the SDK headers, the Lua sources, this
-project's license and the Titan, native, Lua-module and bundled JavaScript
-notices. It contains no Titan provider archive or `lib/titan` tree. Smoke
-tests on the extracted package verify semantic analysis without a C compiler,
-and SDK-backed C imports from an unrelated working directory.
+under `dist/titan`, SDK headers, Lua sources, and bundled notices. It also
+includes the release-matched browser semantic pack, but no Emscripten tools.
+See [paired browser semantic pack](docs/native-build.md#paired-browser-semantic-pack)
+for the packaging inputs. The extracted-package smoke tests cover native and
+browser analysis without the respective C toolchains.
 
 ## Standalone server
 

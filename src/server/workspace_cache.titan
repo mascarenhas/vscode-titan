@@ -79,6 +79,7 @@ record Cache
   local publication_key: string?
   local publication_compatibility: string?
   local publication_native_context: string?
+  local publication_browser_foreign: string?
   local inventory: {InventoryInput}
   local inventory_reads: integer
   local inventory_hashes: integer
@@ -140,7 +141,15 @@ local function open_compatible(path: string, compatibility: string?): Cache?
   end
   if compatibility ~= nil then write_metadata(connection,"compatibility",compatibility) end
   accepted = true
-  return Cache.new(store, path, {}, nil, nil, nil, nil, {}, 0, 0, 0)
+  return Cache {
+    store = store,
+    path = path,
+    pending = {},
+    inventory = {},
+    inventory_reads = 0,
+    inventory_hashes = 0,
+    inventory_reused = 0,
+  }
 end
 
 -- Native startup and SQLite persistence share this workspace-local root.
@@ -341,6 +350,71 @@ function Cache:accept_native_context(context: string): boolean
   if previous ~= nil then return previous == context end
   write_metadata(access.connection,"native_context",context)
   return true
+end
+
+-- Revision-qualified ownership lives beside the graph, including failed
+-- project revisions without payloads or header rows. The unqualified
+-- browser_foreign key is only the completed feature publication's summary.
+local const foreign_owner_prefix = "browser_foreign_owner:"
+local const foreign_graph_match =
+  "g.name=CAST(substr(m.key,instr(m.key,x'3A')+1) AS TEXT) " ..
+  "AND g.provenance IN (0,1) AND g.state IN (2,3) " ..
+  "AND CAST(substr(m.value,1,instr(m.value,x'00')-1) AS TEXT)=g.provenance || ':' || g.revision"
+local const foreign_owner_filter = "substr(m.key,1,?)=?"
+
+record BrowserForeignOwner
+  const module_name: string
+  const project: boolean
+  const identity: string
+end
+
+function browser_foreign_owners(connection: sqlite3.Connection): {BrowserForeignOwner}
+  local rows = sql.rows(connection,
+    "SELECT g.name,g.provenance,substr(m.value,instr(m.value,x'00')+1) " ..
+    "FROM main.cache_meta AS m JOIN main.graph_modules AS g ON " ..
+    foreign_graph_match .. " WHERE " .. foreign_owner_filter .. " ORDER BY g.name",
+    #foreign_owner_prefix, sqlite3.Blob.new(foreign_owner_prefix))
+  local owners: {BrowserForeignOwner} = {}
+  for index = 1, #rows do
+    local row = rows[index]
+    owners[index] = BrowserForeignOwner(row:get(1), row:get(2) == 0, sql.bytes(row, 3))
+  end
+  return owners
+end
+
+function write_browser_foreign_owner(connection: sqlite3.Connection, module_name: string,
+    observed: string?)
+  local key = sqlite3.Blob.new(foreign_owner_prefix .. module_name)
+  if observed == nil then
+    sql.execute(connection, "DELETE FROM main.cache_meta WHERE key=?", key)
+  else
+    sql.execute(connection, "INSERT INTO main.cache_meta(key,value) " ..
+      "SELECT ?,CAST(g.provenance || ':' || g.revision || char(0) || ? AS BLOB) " ..
+      "FROM main.graph_modules AS g " ..
+      "WHERE g.name=? AND g.provenance IN (0,1) AND g.state IN (2,3) " ..
+      "ON CONFLICT(key) DO UPDATE SET value=excluded.value", key, observed, module_name)
+  end
+end
+
+function Cache:browser_foreign_identity(): string?
+  local access = self.store:acquire()
+  defer access:release()
+  local owners = browser_foreign_owners(access.connection)
+  if #owners == 0 then return nil end
+  local observed = owners[1].identity
+  for index = 2, #owners do
+    if owners[index].identity ~= observed then
+      raise "saved browser C facts have incompatible toolchains"
+    end
+  end
+  return observed
+end
+
+local function prune_browser_foreign_owners(connection: sqlite3.Connection)
+  sql.execute(connection,
+    "DELETE FROM main.cache_meta AS m WHERE " .. foreign_owner_filter ..
+    " AND NOT EXISTS (SELECT 1 FROM main.graph_modules AS g WHERE " .. foreign_graph_match .. ")",
+    #foreign_owner_prefix, sqlite3.Blob.new(foreign_owner_prefix))
 end
 
 -- The preliminary inventory can match while PATH, CC, or the native SDK has
@@ -607,9 +681,11 @@ end
 
 -- Publish the context which produced these rows, including live configuration
 -- transitions. Keeping the startup key would mislabel a later completed view.
-function Cache:stage_context(root: string,compatibility: string,native_context: string)
+function Cache:stage_context(root: string, compatibility: string, native_context: string,
+                             browser_foreign: string?)
   self.publication_compatibility = identity.digest(fs.realpath(root) .. "\0" .. compatibility)
   self.publication_native_context = native_context
+  self.publication_browser_foreign = browser_foreign
 end
 
 --- Publish staged cache state within the shared semantic transaction.
@@ -648,7 +724,14 @@ function Cache:publish(connection: sqlite3.Connection)
   write_metadata(connection,"published_revisions",self.publication_key)
   if self.publication_compatibility ~= nil then
     write_metadata(connection,"compatibility",self.publication_compatibility)
+    prune_browser_foreign_owners(connection)
     write_metadata(connection,"native_context",self.publication_native_context)
+    if self.publication_browser_foreign == nil then
+      sql.execute(connection, "DELETE FROM main.cache_meta WHERE key=?",
+        sqlite3.Blob.new("browser_foreign"))
+    else
+      write_metadata(connection, "browser_foreign", self.publication_browser_foreign)
+    end
   end
   -- Keep staged immutable records until the next prepare so a caller rolling
   -- back this transaction can retry the same complete publication.
@@ -661,4 +744,5 @@ function Cache:publication_committed()
   self.publication_key = nil
   self.publication_compatibility = nil
   self.publication_native_context = nil
+  self.publication_browser_foreign = nil
 end

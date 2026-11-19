@@ -5,6 +5,7 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { validateSdkIncludeInventory } from "./sdk-include-inventory.mjs";
 import { resolveTitanSdk } from "./titan-sdk.mjs";
+import { semanticDirectory, semanticFiles } from "./browser-semantic-pack.mjs";
 
 const LUA_VERSION = "5.5";
 const LUA_SOURCE_VERSION = "5.5.1";
@@ -68,9 +69,23 @@ export async function sdkPayloadTrees(sdk, { platform = process.platform } = {})
       description: "Lua native source tree",
       relative: "src",
       expectedRoot: [`lua-${LUA_SOURCE_VERSION}:directory`]
+    },
+    {
+      description: "browser semantic pack",
+      relative: semanticDirectory,
+      expectedRoot: semanticFiles.map((name) => `${name}:file`)
     }
   ];
   for (const tree of trees) {
+    if (tree.relative === semanticDirectory) {
+      let directory = sdk;
+      for (const member of semanticDirectory.split("/")) {
+        directory = path.join(directory, member);
+        if (!(await lstat(directory)).isDirectory()) {
+          throw new Error(`browser semantic directory is not a real directory: ${directory}`);
+        }
+      }
+    }
     tree.source = path.join(sdk, tree.relative);
     tree.selectedRoot = await validateRootInventory(tree);
   }
@@ -234,6 +249,14 @@ async function validateRequiredPayload(trees) {
       );
     }
   }
+  const browserRoot = trees[4].source;
+  for (const name of semanticFiles) {
+    const filename = path.join(browserRoot, name);
+    const metadata = await lstat(filename);
+    if (!metadata.isFile() || metadata.size === 0) {
+      throw new Error(`browser semantic file is not a nonempty regular file: ${filename}`);
+    }
+  }
 }
 
 export async function sdkPayloadInventory(sdk, options) {
@@ -250,7 +273,15 @@ export async function sdkPayloadInventory(sdk, options) {
 
 export async function validateStagedLuaModules(sdk, destination, options) {
   const expected = (await sdkPayloadInventory(sdk, options)).filter((entry) => entry.type === "file");
-  const actual = (await inventory(destination)).filter((entry) => entry.type === "file");
+  const entries = await inventory(destination);
+  const browserTree = path.posix.dirname(semanticDirectory);
+  for (const entry of entries) {
+    if (entry.type === "directory" && entry.path !== semanticDirectory &&
+        entry.path.startsWith(`${browserTree}/`)) {
+      throw new Error(`unexpected staged browser semantic directory: ${entry.path}`);
+    }
+  }
+  const actual = entries.filter((entry) => entry.type === "file");
   if (JSON.stringify(actual.sort((a, b) => a.path.localeCompare(b.path))) !==
       JSON.stringify(expected.sort((a, b) => a.path.localeCompare(b.path)))) {
     throw new Error(`staged compiler module and SDK payload does not exactly match selected inputs from ${sdk}`);

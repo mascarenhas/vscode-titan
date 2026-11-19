@@ -45,8 +45,13 @@ end
 -- Catalog-only siblings belong to a complete physical provider. Saved graph
 -- names always win, and a recapture replaces all prior siblings of its owner.
 local function completion_catalog(connection: sqlite3.Connection,
-    snapshot: service.Snapshot, binaries: {bridge.CompletionBinary}, reusable: boolean):
+    snapshot: service.Snapshot, binaries: {bridge.CompletionBinary}, reusable: boolean,
+    browser_provider: string?):
     ({completion_store.SavedDescriptor}, {string})
+  local browser_provider_key: string? = nil
+  if browser_provider ~= nil then
+    browser_provider_key = binary_provider_key("static", browser_provider)
+  end
   local graph_names: {string: integer} = {}
   local graph_rows = sql.rows(connection, "SELECT name,provenance FROM main.graph_modules")
   for index = 1, #graph_rows do graph_names[graph_rows[index]:get(1)] = graph_rows[index]:get(2) end
@@ -108,7 +113,7 @@ local function completion_catalog(connection: sqlite3.Connection,
     local keep = false
     if kind == "embedded" then
       keep = reusable
-    elseif selected[key] then
+    elseif key == browser_provider_key or selected[key] then
       keep = reusable or clean_providers[key] == true
     end
     if graph_names[name] == nil and not blocked[key] and not replaced[key] and
@@ -121,7 +126,7 @@ local function completion_catalog(connection: sqlite3.Connection,
     local binary = binaries[index]
     local key = binary_provider_key(binary.kind, binary.filename)
     if graph_names[binary.module_name] == nil and not blocked[key] and
-       (binary.kind == "embedded" or selected[key] == true) then
+       (binary.kind == "embedded" or key == browser_provider_key or selected[key] == true) then
       local previous? = choices[binary.module_name]
       if previous == nil then
         names[#names + 1] = binary.module_name
@@ -278,10 +283,14 @@ local function prepare_completion_descriptors(snapshot: service.Snapshot,
         public_interface, source_interface, files, imports, headers, members, documentation[revision.name])
     end
   end
-  local binaries = compiler:completion_binary_catalog()
+  local binaries = compiler:completion_binary_catalog(not reusable)
   local access = loaded:workspace_store():acquire()
   defer access:release()
-  local catalog, catalog_names = completion_catalog(access.connection, snapshot, binaries, reusable)
+  -- The driver seeds the accepted browser SDK even without a saved import.
+  -- Keep its real static provenance; the exact admitted path distinguishes
+  -- this implicit standard provider from arbitrary project archives.
+  local catalog, catalog_names = completion_catalog(access.connection, snapshot,
+    binaries, reusable, compiler:browser_provider_file())
   for index = 1, #catalog do descriptors[#descriptors + 1] = catalog[index] end
   for index = 1, #catalog_names do retained[#retained + 1] = catalog_names[index] end
   return descriptors, retained
@@ -418,13 +427,26 @@ local function load_or_raise(project_root: string,
     snapshot_listener: service.SnapshotListener?): (service.Service?,service.Error?,Restoration?)
   local cpu = logging.clock()
   local wall = ffi.vscode_titan_monotonic_ms()
-  local compiler = bridge.load()
+  local compiler: bridge.Compiler?
+  do
+    compiler = bridge.load()
+  catch
+    if error is bridge.BridgeError and bridge.analysis_target() == "browser" then
+      local failure = error as bridge.BridgeError
+      return nil, service.Error(project_root .. "/titan-config.lua", failure.message), nil
+    end
+    raise
+  end
   local installed_root = compiler:installed_binary_modules_root()
   local selected_inventory_directory? = compiler:selected_inventory_directory()
   local settings?, config_error? = config.load(
     project_root, installed_root, selected_inventory_directory)
   if settings == nil then
     return nil,service.Error.new(config_error.path,config_error.message),nil
+  end
+  if settings.target ~= bridge.analysis_target() then
+    return nil, service.Error(settings.config_file or project_root,
+      "analysis target changed; restart this root's language-server worker"), nil
   end
   compiler:configure(bridge.project_configuration(settings))
   local cache = caches.open_for_inventory(settings.project_root)
@@ -496,6 +518,14 @@ local function load_or_raise(project_root: string,
   }
   if loaded == nil then return nil,failure,nil end
   phase("input_validation",cpu,wall)
+  local browser = settings.target == "browser"
+  if browser then
+    local saved_foreign? = cache:browser_foreign_identity()
+    if saved_foreign ~= nil then
+      local observed? = compiler:observe_browser_foreign()
+      if observed ~= saved_foreign then loaded:invalidate_browser_foreign(observed) end
+    end
+  end
   local unpublished = cache:unpublished_projects()
   for index = 1, #unpublished do loaded:invalidate_cached_project(unpublished[index]) end
   restoring = project_restoration(compiler,loaded,cache)
@@ -513,8 +543,10 @@ local function load_or_raise(project_root: string,
         native_context = compiler:native_cache_identity()
         current_configuration = next_configuration
       end
+      local saved_foreign: string?
+      if browser then saved_foreign = cache:browser_foreign_identity() end
       cache:stage_context(snapshot.config.project_root,
-        inventory .. current_configuration,native_context)
+        inventory .. current_configuration, native_context, saved_foreign)
       local reusable = cache:prepare()
       if not reusable then
         local selected = cache:projects_to_export()

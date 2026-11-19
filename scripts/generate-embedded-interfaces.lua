@@ -399,6 +399,13 @@ static int titan_ls_push_current_executable(lua_State *L) {
 
 #endif
 
+int titan_ls_push_server_image(lua_State *L) {
+    /* At most two rooted path buffers (Darwin), then one result or
+     * luaL_error's two formatted strings; success leaves just the path. */
+    luaL_checkstack(L, 4, "Titan language-server image");
+    return titan_ls_push_current_executable(L);
+}
+
 static void titan_ls_set_identity_integer(lua_State *L,
                                           const unsigned char *key,
                                           size_t key_size,
@@ -492,18 +499,21 @@ int titan_ls_push_embedded_provider_identity(lua_State *L) {
     return 1;
 }
 
-int titan_ls_push_embedded_interface_provider(lua_State *L) {
-    size_t index;
-    luaL_checkstack(L, 8, "embedded Titan interface provider");
-
-    /* package.preload aliases this registry table. Bare titan is the compiler's
-     * metadata-free _loadlib support table, not a native titan.* module. */
+void titan_ls_preload_compiler_support(lua_State *L) {
+    luaL_checkstack(L, 3, "embedded Titan compiler support");
+    /* Bare titan is the compiler's _loadlib support table, not a titan.* module. */
     luaL_getsubtable(L, LUA_REGISTRYINDEX, LUA_PRELOAD_TABLE);
     titan_ls_push_bytes(L, titan_ls_support_name,
                        sizeof(titan_ls_support_name));
     lua_pushcfunction(L, luaopen_titan);
     lua_rawset(L, -3);
     lua_pop(L, 1);
+}
+
+int titan_ls_push_embedded_interface_provider(lua_State *L) {
+    size_t index;
+    luaL_checkstack(L, 8, "embedded Titan interface provider");
+    titan_ls_preload_compiler_support(L);
 
     lua_createtable(L, 0, 3);
     titan_ls_push_bytes(L, titan_ls_provider_file_key,
