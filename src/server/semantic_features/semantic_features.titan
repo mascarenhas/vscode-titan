@@ -1,0 +1,446 @@
+--- Saved-source definition, references, rename, hover, and folding views.
+-- @module server.semantic_features
+
+local strings = import "string"
+local bridge = import "server.compiler_bridge"
+local lsp = import "server.lsp_types"
+local indexer = import "server.semantic_index"
+local source_text = import "server.source_text"
+local sqlite3 = import "sqlite3"
+local workspace_store = import "server.workspace_store"
+local completion_types = import "server.completion_types"
+
+local const YIELD_CADENCE = 1024
+
+local const FOLDABLE_TAGS: {string: boolean} = {
+  ["Ast.TopLevelMethod"] = true,
+  ["Ast.TopLevelStatic"] = true,
+  ["Ast.TopLevelFunc"] = true,
+  ["Ast.TopLevelForeignFunc"] = true,
+  ["Ast.TopLevelRecord"] = true,
+  ["Ast.TopLevelUnion"] = true,
+  ["Ast.TopLevelInterface"] = true,
+  ["Ast.ExpFunction"] = true,
+  ["Ast.StatBlock"] = true,
+  ["Ast.StatTry"] = true,
+  ["Ast.StatIf"] = true,
+  ["Ast.StatFor"] = true,
+  ["Ast.StatForIn"] = true,
+  ["Ast.StatWhile"] = true,
+  ["Ast.StatRepeat"] = true,
+  ["Ast.StatCase"] = true,
+}
+
+local const SCHEMA_STATEMENTS: const {string} = {
+  "CREATE TABLE IF NOT EXISTS main.semantic_hovers(" ..
+    "filename BLOB NOT NULL,byte_start INTEGER NOT NULL," ..
+    "inferred_tag BLOB,inferred_display BLOB,declared_tag BLOB,declared_display BLOB," ..
+    "original_tag BLOB,original_display BLOB,coerced_tag BLOB,coerced_display BLOB," ..
+    "PRIMARY KEY(filename,byte_start))",
+  "CREATE TABLE IF NOT EXISTS main.semantic_folds(" ..
+    "filename BLOB NOT NULL,start_line INTEGER NOT NULL,end_line INTEGER NOT NULL," ..
+    "kind BLOB,PRIMARY KEY(filename,start_line,end_line))",
+}
+
+record Error
+  const message: string
+end
+
+record Location
+  const uri: string
+  const range: source_text.Span
+end
+
+record Hover
+  const range: source_text.Span
+  const inferred_type: bridge.TypeInfo?
+  const declared_type: bridge.TypeInfo?
+  const original_type: bridge.TypeInfo?
+  const coerced_type: bridge.TypeInfo?
+  const visibility: bridge.DeclarationVisibility
+  const callable_signature: bridge.CallableSignature?
+  const summary_markdown: string?
+  const documentation: string?
+end
+
+type Yield = function (): ()
+
+local record SavedFile
+  const module_name: string
+  const contents: string
+  const coordinates: source_text.CoordinateIndex
+end
+
+local record ExtractionState
+  const yield_now: Yield?
+  work: integer
+end
+
+local record RenameAnchor
+  const filename: string
+  const before: source_text.ByteSpan
+  const after: source_text.Span
+end
+
+-- RenameCandidate is intentionally not an encodable workspace edit. Its
+-- edited_project_modules method supplies the in-memory saved-file snapshot to
+-- the compiler. Only preflight can produce VerifiedRename after that analysis
+-- has no diagnostics and every edited occurrence resolves to one declaration.
+record RenameCandidate
+  local const old_name: string
+  local const new_name: string
+  local const edited_projects: {bridge.ProjectModule}
+  local const documents: {lsp.DocumentEdits}
+  local const anchors: {RenameAnchor}
+end
+
+record VerifiedRename
+  local const documents: {lsp.DocumentEdits}
+end
+
+record Features
+  local const store: workspace_store.Store
+  local const published_generation: integer
+  local const index: indexer.Index
+  local const owns_store: boolean
+end
+
+local record MaterializedHover
+  const filename: string
+  const byte_start: integer
+  const inferred_type: bridge.TypeInfo?
+  const declared_type: bridge.TypeInfo?
+  const original_type: bridge.TypeInfo?
+  const coerced_type: bridge.TypeInfo?
+end
+
+local record MaterializedFold
+  const filename: string
+  const range: lsp.FoldingRange
+end
+
+record PreparedView
+  local const index: indexer.Prepared
+  local const hovers: {MaterializedHover}
+  local const folds: {MaterializedFold}
+end
+
+local function ExtractionState:account()
+  if self.yield_now == nil then return end
+  self.work = self.work + 1
+  if self.work < YIELD_CADENCE then return end
+  self.work = 0
+  self.yield_now()
+end
+
+local function fail<|T|>(message: string): T
+  raise Error(message)
+end
+
+local function rejected<|T|>(message: string): (T?, Error?)
+  return nil, Error(message)
+end
+
+local function saved_files(projects: const? {bridge.ProjectModule},
+                           index: indexer.Prepared):
+    {string: SavedFile}
+  local result: {string: SavedFile} = {}
+  local modules: {string: boolean} = {}
+  for module_index = 1, #projects do
+    local module = projects[module_index]
+    if modules[module.module_name] then
+      return fail<|{string: SavedFile}|>(
+        "duplicate saved project module '" .. module.module_name .. "'")
+    end
+    modules[module.module_name] = true
+    for file_index = 1, #module.files do
+      local file = module.files[file_index]
+      if result[file.filename] ~= nil then
+        return fail<|{string: SavedFile}|>(
+          "saved source file belongs to more than one project module: " ..
+          file.filename)
+      end
+      local coordinates? = index:coordinate_index(file.filename)
+      if coordinates == nil then
+        return fail<|{string: SavedFile}|>(
+          "semantic index omitted saved source coordinates: " ..
+          file.filename)
+      end
+      result[file.filename] = SavedFile(
+        module.module_name, file.contents, coordinates)
+    end
+  end
+  return result
+end
+
+local function location_for(occurrence: indexer.Occurrence): Location
+  local uri?, uri_error? = source_text.path_to_file_uri(occurrence.filename)
+  if uri == nil then
+    local detail = "invalid project source path"
+    if uri_error ~= nil then detail = uri_error.message end
+    return fail<|Location|>(
+      "cannot encode location for '" .. occurrence.filename .. "': " ..
+      detail)
+  end
+  return Location(uri, occurrence.span)
+end
+
+function Features:definition(filename: string,
+                             position: source_text.Position): Location?
+  local occurrence? = self.index:occurrence_at(filename, position)
+  if occurrence == nil then return nil end
+  local definition? = self.index:definition(occurrence.symbol_id)
+  if definition == nil then
+    -- The symbol is unresolved or declared in external/foreign source. V1
+    -- never navigates outside the project snapshot.
+    return nil
+  end
+  return location_for(definition)
+end
+
+function Features:references(filename: string, position: source_text.Position,
+                             include_declaration: boolean): {Location}
+  local occurrence? = self.index:occurrence_at(filename, position)
+  if occurrence == nil then return {} end
+  local occurrences = self.index:occurrences(
+    occurrence.symbol_id, include_declaration)
+  local result: {Location} = {}
+  for index = 1, #occurrences do
+    result[index] = location_for(occurrences[index])
+  end
+  return result
+end
+
+-- A saved hover's coordinates are safe for an open document only when its
+-- complete captured text still matches the committed semantic file.
+function Features:matches_source(filename: string, contents: string): boolean
+  local access = self.store:acquire()
+  defer access:release()
+  indexer.check_generation(access.connection, self.published_generation)
+  return workspace_store.scalar_integer(access.connection,
+    "SELECT COUNT(*) FROM main.semantic_files WHERE filename=? AND contents=?",
+    indexer.blob(filename), indexer.blob(contents)) == 1
+end
+
+function initialize_schema(connection: sqlite3.Connection)
+  indexer.initialize_schema(connection)
+  for index = 1, #SCHEMA_STATEMENTS do
+    workspace_store.execute(connection, SCHEMA_STATEMENTS[index])
+  end
+end
+
+local function prepare_internal(projects: {bridge.ProjectModule},
+                                snapshots: {bridge.ModuleSnapshot},
+                                plan: indexer.PublicationPlan?,
+                                yield_now: Yield?): PreparedView
+  local state = ExtractionState(yield_now, 0)
+  local prepared = plan ~= nil and
+    indexer.prepare_update(projects, snapshots, plan, yield_now) or
+    indexer.prepare(projects, snapshots, yield_now)
+  local extracted_projects = projects
+  if plan ~= nil then
+    extracted_projects = {}
+    for index = 1, #projects do
+      local project = projects[index]
+      if plan:replaces(project.module_name) then
+        extracted_projects[#extracted_projects + 1] = project
+      end
+      state:account()
+    end
+  end
+  local files = saved_files(extracted_projects, prepared)
+  local hovers: {MaterializedHover} = {}
+  local folds: {MaterializedFold} = {}
+  -- Partition once during extraction, avoiding an AST scan for every token.
+  local module_occurrences: {string: {indexer.Occurrence}} = {}
+  for index = 1, #prepared.occurrences do
+    local item = prepared.occurrences[index]
+    local bucket? = module_occurrences[item.module_name]
+    if bucket == nil then
+      bucket = {}
+      module_occurrences[item.module_name] = bucket
+    end
+    bucket[#bucket + 1] = item
+    state:account()
+  end
+  local project_snapshots: {string: bridge.ModuleSnapshot} = {}
+  local seen_snapshots: {string: boolean} = {}
+  for index = 1, #snapshots do
+    local snapshot = snapshots[index]
+    if not seen_snapshots[snapshot.module_name] then
+      seen_snapshots[snapshot.module_name] = true
+      case snapshot.provenance
+      when project_source() then project_snapshots[snapshot.module_name] = snapshot
+      end
+    end
+  end
+  for module_index = 1, #extracted_projects do
+    local project = extracted_projects[module_index]
+    local snapshot? = project_snapshots[project.module_name]
+    if snapshot ~= nil then
+      local nodes, by_id = hover_nodes(snapshot, files, state)
+      local occurrences? = module_occurrences[project.module_name]
+      if occurrences ~= nil then
+        for index = 1, #occurrences do
+          local occurrence = occurrences[index]
+          local saved = files[occurrence.filename]
+          hovers[#hovers + 1] = materialize_hover(occurrence, saved, nodes, by_id, state)
+          state:account()
+        end
+      end
+      for index = 1, #snapshot.nodes do
+        local node = snapshot.nodes[index]
+        local span? = node.source_span
+        if not node.synthetic and span ~= nil and FOLDABLE_TAGS[node.tag] then
+          local saved? = files[span.start.filename]
+          if saved ~= nil and saved.module_name == project.module_name then
+            local converted = saved:lsp_span_for_compiler_span(span)
+            local end_line = converted.finish.line - 1
+            if end_line > converted.start.line then
+              folds[#folds + 1] = MaterializedFold(span.start.filename,
+                lsp.FoldingRange {
+                  start_line = converted.start.line,
+                  end_line = end_line,
+                })
+            end
+          end
+        end
+        state:account()
+      end
+      -- Structural entries precede comments so equal spans retain structure.
+      for file_index = 1, #project.files do
+        local file = project.files[file_index]
+        local saved = files[file.filename]
+        saved:append_long_comment_folds(file.filename, folds, state)
+      end
+    end
+  end
+  return PreparedView(prepared, hovers, folds)
+catch
+  if error is indexer.Error then
+    local failure: indexer.Error = error
+    local context = ""
+    if failure.module_name ~= nil then context = "Titan module '" .. failure.module_name .. "'" end
+    if failure.filename ~= nil then
+      if context ~= "" then context = context .. ", " end
+      context = context .. "file '" .. failure.filename .. "'"
+    end
+    if context ~= "" then context = context .. ": " end
+    raise Error(context .. failure.message)
+  end
+  raise
+end
+
+function prepare(projects: {bridge.ProjectModule}, snapshots: {bridge.ModuleSnapshot},
+                 yield_now: Yield?): PreparedView
+  return prepare_internal(projects, snapshots, nil, yield_now)
+end
+
+function prepare_update(projects: {bridge.ProjectModule},
+                        snapshots: {bridge.ModuleSnapshot},
+                        plan: indexer.PublicationPlan, yield_now: Yield?): PreparedView
+  return prepare_internal(projects, snapshots, plan, yield_now)
+end
+
+local function prune_module_features(connection: sqlite3.Connection, name: string)
+  workspace_store.execute(connection,
+    "DELETE FROM main.semantic_hovers WHERE filename IN " ..
+    "(SELECT filename FROM main.semantic_files WHERE module_name=?)", indexer.blob(name))
+  workspace_store.execute(connection,
+    "DELETE FROM main.semantic_folds WHERE filename IN " ..
+    "(SELECT filename FROM main.semantic_files WHERE module_name=?)", indexer.blob(name))
+end
+
+function PreparedView:publish(connection: sqlite3.Connection)
+  self.index:check_publication(connection)
+  -- File ownership must be read from the preceding publication. A removed
+  -- constituent, or a file transferred to another module, is no longer in the
+  -- replacement semantic_files rows after index publication.
+  local plan? = self.index.plan
+  if plan == nil or plan.rebuild_all then
+    workspace_store.execute(connection, "DELETE FROM main.semantic_hovers")
+    workspace_store.execute(connection, "DELETE FROM main.semantic_folds")
+  else
+    for index = 1, #plan.replaced_modules do
+      prune_module_features(connection, plan.replaced_modules[index])
+    end
+    for index = 1, #plan.removed_modules do
+      prune_module_features(connection, plan.removed_modules[index])
+    end
+  end
+  self.index:publish(connection)
+  local hover_batch = workspace_store.batch(connection,
+    "INSERT OR REPLACE INTO main.semantic_hovers VALUES ", 10)
+  for index = 1, #self.hovers do
+    local item = self.hovers[index]
+    hover_batch:append(
+      indexer.blob(item.filename),
+      item.byte_start,
+      indexer.type_tag(item.inferred_type),
+      indexer.type_display(item.inferred_type),
+      indexer.type_tag(item.declared_type),
+      indexer.type_display(item.declared_type),
+      indexer.type_tag(item.original_type),
+      indexer.type_display(item.original_type),
+      indexer.type_tag(item.coerced_type),
+      indexer.type_display(item.coerced_type))
+  end
+  hover_batch:flush()
+  local fold_batch = workspace_store.batch(connection,
+    "INSERT OR IGNORE INTO main.semantic_folds VALUES ", 4)
+  for index = 1, #self.folds do
+    local item = self.folds[index]
+    fold_batch:append(
+      indexer.blob(item.filename),
+      item.range.start_line,
+      item.range.end_line,
+      indexer.blob(item.range.kind))
+  end
+  fold_batch:flush()
+end
+
+function open(store: workspace_store.Store, published_generation: integer): Features
+  return Features {
+    store = store,
+    published_generation = published_generation,
+    index = indexer.open(store, published_generation),
+    owns_store = false,
+  }
+end
+
+function Features:close()
+  if self.owns_store then self.store:close() end
+end
+
+local function build_internal(projects: {bridge.ProjectModule}, snapshots: {bridge.ModuleSnapshot},
+                              yield_now: Yield?): Features
+  local prepared = prepare(projects, snapshots, yield_now)
+  local store = workspace_store.open(":memory:")
+  local completed = false
+  defer do
+    if not completed then store:close() end
+  end
+  do
+    local access = store:acquire()
+    defer access:release()
+    local connection = access.connection
+    initialize_schema(connection)
+    prepared:publish(connection)
+  end
+  completed = true
+  return Features {
+    store = store,
+    published_generation = 0,
+    index = indexer.open(store, 0),
+    owns_store = true,
+  }
+end
+
+function build(projects: {bridge.ProjectModule}, snapshots: {bridge.ModuleSnapshot}): Features
+  return build_internal(projects, snapshots, nil)
+end
+
+function build_with_yield(projects: {bridge.ProjectModule}, snapshots: {bridge.ModuleSnapshot},
+                          yield_now: Yield): Features
+  return build_internal(projects, snapshots, yield_now)
+end

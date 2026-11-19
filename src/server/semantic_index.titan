@@ -46,7 +46,49 @@ end
 
 type Yield = function (): ()
 
-local YIELD_CADENCE = 1024
+local const YIELD_CADENCE = 1024
+
+local const OCCURRENCE_COLUMNS = "declaration_id,module_name,filename,name,role," ..
+  "start_line,start_character,finish_line,finish_character,byte_start," ..
+  "byte_finish,is_local,visibility,type_tag,type_display,callable,summary_id,case_part_id,documentation"
+local const SOURCE_ORDER = " ORDER BY filename,byte_start,byte_finish,declaration_id,role"
+
+local const SCHEMA_PREFIX_STATEMENTS: const {string} = {
+  "CREATE TABLE IF NOT EXISTS main.semantic_projects(" ..
+    "module_name BLOB PRIMARY KEY,module_order INTEGER NOT NULL," ..
+    "revision INTEGER NOT NULL,state INTEGER NOT NULL CHECK(state BETWEEN 0 AND 3))",
+  "CREATE TABLE IF NOT EXISTS main.semantic_files(" ..
+    "filename BLOB PRIMARY KEY,module_name BLOB NOT NULL,contents BLOB NOT NULL," ..
+    "module_order INTEGER NOT NULL,file_order INTEGER NOT NULL," ..
+    "FOREIGN KEY(module_name) REFERENCES semantic_projects(module_name))",
+  "CREATE TABLE IF NOT EXISTS main.semantic_summaries(" ..
+    "module_name BLOB NOT NULL,summary_id INTEGER NOT NULL CHECK(summary_id>0)," ..
+    "markdown BLOB NOT NULL,PRIMARY KEY(module_name,summary_id)," ..
+    "FOREIGN KEY(module_name) REFERENCES semantic_projects(module_name)) WITHOUT ROWID",
+  "CREATE TABLE IF NOT EXISTS main.semantic_occurrences(" ..
+    "declaration_id BLOB NOT NULL,module_name BLOB NOT NULL," ..
+    "filename BLOB NOT NULL,name BLOB NOT NULL,role INTEGER NOT NULL," ..
+    "start_line INTEGER NOT NULL,start_character INTEGER NOT NULL," ..
+    "finish_line INTEGER NOT NULL,finish_character INTEGER NOT NULL," ..
+    "byte_start INTEGER NOT NULL,byte_finish INTEGER NOT NULL," ..
+    "is_local INTEGER NOT NULL,visibility INTEGER NOT NULL," ..
+    "type_tag BLOB,type_display BLOB,callable BLOB,summary_id INTEGER,case_part_id BLOB,documentation BLOB)",
+}
+
+local const SCHEMA_INDEX_STATEMENTS: const {string} = {
+  "CREATE INDEX IF NOT EXISTS main.semantic_occurrences_file " ..
+    "ON semantic_occurrences(filename,start_line,start_character)",
+  "CREATE INDEX IF NOT EXISTS main.semantic_occurrences_module " ..
+    "ON semantic_occurrences(module_name)",
+  "CREATE INDEX IF NOT EXISTS main.semantic_files_module " ..
+    "ON semantic_files(module_name,file_order)",
+  "CREATE INDEX IF NOT EXISTS main.semantic_occurrences_symbol " ..
+    "ON semantic_occurrences(declaration_id,filename,byte_start)",
+  "CREATE INDEX IF NOT EXISTS main.semantic_occurrences_case_part " ..
+    "ON semantic_occurrences(case_part_id) WHERE case_part_id IS NOT NULL",
+  "CREATE UNIQUE INDEX IF NOT EXISTS main.semantic_declarations " ..
+    "ON semantic_occurrences(declaration_id) WHERE role IN (0,1)",
+}
 
 local record YieldState
   const yield_now: Yield?
@@ -107,21 +149,21 @@ end
 
 local function fail<|T|>(module_name: string?, filename: string?,
                         message: string): T
-  raise Error.new(module_name, filename, message)
+  raise Error(module_name, filename, message)
 end
 
 local function fail_span(module_name: string?, filename: string?,
                          message: string):
     (source_text.Span, source_text.ByteSpan)
-  raise Error.new(module_name, filename, message)
+  raise Error(module_name, filename, message)
 end
 
-local function account_work(state: YieldState)
-  if state.yield_now == nil then return end
-  state.work = state.work + 1
-  if state.work < YIELD_CADENCE then return end
-  state.work = 0
-  state.yield_now()
+local function YieldState:account()
+  if self.yield_now == nil then return end
+  self.work = self.work + 1
+  if self.work < YIELD_CADENCE then return end
+  self.work = 0
+  self.yield_now()
 end
 
 local function role_rank(role: bridge.OccurrenceRole): integer
@@ -215,20 +257,18 @@ local function validate_span(module_name: string, saved: SavedFile,
       module_name, symbol.location.filename,
       "cannot convert compiler span to LSP coordinates: " .. detail)
   end
-  return span, source_text.ByteSpan.new(start_offset, finish_offset)
+  return span, source_text.ByteSpan(start_offset, finish_offset)
 end
 
-local function index_coordinates(contents: string,
-                                 yield_state: YieldState):
-    source_text.CoordinateIndex
-  if yield_state.yield_now ~= nil then
-    return source_text.coordinate_index_with_account(
-      contents, function () account_work(yield_state) end)
+local function YieldState:index_coordinates(
+    contents: string): source_text.CoordinateIndex
+  if self.yield_now ~= nil then
+    return source_text.coordinate_index_with_account(contents, self:account)
   end
   return source_text.coordinate_index(contents)
 end
 
-local function project_files(projects: {bridge.ProjectModule},
+local function project_files(projects: const? {bridge.ProjectModule},
                              yield_state: YieldState,
                              selected: {string: boolean}?):
     ({string: SavedFile}, {string: boolean},
@@ -238,7 +278,7 @@ local function project_files(projects: {bridge.ProjectModule},
   local modules: {string: boolean} = {}
   local coordinates: {string: source_text.CoordinateIndex} = {}
   for project_index = 1, #projects do
-    account_work(yield_state)
+    yield_state:account()
     local project = projects[project_index]
     if modules[project.module_name] then
       fail<|value|>(project.module_name, nil,
@@ -246,7 +286,7 @@ local function project_files(projects: {bridge.ProjectModule},
     end
     modules[project.module_name] = true
     for file_index = 1, #project.files do
-      account_work(yield_state)
+      yield_state:account()
       local file = project.files[file_index]
       if filenames[file.filename] then
         fail<|value|>(project.module_name, file.filename,
@@ -254,8 +294,8 @@ local function project_files(projects: {bridge.ProjectModule},
       end
       filenames[file.filename] = true
       if selected == nil or selected[project.module_name] then
-        local indexed = index_coordinates(file.contents, yield_state)
-        files[file.filename] = SavedFile.new(
+        local indexed = yield_state:index_coordinates(file.contents)
+        files[file.filename] = SavedFile(
           project.module_name, file.contents, indexed)
         coordinates[file.filename] = indexed
       end
@@ -265,7 +305,7 @@ local function project_files(projects: {bridge.ProjectModule},
 end
 
 local function summary_key(module_name: string, summary_id: integer): string
-  return module_name .. "\0" .. strings.tostring(summary_id)
+  return module_name .. "\0" .. summary_id
 end
 
 local function summary_kind_label(kind: bridge.HoverSummaryKind): string
@@ -286,13 +326,13 @@ local function render_hover_summary(summary: bridge.HoverSummary,
   output:write(summary.title)
   output:write("`\n")
   for section_index = 1, #summary.sections do
-    account_work(yield_state)
+    yield_state:account()
     local section = summary.sections[section_index]
     output:write("\n")
     output:write(section.heading)
     output:write("\n\n")
     for line_index = 1, #section.lines do
-      account_work(yield_state)
+      yield_state:account()
       output:write("- `")
       output:write(section.lines[line_index])
       output:write("`\n")
@@ -319,7 +359,7 @@ local function append_snapshot_summaries(
   local summaries? = snapshot.hover_summaries
   if summaries == nil then return end
   for index = 1, #summaries do
-    account_work(yield_state)
+    yield_state:account()
     local summary = summaries[index]
     if summary.id ~= index then
       fail<|value|>(snapshot.module_name, nil,
@@ -330,7 +370,7 @@ local function append_snapshot_summaries(
       fail<|value|>(snapshot.module_name, nil,
         "duplicate snapshot-local hover summary id")
     end
-    target[key] = MaterializedSummary.new(snapshot.module_name, summary.id,
+    target[key] = MaterializedSummary(snapshot.module_name, summary.id,
       render_hover_summary(summary, yield_state))
   end
 end
@@ -367,7 +407,7 @@ local function append_snapshot_occurrences(
   end
 
   for index = 1, #snapshot.symbols do
-    account_work(yield_state)
+    yield_state:account()
     local symbol = snapshot.symbols[index]
     local summary_id? = validated_summary_id(snapshot, symbol)
     local saved? = files[symbol.location.filename]
@@ -384,17 +424,27 @@ local function append_snapshot_occurrences(
         fail<|value|>(snapshot.module_name, symbol.location.filename,
           "compiler occurrence has an empty identifier")
       end
-      local span, bytes = validate_span(snapshot.module_name, saved, symbol)
+      local span, byte_span = validate_span(snapshot.module_name, saved, symbol)
       local shared: SharedCaseName? = nil
       if symbol.case_part_id ~= nil then
         shared = SharedCaseName.binding(symbol.case_part_id)
       end
-      target[#target + 1] = Occurrence.new(
-        SymbolId.new(symbol.declaration_id), snapshot.module_name,
-        symbol.location.filename, symbol.name, symbol.role, span, bytes,
-        symbol.is_local, symbol.visibility, symbol.type_info,
-        symbol.callable_signature,
-        summary_id, shared, symbol.documentation)
+      target[#target + 1] = Occurrence {
+        symbol_id = SymbolId(symbol.declaration_id),
+        module_name = snapshot.module_name,
+        filename = symbol.location.filename,
+        name = symbol.name,
+        role = symbol.role,
+        span = span,
+        byte_span = byte_span,
+        is_local = symbol.is_local,
+        visibility = symbol.visibility,
+        type_info = symbol.type_info,
+        callable_signature = symbol.callable_signature,
+        summary_id = summary_id,
+        shared_case_name = shared,
+        documentation = symbol.documentation,
+      }
     end
   end
 end
@@ -403,7 +453,7 @@ local function prepare_internal(projects: {bridge.ProjectModule},
                                 snapshots: {bridge.ModuleSnapshot},
                                 plan: PublicationPlan?,
                                 yield_now: Yield?): Prepared
-  local state = YieldState.new(yield_now, 0)
+  local state = YieldState(yield_now, 0)
   local selected: {string: boolean}? = nil
   if plan ~= nil then selected = plan.replacements end
   local files, project_names = project_files(projects, state, selected)
@@ -422,7 +472,7 @@ local function prepare_internal(projects: {bridge.ProjectModule},
   local summaries: {string: MaterializedSummary} = {}
   local observed: {string: boolean} = {}
   for index = 1, #snapshots do
-    account_work(state)
+    state:account()
     local snapshot = snapshots[index]
     if plan ~= nil and project_snapshot(snapshot) then
       local module? = plan.by_name[snapshot.module_name]
@@ -450,7 +500,13 @@ local function prepare_internal(projects: {bridge.ProjectModule},
       end
     end
   end
-  return Prepared.new(projects, occurrences, plan, files, summaries)
+  return Prepared {
+    projects = projects,
+    occurrences = occurrences,
+    plan = plan,
+    files = files,
+    summaries = summaries,
+  }
 end
 
 function prepare(projects: {bridge.ProjectModule},
@@ -481,24 +537,20 @@ function Prepared:hover_summary(occurrence: Occurrence): string?
 end
 
 function execute(connection: sqlite3.Connection, sql: string)
-  local statement = connection:prepare(sql)
-  defer statement:close()
-  statement:execute()
+  workspace_store.execute(connection, sql)
 end
 
 function bytes(row: sqlite3.Row, column: integer): string
-  return (row:get(column) as sqlite3.Blob).bytes
+  return workspace_store.bytes(row, column)
 end
 
 function optional_bytes(row: sqlite3.Row, column: integer): string?
-  local item = row:get(column)
-  if item == nil then return nil end
-  return (item as sqlite3.Blob).bytes
+  return workspace_store.optional_bytes(row, column)
 end
 
 function blob(item: string?): sqlite3.Blob?
   if item == nil then return nil end
-  return sqlite3.Blob.new(item)
+  return sqlite3.Blob(item)
 end
 
 function type_tag(info: bridge.TypeInfo?): sqlite3.Blob?
@@ -514,7 +566,7 @@ end
 function row_type(row: sqlite3.Row, column: integer): bridge.TypeInfo?
   local tag? = optional_bytes(row, column)
   if tag == nil then return nil end
-  return bridge.TypeInfo.new(tag, bytes(row, column + 1))
+  return bridge.TypeInfo(tag, bytes(row, column + 1))
 end
 
 local function signature_blob(signature: bridge.CallableSignature?):
@@ -523,45 +575,15 @@ local function signature_blob(signature: bridge.CallableSignature?):
   return blob(signature.display)
 end
 
-local OCCURRENCE_COLUMNS = "declaration_id,module_name,filename,name,role," ..
-  "start_line,start_character,finish_line,finish_character,byte_start," ..
-  "byte_finish,is_local,visibility,type_tag,type_display,callable,summary_id,case_part_id,documentation"
-local SOURCE_ORDER = " ORDER BY filename,byte_start,byte_finish,declaration_id,role"
-
 function initialize_schema(connection: sqlite3.Connection)
-  execute(connection, "CREATE TABLE IF NOT EXISTS main.semantic_projects(" ..
-    "module_name BLOB PRIMARY KEY,module_order INTEGER NOT NULL," ..
-    "revision INTEGER NOT NULL,state INTEGER NOT NULL CHECK(state BETWEEN 0 AND 3))")
-  execute(connection, "CREATE TABLE IF NOT EXISTS main.semantic_files(" ..
-    "filename BLOB PRIMARY KEY,module_name BLOB NOT NULL,contents BLOB NOT NULL," ..
-    "module_order INTEGER NOT NULL,file_order INTEGER NOT NULL," ..
-    "FOREIGN KEY(module_name) REFERENCES semantic_projects(module_name))")
-  execute(connection, "CREATE TABLE IF NOT EXISTS main.semantic_summaries(" ..
-    "module_name BLOB NOT NULL,summary_id INTEGER NOT NULL CHECK(summary_id>0)," ..
-    "markdown BLOB NOT NULL,PRIMARY KEY(module_name,summary_id)," ..
-    "FOREIGN KEY(module_name) REFERENCES semantic_projects(module_name)) WITHOUT ROWID")
-  execute(connection, "CREATE TABLE IF NOT EXISTS main.semantic_occurrences(" ..
-    "declaration_id BLOB NOT NULL,module_name BLOB NOT NULL," ..
-    "filename BLOB NOT NULL,name BLOB NOT NULL,role INTEGER NOT NULL," ..
-    "start_line INTEGER NOT NULL,start_character INTEGER NOT NULL," ..
-    "finish_line INTEGER NOT NULL,finish_character INTEGER NOT NULL," ..
-    "byte_start INTEGER NOT NULL,byte_finish INTEGER NOT NULL," ..
-    "is_local INTEGER NOT NULL,visibility INTEGER NOT NULL," ..
-    "type_tag BLOB,type_display BLOB,callable BLOB,summary_id INTEGER,case_part_id BLOB,documentation BLOB)")
+  for index = 1, #SCHEMA_PREFIX_STATEMENTS do
+    execute(connection, SCHEMA_PREFIX_STATEMENTS[index])
+  end
   execute(connection, "CREATE TABLE IF NOT EXISTS main.semantic_occurrence_inputs AS " ..
     "SELECT " .. OCCURRENCE_COLUMNS .. " FROM main.semantic_occurrences WHERE 0")
-  execute(connection, "CREATE INDEX IF NOT EXISTS main.semantic_occurrences_file " ..
-    "ON semantic_occurrences(filename,start_line,start_character)")
-  execute(connection, "CREATE INDEX IF NOT EXISTS main.semantic_occurrences_module " ..
-    "ON semantic_occurrences(module_name)")
-  execute(connection, "CREATE INDEX IF NOT EXISTS main.semantic_files_module " ..
-    "ON semantic_files(module_name,file_order)")
-  execute(connection, "CREATE INDEX IF NOT EXISTS main.semantic_occurrences_symbol " ..
-    "ON semantic_occurrences(declaration_id,filename,byte_start)")
-  execute(connection, "CREATE INDEX IF NOT EXISTS main.semantic_occurrences_case_part " ..
-    "ON semantic_occurrences(case_part_id) WHERE case_part_id IS NOT NULL")
-  execute(connection, "CREATE UNIQUE INDEX IF NOT EXISTS main.semantic_declarations " ..
-    "ON semantic_occurrences(declaration_id) WHERE role IN (0,1)")
+  for index = 1, #SCHEMA_INDEX_STATEMENTS do
+    execute(connection, SCHEMA_INDEX_STATEMENTS[index])
+  end
 end
 
 -- This read-only plan is made under the caller's Store lease and graph revision
@@ -602,8 +624,7 @@ function publication_plan(connection: sqlite3.Connection,
     defer cursor:close()
     for row in cursor:fetch do
       local name = bytes(row, 1)
-      previous[name] = ModulePublication.new(
-        name, row:get(2) as integer, row:get(3) as integer)
+      previous[name] = ModulePublication(name, row:get(2), row:get(3))
       if by_name[name] == nil then removed[#removed + 1] = name end
     end
   end
@@ -617,8 +638,15 @@ function publication_plan(connection: sqlite3.Connection,
       replacements[module.module_name] = true
     end
   end
-  return PublicationPlan.new(current, replaced, removed, not complete, generation,
-    by_name, replacements)
+  return PublicationPlan {
+    modules = current,
+    replaced_modules = replaced,
+    removed_modules = removed,
+    rebuild_all = not complete,
+    expected_generation = generation,
+    by_name = by_name,
+    replacements = replacements,
+  }
 end
 
 function PublicationPlan:replaces(module_name: string): boolean
@@ -650,102 +678,76 @@ end
 -- Ten rows stay below Titan's 200-position variadic-call limit even when
 -- all nineteen columns are non-NULL. SQL orders and normalizes the rows.
 local function publish_occurrences(connection: sqlite3.Connection,
-                                   items: {Occurrence})
-  local offset = 1
-  while offset <= #items do
-    local finish = offset + 9
-    if finish > #items then finish = #items end
-    local parameters: {value} = {}
-    local sql = "INSERT INTO main.semantic_occurrence_inputs VALUES "
-    for index = offset, finish do
-      if index > offset then sql = sql .. "," end
-      local item = items[index]
-      local case_part_id: string? = nil
-      if item.shared_case_name ~= nil then
-        case item.shared_case_name
-        when binding(part_id) then case_part_id = part_id
-        else
-          fail<|value|>(item.module_name, item.filename,
-            "a projected case part cannot be published as a source occurrence")
-        end
+                                   items: const? {Occurrence})
+  local batch = workspace_store.batch(connection,
+    "INSERT INTO main.semantic_occurrence_inputs VALUES ", 19)
+  for index = 1, #items do
+    local item = items[index]
+    local case_part_id: string? = nil
+    if item.shared_case_name ~= nil then
+      case item.shared_case_name
+      when binding(part_id) then case_part_id = part_id
+      else
+        fail<|value|>(item.module_name, item.filename,
+          "a projected case part cannot be published as a source occurrence")
       end
-      sql = sql .. "(" .. binding(parameters, blob(item.symbol_id.declaration_id)) .. "," ..
-        binding(parameters, blob(item.module_name)) .. "," ..
-        binding(parameters, blob(item.filename)) .. "," ..
-        binding(parameters, blob(item.name)) .. "," ..
-        binding(parameters, role_rank(item.role)) .. "," ..
-        binding(parameters, item.span.start.line) .. "," ..
-        binding(parameters, item.span.start.character) .. "," ..
-        binding(parameters, item.span.finish.line) .. "," ..
-        binding(parameters, item.span.finish.character) .. "," ..
-        binding(parameters, item.byte_span.start) .. "," ..
-        binding(parameters, item.byte_span.finish) .. "," ..
-        binding(parameters, item.is_local) .. "," ..
-        binding(parameters, visibility_rank(item.visibility)) .. "," ..
-        binding(parameters, type_tag(item.type_info)) .. "," ..
-        binding(parameters, type_display(item.type_info)) .. "," ..
-        binding(parameters, signature_blob(item.callable_signature)) .. "," ..
-        binding(parameters, item.summary_id) .. "," ..
-        binding(parameters, blob(case_part_id)) .. "," ..
-        binding(parameters, blob(item.documentation)) .. ")"
     end
-    local statement = connection:prepare(sql)
-    defer statement:close()
-    statement:execute(...parameters)
-    offset = finish + 1
+    batch:append(
+      blob(item.symbol_id.declaration_id),
+      blob(item.module_name),
+      blob(item.filename),
+      blob(item.name),
+      role_rank(item.role),
+      item.span.start.line,
+      item.span.start.character,
+      item.span.finish.line,
+      item.span.finish.character,
+      item.byte_span.start,
+      item.byte_span.finish,
+      item.is_local,
+      visibility_rank(item.visibility),
+      type_tag(item.type_info),
+      type_display(item.type_info),
+      signature_blob(item.callable_signature),
+      item.summary_id,
+      blob(case_part_id),
+      blob(item.documentation))
   end
+  batch:flush()
 end
 
 local function validate_published(connection: sqlite3.Connection)
   execute(connection, "DELETE FROM main.semantic_occurrence_inputs WHERE rowid NOT IN " ..
     "(SELECT MIN(rowid) FROM main.semantic_occurrence_inputs GROUP BY " ..
     OCCURRENCE_COLUMNS .. ")")
-  do
-    local statement = connection:prepare(
-      "SELECT module_name,filename FROM (SELECT module_name,filename,byte_start," ..
-      "LAG(byte_finish) OVER (PARTITION BY filename ORDER BY byte_start," ..
-      "byte_finish,declaration_id,role) AS previous_finish " ..
-      "FROM main.semantic_occurrence_inputs) WHERE byte_start < previous_finish LIMIT 1")
-    defer statement:close()
-    local cursor = statement:query()
-    defer cursor:close()
-    local row? = cursor:fetch()
-    if row ~= nil then
-      fail<|value|>(bytes(row, 1), bytes(row, 2),
-        "compiler symbol spans overlap in saved source")
-    end
+  local overlap = workspace_store.rows(connection,
+    "SELECT module_name,filename FROM (SELECT module_name,filename,byte_start," ..
+    "LAG(byte_finish) OVER (PARTITION BY filename ORDER BY byte_start," ..
+    "byte_finish,declaration_id,role) AS previous_finish " ..
+    "FROM main.semantic_occurrence_inputs) WHERE byte_start < previous_finish LIMIT 1")
+  if #overlap > 0 then
+    fail<|value|>(bytes(overlap[1], 1), bytes(overlap[1], 2),
+      "compiler symbol spans overlap in saved source")
   end
-  do
-    local statement = connection:prepare(
-      "SELECT module_name,filename,declaration_id FROM main.semantic_occurrence_inputs " ..
-      "WHERE role IN (0,1) GROUP BY declaration_id HAVING COUNT(*) > 1 LIMIT 1")
-    defer statement:close()
-    local cursor = statement:query()
-    defer cursor:close()
-    local row? = cursor:fetch()
-    if row ~= nil then
-      fail<|value|>(bytes(row, 1), bytes(row, 2),
-        "symbol '" .. bytes(row, 3) .. "' has more than one exact declaration")
-    end
+  local duplicate = workspace_store.rows(connection,
+    "SELECT module_name,filename,declaration_id FROM main.semantic_occurrence_inputs " ..
+    "WHERE role IN (0,1) GROUP BY declaration_id HAVING COUNT(*) > 1 LIMIT 1")
+  if #duplicate > 0 then
+    fail<|value|>(bytes(duplicate[1], 1), bytes(duplicate[1], 2),
+      "symbol '" .. bytes(duplicate[1], 3) .. "' has more than one exact declaration")
   end
-  do
-    -- Replacement declarations must also be unique against the modules whose
-    -- facts survived this publication. Occurrences are owned by their containing
-    -- module, so references to a replaced provider intentionally remain here.
-    local statement = connection:prepare(
-      "SELECT fresh.module_name,fresh.filename,fresh.declaration_id " ..
-      "FROM main.semantic_occurrence_inputs AS fresh " ..
-      "JOIN main.semantic_occurrences AS retained " ..
-      "ON retained.declaration_id=fresh.declaration_id " ..
-      "WHERE fresh.role IN (0,1) AND retained.role IN (0,1) LIMIT 1")
-    defer statement:close()
-    local cursor = statement:query()
-    defer cursor:close()
-    local row? = cursor:fetch()
-    if row ~= nil then
-      fail<|value|>(bytes(row, 1), bytes(row, 2),
-        "symbol '" .. bytes(row, 3) .. "' has more than one exact declaration")
-    end
+  -- Replacement declarations must also be unique against the modules whose
+  -- facts survived this publication. Occurrences are owned by their containing
+  -- module, so references to a replaced provider intentionally remain here.
+  local retained = workspace_store.rows(connection,
+    "SELECT fresh.module_name,fresh.filename,fresh.declaration_id " ..
+    "FROM main.semantic_occurrence_inputs AS fresh " ..
+    "JOIN main.semantic_occurrences AS retained " ..
+    "ON retained.declaration_id=fresh.declaration_id " ..
+    "WHERE fresh.role IN (0,1) AND retained.role IN (0,1) LIMIT 1")
+  if #retained > 0 then
+    fail<|value|>(bytes(retained[1], 1), bytes(retained[1], 2),
+      "symbol '" .. bytes(retained[1], 3) .. "' has more than one exact declaration")
   end
 end
 
@@ -804,60 +806,32 @@ function Prepared:publish(connection: sqlite3.Connection)
     end
   end
   -- Build fixed-size file batches without retaining a second file registry.
-  local file_bindings: {value} = {}
-  local file_sql = "INSERT INTO main.semantic_files VALUES "
-  local file_count = 0
+  local file_batch = workspace_store.batch(connection,
+    "INSERT INTO main.semantic_files VALUES ", 5)
   for module_index = 1, #self.projects do
     local project = self.projects[module_index]
     if self.plan == nil or self.plan:replaces(project.module_name) then
       for file_index = 1, #project.files do
         local file = project.files[file_index]
-        if file_count > 0 then file_sql = file_sql .. "," end
-        file_sql = file_sql .. "(" .. binding(file_bindings, blob(file.filename)) .. "," ..
-          binding(file_bindings, blob(project.module_name)) .. "," ..
-          binding(file_bindings, blob(file.contents)) .. "," ..
-          binding(file_bindings, module_index) .. "," ..
-          binding(file_bindings, file_index) .. ")"
-        file_count = file_count + 1
-        if file_count == 40 then
-          local statement = connection:prepare(file_sql)
-          defer statement:close()
-          statement:execute(...file_bindings)
-          file_bindings = {}
-          file_sql = "INSERT INTO main.semantic_files VALUES "
-          file_count = 0
-        end
+        file_batch:append(
+          blob(file.filename),
+          blob(project.module_name),
+          blob(file.contents),
+          module_index,
+          file_index)
       end
     end
   end
-  if file_count > 0 then
-    local statement = connection:prepare(file_sql)
-    defer statement:close()
-    statement:execute(...file_bindings)
+  file_batch:flush()
+  local summary_batch = workspace_store.batch(connection,
+    "INSERT INTO main.semantic_summaries VALUES ", 3)
+  for _, summary in iteration.pairs(self.summaries) do
+    summary_batch:append(
+      blob(summary.module_name),
+      summary.summary_id,
+      blob(summary.markdown))
   end
-  local summary_bindings: {value} = {}
-  local summary_sql = "INSERT INTO main.semantic_summaries VALUES "
-  local summary_count = 0
-  for _, summary in iteration.pairs<|string, MaterializedSummary|>(self.summaries) do
-    if summary_count > 0 then summary_sql = summary_sql .. "," end
-    summary_sql = summary_sql .. "(" .. binding(summary_bindings, blob(summary.module_name)) .. "," ..
-      binding(summary_bindings, summary.summary_id) .. "," ..
-      binding(summary_bindings, blob(summary.markdown)) .. ")"
-    summary_count = summary_count + 1
-    if summary_count == 60 then
-      local statement = connection:prepare(summary_sql)
-      defer statement:close()
-      statement:execute(...summary_bindings)
-      summary_bindings = {}
-      summary_sql = "INSERT INTO main.semantic_summaries VALUES "
-      summary_count = 0
-    end
-  end
-  if summary_count > 0 then
-    local statement = connection:prepare(summary_sql)
-    defer statement:close()
-    statement:execute(...summary_bindings)
-  end
+  summary_batch:flush()
   publish_occurrences(connection, self.occurrences)
   validate_published(connection)
   execute(connection, "INSERT INTO main.semantic_occurrences SELECT " ..
@@ -866,19 +840,15 @@ function Prepared:publish(connection: sqlite3.Connection)
 end
 
 function check_generation(connection: sqlite3.Connection, expected: integer)
-  local statement = connection:prepare(
+  local found = workspace_store.rows(connection,
     "SELECT published_generation FROM main.store_state WHERE singleton=1")
-  defer statement:close()
-  local cursor = statement:query()
-  defer cursor:close()
-  local row? = cursor:fetch()
   local actual = -1
-  if row ~= nil then actual = row:get(1) as integer end
-  if actual ~= expected then raise StaleView.new(expected, actual) end
+  if #found > 0 then actual = found[1]:get(1) end
+  if actual ~= expected then raise StaleView(expected, actual) end
 end
 
 function open(store: workspace_store.Store, published_generation: integer): Index
-  return Index.new(store, published_generation, false)
+  return Index(store, published_generation, false)
 end
 
 function Index:close()
@@ -902,7 +872,7 @@ local function build_internal(projects: {bridge.ProjectModule},
     prepared:publish(connection)
   end
   completed = true
-  return Index.new(store, 0, true)
+  return Index(store, 0, true)
 end
 
 function build(projects: {bridge.ProjectModule}, snapshots: {bridge.ModuleSnapshot}): Index
@@ -915,7 +885,7 @@ function build_with_yield(projects: {bridge.ProjectModule},
 end
 
 local function row_role(row: sqlite3.Row, column: integer): bridge.OccurrenceRole
-  local role = row:get(column) as integer
+  local role: integer = row:get(column)
   if role == 0 then return bridge.OccurrenceRole.definition() end
   if role == 1 then return bridge.OccurrenceRole.import_alias() end
   if role == 2 then return bridge.OccurrenceRole.write() end
@@ -924,7 +894,7 @@ local function row_role(row: sqlite3.Row, column: integer): bridge.OccurrenceRol
 end
 
 function row_visibility(row: sqlite3.Row, column: integer): bridge.DeclarationVisibility
-  local visibility = row:get(column) as integer
+  local visibility: integer = row:get(column)
   if visibility == 0 then return bridge.DeclarationVisibility.block() end
   if visibility == 1 then return bridge.DeclarationVisibility.module() end
   return bridge.DeclarationVisibility.exported()
@@ -933,7 +903,7 @@ end
 function row_signature(row: sqlite3.Row, column: integer): bridge.CallableSignature?
   local display? = optional_bytes(row, column)
   if display == nil then return nil end
-  return bridge.CallableSignature.new(display)
+  return bridge.CallableSignature(display)
 end
 
 local function row_occurrence(row: sqlite3.Row, selected_id: string?): Occurrence
@@ -950,15 +920,25 @@ local function row_occurrence(row: sqlite3.Row, selected_id: string?): Occurrenc
       shared = SharedCaseName.binding(case_part_id)
     end
   end
-  return Occurrence.new(SymbolId.new(declaration_id), bytes(row, 2),
-    bytes(row, 3), bytes(row, 4), role,
-    source_text.Span.new(
-      source_text.Position.new(row:get(6) as integer, row:get(7) as integer),
-      source_text.Position.new(row:get(8) as integer, row:get(9) as integer)),
-    source_text.ByteSpan.new(row:get(10) as integer, row:get(11) as integer),
-    (row:get(12) as integer) ~= 0, row_visibility(row, 13),
-    row_type(row, 14), row_signature(row, 16), row:get(17) as integer?, shared,
-    optional_bytes(row, 19))
+  local is_local: integer = row:get(12)
+  return Occurrence {
+    symbol_id = SymbolId(declaration_id),
+    module_name = bytes(row, 2),
+    filename = bytes(row, 3),
+    name = bytes(row, 4),
+    role = role,
+    span = source_text.Span(
+      source_text.Position(row:get(6), row:get(7)),
+      source_text.Position(row:get(8), row:get(9))),
+    byte_span = source_text.ByteSpan(row:get(10), row:get(11)),
+    is_local = is_local ~= 0,
+    visibility = row_visibility(row, 13),
+    type_info = row_type(row, 14),
+    callable_signature = row_signature(row, 16),
+    summary_id = row:get(17),
+    shared_case_name = shared,
+    documentation = optional_bytes(row, 19),
+  }
 end
 
 local function collect(cursor: sqlite3.Cursor, selected_id: string?): {Occurrence}
@@ -997,12 +977,12 @@ function Index:project_modules(): {bridge.ProjectModule}
   for row in cursor:fetch do
     local module_name = bytes(row, 1)
     if current == nil or current.module_name ~= module_name then
-      current = bridge.ProjectModule.new(module_name, {})
+      current = bridge.ProjectModule(module_name, {})
       result[#result + 1] = current
     end
     local filename? = optional_bytes(row, 2)
     if filename ~= nil then
-      current.files[#current.files + 1] = bridge.SourceFile.new(filename, bytes(row, 3))
+      current.files[#current.files + 1] = bridge.SourceFile(filename, bytes(row, 3))
     end
   end
   return result
@@ -1012,14 +992,10 @@ function Index:coordinate_index(filename: string): source_text.CoordinateIndex?
   local access = self.store:acquire()
   defer access:release()
   check_generation(access.connection, self.published_generation)
-  local statement = access.connection:prepare(
-    "SELECT contents FROM main.semantic_files WHERE filename=?")
-  defer statement:close()
-  local cursor = statement:query(blob(filename))
-  defer cursor:close()
-  local row? = cursor:fetch()
-  if row == nil then return nil end
-  return source_text.coordinate_index(bytes(row, 1))
+  local found = workspace_store.rows(access.connection,
+    "SELECT contents FROM main.semantic_files WHERE filename=?", blob(filename))
+  if #found == 0 then return nil end
+  return source_text.coordinate_index(bytes(found[1], 1))
 end
 
 function Index:hover_summary(occurrence: Occurrence): string?
@@ -1028,26 +1004,19 @@ function Index:hover_summary(occurrence: Occurrence): string?
   local access = self.store:acquire()
   defer access:release()
   check_generation(access.connection, self.published_generation)
-  local statement = access.connection:prepare(
-    "SELECT markdown FROM main.semantic_summaries WHERE module_name=? AND summary_id=?")
-  defer statement:close()
-  local cursor = statement:query(blob(occurrence.module_name), summary_id)
-  defer cursor:close()
-  local row? = cursor:fetch()
-  if row == nil then return nil end
-  return bytes(row, 1)
+  local found = workspace_store.rows(access.connection,
+    "SELECT markdown FROM main.semantic_summaries WHERE module_name=? AND summary_id=?",
+    blob(occurrence.module_name), summary_id)
+  if #found == 0 then return nil end
+  return bytes(found[1], 1)
 end
 
 function Index:hover_summary_count(): integer
   local access = self.store:acquire()
   defer access:release()
   check_generation(access.connection, self.published_generation)
-  local statement = access.connection:prepare("SELECT COUNT(*) FROM main.semantic_summaries")
-  defer statement:close()
-  local cursor = statement:query()
-  defer cursor:close()
-  local row = cursor:fetch() as sqlite3.Row
-  return row:get(1) as integer
+  return workspace_store.scalar_integer(access.connection,
+    "SELECT COUNT(*) FROM main.semantic_summaries")
 end
 
 function Index:file_occurrences(filename: string): {Occurrence}

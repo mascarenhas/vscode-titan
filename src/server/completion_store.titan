@@ -4,12 +4,57 @@
 local sqlite3 = import "sqlite3"
 local async = import "async"
 local strings = import "string"
-local iteration = import "iteration"
 local sql = import "server.workspace_store"
 local caches = import "server.workspace_cache"
 local bridge = import "server.compiler_bridge"
 local headers = import "server.header_store"
 local facts = import "server.completion_types"
+
+local const MAX_DOCUMENT_BYTES = 4 * 1024 * 1024
+local const MAX_BUFFER_BYTES = 32 * 1024 * 1024
+local const MAX_DOCUMENTS = 256
+local const MAX_SNAPSHOT_BYTES = 16 * 1024 * 1024
+local const MAX_ANALYSIS_BYTES = 64 * 1024 * 1024
+local const MAX_SNAPSHOTS = 16
+local const MAX_CANDIDATES = 100000
+local const MAX_DESCRIPTOR_BYTES = 64 * 1024 * 1024
+
+local const CANDIDATE_COLUMNS = "label,lookup_domain,lookup_key,kind,detail,type_key,scope_id,scope_depth,declaration_order,available,visibility,owner_key,access_mode,call_snippet,documentation"
+
+local const SNAPSHOT_INVENTORY = "SELECT id,byte_count,serial,0 AS kind FROM temp.completion_snapshots " ..
+  "UNION ALL SELECT id,byte_count,serial,1 AS kind FROM temp.retained_hover_snapshots"
+
+-- Keep large descriptor payloads outside the primary-key index. Every child
+-- foreign-key probe otherwise reads the payload's overflow pages when this
+-- parent uses WITHOUT ROWID (SDK headers can produce multi-megabyte rows).
+local const SAVED_SCHEMA_STATEMENTS: const {string} = {
+  "CREATE TABLE IF NOT EXISTS main.completion_configuration(singleton INTEGER PRIMARY KEY CHECK(singleton=1),source_roots_present INTEGER NOT NULL,binary_root BLOB,include_roots_present INTEGER NOT NULL,cppflags BLOB)",
+  "CREATE TABLE IF NOT EXISTS main.completion_roots(kind INTEGER NOT NULL,position INTEGER NOT NULL,path BLOB NOT NULL,PRIMARY KEY(kind,position)) WITHOUT ROWID",
+  "CREATE TABLE IF NOT EXISTS main.completion_descriptors(module_name BLOB PRIMARY KEY NOT NULL,revision INTEGER NOT NULL,state INTEGER NOT NULL,provenance TEXT NOT NULL,main_file BLOB NOT NULL,payload BLOB,public_interface BLOB NOT NULL,source_interface BLOB,documentation BLOB)",
+  "CREATE TABLE IF NOT EXISTS main.completion_source_files(module_name BLOB NOT NULL REFERENCES completion_descriptors(module_name) ON DELETE CASCADE,position INTEGER NOT NULL,filename BLOB NOT NULL,PRIMARY KEY(module_name,position)) WITHOUT ROWID",
+  "CREATE TABLE IF NOT EXISTS main.completion_imports(module_name BLOB NOT NULL REFERENCES completion_descriptors(module_name) ON DELETE CASCADE,position INTEGER NOT NULL,alias BLOB NOT NULL,dependency BLOB NOT NULL,source_required INTEGER NOT NULL,filename BLOB NOT NULL,line INTEGER NOT NULL,column INTEGER NOT NULL,PRIMARY KEY(module_name,position)) WITHOUT ROWID",
+  "CREATE TABLE IF NOT EXISTS main.completion_header_inputs(module_name BLOB NOT NULL REFERENCES completion_descriptors(module_name) ON DELETE CASCADE,position INTEGER NOT NULL,kind INTEGER NOT NULL,path BLOB NOT NULL,identity BLOB NOT NULL,modified_seconds INTEGER,modified_nanoseconds INTEGER,physical_identity BLOB,precision TEXT,size INTEGER,changed_seconds INTEGER,changed_nanoseconds INTEGER,PRIMARY KEY(module_name,position)) WITHOUT ROWID",
+  "CREATE TABLE IF NOT EXISTS main.completion_members(module_name BLOB NOT NULL REFERENCES completion_descriptors(module_name) ON DELETE CASCADE,ordinal INTEGER NOT NULL,label TEXT COLLATE BINARY NOT NULL,lookup_domain TEXT NOT NULL,lookup_key TEXT NOT NULL,kind INTEGER NOT NULL,detail BLOB NOT NULL,type_key BLOB NOT NULL,scope_id INTEGER NOT NULL,scope_depth INTEGER NOT NULL,declaration_order INTEGER NOT NULL,available INTEGER NOT NULL,visibility TEXT NOT NULL,owner_key TEXT NOT NULL,access_mode TEXT NOT NULL,call_snippet BLOB,documentation BLOB,PRIMARY KEY(module_name,ordinal)) WITHOUT ROWID",
+  "CREATE INDEX IF NOT EXISTS main.completion_members_owner ON completion_members(module_name,owner_key,access_mode,label COLLATE BINARY)",
+}
+
+local const TEMP_SCHEMA_STATEMENTS: const {string} = {
+  "CREATE TEMP TABLE IF NOT EXISTS open_documents(filename BLOB PRIMARY KEY,uri BLOB NOT NULL,module_name BLOB NOT NULL,session INTEGER NOT NULL,version INTEGER NOT NULL,contents BLOB,byte_count INTEGER NOT NULL) WITHOUT ROWID",
+  "CREATE TEMP TABLE IF NOT EXISTS completion_document_state(singleton INTEGER PRIMARY KEY CHECK(singleton=1),epoch INTEGER NOT NULL)",
+  "INSERT OR IGNORE INTO temp.completion_document_state VALUES(1,0)",
+  "CREATE TEMP TABLE IF NOT EXISTS completion_snapshots(id BLOB PRIMARY KEY,module_name BLOB NOT NULL,saved_generation INTEGER NOT NULL,buffer_epoch INTEGER NOT NULL,context_key BLOB NOT NULL,filename BLOB NOT NULL,document_session INTEGER NOT NULL,document_version INTEGER NOT NULL,caret_byte INTEGER NOT NULL,replace_start INTEGER NOT NULL,replace_finish INTEGER NOT NULL,prefix TEXT NOT NULL,quality TEXT NOT NULL,byte_count INTEGER NOT NULL,serial INTEGER NOT NULL) WITHOUT ROWID",
+  "CREATE TEMP TABLE IF NOT EXISTS completion_inputs(snapshot_id BLOB NOT NULL REFERENCES completion_snapshots(id) ON DELETE CASCADE,position INTEGER NOT NULL,filename BLOB NOT NULL,session INTEGER NOT NULL,version INTEGER NOT NULL,contents BLOB NOT NULL,PRIMARY KEY(snapshot_id,position)) WITHOUT ROWID",
+  "CREATE TEMP TABLE IF NOT EXISTS covered_modules(snapshot_id BLOB NOT NULL REFERENCES completion_snapshots(id) ON DELETE CASCADE,module_name BLOB NOT NULL,PRIMARY KEY(snapshot_id,module_name)) WITHOUT ROWID",
+  "CREATE TEMP TABLE IF NOT EXISTS completion_scopes(snapshot_id BLOB NOT NULL REFERENCES completion_snapshots(id) ON DELETE CASCADE,scope_id INTEGER NOT NULL,parent_id INTEGER,kind TEXT NOT NULL,filename BLOB NOT NULL,byte_start INTEGER NOT NULL,byte_finish INTEGER NOT NULL,PRIMARY KEY(snapshot_id,scope_id)) WITHOUT ROWID",
+  "CREATE TEMP TABLE IF NOT EXISTS completion_candidates(snapshot_id BLOB NOT NULL REFERENCES completion_snapshots(id) ON DELETE CASCADE,ordinal INTEGER NOT NULL,label TEXT COLLATE BINARY NOT NULL,lookup_domain TEXT NOT NULL,lookup_key TEXT NOT NULL,kind INTEGER NOT NULL,detail BLOB NOT NULL,type_key BLOB NOT NULL,scope_id INTEGER NOT NULL,scope_depth INTEGER NOT NULL,declaration_order INTEGER NOT NULL,available INTEGER NOT NULL,visibility TEXT NOT NULL,owner_key TEXT NOT NULL,access_mode TEXT NOT NULL,call_snippet BLOB,documentation BLOB,PRIMARY KEY(snapshot_id,ordinal)) WITHOUT ROWID",
+  "CREATE INDEX IF NOT EXISTS temp.completion_candidates_lookup ON completion_candidates(snapshot_id,scope_id,label COLLATE BINARY)",
+  "CREATE INDEX IF NOT EXISTS temp.completion_candidates_owner ON completion_candidates(snapshot_id,owner_key,access_mode,label COLLATE BINARY)",
+  "CREATE INDEX IF NOT EXISTS temp.completion_snapshots_context ON completion_snapshots(filename,caret_byte,context_key)",
+  "CREATE TEMP TABLE IF NOT EXISTS completion_hovers(snapshot_id BLOB NOT NULL REFERENCES completion_snapshots(id) ON DELETE CASCADE,filename BLOB NOT NULL,byte_start INTEGER NOT NULL,byte_finish INTEGER NOT NULL,markdown BLOB NOT NULL,PRIMARY KEY(snapshot_id,filename,byte_start)) WITHOUT ROWID",
+  "CREATE TEMP TABLE IF NOT EXISTS retained_hover_snapshots(id BLOB PRIMARY KEY,module_name BLOB NOT NULL,saved_generation INTEGER NOT NULL,buffer_epoch INTEGER NOT NULL,byte_count INTEGER NOT NULL,serial INTEGER NOT NULL) WITHOUT ROWID",
+  "CREATE TEMP TABLE IF NOT EXISTS retained_hover_inputs(snapshot_id BLOB NOT NULL REFERENCES retained_hover_snapshots(id) ON DELETE CASCADE,position INTEGER NOT NULL,filename BLOB NOT NULL,session INTEGER NOT NULL,version INTEGER NOT NULL,contents BLOB NOT NULL,PRIMARY KEY(snapshot_id,position)) WITHOUT ROWID",
+  "CREATE TEMP TABLE IF NOT EXISTS retained_hovers(snapshot_id BLOB NOT NULL REFERENCES retained_hover_snapshots(id) ON DELETE CASCADE,filename BLOB NOT NULL,byte_start INTEGER NOT NULL,byte_finish INTEGER NOT NULL,markdown BLOB NOT NULL,PRIMARY KEY(snapshot_id,filename,byte_start)) WITHOUT ROWID",
+}
 
 -- Main rows are written only by the existing saved publication owner. A nil
 -- project payload selects the exact-revision payload published by Cache in the
@@ -62,15 +107,22 @@ local function saved_headers(connection: sqlite3.Connection,
   local result: {bridge.CHeaderDependency} = {}
   for index = 1, #rows do
     local row = rows[index]
-    local kind = bridge.CHeaderDependencyKind.file()
-    if row:get(1) == 1 then kind = bridge.CHeaderDependencyKind.search()
-    elseif row:get(1) == 2 then kind = bridge.CHeaderDependencyKind.origin() end
+    local kind = bridge.header_dependency_kind_from_code(row:get(1)) or
+      bridge.CHeaderDependencyKind.file()
     local observation?: bridge.HeaderObservation
     if row:get(4) ~= nil then
-      observation = bridge.HeaderObservation.new(row:get(4), row:get(5), sql.bytes(row, 6),
-        row:get(7), row:get(8), row:get(9), row:get(10))
+      observation = bridge.HeaderObservation {
+        modified_seconds = row:get(4),
+        modified_nanoseconds = row:get(5),
+        physical_identity = sql.bytes(row, 6),
+        precision = row:get(7),
+        size = row:get(8),
+        changed_seconds = row:get(9),
+        changed_nanoseconds = row:get(10),
+      }
     end
-    result[index] = bridge.CHeaderDependency.new(kind, sql.bytes(row, 2), sql.bytes(row, 3), observation)
+    result[index] = bridge.CHeaderDependency(
+      kind, sql.bytes(row, 2), sql.bytes(row, 3), observation)
   end
   return result
 end
@@ -92,8 +144,9 @@ local function saved_imports(connection: sqlite3.Connection,
   local result: {bridge.Import} = {}
   for index = 1, #rows do
     local row = rows[index]
-    result[index] = bridge.Import.new(sql.bytes(row, 1), sql.bytes(row, 2),
-      (row:get(3) as integer) ~= 0, bridge.SourceLocation.new(sql.bytes(row, 4), row:get(5), row:get(6)))
+    local source_required: integer = row:get(3)
+    result[index] = bridge.Import(sql.bytes(row, 1), sql.bytes(row, 2),
+      source_required ~= 0, bridge.SourceLocation(sql.bytes(row, 4), row:get(5), row:get(6)))
   end
   return result
 end
@@ -145,10 +198,8 @@ function descriptor_matches(connection: sqlite3.Connection,
   if #inputs ~= #descriptor.header_inputs then return false end
   for index = 1, #inputs do
     local old, new = inputs[index], descriptor.header_inputs[index]
-    local old_kind, new_kind = 0, 0
-    case old.kind when search() then old_kind = 1 when origin() then old_kind = 2 end
-    case new.kind when search() then new_kind = 1 when origin() then new_kind = 2 end
-    if old_kind ~= new_kind or old.path ~= new.path or old.identity ~= new.identity then return false end
+    if old.kind:code() ~= new.kind:code() or old.path ~= new.path or
+        old.identity ~= new.identity then return false end
   end
   return true
 end
@@ -178,8 +229,12 @@ function Store:capture_baseline(): Baseline?
   local include_roots?: {string}
   if setting:get(1) == 1 then source_roots = saved_roots(connection, 0) end
   if setting:get(3) == 1 then include_roots = saved_roots(connection, 1) end
-  local configuration = bridge.CompilerConfiguration.new(source_roots,
-    sql.optional_bytes(setting, 2), include_roots, sql.optional_bytes(setting, 4))
+  local configuration = bridge.CompilerConfiguration {
+    source_roots = source_roots,
+    binary_root = sql.optional_bytes(setting, 2),
+    include_roots = include_roots,
+    cppflags = sql.optional_bytes(setting, 4),
+  }
   local rows = sql.rows(connection,
     "SELECT module_name,revision,state,provenance,main_file,public_interface,source_interface,documentation " ..
     "FROM main.completion_descriptors ORDER BY module_name")
@@ -187,9 +242,18 @@ function Store:capture_baseline(): Baseline?
   for index = 1, #rows do
     local row = rows[index]
     local name = sql.bytes(row, 1)
-    modules[index] = SavedModule.new(name, row:get(2), row:get(3), row:get(4),
-      sql.bytes(row, 5), sql.bytes(row, 6), sql.optional_bytes(row, 7),
-      saved_files(connection, name), saved_imports(connection, name), sql.optional_bytes(row, 8))
+    modules[index] = SavedModule {
+      module_name = name,
+      revision = row:get(2),
+      state = row:get(3),
+      provenance = row:get(4),
+      main_file = sql.bytes(row, 5),
+      public_interface = sql.bytes(row, 6),
+      source_interface = sql.optional_bytes(row, 7),
+      source_files = saved_files(connection, name),
+      imports = saved_imports(connection, name),
+      documentation = sql.optional_bytes(row, 8),
+    }
   end
   if sql.scalar_integer(connection,
       "SELECT COALESCE(SUM(length(contents)),0) FROM main.semantic_files") > MAX_BUFFER_BYTES then
@@ -204,15 +268,22 @@ function Store:capture_baseline(): Baseline?
     local name = sql.bytes(row, 1)
     local project? = by_name[name]
     if project == nil then
-      project = bridge.ProjectModule.new(name, {})
+      project = bridge.ProjectModule(name, {})
       by_name[name] = project
       projects[#projects + 1] = project
     end
-    project.files[#project.files + 1] = bridge.SourceFile.new(sql.bytes(row, 2), sql.bytes(row, 3))
+    project.files[#project.files + 1] = bridge.SourceFile(sql.bytes(row, 2), sql.bytes(row, 3))
   end
-  return Baseline.new(generation(connection), configuration, modules, projects,
-    saved_roots(connection, 2), saved_roots(connection, 3),
-    saved_roots(connection, 4), bridge.analysis_target())
+  return Baseline {
+    generation = generation(connection),
+    configuration = configuration,
+    modules = modules,
+    projects = projects,
+    include = saved_roots(connection, 2),
+    exclude = saved_roots(connection, 3),
+    inactive_files = saved_roots(connection, 4),
+    target = bridge.analysis_target(),
+  }
 end
 
 function Store:read_descriptor(expected_generation: integer,
@@ -226,7 +297,8 @@ function Store:read_descriptor(expected_generation: integer,
     "WHERE module_name=? AND (provenance<>'project' OR state=2) AND payload IS NOT NULL " ..
     "AND length(payload)<=?", blob(module_name), MAX_DESCRIPTOR_BYTES)
   if #rows ~= 1 then return nil end
-  return bridge.ProjectPayload.new(module_name, sql.bytes(rows[1], 1), saved_headers(connection, module_name))
+  return bridge.ProjectPayload(
+    module_name, sql.bytes(rows[1], 1), saved_headers(connection, module_name))
 end
 
 -- Routing captures only the committed identity. Preparation may materialize
@@ -274,17 +346,8 @@ end
 
 type Current = function (): boolean
 
-local MAX_DOCUMENT_BYTES = 4 * 1024 * 1024
-local MAX_BUFFER_BYTES = 32 * 1024 * 1024
-local MAX_DOCUMENTS = 256
-local MAX_SNAPSHOT_BYTES = 16 * 1024 * 1024
-local MAX_ANALYSIS_BYTES = 64 * 1024 * 1024
-local MAX_SNAPSHOTS = 16
-local MAX_CANDIDATES = 100000
-local MAX_DESCRIPTOR_BYTES = 64 * 1024 * 1024
-
 local function blob(text: string): sqlite3.Blob
-  return sqlite3.Blob.new(text)
+  return sqlite3.Blob(text)
 end
 
 local function generation(connection: sqlite3.Connection): integer
@@ -298,20 +361,9 @@ local function current_generation(connection: sqlite3.Connection,
 end
 
 function initialize_saved_schema(connection: sqlite3.Connection)
-  -- Keep large descriptor payloads outside the primary-key index. Every child
-  -- foreign-key probe otherwise reads the payload's overflow pages when this
-  -- parent uses WITHOUT ROWID (SDK headers can produce multi-megabyte rows).
-  local schema = {
-    "CREATE TABLE IF NOT EXISTS main.completion_configuration(singleton INTEGER PRIMARY KEY CHECK(singleton=1),source_roots_present INTEGER NOT NULL,binary_root BLOB,include_roots_present INTEGER NOT NULL,cppflags BLOB)",
-    "CREATE TABLE IF NOT EXISTS main.completion_roots(kind INTEGER NOT NULL,position INTEGER NOT NULL,path BLOB NOT NULL,PRIMARY KEY(kind,position)) WITHOUT ROWID",
-    "CREATE TABLE IF NOT EXISTS main.completion_descriptors(module_name BLOB PRIMARY KEY NOT NULL,revision INTEGER NOT NULL,state INTEGER NOT NULL,provenance TEXT NOT NULL,main_file BLOB NOT NULL,payload BLOB,public_interface BLOB NOT NULL,source_interface BLOB,documentation BLOB)",
-    "CREATE TABLE IF NOT EXISTS main.completion_source_files(module_name BLOB NOT NULL REFERENCES completion_descriptors(module_name) ON DELETE CASCADE,position INTEGER NOT NULL,filename BLOB NOT NULL,PRIMARY KEY(module_name,position)) WITHOUT ROWID",
-    "CREATE TABLE IF NOT EXISTS main.completion_imports(module_name BLOB NOT NULL REFERENCES completion_descriptors(module_name) ON DELETE CASCADE,position INTEGER NOT NULL,alias BLOB NOT NULL,dependency BLOB NOT NULL,source_required INTEGER NOT NULL,filename BLOB NOT NULL,line INTEGER NOT NULL,column INTEGER NOT NULL,PRIMARY KEY(module_name,position)) WITHOUT ROWID",
-    "CREATE TABLE IF NOT EXISTS main.completion_header_inputs(module_name BLOB NOT NULL REFERENCES completion_descriptors(module_name) ON DELETE CASCADE,position INTEGER NOT NULL,kind INTEGER NOT NULL,path BLOB NOT NULL,identity BLOB NOT NULL,modified_seconds INTEGER,modified_nanoseconds INTEGER,physical_identity BLOB,precision TEXT,size INTEGER,changed_seconds INTEGER,changed_nanoseconds INTEGER,PRIMARY KEY(module_name,position)) WITHOUT ROWID",
-    "CREATE TABLE IF NOT EXISTS main.completion_members(module_name BLOB NOT NULL REFERENCES completion_descriptors(module_name) ON DELETE CASCADE,ordinal INTEGER NOT NULL,label TEXT COLLATE BINARY NOT NULL,lookup_domain TEXT NOT NULL,lookup_key TEXT NOT NULL,kind INTEGER NOT NULL,detail BLOB NOT NULL,type_key BLOB NOT NULL,scope_id INTEGER NOT NULL,scope_depth INTEGER NOT NULL,declaration_order INTEGER NOT NULL,available INTEGER NOT NULL,visibility TEXT NOT NULL,owner_key TEXT NOT NULL,access_mode TEXT NOT NULL,call_snippet BLOB,documentation BLOB,PRIMARY KEY(module_name,ordinal)) WITHOUT ROWID",
-    "CREATE INDEX IF NOT EXISTS main.completion_members_owner ON completion_members(module_name,owner_key,access_mode,label COLLATE BINARY)",
-  }
-  for index = 1, #schema do sql.execute(connection, schema[index]) end
+  for index = 1, #SAVED_SCHEMA_STATEMENTS do
+    sql.execute(connection, SAVED_SCHEMA_STATEMENTS[index])
+  end
 end
 
 local function initialize_temp_schema(connection: sqlite3.Connection)
@@ -320,31 +372,16 @@ local function initialize_temp_schema(connection: sqlite3.Connection)
   if sql.scalar_integer(connection, "PRAGMA temp_store") ~= 2 then
     raise "completion requires SQLite memory TEMP storage"
   end
-  local schema = {
-    "CREATE TEMP TABLE IF NOT EXISTS open_documents(filename BLOB PRIMARY KEY,uri BLOB NOT NULL,module_name BLOB NOT NULL,session INTEGER NOT NULL,version INTEGER NOT NULL,contents BLOB,byte_count INTEGER NOT NULL) WITHOUT ROWID",
-    "CREATE TEMP TABLE IF NOT EXISTS completion_document_state(singleton INTEGER PRIMARY KEY CHECK(singleton=1),epoch INTEGER NOT NULL)",
-    "INSERT OR IGNORE INTO temp.completion_document_state VALUES(1,0)",
-    "CREATE TEMP TABLE IF NOT EXISTS completion_snapshots(id BLOB PRIMARY KEY,module_name BLOB NOT NULL,saved_generation INTEGER NOT NULL,buffer_epoch INTEGER NOT NULL,context_key BLOB NOT NULL,filename BLOB NOT NULL,document_session INTEGER NOT NULL,document_version INTEGER NOT NULL,caret_byte INTEGER NOT NULL,replace_start INTEGER NOT NULL,replace_finish INTEGER NOT NULL,prefix TEXT NOT NULL,quality TEXT NOT NULL,byte_count INTEGER NOT NULL,serial INTEGER NOT NULL) WITHOUT ROWID",
-    "CREATE TEMP TABLE IF NOT EXISTS completion_inputs(snapshot_id BLOB NOT NULL REFERENCES completion_snapshots(id) ON DELETE CASCADE,position INTEGER NOT NULL,filename BLOB NOT NULL,session INTEGER NOT NULL,version INTEGER NOT NULL,contents BLOB NOT NULL,PRIMARY KEY(snapshot_id,position)) WITHOUT ROWID",
-    "CREATE TEMP TABLE IF NOT EXISTS covered_modules(snapshot_id BLOB NOT NULL REFERENCES completion_snapshots(id) ON DELETE CASCADE,module_name BLOB NOT NULL,PRIMARY KEY(snapshot_id,module_name)) WITHOUT ROWID",
-    "CREATE TEMP TABLE IF NOT EXISTS completion_scopes(snapshot_id BLOB NOT NULL REFERENCES completion_snapshots(id) ON DELETE CASCADE,scope_id INTEGER NOT NULL,parent_id INTEGER,kind TEXT NOT NULL,filename BLOB NOT NULL,byte_start INTEGER NOT NULL,byte_finish INTEGER NOT NULL,PRIMARY KEY(snapshot_id,scope_id)) WITHOUT ROWID",
-    "CREATE TEMP TABLE IF NOT EXISTS completion_candidates(snapshot_id BLOB NOT NULL REFERENCES completion_snapshots(id) ON DELETE CASCADE,ordinal INTEGER NOT NULL,label TEXT COLLATE BINARY NOT NULL,lookup_domain TEXT NOT NULL,lookup_key TEXT NOT NULL,kind INTEGER NOT NULL,detail BLOB NOT NULL,type_key BLOB NOT NULL,scope_id INTEGER NOT NULL,scope_depth INTEGER NOT NULL,declaration_order INTEGER NOT NULL,available INTEGER NOT NULL,visibility TEXT NOT NULL,owner_key TEXT NOT NULL,access_mode TEXT NOT NULL,call_snippet BLOB,documentation BLOB,PRIMARY KEY(snapshot_id,ordinal)) WITHOUT ROWID",
-    "CREATE INDEX IF NOT EXISTS temp.completion_candidates_lookup ON completion_candidates(snapshot_id,scope_id,label COLLATE BINARY)",
-    "CREATE INDEX IF NOT EXISTS temp.completion_candidates_owner ON completion_candidates(snapshot_id,owner_key,access_mode,label COLLATE BINARY)",
-    "CREATE INDEX IF NOT EXISTS temp.completion_snapshots_context ON completion_snapshots(filename,caret_byte,context_key)",
-    "CREATE TEMP TABLE IF NOT EXISTS completion_hovers(snapshot_id BLOB NOT NULL REFERENCES completion_snapshots(id) ON DELETE CASCADE,filename BLOB NOT NULL,byte_start INTEGER NOT NULL,byte_finish INTEGER NOT NULL,markdown BLOB NOT NULL,PRIMARY KEY(snapshot_id,filename,byte_start)) WITHOUT ROWID",
-    "CREATE TEMP TABLE IF NOT EXISTS retained_hover_snapshots(id BLOB PRIMARY KEY,module_name BLOB NOT NULL,saved_generation INTEGER NOT NULL,buffer_epoch INTEGER NOT NULL,byte_count INTEGER NOT NULL,serial INTEGER NOT NULL) WITHOUT ROWID",
-    "CREATE TEMP TABLE IF NOT EXISTS retained_hover_inputs(snapshot_id BLOB NOT NULL REFERENCES retained_hover_snapshots(id) ON DELETE CASCADE,position INTEGER NOT NULL,filename BLOB NOT NULL,session INTEGER NOT NULL,version INTEGER NOT NULL,contents BLOB NOT NULL,PRIMARY KEY(snapshot_id,position)) WITHOUT ROWID",
-    "CREATE TEMP TABLE IF NOT EXISTS retained_hovers(snapshot_id BLOB NOT NULL REFERENCES retained_hover_snapshots(id) ON DELETE CASCADE,filename BLOB NOT NULL,byte_start INTEGER NOT NULL,byte_finish INTEGER NOT NULL,markdown BLOB NOT NULL,PRIMARY KEY(snapshot_id,filename,byte_start)) WITHOUT ROWID",
-  }
-  for index = 1, #schema do sql.execute(connection, schema[index]) end
+  for index = 1, #TEMP_SCHEMA_STATEMENTS do
+    sql.execute(connection, TEMP_SCHEMA_STATEMENTS[index])
+  end
 end
 
 function open(store: sql.Store): Store
   local access = store:acquire()
   defer access:release()
   initialize_temp_schema(access.connection)
-  return Store.new(store, {}, false)
+  return Store(store, {}, false)
 end
 
 local function optional_blob(text: string?): value
@@ -356,7 +393,7 @@ end
 -- rows as the saved semantic index does; 11 * 17 bindings stay below Titan's
 -- 200-position variadic-call limit. All values, including names, remain bound.
 local function write_candidates(connection: sqlite3.Connection, table_name: string,
-    owner: string, candidates: {facts.Candidate}, current: Current?): boolean
+    owner: string, candidates: const? {facts.Candidate}, current: Current?): boolean
   if #candidates == 0 then return true end
   local width = 11
   if #candidates < width then width = #candidates end
@@ -407,13 +444,28 @@ local function write_candidates(connection: sqlite3.Connection, table_name: stri
 end
 
 local function read_candidate(row: sqlite3.Row): facts.Candidate
-  return facts.Candidate.new(row:get(1), row:get(2), row:get(3), row:get(4),
-    sql.bytes(row, 5), sql.bytes(row, 6), row:get(7), row:get(8), row:get(9),
-    (row:get(10) as integer) ~= 0, row:get(11), row:get(12), row:get(13), sql.optional_bytes(row, 14), sql.optional_bytes(row, 15))
+  local available: integer = row:get(10)
+  return facts.Candidate {
+    label = row:get(1),
+    lookup_domain = row:get(2),
+    lookup_key = row:get(3),
+    kind = row:get(4),
+    detail = sql.bytes(row, 5),
+    type_key = sql.bytes(row, 6),
+    scope_id = row:get(7),
+    scope_depth = row:get(8),
+    declaration_order = row:get(9),
+    available = available ~= 0,
+    visibility = row:get(11),
+    owner_key = row:get(12),
+    access_mode = row:get(13),
+    call_snippet = sql.optional_bytes(row, 14),
+    documentation = sql.optional_bytes(row, 15),
+  }
 end
 
 local function write_hovers(connection: sqlite3.Connection, snapshot_id: string,
-    hovers: {facts.Hover}, current: Current, table_name: string?): boolean
+    hovers: const? {facts.Hover}, current: Current, table_name: string?): boolean
   local offset = 1
   while offset <= #hovers do
     if not current() then return false end
@@ -437,8 +489,6 @@ local function write_hovers(connection: sqlite3.Connection, snapshot_id: string,
   return true
 end
 
-local CANDIDATE_COLUMNS = "label,lookup_domain,lookup_key,kind,detail,type_key,scope_id,scope_depth,declaration_order,available,visibility,owner_key,access_mode,call_snippet,documentation"
-
 local function publish_header_inputs(connection: sqlite3.Connection,
                                      descriptor: SavedDescriptor)
   local insert = connection:prepare(
@@ -446,8 +496,6 @@ local function publish_header_inputs(connection: sqlite3.Connection,
   defer insert:close()
   for index = 1, #descriptor.header_inputs do
     local input = descriptor.header_inputs[index]
-    local kind = 0
-    case input.kind when search() then kind = 1 when origin() then kind = 2 end
     local seconds?: integer
     local nanoseconds?: integer
     local physical?: string
@@ -455,16 +503,17 @@ local function publish_header_inputs(connection: sqlite3.Connection,
     local size?: integer
     local changed_seconds?: integer
     local changed_nanoseconds?: integer
-    if input.observation ~= nil then
-      seconds = input.observation.modified_seconds
-      nanoseconds = input.observation.modified_nanoseconds
-      physical = input.observation.physical_identity
-      precision = input.observation.precision
-      size = input.observation.size
-      changed_seconds = input.observation.changed_seconds
-      changed_nanoseconds = input.observation.changed_nanoseconds
+    local observation? = input.observation
+    if observation ~= nil then
+      seconds = observation.modified_seconds
+      nanoseconds = observation.modified_nanoseconds
+      physical = observation.physical_identity
+      precision = observation.precision
+      size = observation.size
+      changed_seconds = observation.changed_seconds
+      changed_nanoseconds = observation.changed_nanoseconds
     end
-    insert:execute(blob(descriptor.module_name), index, kind, blob(input.path),
+    insert:execute(blob(descriptor.module_name), index, input.kind:code(), blob(input.path),
       blob(input.identity), seconds, nanoseconds, optional_blob(physical),
       precision, size, changed_seconds, changed_nanoseconds)
   end
@@ -767,7 +816,7 @@ local function snapshot_bytes(snapshot: facts.Snapshot, include_hovers: boolean)
 end
 
 local function inputs_current(connection: sqlite3.Connection,
-                               inputs: {facts.Input}): boolean
+                               inputs: const? {facts.Input}): boolean
   for index = 1, #inputs do
     local input = inputs[index]
     if input.session > 0 then
@@ -779,9 +828,6 @@ local function inputs_current(connection: sqlite3.Connection,
   end
   return true
 end
-
-local SNAPSHOT_INVENTORY = "SELECT id,byte_count,serial,0 AS kind FROM temp.completion_snapshots " ..
-  "UNION ALL SELECT id,byte_count,serial,1 AS kind FROM temp.retained_hover_snapshots"
 
 local function make_snapshot_room(connection: sqlite3.Connection, bytes: integer)
   while sql.scalar_integer(connection, "SELECT count(*) FROM (" .. SNAPSHOT_INVENTORY .. ")") >= MAX_SNAPSHOTS or
@@ -809,6 +855,7 @@ end
 function Store:publish_hover(snapshot: facts.Snapshot, current: Current,
     previous_id: string?): boolean
   if snapshot.hovers == nil or #snapshot.hovers > facts.MAX_HOVER_ROWS then return false end
+  local hovers = snapshot.hovers
   local bytes = #snapshot.id + #snapshot.module_name + 256
   for index = 1, #snapshot.inputs do
     if index % 128 == 0 then async.yield() end
@@ -816,9 +863,9 @@ function Store:publish_hover(snapshot: facts.Snapshot, current: Current,
     bytes = bytes + #input.filename + #input.contents + 64
   end
   local hover_bytes = 0
-  for index = 1, #snapshot.hovers do
+  for index = 1, #hovers do
     if index % 1024 == 0 then async.yield() end
-    local hover = snapshot.hovers[index]
+    local hover = hovers[index]
     hover_bytes = hover_bytes + #hover.filename + #hover.markdown + 64
     if hover_bytes > facts.MAX_HOVER_BYTES then return false end
   end
@@ -849,7 +896,7 @@ function Store:publish_hover(snapshot: facts.Snapshot, current: Current,
           input.version, blob(input.contents))
       end
     end
-    if not write_hovers(connection, snapshot.id, snapshot.hovers, current,
+    if not write_hovers(connection, snapshot.id, hovers, current,
         "temp.retained_hovers") then return false end
     return current()
   end)
@@ -858,11 +905,11 @@ end
 function Store:publish(snapshot: facts.Snapshot, current: Current): boolean
   local bytes = snapshot_bytes(snapshot, false)
   if bytes > MAX_SNAPSHOT_BYTES or #snapshot.candidates > MAX_CANDIDATES then return false end
-  local retain_hovers = false
+  local retained_hovers?: {facts.Hover}
   if snapshot.hovers ~= nil and #snapshot.hovers <= facts.MAX_HOVER_ROWS then
     local combined_bytes = snapshot_bytes(snapshot, true)
     if combined_bytes <= MAX_SNAPSHOT_BYTES and combined_bytes - bytes <= facts.MAX_HOVER_BYTES then
-      retain_hovers = true
+      retained_hovers = snapshot.hovers
       bytes = combined_bytes
     end
   end
@@ -907,8 +954,10 @@ function Store:publish(snapshot: facts.Snapshot, current: Current): boolean
     end
     if not write_candidates(connection, "temp.completion_candidates", snapshot.id,
         snapshot.candidates, current) then return false end
-    if retain_hovers and not write_hovers(connection, snapshot.id,
-        snapshot.hovers, current) then return false end
+    if retained_hovers ~= nil then
+      local hovers = retained_hovers
+      if not write_hovers(connection, snapshot.id, hovers, current) then return false end
+    end
     -- A change notification may run while native SQLite operations suspend.
     -- Returning false rolls back the whole transaction without a stale row.
     return current()
@@ -950,7 +999,7 @@ local function select_candidates(connection: sqlite3.Connection, snapshot_id: st
     if index > limit then break end
     candidates[index] = read_candidate(rows[index])
   end
-  return facts.Selection.new(candidates, incomplete)
+  return facts.Selection(candidates, incomplete)
 end
 
 -- The complete read owns one connection lease from generation/context checks
@@ -1017,7 +1066,7 @@ function Store:hover(snapshot_id: string, filename: string, session: integer,
     "AND live.version=other.version AND live.contents=other.contents)) LIMIT 1",
     blob(snapshot_id), blob(filename), session, version, offset, offset)
   if #rows ~= 1 or not current() then return nil end
-  return facts.Hover.new(filename, rows[1]:get(1), rows[1]:get(2), sql.bytes(rows[1], 3))
+  return facts.Hover(filename, rows[1]:get(1), rows[1]:get(2), sql.bytes(rows[1], 3))
 end
 
 -- Read the retained artifact in its original byte coordinates. Versions and
@@ -1041,5 +1090,5 @@ function Store:hover_retained(snapshot_id: string, filename: string, session: in
     "WHERE live.filename=other.filename AND live.session=other.session AND live.contents IS NOT NULL)) LIMIT 1",
     blob(snapshot_id), blob(filename), session, offset, offset)
   if #rows ~= 1 or not current() then return nil end
-  return facts.Hover.new(filename, rows[1]:get(1), rows[1]:get(2), sql.bytes(rows[1], 3))
+  return facts.Hover(filename, rows[1]:get(1), rows[1]:get(2), sql.bytes(rows[1], 3))
 end
