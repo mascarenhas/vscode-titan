@@ -5,6 +5,7 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { validateSdkIncludeInventory } from "./sdk-include-inventory.mjs";
 import { resolveTitanSdk } from "./titan-sdk.mjs";
+import { semanticDirectory, semanticFiles } from "./browser-semantic-pack.mjs";
 
 const LUA_VERSION = "5.5";
 const LUA_SOURCE_VERSION = "5.5.1";
@@ -68,9 +69,23 @@ export async function sdkPayloadTrees(sdk, { platform = process.platform } = {})
       description: "Lua native source tree",
       relative: "src",
       expectedRoot: [`lua-${LUA_SOURCE_VERSION}:directory`]
+    },
+    {
+      description: "browser semantic pack",
+      relative: semanticDirectory,
+      expectedRoot: semanticFiles.map((name) => `${name}:file`)
     }
   ];
   for (const tree of trees) {
+    if (tree.relative === semanticDirectory) {
+      let directory = sdk;
+      for (const member of semanticDirectory.split("/")) {
+        directory = path.join(directory, member);
+        if (!(await lstat(directory)).isDirectory()) {
+          throw new Error(`browser semantic directory is not a real directory: ${directory}`);
+        }
+      }
+    }
     tree.source = path.join(sdk, tree.relative);
     tree.selectedRoot = await validateRootInventory(tree);
   }
@@ -232,6 +247,14 @@ async function validateRequiredPayload(trees) {
       await requireRegularFile(
         trees[2].source, `openssl/${header}`, `bundled OpenSSL header ${header}`
       );
+    }
+  }
+  const browserRoot = trees[4].source;
+  for (const name of semanticFiles) {
+    const filename = path.join(browserRoot, name);
+    const metadata = await lstat(filename);
+    if (!metadata.isFile() || metadata.size === 0) {
+      throw new Error(`browser semantic file is not a nonempty regular file: ${filename}`);
     }
   }
 }

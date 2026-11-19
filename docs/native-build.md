@@ -228,27 +228,54 @@ afterward. Run packaging jobs one at a time in a checkout. `make clean` removes
 `BUILD_ROOT`, `SERVER`, `dist` and `dist-test`.
 
 `npm run compile`, used by `extension` and `package`, runs
-`scripts/stage-lua-modules.mjs`. That script copies four SDK trees under
+`scripts/stage-lua-modules.mjs`. That script selects five SDK trees under
 `dist/titan/`:
 
 - `share/lua/5.5` and `lib/lua/5.5`, restricted to an exact root allowlist;
 - `include`;
-- `src/lua-5.5.1`.
+- `src/lua-5.5.1`;
+- `lib/titan-browser/0.6`, limited to `analysis-target`, `absent-modules` and `titan.a`.
 
 It then checks the copies byte for byte against the SDK. The allowlist
 (`EXPECTED_SHARE_ROOT` and `nativeRootInventory` in
 `scripts/stage-lua-modules.mjs`) keeps the compiler and its LuaRocks-installed
 dependencies, including `luv` on every platform, and leaves out LuaRocks's own
 modules and unrelated packages. The allowlist names no `share/lua/5.5/titan`
-tree: the standard modules are native providers, not Lua sources. No
-`lib/titan` tree or provider archive is staged. `scripts/stage-notices.mjs`
-collects licenses from the installation, using the rock versions and license
-files in `compilerRocks` (`scripts/compiler-rocks.mjs`). `scripts/inspect-vsix.sh` and
-`scripts/inspect-server.sh` check the package and the executable's native
-linkage. `inspect-server` rejects dynamic language/runtime dependencies. A
+tree: the standard modules are providers, not Lua sources. No native
+`lib/titan` tree or archive is staged in this payload. The browser archive
+supplies interfaces only; no Wasm runtime or Emscripten tools are shipped.
+`scripts/stage-notices.mjs` includes the browser provider's licenses and
+collects notices from the installed rocks (`scripts/compiler-rocks.mjs`).
+`scripts/inspect-vsix.sh` and `scripts/inspect-server.sh` check the package
+and the executable's native linkage. The VSIX inspector also validates the
+full browser provider and exercises the extracted server without Emscripten.
+`inspect-server` rejects dynamic language/runtime dependencies. A
 system-OpenSSL SDK may link the OpenSSL 3 or 4 system libraries; a bundled-OpenSSL
 SDK must not link OpenSSL dynamically. The inspection also enforces
 `TITAN_MAX_GLIBC_VERSION` when it is set.
+
+### Paired browser semantic pack
+
+Use the source rock and `titan-0.6.0-1-browser-semantics.tar.gz` from the same
+Titan release. Before building a package from a native-only SDK, provision it
+with the companion and the recorded full Git commit and asset SHA-256 values:
+
+```sh
+node scripts/browser-semantic-pack.mjs --install "$TITAN_PREFIX" "$PACK" \
+  "$PACK_SHA256" "$ROCK_SHA256" "$TITAN_COMMIT" production
+```
+
+Use `validation` instead of `production` for a deliberately built validation
+companion. The offline verifier checks the compressed digest, exact regular
+members, manifest pairing, notices from the installed rock and the compiler's
+complete Wasm interface inventory. It installs only the three semantic files
+and refuses an existing partial or different pack. The package target never
+downloads or repairs inputs.
+
+The checked-in smaller provider is for source-tree protocol tests, never
+packaging. To exercise real foreign C work against an extracted package, set
+`TITAN_LS_TEST_BROWSER_LIVE=1` and activate Emscripten 6.0.13 before inspection.
+That adds live and offline cache transitions to the tool-free smoke.
 
 ## Build regressions
 
@@ -277,19 +304,15 @@ the matching `BUILD_ROOT`, `SERVER` and compiler flags.
 `OPENSSL_MODE=system` and `TITAN_MAX_GLIBC_VERSION=2.39`. It runs on pushes to
 `main`, on pull requests and on manual dispatch.
 
-1. **SDK.** Restore `.titan-validation` from the cache. The cache key covers the
-   Lua, LuaRocks and Titan release versions, the build policy and a hash of the
-   absolute prefix. There are no fallback keys, so another release is never a
-   hit. On a miss, build Lua 5.5.1 from the
-   [`v5.5.1-1` archive](https://github.com/mascarenhas/lua-5.5.1/archive/refs/tags/v5.5.1-1.tar.gz)
-   and [LuaRocks](https://luarocks.org/#quick-start) 3.13.0. Then download the
-   [Titan 0.6 source rock](https://github.com/mascarenhas/titan/releases/download/v0.6.0/titan-0.6.0-1.src.rock)
-   and install it with `TITAN_BUILD_PROFILE=validation`. If the
-   `TITAN_RELEASE_TOKEN` secret is set, the download uses
-   `gh release download` with it; otherwise it uses the public release URL.
-   Before caching, check the installation's files (the compiler, the standard
-   provider, the runtime archive and the `lib/lua/5.5` support module), its
-   recorded build profile and `titanc --print-root`.
+1. **SDK.** Resolve both exact assets, their SHA-256 values and the commit
+   named by the release tag. Restore `.titan-validation` using a cache key
+   covering the pair, the Lua and LuaRocks versions, the build policy and the
+   absolute prefix. On a miss, install Lua 5.5.1, LuaRocks 3.13.0 and the
+   digest-checked source rock with `TITAN_BUILD_PROFILE=validation`.
+   Download the companion by asset ID even on a hit, verify it against the
+   release and the installed compiler, and reject mismatched cached bytes.
+   CI requires a production companion; its host compiler build can still
+   use the validation profile. There are no fallback cache keys.
 2. **Build and test.** Run `make -j2 server server-test-build`, then
    `server-test-sharded`, `incremental-build-test`, `server-protocol-test`,
    `codex-native-test`, `extension-test`, `shard-runner-test` and
@@ -391,10 +414,11 @@ Unix server links, so the payload needs no `lib/lua/5.5/titan.dll`.
 `lua55.dll` and five native runtime DLLs (`libuv-1.dll`, `libllhttp-9.4.dll`,
 `libsqlite3-0.dll`, `libssl-3-x64.dll`, `libcrypto-3-x64.dll`) live in `bin`.
 `lfs.dll`, `lpeglabel.dll` and `luv.dll` live in `dist/titan/lib/lua/5.5`.
-Windows never packages a static Titan provider archive. The launcher can be
-renamed within `bin` without changing logical module identity. Staging also
-copies the compiler's Lua sources, the SDK headers and the matching Lua
-sources. Staging and package inspection accept the libbacktrace header pair
+Windows ships no native static provider archive. It ships the same Wasm
+semantic pack as Linux and macOS. The launcher can be renamed within `bin`
+without changing logical module identity. Staging also copies the compiler's
+Lua sources, the SDK headers and the matching Lua sources. Staging and
+package inspection accept the libbacktrace header pair
 `backtrace.h` and `backtrace-supported.h` only as a complete pair of regular
 files, or both absent (`windowsBacktraceHeaders` in
 `scripts/sdk-include-inventory.mjs`). They reject partial pairs, links and
@@ -457,8 +481,9 @@ libuv are Titan's `LICENSES/libuv-LICENSE`, `libuv-LICENSE-extra`,
 `libuv-tree-LICENSE` and `libuv-inet-LICENSE`.
 
 `scripts/inspect-windows-package.mjs` verifies the `win32-x64` VSIX target,
-the exact DLL and EXE inventory, the compiler and SDK bytes and the PE
-imports. The system-import allowlist (`systemDlls`) includes libuv's
+the exact DLL and EXE inventory, compiler and SDK bytes, the browser pack
+and its notices, and PE imports. It runs a browser analysis smoke from the
+extracted ZIP. The system-import allowlist (`systemDlls`) includes libuv's
 `api-ms-win-core-synch-l1-2-0.dll` synchronization contract, documented by
 [Microsoft's WaitOnAddress reference](https://learn.microsoft.com/en-us/windows/win32/api/synchapi/nf-synchapi-waitonaddress).
 Unreviewed API sets and compiler runtime DLLs fail inspection. Signing and

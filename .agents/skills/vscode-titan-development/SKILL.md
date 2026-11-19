@@ -24,6 +24,12 @@ with LuaRocks, and omits LuaRocks's own modules and unrelated packages. Keep
 upstream compiler test tools such as Busted and coverage modules in a separate
 test prefix; they are not part of the extension's compiler payload.
 
+For packaging, provision the matching browser semantic companion in the
+packaging SDK before running the consumer build. Follow
+[native-build.md](../../../docs/native-build.md#paired-browser-semantic-pack)
+for exact asset pairing, the scoped offline browser test and the pinned
+Emscripten lane. Never package the small checked-in protocol fixture.
+
 Before changing code, identify the board issue that owns the work and its
 acceptance criteria. If the unit is still broad, split it into board-sized
 issues and record dependencies before implementation.
@@ -197,14 +203,13 @@ not full restoration. Keep failed runs as failed evidence.
 CI explicitly builds and caches the complete validation compiler installation at
 `.titan-validation` by installing tagged Lua 5.5.1, LuaRocks 3.13.0 and the
 Titan v0.6 source rock with `luarocks install` before invoking
-the consumer build. Select it with `TITAN_PREFIX`. Cache by release versions,
-O0/no-LTO Titan profile with optimized Lua/compiler dependencies, platform/build
-policy and absolute installation prefix. It builds disposable packages for inspection
-and uploads no VSIX/server artifacts. Future main-only release jobs must rebuild
-all inputs in production after tests pass. Cache only the installed SDK;
-packaging reads licenses from that installation, including `share/titan/LICENSE`.
-No fallback cache may supply a different compiler. Native tests compile once and execute in two
-parallel shards on the two-CPU runner. Maintain the module inventory in
+the consumer build. Select it with `TITAN_PREFIX`. Key the cache on both
+release asset digests, the resolved commit, profile, architecture, build
+policy and absolute prefix. Validate the browser companion even on a cache
+hit. CI builds disposable packages for inspection and uploads no VSIX/server
+artifacts. Future main-only release jobs must rebuild inputs in production.
+Native tests compile once and execute in two shards on the two-CPU runner.
+Maintain the module inventory in
 `scripts/run-server-tests.mjs` when adding a test owner, inspect positive test
 selection and both shard outcomes, and use `make verify` for the complete gate.
 

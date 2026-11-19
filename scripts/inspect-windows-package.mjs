@@ -1,15 +1,18 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
-import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import yauzl from "yauzl";
+import { semanticDirectory, semanticFiles, semanticNotices, verifyBrowserNotices,
+  verifyInstalledBrowserPack } from "./browser-semantic-pack.mjs";
 import { runtimeDlls } from "./build-windows.mjs";
 import { verifyCompilerRocks } from "./compiler-rocks.mjs";
 import { validateSdkIncludeInventory } from "./sdk-include-inventory.mjs";
 import { sdkPayloadInventory } from "./stage-lua-modules.mjs";
+import { compilerDiscoveryEnvironment } from "./titan-sdk.mjs";
 
 const hash = (bytes) => createHash("sha256").update(bytes).digest("hex");
 export const packageImages = [
@@ -49,7 +52,9 @@ export function readPackage(filename) {
           assert(!name.includes("\\") && !name.startsWith("/") && !name.split("/").includes(".."), "unsafe VSIX pathname");
           assert(!names.has(name.toLowerCase()), `duplicate Windows VSIX pathname: ${name}`);
           names.add(name.toLowerCase());
-          assert(((entry.externalFileAttributes >>> 16) & 0o170000) !== 0o120000, `VSIX symlink: ${name}`);
+          const mode = (entry.externalFileAttributes >>> 16) & 0o170000;
+          assert(mode === 0 || mode === (name.endsWith("/") ? 0o040000 : 0o100000),
+            `VSIX entry is not a regular file or directory: ${name}`);
           if (name.endsWith("/")) return zip.readEntry();
           zip.openReadStream(entry, (streamError, stream) => {
             if (streamError) return fail(streamError);
@@ -81,14 +86,18 @@ export async function inspectPackage(filename, sdk, readobj, repository) {
       entry.isSymbolicLink() ? "symbolic link" : "unsupported"}`), "win32");
   const files = await readPackage(filename);
   const required = ["dist/extension.js", "package.json", "readme.md", "LICENSE.txt", "language-configuration.json",
-    "syntaxes/titan.tmLanguage.json", "dist/notices/README.md", "dist/notices/titan/LICENSE",
-    "dist/notices/titan/THIRD_PARTY_NOTICES.md", ...packageImages];
+    "syntaxes/titan.tmLanguage.json", "dist/notices/README.md",
+    ...semanticNotices.map((name) => `dist/notices/titan/${name}`),
+    ...semanticFiles.map((name) => `dist/titan/${semanticDirectory}/${name}`),
+    ...packageImages];
   for (const name of required) assert(files.has(`extension/${name}`), `missing VSIX file ${name}`);
   const manifest = files.get("extension.vsixmanifest")?.toString("utf8") ?? "";
   assert(manifest.includes('TargetPlatform="win32-x64"'), "VSIX lacks Windows x64 target");
   for (const name of files.keys()) {
     assert(!/^extension\/(?:\.agents|\.build|\.git|\.titan(?:-validation)?|node_modules|plugins|scripts|src|test)\//.test(name), `development payload ${name}`);
-    assert(!/(?:^|\/)\.titan-ls(?:\/|$)|[.](?:map|a|so)(?:[.]|$)/.test(name), `unexpected cache/native payload ${name}`);
+    assert(!/(?:^|\/)\.titan-ls(?:\/|$)|[.](?:map|so)(?:[.]|$)/.test(name) &&
+      (!/[.]a(?:[.]|$)/.test(name) || name === `extension/dist/titan/${semanticDirectory}/titan.a`),
+      `unexpected cache/native payload ${name}`);
   }
   const actualImages = [...files.keys()].filter((name) => /[.](dll|exe)$/i.test(name)).map((name) => name.replace(/^extension\//, "")).sort();
   assert.deepEqual(actualImages, packageImages, "VSIX executable/DLL inventory differs");
@@ -99,6 +108,8 @@ export async function inspectPackage(filename, sdk, readobj, repository) {
   "VSIX compiler inventory differs from selected SDK payload");
   for (const entry of payload) assert.equal(hash(files.get(payloadPrefix + entry.path)), entry.sha256,
     `VSIX compiler bytes differ: ${entry.path}`);
+  await verifyInstalledBrowserPack(sdk);
+  await verifyBrowserNotices(sdk, (name) => files.get(`extension/dist/notices/titan/${name}`));
   for (const name of await tree(path.join(repository, "dist/notices"))) {
     assert.equal(hash(files.get(`extension/dist/notices/${name}`)), hash(await readFile(path.join(repository, "dist/notices", name))), `VSIX notice differs: ${name}`);
   }
@@ -113,14 +124,39 @@ export async function inspectPackage(filename, sdk, readobj, repository) {
   try {
     const report = [];
     for (const name of packageImages) {
-      const bytes = files.get(`extension/${name}`), input = path.join(scratch, path.basename(name));
+      const bytes = files.get(`extension/${name}`), input = path.join(scratch, name);
       assert.equal(hash(bytes), hash(await readFile(path.join(repository, name))), `VSIX image differs from staged bytes: ${name}`);
+      await mkdir(path.dirname(input), { recursive: true });
       await writeFile(input, bytes);
       const result = spawnSync(readobj, ["--coff-imports", input], { encoding: "utf8", shell: false, windowsHide: true });
       if (result.error) throw result.error;
       assert.equal(result.status, 0, `PE inspection failed: ${result.stderr}`);
       report.push({ path: name, sha256: hash(bytes), imports: validateImports(name, result.stdout) });
     }
+    for (const { path: relative } of payload) {
+      const destination = path.join(scratch, "dist/titan", relative);
+      await mkdir(path.dirname(destination), { recursive: true });
+      await writeFile(destination, files.get(payloadPrefix + relative));
+    }
+    const root = path.join(scratch, "dist/titan");
+    const share = path.join(root, "share/lua/5.5");
+    const smoke = spawnSync(process.execPath, [
+      path.join(repository, "scripts/test-multi-root.mjs"),
+      path.join(scratch, "bin/titan-language-server.exe"), "browser-packaged"
+    ], {
+      cwd: scratch,
+      env: {
+        ...compilerDiscoveryEnvironment(),
+        TITAN_ROOT: root,
+        TITAN_TEST_HOST_SDK: sdk,
+        TITAN_LS_LUA_PATH: `${share}/?.lua;${share}/?/init.lua`,
+        TITAN_LS_LUA_CPATH: `${path.join(root, "lib/lua/5.5")}/?.dll`
+      },
+      encoding: "utf8", shell: false, windowsHide: true
+    });
+    if (smoke.error) throw smoke.error;
+    assert.equal(smoke.status, 0, `extracted Windows browser smoke failed: ${smoke.stderr}`);
+    process.stdout.write(smoke.stdout);
     return { target: "win32-x64", vsixSha256: hash(await readFile(filename)), files: files.size, images: report };
   } finally { await rm(scratch, { recursive: true, force: true }); }
 }
