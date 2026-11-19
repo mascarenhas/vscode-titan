@@ -8,6 +8,7 @@ import {
   symlink,
   writeFile
 } from "node:fs/promises";
+import { connect } from "node:net";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import * as vscode from "vscode";
@@ -24,6 +25,7 @@ import {
 interface FixtureEvent {
   event: "initialize" | "shutdown" | "exit" | "terminate";
   pid: number;
+  identity: { port: number; token: string };
   cwd: string;
   arguments: string[];
   luaPath?: string;
@@ -44,19 +46,18 @@ interface FixtureEvent {
 }
 
 // Windows child.kill() terminates the process without delivering a catchable
-// SIGTERM. The child PID must still disappear on every platform.
+// SIGTERM. The specific fixture instance must still exit on every platform.
 const forcedTerminationEvents: FixtureEvent["event"][] =
   process.platform === "win32" ? [] : ["terminate"];
 
 interface TraceFixtureEvent {
   event: "trace";
-  pid: number;
   value: string;
 }
 
 interface SemanticFixtureEvent {
   event: "semantic";
-  pid: number;
+  identity: FixtureEvent["identity"];
   cwd: string;
   arguments: string[];
   method: string;
@@ -79,8 +80,6 @@ suite("Titan extension", () => {
   let betaMarkerPath: string;
   let alphaTraceMarkerPath: string;
   let betaTraceMarkerPath: string;
-  let alphaSettingsPath: string;
-  let originalAlphaSettings: string;
 
   suiteSetup(async function () {
     this.timeout(20_000);
@@ -101,17 +100,6 @@ suite("Titan extension", () => {
     );
     alphaTraceMarkerPath = `${alphaMarkerPath}.trace`;
     betaTraceMarkerPath = `${betaMarkerPath}.trace`;
-    await Promise.all([
-      resetMarker(alphaMarkerPath),
-      resetMarker(betaMarkerPath)
-    ]);
-
-    alphaSettingsPath = path.join(
-      alpha.uri.fsPath,
-      ".vscode",
-      "settings.json"
-    );
-    originalAlphaSettings = await readFile(alphaSettingsPath, "utf8");
 
     const nodeExecutable = process.env.npm_node_execpath;
     assert.ok(nodeExecutable, "npm_node_execpath should identify Node");
@@ -153,14 +141,6 @@ suite("Titan extension", () => {
     ]);
   });
 
-  suiteTeardown(async () => {
-    // The scoped configuration test edits this checked-in fixture through the
-    // VS Code API. Restore its exact text even if a later assertion fails.
-    if (originalAlphaSettings !== undefined) {
-      await writeFile(alphaSettingsPath, originalAlphaSettings);
-    }
-  });
-
   test("isolates multi-root clients and their lifecycle", async function () {
     this.timeout(30_000);
 
@@ -181,7 +161,7 @@ suite("Titan extension", () => {
       betaMarkerPath,
       ["initialize"]
     );
-    assert.notEqual(alphaInitial.pid, betaInitial.pid);
+    assert.notEqual(alphaInitial.identity.token, betaInitial.identity.token);
     await assertInitialization(
       alphaInitial,
       alpha,
@@ -202,7 +182,7 @@ suite("Titan extension", () => {
       betaMarkerPath,
       ["initialize", "shutdown", "exit"]
     );
-    assert.equal(new Set(betaRemoved.map((event) => event.pid)).size, 1);
+    assert.ok(betaRemoved.every((event) => event.identity.token === betaInitial.identity.token));
     await assertStableEventSequence(alphaMarkerPath, ["initialize"]);
 
     await updateWorkspaceFolders(1, 0, { uri: beta.uri, name: beta.name });
@@ -210,7 +190,7 @@ suite("Titan extension", () => {
       betaMarkerPath,
       ["initialize", "shutdown", "exit", "initialize"]
     );
-    assert.notEqual(betaReadded[3].pid, betaInitial.pid);
+    assert.notEqual(betaReadded[3].identity.token, betaInitial.identity.token);
     await assertInitialization(
       betaReadded[3],
       beta,
@@ -238,7 +218,7 @@ suite("Titan extension", () => {
       alphaMarkerPath,
       ["initialize", "shutdown", "exit", "initialize"]
     );
-    assert.notEqual(alphaReconfigured[3].pid, alphaInitial.pid);
+    assert.notEqual(alphaReconfigured[3].identity.token, alphaInitial.identity.token);
     assert.deepEqual(
       alphaReconfigured[3].arguments,
       ["--fixture-token", "alpha-reconfigured"]
@@ -282,12 +262,12 @@ suite("Titan extension", () => {
     assert.equal(alphaGloballyReconfigured[6].luaPath, globalLuaPath);
     assert.equal(betaGloballyReconfigured[6].luaPath, globalLuaPath);
     assert.notEqual(
-      alphaGloballyReconfigured[6].pid,
-      alphaReconfigured[3].pid
+      alphaGloballyReconfigured[6].identity.token,
+      alphaReconfigured[3].identity.token
     );
     assert.notEqual(
-      betaGloballyReconfigured[6].pid,
-      betaReadded[3].pid
+      betaGloballyReconfigured[6].identity.token,
+      betaReadded[3].identity.token
     );
 
     await vscode.workspace.getConfiguration(
@@ -316,8 +296,8 @@ suite("Titan extension", () => {
     );
     assert.equal(alphaLogReconfigured[9].serverLogLevel, "trace");
     assert.notEqual(
-      alphaLogReconfigured[9].pid,
-      alphaGloballyReconfigured[6].pid
+      alphaLogReconfigured[9].identity.token,
+      alphaGloballyReconfigured[6].identity.token
     );
     await assertStableEventSequence(
       betaMarkerPath,
@@ -628,8 +608,10 @@ suite("Titan extension", () => {
         assert.equal(item.range.end.character, 6);
 
         await completionConfiguration.update("insertCallSnippets", false, vscode.ConfigurationTarget.WorkspaceFolder);
-        const optedOut = await waitForInitializationToken(alphaMarkerPath, "call-snippets", 10_000, initialization.pid);
-        assert.notEqual(optedOut.pid, initialization.pid);
+        const optedOut = await waitForInitializationToken(
+          alphaMarkerPath, "call-snippets", 10_000, initialization.identity.token
+        );
+        assert.notEqual(optedOut.identity.token, initialization.identity.token);
         assert.deepEqual(optedOut.initializationOptions, {
           insertCallSnippets: false,
           pullDiagnostics: false,
@@ -640,7 +622,9 @@ suite("Titan extension", () => {
         assert.ok(reference, "name-only completion did not reach the editor");
         assert.equal(reference.insertText, "method");
         const betaAfter = (await readEvents(betaMarkerPath)).filter((event) => event.event === "initialize").at(-1);
-        assert.equal(betaAfter?.pid, betaBefore?.pid, "alpha completion preference restarted beta");
+        assert.ok(betaBefore && betaAfter, "beta did not initialize");
+        assert.equal(betaAfter.identity.token, betaBefore.identity.token,
+          "alpha completion preference restarted beta");
       } finally {
         if (document?.isDirty) {
           await vscode.window.showTextDocument(document);
@@ -742,14 +726,14 @@ suite("Titan extension", () => {
           ["shutdown", "exit", "initialize"],
           10_000
         );
-        const initialOuterPid = initialEvents[2].pid;
+        const initialOuter = initialEvents[2].identity.token;
         document = await vscode.workspace.openTextDocument(
           vscode.Uri.file(path.join(nestedRoot, "sample.titan"))
         );
         await replaceDocumentText(document, "local before_nested = 1\n");
         assert.equal(document.isDirty, true);
         assert.equal(await waitForBufferCompletion(document, 10_000),
-          initialOuterPid);
+          initialOuter);
 
         await updateWorkspaceFolders(
           vscode.workspace.workspaceFolders?.length ?? 0,
@@ -775,17 +759,17 @@ suite("Titan extension", () => {
         );
 
         assert.equal(await waitForBufferCompletion(document, 10_000),
-          initialization.pid,
+          initialization.identity.token,
           "the new nested client must open the already dirty document");
-        await waitForProcessEvents(alphaMarkerPath, initialOuterPid,
+        await waitForProcessEvents(alphaMarkerPath, initialOuter,
           ["shutdown", "exit"], 10_000);
         const outerAfterAdd = (await readEvents(alphaMarkerPath))
           .filter((event) => event.event === "initialize").at(-1)!;
-        assert.notEqual(outerAfterAdd.pid, initialOuterPid,
+        assert.notEqual(outerAfterAdd.identity.token, initialOuter,
           "adding a nested root must discard the ancestor's old buffer session");
         await replaceDocumentText(document, "local inside_nested = 2\n");
         assert.equal(await waitForBufferCompletion(document, 10_000),
-          initialization.pid);
+          initialization.identity.token);
         // Every buffer event and completion belongs to the same most-specific
         // owner as saved-file requests, even while the outer selector matches.
         const outerMiddleware = createWorkspaceMiddleware(alpha);
@@ -850,7 +834,7 @@ suite("Titan extension", () => {
           await realpath(document.uri.fsPath)
         ).toString();
         for (const request of await readSemanticEvents(nestedSemanticMarker)) {
-          assert.equal(request.pid, initialization.pid);
+          assert.equal(request.identity.token, initialization.identity.token);
           assert.equal(request.uri, physicalDocumentUri);
         }
         assert.deepEqual(
@@ -863,17 +847,17 @@ suite("Titan extension", () => {
         nestedFolder = undefined;
         await waitForProcessEvents(
           nestedLifecycleMarker,
-          initialization.pid,
+          initialization.identity.token,
           ["shutdown", "exit"],
           10_000
         );
-        const restoredOuterPid = await waitForBufferCompletion(document, 10_000);
-        assert.notEqual(restoredOuterPid, initialization.pid);
-        assert.notEqual(restoredOuterPid, outerAfterAdd.pid,
+        const restoredOuter = await waitForBufferCompletion(document, 10_000);
+        assert.notEqual(restoredOuter, initialization.identity.token);
+        assert.notEqual(restoredOuter, outerAfterAdd.identity.token,
           "removing a nested root must reopen its dirty documents in the ancestor");
         await replaceDocumentText(document, "local after_nested = 3\n");
         assert.equal(await waitForBufferCompletion(document, 10_000),
-          restoredOuterPid);
+          restoredOuter);
       } finally {
         if (nestedFolder !== undefined) {
           try {
@@ -1066,7 +1050,7 @@ suite("Titan extension", () => {
         symlinkFolder = undefined;
         await waitForProcessEvents(
           lifecycleMarker,
-          initialization.pid,
+          initialization.identity.token,
           ["shutdown", "exit"],
           10_000
         );
@@ -1111,8 +1095,7 @@ suite("Titan extension", () => {
         ["shutdown", "exit", "initialize", ...forcedTerminationEvents],
         10_000
       );
-      const failedPid = failed[2].pid;
-      await assertForcedTermination(failed, failedPid, 10_000);
+      await assertForcedTermination(failed, failed[2], 10_000);
 
       await vscode.workspace.getConfiguration(
         "titan.languageServer",
@@ -1133,13 +1116,11 @@ suite("Titan extension", () => {
         ["shutdown", "exit", "initialize", ...forcedTerminationEvents,
           "initialize"]
       );
-      const retryPid = retried.at(-1)!.pid;
-      assert.notEqual(retryPid, failedPid);
-      const livingPids = [...new Set(retried.map((event) => event.pid))]
-        .filter(isProcessAlive);
+      const retry = retried.at(-1)!;
+      assert.notEqual(retry.identity.token, failed[2].identity.token);
       assert.deepEqual(
-        livingPids,
-        [retryPid],
+        await livingFixtureTokens(retried),
+        [retry.identity.token],
         "retry should own exactly one living language-server process"
       );
     }
@@ -1176,7 +1157,6 @@ suite("Titan extension", () => {
         ["shutdown", "exit", "initialize"],
         10_000
       );
-      const ignoredShutdownPid = ignoring[2].pid;
 
       await vscode.workspace.getConfiguration(
         "titan.languageServer",
@@ -1203,16 +1183,14 @@ suite("Titan extension", () => {
           "initialize"
         ]
       );
-      assert.equal(replaced[3].pid, ignoredShutdownPid);
-      const replacementPid = replaced.at(-1)!.pid;
-      assert.notEqual(replacementPid, ignoredShutdownPid);
-      await assertForcedTermination(replaced, ignoredShutdownPid, 10_000);
-
-      const livingPids = [...new Set(replaced.map((event) => event.pid))]
-        .filter(isProcessAlive);
+      const terminating = ignoring[2];
+      const replacement = replaced.at(-1)!;
+      assert.equal(replaced[3].identity.token, terminating.identity.token);
+      assert.notEqual(replacement.identity.token, terminating.identity.token);
+      await assertForcedTermination(replaced, terminating, 10_000);
       assert.deepEqual(
-        livingPids,
-        [replacementPid],
+        await livingFixtureTokens(replaced),
+        [replacement.identity.token],
         "shutdown recovery should own exactly one living server process"
       );
     }
@@ -1261,7 +1239,7 @@ suite("Titan extension", () => {
           ["shutdown", "exit", "initialize"],
           "beta should start before alpha reaches its startup timeout"
         );
-        assert.equal(isProcessAlive(alphaBeforeTimeout[2].pid), true,
+        assert.ok(await isFixtureAlive(alphaBeforeTimeout[2]),
           "hanging alpha should remain alive when beta becomes ready");
         assert.equal(betaStarted[2].luaCPath, globalLuaCPath);
       } finally {
@@ -1277,8 +1255,8 @@ suite("Titan extension", () => {
         ["shutdown", "exit", "initialize", ...forcedTerminationEvents],
         35_000
       );
-      const hangingPid = alphaTimedOut[2].pid;
-      await assertForcedTermination(alphaTimedOut, hangingPid, 35_000);
+      const hanging = alphaTimedOut[2];
+      await assertForcedTermination(alphaTimedOut, hanging, 35_000);
 
       await vscode.workspace.getConfiguration(
         "titan.languageServer",
@@ -1303,20 +1281,12 @@ suite("Titan extension", () => {
         betaMarkerPath,
         ["shutdown", "exit", "initialize"]
       );
-      const retryPid = alphaRetried.at(-1)!.pid;
-      const betaPid = betaStable[2].pid;
-      assert.notEqual(retryPid, hangingPid);
-
-      const observedPids = new Set([
-        ...alphaRetried.map((event) => event.pid),
-        ...betaStable.map((event) => event.pid)
-      ]);
-      const livingPids = [...observedPids]
-        .filter(isProcessAlive)
-        .sort((left, right) => left - right);
+      const retry = alphaRetried.at(-1)!;
+      const betaCurrent = betaStable[2];
+      assert.notEqual(retry.identity.token, hanging.identity.token);
       assert.deepEqual(
-        livingPids,
-        [retryPid, betaPid].sort((left, right) => left - right),
+        await livingFixtureTokens([...alphaRetried, ...betaStable]),
+        [retry.identity.token, betaCurrent.identity.token].sort(),
         "the retry and beta should be the only living language-server processes"
       );
     }
@@ -1514,7 +1484,6 @@ async function assertNativeServerClosed(
       assert.deepEqual(events[1], {
         event: "close", pid: events[0].pid, code: 0, signal: null
       }, "native server was terminated before graceful exit");
-      await assertProcessExited(events[0].pid, timeoutMilliseconds);
       return;
     }
     await delay(50);
@@ -1545,7 +1514,7 @@ async function replaceDocumentText(
 async function waitForBufferCompletion(
   document: vscode.TextDocument,
   timeoutMilliseconds: number
-): Promise<number> {
+): Promise<string> {
   const deadline = Date.now() + timeoutMilliseconds;
   let labels: string[] = [];
   while (Date.now() < deadline) {
@@ -1557,7 +1526,7 @@ async function waitForBufferCompletion(
       typeof item.label === "string" ? item.label : item.label.label);
     const item = result?.items.find((item) =>
       item.label === document.getText().trim());
-    if (item !== undefined) return Number(item.detail);
+    if (item?.detail !== undefined) return item.detail;
     await delay(50);
   }
   assert.fail(`completion did not receive current dirty text; labels: ${labels}`);
@@ -1719,7 +1688,7 @@ async function waitForInitializationToken(
   file: string,
   token: string,
   timeoutMilliseconds: number,
-  previousPid?: number,
+  previousIdentity?: string,
   afterEventCount: number = 0
 ): Promise<FixtureEvent> {
   const deadline = Date.now() + timeoutMilliseconds;
@@ -1728,7 +1697,7 @@ async function waitForInitializationToken(
     observed = await readEvents(file);
     const initialization = observed.slice(afterEventCount).find((event) =>
       event.event === "initialize" && event.arguments.includes(token) &&
-      event.pid !== previousPid);
+      event.identity?.token !== previousIdentity);
     if (initialization !== undefined) {
       return initialization;
     }
@@ -1743,14 +1712,14 @@ async function waitForInitializationToken(
 
 async function waitForProcessEvents(
   file: string,
-  pid: number,
+  identity: string,
   expected: FixtureEvent["event"][],
   timeoutMilliseconds: number
 ): Promise<FixtureEvent[]> {
   const deadline = Date.now() + timeoutMilliseconds;
   let observed: FixtureEvent[] = [];
   while (Date.now() < deadline) {
-    observed = (await readEvents(file)).filter((event) => event.pid === pid);
+    observed = (await readEvents(file)).filter((event) => event.identity?.token === identity);
     if (expected.every((event) =>
       observed.some((candidate) => candidate.event === event))) {
       return observed;
@@ -1758,7 +1727,7 @@ async function waitForProcessEvents(
     await delay(50);
   }
   assert.fail(
-    `timed out waiting for ${expected.join(", ")} from process ${pid} in ` +
+    `timed out waiting for ${expected.join(", ")} from fixture ${identity} in ` +
       `${file}; observed ${observed.map((event) => event.event).join(", ")}`
   );
 }
@@ -1885,44 +1854,52 @@ function delay(milliseconds: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
-async function assertProcessExited(
-  pid: number,
-  timeoutMilliseconds: number
-): Promise<void> {
-  const deadline = Date.now() + timeoutMilliseconds;
-  while (Date.now() < deadline) {
-    if (!isProcessAlive(pid)) {
-      return;
-    }
-    await delay(50);
-  }
-  assert.fail(`language-server process ${pid} remained alive after cleanup`);
+function isFixtureAlive(event: FixtureEvent): Promise<boolean> {
+  const { port, token } = event.identity;
+  // The suite's ES2022 library has no Promise.withResolvers declaration.
+  return new Promise((resolve) => {
+    const socket = connect(port, "127.0.0.1");
+    let received = "";
+    socket.setEncoding("ascii");
+    // Bound a real socket check; a fake clock cannot drive its I/O.
+    socket.setTimeout(2_000, () => socket.destroy());
+    socket.on("data", (chunk: string) => {
+      received += chunk;
+      if (!token.startsWith(received)) {
+        socket.destroy();
+        resolve(false);
+      }
+    });
+    socket.once("end", () => resolve(received === token));
+    socket.once("error", () => resolve(false));
+    socket.once("close", () => resolve(false));
+  });
+}
+
+async function livingFixtureTokens(events: FixtureEvent[]): Promise<string[]> {
+  const instances = new Map(events.map((event) => [event.identity.token, event]));
+  const living = await Promise.all([...instances.values()].map(async (event) =>
+    await isFixtureAlive(event) ? event.identity.token : undefined));
+  return living.filter((token) => token !== undefined).sort();
 }
 
 async function assertForcedTermination(
   events: FixtureEvent[],
-  pid: number,
+  fixture: FixtureEvent,
   timeoutMilliseconds: number
 ): Promise<void> {
   if (process.platform !== "win32") {
     const termination = events.find((event) =>
-      event.event === "terminate" && event.pid === pid);
+      event.event === "terminate" && event.identity.token === fixture.identity.token);
     assert.ok(termination, "the fixture should receive forced SIGTERM");
     assert.equal(termination.signal, "SIGTERM");
   }
-  await assertProcessExited(pid, timeoutMilliseconds);
-}
-
-function isProcessAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    if (error instanceof Error && "code" in error && error.code === "ESRCH") {
-      return false;
-    }
-    throw error;
+  const deadline = Date.now() + timeoutMilliseconds;
+  while (Date.now() < deadline) {
+    if (!await isFixtureAlive(fixture)) return;
+    await delay(50);
   }
+  assert.fail(`language-server fixture ${fixture.pid} remained alive after cleanup`);
 }
 
 async function waitForDefinitions(

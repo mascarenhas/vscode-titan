@@ -163,6 +163,19 @@ unassigned or assigned twice. Per-shard logs and `summary.json` go to
 `.build/test-shards`. `server-test-run` runs the current aggregate without
 rebuilding it.
 
+Before VS Code starts, `.vscode-test.js` calls `prepareExtensionHostWorkspace`
+in `scripts/extension-host-workspace.mjs`. The same config serves
+`make extension-host-test`, direct `vscode-test` and the prepared
+`scripts/run-extension-host-tests.mjs` runner. Folder settings, markers,
+`.titan-ls` caches, VS Code user data and installed test extensions are private
+to the invocation. Cleanup runs after VS Code closes. A killed run may leave
+its directory behind, but no later run reuses it. Run Electron gates serially.
+Set `TITAN_LSP_TEST_CODE` to the absolute path of an installed VS Code executable
+to use the same config without downloading VS Code.
+Lifecycle tests identify the fake server instance by its private loopback
+listener and a per-process token, not by a PID which the OS may reuse. The
+prepared native-server test uses the proxy's joined child-close receipt.
+
 Router lifecycle tests also use `test/fixtures/router_worker_fixture.titan`, a
 framed child peer built with the server's `framing` and `wire` modules. Make
 invokes Titan with `--tree 'src;test/fixtures' --source-first --incremental`,
@@ -466,6 +479,12 @@ the stdio suites instead read the two `TITAN_LS_LUA_*` variables above. Clear
 `TITAN_PREFIX`, which the server reads as an inherited probe prefix, so each
 root keeps its own `.titan-ls` cache. The multi-root suite accepts one group
 name as its second argument, so a failure can be rerun alone.
+
+Run the automated `npm run test:vscode` gate from the interactive desktop
+account with native Node and the compiler tools on `PATH`, `TITAN_PREFIX`
+pointing to the SDK for staging, `TITAN_LSP_TEST_CODE` pointing to the installed
+`Code.exe`, and `TITAN_LSP_TEST_SERVER` pointing to the freshly built
+`titan-language-server.exe`. Do not run another Electron suite at the same time.
 
 For F5, the interactive account needs read and execute access to the SDK and
 the tool prefix. It also needs its own writable workspace, build output, Node
