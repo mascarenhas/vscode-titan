@@ -1,12 +1,12 @@
 # Browser analysis protocol fixture
 
-The `sdk` directory contains only the three browser analysis inputs. Its
-archive preserves the unmodified Wasm object for `titan.gc` and all four
-objects for `titan.browser` from the full SDK. The absent-module list is
-unchanged. `analysis-target` uses the compiler's production encoder and the
-actual archive and absent-list digests. The separate `browser_external`
-archive is compiled from the source in this directory and exercises project
-binary lookup, not the standard library.
+The `sdk` directory contains only the three browser analysis inputs. Its Wasm
+archive contains `titan.gc` and all four object parts of `titan.browser`,
+rebuilt from the pinned source rock under `/tmp/titan-browser-fixture`. The
+regenerator strips DWARF with the pinned Emscripten `llvm-objcopy` and verifies
+exact public `.titan.meta` bytes, each Wasm fingerprint and the aggregate
+linker-visible symbol inventory against the full pack. The separate
+`browser_external` archive exercises project binary lookup.
 
 `provenance.json` pins the exact Titan source commit, matching source rock
 and full browser semantic pack, and the original asset hashes. `SHA256SUMS`
@@ -23,8 +23,13 @@ TITAN_ROOT="$SDK" node --test scripts/browser-analysis-fixture.test.mjs
 ```
 
 The second command needs the matching native compiler, not Emscripten. The
-regenerator compares the decoded live profile with the source descriptor;
-the codec's map traversal order can change the raw descriptor bytes without
-changing its semantic contents. It then records the hashes of the emitted
-bytes. Do not install this subset into a packaging SDK: only disposable
-protocol-test prefixes may use it. The VSIX takes the full companion instead.
+regenerator refuses an existing scratch prefix. The fixture's semantics are
+reproducible; independent recompiles can change archive bytes because source
+certificates record filesystem and toolchain observations. The changing
+certificate can also move a pre-link GC transfer manifest pointer slot. The
+canonical descriptor is byte-reproducible for the same archive bytes. Across
+regenerations only the descriptor's provider digest changes. CI checks the
+checked-in assets against the checked-in `SHA256SUMS`.
+
+Only disposable protocol-test prefixes may use this subset. The VSIX takes
+the full companion instead.

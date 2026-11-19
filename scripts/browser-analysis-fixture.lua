@@ -1,5 +1,5 @@
 -- The editor fixture uses the compiler's real browser metadata readers.
-local mode, sdk, fixture, output = ...
+local mode, sdk, fixture, reference = ...
 assert(mode == "encode" or mode == "verify" or mode == "wrong-target", "invalid fixture operation")
 local share = sdk .. "/share/lua/5.5/"
 local native = package.config:sub(1, 1) == "\\" and "dll" or "so"
@@ -34,29 +34,17 @@ local function digest(file)
     return sha256.hex_via(support._sha256_binary, assert(strategy:read_file(file)))
 end
 
-local function target_identity(context, bytes)
-    return incremental.digest(context, "browser-analysis-target",
-        assert(profile.decode_analysis(context, bytes)))
-end
-
 if mode == "encode" then
-    driver.TITAN_ROOT = sdk
-    driver.INSTALL_PATHS = driver.installed_paths(sdk)
-    local context = driver.new_resolver_context {
-        io = strategy, target = "browser", output_root = output,
-    }
-    local descriptor = assert(driver.context_target_descriptor(context))
     local full = driver.installed_paths(sdk, "browser").titan_bin
-    local encoded = assert(profile.encode_analysis(context, descriptor,
-        digest(path.join(full, "titan.a")), digest(path.join(full, "absent-modules"))))
     local published = assert(strategy:read_file(path.join(full, "analysis-target")))
-    assert(target_identity(context, encoded) == target_identity(context, published),
-        "live toolchain profile disagrees with the installed browser semantic target")
+    local data = assert(profile.decode_analysis(nil, published))
+    assert(published == assert(profile.encode_analysis_data(nil, data)),
+        "the source companion must use the canonical semantic target encoder")
+    assert(data.absent_sha256 == digest(absent_file), "the absent-module list changed")
+    data.provider_sha256 = digest(archive_file)
     local file <close> = assert(io.open(descriptor_file, "wb"))
-    assert(file:write(assert(profile.encode_analysis(context, descriptor,
-        digest(archive_file), digest(absent_file)))))
+    assert(file:write(assert(profile.encode_analysis_data(nil, data))))
     assert(file:close())
-    assert(driver.close_resolver_context(context))
 end
 
 function strategy:run()
@@ -83,6 +71,47 @@ for _, member in ipairs(archive.members) do
 end
 assert(table.concat(members, " ") == "browser.o browser.part1.o browser.part2.o browser.part3.o gc.o",
     "browser fixture omitted an original split object")
+if mode == "encode" then
+    local original = assert(metadata.scan_archive(reference, {
+        io = strategy, target = descriptor.fingerprint, expected_abi = driver.TITAN_ABI_VERSION,
+    }))
+    local originals = {}
+    for _, member in ipairs(original.members) do originals[member.display_name] = member.object end
+    local function linking_symbols(provider)
+        local defined, imported = {}, {}
+        for _, member in ipairs(provider.members) do
+            for _, symbol in ipairs(member.object.symbols) do
+                if symbol.name and symbol.binding ~= "local" then
+                    local key = symbol.kind .. "\0" .. symbol.name .. "\0" .. symbol.binding
+                    if symbol.defined then defined[key] = true else imported[key] = true end
+                end
+            end
+        end
+        for key in pairs(defined) do imported[key] = nil end
+        return { defined = defined, imported = imported }
+    end
+    for _, member in ipairs(archive.members) do
+        local rebuilt = member.object
+        local source = assert(originals[member.display_name])
+        assert((not rebuilt.metadata and not source.metadata) or
+            (rebuilt.metadata and source.metadata and rebuilt.metadata.payload == source.metadata.payload),
+            member.display_name .. ": public metadata disagrees with source archive")
+        assert(incremental.digest({}, "wasm", rebuilt.fingerprint) ==
+            incremental.digest({}, "wasm", source.fingerprint),
+            member.display_name .. ": Wasm fingerprint disagrees with source archive")
+    end
+    local rebuilt, published = linking_symbols(archive), linking_symbols(original)
+    for _, category in ipairs({"defined", "imported"}) do
+        for symbol in pairs(rebuilt[category]) do
+            assert(published[category][symbol],
+                "rebuilt archive " .. category .. " an unexpected symbol: " .. symbol:gsub("\0", ":"))
+        end
+        for symbol in pairs(published[category]) do
+            assert(rebuilt[category][symbol],
+                "rebuilt archive is missing a symbol: " .. symbol:gsub("\0", ":"))
+        end
+    end
+end
 verify_archive(path.join(fixture, "providers", "browser_external.a"), "browser_external")
 
 local context = driver.new_resolver_context {
