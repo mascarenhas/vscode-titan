@@ -137,8 +137,11 @@ local providers = fixture .. "/providers"
 local browser = assert(driver.find_dependency_interface(providers, "titan.browser", context))
 assert(browser.static_archive == handle.provider_file and browser.type.members.binding)
 local external = assert(driver.find_dependency_interface(providers, "browser_external", context))
-assert(external.static_archive == assert(strategy:realpath(path.join(providers, "browser_external.a")))
-    and external.type.members.explicit_archive)
+local actual = assert(strategy:realpath(external.static_archive))
+local expected = assert(strategy:realpath(path.join(providers, "browser_external.a")))
+assert(path.normalize(actual) == path.normalize(expected),
+    "explicit browser provider path mismatch: " .. actual .. " != " .. expected)
+assert(external.type.members.explicit_archive)
 local missing, failure = driver.find_dependency_interface(providers, "titan.fs", context)
 assert(missing == nil and failure == nil)
 assert(driver.missing_module_message(context, "titan.fs"):find("requires a filesystem", 1, true))

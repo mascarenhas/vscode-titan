@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { spawnSync } from "node:child_process";
-import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -137,10 +137,13 @@ test("staging requires and copies the portable compiler path helper", async (con
   });
   await context.test("payload CLI follows an absolute script symlink", async (aliasContext) => {
     const alias = path.join(root, "stage-alias.mjs");
-    try { await symlink(script, alias); }
-    catch (error) {
-      if (["EACCES", "EPERM", "ENOSYS"].includes(error.code)) {
-        aliasContext.skip("file symlink fixture creation is unavailable"); return;
+    try {
+      await symlink(script, alias);
+      assert.equal(path.relative(script, await realpath(alias)), "");
+      await readFile(alias);
+    } catch (error) {
+      if (["EACCES", "EPERM", "ENOSYS", "EINVAL", "UNKNOWN"].includes(error.code)) {
+        aliasContext.skip("file symlink fixture cannot be created or traversed"); return;
       }
       throw error;
     }

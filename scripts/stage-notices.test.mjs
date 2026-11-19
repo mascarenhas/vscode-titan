@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import test from "node:test";
-import { mkdtemp, readFile, readdir, rm, symlink } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, realpath, rm, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -66,10 +66,13 @@ test("notice CLI runs through an absolute symlink", async (context) => {
   context.after(() => rm(root, { recursive: true, force: true }));
   const script = fileURLToPath(new URL("./stage-notices.mjs", import.meta.url));
   const alias = path.join(root, "notices-alias.mjs");
-  try { await symlink(script, alias); }
-  catch (error) {
-    if (["EACCES", "EPERM", "ENOSYS"].includes(error.code)) {
-      context.skip("file symlink fixture creation is unavailable"); return;
+  try {
+    await symlink(script, alias);
+    assert.equal(path.relative(script, await realpath(alias)), "");
+    await readFile(alias);
+  } catch (error) {
+    if (["EACCES", "EPERM", "ENOSYS", "EINVAL", "UNKNOWN"].includes(error.code)) {
+      context.skip("file symlink fixture cannot be created or traversed"); return;
     }
     throw error;
   }
