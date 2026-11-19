@@ -1201,15 +1201,18 @@ function Application:set_diagnostics_listener(listener: diagnostics.Listener?)
   if self.closed then return end
   self.diagnostic_publisher:set_listener(listener)
   local completed? = self.completed_view
-  -- A retained semantic View does not validate diagnostics cleared by failure.
-  if not self.closed and listener ~= nil and completed ~= nil and
-     self.failed_epoch == nil then
+  local epoch = self.completed_epoch
+  if listener ~= nil and completed ~= nil and self.failed_epoch == nil and
+     epoch == self.change_epoch then
     do
       local service = self.service as project_service.Service
       local publications = published_diagnostics.read(
         service:workspace_store(), completed.published_generation)
-      -- Reading can yield while a failed saved refresh clears the current set.
-      if not self.closed and self.failed_epoch == nil then
+      -- A new save can invalidate this replay even if its SQL generation
+      -- has not yet been replaced.
+      if not self.closed and self.failed_epoch == nil and
+         self.completed_view == completed and self.completed_epoch == epoch and
+         self.change_epoch == epoch then
         self.diagnostic_publisher:publish(publications)
       end
     catch
