@@ -2,31 +2,32 @@
 -- @module server.completion_discovery
 
 local bridge = import "server.compiler_bridge"
-local discovery = import "server.project_discovery.titan"
+local discovery = import "server.project_discovery"
 local source_text = import "server.source_text"
 local strings = import "string"
 
 -- This resolver reads the captured catalog only. It never discovers files,
 -- mutates saved membership, or follows a client URI through the filesystem.
-local function within_any(path: string, roots: {string}): boolean
+local function within_any(path: string, roots: const? {string}): boolean
   for index = 1, #roots do
-    if discovery.path_within(roots[index], path) then return true end
+    if source_text.path_within(roots[index], path) then return true end
   end
   return false
 end
 
-local function admitted(path: string, include: {string}, exclude: {string}): boolean
+local function admitted(path: string, include: const? {string},
+                        exclude: const? {string}): boolean
   return within_any(path, include) and not within_any(path, exclude) and
     strings.find(path, "/.titan-ls/") == nil and
-    #path > 6 and strings.sub(path, -6) == ".titan"
+    #path > 6 and source_text.titan_source_path(path)
 end
 
-local function selected_root(path: string, roots: {string}): integer?
+local function selected_root(path: string, roots: const? {string}): integer?
   local selected?: integer
   local length = 0
   for index = 1, #roots do
     local root = roots[index]
-    if discovery.path_within(root, path) and #root > length then
+    if source_text.path_within(root, path) and #root > length then
       selected = index
       length = #root
     end
@@ -34,17 +35,16 @@ local function selected_root(path: string, roots: {string}): integer?
   return selected
 end
 
-local function dotted(path: string): string
-  local output = strings.writer()
-  for index = 1, #path do
-    local character = strings.sub(path, index, index)
-    if character == "/" then character = "." end
-    output:write(character)
-  end
-  return output:drain()
+local function slash_to_dot(_: string): string
+  return "."
 end
 
-local function saved_owner(path: string, sources: {bridge.ProjectModule}): string?
+local function dotted(path: string): string
+  return (strings.gsub(path, "/", slash_to_dot))
+end
+
+local function saved_owner(path: string,
+                           sources: const? {bridge.ProjectModule}): string?
   for index = 1, #sources do
     local module = sources[index]
     for file_index = 1, #module.files do
@@ -54,8 +54,9 @@ local function saved_owner(path: string, sources: {bridge.ProjectModule}): strin
   return nil
 end
 
-local function open_exists(path: string, include: {string}, exclude: {string},
-                           open_paths: const {string}): boolean
+local function open_exists(path: string, include: const? {string},
+                           exclude: const? {string},
+                           open_paths: const? {string}): boolean
   if not admitted(path, include, exclude) then return false end
   for index = 1, #open_paths do
     if open_paths[index] == path then return true end
@@ -66,24 +67,23 @@ end
 local function inactive_exists(path: string,
                                inactive_paths: {string}?): boolean
   if inactive_paths == nil then return false end
-  local paths: {string} = inactive_paths
-  for index = 1, #paths do
-    if paths[index] == path then return true end
+  for index = 1, #inactive_paths do
+    if inactive_paths[index] == path then return true end
   end
   return false
 end
 
 local function saved_family_member(directory: string, logical_basename: string,
-                                   labels: {string},
-                                   sources: {bridge.ProjectModule},
+                                   labels: const? {string},
+                                   sources: const? {bridge.ProjectModule},
                                    inactive_paths: {string}?): string?
   for index = 1, #sources do
     local module = sources[index]
     for file_index = 1, #module.files do
       local filename = module.files[file_index].filename
-      if discovery.parent_directory(filename) == directory then
+      if source_text.parent_directory(filename) == directory then
         local classification = bridge.classify_source_filename(
-          discovery.leaf_name(filename))
+          source_text.leaf_name(filename))
         if classification.logical_basename == logical_basename then
           return filename
         end
@@ -93,13 +93,13 @@ local function saved_family_member(directory: string, logical_basename: string,
   if inactive_paths ~= nil then
     local stem = strings.sub(logical_basename, 1, #logical_basename - 6)
     for index = 1, #labels do
-      local candidate = discovery.join(
+      local candidate = source_text.join_path(
         directory, stem .. "." .. labels[index] .. ".titan")
       if inactive_exists(candidate, inactive_paths) then
         return candidate
       end
     end
-    local default_path = discovery.join(directory, logical_basename)
+    local default_path = source_text.join_path(directory, logical_basename)
     if inactive_exists(default_path, inactive_paths) then
       return default_path
     end
@@ -109,17 +109,18 @@ end
 
 local function has_any_family_member(directory: string,
                                      logical_basename: string,
-                                     sources: {bridge.ProjectModule},
+                                     sources: const? {bridge.ProjectModule},
                                      inactive_paths: {string}?,
-                                     include: {string}, exclude: {string},
-                                     open_paths: const {string}): boolean
+                                     include: const? {string},
+                                     exclude: const? {string},
+                                     open_paths: const? {string}): boolean
   for index = 1, #sources do
     local module = sources[index]
     for file_index = 1, #module.files do
       local filename = module.files[file_index].filename
-      if discovery.parent_directory(filename) == directory then
+      if source_text.parent_directory(filename) == directory then
         local classification = bridge.classify_source_filename(
-          discovery.leaf_name(filename))
+          source_text.leaf_name(filename))
         if classification.logical_basename == logical_basename then
           return true
         end
@@ -127,12 +128,11 @@ local function has_any_family_member(directory: string,
     end
   end
   if inactive_paths ~= nil then
-    local paths: {string} = inactive_paths
-    for index = 1, #paths do
-      local filename = paths[index]
-      if discovery.parent_directory(filename) == directory then
+    for index = 1, #inactive_paths do
+      local filename = inactive_paths[index]
+      if source_text.parent_directory(filename) == directory then
         local classification = bridge.classify_source_filename(
-          discovery.leaf_name(filename))
+          source_text.leaf_name(filename))
         if classification.logical_basename == logical_basename then
           return true
         end
@@ -142,9 +142,9 @@ local function has_any_family_member(directory: string,
   for index = 1, #open_paths do
     local filename = open_paths[index]
     if admitted(filename, include, exclude) and
-       discovery.parent_directory(filename) == directory then
+       source_text.parent_directory(filename) == directory then
       local classification = bridge.classify_source_filename(
-        discovery.leaf_name(filename))
+        source_text.leaf_name(filename))
       if classification.logical_basename == logical_basename then
         return true
       end
@@ -155,23 +155,24 @@ end
 
 local function select_virtual_family(directory: string,
                                      logical_basename: string,
-                                     labels: {string},
-                                     sources: {bridge.ProjectModule},
+                                     labels: const? {string},
+                                     sources: const? {bridge.ProjectModule},
                                      inactive_paths: {string}?,
-                                     include: {string}, exclude: {string},
-                                     open_paths: const {string}): string?
+                                     include: const? {string},
+                                     exclude: const? {string},
+                                     open_paths: const? {string}): string?
   local saved? = saved_family_member(
     directory, logical_basename, labels, sources, inactive_paths)
   if saved ~= nil then return saved end
   local stem = strings.sub(logical_basename, 1, #logical_basename - 6)
   for index = 1, #labels do
-    local candidate = discovery.join(
+    local candidate = source_text.join_path(
       directory, stem .. "." .. labels[index] .. ".titan")
     if open_exists(candidate, include, exclude, open_paths) then
       return candidate
     end
   end
-  local default_path = discovery.join(directory, logical_basename)
+  local default_path = source_text.join_path(directory, logical_basename)
   if open_exists(default_path, include, exclude, open_paths) then
     return default_path
   end
@@ -179,11 +180,11 @@ local function select_virtual_family(directory: string,
 end
 
 local function folder_conflicts(directory: string, module_name: string,
-                                 sources: {bridge.ProjectModule}): boolean
+                                sources: const? {bridge.ProjectModule}): boolean
   for index = 1, #sources do
     local module = sources[index]
     for file_index = 1, #module.files do
-      if discovery.parent_directory(module.files[file_index].filename) == directory and
+      if source_text.parent_directory(module.files[file_index].filename) == directory and
          module.module_name ~= module_name then
         return true
       end
@@ -195,14 +196,15 @@ end
 -- Include roots are a complete saved scan only within their own trees. An
 -- earlier source root outside them may contain an uncaptured provider, so a
 -- new later-root identity cannot safely claim that the earlier lookup missed.
-local function covered_root(root: string, include: {string}): boolean
+local function covered_root(root: string, include: const? {string}): boolean
   return within_any(root, include)
 end
 
 function find(path: string, sources: {bridge.ProjectModule},
-               source_roots: {string}, include: {string}, exclude: {string},
-               open_paths: const {string},
-               inactive_paths: {string}?, requested_target: string?): string?
+              source_roots: {string}, include: {string},
+              exclude: {string}, open_paths: const {string},
+              inactive_paths: {string}?,
+              requested_target: string?): string?
   local normalized? = source_text.normalize_absolute_path(path)
   if normalized == nil then return nil end
   if inactive_exists(normalized, inactive_paths) then return nil end
@@ -210,23 +212,24 @@ function find(path: string, sources: {bridge.ProjectModule},
   if known ~= nil then return known end
   if not admitted(normalized, include, exclude) then return nil end
   local classification = bridge.classify_source_filename(
-    discovery.leaf_name(normalized))
+    source_text.leaf_name(normalized))
   if classification.error ~= nil or
      classification.logical_basename == nil then
     return nil
   end
   local target = requested_target or bridge.host_target()
   if classification.label ~= nil and
-     not bridge.target_label_applies(target, classification.label as string) then
+     not bridge.target_label_applies(target, classification.label) then
     return nil
   end
-  local logical_basename = classification.logical_basename as string
+  local logical_basename = classification.logical_basename
   local selection_labels = bridge.target_selection_labels(target)
   local root_index? = selected_root(normalized, source_roots)
   if root_index == nil then return nil end
   local root = source_roots[root_index]
-  local relative = discovery.relative_to_root(root, normalized)
-  local directory = discovery.parent_directory(normalized)
+  local relative? = source_text.relative_path(root, normalized)
+  if relative == nil then return nil end
+  local directory = source_text.parent_directory(normalized)
   local relative_directory = discovery.relative_parent(relative)
   local logical_relative = logical_basename
   if relative_directory ~= "" then
@@ -239,7 +242,7 @@ function find(path: string, sources: {bridge.ProjectModule},
   -- number of saved contributors or the order in which buffers were opened.
   if relative_directory ~= "" then
     local folder_main? = select_virtual_family(
-      directory, discovery.leaf_name(directory) .. ".titan",
+      directory, source_text.leaf_name(directory) .. ".titan",
       selection_labels, sources, nil, include, exclude, open_paths)
     if folder_main ~= nil then
       candidate_relative = relative_directory
@@ -253,7 +256,7 @@ function find(path: string, sources: {bridge.ProjectModule},
   local basename = discovery.terminal_component(candidate)
   for index = 1, #source_roots do
     local candidate_root = source_roots[index]
-    local folder = discovery.join(candidate_root, candidate_path)
+    local folder = source_text.join_path(candidate_root, candidate_path)
     local folder_main? = select_virtual_family(
       folder, basename .. ".titan", selection_labels,
       sources, nil, include, exclude, open_paths)
@@ -274,15 +277,15 @@ function find(path: string, sources: {bridge.ProjectModule},
       return candidate
     end
 
-    local flat_directory = discovery.parent_directory(
-      discovery.join(candidate_root, candidate_path .. ".titan"))
+    local flat_directory = source_text.parent_directory(
+      source_text.join_path(candidate_root, candidate_path .. ".titan"))
     local flat? = select_virtual_family(
       flat_directory, basename .. ".titan", selection_labels,
       sources, inactive_paths, include, exclude, open_paths)
     if flat ~= nil then
       local owner? = discovery.module_owner(candidate)
       if owner ~= nil then
-        local owner_folder = discovery.join(
+        local owner_folder = source_text.join_path(
           candidate_root, discovery.module_path(owner))
         if has_any_family_member(
             owner_folder, discovery.terminal_component(owner) .. ".titan",

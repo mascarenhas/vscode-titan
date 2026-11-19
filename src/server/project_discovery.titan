@@ -1,13 +1,13 @@
 --- Discover flat and folder modules using Titan source-root ownership rules.
 -- @module server.project_discovery
 
-foreign import "compiler_io_platform.h"
 local async = import "async"
 local fs = import "fs"
 local iteration = import "iteration"
 local strings = import "string"
 local paths = import "path"
 local source_text = import "server.source_text"
+local workspace_roots = import "server.roots"
 local bridge = import "server.compiler_bridge"
 
 union ModuleKind
@@ -15,19 +15,23 @@ union ModuleKind
   folder()
 end
 
---- One logical flat or folder module and its canonical source contributors.
-record Module
-  name: string
-  kind: ModuleKind
-  main_file: string
-  files: {string}
-end
-
-function Module:is_folder(): boolean
-  case self.kind
+local function ModuleKind:is_folder(): boolean
+  case self
   when folder() then return true
   else return false
   end
+end
+
+--- One logical flat or folder module and its canonical source contributors.
+record Module
+  const name: string
+  const kind: ModuleKind
+  const main_file: string
+  const files: {string}
+end
+
+function Module:is_folder(): boolean
+  return self.kind:is_folder()
 end
 
 union IssueKind
@@ -37,24 +41,24 @@ union IssueKind
 end
 
 record Issue
-  path: string
-  message: string
-  kind: IssueKind
+  const path: string
+  const message: string
+  const kind: IssueKind
 end
 
 record Error
-  path: string
-  message: string
+  const path: string
+  const message: string
 end
 
 --- Saved-project module inventory, directory scope, and discovery issues.
 record Discovery
-  include_roots: {string}
-  source_roots: {string}
-  directories: {string}
-  modules: {Module}
-  owner_by_file: {string: string}
-  issues: {Issue}
+  const include_roots: {string}
+  const source_roots: {string}
+  const directories: {string}
+  const modules: {Module}
+  const owner_by_file: {string: string}
+  const issues: {Issue}
 end
 
 function Discovery:find_module(name: string): Module?
@@ -89,38 +93,38 @@ function Discovery:owner_for_file(path: string): string?
 end
 
 local record FileEntry
-  path: string
-  source_path: string
-  canonical_path: string
-  relative: string
-  directory: string
-  basename: string
+  const path: string
+  const source_path: string
+  const canonical_path: string
+  const relative: string
+  const directory: string
+  const basename: string
 end
 
 local record IncludeRoot
-  lexical: string
-  canonical: string
+  const lexical: string
+  const canonical: string
 end
 
 local record SourceRoot
-  lexical: string
-  canonical: string
+  const lexical: string
+  const canonical: string
 end
 
 local record Scan
-  files: {FileEntry}
-  directories: {string}
+  const files: {FileEntry}
+  const directories: {string}
 end
 
 local record ModuleCatalog
-  modules: {Module}
-  owner_by_file: {string: string}
-  issues: {Issue}
+  const modules: {Module}
+  const owner_by_file: {string: string}
+  const issues: {Issue}
 end
 
 local record Candidate
-  module: Module
-  owner_by_file: {string: string}
+  const module: Module
+  const owner_by_file: {string: string}
 end
 
 local union SourceResolution
@@ -156,16 +160,17 @@ local record SourceFamilyCandidate
 end
 
 local record SourceSelection
-  root_index: integer
-  relative: string
-  source_path: string
-  depth: integer
+  const root_index: integer
+  const relative: string
+  const source_path: string
+  const depth: integer
 end
 
 local function fail<|T|>(path: string, message: string): T
-  raise Error.new(path, message)
+  raise Error(path, message)
 end
 
+-- Locale-independent bytewise ASCII comparison matching driver.lua ordering.
 local function bytewise_less(left: string, right: string): boolean
   local limit = #left
   if #right < limit then limit = #right end
@@ -178,11 +183,12 @@ local function bytewise_less(left: string, right: string): boolean
   return #left < #right
 end
 
-local function sort_strings(items: {string})
+local function sort_by<|T|>(items: {T}, key: function (T): string)
   for index = 2, #items do
     local item = items[index]
+    local item_key = key(item)
     local target = index
-    while target > 1 and bytewise_less(item, items[target - 1]) do
+    while target > 1 and bytewise_less(item_key, key(items[target - 1])) do
       items[target] = items[target - 1]
       target = target - 1
     end
@@ -190,97 +196,20 @@ local function sort_strings(items: {string})
   end
 end
 
-local function sort_contributors(items: {ContributorSelection})
-  for index = 2, #items do
-    local item = items[index]
-    local target = index
-    while target > 1 and
-          bytewise_less(item.logical_basename,
-                        items[target - 1].logical_basename) do
-      items[target] = items[target - 1]
-      target = target - 1
-    end
-    items[target] = item
-  end
+local function identity_key(item: string): string
+  return item
 end
 
-local function sort_modules(items: {Module})
-  for index = 2, #items do
-    local item = items[index]
-    local target = index
-    while target > 1 and bytewise_less(item.name, items[target - 1].name) do
-      items[target] = items[target - 1]
-      target = target - 1
-    end
-    items[target] = item
-  end
+local function contributor_key(item: ContributorSelection): string
+  return item.logical_basename
 end
 
-local function sort_issues(items: {Issue})
-  for index = 2, #items do
-    local item = items[index]
-    local target = index
-    while target > 1 and bytewise_less(item.path, items[target - 1].path) do
-      items[target] = items[target - 1]
-      target = target - 1
-    end
-    items[target] = item
-  end
+local function module_key(item: Module): string
+  return item.name
 end
 
-local function join(root: string, name: string): string
-  return paths.to_slash(paths.join(root, name))
-end
-
-local function parent_directory(subject: string): string
-  local parent?, failure? = source_text.normalize_absolute_path(paths.dirname(subject))
-  if parent == nil then raise failure end
-  return parent
-end
-
-local function leaf_name(subject: string): string
-  local normalized?, failure? = source_text.normalize_absolute_path(subject)
-  if normalized == nil then raise failure end
-  if normalized == parent_directory(normalized) then return "" end
-  return paths.basename(normalized)
-end
-
--- Resolve every existing ancestor so deleted/future exclusion leaves retain
--- the same physical identity as an include root reached through a symlink.
-local function canonical_path(path: string): string
-  local suffix: {string} = {}
-  local candidate = path
-  while true do
-    do
-      local canonical = fs.realpath(candidate)
-      if ffi.VSCODE_TITAN_WINDOWS ~= 0 then
-        local normalized?, failure? = source_text.normalize_absolute_path(canonical)
-        if normalized == nil then raise failure end
-        canonical = normalized
-      end
-      for index = #suffix, 1, -1 do
-        canonical = join(canonical, suffix[index])
-      end
-      return canonical
-    catch
-      if error is async.CancellationReason then raise end
-    end
-    local parent = parent_directory(candidate)
-    if parent == candidate then return path end
-    suffix[#suffix + 1] = leaf_name(candidate)
-    candidate = parent
-  end
-  return path
-end
-
-local function rebase_path(subject: string, source_root: string,
-                           observed_root: string): string
-  local relative = source_text.relative_path(source_root, subject)
-  return paths.to_slash(paths.join(observed_root, relative))
-end
-
-local function titan_source(name: string): boolean
-  return #name >= 6 and strings.sub(name, #name - 5) == ".titan"
+local function issue_key(item: Issue): string
+  return item.path
 end
 
 local function source_stem(name: string): string
@@ -314,18 +243,9 @@ function valid_module_component(component: string): boolean
   return true
 end
 
--- Inputs are the established slash-separated project identities, not raw
--- native paths. Containment remains a component boundary and preserves case.
-local function path_within(root: string, subject: string): boolean
-  if subject == root then return true end
-  local prefix = root
-  if strings.sub(prefix, -1) ~= "/" then prefix = prefix .. "/" end
-  return strings.sub(subject, 1, #prefix) == prefix
-end
-
-local function pruned(path: string, roots: {string}): boolean
+local function pruned(path: string, roots: const? {string}): boolean
   for index = 1, #roots do
-    if path_within(roots[index], path) then return true end
+    if source_text.path_within(roots[index], path) then return true end
   end
   return false
 end
@@ -337,7 +257,8 @@ local function relative_to_root(root: string, path: string): string
   return strings.sub(path, #root + 2)
 end
 
-local function valid_path_components(path: string): boolean
+--- Report whether every slash-separated segment of a relative path is a valid module component.
+function valid_path_components(path: string): boolean
   if path == "" then return true end
   local start = 1
   for index = 1, #path + 1 do
@@ -355,14 +276,15 @@ end
 -- Native directory watches cover mapped source trees and the ancestors needed
 -- to observe a configured source root appearing later. Unmapped branches are
 -- still scanned below, but changes there do not initiate another scan.
-local function mapped_directory_relevant(observed: string, canonical: string,
-                                         source_roots: {SourceRoot}): boolean
+local function mapped_directory_relevant(
+    observed: string, canonical: string,
+    source_roots: const? {SourceRoot}): boolean
   for index = 1, #source_roots do
     local root = source_roots[index]
-    if path_within(observed, root.lexical) or
-       path_within(canonical, root.canonical) or
-       path_within(root.lexical, observed) or
-       path_within(root.canonical, canonical) then
+    if source_text.path_within(observed, root.lexical) or
+       source_text.path_within(canonical, root.canonical) or
+       source_text.path_within(root.lexical, observed) or
+       source_text.path_within(root.canonical, canonical) then
       return true
     end
   end
@@ -373,20 +295,21 @@ end
 -- logical path after an include-relative component such as `vendor.foo` that
 -- is not itself a valid module component. Preserve the old tooling-tree prune
 -- everywhere that cannot lead to such a configured source root.
-local function source_directory_relevant(observed: string, canonical: string,
-                                         include_relative: string,
-                                         source_roots: {SourceRoot}): boolean
+local function source_directory_relevant(
+    observed: string, canonical: string,
+    include_relative: string,
+    source_roots: const? {SourceRoot}): boolean
   for index = 1, #source_roots do
     local root = source_roots[index]
-    if path_within(observed, root.lexical) or
-       path_within(canonical, root.canonical) then
+    if source_text.path_within(observed, root.lexical) or
+       source_text.path_within(canonical, root.canonical) then
       return true
     end
-    if path_within(root.lexical, observed) and
+    if source_text.path_within(root.lexical, observed) and
        valid_path_components(relative_to_root(root.lexical, observed)) then
       return true
     end
-    if path_within(root.canonical, canonical) and
+    if source_text.path_within(root.canonical, canonical) and
        valid_path_components(relative_to_root(root.canonical, canonical)) then
       return true
     end
@@ -396,28 +319,30 @@ end
 
 local function collect(directory: string, relative_directory: string,
                        files: {FileEntry}, directories: {string},
-                       excluded: {string}, boundaries: {string},
+                       excluded: const? {string}, boundaries: const? {string},
                        observed_root: string, canonical_root: string,
-                       source_roots: {SourceRoot})
+                       source_roots: const? {SourceRoot})
   -- The workspace-owned database is never a source or watcher subtree, even
   -- when configuration explicitly names this otherwise hidden directory.
-  if strings.sub(directory,-10) == "/.titan-ls" or
-     strings.sub(rebase_path(directory, observed_root, canonical_root),-10) == "/.titan-ls" then
+  if strings.sub(directory, -10) == "/.titan-ls" or
+     strings.sub(source_text.rebase_path(
+       directory, observed_root, canonical_root), -10) == "/.titan-ls" then
     return
   end
   if pruned(directory, boundaries) then return end
   -- Exclusions affect only the returned watcher set. Discovery still scans
   -- their saved sources so compiler/project ownership remains unchanged.
   if not pruned(directory, excluded) and mapped_directory_relevant(
-      directory, rebase_path(directory, observed_root, canonical_root),
+      directory, source_text.rebase_path(
+        directory, observed_root, canonical_root),
       source_roots) then
     directories[#directories + 1] = directory
   end
   local entries = fs.list(directory)
-  sort_strings(entries)
+  sort_by(entries, identity_key)
   for index = 1, #entries do
     local name = entries[index]
-    local path = join(directory, name)
+    local path = source_text.join_path(directory, name)
     local relative = name
     if relative_directory ~= "" then
       relative = relative_directory .. "/" .. name
@@ -427,16 +352,22 @@ local function collect(directory: string, relative_directory: string,
     if not pruned(path, boundaries) then
       local metadata? = fs.lstat(path)
       if metadata ~= nil then
-        local canonical = rebase_path(
+        local canonical = source_text.rebase_path(
           path, observed_root, canonical_root)
         if metadata.kind == "directory" and source_directory_relevant(
             path, canonical, relative, source_roots) then
           collect(path, relative, files, directories, excluded, boundaries,
                   observed_root, canonical_root, source_roots)
-        elseif metadata.kind == "file" and titan_source(name) then
-          files[#files + 1] = FileEntry.new(
-            path, path, canonical, relative,
-            relative_directory, name)
+        elseif metadata.kind == "file" and
+               source_text.titan_source_path(name) then
+          files[#files + 1] = FileEntry {
+            path = path,
+            source_path = path,
+            canonical_path = canonical,
+            relative = relative,
+            directory = relative_directory,
+            basename = name,
+          }
         end
         -- Symlinks are deliberately not followed. The project identity is the
         -- lexical source tree, and a watch must not escape it through a link.
@@ -459,7 +390,7 @@ local function path_components(path: string): {string}
   return result
 end
 
-local function dotted(components: {string}, count: integer): string
+local function dotted(components: const? {string}, count: integer): string
   local output = strings.writer()
   for index = 1, count do
     if index > 1 then output:write(".") end
@@ -468,6 +399,7 @@ local function dotted(components: {string}, count: integer): string
   return output:drain()
 end
 
+--- Report whether a dotted logical module name satisfies Titan naming rules.
 function valid_module_name(name: string): boolean
   local components: {string} = {}
   local start = 1
@@ -492,12 +424,11 @@ local function flat_module_name_for_relative(logical_relative: string): string
   return dotted(components, #components)
 end
 
-local function folder_module_name_for_family(directory: string,
-                                             logical_basename: string): string?
-  if directory == "" then return nil end
-  if not valid_path_components(directory) then return nil end
-  local components = path_components(directory)
-  local stem = source_stem(logical_basename)
+local function FileFamily:folder_module_name(): string?
+  if self.directory == "" then return nil end
+  if not valid_path_components(self.directory) then return nil end
+  local components = path_components(self.directory)
+  local stem = source_stem(self.logical_basename)
   if components[#components] ~= stem then return nil end
   local name = dotted(components, #components)
   if not valid_module_name(name) then return nil end
@@ -520,37 +451,34 @@ local function absolute_root(path: string): string
 end
 
 local function validated_include_root(root: string): IncludeRoot
-  do
-    local metadata? = fs.stat(root)
-    if metadata == nil then
-      return fail<|IncludeRoot|>(root, "include root does not exist")
-    end
-    if metadata.kind ~= "directory" then
-      return fail<|IncludeRoot|>(root, "include root is not a directory")
-    end
-    return IncludeRoot.new(root, canonical_path(root))
-  catch
-    if error is async.CancellationReason then raise end
-    if error is Error then raise end
-    return fail<|IncludeRoot|>(root, strings.tostring(error))
+  local metadata? = fs.stat(root)
+  if metadata == nil then
+    return fail<|IncludeRoot|>(root, "include root does not exist")
   end
+  if metadata.kind ~= "directory" then
+    return fail<|IncludeRoot|>(root, "include root is not a directory")
+  end
+  return IncludeRoot(root, workspace_roots.canonical(root))
+catch
+  if error is async.CancellationReason then raise end
+  if error is Error then raise end
+  return fail<|IncludeRoot|>(root, strings.tostring(error))
 end
 
-local function own(owner_by_file: {string: string}, entry: FileEntry,
-                   module_name: string)
-  owner_by_file[entry.path] = module_name
-  owner_by_file[entry.source_path] = module_name
-  owner_by_file[entry.canonical_path] = module_name
+local function FileEntry:assign_owner(owner_by_file: {string: string},
+                                      module_name: string)
+  owner_by_file[self.path] = module_name
+  owner_by_file[self.source_path] = module_name
+  owner_by_file[self.canonical_path] = module_name
 end
 
-local function select_family_member(family: FileFamily,
-                                    selection_labels: {string}):
-    ClassifiedEntry?
+local function FileFamily:select(
+    selection_labels: const? {string}): ClassifiedEntry?
   for index = 1, #selection_labels do
-    local candidate? = family.by_label[selection_labels[index]]
+    local candidate? = self.by_label[selection_labels[index]]
     if candidate ~= nil then return candidate end
   end
-  return family.default_entry
+  return self.default_entry
 end
 
 local function inactive_issue(path: string, target: string,
@@ -558,19 +486,19 @@ local function inactive_issue(path: string, target: string,
                               selected_basename: string?): Issue
   local detail = "has no active variant"
   if selected_basename ~= nil then
-    detail = "selects '" .. (selected_basename as string) .. "'"
+    detail = "selects '" .. selected_basename .. "'"
   end
   local target_name = "host target"
   if target == "browser" then target_name = "target" end
-  return Issue.new(
+  return Issue(
     path,
     "not analyzed: inactive for " .. target_name .. " '" .. target .. "'; '" ..
     logical_basename .. "' " .. detail,
     IssueKind.inactive_variant())
 end
 
-local function discover_entries(entries: {FileEntry}, target: string,
-                                selection_labels: {string}): ModuleCatalog
+local function discover_entries(entries: const? {FileEntry}, target: string,
+                                selection_labels: const? {string}): ModuleCatalog
   local modules: {Module} = {}
   local modules_by_name: {string: Module} = {}
   local folders_by_directory: {string: Module} = {}
@@ -585,14 +513,13 @@ local function discover_entries(entries: {FileEntry}, target: string,
     local entry = entries[index]
     local classification = bridge.classify_source_filename(entry.basename)
     if classification.error ~= nil then
-      issues[#issues + 1] = Issue.new(
-        entry.path, classification.error as string,
-        IssueKind.invalid_module())
+      issues[#issues + 1] = Issue(
+        entry.path, classification.error, IssueKind.invalid_module())
       if entry.directory ~= "" then
         invalid_directories[entry.directory] = true
       end
     elseif classification.logical_basename ~= nil then
-      local logical_basename = classification.logical_basename as string
+      local logical_basename = classification.logical_basename
       local logical_relative = logical_basename
       if entry.directory ~= "" then
         logical_relative = entry.directory .. "/" .. logical_basename
@@ -600,17 +527,21 @@ local function discover_entries(entries: {FileEntry}, target: string,
       local key = entry.directory .. "\0" .. logical_basename
       local family? = families_by_key[key]
       if family == nil then
-        family = FileFamily.new(
-          entry.directory, logical_basename, logical_relative,
-          {}, nil, {})
+        family = FileFamily {
+          directory = entry.directory,
+          logical_basename = logical_basename,
+          logical_relative = logical_relative,
+          by_label = {},
+          members = {},
+        }
         families_by_key[key] = family
         families[#families + 1] = family
       end
-      local classified = ClassifiedEntry.new(
+      local classified = ClassifiedEntry(
         entry, logical_basename, classification.label)
       family.members[#family.members + 1] = classified
       if classification.label ~= nil then
-        family.by_label[classification.label as string] = classified
+        family.by_label[classification.label] = classified
       else
         family.default_entry = classified
       end
@@ -620,20 +551,19 @@ local function discover_entries(entries: {FileEntry}, target: string,
   -- Folder mains are selected before flat files, exactly as driver.lua does.
   for index = 1, #families do
     local family = families[index]
-    local name? = folder_module_name_for_family(
-      family.directory, family.logical_basename)
+    local name? = family:folder_module_name()
     if name ~= nil then
       folder_main_families[family.directory] = family
-      local selected? = select_family_member(family, selection_labels)
+      local selected? = family:select(selection_labels)
       if selected ~= nil then
         local main_entry = selected.entry
         if not invalid_directories[family.directory] then
-          local module = Module.new(
+          local module = Module(
             name, ModuleKind.folder(), main_entry.path, {main_entry.path})
           modules[#modules + 1] = module
           modules_by_name[name] = module
           folders_by_directory[family.directory] = module
-          own(owner_by_file, main_entry, name)
+          main_entry:assign_owner(owner_by_file, name)
         end
         for member_index = 1, #family.members do
           local member = family.members[member_index]
@@ -665,11 +595,11 @@ local function discover_entries(entries: {FileEntry}, target: string,
     if main_family ~= nil and family ~= main_family then
       local module? = folders_by_directory[family.directory]
       if module ~= nil then
-        local selected? = select_family_member(family, selection_labels)
+        local selected? = family:select(selection_labels)
         if selected ~= nil then
           local selected_entry = selected.entry
           local bucket = contributors_by_directory[family.directory]
-          bucket[#bucket + 1] = ContributorSelection.new(
+          bucket[#bucket + 1] = ContributorSelection(
             family.logical_basename, selected_entry)
           for member_index = 1, #family.members do
             local member = family.members[member_index]
@@ -697,11 +627,11 @@ local function discover_entries(entries: {FileEntry}, target: string,
   end
   for directory, module in iteration.pairs(folders_by_directory) do
     local contributors = contributors_by_directory[directory]
-    sort_contributors(contributors)
+    sort_by(contributors, contributor_key)
     for index = 1, #contributors do
       local contributor = contributors[index].entry
       module.files[#module.files + 1] = contributor.path
-      own(owner_by_file, contributor, module.name)
+      contributor:assign_owner(owner_by_file, module.name)
     end
   end
 
@@ -713,7 +643,7 @@ local function discover_entries(entries: {FileEntry}, target: string,
         family.logical_relative, 1, #family.logical_relative - 6)
       if stem == "" or not valid_path_components(stem) or
          not valid_module_name(name) then
-        local selected? = select_family_member(family, selection_labels)
+        local selected? = family:select(selection_labels)
         local selected_basename: string? = nil
         if selected ~= nil then
           selected_basename = selected.entry.basename
@@ -721,7 +651,7 @@ local function discover_entries(entries: {FileEntry}, target: string,
         for member_index = 1, #family.members do
           local member = family.members[member_index]
           if member.label ~= nil and
-             (not bridge.target_label_applies(target, member.label as string) or
+             (not bridge.target_label_applies(target, member.label) or
               (selected ~= nil and member.entry.path ~= selected.entry.path)) then
             issues[#issues + 1] = inactive_issue(
               member.entry.path, target, family.logical_basename,
@@ -729,21 +659,21 @@ local function discover_entries(entries: {FileEntry}, target: string,
           else
             local invalid_name = flat_module_name_for_relative(
               member.entry.relative)
-            issues[#issues + 1] = Issue.new(
+            issues[#issues + 1] = Issue(
               member.entry.path,
               "invalid logical Titan module name '" .. invalid_name .. "'",
               IssueKind.invalid_module())
           end
         end
       elseif modules_by_name[name] == nil then
-        local selected? = select_family_member(family, selection_labels)
+        local selected? = family:select(selection_labels)
         if selected ~= nil then
           local selected_entry = selected.entry
-          local module = Module.new(
+          local module = Module(
             name, ModuleKind.flat(), selected_entry.path, {selected_entry.path})
           modules[#modules + 1] = module
           modules_by_name[name] = module
-          own(owner_by_file, selected_entry, name)
+          selected_entry:assign_owner(owner_by_file, name)
           for member_index = 1, #family.members do
             local member = family.members[member_index]
             if member.entry.path ~= selected_entry.path then
@@ -773,41 +703,34 @@ local function discover_entries(entries: {FileEntry}, target: string,
     end
   end
 
-  sort_modules(modules)
-  sort_issues(issues)
-  return ModuleCatalog.new(modules, owner_by_file, issues)
+  sort_by(modules, module_key)
+  sort_by(issues, issue_key)
+  return ModuleCatalog(modules, owner_by_file, issues)
 end
 
-local function scan_root_or_raise(root: IncludeRoot, excluded: {string},
-                                  boundaries: {string},
-                                  source_roots: {SourceRoot}): Scan
-  local root_metadata? = fs.stat(root.lexical)
+local function IncludeRoot:scan(excluded: const? {string},
+                                boundaries: const? {string},
+                                source_roots: const? {SourceRoot}): Scan
+  local root_metadata? = fs.stat(self.lexical)
   if root_metadata == nil then
-    return fail<|Scan|>(root.lexical, "include root does not exist")
+    return fail<|Scan|>(self.lexical, "include root does not exist")
   end
   if root_metadata.kind ~= "directory" then
-    return fail<|Scan|>(root.lexical, "include root is not a directory")
+    return fail<|Scan|>(self.lexical, "include root is not a directory")
   end
   local entries: {FileEntry} = {}
   local directories: {string} = {}
-  collect(root.lexical, "", entries, directories, excluded, boundaries,
-          root.lexical, root.canonical, source_roots)
-  return Scan.new(entries, directories)
+  collect(self.lexical, "", entries, directories, excluded, boundaries,
+          self.lexical, self.canonical, source_roots)
+  return Scan(entries, directories)
+catch
+  if error is async.CancellationReason then raise end
+  if error is Error then raise end
+  return fail<|Scan|>(self.lexical, strings.tostring(error))
 end
 
-local function scan_root(root: IncludeRoot, excluded: {string},
-                         boundaries: {string},
-                         source_roots: {SourceRoot}): Scan
-  do
-    return scan_root_or_raise(root, excluded, boundaries, source_roots)
-  catch
-    if error is async.CancellationReason then raise end
-    if error is Error then raise end
-    return fail<|Scan|>(root.lexical, strings.tostring(error))
-  end
-end
-
-local function relative_parent(subject: string): string
+--- Return the slash-normalized parent of a relative path, or "" at top level.
+function relative_parent(subject: string): string
   local parent = paths.to_slash(paths.dirname(subject))
   if parent == "." then return "" end
   return parent
@@ -827,7 +750,7 @@ local function consider_source_selection(selected: SourceSelection?,
                                          relative: string,
                                          source_path: string):
     SourceSelection
-  local candidate = SourceSelection.new(
+  local candidate = SourceSelection(
     root_index, relative, source_path, path_depth(relative))
   if selected == nil or candidate.depth < selected.depth then
     return candidate
@@ -840,34 +763,41 @@ end
 -- Canonical containment then handles the inverse alias. The shortest relative
 -- path is the physically most-specific source root; declaration order breaks
 -- ties without making include order part of module identity.
-local function selected_source_root(entry: FileEntry,
-                                    roots: {SourceRoot}): SourceSelection?
+local function FileEntry:select_source_root(
+    roots: const? {SourceRoot}): SourceSelection?
   local selected: SourceSelection? = nil
   for index = 1, #roots do
     local root = roots[index]
-    if path_within(root.lexical, entry.path) then
-      local relative = relative_to_root(root.lexical, entry.path)
+    if source_text.path_within(root.lexical, self.path) then
+      local relative = relative_to_root(root.lexical, self.path)
       selected = consider_source_selection(
-        selected, index, relative, entry.path)
+        selected, index, relative, self.path)
     end
-    if path_within(root.canonical, entry.canonical_path) then
-      local relative = relative_to_root(root.canonical, entry.canonical_path)
+    if source_text.path_within(root.canonical, self.canonical_path) then
+      local relative = relative_to_root(root.canonical, self.canonical_path)
       selected = consider_source_selection(
         selected, index, relative,
-        rebase_path(entry.canonical_path, root.canonical, root.lexical))
+        source_text.rebase_path(
+          self.canonical_path, root.canonical, root.lexical))
     end
   end
   return selected
 end
 
-local function map_to_source_root(entry: FileEntry,
-                                  selection: SourceSelection): FileEntry
-  return FileEntry.new(
-    entry.path, selection.source_path, entry.canonical_path,
-    selection.relative, relative_parent(selection.relative), entry.basename)
+local function FileEntry:map_to_source_root(
+    selection: SourceSelection): FileEntry
+  return FileEntry {
+    path = self.path,
+    source_path = selection.source_path,
+    canonical_path = self.canonical_path,
+    relative = selection.relative,
+    directory = relative_parent(selection.relative),
+    basename = self.basename,
+  }
 end
 
-local function module_path(name: string): string
+--- Translate a dotted logical module name to its slash-separated relative path.
+function module_path(name: string): string
   local output = strings.writer()
   for index = 1, #name do
     local byte: integer = strings.byte(name, index)
@@ -880,7 +810,8 @@ local function module_path(name: string): string
   return output:drain()
 end
 
-local function terminal_component(name: string): string
+--- Return the final dot-separated component of a logical module name.
+function terminal_component(name: string): string
   local start = 1
   for index = 1, #name do
     if strings.byte(name, index) == 46 then start = index + 1 end
@@ -888,7 +819,8 @@ local function terminal_component(name: string): string
   return strings.sub(name, start)
 end
 
-local function module_owner(name: string): string?
+--- Return the enclosing parent module name, or nil for a top-level module.
+function module_owner(name: string): string?
   local finish = 0
   for index = 1, #name do
     if strings.byte(name, index) == 46 then finish = index - 1 end
@@ -898,20 +830,18 @@ local function module_owner(name: string): string?
 end
 
 local function regular_file(path: string): boolean
-  do
-    local metadata? = fs.stat(path)
-    return metadata ~= nil and metadata.kind == "file"
-  catch
-    if error is async.CancellationReason then raise end
-    -- The compiler treats a failed source-candidate stat as a miss and keeps
-    -- searching. Only a selected folder whose contents cannot be listed is a
-    -- resolver error.
-    return false
-  end
+  local metadata? = fs.stat(path)
+  return metadata ~= nil and metadata.kind == "file"
+catch
+  if error is async.CancellationReason then raise end
+  -- The compiler treats a failed source-candidate stat as a miss and keeps
+  -- searching. Only a selected folder whose contents cannot be listed is a
+  -- resolver error.
+  return false
 end
 
 local function select_source_family(filename: string,
-                                    labels: {string}): string?
+                                    labels: const? {string}): string?
   local stem = source_stem(filename)
   for index = 1, #labels do
     local candidate = stem .. "." .. labels[index] .. ".titan"
@@ -921,44 +851,45 @@ local function select_source_family(filename: string,
   return nil
 end
 
-local function select_source_candidate(candidate: SourceFamilyCandidate,
-                                       labels: {string}): string?
+local function SourceFamilyCandidate:select(
+    labels: const? {string}): string?
   for index = 1, #labels do
-    local selected? = candidate.by_label[labels[index]]
+    local selected? = self.by_label[labels[index]]
     if selected ~= nil then return selected end
   end
-  return candidate.default_name
+  return self.default_name
 end
 
-local function source_resolution_in_root(root: SourceRoot, name: string,
-                                         selection_labels: {string},
-                                         all_labels: {string}):
+local function SourceRoot:resolve_source(name: string,
+                                         selection_labels: const? {string},
+                                         all_labels: const? {string}):
     SourceResolution?
   local relative = module_path(name)
   local basename = terminal_component(name)
-  local folder = join(root.lexical, relative)
+  local folder = source_text.join_path(self.lexical, relative)
   local folder_main? = select_source_family(
-    join(folder, basename .. ".titan"), selection_labels)
+    source_text.join_path(folder, basename .. ".titan"), selection_labels)
   if folder_main ~= nil then
     local families: {string: SourceFamilyCandidate} = {}
     local entries = fs.list(folder)
     for index = 1, #entries do
       local entry = entries[index]
-      if titan_source(entry) and regular_file(join(folder, entry)) then
+      if source_text.titan_source_path(entry) and
+         regular_file(source_text.join_path(folder, entry)) then
         local classification = bridge.classify_source_filename(entry)
         if classification.error ~= nil then
-          return SourceResolution.invalid(classification.error as string)
+          return SourceResolution.invalid(classification.error)
         end
         local logical? = classification.logical_basename
-        if logical ~= nil and (logical as string) ~= basename .. ".titan" then
-          local logical_name = logical as string
+        if logical ~= nil and logical ~= basename .. ".titan" then
+          local logical_name = logical
           local family? = families[logical_name]
           if family == nil then
-            family = SourceFamilyCandidate.new(logical_name, {}, nil)
+            family = SourceFamilyCandidate(logical_name, {})
             families[logical_name] = family
           end
           if classification.label ~= nil then
-            family.by_label[classification.label as string] = entry
+            family.by_label[classification.label] = entry
           else
             family.default_name = entry
           end
@@ -968,73 +899,59 @@ local function source_resolution_in_root(root: SourceRoot, name: string,
     local contributor_logicals: {string} = {}
     local selected_by_logical: {string: string} = {}
     for logical_name, family in iteration.pairs(families) do
-      local selected? = select_source_candidate(family, selection_labels)
+      local selected? = family:select(selection_labels)
       if selected ~= nil then
         contributor_logicals[#contributor_logicals + 1] = logical_name
-        selected_by_logical[logical_name] = selected as string
+        selected_by_logical[logical_name] = selected
       end
     end
-    sort_strings(contributor_logicals)
-    local files = {folder_main as string}
+    sort_by(contributor_logicals, identity_key)
+    local files: {string} = {folder_main}
     for index = 1, #contributor_logicals do
       local logical_name = contributor_logicals[index]
-      files[#files + 1] = join(folder, selected_by_logical[logical_name])
+      files[#files + 1] = source_text.join_path(
+        folder, selected_by_logical[logical_name])
     end
-    return SourceResolution.found(
-      ModuleKind.folder(), folder_main as string, files)
+    return SourceResolution.found(ModuleKind.folder(), folder_main, files)
   end
 
   local flat? = select_source_family(
-    join(root.lexical, relative .. ".titan"), selection_labels)
+    source_text.join_path(self.lexical, relative .. ".titan"), selection_labels)
   if flat == nil then return nil end
   local owner? = module_owner(name)
   if owner ~= nil then
     local owner_main? = select_source_family(
-      join(
-        join(root.lexical, module_path(owner)),
+      source_text.join_path(
+        source_text.join_path(self.lexical, module_path(owner)),
         terminal_component(owner) .. ".titan"),
       all_labels)
     if owner_main ~= nil then
-      return SourceResolution.blocked(owner_main as string)
+      return SourceResolution.blocked(owner_main)
     end
   end
-  return SourceResolution.found(
-    ModuleKind.flat(), flat as string, {flat as string})
+  return SourceResolution.found(ModuleKind.flat(), flat, {flat})
 end
 
-local function resolve_source(roots: {SourceRoot}, name: string,
-                              selection_labels: {string},
-                              all_labels: {string}):
+local function resolve_source(roots: const? {SourceRoot}, name: string,
+                              selection_labels: const? {string},
+                              all_labels: const? {string}):
     SourceResolution?
   for index = 1, #roots do
-    local resolved? = source_resolution_in_root(
-      roots[index], name, selection_labels, all_labels)
+    local resolved? = roots[index]:resolve_source(
+      name, selection_labels, all_labels)
     if resolved ~= nil then return resolved end
   end
   return nil
 end
 
-local function module_is_folder(module: Module): boolean
-  return module:is_folder()
-end
-
-local function physical_is_folder(kind: ModuleKind): boolean
-  case kind
-  when folder() then return true
-  else return false
-  end
-end
-
-local function same_physical_source(module: Module,
-                                    kind: ModuleKind,
-                                    files: {string}): boolean
-  if module_is_folder(module) ~= physical_is_folder(kind) or
-     #module.files ~= #files then
+local function Module:matches_physical_source(
+    kind: ModuleKind, files: const? {string}): boolean
+  if self:is_folder() ~= kind:is_folder() or #self.files ~= #files then
     return false
   end
-  for index = 1, #module.files do
-    if canonical_path(module.files[index]) ~= canonical_path(files[index])
-       then
+  for index = 1, #self.files do
+    if workspace_roots.canonical(self.files[index]) ~=
+       workspace_roots.canonical(files[index]) then
       return false
     end
   end
@@ -1058,17 +975,17 @@ local function discover_or_raise(include: {string}, exclude: {string},
   local source_present: {string: boolean} = {}
   for index = 1, #source_module_roots do
     local root = absolute_root(source_module_roots[index])
-    local canonical = canonical_path(root)
+    local canonical = workspace_roots.canonical(root)
     if not source_present[canonical] then
       source_present[canonical] = true
-      source_roots[#source_roots + 1] = SourceRoot.new(root, canonical)
+      source_roots[#source_roots + 1] = SourceRoot(root, canonical)
     end
   end
 
   local excluded: {string} = {}
   local excluded_present: {string: boolean} = {}
   for index = 1, #exclude do
-    local path = canonical_path(absolute_root(exclude[index]))
+    local path = workspace_roots.canonical(absolute_root(exclude[index]))
     if not excluded_present[path] then
       excluded_present[path] = true
       excluded[#excluded + 1] = path
@@ -1088,22 +1005,22 @@ local function discover_or_raise(include: {string}, exclude: {string},
     for candidate_index = 1, #roots do
       local candidate = roots[candidate_index]
       if candidate.canonical ~= root.canonical and
-         path_within(root.canonical, candidate.canonical) then
-        boundaries[#boundaries + 1] = rebase_path(
+         source_text.path_within(root.canonical, candidate.canonical) then
+        boundaries[#boundaries + 1] = source_text.rebase_path(
           candidate.canonical, root.canonical, root.lexical)
       end
     end
     local root_excluded: {string} = {}
     for excluded_index = 1, #excluded do
       local excluded_path = excluded[excluded_index]
-      if path_within(excluded_path, root.canonical) then
+      if source_text.path_within(excluded_path, root.canonical) then
         root_excluded[#root_excluded + 1] = root.lexical
-      elseif path_within(root.canonical, excluded_path) then
-        root_excluded[#root_excluded + 1] = rebase_path(
+      elseif source_text.path_within(root.canonical, excluded_path) then
+        root_excluded[#root_excluded + 1] = source_text.rebase_path(
           excluded_path, root.canonical, root.lexical)
       end
     end
-    local found = scan_root(root, root_excluded, boundaries, source_roots)
+    local found = root:scan(root_excluded, boundaries, source_roots)
     for index = 1, #found.directories do
       local directory = found.directories[index]
       if not directory_present[directory] then
@@ -1120,16 +1037,16 @@ local function discover_or_raise(include: {string}, exclude: {string},
   for index = 1, #source_roots do entries_by_source_root[index] = {} end
   for index = 1, #entries do
     local entry = entries[index]
-    local selection? = selected_source_root(entry, source_roots)
+    local selection? = entry:select_source_root(source_roots)
     if selection == nil then
-      issues[#issues + 1] = Issue.new(
+      issues[#issues + 1] = Issue(
         entry.path,
         "saved Titan source is not beneath any source_module_roots entry; " ..
         "it is excluded from project analysis and watching",
         IssueKind.unmapped_source())
     else
       local bucket = entries_by_source_root[selection.root_index]
-      bucket[#bucket + 1] = map_to_source_root(entry, selection)
+      bucket[#bucket + 1] = entry:map_to_source_root(selection)
     end
   end
 
@@ -1143,17 +1060,17 @@ local function discover_or_raise(include: {string}, exclude: {string},
   local candidates: {string: Candidate} = {}
   local candidate_names: {string} = {}
   for root_index = 1, #source_roots do
+    local root_entries = entries_by_source_root[root_index]
     local catalog = discover_entries(
-      entries_by_source_root[root_index], target, selection_labels)
+      root_entries, target, selection_labels)
     for index = 1, #catalog.modules do
       local module = catalog.modules[index]
       if candidates[module.name] == nil then
-        candidates[module.name] = Candidate.new(
-          module, catalog.owner_by_file)
+        candidates[module.name] = Candidate(module, catalog.owner_by_file)
         candidate_names[#candidate_names + 1] = module.name
       else
         local selected = candidates[module.name]
-        issues[#issues + 1] = Issue.new(
+        issues[#issues + 1] = Issue(
           module.main_file,
           "logical Titan module '" .. module.name ..
           "' is shadowed by earlier source_module_roots provider '" ..
@@ -1165,14 +1082,14 @@ local function discover_or_raise(include: {string}, exclude: {string},
     end
   end
 
-  sort_strings(candidate_names)
+  sort_by(candidate_names, identity_key)
   for index = 1, #candidate_names do
     local name = candidate_names[index]
     local candidate = candidates[name]
     local resolved? = resolve_source(
       source_roots, name, selection_labels, all_labels)
     if resolved == nil then
-      issues[#issues + 1] = Issue.new(
+      issues[#issues + 1] = Issue(
         candidate.module.main_file,
         "logical Titan module '" .. name ..
         "' is not resolvable through source_module_roots",
@@ -1180,22 +1097,22 @@ local function discover_or_raise(include: {string}, exclude: {string},
     else
       case resolved
       when blocked(blocking_source) then
-        issues[#issues + 1] = Issue.new(
+        issues[#issues + 1] = Issue(
           candidate.module.main_file,
           "logical Titan module '" .. name ..
           "' is blocked by folder source '" .. blocking_source .. "'",
           IssueKind.invalid_module())
       when invalid(message) then
-        issues[#issues + 1] = Issue.new(
+        issues[#issues + 1] = Issue(
           candidate.module.main_file, message, IssueKind.invalid_module())
       when found{kind; main_file; files} then
-        if same_physical_source(candidate.module, kind, files) then
+        if candidate.module:matches_physical_source(kind, files) then
           modules[#modules + 1] = candidate.module
           for file, owner in iteration.pairs(candidate.owner_by_file) do
             if owner == name then owner_by_file[file] = name end
           end
         else
-          issues[#issues + 1] = Issue.new(
+          issues[#issues + 1] = Issue(
             candidate.module.main_file,
             "logical Titan module '" .. name ..
             "' resolves to a different physical provider through " ..
@@ -1206,29 +1123,32 @@ local function discover_or_raise(include: {string}, exclude: {string},
     end
   end
 
-  sort_modules(modules)
-  sort_issues(issues)
+  sort_by(modules, module_key)
+  sort_by(issues, issue_key)
   local include_roots: {string} = {}
   for index = 1, #roots do include_roots[index] = roots[index].lexical end
   local source_root_paths: {string} = {}
   for index = 1, #source_roots do
     source_root_paths[index] = source_roots[index].lexical
   end
-  return Discovery.new(
-    include_roots, source_root_paths, directories,
-    modules, owner_by_file, issues)
+  return Discovery {
+    include_roots = include_roots,
+    source_roots = source_root_paths,
+    directories = directories,
+    modules = modules,
+    owner_by_file = owner_by_file,
+    issues = issues,
+  }
 end
 
 --- Discover source modules using ordered include, exclude, and source-root rules.
 function discover(include: {string}, exclude: {string},
     source_module_roots: {string}, target: string?): (Discovery?, Error?)
-  do
-    return discover_or_raise(include, exclude, source_module_roots, target), nil
-  catch
-    if error is async.CancellationReason then raise end
-    if error is Error then return nil, error as Error end
-    local path = ""
-    if #include > 0 then path = include[1] end
-    return nil, Error.new(path, strings.tostring(error))
-  end
+  return discover_or_raise(include, exclude, source_module_roots, target), nil
+catch
+  if error is async.CancellationReason then raise end
+  if error is Error then return nil, error as Error end
+  local path = ""
+  if #include > 0 then path = include[1] end
+  return nil, Error(path, strings.tostring(error))
 end

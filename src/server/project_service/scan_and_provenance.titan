@@ -1,0 +1,606 @@
+-- Stable file reads, discovery acceptance, and header/external provenance revalidation.
+
+-- An unchanged observation reuses its certified content without reading it.
+-- Replacement and symlink retargeting are new physical inputs, irrespective
+-- of the saved timestamp. Changed timestamps trigger one stable read/hash.
+local function read_saved_file(path: string, previous: project_graph.FileStamp?,
+    cached_contents: string?): (string?, project_graph.FileStamp?, integer, integer)
+  local reads = 0
+  for _ = 1, 3 do
+    local before? = content_identity.observe(path)
+    if before == nil then return nil, nil, reads, 0 end
+    if before.kind ~= "file" then
+      return fail<|string|>(path, "path is not a regular file"), nil, reads, 0
+    end
+    if previous ~= nil and previous.path == path and previous.identity ~= nil and
+       previous.physical_identity == before.physical_identity and
+       previous.modified_seconds == before.modified_seconds and
+       previous.modified_nanoseconds == before.modified_nanoseconds and
+       previous.size == before.size then
+      return cached_contents, previous, reads, 0
+    end
+    local contents = fs.read_file(path)
+    reads = reads + 1
+    local after? = content_identity.observe(path)
+    if after ~= nil and content_identity.same_observation(before, after) then
+      return contents, project_graph.FileStamp {
+        path = path,
+        modified_seconds = after.modified_seconds,
+        modified_nanoseconds = after.modified_nanoseconds,
+        size = after.size,
+        identity = content_identity.digest(contents),
+        physical_identity = after.physical_identity,
+      }, reads, 1
+    end
+  end
+  return fail<|string|>(path,
+    "saved input changed repeatedly while it was being read"), nil, reads, 0
+end
+
+local function Service:stamp_for(path: string, previous: project_graph.FileStamp?):
+    project_graph.FileStamp?
+  local _?, stamp?, reads, hashes = read_saved_file(path, previous)
+  self.external_read_count = self.external_read_count + reads
+  self.external_hash_count = self.external_hash_count + hashes
+  return stamp
+end
+
+local function find_stamp(stamps: const? {project_graph.FileStamp},
+                          path: string): project_graph.FileStamp?
+  for index = 1, #stamps do
+    if stamps[index].path == path then return stamps[index] end
+  end
+  return nil
+end
+
+local function find_file(source: const? {SourceFileSnapshot},
+                         filename: string): SourceFileSnapshot?
+  for index = 1, #source do
+    if source[index].filename == filename then return source[index] end
+  end
+  return nil
+end
+
+local function Service:read_stable_file(
+    filename: string, previous: SourceFileSnapshot?): SourceFileSnapshot
+  local previous_stamp: project_graph.FileStamp?
+  local previous_contents: string?
+  if previous ~= nil then
+    previous_stamp = previous.stamp
+    previous_contents = previous.contents
+  end
+  local contents?, observed?, reads, hashes = read_saved_file(
+    filename, previous_stamp, previous_contents)
+  self.read_count = self.read_count + reads
+  self.hash_count = self.hash_count + hashes
+  if contents == nil or observed == nil then
+    return fail<|SourceFileSnapshot|>(filename, "saved source file disappeared")
+  end
+  if previous ~= nil then
+    if same_observed_stamp(previous.stamp, observed) then return previous end
+    if same_stamp(previous.stamp, observed) then
+      return SourceFileSnapshot(filename, previous.contents, observed)
+    end
+  end
+  return SourceFileSnapshot(filename, contents, observed)
+end
+
+local function Service:snapshot_discovered_module(
+    module: project_discovery.Module): (ProjectState, boolean, boolean)
+  local previous? = self.metadata:project(module.name)
+  local files: {SourceFileSnapshot} = {}
+  for index = 1, #module.files do
+    local old_file: SourceFileSnapshot? = nil
+    if previous ~= nil then
+      old_file = find_file(previous.source_files, module.files[index])
+    end
+    files[index] = self:read_stable_file(module.files[index], old_file)
+  end
+
+  if previous ~= nil then
+    local changed = #previous.source_files ~= #files
+    local observed = changed
+    if not changed then
+      for index = 1, #files do
+        if previous.source_files[index].filename ~= files[index].filename or
+           not same_stamp(previous.source_files[index].stamp, files[index].stamp) then
+          changed = true
+          observed = true
+          break
+        end
+        if not same_observed_stamp(previous.source_files[index].stamp,
+            files[index].stamp) then observed = true end
+      end
+    end
+    return ProjectState(
+      module.name, files, previous.compiler_snapshot, previous.diagnostics),
+      changed, observed
+  end
+  return ProjectState {
+    module_name = module.name,
+    source_files = files,
+    diagnostics = {},
+  }, true, true
+end
+
+local function state_stamps(state: ProjectState): {project_graph.FileStamp}
+  local result: {project_graph.FileStamp} = {}
+  for index = 1, #state.source_files do
+    result[index] = state.source_files[index].stamp
+  end
+  return result
+end
+
+local function Service:restat_header_dependencies(
+    module_name: string,
+    dependencies: const? {compiler_bridge.CHeaderDependency},
+    validation: compiler_bridge.HeaderValidation?):
+    ({compiler_bridge.CHeaderDependency}, boolean)
+  if #dependencies == 0 then return {}, false end
+  if self.header_restater == nil then
+    return fail<|{compiler_bridge.CHeaderDependency}|>(module_name,
+      "analyzer reported C header dependencies without a header restater"), false
+  end
+  local current, changed = self.header_restater({...dependencies}, validation)
+  if #current ~= #dependencies then
+    return fail<|{compiler_bridge.CHeaderDependency}|>(module_name,
+      "header restater returned the wrong number of dependencies"), false
+  end
+  for index = 1, #dependencies do
+    local before = dependencies[index]
+    local after = current[index]
+    if before.kind:name() ~= after.kind:name() or
+       before.path ~= after.path then
+      return fail<|{compiler_bridge.CHeaderDependency}|>(module_name,
+        "header restater changed dependency kind/path at index " .. index), false
+    elseif after.identity == "" then
+      return fail<|{compiler_bridge.CHeaderDependency}|>(module_name,
+        "header restater returned an empty identity at index " .. index), false
+    end
+  end
+  return {...current}, changed
+end
+
+local function Service:accept_revalidated_headers(
+    module_name: string,
+    current: {compiler_bridge.CHeaderDependency}, changed: boolean?): boolean
+  local previous? = self.metadata:header(module_name)
+  if changed ~= true and previous ~= nil and
+     same_header_dependencies(previous.dependencies, current) then
+    if not same_header_observations(previous.dependencies, current) then
+      self:update_metadata(function ()
+        self.metadata:refresh_header_observations(module_name, current)
+      end)
+    end
+    return false
+  end
+  self:update_metadata(function ()
+    self:remember_header_fingerprint(module_name, current)
+    if previous ~= nil then
+      if self.metadata:has_project(module_name) then
+        self.graph:invalidate_project(module_name)
+      elseif self.metadata:has_external(module_name) or
+             #self.graph:reverse_imports(module_name) > 0 then
+        self:retire_external_browser_owner(module_name)
+        self.graph:invalidate_external_change(module_name)
+      end
+    end
+  end)
+  return true
+end
+
+-- Refresh the baseline before selecting compiler work. Store the current
+-- identity before invalidation so repeated scans of the same filesystem state
+-- do not advance the graph revision forever.
+local function Service:revalidate_known_headers()
+  local names = self.metadata:header_names()
+  local validation = compiler_bridge.header_validation()
+  for index = 1, #names do
+    local name = names[index]
+    local previous? = self.metadata:header(name)
+    if previous ~= nil then
+      local current, changed = self:restat_header_dependencies(
+        name, previous.dependencies, validation)
+      if changed or not same_header_observations(previous.dependencies, current) then
+        self:accept_revalidated_headers(name, current, changed)
+      end
+    end
+  end
+end
+
+local function Service:invalidate_all_projects()
+  local project_names = self.metadata:project_names()
+  for index = 1, #project_names do
+    self.graph:invalidate_project(project_names[index])
+  end
+end
+
+local function Service:clear_external_cache()
+  local names = self.metadata:external_names()
+  for index = 1, #names do
+    self.graph:prune_external(names[index])
+    self:forget_header_fingerprint(names[index])
+  end
+  self.metadata:clear_externals()
+end
+
+local function Service:source_required_for_external(name: string): boolean
+  local remembered? = self.metadata:fingerprint(name)
+  if remembered ~= nil then return remembered.source_required end
+  local reverse = self.graph:reverse_imports(name)
+  for index = 1, #reverse do
+    case reverse[index].visibility
+    when source_required() then return true
+    else
+    end
+  end
+  return false
+end
+
+local function Service:fingerprint_from_resolution(
+    resolution: compiler_bridge.ExternalResolution,
+    source_required: boolean, previous: ExternalFingerprint?): ExternalFingerprint
+  local origin?: ExternalOrigin = nil
+  local paths: {string} = {}
+  if resolution.provenance ~= nil then
+    case resolution.provenance
+    when external_source{main_file; source_files} then
+      origin = ExternalOrigin.source(main_file, {...source_files})
+      paths = source_files
+    when dynamic_binary{provider_file} then
+      origin = ExternalOrigin.dynamic_binary(provider_file)
+      paths[1] = provider_file
+    when static_binary{provider_file} then
+      origin = ExternalOrigin.static_binary(provider_file)
+      paths[1] = provider_file
+    when project_source() then
+      return fail<|ExternalFingerprint|>(resolution.module_name,
+        "external resolver returned project-source provenance")
+    end
+  end
+
+  local stamps: {project_graph.FileStamp} = {}
+  local message? = resolution.error
+  for index = 1, #paths do
+    local old: project_graph.FileStamp?
+    if previous ~= nil then old = find_stamp(previous.stamps, paths[index]) end
+    local stamp? = self:stamp_for(paths[index], old)
+    if stamp == nil then
+      message = "resolved external file disappeared before analysis: " ..
+                paths[index]
+      stamps = {}
+      break
+    end
+    stamps[index] = stamp
+  end
+  return ExternalFingerprint {
+    module_name = resolution.module_name,
+    source_required = source_required,
+    topology_resolved = true,
+    origin = origin,
+    stamps = stamps,
+    error = message,
+  }
+end
+
+local function Service:restat_external_fingerprint(
+    previous: ExternalFingerprint): ExternalFingerprint
+  local origin? = previous.origin
+  local paths: {string} = {}
+  if origin ~= nil then
+    case origin
+    when source{source_files} then paths = source_files
+    when dynamic_binary{provider_file} then paths[1] = provider_file
+    when static_binary{provider_file} then paths[1] = provider_file
+    end
+  end
+  local stamps: {project_graph.FileStamp} = {}
+  local message? = previous.error
+  if origin ~= nil then message = nil end
+  for index = 1, #paths do
+    local stamp? = self:stamp_for(paths[index], find_stamp(previous.stamps, paths[index]))
+    if stamp == nil then
+      message = "resolved external file disappeared before analysis: " ..
+                paths[index]
+      stamps = {}
+      break
+    end
+    stamps[index] = stamp
+  end
+  return ExternalFingerprint {
+    module_name = previous.module_name,
+    source_required = previous.source_required,
+    topology_resolved = previous.topology_resolved,
+    origin = origin,
+    stamps = stamps,
+    error = message,
+  }
+end
+
+local function Service:accept_revalidated_fingerprint(
+    current: ExternalFingerprint)
+  local previous? = self.metadata:fingerprint(current.module_name)
+  local external? = self.metadata:external(current.module_name)
+  local matches_external = external ~= nil and external_matches_fingerprint(external, current)
+  local changed = false
+  if previous ~= nil then
+    changed = not same_external_fingerprint(previous, current)
+  else
+    changed = external ~= nil and not matches_external
+  end
+  local observation_changed = previous == nil or
+    not same_observed_stamps(previous.stamps, current.stamps)
+  local refresh_external = matches_external and
+    not same_observed_stamps(external.stamps, current.stamps)
+  if not changed and not observation_changed and not refresh_external then return end
+  self:update_metadata(function ()
+    if changed or previous == nil then
+      self.metadata:write_fingerprint(current)
+    elseif observation_changed then
+      self.metadata:refresh_fingerprint_observations(current.module_name, current.stamps)
+    end
+    if refresh_external then
+      self.metadata:refresh_external_observations(current.module_name, current.stamps)
+      self.graph:refresh_file_observations(current.module_name, current.stamps)
+    end
+    if changed then
+      -- A source-required preference can change even when the same external
+      -- source and its already accepted interface remain eligible.
+      if external ~= nil and not matches_external then
+        self:retire_external_browser_owner(current.module_name)
+      end
+      self.graph:invalidate_external_change(current.module_name)
+    end
+  end)
+end
+
+-- Re-resolve only import names already present in committed or pending
+-- external metadata. This sees provider precedence changes and complete folder
+-- membership without walking or watching any external source tree. Contextual
+-- owners carried by their exposer have fixed physical identity instead; those
+-- metadata-only fingerprints are re-statted without inventing an ordinary
+-- resolver/import choice.
+local function Service:revalidate_external_topology()
+  local fingerprint_names = self.metadata:fingerprint_names()
+  if #fingerprint_names == 0 then return end
+  local requests: {compiler_bridge.ExternalResolutionRequest} = {}
+  for index = 1, #fingerprint_names do
+    local name = fingerprint_names[index]
+    local previous? = self.metadata:fingerprint(name)
+    if previous ~= nil then
+      if previous.topology_resolved and self.external_resolver ~= nil then
+        requests[#requests + 1] =
+          compiler_bridge.ExternalResolutionRequest(
+            name, self:source_required_for_external(name))
+      else
+        self:accept_revalidated_fingerprint(
+          self:restat_external_fingerprint(previous))
+      end
+    end
+  end
+  if #requests == 0 then return end
+  local resolutions = self.external_resolver(
+    self.current_config:copy(), self.metadata:project_names(), requests)
+  if #resolutions ~= #requests then
+    raise Error(self.project_root,
+      "external resolver returned the wrong number of results")
+  end
+
+  for index = 1, #requests do
+    local request = requests[index]
+    local resolution = resolutions[index]
+    if resolution.module_name ~= request.module_name then
+      raise Error(self.project_root,
+        "external resolver returned '" .. resolution.module_name ..
+        "' while resolving '" .. request.module_name .. "'")
+    end
+    local current = self:fingerprint_from_resolution(
+      resolution, request.source_required, self.metadata:fingerprint(request.module_name))
+    self:accept_revalidated_fingerprint(current)
+  end
+end
+
+local function Service:revalidate_external_files()
+  local names = self.metadata:external_names()
+  for index = 1, #names do
+    local name = names[index]
+    local external? = self.metadata:external(name)
+    if external ~= nil then
+      local current: {project_graph.FileStamp} = {}
+      local missing = false
+      for file_index = 1, #external.stamps do
+        local previous_stamp = external.stamps[file_index]
+        local stamp? = self:stamp_for(previous_stamp.path, previous_stamp)
+        if stamp == nil then
+          missing = true
+          break
+        end
+        current[file_index] = stamp
+      end
+
+      if missing then
+        self:update_metadata(function ()
+          self.graph:remove_module(name)
+          self.metadata:remove_external(name)
+          self:forget_header_fingerprint(name)
+        end)
+      elseif not same_stamps(current, external.stamps) then
+        self:update_metadata(function ()
+          case external.origin
+          when source() then
+            self.graph:upsert_external_source(
+              name, current, comparison_manifest(external.manifest), external.imports)
+          when dynamic_binary() then
+            self.graph:upsert_external_binary(
+              name, current, comparison_manifest(external.manifest), external.imports)
+          when static_binary() then
+            self.graph:upsert_external_binary(
+              name, current, comparison_manifest(external.manifest), external.imports)
+          end
+          self.metadata:write_external(ExternalModule {
+            module_name = name,
+            origin = external.origin,
+            manifest = external.manifest,
+            stamps = current,
+            analyzed_input_identity = external.analyzed_input_identity,
+            imports = external.imports,
+            compiler_imports = external.compiler_imports,
+            c_header_dependencies = external.c_header_dependencies,
+          })
+          -- The old manifest cannot prove that changed external bytes kept the
+          -- same interface. Cross external metadata nodes to every first project
+          -- consumer; those projects' recomputed manifests govern propagation
+          -- through the project graph.
+          self:retire_external_browser_owner(name)
+          self.graph:invalidate_external_change(name)
+        end)
+      elseif not same_observed_stamps(current, external.stamps) then
+        self:update_metadata(function ()
+          self.graph:refresh_file_observations(name, current)
+          self.metadata:refresh_external_observations(name, current)
+        end)
+      end
+    end
+  end
+end
+
+local function Service:accept_discovery(loaded: project_config.ProjectConfig,
+    found: project_discovery.Discovery): Snapshot
+  local started = logging.clock()
+  local reads_before = self.read_count
+  local hashes_before = self.hash_count
+  local external_reads_before = self.external_read_count
+  local external_hashes_before = self.external_hash_count
+  logging.emit("debug", "project.scan.start", {
+    ["root"] = self.project_root,
+    ["generation"] = self.graph:generation(),
+  })
+  -- Compare with the configuration that produced the persisted graph, even
+  -- when construction loaded a newer configuration before this first scan.
+  -- Exclude remains watcher policy and is omitted from semantic_identity.
+  local configuration = loaded:semantic_identity()
+  local remembered_configuration = sql.rows(self.graph.connection,
+    "SELECT value FROM main.cache_meta WHERE key=?",
+    sqlite3.Blob("graph_configuration"))
+  local config_changed = #remembered_configuration == 0 or
+    sql.bytes(remembered_configuration[1], 1) ~= configuration
+  local next_projects: {string: ProjectState} = {}
+  local changed_sources: {string: boolean} = {}
+  local observed_sources: {string: boolean} = {}
+  local next_names: {string} = {}
+  for index = 1, #found.modules do
+    local module = found.modules[index]
+    local state, changed, observed = self:snapshot_discovered_module(module)
+    next_projects[module.name] = state
+    changed_sources[module.name] = changed
+    observed_sources[module.name] = observed
+    next_names[index] = module.name
+  end
+
+  do
+    local connection = self.graph.connection
+    local saved_asts = self.graph:checkpoint_asts()
+    connection:set_autocommit(false)
+    local published = false
+    defer do
+      if not published then
+        connection:rollback()
+        self.graph:restore_asts(saved_asts)
+      end
+    end
+    local old_names = self.metadata:project_names()
+    for index = 1, #old_names do
+      local name = old_names[index]
+      if next_projects[name] == nil then
+        self.graph:remove_module(name)
+        self.metadata:remove_project(name)
+        self:forget_header_fingerprint(name)
+      end
+    end
+    for index = 1, #next_names do
+      local name = next_names[index]
+      local state = next_projects[name]
+      local observation = self.graph:observe_project(name, state_stamps(state))
+      if changed_sources[name] then
+        if not observation.changed then self.graph:invalidate_project(name) end
+        self.metadata:write_project_sources(name, state.source_files)
+      elseif observed_sources[name] then
+        self.metadata:refresh_project_observations(name, state.source_files)
+      end
+    end
+    if config_changed then
+      self:invalidate_all_projects()
+      -- Every resolution input is configuration-dependent, including FFI
+      -- include paths used while checking external source. Do not carry an old
+      -- serialized interface or provider identity across any config change.
+      self:clear_external_cache()
+      -- Search observations are relative to the configured compiler paths. The
+      -- projects are already dirty, so let their next compiler result establish
+      -- a fresh closure instead of restatting obsolete candidates.
+      self.metadata:clear_headers()
+      -- A process can stop after graph checking but before semantic/cache
+      -- publication. Keep this identity with the work revisions themselves.
+      sql.execute(connection,
+        "INSERT INTO main.cache_meta(key,value) VALUES(?,?) " ..
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        sqlite3.Blob("graph_configuration"), sqlite3.Blob(configuration))
+    end
+    connection:commit()
+    published = true
+  end
+  self.current_config = loaded
+  self.configuration_identity = configuration
+  self.catalog = found
+  if self.external_resolver == nil then
+    self:revalidate_external_files()
+  end
+  self:revalidate_external_topology()
+  self:revalidate_known_headers()
+  local snapshot = self:latest_inner()
+  logging.emit("debug", "project.scan.complete", {
+    ["generation"] = snapshot.generation,
+    ["source_content_reads"] = self.read_count - reads_before,
+    ["source_content_hashes"] = self.hash_count - hashes_before,
+    ["external_content_reads"] = self.external_read_count - external_reads_before,
+    ["external_content_hashes"] = self.external_hash_count - external_hashes_before,
+    ["project_modules"] = #snapshot.project_modules,
+    ["project_directories"] = #snapshot.project_directories,
+    ["dirty_modules"] = logging.summarize_strings(
+      snapshot.dirty_modules),
+    ["config_changed"] = config_changed,
+    ["cpu_ms"] = logging.elapsed_ms(started),
+  })
+  return snapshot
+end
+
+local function Service:scan_or_raise(): Snapshot
+  local loaded?, config_error? = project_config.load(
+    self.project_root, self.installed_binary_modules_root,
+    self.selected_inventory_directory)
+  if loaded == nil then
+    return fail<|Snapshot|>(config_error.path, config_error.message)
+  end
+  if loaded.target ~= self.current_config.target then
+    return fail<|Snapshot|>(loaded.config_file or self.project_root,
+      "analysis target changed; restart this root's language-server worker")
+  end
+  local found?, discovery_error? = project_discovery.discover(
+    loaded.include, loaded.exclude, loaded.source_module_roots, loaded.target)
+  if found == nil then
+    return fail<|Snapshot|>(discovery_error.path, discovery_error.message)
+  end
+
+  return self:accept_discovery(loaded, found)
+end
+
+--- Reconcile saved filesystem inputs into project state before selecting compiler work.
+function Service:scan(): (Snapshot?, Error?)
+  local access = self.store:acquire()
+  defer access:release()
+  do
+    return self:scan_or_raise(), nil
+  catch
+    if error is async.CancellationReason then raise end
+    return nil, service_error(self.project_root, error)
+  end
+end
