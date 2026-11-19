@@ -1,112 +1,20 @@
 local staticmetadata = require "titan-compiler.staticmetadata"
 
-local EXPECTED_ABI = "2"
-local EXPECTED_MODULES = {
-    "titan.async",
-    "titan.coroutine",
-    "titan.fs",
-    "titan.gc",
-    "titan.http",
-    "titan.io",
-    "titan.iteration",
-    "titan.json",
-    "titan.lua",
-    "titan.math",
-    "titan.net",
-    "titan.os",
-    "titan.path",
-    "titan.peg",
-    "titan.protobuf",
-    "titan.reflect",
-    "titan.sqlite3",
-    "titan.ssl",
-    "titan.string",
-    "titan.test",
-    "titan.thread",
-    "titan.timer",
-    "titan.transfer",
-    "titan.url",
-    "titan.uv",
-    "titan.websocket"
-}
-local MODERN_MODULES = {
-    ["titan.protobuf"] = true,
-    ["titan.thread"] = true,
-    ["titan.transfer"] = true,
-}
+local source_dir = arg[0]:match("^(.*[/\\])") or "./"
+local helper_source
+do
+    local file <close> = assert(io.open(source_dir .. "standard-interface-inventory.lua", "rb"))
+    helper_source = assert(file:read("a"))
+end
+local inventory = assert(load(helper_source, "@standard-interface-inventory.lua", "t"))()
+local EXPECTED_ABI = inventory.abi
+local EXPECTED_MODULES = inventory.modules
+local MODERN_MODULES = inventory.modern
+local validate_inventory = inventory.validate
 
 local function script_error(message)
     io.stderr:write("generate-embedded-interfaces: ", message, "\n")
     os.exit(1)
-end
-
-local function join_quoted(values)
-    local quoted = {}
-    for index, value in ipairs(values) do
-        quoted[index] = string.format("%q", value)
-    end
-    return table.concat(quoted, ", ")
-end
-
-local function validate_inventory(entries)
-    if type(entries) ~= "table" then
-        return nil, "archive scanner returned no metadata entry table"
-    end
-
-    -- The published 0.6 source rock has 23 modules. Master adds this complete
-    -- three-module group; a partial group is an incomplete SDK, not a profile.
-    local modern = false
-    for name in pairs(MODERN_MODULES) do
-        if entries[name] ~= nil then modern = true end
-    end
-    local selected, expected = {}, {}
-    for _, name in ipairs(EXPECTED_MODULES) do
-        if modern or not MODERN_MODULES[name] then
-            selected[#selected + 1] = name
-            expected[name] = true
-        end
-    end
-
-    local missing = {}
-    for _, name in ipairs(selected) do
-        if entries[name] == nil then missing[#missing + 1] = name end
-    end
-
-    local unexpected = {}
-    for name in pairs(entries) do
-        if not expected[name] then unexpected[#unexpected + 1] = name end
-    end
-    table.sort(unexpected)
-
-    if #missing ~= 0 or #unexpected ~= 0 then
-        local parts = {}
-        if #missing ~= 0 then
-            parts[#parts + 1] = "missing " .. join_quoted(missing)
-        end
-        if #unexpected ~= 0 then
-            parts[#parts + 1] = "unexpected " .. join_quoted(unexpected)
-        end
-        return nil, "expected the exact " .. #selected ..
-            "-module Titan interface inventory (" ..
-            table.concat(parts, "; ") .. ")"
-    end
-
-    for _, name in ipairs(selected) do
-        local entry = entries[name]
-        if type(entry) ~= "table" or entry.module ~= name then
-            return nil, "metadata entry " .. string.format("%q", name) ..
-                " has an inconsistent logical module name"
-        elseif entry.abi ~= EXPECTED_ABI then
-            return nil, "metadata entry " .. string.format("%q", name) ..
-                " has ABI " .. string.format("%q", tostring(entry.abi)) ..
-                "; expected " .. string.format("%q", EXPECTED_ABI)
-        elseif type(entry.types) ~= "string" or entry.types == "" then
-            return nil, "metadata entry " .. string.format("%q", name) ..
-                " has empty or non-string type metadata"
-        end
-    end
-
-    return selected
 end
 
 local function byte_initializer(value, indent)
@@ -795,28 +703,7 @@ end
 
 local provider, scan_error
 if windows then
-    local support = require "titan"
-    local driver = require "titan-compiler.driver"
-    provider = { entries = {} }
-    for _, name in ipairs(EXPECTED_MODULES) do
-        local symbol = driver.mangle_module_name(name) .. "_abi_value"
-        local abi, error = support._abivalue(archive, symbol)
-        if abi == nil and MODERN_MODULES[name] then
-            -- The exact legacy/modern group is checked after all probes.
-        elseif abi ~= EXPECTED_ABI then
-            script_error(name .. " ABI mismatch: " .. tostring(abi or error))
-        else
-            provider.entries[name] = { module = name, abi = abi }
-        end
-    end
-    for _, name in ipairs(EXPECTED_MODULES) do
-        if provider.entries[name] then
-            local symbol = driver.mangle_module_name(name) .. "_types"
-            local query, error = support._loadlib(archive, symbol)
-            if not query then script_error(tostring(error)) end
-            provider.entries[name].types = query()
-        end
-    end
+    provider, scan_error = inventory.query(archive)
 else
     provider, scan_error = staticmetadata.scan_archive(archive, { expected_abi = EXPECTED_ABI })
 end
@@ -892,7 +779,12 @@ end
 if not contents then
     script_error(string.format("archive %q: %s", archive, render_error))
 end
-contents = contents .. "\n"
+contents = contents .. "\n" ..
+    render_array("titan_ls_standard_interfaces_source", helper_source) .. "\n" ..
+    [[const unsigned char *titan_ls_standard_interfaces_helper(size_t *size) {
+    *size = sizeof(titan_ls_standard_interfaces_source);
+    return titan_ls_standard_interfaces_source;
+}]] .. "\n"
 
 local wrote, write_error = write_if_changed(output, contents)
 if not wrote then script_error(write_error) end

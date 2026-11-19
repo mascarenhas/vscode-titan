@@ -1,4 +1,10 @@
 foreign import "compiler_io_platform.h"
+local async = import "async"
+local fs = import "fs"
+local os = import "os"
+local selected = import "server.selected_interfaces.titan"
+local test_runtime = import "server.test_runtime"
+local timer = import "timer"
 local test = import "test"
 local iteration = import "iteration"
 local lua = import "lua"
@@ -183,4 +189,101 @@ function test_embedded_interfaces_native_windows_identity_is_complete(_context: 
   end
   test.assert(current["path"] == provider["provider_file"],
               "embedded inventory and identity used different mapped images")
+end
+
+local function copy_file(source: string, destination: string)
+  local input = fs.open(source, "r")
+  defer input:close()
+  local output = fs.open(destination, "w")
+  defer output:close()
+  for bytes in input:read do output:write(bytes) end
+end
+
+local function with_selected_provider(
+    body: function (string, string, string): ())
+  local prefix = os.getenv("TITAN_ROOT")
+  local folder = fs.tmpname()
+  fs.unlink(folder)
+  fs.mkdir(folder)
+  defer fs.rmdir(folder)
+  local basename = "titan.so"
+  if ffi.VSCODE_TITAN_WINDOWS ~= 0 then basename = "titan.dll" end
+  local provider = paths.to_slash(paths.join(folder, "selected é " .. basename))
+  copy_file(paths.join(prefix, "lib/titan/0.6/" .. basename), provider)
+  defer fs.unlink(provider)
+  body(prefix, provider, folder)
+end
+
+function test_embedded_provider_helper_transfers_real_interfaces_as_binary(
+    _context: test.Context)
+  test_runtime.run(function ()
+    with_selected_provider(function (prefix: string, provider: string, _: string)
+      local source = selected.helper_source()
+      local bytes = selected.extract(prefix, provider, source)
+      local snapshot = selected.decode(bytes, provider, source)
+      test.assert(snapshot["provider_file"] == provider and
+                  snapshot["target_profile"] == nil,
+                  "helper changed provider path or supplied a build C profile")
+      local entries = snapshot["entries"] as {string: value}
+      local runtime = embedded_interfaces.provider()
+      local runtime_entries = runtime["entries"] as {string: value}
+      for name, raw in iteration.pairs<|string, value|>(runtime_entries) do
+        local expected = raw as {string: value}
+        local actual = entries[name] as {string: value}
+        test.assert(actual["types"] == expected["types"],
+                    "binary transport changed exact serialized types for " .. name)
+      end
+      local rejected = false
+      do
+        selected.decode(bytes .. "garbage", provider, source)
+      catch
+        rejected = true
+      end
+      test.assert(rejected, "decoder accepted trailing bytes after a valid inventory")
+    end)
+  end)
+end
+
+function test_embedded_provider_helper_reports_failure_and_retires_cancelled_child(
+    _context: test.Context)
+  test_runtime.run(function ()
+    local prefix = os.getenv("TITAN_ROOT")
+    local marker = fs.tmpname()
+    defer fs.unlink(marker)
+    local rejected = false
+    do
+      selected.read(prefix, marker)
+    catch
+      rejected = strings.find(strings.tostring(error), "SDK Lua exited", 1, true) ~= nil
+    end
+    test.assert(rejected, "an invalid selected native image was not reported as a child failure")
+
+    local slow = [=[
+return { extract = function(_, marker, output)
+  local file = assert(io.open(marker, "wb"))
+  assert(file:write(output))
+  assert(file:close())
+  while true do end
+end }
+]=]
+    local request = async.run<|nil, value|>(function (): nil
+      selected.extract(prefix, marker, slow)
+      return nil
+    end)
+    defer request:cancel(async.CancellationReason.simple("cleanup"))
+    local output = ""
+    for attempt = 1, 1000 do
+      output = fs.read_file(marker)
+      if #output > 0 then break end
+      timer.sleep(5)
+    end
+    test.assert(#output > 0, "the owned helper never started")
+    request:cancel(async.CancellationReason.simple("cancel selected interfaces"))
+    test.assert(request:status():has_finished() == false,
+                "cancellation retired an active helper before joining")
+    local status = async.join(request)
+    test.assert(status:has_cancelled(), "the caller lost its cancellation")
+    test.assert(fs.lstat(output) == nil,
+                "the helper result was still present after cancellation returned")
+  end)
 end
