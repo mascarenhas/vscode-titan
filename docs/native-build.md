@@ -163,6 +163,17 @@ unassigned or assigned twice. Per-shard logs and `summary.json` go to
 `.build/test-shards`. `server-test-run` runs the current aggregate without
 rebuilding it.
 
+The Extension Host test config creates a new workspace in the system temporary
+directory before VS Code starts. This applies to `make extension-host-test`,
+direct `vscode-test` runs and the prepared native coverage runner. The two
+folder settings, fixtures, markers, `.titan-ls` caches and VS Code user data
+are private to that run; neither Electron nor the language server writes into
+the checkout's fixture templates. A normal exit removes the temporary
+workspace after VS Code closes. A killed run may leave its directory behind,
+but subsequent invocations never reuse it. Set `TITAN_LSP_TEST_CODE` to the
+absolute path of an existing VS Code executable to run the same config
+without downloading VS Code (for example in the Windows guest).
+
 Router lifecycle tests also use `test/fixtures/router_worker_fixture.titan`, a
 framed child peer built with the server's `framing` and `wire` modules. Make
 invokes Titan with `--tree 'src;test/fixtures' --source-first --incremental`,

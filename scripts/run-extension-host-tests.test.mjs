@@ -7,8 +7,101 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 import { terminateNativeServers } from "./run-extension-host-tests.mjs";
+import { prepareExtensionHostWorkspace } from "./extension-host-workspace.mjs";
 
 const proxy = fileURLToPath(new URL("./run-extension-host-tests.mjs", import.meta.url));
+const repository = path.dirname(path.dirname(proxy));
+
+test("direct test-cli config prepares and cleans a private workspace", async (context) => {
+  const temp = await mkdtemp(path.join(await realpath(tmpdir()), "titan host config "));
+  context.after(() => rm(temp, { recursive: true, force: true }));
+  const child = spawn(process.execPath, [
+    path.join(repository, "node_modules", "@vscode", "test-cli", "out", "bin.mjs"),
+    "--list-configuration"
+  ], {
+    cwd: repository,
+    env: { ...process.env, TMPDIR: temp, TMP: temp, TEMP: temp },
+    stdio: ["ignore", "pipe", "pipe"]
+  });
+  const closed = once(child, "close");
+  let stdout = "";
+  let stderr = "";
+  child.stdout.setEncoding("utf8").on("data", (chunk) => { stdout += chunk; });
+  child.stderr.setEncoding("utf8").on("data", (chunk) => { stderr += chunk; });
+  assert.deepEqual(await closed, [0, null], stderr);
+  const [{ config, extensionDevelopmentPath }] = JSON.parse(stdout);
+  const windows = process.platform === "win32";
+  const workspace = windows
+    ? config.launchArgs.at(-1).slice(1, -1)
+    : config.workspaceFolder;
+  const directory = path.dirname(workspace);
+  assert.equal(path.dirname(directory), temp);
+  assert.equal(path.basename(workspace), "multiroot.code-workspace");
+  const profile = path.join(directory, "user-data");
+  assert.ok(config.launchArgs.includes(windows
+    ? `--user-data-dir="${profile}"`
+    : `--user-data-dir=${profile}`));
+  if (windows) assert.equal(config.launchArgs.at(-1), `"${workspace}"`);
+  assert.deepEqual(extensionDevelopmentPath, [repository]);
+  await assert.rejects(readFile(workspace), { code: "ENOENT" });
+});
+
+test("an abandoned Extension Host workspace cannot change a later run", async (context) => {
+  const fixtures = fileURLToPath(new URL("../test/fixtures/", import.meta.url));
+  const sources = ["fake-lsp-server.cjs", ...["workspace", "workspace-beta"]
+    .flatMap((root) => ["sample.titan", "titan-config.lua"]
+      .map((filename) => path.join(root, filename)))];
+  const templateBytes = await Promise.all(sources.map((name) =>
+    readFile(path.join(fixtures, name))));
+  const first = await prepareExtensionHostWorkspace();
+  context.after(() => rm(first.directory, { recursive: true, force: true }));
+
+  const readFolders = async ({ workspace }) =>
+    JSON.parse(await readFile(workspace, "utf8")).folders;
+  const settings = (root) => path.join(root, ".vscode", "settings.json");
+  const dirtySettings = JSON.stringify({
+    "titan.languageServer.arguments": ["--fixture-token", "abandoned"]
+  }) + "\n";
+  for (const folder of await readFolders(first)) {
+    await writeFile(settings(path.join(first.directory, folder.path)), dirtySettings);
+  }
+  const firstMarker = path.join(first.directory, "workspace", ".titan-lsp-test", "events.jsonl");
+  await mkdir(path.dirname(firstMarker), { recursive: true });
+  await writeFile(firstMarker, '{"event":"initialize","fixtureToken":"stale"}\n');
+  const firstCache = path.join(first.directory, "workspace", ".titan-ls");
+  await mkdir(firstCache);
+  await writeFile(path.join(firstCache, "index.sqlite3"), "old cache");
+
+  const second = await prepareExtensionHostWorkspace();
+  context.after(() => rm(second.directory, { recursive: true, force: true }));
+  assert.notEqual(first.directory, second.directory);
+  const folders = await readFolders(second);
+  assert.deepEqual(folders, [
+    { name: "alpha", path: "workspace" },
+    { name: "beta", path: "workspace-beta" }
+  ]);
+  assert.deepEqual(await Promise.all(sources.map((name) =>
+    readFile(path.join(fixtures, name)))), templateBytes);
+  for (const folder of folders) {
+    const root = path.join(second.directory, folder.path);
+    const args = JSON.parse(await readFile(settings(root), "utf8"))["titan.languageServer.arguments"];
+    assert.deepEqual(args, [
+      "../fake-lsp-server.cjs", ".titan-lsp-test/events.jsonl", "--fixture-token", folder.name
+    ]);
+    assert.deepEqual(await readFile(path.resolve(root, args[0])),
+      await readFile(path.join(fixtures, "fake-lsp-server.cjs")));
+    for (const name of ["sample.titan", "titan-config.lua"]) {
+      assert.deepEqual(await readFile(path.join(root, name)),
+        await readFile(path.join(fixtures, folder.path, name)));
+    }
+    await assert.rejects(readFile(path.resolve(root, args[1])), { code: "ENOENT" });
+    await assert.rejects(readFile(path.join(root, ".titan-ls", "index.sqlite3")), { code: "ENOENT" });
+    assert.equal(await readFile(settings(path.join(first.directory, folder.path)), "utf8"),
+      dirtySettings);
+  }
+  assert.match(await readFile(firstMarker, "utf8"), /"fixtureToken":"stale"/);
+  assert.equal(await readFile(path.join(firstCache, "index.sqlite3"), "utf8"), "old cache");
+});
 
 async function failedHost(context, root, receipts) {
   root = await realpath(root);

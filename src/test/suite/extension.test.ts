@@ -79,8 +79,6 @@ suite("Titan extension", () => {
   let betaMarkerPath: string;
   let alphaTraceMarkerPath: string;
   let betaTraceMarkerPath: string;
-  let alphaSettingsPath: string;
-  let originalAlphaSettings: string;
 
   suiteSetup(async function () {
     this.timeout(20_000);
@@ -101,17 +99,6 @@ suite("Titan extension", () => {
     );
     alphaTraceMarkerPath = `${alphaMarkerPath}.trace`;
     betaTraceMarkerPath = `${betaMarkerPath}.trace`;
-    await Promise.all([
-      resetMarker(alphaMarkerPath),
-      resetMarker(betaMarkerPath)
-    ]);
-
-    alphaSettingsPath = path.join(
-      alpha.uri.fsPath,
-      ".vscode",
-      "settings.json"
-    );
-    originalAlphaSettings = await readFile(alphaSettingsPath, "utf8");
 
     const nodeExecutable = process.env.npm_node_execpath;
     assert.ok(nodeExecutable, "npm_node_execpath should identify Node");
@@ -151,14 +138,6 @@ suite("Titan extension", () => {
       waitForEventSequence(alphaMarkerPath, ["initialize"], 10_000),
       waitForEventSequence(betaMarkerPath, ["initialize"], 10_000)
     ]);
-  });
-
-  suiteTeardown(async () => {
-    // The scoped configuration test edits this checked-in fixture through the
-    // VS Code API. Restore its exact text even if a later assertion fails.
-    if (originalAlphaSettings !== undefined) {
-      await writeFile(alphaSettingsPath, originalAlphaSettings);
-    }
   });
 
   test("isolates multi-root clients and their lifecycle", async function () {
