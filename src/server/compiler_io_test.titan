@@ -452,7 +452,7 @@ function test_compiler_io_bounded_reader_continues_after_short_reads(
   local requests: {integer} = {}
   local index = 0
   local result = compiler_io.read_bounded_chunks(
-    function (remaining: integer): string?
+    function (remaining: integer?): string?
       requests[#requests + 1] = remaining
       index = index + 1
       return chunks[index]
@@ -466,7 +466,7 @@ function test_compiler_io_bounded_reader_continues_after_short_reads(
   local eof_chunks = {"ab", "c"}
   index = 0
   result = compiler_io.read_bounded_chunks(
-    function (_remaining: integer): string?
+    function (_: integer?): string?
       index = index + 1
       return eof_chunks[index]
     end, 5)
@@ -917,18 +917,52 @@ function test_compiler_io_atomic_siblings_preserve_native_names(context: test.Co
 end
 
 function test_compiler_io_keeps_opaque_provider_identity_complete(_context: test.Context)
-  local native = compiler_io.LstatIdentity.new(
-    "C:/provider.dll", 42, "file", nil, nil, 100, 700, "volume\0full-128-bit-file-id")
-  local same = compiler_io.LstatIdentity.new(
-    native.path, native.size, native.kind, nil, nil, 100, 700, native.native_identity)
+  local native = compiler_io.LstatIdentity {
+    path = "C:/provider.dll",
+    size = 42,
+    kind = "file",
+    modified_seconds = 100,
+    modified_nanoseconds = 700,
+    native_identity = "volume\0full-128-bit-file-id",
+  }
+  local same = compiler_io.LstatIdentity {
+    path = native.path,
+    size = native.size,
+    kind = native.kind,
+    modified_seconds = 100,
+    modified_nanoseconds = 700,
+    native_identity = native.native_identity,
+  }
   test.assert(compiler_io.same_lstat_identity(native, same), "matching opaque identity changed")
-  same.native_identity = nil
-  test.assert(not compiler_io.same_lstat_identity(native, same), "missing opaque identity fell back to integers")
-  same.native_identity = "volume\0different-full-file-id"
-  test.assert(not compiler_io.same_lstat_identity(native, same), "different full file identity was ignored")
-  same.native_identity = native.native_identity
-  same.path = "C:/other.dll"
-  test.assert(not compiler_io.same_lstat_identity(native, same), "provider pathname was ignored")
+  local missing_opaque = compiler_io.LstatIdentity {
+    path = native.path,
+    size = native.size,
+    kind = native.kind,
+    modified_seconds = 100,
+    modified_nanoseconds = 700,
+  }
+  test.assert(not compiler_io.same_lstat_identity(native, missing_opaque),
+    "missing opaque identity fell back to integers")
+  local different_opaque = compiler_io.LstatIdentity {
+    path = native.path,
+    size = native.size,
+    kind = native.kind,
+    modified_seconds = 100,
+    modified_nanoseconds = 700,
+    native_identity = "volume\0different-full-file-id",
+  }
+  test.assert(not compiler_io.same_lstat_identity(native, different_opaque),
+    "different full file identity was ignored")
+  local different_path = compiler_io.LstatIdentity {
+    path = "C:/other.dll",
+    size = native.size,
+    kind = native.kind,
+    modified_seconds = 100,
+    modified_nanoseconds = 700,
+    native_identity = native.native_identity,
+  }
+  test.assert(not compiler_io.same_lstat_identity(native, different_path),
+    "provider pathname was ignored")
   if ffi.VSCODE_TITAN_WINDOWS == 0 then
     test.assert(not compiler_io.lstat_identity_is_current(native), "Unix accepted a forged Windows identity")
   end

@@ -11,8 +11,11 @@ local content_identity = import "server.content_identity"
 foreign import "compiler_io_platform.h"
 foreign import "embedded_interfaces_native.h"
 
-local TRANSPORT_LIMIT = 8 * 1024 * 1024 + 64
-local DIAGNOSTIC_LIMIT = 8192
+local const TRANSPORT_LIMIT = 8 * 1024 * 1024 + 64
+local const DIAGNOSTIC_LIMIT = 8192
+
+local type Decoder = function (string, string, string, function (string): string): {string: value}
+local cached_decoder: Decoder? = nil
 
 local union ExtractionResult
   bytes(string)
@@ -136,11 +139,11 @@ end
 local function extract(prefix: string, path: string, source: string): string
   local program = "local inventory = (function()\n" .. source ..
     "\nend)()\ninventory.extract(arg[1], arg[2], arg[3])\n"
-  local job = Extraction.new(nil, false)
+  local job = Extraction(nil, false)
   local task = async.run<|ExtractionResult, value|>(function (): ExtractionResult
     return ExtractionResult.bytes(job:read(prefix, path, program))
   catch
-    return ExtractionResult.failed(async.Error.new(error, traceback))
+    return ExtractionResult.failed(async.Error(error, traceback))
   end)
   do
     case async.join(task)
@@ -160,8 +163,10 @@ local function extract(prefix: string, path: string, source: string): string
   return ""
 end
 
-local function decode(bytes: string, provider_file: string, source: string): {string: value}
-  local raw = lua.load([[
+local function decoder(): Decoder
+  local existing? = cached_decoder
+  if existing ~= nil then return existing end
+  local compiled = lua.load([[
 return function(payload, provider_file, source, digest)
   local inventory = assert(load(source, "=standard-interface-inventory", "t"))()
   local codec = require "titan-compiler.graphcodec"
@@ -175,9 +180,13 @@ return function(payload, provider_file, source, digest)
   assert(inventory.validate(snapshot.entries, true))
   return snapshot
 end
-]], "=server.selected_interfaces.decode", nil)()
-  local unpack = raw as function (string, string, string, function (string): string): {string: value}
-  return unpack(bytes, provider_file, source, content_identity.digest)
+]], "=server.selected_interfaces.decode", nil)() as Decoder
+  cached_decoder = compiled
+  return compiled
+end
+
+local function decode(bytes: string, provider_file: string, source: string): {string: value}
+  return decoder()(bytes, provider_file, source, content_identity.digest)
 end
 
 function read(prefix: string, provider_file: string): {string: value}
