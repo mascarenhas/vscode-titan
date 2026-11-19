@@ -12,7 +12,12 @@ local bridge = import "server.compiler_bridge"
 local logging = import "server.logging"
 local headers = import "server.header_store"
 
-local SCHEMA_VERSION = 8
+local const SCHEMA_VERSION = 8
+
+local const SCHEMA_STATEMENTS: const {string} = {
+  "CREATE TABLE IF NOT EXISTS main.project_snapshots(module BLOB PRIMARY KEY,payload BLOB NOT NULL,revision INTEGER NOT NULL) WITHOUT ROWID",
+  "CREATE TABLE IF NOT EXISTS main.compiler_inputs(path BLOB PRIMARY KEY,observation BLOB NOT NULL,fingerprint BLOB NOT NULL) WITHOUT ROWID",
+}
 
 type ProjectPayload = bridge.ProjectPayload
 
@@ -56,8 +61,8 @@ end
 -- namespace is one edit here, and the installed-kind regression covers both
 -- read paths.
 local const artifact_namespaces: const {ArtifactNamespace} = {
-  ArtifactNamespace.new("c-header-v8","main.header_graphs",2),
-  ArtifactNamespace.new("ffi-conversion-v8","main.ffi_conversion_snapshots",3),
+  ArtifactNamespace("c-header-v8","main.header_graphs",2),
+  ArtifactNamespace("ffi-conversion-v8","main.ffi_conversion_snapshots",3),
 }
 
 --- Resolve a compiler artifact namespace to its table and header scope.
@@ -88,7 +93,7 @@ end
 
 local function metadata(connection: sqlite3.Connection, key: string): string?
   local rows = sql.rows(connection,
-    "SELECT value FROM main.cache_meta WHERE key=?",sqlite3.Blob.new(key))
+    "SELECT value FROM main.cache_meta WHERE key=?", sqlite3.Blob(key))
   if #rows == 0 then return nil end
   return sql.bytes(rows[1], 1)
 end
@@ -97,7 +102,7 @@ local function write_metadata(connection: sqlite3.Connection,
                               key: string, payload: string)
   sql.execute(connection,
     "INSERT INTO main.cache_meta VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-    sqlite3.Blob.new(key), sqlite3.Blob.new(payload))
+    sqlite3.Blob(key), sqlite3.Blob(payload))
 end
 
 -- Nil means a disposable schema/root/compiler compatibility mismatch. The
@@ -123,11 +128,9 @@ local function open_compatible(path: string, compatibility: string?): Cache?
     if #checked ~= 1 or checked[1]:get(1) ~= "ok" then return nil end
   end
   headers.create(connection)
-  local schema = {
-    "CREATE TABLE IF NOT EXISTS main.project_snapshots(module BLOB PRIMARY KEY,payload BLOB NOT NULL,revision INTEGER NOT NULL) WITHOUT ROWID",
-    "CREATE TABLE IF NOT EXISTS main.compiler_inputs(path BLOB PRIMARY KEY,observation BLOB NOT NULL,fingerprint BLOB NOT NULL) WITHOUT ROWID",
-  }
-  for index = 1, #schema do sql.execute(connection, schema[index]) end
+  for index = 1, #SCHEMA_STATEMENTS do
+    sql.execute(connection, SCHEMA_STATEMENTS[index])
+  end
   -- Artifact tables come from the namespace map so a new namespace cannot
   -- stage payloads into a table this schema never created.
   for index = 1, #artifact_namespaces do
@@ -202,23 +205,21 @@ local function disk_cache(root: string, compatibility: string?): Cache
 end
 
 local function open_cache(root: string, compatibility: string?): Cache
-  do
-    local physical_root = fs.realpath(root)
-    local key?: string
-    if compatibility ~= nil then key = identity.digest(physical_root .. "\0" .. compatibility) end
-    local cache = disk_cache(physical_root, key)
-    logging.emit("debug", "cache.open", {["path"] = cache.path,["mode"] = "file"})
-    return cache
-  catch
-    if error is async.CancellationReason then raise end
-    local reason = strings.tostring(error)
-    if error is sqlite3.Error then reason = (error as sqlite3.Error).message end
-    if error is async.OperationError then reason = (error as async.OperationError).message end
-    logging.emit("info", "cache.memory_fallback", {
-      ["root"] = root, ["message"] = "Workspace persistence is unavailable: " .. reason,
-    })
-    return open_compatible(":memory:",compatibility)
-  end
+  local physical_root = fs.realpath(root)
+  local key?: string
+  if compatibility ~= nil then key = identity.digest(physical_root .. "\0" .. compatibility) end
+  local cache = disk_cache(physical_root, key)
+  logging.emit("debug", "cache.open", {["path"] = cache.path,["mode"] = "file"})
+  return cache
+catch
+  if error is async.CancellationReason then raise end
+  local reason = strings.tostring(error)
+  if error is sqlite3.Error then reason = (error as sqlite3.Error).message end
+  if error is async.OperationError then reason = (error as async.OperationError).message end
+  logging.emit("info", "cache.memory_fallback", {
+    ["root"] = root, ["message"] = "Workspace persistence is unavailable: " .. reason,
+  })
+  return open_compatible(":memory:", compatibility)
 end
 
 --- Open or rebuild a persistent workspace cache using its compatibility identity.
@@ -268,20 +269,20 @@ function Cache:inventory_identity(path: string): string
     defer access:release()
     local rows = sql.rows(access.connection,
       "SELECT observation,fingerprint FROM main.compiler_inputs WHERE path=?",
-      sqlite3.Blob.new(path))
+      sqlite3.Blob(path))
     if #rows == 1 then
       local observation: value = rows[1]:get(1)
       local fingerprint: value = rows[1]:get(2)
       if observation is sqlite3.Blob and fingerprint is sqlite3.Blob then
         local saved: sqlite3.Blob = fingerprint
         if #saved.bytes == 32 then
-          previous = InventoryInput.new(path,(observation as sqlite3.Blob).bytes,saved.bytes)
+          previous = InventoryInput(path, (observation as sqlite3.Blob).bytes, saved.bytes)
         end
       end
     end
   end
   for attempt = 1, 3 do
-    local before,physical = inventory_observation(path)
+    local before, physical = inventory_observation(path)
     if previous ~= nil and previous.observation == before then
       self.inventory_reused = self.inventory_reused + 1
       self:record_inventory(previous)
@@ -289,11 +290,11 @@ function Cache:inventory_identity(path: string): string
     end
     self.inventory_reads = self.inventory_reads + 1
     local contents = fs.read_file(path)
-    local after,_physical = inventory_observation(path)
+    local after, _ = inventory_observation(path)
     if before == after then
       self.inventory_hashes = self.inventory_hashes + 1
       local fingerprint = identity.digest(identity.digest(contents) .. physical)
-      self:record_inventory(InventoryInput.new(path,after,fingerprint))
+      self:record_inventory(InventoryInput(path, after, fingerprint))
       return fingerprint
     end
   end
@@ -301,7 +302,7 @@ function Cache:inventory_identity(path: string): string
 end
 
 function Cache:inventory_metrics(): InventoryMetrics
-  return InventoryMetrics.new(self.inventory_reads,self.inventory_hashes,self.inventory_reused)
+  return InventoryMetrics(self.inventory_reads, self.inventory_hashes, self.inventory_reused)
 end
 
 local function Cache:publish_inventory()
@@ -317,8 +318,8 @@ local function Cache:publish_inventory()
   defer insert:close()
   for index = 1, #self.inventory do
     local input = self.inventory[index]
-    insert:execute(sqlite3.Blob.new(input.path),sqlite3.Blob.new(input.observation),
-      sqlite3.Blob.new(input.fingerprint))
+    insert:execute(sqlite3.Blob(input.path), sqlite3.Blob(input.observation),
+      sqlite3.Blob(input.fingerprint))
   end
   access.connection:commit()
   committed = true
@@ -373,7 +374,7 @@ function browser_foreign_owners(connection: sqlite3.Connection): {BrowserForeign
     "SELECT g.name,g.provenance,substr(m.value,instr(m.value,x'00')+1) " ..
     "FROM main.cache_meta AS m JOIN main.graph_modules AS g ON " ..
     foreign_graph_match .. " WHERE " .. foreign_owner_filter .. " ORDER BY g.name",
-    #foreign_owner_prefix, sqlite3.Blob.new(foreign_owner_prefix))
+    #foreign_owner_prefix, sqlite3.Blob(foreign_owner_prefix))
   local owners: {BrowserForeignOwner} = {}
   for index = 1, #rows do
     local row = rows[index]
@@ -384,7 +385,7 @@ end
 
 function write_browser_foreign_owner(connection: sqlite3.Connection, module_name: string,
     observed: string?)
-  local key = sqlite3.Blob.new(foreign_owner_prefix .. module_name)
+  local key = sqlite3.Blob(foreign_owner_prefix .. module_name)
   if observed == nil then
     sql.execute(connection, "DELETE FROM main.cache_meta WHERE key=?", key)
   else
@@ -414,7 +415,7 @@ local function prune_browser_foreign_owners(connection: sqlite3.Connection)
   sql.execute(connection,
     "DELETE FROM main.cache_meta AS m WHERE " .. foreign_owner_filter ..
     " AND NOT EXISTS (SELECT 1 FROM main.graph_modules AS g WHERE " .. foreign_graph_match .. ")",
-    #foreign_owner_prefix, sqlite3.Blob.new(foreign_owner_prefix))
+    #foreign_owner_prefix, sqlite3.Blob(foreign_owner_prefix))
 end
 
 -- The preliminary inventory can match while PATH, CC, or the native SDK has
@@ -462,13 +463,13 @@ function Cache:lookup(kind: string, key: string): (string?,{bridge.CHeaderDepend
   local access = self.store:acquire()
   defer access:release()
   local rows = sql.rows(access.connection,
-    "SELECT payload FROM " .. namespace.table .. " WHERE key=?",sqlite3.Blob.new(key))
-  if #rows == 0 then return nil,nil end
+    "SELECT payload FROM " .. namespace.table .. " WHERE key=?", sqlite3.Blob(key))
+  if #rows == 0 then return nil, nil end
   local payload: value = rows[1]:get(1)
-  if not (payload is sqlite3.Blob) then return nil,nil end
-  if refreshed == nil then refreshed = headers.read(access.connection,namespace.scope,key) end
-  if refreshed == nil then return nil,nil end
-  return (payload as sqlite3.Blob).bytes,refreshed
+  if not (payload is sqlite3.Blob) then return nil, nil end
+  if refreshed == nil then refreshed = headers.read(access.connection, namespace.scope, key) end
+  if refreshed == nil then return nil, nil end
+  return (payload as sqlite3.Blob).bytes, refreshed
 end
 
 -- Compiler hooks only stage successful records. SQLite writes remain with the
@@ -477,7 +478,7 @@ end
 function Cache:stage(kind: string, key: string, payload: string,
                       inputs: {bridge.CHeaderDependency})
   if artifact_namespace(kind) == nil then return end
-  local item = Artifact.new(kind,key,payload,inputs)
+  local item = Artifact(kind, key, payload, inputs)
   for index = 1, #self.pending do
     if self.pending[index].kind == kind and self.pending[index].key == key then
       self.pending[index] = item
@@ -494,7 +495,7 @@ function Cache:refresh_inputs(kind: string,key: string,
   for index = #self.pending, 1, -1 do
     local item = self.pending[index]
     if item.kind == kind and item.key == key then
-      self.pending[index] = Artifact.new(kind,key,item.payload,inputs)
+      self.pending[index] = Artifact(kind, key, item.payload, inputs)
       return true
     end
   end
@@ -502,11 +503,11 @@ function Cache:refresh_inputs(kind: string,key: string,
     local access = self.store:acquire()
     defer access:release()
     if sql.scalar_integer(access.connection,"SELECT count(*) FROM " .. namespace.table ..
-        " WHERE key=? AND typeof(payload)='blob'",sqlite3.Blob.new(key)) ~= 1 then
+        " WHERE key=? AND typeof(payload)='blob'", sqlite3.Blob(key)) ~= 1 then
       return false
     end
   end
-  self.pending[#self.pending + 1] = Artifact.new(kind,key,nil,inputs)
+  self.pending[#self.pending + 1] = Artifact(kind, key, nil, inputs)
   return true
 end
 
@@ -518,7 +519,7 @@ function Cache:project_candidates(): {ProjectCandidate}
     "ORDER BY name COLLATE BINARY")
   local result: {ProjectCandidate} = {}
   for index = 1, #rows do
-    result[index] = ProjectCandidate.new(rows[index]:get(1),rows[index]:get(2))
+    result[index] = ProjectCandidate(rows[index]:get(1), rows[index]:get(2))
   end
   return result
 end
@@ -546,7 +547,7 @@ function Cache:unpublished_projects(): {string}
   end
   local rows = sql.rows(connection, query .. " ORDER BY g.name COLLATE BINARY")
   local result: {string} = {}
-  for index = 1, #rows do result[index] = rows[index]:get(1) as string end
+  for index = 1, #rows do result[index] = rows[index]:get(1) end
   return result
 end
 
@@ -558,7 +559,7 @@ function Cache:project_payload(candidate: ProjectCandidate): ProjectPayload?
     "JOIN main.graph_modules AS g ON g.name=CAST(p.module AS TEXT) " ..
     "WHERE p.module=? AND p.revision=? AND typeof(p.revision)='integer' " ..
     "AND g.provenance=0 AND g.state=2 AND g.revision=p.revision",
-    sqlite3.Blob.new(candidate.module_name),candidate.revision)
+    sqlite3.Blob(candidate.module_name), candidate.revision)
   if #rows ~= 1 then
     logging.emit("debug","cache.project.miss",{
       ["module"] = candidate.module_name,
@@ -582,7 +583,7 @@ function Cache:project_payload(candidate: ProjectCandidate): ProjectPayload?
     })
     return nil
   end
-  return ProjectPayload.new(candidate.module_name,(payload as sqlite3.Blob).bytes,inputs)
+  return ProjectPayload(candidate.module_name, (payload as sqlite3.Blob).bytes, inputs)
 end
 
 function Cache:project_payloads(): {ProjectPayload}
@@ -598,8 +599,8 @@ function Cache:project_payloads(): {ProjectPayload}
     local module: value = rows[index]:get(1)
     local payload: value = rows[index]:get(2)
     if module is sqlite3.Blob and payload is sqlite3.Blob then
-      result[#result + 1] = ProjectPayload.new(
-        (module as sqlite3.Blob).bytes,(payload as sqlite3.Blob).bytes)
+      result[#result + 1] = ProjectPayload(
+        (module as sqlite3.Blob).bytes, (payload as sqlite3.Blob).bytes)
     else
       logging.emit("debug","cache.project.miss",{
         ["message"] = "persisted project payload has invalid SQLite storage types",
@@ -675,7 +676,7 @@ function Cache:projects_to_export(): {string}
       "AND typeof(p.revision)='integer' AND p.revision=g.revision) " ..
     "ORDER BY g.name COLLATE BINARY")
   local result: {string} = {}
-  for index = 1, #rows do result[index] = rows[index]:get(1) as string end
+  for index = 1, #rows do result[index] = rows[index]:get(1) end
   return result
 end
 
@@ -706,7 +707,7 @@ function Cache:publish(connection: sqlite3.Connection)
     defer insert:close()
     for index = 1, #self.projects do
       local item = self.projects[index]
-      insert:execute(sqlite3.Blob.new(item.module_name),sqlite3.Blob.new(item.payload),item.module_name)
+      insert:execute(sqlite3.Blob(item.module_name), sqlite3.Blob(item.payload), item.module_name)
     end
   end
   for index = 1, #self.pending do
@@ -716,7 +717,7 @@ function Cache:publish(connection: sqlite3.Connection)
     if item.payload ~= nil then
       sql.execute(connection,"INSERT INTO " .. namespace.table ..
         " VALUES(?,?) ON CONFLICT(key) DO UPDATE SET payload=excluded.payload",
-        sqlite3.Blob.new(item.key),sqlite3.Blob.new(item.payload))
+        sqlite3.Blob(item.key), sqlite3.Blob(item.payload))
     end
     headers.replace(connection,namespace.scope,item.key,item.inputs)
   end
@@ -728,7 +729,7 @@ function Cache:publish(connection: sqlite3.Connection)
     write_metadata(connection,"native_context",self.publication_native_context)
     if self.publication_browser_foreign == nil then
       sql.execute(connection, "DELETE FROM main.cache_meta WHERE key=?",
-        sqlite3.Blob.new("browser_foreign"))
+        sqlite3.Blob("browser_foreign"))
     else
       write_metadata(connection, "browser_foreign", self.publication_browser_foreign)
     end

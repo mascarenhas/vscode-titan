@@ -6,45 +6,40 @@ local strings = import "string"
 local sql = import "server.workspace_store"
 local bridge = import "server.compiler_bridge"
 
+local const SCHEMA_STATEMENTS: const {string} = {
+  "CREATE TABLE IF NOT EXISTS main.header_dependencies(" ..
+    "id INTEGER PRIMARY KEY,kind INTEGER NOT NULL CHECK(kind IN (0,1,2))," ..
+    "path BLOB NOT NULL CHECK(typeof(path)='blob')," ..
+    "identity BLOB NOT NULL CHECK(typeof(identity)='blob')," ..
+    "observed_seconds INTEGER,observed_nanos INTEGER,physical_identity BLOB," ..
+    "precision TEXT,size INTEGER,changed_seconds INTEGER,changed_nanos INTEGER," ..
+    "CHECK((observed_seconds IS NULL AND observed_nanos IS NULL AND physical_identity IS NULL) OR " ..
+      "(typeof(observed_seconds)='integer' AND typeof(observed_nanos)='integer' AND typeof(physical_identity)='blob')))",
+  "CREATE UNIQUE INDEX IF NOT EXISTS main.header_dependencies_absent " ..
+    "ON header_dependencies(kind,path,identity) WHERE observed_seconds IS NULL",
+  "CREATE UNIQUE INDEX IF NOT EXISTS main.header_dependencies_observed " ..
+    "ON header_dependencies(kind,path,identity,observed_seconds,observed_nanos,physical_identity," ..
+      "COALESCE(precision,''),COALESCE(size,''),COALESCE(changed_seconds,''),COALESCE(changed_nanos,'')) " ..
+    "WHERE observed_seconds IS NOT NULL",
+  "CREATE TABLE IF NOT EXISTS main.header_owners(" ..
+    "id INTEGER PRIMARY KEY,scope INTEGER NOT NULL CHECK(scope IN (0,1,2,3))," ..
+    "key BLOB NOT NULL CHECK(typeof(key)='blob'),UNIQUE(scope,key))",
+  "CREATE TABLE IF NOT EXISTS main.header_inputs(" ..
+    "owner_id INTEGER NOT NULL REFERENCES header_owners(id) ON DELETE CASCADE," ..
+    "ordinal INTEGER NOT NULL CHECK(ordinal>0)," ..
+    "dependency_id INTEGER NOT NULL REFERENCES header_dependencies(id)," ..
+    "PRIMARY KEY(owner_id,ordinal)) WITHOUT ROWID",
+  "CREATE INDEX IF NOT EXISTS main.header_inputs_dependency ON header_inputs(dependency_id)",
+}
+
 -- Namespaces: 0 = observed module baseline, 1 = analyzed external module,
 -- 2 = parsed C-header artifact, 3 = converted FFI artifact. An owner exists
 -- even when its ordered input list is empty. All operations borrow the caller's
 -- lease and transaction; no dictionary or owner index remains in memory.
 --- Create persistent tables for ordered C-header dependency closures.
 function create(connection: sqlite3.Connection)
-  local statements = {
-    "CREATE TABLE IF NOT EXISTS main.header_dependencies(" ..
-      "id INTEGER PRIMARY KEY,kind INTEGER NOT NULL CHECK(kind IN (0,1,2))," ..
-      "path BLOB NOT NULL CHECK(typeof(path)='blob')," ..
-      "identity BLOB NOT NULL CHECK(typeof(identity)='blob')," ..
-      "observed_seconds INTEGER,observed_nanos INTEGER,physical_identity BLOB," ..
-      "precision TEXT,size INTEGER,changed_seconds INTEGER,changed_nanos INTEGER," ..
-      "CHECK((observed_seconds IS NULL AND observed_nanos IS NULL AND physical_identity IS NULL) OR " ..
-        "(typeof(observed_seconds)='integer' AND typeof(observed_nanos)='integer' AND typeof(physical_identity)='blob')))",
-    "CREATE UNIQUE INDEX IF NOT EXISTS main.header_dependencies_absent " ..
-      "ON header_dependencies(kind,path,identity) WHERE observed_seconds IS NULL",
-    "CREATE UNIQUE INDEX IF NOT EXISTS main.header_dependencies_observed " ..
-      "ON header_dependencies(kind,path,identity,observed_seconds,observed_nanos,physical_identity," ..
-        "COALESCE(precision,''),COALESCE(size,''),COALESCE(changed_seconds,''),COALESCE(changed_nanos,'')) " ..
-      "WHERE observed_seconds IS NOT NULL",
-    "CREATE TABLE IF NOT EXISTS main.header_owners(" ..
-      "id INTEGER PRIMARY KEY,scope INTEGER NOT NULL CHECK(scope IN (0,1,2,3))," ..
-      "key BLOB NOT NULL CHECK(typeof(key)='blob'),UNIQUE(scope,key))",
-    "CREATE TABLE IF NOT EXISTS main.header_inputs(" ..
-      "owner_id INTEGER NOT NULL REFERENCES header_owners(id) ON DELETE CASCADE," ..
-      "ordinal INTEGER NOT NULL CHECK(ordinal>0)," ..
-      "dependency_id INTEGER NOT NULL REFERENCES header_dependencies(id)," ..
-      "PRIMARY KEY(owner_id,ordinal)) WITHOUT ROWID",
-    "CREATE INDEX IF NOT EXISTS main.header_inputs_dependency ON header_inputs(dependency_id)",
-  }
-  for index = 1, #statements do sql.execute(connection, statements[index]) end
-end
-
-local function kind_code(input: bridge.CHeaderDependency): integer
-  case input.kind
-  when file() then return 0
-  when search() then return 1
-  when origin() then return 2
+  for index = 1, #SCHEMA_STATEMENTS do
+    sql.execute(connection, SCHEMA_STATEMENTS[index])
   end
 end
 
@@ -53,7 +48,7 @@ function read(connection: sqlite3.Connection, scope: integer,
               key: string): {bridge.CHeaderDependency}?
   local owners = sql.rows(connection,
     "SELECT id FROM main.header_owners WHERE scope=? AND key=?",
-    scope, sqlite3.Blob.new(key))
+    scope, sqlite3.Blob(key))
   if #owners ~= 1 then return nil end
   local owner: integer = owners[1]:get(1)
   local rows = sql.rows(connection,
@@ -70,10 +65,8 @@ function read(connection: sqlite3.Connection, scope: integer,
     local ordinal: value = row:get(7)
     if not (code is integer) or not (path is sqlite3.Blob) or
        not (digest is sqlite3.Blob) or ordinal ~= index then return nil end
-    local kind = bridge.CHeaderDependencyKind.file()
-    if code == 1 then kind = bridge.CHeaderDependencyKind.search()
-    elseif code == 2 then kind = bridge.CHeaderDependencyKind.origin()
-    elseif code ~= 0 then return nil end
+    local kind? = bridge.header_dependency_kind_from_code(code)
+    if kind == nil then return nil end
     local observation: bridge.HeaderObservation?
     local seconds: value = row:get(4)
     local nanos: value = row:get(5)
@@ -81,10 +74,10 @@ function read(connection: sqlite3.Connection, scope: integer,
     if seconds ~= nil or nanos ~= nil or physical ~= nil then
       if not (seconds is integer) or not (nanos is integer) or
          not (physical is sqlite3.Blob) then return nil end
-      observation = bridge.HeaderObservation.new(seconds, nanos,
+      observation = bridge.HeaderObservation(seconds, nanos,
         (physical as sqlite3.Blob).bytes, row:get(8), row:get(9), row:get(10), row:get(11))
     end
-    inputs[index] = bridge.CHeaderDependency.new(kind,
+    inputs[index] = bridge.CHeaderDependency(kind,
       (path as sqlite3.Blob).bytes, (digest as sqlite3.Blob).bytes, observation)
   end
   return inputs
@@ -93,7 +86,7 @@ end
 -- Bounded SQL packets insert dictionary values and resolve their row IDs in
 -- bulk. Separate NULL/present joins use the matching partial unique index;
 -- each packet stays below Titan's 200-value variadic-call limit.
-local function incoming(inputs: {bridge.CHeaderDependency}, first: integer,
+local function incoming(inputs: const? {bridge.CHeaderDependency}, first: integer,
                         last: integer): (string, {value})
   local query = strings.writer()
   query:write("WITH incoming(ordinal,kind,path,identity,observed_seconds,observed_nanos,physical_identity,precision,size,changed_seconds,changed_nanos) AS (VALUES")
@@ -101,28 +94,43 @@ local function incoming(inputs: {bridge.CHeaderDependency}, first: integer,
   for index = first, last do
     if index > first then query:write(",") end
     local input = inputs[index]
-    if input.observation == nil then
+    local obs? = input.observation
+    parameters[#parameters + 1] = index
+    parameters[#parameters + 1] = input.kind:code()
+    parameters[#parameters + 1] = sqlite3.Blob(input.path)
+    parameters[#parameters + 1] = sqlite3.Blob(input.identity)
+    if obs == nil then
       query:write("(?,?,?,?,NULL,NULL,NULL,NULL,NULL,NULL,NULL)")
     else
       query:write("(?,?,?,?,?,?,?")
-      if input.observation.precision == nil then query:write(",NULL") else query:write(",?") end
-      if input.observation.size == nil then query:write(",NULL") else query:write(",?") end
-      if input.observation.changed_seconds == nil then query:write(",NULL") else query:write(",?") end
-      if input.observation.changed_nanoseconds == nil then query:write(",NULL") else query:write(",?") end
+      parameters[#parameters + 1] = obs.modified_seconds
+      parameters[#parameters + 1] = obs.modified_nanoseconds
+      parameters[#parameters + 1] = sqlite3.Blob(obs.physical_identity)
+      if obs.precision == nil then
+        query:write(",NULL")
+      else
+        query:write(",?")
+        parameters[#parameters + 1] = obs.precision
+      end
+      if obs.size == nil then
+        query:write(",NULL")
+      else
+        query:write(",?")
+        parameters[#parameters + 1] = obs.size
+      end
+      if obs.changed_seconds == nil then
+        query:write(",NULL")
+      else
+        query:write(",?")
+        parameters[#parameters + 1] = obs.changed_seconds
+      end
+      if obs.changed_nanoseconds == nil then
+        query:write(",NULL")
+      else
+        query:write(",?")
+        parameters[#parameters + 1] = obs.changed_nanoseconds
+      end
       query:write(")")
-    end
-    parameters[#parameters + 1] = index
-    parameters[#parameters + 1] = kind_code(input)
-    parameters[#parameters + 1] = sqlite3.Blob.new(input.path)
-    parameters[#parameters + 1] = sqlite3.Blob.new(input.identity)
-    if input.observation ~= nil then
-      parameters[#parameters + 1] = input.observation.modified_seconds
-      parameters[#parameters + 1] = input.observation.modified_nanoseconds
-      parameters[#parameters + 1] = sqlite3.Blob.new(input.observation.physical_identity)
-      if input.observation.precision ~= nil then parameters[#parameters + 1] = input.observation.precision end
-      if input.observation.size ~= nil then parameters[#parameters + 1] = input.observation.size end
-      if input.observation.changed_seconds ~= nil then parameters[#parameters + 1] = input.observation.changed_seconds end
-      if input.observation.changed_nanoseconds ~= nil then parameters[#parameters + 1] = input.observation.changed_nanoseconds end
     end
   end
   query:write(") ")
@@ -131,12 +139,12 @@ end
 
 --- Replace one complete observed header closure within the caller transaction.
 function replace(connection: sqlite3.Connection, scope: integer, key: string,
-                 inputs: {bridge.CHeaderDependency})
+                 inputs: const? {bridge.CHeaderDependency})
   sql.execute(connection,
     "INSERT INTO main.header_owners(scope,key) VALUES(?,?) ON CONFLICT(scope,key) DO NOTHING",
-    scope, sqlite3.Blob.new(key))
+    scope, sqlite3.Blob(key))
   local owner = sql.scalar_integer(connection,
-    "SELECT id FROM main.header_owners WHERE scope=? AND key=?", scope, sqlite3.Blob.new(key))
+    "SELECT id FROM main.header_owners WHERE scope=? AND key=?", scope, sqlite3.Blob(key))
   sql.execute(connection, "DELETE FROM main.header_inputs WHERE owner_id=?", owner)
   for first = 1, #inputs, 16 do
     local last = first + 15
@@ -165,32 +173,33 @@ function replace(connection: sqlite3.Connection, scope: integer, key: string,
 end
 
 local function dependency_key(input: bridge.CHeaderDependency): string
-  return kind_code(input) .. ":" .. #input.path .. ":" .. input.path .. input.identity
+  return input.kind:code() .. ":" .. #input.path .. ":" .. input.path .. input.identity
 end
 
 -- A module refresh may include only some of the analyzed external closure.
 -- Match existing triples and retain order, duplicates, and unmatched inputs.
 -- Immutable values shared by other owners are never updated in place.
 function refresh(connection: sqlite3.Connection, scope: integer, key: string,
-                 inputs: {bridge.CHeaderDependency})
+                 inputs: const? {bridge.CHeaderDependency})
   local previous? = read(connection, scope, key)
   if previous == nil then return end
+  local entries = previous
   local updates: {string: bridge.CHeaderDependency} = {}
   for index = 1, #inputs do updates[dependency_key(inputs[index])] = inputs[index] end
   local changed = false
-  for index = 1, #previous do
-    local update? = updates[dependency_key(previous[index])]
+  for index = 1, #entries do
+    local update? = updates[dependency_key(entries[index])]
     if update ~= nil then
-      previous[index] = update
+      entries[index] = update
       changed = true
     end
   end
-  if changed then replace(connection, scope, key, previous) end
+  if changed then replace(connection, scope, key, entries) end
 end
 
 function remove(connection: sqlite3.Connection, scope: integer, key: string)
   sql.execute(connection, "DELETE FROM main.header_owners WHERE scope=? AND key=?",
-    scope, sqlite3.Blob.new(key))
+    scope, sqlite3.Blob(key))
 end
 
 function clear_scope(connection: sqlite3.Connection, scope: integer)

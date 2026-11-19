@@ -36,8 +36,9 @@ function test_header_store_shares_complete_values_and_preserves_ordered_namespac
     }
     local ordered: {bridge.CHeaderDependency} = {}
     for index = 1, 45 do ordered[index] = values[(index - 1) % 10 + 1] end
+    local empty: const {bridge.CHeaderDependency} = {}
     for scope = 0, 3 do headers.replace(connection, scope, "same\0key", ordered) end
-    headers.replace(connection, 0, "empty", {})
+    headers.replace(connection, 0, "empty", empty)
     test.assert(sql.scalar_integer(connection, "SELECT count(*) FROM main.header_dependencies") == 10 and
       sql.scalar_integer(connection, "SELECT count(*) FROM main.header_owners") == 5 and
       sql.scalar_integer(connection, "SELECT count(*) FROM main.header_inputs") == 180,
@@ -87,11 +88,14 @@ function test_header_store_refreshes_selected_owner_without_mutating_shared_valu
     local old = dependency(bridge.HeaderObservation.new(1, 2, "physical"))
     local unmatched = bridge.CHeaderDependency.new(bridge.CHeaderDependencyKind.search(),
       "missing.h", "missing", nil)
-    for scope = 0, 3 do headers.replace(connection, scope, "same", {old, unmatched, old}) end
-    headers.replace(connection, 0, "other", {old})
+    local initial_inputs: {bridge.CHeaderDependency} = {old, unmatched, old}
+    local other_inputs: {bridge.CHeaderDependency} = {old}
+    for scope = 0, 3 do headers.replace(connection, scope, "same", initial_inputs) end
+    headers.replace(connection, 0, "other", other_inputs)
     local next = dependency(bridge.HeaderObservation.new(3, 4, "physical"))
-    headers.refresh(connection, 0, "same", {next,
-      bridge.CHeaderDependency.new(bridge.CHeaderDependencyKind.file(), "new.h", "new", nil)})
+    local refresh_inputs: {bridge.CHeaderDependency} = {next,
+      bridge.CHeaderDependency.new(bridge.CHeaderDependencyKind.file(), "new.h", "new", nil)}
+    headers.refresh(connection, 0, "same", refresh_inputs)
     local refreshed = headers.read(connection, 0, "same")
     test.assert(#refreshed == 3 and refreshed[1].observation.modified_seconds == 3 and
       refreshed[3].observation.modified_seconds == 3 and refreshed[2].path == "missing.h" and
@@ -104,10 +108,12 @@ function test_header_store_refreshes_selected_owner_without_mutating_shared_valu
     test.assert(headers.read(connection, 0, "other")[1].observation.modified_seconds == 1 and
       sql.scalar_integer(connection, "SELECT count(*) FROM main.header_dependencies") == 3,
       "refresh changed another module or inserted an unmatched value")
-    headers.refresh(connection, 0, "absent", {next})
+    local next_only: {bridge.CHeaderDependency} = {next}
+    headers.refresh(connection, 0, "absent", next_only)
     test.assert(headers.read(connection, 0, "absent") == nil,
       "refresh created an owner with no accepted baseline")
-    headers.refresh(connection, 0, "same", {dependency(nil)})
+    local cleared: {bridge.CHeaderDependency} = {dependency(nil)}
+    headers.refresh(connection, 0, "same", cleared)
     test.assert(headers.read(connection, 0, "same")[1].observation == nil and
       headers.read(connection, 2, "same")[1].observation ~= nil,
       "clearing one observation changed a shared artifact")
@@ -124,12 +130,16 @@ function test_header_store_rolls_back_links_values_and_pruning_before_restart(
     local connection = access.connection
     headers.create(connection)
     connection:set_autocommit(false)
-    headers.replace(connection, 0, "module", {dependency(nil)})
-    headers.replace(connection, 2, "artifact", {dependency(nil), dependency(nil)})
-    headers.replace(connection, 0, "empty", {})
+    local one_absent: {bridge.CHeaderDependency} = {dependency(nil)}
+    local two_absent: {bridge.CHeaderDependency} = {dependency(nil), dependency(nil)}
+    local empty: {bridge.CHeaderDependency} = {}
+    headers.replace(connection, 0, "module", one_absent)
+    headers.replace(connection, 2, "artifact", two_absent)
+    headers.replace(connection, 0, "empty", empty)
     connection:commit()
     connection:set_autocommit(false)
-    headers.replace(connection, 0, "module", {dependency(bridge.HeaderObservation.new(5, 6, "new"))})
+    local updated: {bridge.CHeaderDependency} = {dependency(bridge.HeaderObservation.new(5, 6, "new"))}
+    headers.replace(connection, 0, "module", updated)
     headers.remove(connection, 2, "artifact")
     headers.prune(connection)
     test.assert(sql.scalar_integer(connection, "SELECT count(*) FROM main.header_dependencies") == 1 and

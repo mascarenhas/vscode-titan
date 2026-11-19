@@ -58,8 +58,8 @@ end
 
 --- Persisted source and diagnostic state for one project module.
 record ProjectState
-  module_name: string
-  source_files: {SourceFileSnapshot}
+  const module_name: string
+  const source_files: {SourceFileSnapshot}
   compiler_snapshot: compiler_bridge.ModuleSnapshot?
   diagnostics: {compiler_bridge.Diagnostic}
 end
@@ -74,71 +74,29 @@ end
 
 local function optional_blob(candidate: string?): value
   if candidate == nil then return nil end
-  return sqlite3.Blob.new(candidate)
+  return sqlite3.Blob(candidate)
 end
 
--- Rows are temporary SQL-boundary values with an explicit column count. Array
--- holes represent NULL; they never determine the row width or bind arity.
-local record Batch
-  connection: sqlite3.Connection
-  prefix: string
-  columns: integer
-  query: string
-  parameters: {value}
-  count: integer
-end
-
-local function batch(connection: sqlite3.Connection, table_name: string,
-                     columns: integer): Batch
-  local prefix = "INSERT INTO main." .. table_name .. " VALUES "
-  return Batch.new(connection, prefix, columns, prefix, {}, 0)
-end
-
-local function Batch:flush()
-  if self.count == 0 then return end
-  sql.execute(self.connection, self.query, ...self.parameters)
-  self.query = self.prefix
-  self.parameters = {}
-  self.count = 0
-end
-
-local function Batch:append(row: {value})
-  if self.count > 0 then self.query = self.query .. "," end
-  self.query = self.query .. "("
-  for column = 1, self.columns do
-    if column > 1 then self.query = self.query .. "," end
-    local item: value = row[column]
-    if item == nil then
-      self.query = self.query .. "NULL"
-    else
-      self.query = self.query .. "?"
-      self.parameters[#self.parameters + 1] = item
-    end
-  end
-  self.query = self.query .. ")"
-  self.count = self.count + 1
-  -- The widest metadata row has eight columns: 160 parameters stays below
-  -- Titan's 200-position variadic-call bound and keeps each SQL packet small.
-  if self.count == 20 then self:flush() end
-end
+local const SCHEMA_STATEMENTS: const {string} = {
+  "CREATE TABLE IF NOT EXISTS main.project_records(name BLOB PRIMARY KEY) WITHOUT ROWID",
+  "CREATE TABLE IF NOT EXISTS main.project_sources(module BLOB NOT NULL REFERENCES project_records(name) ON DELETE CASCADE, ordinal INTEGER NOT NULL, path BLOB NOT NULL, contents BLOB NOT NULL, seconds INTEGER NOT NULL, nanos INTEGER NOT NULL, size INTEGER NOT NULL, identity BLOB, physical_identity BLOB, PRIMARY KEY(module,ordinal)) WITHOUT ROWID",
+  "CREATE UNIQUE INDEX IF NOT EXISTS main.project_source_path ON project_sources(path)",
+  "CREATE TABLE IF NOT EXISTS main.project_diagnostics(module BLOB NOT NULL REFERENCES project_records(name) ON DELETE CASCADE, ordinal INTEGER NOT NULL, kind INTEGER NOT NULL, message BLOB NOT NULL, path BLOB, line INTEGER, column_number INTEGER, owner BLOB, PRIMARY KEY(module,ordinal)) WITHOUT ROWID",
+  "CREATE TABLE IF NOT EXISTS main.external_records(name BLOB PRIMARY KEY, kind INTEGER NOT NULL, main_path BLOB NOT NULL, public_manifest BLOB NOT NULL, source_manifest BLOB NOT NULL, analyzed_identity BLOB) WITHOUT ROWID",
+  "CREATE TABLE IF NOT EXISTS main.external_observations(name BLOB PRIMARY KEY, source_required INTEGER NOT NULL, topology_resolved INTEGER NOT NULL, kind INTEGER, main_path BLOB, error BLOB) WITHOUT ROWID",
+  "CREATE TABLE IF NOT EXISTS main.external_files(scope INTEGER NOT NULL, module BLOB NOT NULL, ordinal INTEGER NOT NULL, path BLOB NOT NULL, seconds INTEGER NOT NULL, nanos INTEGER NOT NULL, size INTEGER NOT NULL, identity BLOB, physical_identity BLOB, PRIMARY KEY(scope,module,ordinal)) WITHOUT ROWID",
+  "CREATE TABLE IF NOT EXISTS main.external_sources(scope INTEGER NOT NULL, module BLOB NOT NULL, ordinal INTEGER NOT NULL, path BLOB NOT NULL, PRIMARY KEY(scope,module,ordinal)) WITHOUT ROWID",
+  "CREATE TABLE IF NOT EXISTS main.external_import_details(module BLOB NOT NULL, ordinal INTEGER NOT NULL, alias BLOB NOT NULL, imported BLOB NOT NULL, source_required INTEGER NOT NULL, path BLOB NOT NULL, line INTEGER NOT NULL, column_number INTEGER NOT NULL, PRIMARY KEY(module,ordinal)) WITHOUT ROWID",
+}
 
 --- Open project metadata storage on the shared workspace connection.
 function create(connection: sqlite3.Connection,
                 graph: project_graph.Graph<|compiler_bridge.ModuleSnapshot|>): Metadata
   header_store.create(connection)
-  local statements = {
-    "CREATE TABLE IF NOT EXISTS main.project_records(name BLOB PRIMARY KEY) WITHOUT ROWID",
-    "CREATE TABLE IF NOT EXISTS main.project_sources(module BLOB NOT NULL REFERENCES project_records(name) ON DELETE CASCADE, ordinal INTEGER NOT NULL, path BLOB NOT NULL, contents BLOB NOT NULL, seconds INTEGER NOT NULL, nanos INTEGER NOT NULL, size INTEGER NOT NULL, identity BLOB, physical_identity BLOB, PRIMARY KEY(module,ordinal)) WITHOUT ROWID",
-    "CREATE UNIQUE INDEX IF NOT EXISTS main.project_source_path ON project_sources(path)",
-    "CREATE TABLE IF NOT EXISTS main.project_diagnostics(module BLOB NOT NULL REFERENCES project_records(name) ON DELETE CASCADE, ordinal INTEGER NOT NULL, kind INTEGER NOT NULL, message BLOB NOT NULL, path BLOB, line INTEGER, column_number INTEGER, owner BLOB, PRIMARY KEY(module,ordinal)) WITHOUT ROWID",
-    "CREATE TABLE IF NOT EXISTS main.external_records(name BLOB PRIMARY KEY, kind INTEGER NOT NULL, main_path BLOB NOT NULL, public_manifest BLOB NOT NULL, source_manifest BLOB NOT NULL, analyzed_identity BLOB) WITHOUT ROWID",
-    "CREATE TABLE IF NOT EXISTS main.external_observations(name BLOB PRIMARY KEY, source_required INTEGER NOT NULL, topology_resolved INTEGER NOT NULL, kind INTEGER, main_path BLOB, error BLOB) WITHOUT ROWID",
-    "CREATE TABLE IF NOT EXISTS main.external_files(scope INTEGER NOT NULL, module BLOB NOT NULL, ordinal INTEGER NOT NULL, path BLOB NOT NULL, seconds INTEGER NOT NULL, nanos INTEGER NOT NULL, size INTEGER NOT NULL, identity BLOB, physical_identity BLOB, PRIMARY KEY(scope,module,ordinal)) WITHOUT ROWID",
-    "CREATE TABLE IF NOT EXISTS main.external_sources(scope INTEGER NOT NULL, module BLOB NOT NULL, ordinal INTEGER NOT NULL, path BLOB NOT NULL, PRIMARY KEY(scope,module,ordinal)) WITHOUT ROWID",
-    "CREATE TABLE IF NOT EXISTS main.external_import_details(module BLOB NOT NULL, ordinal INTEGER NOT NULL, alias BLOB NOT NULL, imported BLOB NOT NULL, source_required INTEGER NOT NULL, path BLOB NOT NULL, line INTEGER NOT NULL, column_number INTEGER NOT NULL, PRIMARY KEY(module,ordinal)) WITHOUT ROWID",
-  }
-  for index = 1, #statements do sql.execute(connection, statements[index]) end
-  return Metadata.new(connection, graph)
+  for index = 1, #SCHEMA_STATEMENTS do
+    sql.execute(connection, SCHEMA_STATEMENTS[index])
+  end
+  return Metadata(connection, graph)
 end
 
 local function Metadata:names(query: string): {string}
@@ -167,13 +125,13 @@ end
 function Metadata:has_project(name: string): boolean
   return sql.scalar_integer(self.connection,
     "SELECT EXISTS(SELECT 1 FROM main.project_records WHERE name=?)",
-    sqlite3.Blob.new(name)) == 1
+    sqlite3.Blob(name)) == 1
 end
 
 function Metadata:has_external(name: string): boolean
   return sql.scalar_integer(self.connection,
     "SELECT EXISTS(SELECT 1 FROM main.external_records WHERE name=?)",
-    sqlite3.Blob.new(name)) == 1
+    sqlite3.Blob(name)) == 1
 end
 
 local function diagnostic_kind(code: integer): compiler_bridge.DiagnosticKind
@@ -194,47 +152,53 @@ function Metadata:project(name: string): ProjectState?
   if not self:has_project(name) then return nil end
   local sources = sql.rows(self.connection,
     "SELECT path,contents,seconds,nanos,size,identity,physical_identity FROM main.project_sources WHERE module=? ORDER BY ordinal",
-    sqlite3.Blob.new(name))
+    sqlite3.Blob(name))
   local files: {SourceFileSnapshot} = {}
   for index = 1, #sources do
     local row = sources[index]
     local path = sql.bytes(row, 1)
-    files[index] = SourceFileSnapshot.new(path, sql.bytes(row, 2),
-      project_graph.FileStamp.new(path, row:get(3), row:get(4), row:get(5),
-        sql.optional_bytes(row, 6), sql.optional_bytes(row, 7)))
+    files[index] = SourceFileSnapshot(path, sql.bytes(row, 2),
+      project_graph.FileStamp {
+        path = path,
+        modified_seconds = row:get(3),
+        modified_nanoseconds = row:get(4),
+        size = row:get(5),
+        identity = sql.optional_bytes(row, 6),
+        physical_identity = sql.optional_bytes(row, 7),
+      })
   end
   local raw = sql.rows(self.connection,
     "SELECT kind,message,path,line,column_number,owner FROM main.project_diagnostics WHERE module=? ORDER BY ordinal",
-    sqlite3.Blob.new(name))
+    sqlite3.Blob(name))
   local diagnostics: {compiler_bridge.Diagnostic} = {}
   for index = 1, #raw do
     local row = raw[index]
     local path? = sql.optional_bytes(row, 3)
-    local location?: compiler_bridge.SourceLocation = nil
+    local location?: compiler_bridge.SourceLocation
     if path ~= nil then
-      location = compiler_bridge.SourceLocation.new(path, row:get(4), row:get(5))
+      location = compiler_bridge.SourceLocation(path, row:get(4), row:get(5))
     end
-    diagnostics[index] = compiler_bridge.Diagnostic.new(
+    diagnostics[index] = compiler_bridge.Diagnostic(
       diagnostic_kind(row:get(1)), sql.bytes(row, 2), location,
       sql.optional_bytes(row, 6))
   end
-  return ProjectState.new(name, files, self.graph:project_snapshot(name), diagnostics)
+  return ProjectState(name, files, self.graph:project_snapshot(name), diagnostics)
 end
 
 function Metadata:write_project_sources(name: string, files: {SourceFileSnapshot})
   sql.execute(self.connection,
     "INSERT INTO main.project_records VALUES(?) ON CONFLICT DO NOTHING",
-    sqlite3.Blob.new(name))
+    sqlite3.Blob(name))
   sql.execute(self.connection,"DELETE FROM main.project_sources WHERE module=?",
-    sqlite3.Blob.new(name))
-  local insert = batch(self.connection, "project_sources", 9)
+    sqlite3.Blob(name))
+  local insert = sql.batch(self.connection, "INSERT INTO main.project_sources VALUES ", 9)
   for index = 1, #files do
     local source = files[index]
     local stamp = source.stamp
-    insert:append({sqlite3.Blob.new(name), index, sqlite3.Blob.new(source.filename),
-      sqlite3.Blob.new(source.contents), stamp.modified_seconds,
+    insert:append(sqlite3.Blob(name), index, sqlite3.Blob(source.filename),
+      sqlite3.Blob(source.contents), stamp.modified_seconds,
       stamp.modified_nanoseconds, stamp.size, optional_blob(stamp.identity),
-      optional_blob(stamp.physical_identity)})
+      optional_blob(stamp.physical_identity))
   end
   insert:flush()
 end
@@ -247,16 +211,16 @@ function Metadata:refresh_project_observations(name: string,
     sql.execute(self.connection,
       "UPDATE main.project_sources SET seconds=?,nanos=?,size=? " ..
       "WHERE module=? AND ordinal=? AND path=?", stamp.modified_seconds,
-      stamp.modified_nanoseconds, stamp.size, sqlite3.Blob.new(name), index,
-      sqlite3.Blob.new(source.filename))
+      stamp.modified_nanoseconds, stamp.size, sqlite3.Blob(name), index,
+      sqlite3.Blob(source.filename))
   end
 end
 
 function Metadata:write_diagnostics(name: string,
     diagnostics: {compiler_bridge.Diagnostic})
   sql.execute(self.connection,"DELETE FROM main.project_diagnostics WHERE module=?",
-    sqlite3.Blob.new(name))
-  local insert = batch(self.connection, "project_diagnostics", 8)
+    sqlite3.Blob(name))
+  local insert = sql.batch(self.connection, "INSERT INTO main.project_diagnostics VALUES ", 8)
   for index = 1, #diagnostics do
     local diagnostic = diagnostics[index]
     local path?: string
@@ -267,16 +231,16 @@ function Metadata:write_diagnostics(name: string,
       line = diagnostic.location.line
       column = diagnostic.location.column
     end
-    insert:append({sqlite3.Blob.new(name), index, diagnostic_code(diagnostic.kind),
-      sqlite3.Blob.new(diagnostic.message), optional_blob(path), line, column,
-      optional_blob(diagnostic.owner_module)})
+    insert:append(sqlite3.Blob(name), index, diagnostic_code(diagnostic.kind),
+      sqlite3.Blob(diagnostic.message), optional_blob(path), line, column,
+      optional_blob(diagnostic.owner_module))
   end
   insert:flush()
 end
 
 function Metadata:remove_project(name: string)
   sql.execute(self.connection,"DELETE FROM main.project_records WHERE name=?",
-    sqlite3.Blob.new(name))
+    sqlite3.Blob(name))
 end
 
 local function origin_values(origin: ExternalOrigin?): (integer?, string?)
@@ -298,7 +262,7 @@ local function Metadata:origin(scope: integer, name: string,
   end
   local rows = sql.rows(self.connection,
     "SELECT path FROM main.external_sources WHERE scope=? AND module=? ORDER BY ordinal",
-    scope, sqlite3.Blob.new(name))
+    scope, sqlite3.Blob(name))
   local files: {string} = {}
   for index = 1, #rows do files[index] = sql.bytes(rows[index], 1) end
   return ExternalOrigin.source(main_path, files)
@@ -308,14 +272,14 @@ local function Metadata:write_origin(scope: integer, name: string,
                                     origin: ExternalOrigin?)
   sql.execute(self.connection,
     "DELETE FROM main.external_sources WHERE scope=? AND module=?",
-    scope, sqlite3.Blob.new(name))
+    scope, sqlite3.Blob(name))
   if origin == nil then return end
   case origin
   when source{source_files} then
-    local insert = batch(self.connection, "external_sources", 4)
+    local insert = sql.batch(self.connection, "INSERT INTO main.external_sources VALUES ", 4)
     for index = 1, #source_files do
-      insert:append({scope, sqlite3.Blob.new(name), index,
-        sqlite3.Blob.new(source_files[index])})
+      insert:append(scope, sqlite3.Blob(name), index,
+        sqlite3.Blob(source_files[index]))
     end
     insert:flush()
   else
@@ -325,13 +289,18 @@ end
 local function Metadata:stamps(scope: integer, name: string): {project_graph.FileStamp}
   local rows = sql.rows(self.connection,
     "SELECT path,seconds,nanos,size,identity,physical_identity FROM main.external_files WHERE scope=? AND module=? ORDER BY ordinal",
-    scope, sqlite3.Blob.new(name))
+    scope, sqlite3.Blob(name))
   local result: {project_graph.FileStamp} = {}
   for index = 1, #rows do
     local row = rows[index]
-    result[index] = project_graph.FileStamp.new(sql.bytes(row, 1),
-      row:get(2), row:get(3), row:get(4), sql.optional_bytes(row, 5),
-      sql.optional_bytes(row, 6))
+    result[index] = project_graph.FileStamp {
+      path = sql.bytes(row, 1),
+      modified_seconds = row:get(2),
+      modified_nanoseconds = row:get(3),
+      size = row:get(4),
+      identity = sql.optional_bytes(row, 5),
+      physical_identity = sql.optional_bytes(row, 6),
+    }
   end
   return result
 end
@@ -339,13 +308,13 @@ end
 local function Metadata:write_stamps(scope: integer, name: string,
                                     stamps: {project_graph.FileStamp})
   sql.execute(self.connection,
-    "DELETE FROM main.external_files WHERE scope=? AND module=?",scope,sqlite3.Blob.new(name))
-  local insert = batch(self.connection, "external_files", 9)
+    "DELETE FROM main.external_files WHERE scope=? AND module=?",scope,sqlite3.Blob(name))
+  local insert = sql.batch(self.connection, "INSERT INTO main.external_files VALUES ", 9)
   for index = 1, #stamps do
     local stamp = stamps[index]
-    insert:append({scope, sqlite3.Blob.new(name), index, sqlite3.Blob.new(stamp.path),
+    insert:append(scope, sqlite3.Blob(name), index, sqlite3.Blob(stamp.path),
       stamp.modified_seconds, stamp.modified_nanoseconds, stamp.size,
-      optional_blob(stamp.identity), optional_blob(stamp.physical_identity)})
+      optional_blob(stamp.identity), optional_blob(stamp.physical_identity))
   end
   insert:flush()
 end
@@ -358,7 +327,7 @@ local function Metadata:refresh_observations(scope: integer, name: string,
       "UPDATE main.external_files SET seconds=?,nanos=?,size=? " ..
       "WHERE scope=? AND module=? AND ordinal=? AND path=?",
       stamp.modified_seconds, stamp.modified_nanoseconds, stamp.size,
-      scope, sqlite3.Blob.new(name), index, sqlite3.Blob.new(stamp.path))
+      scope, sqlite3.Blob(name), index, sqlite3.Blob(stamp.path))
   end
 end
 
@@ -377,12 +346,12 @@ local function Metadata:headers(scope: integer, name: string): HeaderFingerprint
   if inputs == nil then
     if sql.scalar_integer(self.connection,
         "SELECT EXISTS(SELECT 1 FROM main.header_owners WHERE scope=? AND key=?)",
-        scope, sqlite3.Blob.new(name)) ~= 0 then
+        scope, sqlite3.Blob(name)) ~= 0 then
       raise "invalid saved header owner"
     end
     return nil
   end
-  return HeaderFingerprint.new(name, inputs)
+  return HeaderFingerprint(name, inputs)
 end
 
 local function Metadata:write_headers(scope: integer, name: string,
@@ -414,15 +383,20 @@ end
 
 function Metadata:fingerprint(name: string): ExternalFingerprint?
   local rows = sql.rows(self.connection,
-    "SELECT source_required,topology_resolved,kind,main_path,error FROM main.external_observations WHERE name=?",sqlite3.Blob.new(name))
+    "SELECT source_required,topology_resolved,kind,main_path,error FROM main.external_observations WHERE name=?",sqlite3.Blob(name))
   if #rows == 0 then return nil end
   local row = rows[1]
   local source_required: integer = row:get(1)
   local topology_resolved: integer = row:get(2)
   local kind?: integer = row:get(3)
-  return ExternalFingerprint.new(name, source_required == 1, topology_resolved == 1,
-    self:origin(0, name, kind, sql.optional_bytes(row, 4)),
-    self:stamps(0, name), sql.optional_bytes(row, 5))
+  return ExternalFingerprint {
+    module_name = name,
+    source_required = source_required == 1,
+    topology_resolved = topology_resolved == 1,
+    origin = self:origin(0, name, kind, sql.optional_bytes(row, 4)),
+    stamps = self:stamps(0, name),
+    error = sql.optional_bytes(row, 5),
+  }
 end
 
 function Metadata:write_fingerprint(fingerprint: ExternalFingerprint)
@@ -434,38 +408,43 @@ function Metadata:write_fingerprint(fingerprint: ExternalFingerprint)
   if fingerprint.topology_resolved then topology = 1 end
   sql.execute(self.connection,
     "INSERT INTO main.external_observations VALUES(?,?,?,?,?,?) ON CONFLICT(name) DO UPDATE SET source_required=excluded.source_required,topology_resolved=excluded.topology_resolved,kind=excluded.kind,main_path=excluded.main_path,error=excluded.error",
-    sqlite3.Blob.new(name), source_required, topology, kind, optional_blob(path), optional_blob(fingerprint.error))
+    sqlite3.Blob(name), source_required, topology, kind, optional_blob(path), optional_blob(fingerprint.error))
   self:write_origin(0, name, fingerprint.origin)
   self:write_stamps(0, name, fingerprint.stamps)
 end
 
 function Metadata:remove_fingerprint(name: string)
-  sql.execute(self.connection,"DELETE FROM main.external_observations WHERE name=?",sqlite3.Blob.new(name))
+  sql.execute(self.connection,"DELETE FROM main.external_observations WHERE name=?",sqlite3.Blob(name))
   self:write_origin(0, name, nil)
   self:write_stamps(0, name, {})
 end
 
 function Metadata:external(name: string): ExternalModule?
   local rows = sql.rows(self.connection,
-    "SELECT kind,main_path,public_manifest,source_manifest,analyzed_identity FROM main.external_records WHERE name=?",sqlite3.Blob.new(name))
+    "SELECT kind,main_path,public_manifest,source_manifest,analyzed_identity FROM main.external_records WHERE name=?",sqlite3.Blob(name))
   if #rows == 0 then return nil end
   local row = rows[1]
   local imports = sql.rows(self.connection,
-    "SELECT alias,imported,source_required,path,line,column_number FROM main.external_import_details WHERE module=? ORDER BY ordinal",sqlite3.Blob.new(name))
+    "SELECT alias,imported,source_required,path,line,column_number FROM main.external_import_details WHERE module=? ORDER BY ordinal",sqlite3.Blob(name))
   local compiler_imports: {compiler_bridge.Import} = {}
   for index = 1, #imports do
     local item = imports[index]
     local required: integer = item:get(3)
-    compiler_imports[index] = compiler_bridge.Import.new(sql.bytes(item, 1),
+    compiler_imports[index] = compiler_bridge.Import(sql.bytes(item, 1),
       sql.bytes(item, 2), required == 1,
-      compiler_bridge.SourceLocation.new(sql.bytes(item, 4), item:get(5), item:get(6)))
+      compiler_bridge.SourceLocation(sql.bytes(item, 4), item:get(5), item:get(6)))
   end
   local headers = self:headers(1, name)
-  return ExternalModule.new(name,
-    self:origin(1, name, row:get(1), sql.bytes(row, 2)),
-    project_graph.Manifest.new(sql.bytes(row, 3), sql.bytes(row, 4)),
-    self:stamps(1, name), sql.optional_bytes(row, 5),
-    self.graph:direct_imports(name), compiler_imports, headers.dependencies)
+  return ExternalModule {
+    module_name = name,
+    origin = self:origin(1, name, row:get(1), sql.bytes(row, 2)),
+    manifest = project_graph.Manifest(sql.bytes(row, 3), sql.bytes(row, 4)),
+    stamps = self:stamps(1, name),
+    analyzed_input_identity = sql.optional_bytes(row, 5),
+    imports = self.graph:direct_imports(name),
+    compiler_imports = compiler_imports,
+    c_header_dependencies = headers.dependencies,
+  }
 end
 
 function Metadata:write_external(external: ExternalModule)
@@ -473,28 +452,28 @@ function Metadata:write_external(external: ExternalModule)
   local kind?, path? = origin_values(external.origin)
   sql.execute(self.connection,
     "INSERT INTO main.external_records VALUES(?,?,?,?,?,?) ON CONFLICT(name) DO UPDATE SET kind=excluded.kind,main_path=excluded.main_path,public_manifest=excluded.public_manifest,source_manifest=excluded.source_manifest,analyzed_identity=excluded.analyzed_identity",
-    sqlite3.Blob.new(name), kind, optional_blob(path),
-    sqlite3.Blob.new(external.manifest.public_digest),
-    sqlite3.Blob.new(external.manifest.source_digest),optional_blob(external.analyzed_input_identity))
+    sqlite3.Blob(name), kind, optional_blob(path),
+    sqlite3.Blob(external.manifest.public_digest),
+    sqlite3.Blob(external.manifest.source_digest), optional_blob(external.analyzed_input_identity))
   self:write_origin(1, name, external.origin)
   self:write_stamps(1, name, external.stamps)
   self:write_headers(1, name, external.c_header_dependencies)
-  sql.execute(self.connection,"DELETE FROM main.external_import_details WHERE module=?",sqlite3.Blob.new(name))
-  local insert = batch(self.connection, "external_import_details", 8)
+  sql.execute(self.connection,"DELETE FROM main.external_import_details WHERE module=?",sqlite3.Blob(name))
+  local insert = sql.batch(self.connection, "INSERT INTO main.external_import_details VALUES ", 8)
   for index = 1, #external.compiler_imports do
     local item = external.compiler_imports[index]
     local required = 0
     if item.source_required then required = 1 end
-    insert:append({sqlite3.Blob.new(name), index, sqlite3.Blob.new(item.alias),
-      sqlite3.Blob.new(item.module_name), required, sqlite3.Blob.new(item.location.filename),
-      item.location.line, item.location.column})
+    insert:append(sqlite3.Blob(name), index, sqlite3.Blob(item.alias),
+      sqlite3.Blob(item.module_name), required, sqlite3.Blob(item.location.filename),
+      item.location.line, item.location.column)
   end
   insert:flush()
 end
 
 function Metadata:remove_external(name: string)
-  sql.execute(self.connection,"DELETE FROM main.external_records WHERE name=?",sqlite3.Blob.new(name))
-  sql.execute(self.connection,"DELETE FROM main.external_import_details WHERE module=?",sqlite3.Blob.new(name))
+  sql.execute(self.connection,"DELETE FROM main.external_records WHERE name=?",sqlite3.Blob(name))
+  sql.execute(self.connection,"DELETE FROM main.external_import_details WHERE module=?",sqlite3.Blob(name))
   header_store.remove(self.connection, 1, name)
   self:write_origin(1, name, nil)
   self:write_stamps(1, name, {})
