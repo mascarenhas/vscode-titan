@@ -1478,6 +1478,66 @@ async function testBrowserTarget() {
   }
 }
 
+async function testFreshProviderCompletion() {
+  const base = await makeBase("browser-catalog");
+  const installed = sdkRoot();
+  await stageBrowserFixture(base);
+  const selectedSdk = path.join(base, "sdk");
+  for (const folder of ["share/lua/5.5", "lib/lua/5.5"]) {
+    await cp(path.join(installed, folder), path.join(selectedSdk, folder), { recursive: true, dereference: true });
+  }
+  const targets = [
+    { name: "browser", sdk: installed, module: "browser", member: "binding", other: "fs" },
+    { name: "explicit", sdk: selectedSdk, module: "browser", member: "binding", other: "fs" },
+    { name: "native", module: "fs", member: "stat", other: "browser" }
+  ];
+  for (const target of targets) {
+    target.root = path.join(base, target.name);
+    const config = target.name === "explicit"
+      ? `target = "browser"\ncompiler_root = ${luaString(target.sdk)}\n`
+      : `target = "${target.name}"\n`;
+    target.source = await writeRoot(target.root, BROWSER_FALLBACK, ROOT_CONFIG + config);
+  }
+  const session = new Session(launch(base, "debug", { EMSDK: path.join(base, "missing-emsdk") }));
+  try {
+    await session.initialize({
+      workspaceFolders: targets.map(({ root, name }) => ({ uri: uri(root), name })),
+      initializationOptions: { trustedRoots: [base] }
+    });
+    session.notify("initialized", {});
+    const settled = await pollSettled(session, targets.length, "fresh provider roots did not settle");
+    for (const { root, name, source, sdk, module, member, other } of targets) {
+      assertReady(settled, root, name);
+      assert.deepEqual((await pullDiagnostics(session, uri(source))).items, []);
+      const catalog = 'local dependency = import ""\n';
+      const document = { uri: uri(source), languageId: "titan", version: 1, text: catalog };
+      session.notify("textDocument/didOpen", { textDocument: document });
+      const imports = await pollCompletion(session, source, endOfToken(catalog, 'import "'), `${name} fresh import`);
+      assert.ok(imports.some((item) => item.label === `titan.${module}`),
+        `${name} fresh import omitted titan.${module}: ${imports.map((item) => item.label).join(", ")}`);
+      assert.ok(!imports.some((item) => item.label === `titan.${other}`));
+      if (sdk !== undefined) {
+        const standard = imports.filter((item) => item.label.startsWith("titan."));
+        assert.equal(standard.length, name === "explicit" ? 2 : 21,
+          `${name} did not publish its complete browser SDK inventory`);
+        const descriptor = sdkDescriptor(root, "titan.browser");
+        assert.equal(descriptor.provenance, "static");
+        assert.ok(samePath(descriptor.file, path.join(sdk, browserDirectory, "titan.a")), descriptor.file);
+      }
+      const overlay = `local std = import "${module}"\nfunction answer() local value = std.${member} end\n`;
+      session.notify("textDocument/didChange", {
+        textDocument: { uri: document.uri, version: 2 }, contentChanges: [{ text: overlay }]
+      });
+      const members = await pollCompletion(session, source, endOfToken(overlay, "std."), `${name} fresh members`);
+      assert.ok(members.some((item) => item.label === member), `${name} closed-world member ${member} was absent`);
+      assert.equal(await readFile(source, "utf8"), BROWSER_FALLBACK, "the fixture must not save a library import");
+    }
+    await session.shutdown();
+  } finally {
+    await session.abort();
+  }
+}
+
 function cachedBrowserForeign(root) {
   const db = new DatabaseSync(path.join(root, ".titan-ls", "index.sqlite3"), { readOnly: true });
   try {
@@ -3549,6 +3609,7 @@ const groups = [
   ["sdk-errors", testRootScopedSdkErrors, "root-scoped SDK errors"],
   ["completion-config", testCompletionConfigurationBoundary, "private completion across a saved configuration change"],
   ["browser-target", testBrowserTarget, "browser target and native target isolation"],
+  ["browser-catalog", testFreshProviderCompletion, "fresh browser and native completion catalogs"],
   ["crash", testWorkerCrashAndOverlay, "crash and overlay replay"],
   ["cap", testCapAndIdleEviction, "worker cap and idle eviction"],
   ["cancel", testCancellation, "request cancellation"],

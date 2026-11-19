@@ -36,8 +36,8 @@ from malformed source is out of scope.
 Private completion uses the current worker's accepted target and the same
 committed baseline as saved analysis. Shadowed and inactive variants never
 contribute candidates. For a browser root, import completion includes the
-selected archive's eligible module inventory, even siblings not yet imported;
-member completion reads its Wasm interfaces through the captured catalog.
+accepted SDK's eligible module inventory even before the first saved import.
+Member completion reads the Wasm interfaces from that captured catalog.
 Changing the target starts a new worker and replays the open documents, not
 the previous worker's temporary completion or hover facts.
 
