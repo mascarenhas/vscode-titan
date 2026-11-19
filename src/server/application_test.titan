@@ -4248,3 +4248,160 @@ function test_application_diagnostic_replay_respects_failed_saved_epoch(
     end)
   end)
 end
+
+local type ReplayFixture = function (string, string): ()
+local NEXT_DIAGNOSTIC_SOURCE = "function answer(): integer\n  return true\nend\n"
+
+local function with_diagnostic_replay_cache(body: ReplayFixture)
+  local root = test_paths.canonical_path(test_paths.temporary_name())
+  fs.unlink(root)
+  fs.mkdir(root)
+  local filename = root .. "/main.titan"
+  local config = root .. "/titan-config.lua"
+  fs.write_file(filename, "function answer(): integer return 'broken' end\n")
+  fs.write_file(config, "include = { '.' }\nsource_module_roots = { '.' }\n")
+  defer do
+    remove_application_cache(workspace_cache.directory(root))
+    fs.unlink(config)
+    fs.unlink(filename)
+    fs.rmdir(root)
+  end
+  do
+    local app = application.create(root)
+    defer app:close()
+    app:start_indexing()
+    wait_until(function (): boolean
+      return app.completed_view ~= nil and
+        not app:indexing_metrics().refresh_chain_active
+    end, "the cold diagnostic generation did not complete")
+    local uri = source_text.path_to_file_uri(filename)
+    local persisted? = app:published_items(app.completed_view, uri)
+    test.assert(persisted ~= nil and #persisted == 1,
+      "the cold compiler did not persist a diagnostic")
+  end
+  body(root, filename)
+end
+
+local function await_next_replay_publication(app: application.Application,
+    observed: {diagnostics.Publication}, uri: string)
+  wait_until(function (): boolean
+    return not app:indexing_metrics().refresh_chain_active
+  end, "the follow-up diagnostic generation did not complete")
+  test.assert(app.completed_epoch == app.change_epoch and app.failed_epoch == nil,
+    "the follow-up did not accept the newest saved epoch")
+  local current = false
+  for index = 1, #observed do
+    local publication = observed[index]
+    if publication.uri == uri then
+      if #publication.items > 0 then
+        test.assert(#publication.items == 1 and
+          publication.items[1].range.start.line == 1,
+          "a stale type error reached the listener")
+        current = true
+      end
+    end
+  end
+  test.assert(current, "the attached listener never received the current diagnostic")
+end
+
+local function replay_after_superseding_first_warm_pass(root: string,
+                                                       filename: string)
+  local uri = source_text.path_to_file_uri(filename)
+  local replacement: application.Application? = nil
+  local app = application.create(root, function (directory: string,
+      progress: bridge.ProgressListener?, listener: project_service.SnapshotListener?):
+      (project_service.Service?, project_service.Error?, project_loader.Restoration?)
+    local loaded?, failure?, restoration? =
+      project_loader.load(directory, progress, listener)
+    if loaded ~= nil then
+      local current = replacement
+      use_manual_watch_delivery(current)
+      fs.write_file(filename, NEXT_DIAGNOSTIC_SOURCE)
+      current:note_saved_change()
+    end
+    return loaded, failure, restoration
+  end)
+  replacement = app
+  defer app:close()
+  local observed: {diagnostics.Publication} = {}
+  local reattached = false
+  local stale_replay = false
+  app:set_indexing_listener(function (status: indexing_status.Status)
+    -- The first View is installed, but its epoch is superseded. The coalesced
+    -- pass has not been scheduled when this status is emitted.
+    if not reattached and app.completed_view ~= nil and
+       app.completed_epoch < app.change_epoch and status.completed_files == nil then
+      test.assert(app:indexing_metrics().view_builds == 0,
+        "the replacement did not reuse its real SQLite publication")
+      app:set_diagnostics_listener(function (publication: diagnostics.Publication)
+        observed[#observed + 1] = publication
+        if publication.uri == uri and #publication.items > 0 and
+           publication.items[1].range.start.line == 0 then
+          stale_replay = true
+        end
+      end)
+      reattached = true
+    end
+  end)
+  app:start_indexing()
+  wait_until(function (): boolean return reattached end,
+    "the superseded warm View was never available before the follow-up")
+  test.assert(not stale_replay, "reattach replayed the superseded first saved epoch")
+  await_next_replay_publication(app, observed, uri)
+end
+
+function test_application_diagnostic_replay_withholds_superseded_first_warm_pass(
+    _context: test.Context)
+  test_runtime.run(function ()
+    with_diagnostic_replay_cache(replay_after_superseding_first_warm_pass)
+  end)
+end
+
+local function replay_after_hint_while_store_is_held(root: string, filename: string)
+  local app = application.create(root)
+  defer app:close()
+  app:start_indexing()
+  wait_until(function (): boolean
+    return app.completed_view ~= nil and
+      not app:indexing_metrics().refresh_chain_active
+  end, "the warm diagnostic generation did not complete")
+  use_manual_watch_delivery(app)
+  local uri = source_text.path_to_file_uri(filename)
+  local old? = app:published_items(app.completed_view, uri)
+  test.assert(old ~= nil and #old == 1, "replay fixture has no old saved error")
+  local service = app.service
+  local access = service:workspace_store():acquire()
+  defer access:release()
+  local observed: {diagnostics.Publication} = {}
+  local stale_replay = false
+  local replay = async.run<|nil, value|>(function (): nil
+    app:set_diagnostics_listener(function (publication: diagnostics.Publication)
+      observed[#observed + 1] = publication
+      if publication.uri == uri and #publication.items > 0 and
+         publication.items[1].range.start.line == 0 then
+        stale_replay = true
+      end
+    end)
+    return nil
+  end)
+  timer.yield()
+  test.assert(replay:status():as_string() == "waiting",
+    "listener replay did not queue behind the held Store lease")
+  fs.write_file(filename, NEXT_DIAGNOSTIC_SOURCE)
+  app:note_saved_change()
+  access:release()
+  case async.join(replay)
+  when succeeded() then
+  when failed(failure) then failure:raise()
+  else raise "listener replay unexpectedly cancelled"
+  end
+  test.assert(not stale_replay, "listener replay accepted rows after a newer save hint")
+  await_next_replay_publication(app, observed, uri)
+end
+
+function test_application_diagnostic_replay_rechecks_epoch_after_store_wait(
+    _context: test.Context)
+  test_runtime.run(function ()
+    with_diagnostic_replay_cache(replay_after_hint_while_store_is_held)
+  end)
+end

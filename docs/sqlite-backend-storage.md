@@ -160,6 +160,9 @@ Validated SQL answers are served before declaration manifests finish
 restoring. `Restoration` in `src/server/project_loader.titan` decodes them in an
 owned background Task, which `Application` starts and finishes. Saved edits and
 compiler-verified rename coordinate with it.
+Cached diagnostic rows do not become visible on attachment until this worker
+has accepted a publication for the current saved epoch. That eligibility
+belongs to the running application, not the cache schema.
 
 ## Measured footprint
 

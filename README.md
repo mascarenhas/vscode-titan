@@ -437,6 +437,10 @@ read-only requests use the preceding generation; a rename joins or starts an
 explicit refresh instead (`Application:fresh_view`). Rename always waits for
 the newest stable generation and rechecks the disk after its preflight.
 
+A restarted or reclaimed worker publishes diagnostics only after it accepts a
+saved generation for the current files. When the current pass fails or another
+save supersedes it, reattaching the listener does not replay old diagnostics.
+
 ## Logging and tracing
 
 Run **Titan: Show Language Server Output** to open the **Titan Language
