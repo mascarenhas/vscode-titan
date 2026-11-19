@@ -11,27 +11,29 @@ module.exports = (async () => {
   // cleanup (including beforeExit) would not run on the normal exit path.
   process.once("exit", () => {
     try {
-      rmSync(directory, { recursive: true, force: true, maxRetries: 5 });
+      rmSync(directory, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
     } catch (cause) {
       console.error(`Could not remove Extension Host workspace ${directory}:`, cause);
     }
   });
 
   const profile = join(directory, "user-data");
+  const extensions = join(directory, "extensions");
   // test-electron launches through cmd.exe on Windows. Its workspaceFolder
-  // argument is appended unquoted, so pass both owned paths as launch args.
+  // argument is appended unquoted, so supply explicitly quoted owned paths.
   const windows = process.platform === "win32";
   return defineConfig({
     files: "dist-test/src/test/suite/**/*.test.js",
     version: "1.106.0",
     workspaceFolder: windows ? undefined : workspace,
     launchArgs: windows
-      ? [`--user-data-dir="${profile}"`, `"${workspace}"`]
-      : [`--user-data-dir=${profile}`],
+      ? [`--user-data-dir="${profile}"`, `--extensions-dir="${extensions}"`, `"${workspace}"`]
+      : [`--user-data-dir=${profile}`, `--extensions-dir=${extensions}`],
     useInstallation: process.env.TITAN_LSP_TEST_CODE
       ? { fromPath: process.env.TITAN_LSP_TEST_CODE }
       : undefined,
     env: {
+      TITAN_LSP_TEST_FIXTURE_LEASE: "1",
       npm_node_execpath: process.env.npm_node_execpath ?? process.execPath,
       TITAN_PREFIX: undefined,
       TITAN_ROOT: undefined

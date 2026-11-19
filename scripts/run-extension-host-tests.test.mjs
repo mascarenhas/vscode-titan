@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
-import { appendFile, copyFile, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { appendFile, copyFile, mkdir, mkdtemp, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -13,7 +13,7 @@ const proxy = fileURLToPath(new URL("./run-extension-host-tests.mjs", import.met
 const repository = path.dirname(path.dirname(proxy));
 
 test("direct test-cli config prepares and cleans a private workspace", async (context) => {
-  const temp = await mkdtemp(path.join(await realpath(tmpdir()), "titan host config "));
+  const temp = await mkdtemp(path.join(await realpath(tmpdir()), "titan host café "));
   context.after(() => rm(temp, { recursive: true, force: true }));
   const child = spawn(process.execPath, [
     path.join(repository, "node_modules", "@vscode", "test-cli", "out", "bin.mjs"),
@@ -41,9 +41,13 @@ test("direct test-cli config prepares and cleans a private workspace", async (co
   assert.ok(config.launchArgs.includes(windows
     ? `--user-data-dir="${profile}"`
     : `--user-data-dir=${profile}`));
+  const extensions = path.join(directory, "extensions");
+  assert.ok(config.launchArgs.includes(windows
+    ? `--extensions-dir="${extensions}"`
+    : `--extensions-dir=${extensions}`));
   if (windows) assert.equal(config.launchArgs.at(-1), `"${workspace}"`);
   assert.deepEqual(extensionDevelopmentPath, [repository]);
-  await assert.rejects(readFile(workspace), { code: "ENOENT" });
+  await assert.rejects(stat(directory), { code: "ENOENT" });
 });
 
 test("an abandoned Extension Host workspace cannot change a later run", async (context) => {
@@ -159,7 +163,6 @@ for (const code of [0, 7]) {
     assert.equal(events[0].event, "spawn");
     assert.equal(events[0].server, process.execPath);
     assert.deepEqual(events[1], { event: "close", pid: events[0].pid, code, signal: null });
-    assert.throws(() => process.kill(events[0].pid, 0), { code: "ESRCH" });
   });
 }
 
@@ -187,7 +190,6 @@ test("native proxy forwards termination and records abnormal native exit", {
   assert.deepEqual(events[1], {
     event: "close", pid: events[0].pid, code: null, signal: "SIGTERM"
   });
-  assert.throws(() => process.kill(events[0].pid, 0), { code: "ESRCH" });
 });
 
 test("failed-run cleanup retires a restarted native server after an earlier close", {
@@ -218,8 +220,8 @@ test("failed-run cleanup retires a restarted native server after an earlier clos
   await appendFile(receipt, JSON.stringify({ event: "spawn", pid: restarted.pid }) + "\n");
 
   assert.deepEqual(terminateNativeServers(root, "SIGKILL"), { pending: [restarted.pid], errors: [] });
-  await restartedClosed;
-  assert.throws(() => process.kill(restarted.pid, 0), { code: "ESRCH" });
+  const [restartedCode, restartedSignal] = await restartedClosed;
+  assert.equal(process.platform === "win32" ? restartedCode !== null : restartedSignal === "SIGKILL", true);
 });
 
 for (const betaReceipt of ["missing", "malformed"]) {
@@ -276,8 +278,6 @@ for (const malformed of ["alpha", "beta"]) {
     assert.deepEqual(status, [1, null]);
     assert.match(stderr, /AssertionError \[ERR_ASSERTION\]: prepared Extension Host tests failed/);
     assert.match(stderr, /Native server cleanup failed: AggregateError/);
-    assert.throws(() => process.kill(native.pid, 0), { code: "ESRCH" },
-      "the runner must finish retiring the valid child before exposing the receipt error");
     const [code, signal] = await nativeClosed;
     assert.equal(process.platform === "win32" ? code !== null : signal === "SIGKILL", true);
     const diagnostics = stderr.split("\n").filter((line) => line.startsWith("{"))

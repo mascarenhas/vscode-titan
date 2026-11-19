@@ -38,7 +38,9 @@ let identity;
 
 for (const signal of ["SIGINT", "SIGTERM"]) {
   process.on(signal, () => {
-    recordEvent("terminate", { signal });
+    if (identity || process.env.TITAN_LSP_TEST_FIXTURE_LEASE !== "1") {
+      recordEvent("terminate", { signal });
+    }
     if (!ignoreTerminate) process.exit(0);
   });
 }
@@ -250,7 +252,7 @@ function handleMessage(message, initializeDelayElapsed = false) {
     respond(message.id, {
       isIncomplete: false,
       items: [{ label: document?.text.trim() ?? "<missing didOpen>",
-        detail: String(process.pid) }]
+        detail: identity?.token }]
     });
   } else if (provideSemantics && isSemanticMethod(message.method)) {
     recordSemanticRequest(message);

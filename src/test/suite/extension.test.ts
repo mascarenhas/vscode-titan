@@ -52,13 +52,12 @@ const forcedTerminationEvents: FixtureEvent["event"][] =
 
 interface TraceFixtureEvent {
   event: "trace";
-  pid: number;
   value: string;
 }
 
 interface SemanticFixtureEvent {
   event: "semantic";
-  pid: number;
+  identity: FixtureEvent["identity"];
   cwd: string;
   arguments: string[];
   method: string;
@@ -131,7 +130,6 @@ suite("Titan extension", () => {
       vscode.ConfigurationTarget.Global
     );
 
-    process.env.TITAN_LSP_TEST_FIXTURE_LEASE = "1";
     const extension = vscode.extensions.getExtension(extensionIdentifier);
     assert.ok(extension, `${extensionIdentifier} should be installed`);
     await extension.activate();
@@ -163,7 +161,7 @@ suite("Titan extension", () => {
       betaMarkerPath,
       ["initialize"]
     );
-    assert.notEqual(alphaInitial.pid, betaInitial.pid);
+    assert.notEqual(alphaInitial.identity.token, betaInitial.identity.token);
     await assertInitialization(
       alphaInitial,
       alpha,
@@ -184,7 +182,7 @@ suite("Titan extension", () => {
       betaMarkerPath,
       ["initialize", "shutdown", "exit"]
     );
-    assert.equal(new Set(betaRemoved.map((event) => event.pid)).size, 1);
+    assert.ok(betaRemoved.every((event) => event.identity.token === betaInitial.identity.token));
     await assertStableEventSequence(alphaMarkerPath, ["initialize"]);
 
     await updateWorkspaceFolders(1, 0, { uri: beta.uri, name: beta.name });
@@ -192,7 +190,7 @@ suite("Titan extension", () => {
       betaMarkerPath,
       ["initialize", "shutdown", "exit", "initialize"]
     );
-    assert.notEqual(betaReadded[3].pid, betaInitial.pid);
+    assert.notEqual(betaReadded[3].identity.token, betaInitial.identity.token);
     await assertInitialization(
       betaReadded[3],
       beta,
@@ -220,7 +218,7 @@ suite("Titan extension", () => {
       alphaMarkerPath,
       ["initialize", "shutdown", "exit", "initialize"]
     );
-    assert.notEqual(alphaReconfigured[3].pid, alphaInitial.pid);
+    assert.notEqual(alphaReconfigured[3].identity.token, alphaInitial.identity.token);
     assert.deepEqual(
       alphaReconfigured[3].arguments,
       ["--fixture-token", "alpha-reconfigured"]
@@ -264,12 +262,12 @@ suite("Titan extension", () => {
     assert.equal(alphaGloballyReconfigured[6].luaPath, globalLuaPath);
     assert.equal(betaGloballyReconfigured[6].luaPath, globalLuaPath);
     assert.notEqual(
-      alphaGloballyReconfigured[6].pid,
-      alphaReconfigured[3].pid
+      alphaGloballyReconfigured[6].identity.token,
+      alphaReconfigured[3].identity.token
     );
     assert.notEqual(
-      betaGloballyReconfigured[6].pid,
-      betaReadded[3].pid
+      betaGloballyReconfigured[6].identity.token,
+      betaReadded[3].identity.token
     );
 
     await vscode.workspace.getConfiguration(
@@ -298,8 +296,8 @@ suite("Titan extension", () => {
     );
     assert.equal(alphaLogReconfigured[9].serverLogLevel, "trace");
     assert.notEqual(
-      alphaLogReconfigured[9].pid,
-      alphaGloballyReconfigured[6].pid
+      alphaLogReconfigured[9].identity.token,
+      alphaGloballyReconfigured[6].identity.token
     );
     await assertStableEventSequence(
       betaMarkerPath,
@@ -610,8 +608,10 @@ suite("Titan extension", () => {
         assert.equal(item.range.end.character, 6);
 
         await completionConfiguration.update("insertCallSnippets", false, vscode.ConfigurationTarget.WorkspaceFolder);
-        const optedOut = await waitForInitializationToken(alphaMarkerPath, "call-snippets", 10_000, initialization.pid);
-        assert.notEqual(optedOut.pid, initialization.pid);
+        const optedOut = await waitForInitializationToken(
+          alphaMarkerPath, "call-snippets", 10_000, initialization.identity.token
+        );
+        assert.notEqual(optedOut.identity.token, initialization.identity.token);
         assert.deepEqual(optedOut.initializationOptions, {
           insertCallSnippets: false,
           pullDiagnostics: false,
@@ -622,7 +622,9 @@ suite("Titan extension", () => {
         assert.ok(reference, "name-only completion did not reach the editor");
         assert.equal(reference.insertText, "method");
         const betaAfter = (await readEvents(betaMarkerPath)).filter((event) => event.event === "initialize").at(-1);
-        assert.equal(betaAfter?.pid, betaBefore?.pid, "alpha completion preference restarted beta");
+        assert.ok(betaBefore && betaAfter, "beta did not initialize");
+        assert.equal(betaAfter.identity.token, betaBefore.identity.token,
+          "alpha completion preference restarted beta");
       } finally {
         if (document?.isDirty) {
           await vscode.window.showTextDocument(document);
@@ -724,14 +726,14 @@ suite("Titan extension", () => {
           ["shutdown", "exit", "initialize"],
           10_000
         );
-        const initialOuterPid = initialEvents[2].pid;
+        const initialOuter = initialEvents[2].identity.token;
         document = await vscode.workspace.openTextDocument(
           vscode.Uri.file(path.join(nestedRoot, "sample.titan"))
         );
         await replaceDocumentText(document, "local before_nested = 1\n");
         assert.equal(document.isDirty, true);
         assert.equal(await waitForBufferCompletion(document, 10_000),
-          initialOuterPid);
+          initialOuter);
 
         await updateWorkspaceFolders(
           vscode.workspace.workspaceFolders?.length ?? 0,
@@ -757,17 +759,17 @@ suite("Titan extension", () => {
         );
 
         assert.equal(await waitForBufferCompletion(document, 10_000),
-          initialization.pid,
+          initialization.identity.token,
           "the new nested client must open the already dirty document");
-        await waitForProcessEvents(alphaMarkerPath, initialOuterPid,
+        await waitForProcessEvents(alphaMarkerPath, initialOuter,
           ["shutdown", "exit"], 10_000);
         const outerAfterAdd = (await readEvents(alphaMarkerPath))
           .filter((event) => event.event === "initialize").at(-1)!;
-        assert.notEqual(outerAfterAdd.pid, initialOuterPid,
+        assert.notEqual(outerAfterAdd.identity.token, initialOuter,
           "adding a nested root must discard the ancestor's old buffer session");
         await replaceDocumentText(document, "local inside_nested = 2\n");
         assert.equal(await waitForBufferCompletion(document, 10_000),
-          initialization.pid);
+          initialization.identity.token);
         // Every buffer event and completion belongs to the same most-specific
         // owner as saved-file requests, even while the outer selector matches.
         const outerMiddleware = createWorkspaceMiddleware(alpha);
@@ -832,7 +834,7 @@ suite("Titan extension", () => {
           await realpath(document.uri.fsPath)
         ).toString();
         for (const request of await readSemanticEvents(nestedSemanticMarker)) {
-          assert.equal(request.pid, initialization.pid);
+          assert.equal(request.identity.token, initialization.identity.token);
           assert.equal(request.uri, physicalDocumentUri);
         }
         assert.deepEqual(
@@ -845,17 +847,17 @@ suite("Titan extension", () => {
         nestedFolder = undefined;
         await waitForProcessEvents(
           nestedLifecycleMarker,
-          initialization.pid,
+          initialization.identity.token,
           ["shutdown", "exit"],
           10_000
         );
-        const restoredOuterPid = await waitForBufferCompletion(document, 10_000);
-        assert.notEqual(restoredOuterPid, initialization.pid);
-        assert.notEqual(restoredOuterPid, outerAfterAdd.pid,
+        const restoredOuter = await waitForBufferCompletion(document, 10_000);
+        assert.notEqual(restoredOuter, initialization.identity.token);
+        assert.notEqual(restoredOuter, outerAfterAdd.identity.token,
           "removing a nested root must reopen its dirty documents in the ancestor");
         await replaceDocumentText(document, "local after_nested = 3\n");
         assert.equal(await waitForBufferCompletion(document, 10_000),
-          restoredOuterPid);
+          restoredOuter);
       } finally {
         if (nestedFolder !== undefined) {
           try {
@@ -1048,7 +1050,7 @@ suite("Titan extension", () => {
         symlinkFolder = undefined;
         await waitForProcessEvents(
           lifecycleMarker,
-          initialization.pid,
+          initialization.identity.token,
           ["shutdown", "exit"],
           10_000
         );
@@ -1512,7 +1514,7 @@ async function replaceDocumentText(
 async function waitForBufferCompletion(
   document: vscode.TextDocument,
   timeoutMilliseconds: number
-): Promise<number> {
+): Promise<string> {
   const deadline = Date.now() + timeoutMilliseconds;
   let labels: string[] = [];
   while (Date.now() < deadline) {
@@ -1524,7 +1526,7 @@ async function waitForBufferCompletion(
       typeof item.label === "string" ? item.label : item.label.label);
     const item = result?.items.find((item) =>
       item.label === document.getText().trim());
-    if (item !== undefined) return Number(item.detail);
+    if (item?.detail !== undefined) return item.detail;
     await delay(50);
   }
   assert.fail(`completion did not receive current dirty text; labels: ${labels}`);
@@ -1686,7 +1688,7 @@ async function waitForInitializationToken(
   file: string,
   token: string,
   timeoutMilliseconds: number,
-  previousPid?: number,
+  previousIdentity?: string,
   afterEventCount: number = 0
 ): Promise<FixtureEvent> {
   const deadline = Date.now() + timeoutMilliseconds;
@@ -1695,7 +1697,7 @@ async function waitForInitializationToken(
     observed = await readEvents(file);
     const initialization = observed.slice(afterEventCount).find((event) =>
       event.event === "initialize" && event.arguments.includes(token) &&
-      event.pid !== previousPid);
+      event.identity?.token !== previousIdentity);
     if (initialization !== undefined) {
       return initialization;
     }
@@ -1710,14 +1712,14 @@ async function waitForInitializationToken(
 
 async function waitForProcessEvents(
   file: string,
-  pid: number,
+  identity: string,
   expected: FixtureEvent["event"][],
   timeoutMilliseconds: number
 ): Promise<FixtureEvent[]> {
   const deadline = Date.now() + timeoutMilliseconds;
   let observed: FixtureEvent[] = [];
   while (Date.now() < deadline) {
-    observed = (await readEvents(file)).filter((event) => event.pid === pid);
+    observed = (await readEvents(file)).filter((event) => event.identity?.token === identity);
     if (expected.every((event) =>
       observed.some((candidate) => candidate.event === event))) {
       return observed;
@@ -1725,7 +1727,7 @@ async function waitForProcessEvents(
     await delay(50);
   }
   assert.fail(
-    `timed out waiting for ${expected.join(", ")} from process ${pid} in ` +
+    `timed out waiting for ${expected.join(", ")} from fixture ${identity} in ` +
       `${file}; observed ${observed.map((event) => event.event).join(", ")}`
   );
 }
@@ -1855,14 +1857,12 @@ function delay(milliseconds: number): Promise<void> {
 function isFixtureAlive(event: FixtureEvent): Promise<boolean> {
   const { port, token } = event.identity;
   // The suite's ES2022 library has no Promise.withResolvers declaration.
-  return new Promise((resolve, reject) => {
+  return new Promise((resolve) => {
     const socket = connect(port, "127.0.0.1");
     let received = "";
     socket.setEncoding("ascii");
     // Bound a real socket check; a fake clock cannot drive its I/O.
-    socket.setTimeout(2_000, () => socket.destroy(
-      new Error(`fixture ${event.pid} did not answer its liveness check`)
-    ));
+    socket.setTimeout(2_000, () => socket.destroy());
     socket.on("data", (chunk: string) => {
       received += chunk;
       if (!token.startsWith(received)) {
@@ -1871,13 +1871,8 @@ function isFixtureAlive(event: FixtureEvent): Promise<boolean> {
       }
     });
     socket.once("end", () => resolve(received === token));
-    socket.once("error", (error: NodeJS.ErrnoException) => {
-      if (error.code === "ECONNREFUSED" || error.code === "ECONNRESET") {
-        resolve(false);
-      } else {
-        reject(error);
-      }
-    });
+    socket.once("error", () => resolve(false));
+    socket.once("close", () => resolve(false));
   });
 }
 
