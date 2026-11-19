@@ -1642,7 +1642,8 @@ async function testFreshProviderCompletion() {
           `${name} did not publish its complete browser SDK inventory`);
         const descriptor = sdkDescriptor(root, "titan.browser");
         assert.equal(descriptor.provenance, "static");
-        assert.ok(samePath(descriptor.file, path.join(sdk, browserDirectory, "titan.a")), descriptor.file);
+        const filename = await realpath(path.join(sdk, browserDirectory, "titan.a"));
+        assert.ok(samePath(descriptor.file, filename), descriptor.file);
       }
       const overlay = `local std = import "${module}"\nfunction answer() local value = std.${member} end\n`;
       session.notify("textDocument/didChange", {
@@ -1779,6 +1780,7 @@ async function testPackagedBrowser() {
     "the extracted default installation must not supply bare Titan on package.cpath");
   assert.deepEqual((await readdir(path.join(sdk, browserDirectory))).sort(),
     ["absent-modules", "analysis-target", "titan.a"]);
+  const filename = await realpath(path.join(sdk, browserDirectory, "titan.a"));
   const base = await makeBase("browser-packaged");
   const hostSdk = process.env.TITAN_TEST_HOST_SDK;
   assert.ok(hostSdk, "the package smoke needs the verified packaging SDK for a native-only selection");
@@ -1824,7 +1826,6 @@ async function testPackagedBrowser() {
       await pollHover(session, source, pure, "binding", /BrowserHandle/, "default browser pack");
       await pollHover(session, source, pure, "use_full_pack", /string/, "module outside the protocol fixture");
       assert.deepEqual((await pullDiagnostics(session, uri(source))).items, []);
-      const filename = path.join(sdk, browserDirectory, "titan.a");
       assert.ok(samePath(sdkDescriptor(base, "titan.browser").file, filename));
       assert.ok(samePath(sdkDescriptor(base, "titan.gc").file, filename));
       assert.ok(samePath(sdkDescriptor(base, "titan.json").file, filename));
