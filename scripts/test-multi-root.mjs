@@ -792,10 +792,15 @@ async function assertSelectedSdkUsesProvider(session, project, source, provider)
   assert.ok(samePath(json.file, provider), `selected titan.json came from ${json.file}`);
   const sibling = sdkDescriptor(project, "titan.math");
   assert.ok(samePath(sibling.file, provider), `selected sibling came from ${sibling.file}`);
-  for (const symbol of ["encode", "tripled"]) {
-    await pollCompletion(session, source, positionOf(SDK_SOURCE, symbol),
-      "repeated selected-compiler completion");
+  session.notify("textDocument/didOpen", {
+    textDocument: { uri: uri(source), languageId: "titan", version: 1, text: SDK_SOURCE }
+  });
+  for (const [symbol, occurrence] of [["encode", 1], ["tripled", 1]]) {
+    const items = await pollCompletion(session, source, endOfToken(SDK_SOURCE, symbol, occurrence),
+      `selected SDK completion of ${symbol}`);
+    assert.ok(items.some((item) => item.label === symbol));
   }
+  session.notify("textDocument/didClose", { textDocument: { uri: uri(source) } });
   for (let iteration = 0; iteration < 2; iteration++) {
     const rename = await session.result("textDocument/rename", {
       textDocument: { uri: uri(source) },
