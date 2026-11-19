@@ -6,10 +6,9 @@ foreign import "compiler_io_platform.h"
 local async = import "async"
 local fs = import "fs"
 local paths = import "path"
-local strings = import "string"
 local source_text = import "server.source_text"
 
-local CONFIG_FILE_NAME = "titan-config.lua"
+local const CONFIG_FILE_NAME = "titan-config.lua"
 
 --- Workspace-root provenance: a client folder, config discovery, or a root whose
 --- folder was removed while its worker stays warm.
@@ -53,14 +52,11 @@ local function normalize_platform(path: string): string
 end
 
 local function join(parent: string, name: string): string
-  return paths.to_slash(paths.join(parent, name))
+  return source_text.join_path(parent, name)
 end
 
 local function parent_path(subject: string): string
-  local parent?, failure? = source_text.normalize_absolute_path(
-    paths.dirname(subject))
-  if parent == nil then raise failure end
-  return parent
+  return source_text.parent_directory(subject)
 end
 
 -- Physical identity is the deepest existing ancestor's realpath plus the
@@ -92,10 +88,7 @@ end
 
 --- Report whether a canonical root contains a canonical subject path.
 function contains(root: string, subject: string): boolean
-  if subject == root then return true end
-  local prefix = root
-  if strings.sub(prefix, -1) ~= "/" then prefix = prefix .. "/" end
-  return strings.sub(subject, 1, #prefix) == prefix
+  return source_text.path_within(root, subject)
 end
 
 local function configuration_file(directory: string): string
@@ -123,7 +116,7 @@ end
 
 --- Create an empty canonical root registry.
 function create(): Roots
-  return Roots.new({}, {})
+  return Roots({}, {})
 end
 
 function Roots:find(root_path: string): Root?
@@ -145,8 +138,8 @@ end
 
 local function Roots:register(root_path: string): Root
   local existing? = self.entries[root_path]
-  if existing ~= nil then return existing as Root end
-  local entry = Root.new(root_path, 0, false)
+  if existing ~= nil then return existing end
+  local entry = Root(root_path, 0, false)
   self.entries[root_path] = entry
   self.order[#self.order + 1] = root_path
   return entry
@@ -182,18 +175,15 @@ end
 function Roots:remove_folder(root_path: string): boolean
   local entry? = self.entries[root_path]
   if entry == nil then return false end
-  local actual = entry as Root
-  if actual.folder_refs > 0 then actual.folder_refs = actual.folder_refs - 1 end
-  return not actual:claimed()
+  if entry.folder_refs > 0 then entry.folder_refs = entry.folder_refs - 1 end
+  return not entry:claimed()
 end
 
 --- Drop a released root whose worker has stopped.
 function Roots:drop(root_path: string): boolean
   local entry? = self.entries[root_path]
-  if entry == nil then return false end
-  local actual = entry as Root
-  if actual:claimed() then return false end
-  self:unregister(actual)
+  if entry == nil or entry:claimed() then return false end
+  self:unregister(entry)
   return true
 end
 

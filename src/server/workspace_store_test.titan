@@ -139,3 +139,35 @@ function test_workspace_store_file_reopen_and_rolled_back_publication(
       "reopen lost completed binary payload")
   end)
 end
+
+function test_workspace_store_batch_inserts_nulls_and_multi_packet_flushes(
+    _context: test.Context)
+  test_runtime.run(function ()
+    local store = stores.open(":memory:")
+    defer store:close()
+    local access = store:acquire()
+    defer access:release()
+    stores.execute(access.connection,
+      "CREATE TABLE main.batch_items(id INTEGER PRIMARY KEY, label BLOB, note TEXT)")
+    local insert = stores.batch(access.connection,
+      "INSERT OR IGNORE INTO main.batch_items VALUES ", 3, 2)
+    insert:flush()
+    insert:append(1, sqlite3.Blob("one"), nil)
+    insert:append(2, nil, "two")
+    insert:append(3, sqlite3.Blob("three"))
+    insert:append(2, sqlite3.Blob("duplicate"), "ignored")
+    insert:append(4, sqlite3.Blob("four"), "tail")
+    insert:flush()
+    local rows = stores.rows(access.connection,
+      "SELECT id, label, note FROM main.batch_items ORDER BY id")
+    test.assert(#rows == 4, "batch did not insert all distinct rows")
+    test.assert(rows[1]:get(1) == 1 and stores.bytes(rows[1], 2) == "one" and
+                rows[1]:get(3) == nil, "first batch row lost blob or NULL")
+    test.assert(rows[2]:get(1) == 2 and stores.optional_bytes(rows[2], 2) == nil and
+                rows[2]:get(3) == "two", "second batch row lost NULL or OR IGNORE")
+    test.assert(rows[3]:get(1) == 3 and stores.bytes(rows[3], 2) == "three" and
+                rows[3]:get(3) == nil, "third batch row did not nil-fill omitted tail")
+    test.assert(rows[4]:get(1) == 4 and stores.bytes(rows[4], 2) == "four" and
+                rows[4]:get(3) == "tail", "final flush lost tail row")
+  end)
+end
