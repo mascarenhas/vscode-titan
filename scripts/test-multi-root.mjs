@@ -574,11 +574,13 @@ async function testFolderChanges() {
     }, "the folder removal did not release its root");
     assert.equal(rootEntry(released, rootB).workerPid, servedPid,
       "releasing a folder stopped its worker");
+    assert.equal(rootEntry(released, rootB).generation, servedGeneration);
     assert.equal(rootEntry(released, rootA).state, "ready",
       "removing one folder disturbed another root");
     assert.equal(rootEntry(released, rootA).workerPid,
       rootEntry(twoRoots, rootA).workerPid,
       "removing one folder restarted another root");
+    assert.equal(rootEntry(released, rootA).generation, rootEntry(twoRoots, rootA).generation);
     await pollHover(session, sourceA, ROOT_A_SOURCE, "doubled",
       /doubled|integer/, "the surviving root");
 
@@ -1547,7 +1549,6 @@ async function testReleasedRoots() {
     });
     await pollHover(session, sourceB, ROOT_B_SOURCE, "tripled", /integer/,
       "the sibling root");
-    const served = rootEntry(await session.status(), rootB);
     session.notify("workspace/didChangeWorkspaceFolders", {
       event: { added: [], removed: [{ uri: uri(rootB), name: "b" }] }
     });
@@ -1569,8 +1570,7 @@ async function testReleasedRoots() {
     const restarted = rootEntry(await session.status(), rootB);
     // The released root's slot was dropped with its worker, so re-adding it
     // starts a fresh worker (and a fresh generation).
-    assert.notEqual(restarted.workerPid, served.workerPid,
-      "an evicted released root came back with its old worker pid");
+    assert.ok(Number.isInteger(restarted.workerPid), "the re-added slot has no live worker");
     assert.equal(restarted.generation, 1,
       "an evicted released root kept its old generation");
     await pollHover(session, sourceA, ROOT_A_SOURCE, "doubled", /integer/,
@@ -2355,7 +2355,9 @@ async function testCrashDiagnosticClearing() {
       "the crashed worker's diagnostic clearing");
     await pollHover(session, source, ROOT_A_SOURCE, "doubled", /integer/,
       "the fixed replacement worker");
-    assert.notEqual(rootEntry(await session.status(), root).workerPid, running.workerPid);
+    const replacement = rootEntry(await session.status(), root);
+    assert.ok(Number.isInteger(replacement.workerPid), "the replacement has no live worker");
+    assert.ok(replacement.generation > running.generation, "the crashed slot was not reactivated");
     assert.equal(lastPublicationFor(session, published.uri).diagnostics.length, 0,
       "the replacement left the crashed worker's error visible");
     await session.shutdown();
@@ -2523,7 +2525,6 @@ async function testReplacementHoldsOldDiagnostics() {
     const replacing = rootEntry(await pollStatus(session, (entries) =>
       held !== undefined && rootEntry(entries, root).workerPid !== null,
     "the replacement worker's held progress request"), root);
-    assert.notEqual(replacing.workerPid, running.workerPid);
     assert.ok(replacing.generation > running.generation);
     folders([], [folder]);
     assert.equal(rootEntry(await session.status(), root).origin, "released");
@@ -2561,7 +2562,9 @@ async function testReplacementHoldsOldDiagnostics() {
     const replay = await waitNotification(session, session.responses.diagnosticPublications,
       reclaimAt, nonempty, "the replacement's later warm replay");
     assert.deepEqual(replay, fresh);
-    assert.equal(rootEntry(await session.status(), root).workerPid, replacing.workerPid);
+    const replaying = rootEntry(await session.status(), root);
+    assert.equal(replaying.workerPid, replacing.workerPid);
+    assert.equal(replaying.generation, replacing.generation);
     await session.shutdown();
     const records = structuredLogRecords(session.stderr().subarray(logsStart));
     assert.ok(records.some((record) =>
@@ -2698,8 +2701,10 @@ async function testNestedDiscoveryDuringBlockedRefresh() {
     assert.ok(reclaimed.epoch > released.epoch);
     assert.equal(reclaimed.generation, released.generation,
       "warm reclaim counted another completed publication");
-    assert.equal(rootEntry(await session.status(), outer).workerPid, running.workerPid,
+    const current = rootEntry(await session.status(), outer);
+    assert.equal(current.workerPid, running.workerPid,
       "busy release/reclaim replaced the warm worker");
+    assert.equal(current.generation, running.generation);
 
     const hoverId = issue("textDocument/hover", {
       textDocument: { uri: uri(outerSource) }, position: { line: 0, character: 0 }
