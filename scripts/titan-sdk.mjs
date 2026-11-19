@@ -9,6 +9,23 @@ function environmentValue(environment, name, platform) {
     : environment[name];
 }
 
+export function childEnvironment(inherited, overrides, removed = [], platform = process.platform) {
+  if (platform !== "win32") {
+    const environment = { ...inherited };
+    for (const name of removed) delete environment[name];
+    return { ...environment, ...overrides };
+  }
+  const selected = new Map();
+  for (const [name, value] of Object.entries(inherited)) {
+    selected.set(name.toUpperCase(), [name, value]);
+  }
+  for (const name of removed) selected.delete(name.toUpperCase());
+  for (const [name, value] of Object.entries(overrides)) {
+    selected.set(name.toUpperCase(), [name, value]);
+  }
+  return Object.fromEntries(selected.values());
+}
+
 export function compilerDiscoveryEnvironment(environment = process.env) {
   return Object.fromEntries(Object.entries(environment).filter(([name]) =>
     !/^(LUA_(PATH|CPATH|INIT)(_[0-9_]+)?|TITAN_(PREFIX|ROOT|PATH(_[0-9_]+)?|SOURCE_PATH))$/i.test(name)));

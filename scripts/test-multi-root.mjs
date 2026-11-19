@@ -13,6 +13,7 @@ import {
   realpath,
   rm,
   stat,
+  rename,
   symlink,
   writeFile
 } from "node:fs/promises";
@@ -21,7 +22,7 @@ import { stripTypeScriptTypes } from "node:module";
 import * as path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { browserDirectory, stageBrowserFixture } from "./browser-analysis-fixture.mjs";
+import { browserDirectory, semanticFiles, stageBrowserFixture } from "./browser-analysis-fixture.mjs";
 import {
   FrameReader,
   collect,
@@ -1283,7 +1284,53 @@ const BROWSER_MAIN = [
 ].join("\n");
 const BROWSER_FALLBACK = "function platform_value(): integer return 5 end\n";
 
-function assertBrowserContributors(project, fixture, name) {
+async function installedBrowserSdkForTest() {
+  const sdk = sdkRoot();
+  const present = await Promise.all(semanticFiles.map(async (name) => {
+    try {
+      return (await stat(path.join(sdk, browserDirectory, name))).isFile();
+    } catch (error) {
+      if (error.code === "ENOENT") return false;
+      throw error;
+    }
+  }));
+  if (present.every(Boolean)) return sdk;
+  assert.ok(present.every((value) => !value), "the host SDK has an incomplete browser pack");
+  console.log("multi-root: full browser SDK checks skipped (TITAN_ROOT is native-only); exercising the checked-in fixture");
+  return null;
+}
+
+async function compilerTripwire(base, sdk) {
+  const lua = path.join(sdk, "bin", process.platform === "win32" ? "lua.exe" : "lua");
+  const marker = path.join(base, "native-compiler-was-invoked");
+  const script = path.join(base, "reject native compiler.lua");
+  const extension = process.platform === "win32" ? "dll" : "so";
+  const cpath = path.join(sdk, "lib/lua/5.5", `?.${extension}`);
+  await writeFile(script, [
+    `package.cpath = ${luaString(cpath)}`,
+    `local log <close> = assert(io.open(${luaString(marker)}, "ab"))`,
+    'assert(log:write(assert(require("lfs").currentdir()), "\\n"))',
+    "os.exit(93, true)"
+  ].join("\n"));
+  const probe = spawnSync(lua, ["-E", script], { cwd: base, windowsHide: true, encoding: "utf8" });
+  assert.ifError(probe.error);
+  assert.equal(probe.status, 93, probe.stderr);
+  assert.ok(samePath((await readFile(marker, "utf8")).trimEnd(), base));
+  await rm(marker);
+  const command = `${luaString(serverPath(lua))} -E ${luaString(serverPath(script))}`;
+  return {
+    environment: { CC: command, CPP: command },
+    verify: async (...nativeRoots) => {
+      if (!await exists(marker)) return;
+      const calls = (await readFile(marker, "utf8")).trimEnd().split(/\r?\n/);
+      assert.ok(calls.every((from) => nativeRoots.some((root) => samePath(root, from))),
+        `browser protocol invoked the native C compiler from ${JSON.stringify(calls)}`);
+      await rm(marker);
+    }
+  };
+}
+
+function assertBrowserContributors(project, fixture, name, full) {
   const installed = sdkRoot();
   const script = fileURLToPath(new URL("./browser-analysis-fixture.lua", import.meta.url));
   const lua = path.join(installed, "bin", process.platform === "win32" ? "lua.exe" : "lua");
@@ -1291,7 +1338,7 @@ function assertBrowserContributors(project, fixture, name) {
   try {
     const files = db.prepare("SELECT filename FROM completion_source_files WHERE module_name=? ORDER BY position")
       .all(Buffer.from(name)).map(({ filename }) => Buffer.from(filename).toString("utf8"));
-    for (const prefix of [fixture, installed]) {
+    for (const prefix of full === null ? [fixture] : [fixture, full]) {
       const resolved = spawnSync(lua, ["-E", script, "sources", installed,
         path.join(project, "src"), name, prefix], { encoding: "utf8", windowsHide: true });
       assert.ifError(resolved.error);
@@ -1308,6 +1355,8 @@ function assertBrowserContributors(project, fixture, name) {
 
 async function testBrowserTarget() {
   const base = await makeBase("browser-target");
+  const full = await installedBrowserSdkForTest();
+  const tripwire = await compilerTripwire(base, sdkRoot());
   await stageBrowserFixture(base);
   const sdk = path.join(base, "sdk");
   const providers = path.join(base, "providers");
@@ -1316,14 +1365,16 @@ async function testBrowserTarget() {
   }
   const native = path.join(base, "native");
   const browser = path.join(base, "browser");
-  const nativeSource = await writeRoot(native, BROWSER_FALLBACK);
+  const nativeText = 'local fs = import "fs"\n' + BROWSER_FALLBACK;
+  const nativeSource = await writeRoot(native, nativeText);
   const browserConfig = `${ROOT_CONFIG}compiler_root = ${luaString(sdk)}\n` +
     `binary_modules_root = ${luaString(providers)}\n`;
   const fallback = await writeRoot(browser, BROWSER_FALLBACK, `${browserConfig}target = "browser"\n`);
   const active = path.join(browser, "src", "main.browser.titan");
   const absent = path.join(browser, "src", "unsupported.browser.titan");
   await writeFile(active, BROWSER_MAIN);
-  await writeFile(path.join(native, "src", "main.browser.titan"), BROWSER_MAIN);
+  const nativeInactiveFile = path.join(native, "src", "main.browser.titan");
+  await writeFile(nativeInactiveFile, BROWSER_MAIN);
   const pair = path.join(browser, "src", "pair");
   await mkdir(pair);
   for (const file of ["pair.browser.titan", "pair.native.titan", "z.browser.titan", "z.titan", "a.titan"]) {
@@ -1343,24 +1394,49 @@ async function testBrowserTarget() {
     assertReady(status, browser, "browser root");
     return status;
   };
-  const env = { TITAN_TARGET: "wasm-is-not-an-ambient-selector", EMSDK: path.join(base, "no emsdk") };
+  const env = { ...tripwire.environment, TITAN_TARGET: "wasm-is-not-an-ambient-selector",
+    EMSDK: path.join(base, "no emsdk") };
   const session = new Session(launch(native, "debug", env));
+  const isInactive = (items) => items.some((entry) => entry.code === "inactive-variant");
+  const publications = session.responses.diagnosticPublications;
+  const pushed = (filename, start, predicate, label) => waitNotification(session, publications, start,
+    (report) => report.uri === uri(filename) && predicate(report.diagnostics), label);
+  const liveRoot = async (root, target, after = 0) => rootEntry(await pollStatus(session, (entries) => {
+    const entry = findRoot(entries, root);
+    return entry?.target === target && entry.state === "ready" && entry.generation > after &&
+      Number.isInteger(entry.workerPid);
+  }, `${target} worker for ${root} did not become live`), root);
+  const retirementCount = () => {
+    const text = session.stderr().toString("utf8");
+    return structuredLogRecords(Buffer.from(text.slice(0, text.lastIndexOf("\n") + 1)))
+      .filter((entry) => entry.event === "root.stop" && samePath(entry.root, browser) &&
+        entry.reason === "settings changed").length;
+  };
   try {
-    const status = await initialize(session);
-    assert.equal(rootEntry(status, browser).target, "browser");
-    assert.equal(rootEntry(status, native).target, "native");
+    await initialize(session);
+    const original = await liveRoot(browser, "browser");
+    const sibling = await liveRoot(native, "native");
+    await pushed(fallback, 0, isInactive, "browser target inactive unlabeled diagnostic");
+    await pushed(nativeInactiveFile, 0, isInactive, "native target inactive browser diagnostic");
     await pollHover(session, active, BROWSER_MAIN, "binding", /BrowserHandle/, "browser SDK");
     await pollHover(session, active, BROWSER_MAIN, "explicit_archive", /string/, "explicit Wasm provider");
-    await pollHover(session, nativeSource, BROWSER_FALLBACK, "platform_value", /integer/, "native root");
+    await pollHover(session, nativeSource, nativeText, "platform_value", /integer/, "native root");
+    await pollHover(session, nativeSource, nativeText, "fs", /titan[.]fs/, "native-only standard library");
     assert.deepEqual((await pullDiagnostics(session, uri(active))).items, []);
-    assertBrowserContributors(browser, sdk, "main");
-    assertBrowserContributors(browser, sdk, "pair");
+    assertBrowserContributors(browser, sdk, "main", full);
+    assertBrowserContributors(browser, sdk, "pair", full);
     const inactive = await pullDiagnostics(session, uri(fallback));
     assert.ok(inactive.items.some((entry) => entry.code === "inactive-variant"));
-    const nativeInactive = await pullDiagnostics(session, uri(path.join(native, "src", "main.browser.titan")));
+    const nativeInactive = await pullDiagnostics(session, uri(nativeInactiveFile));
     assert.ok(nativeInactive.items.some((entry) => entry.code === "inactive-variant"));
     assert.ok(!nativeInactive.items.some((entry) => entry.severity === 1),
       "native worker analyzed the inactive browser declarations");
+    const nativeUnsupported = path.join(native, "src", "unsupported.titan");
+    await writeFile(nativeUnsupported, 'local missing = import "browser"\n');
+    assert.match(JSON.stringify((await pullDiagnostics(session, uri(nativeUnsupported))).items),
+      /module 'titan[.]browser' not found/);
+    await rm(nativeUnsupported);
+    assert.deepEqual((await pullDiagnostics(session, uri(nativeUnsupported))).items, []);
     assert.ok(samePath(sdkDescriptor(browser, "titan.browser").file, library));
     assert.ok(samePath(sdkDescriptor(browser, "titan.gc").file, library), "unused browser SDK sibling missing");
     assert.ok(samePath(sdkDescriptor(browser, "browser_external").file, external));
@@ -1372,6 +1448,12 @@ async function testBrowserTarget() {
       ...request, context: { includeDeclaration: true }
     });
     assert.deepEqual(references.map((location) => location.uri), [uri(active), uri(active)]);
+    for (const token of ["binding", "explicit_archive"]) {
+      const binary = await session.result("textDocument/definition", {
+        textDocument: request.textDocument, position: positionOf(BROWSER_MAIN, token)
+      });
+      assert.ok(binary === null || binary.length === 0, `${token} invented a binary source location`);
+    }
     const folds = await session.result("textDocument/foldingRange", { textDocument: request.textDocument });
     assert.ok(folds.some((range) => range.startLine === 2 && range.endLine === 3),
       JSON.stringify(folds));
@@ -1379,10 +1461,17 @@ async function testBrowserTarget() {
     assert.match(JSON.stringify(renamed), /chosen/);
     assert.ok(JSON.stringify(renamed).includes(uri(active)), "rename did not address the active variant");
     assert.ok(!JSON.stringify(renamed).includes(uri(fallback)), "rename edited the inactive variant");
-    await writeFile(absent, 'local missing = import "fs"\n');
-    assert.match(JSON.stringify((await pullDiagnostics(session, uri(absent))).items), /requires a filesystem/);
+    const staged = path.join(base, "staged-diagnostic.titan");
+    const missingFs = (items) => items.some((entry) => /requires a filesystem/.test(entry.message));
+    await writeFile(staged, 'local missing = import "fs"\n');
+    const addAt = publications.length;
+    await rename(staged, absent);
+    await pushed(absent, addAt, missingFs, "browser unsupported library push");
+    assert.ok(missingFs((await pullDiagnostics(session, uri(absent))).items));
+    const removeAt = publications.length;
     await rm(absent);
-    await pullDiagnostics(session, uri(active));
+    await pushed(absent, removeAt, (items) => items.length === 0, "removed browser diagnostic URI");
+    assert.deepEqual((await pullDiagnostics(session, uri(absent))).items, []);
 
     session.notify("textDocument/didOpen", {
       textDocument: { uri: uri(active), languageId: "titan", version: 1, text: BROWSER_MAIN }
@@ -1417,23 +1506,45 @@ async function testBrowserTarget() {
       });
       return response.result === null ? { accepted: true } : { rejected: response };
     });
+    await tripwire.verify(native);
 
-    const original = rootEntry(status, browser);
+    const nativeAt = publications.length;
+    const retiredBefore = retirementCount();
     // A native selector uses the default SDK, not the browser-only SDK farm.
     await writeFile(configFile, `${ROOT_CONFIG}target = "native"\n`);
     session.notify("workspace/didChangeConfiguration", {});
     await pollHover(session, fallback, BROWSER_FALLBACK, "platform_value", /integer/, "switched native target");
-    const changed = await session.status();
-    assert.equal(rootEntry(changed, browser).target, "native");
-    assert.ok(rootEntry(changed, browser).generation > original.generation);
-    assert.equal(rootEntry(changed, native).workerPid, rootEntry(status, native).workerPid);
-    assert.equal(rootEntry(changed, native).generation, rootEntry(status, native).generation);
-    await pollHover(session, nativeSource, BROWSER_FALLBACK, "platform_value", /integer/, "unchanged native root");
+    const changed = await liveRoot(browser, "native", original.generation);
+    await pushed(active, nativeAt, isInactive, "browser overlay became an inactive native URI");
+    await pushed(fallback, nativeAt, (items) => items.length === 0, "native target cleared the fallback URI");
+    assert.equal(retirementCount(), retiredBefore + 1);
+    const stillNative = await liveRoot(native, "native");
+    assert.deepEqual([stillNative.workerPid, stillNative.generation], [sibling.workerPid, sibling.generation]);
+    await pollHover(session, nativeSource, nativeText, "platform_value", /integer/, "unchanged native root");
+    const inactiveCompletion = await session.result("textDocument/completion", {
+      textDocument: request.textDocument, position: endOfToken(dirty, "dirty_choice", 1),
+      context: { triggerKind: 1 }
+    });
+    assert.deepEqual(inactiveCompletion.items, [], "native worker reused browser TEMP candidates");
+    assert.equal(await session.result("textDocument/hover", {
+      textDocument: request.textDocument, position: positionOf(dirty, "dirty_choice")
+    }), null, "native worker reused browser private hover");
     assert.deepEqual((await pullDiagnostics(session, uri(fallback))).items, []);
+    await tripwire.verify(native, browser);
+    const browserAt = publications.length;
     await writeFile(configFile, `${browserConfig}target = "browser"\n`);
     session.notify("workspace/didChangeConfiguration", {});
     await pollCompletion(session, active, endOfToken(dirty, "dirty_choice", 1), "replayed browser overlay");
     await pollHover(session, active, dirty, "dirty_choice", /dirty_choice/, "restored browser target");
+    const restored = await liveRoot(browser, "browser", changed.generation);
+    // PIDs can be recycled after retirement; a real stop plus a new generation
+    // and a live reported PID prove replacement even in that case.
+    assert.equal(retirementCount(), retiredBefore + 2);
+    assert.ok(Number.isInteger(restored.workerPid));
+    const untouched = await liveRoot(native, "native");
+    assert.deepEqual([untouched.workerPid, untouched.generation], [sibling.workerPid, sibling.generation]);
+    await pushed(fallback, browserAt, isInactive, "restored browser diagnostic");
+    await pushed(active, browserAt, (items) => items.length === 0, "restored browser URI was cleared");
 
     const descriptor = path.join(sdk, browserDirectory, "analysis-target");
     const savedDescriptor = await readFile(descriptor);
@@ -1455,7 +1566,7 @@ async function testBrowserTarget() {
     }, "malformed selected browser descriptor");
     assert.match(malformed.message, /analysis-target/);
     assert.match(malformed.message, /titan-config[.]lua/);
-    await pollHover(session, nativeSource, BROWSER_FALLBACK, "platform_value", /integer/, "native sibling during SDK failure");
+    await pollHover(session, nativeSource, nativeText, "platform_value", /integer/, "native sibling during SDK failure");
     await writeFile(descriptor, savedDescriptor);
     session.notify("workspace/didChangeConfiguration", {});
     await pollCompletion(session, active, endOfToken(dirty, "dirty_choice", 1), "browser overlay after SDK repair");
@@ -1473,21 +1584,27 @@ async function testBrowserTarget() {
     await pollHover(warm, active, BROWSER_MAIN, "binding", /BrowserHandle/, "warm browser target");
     assert.ok(samePath(sdkDescriptor(browser, "titan.browser").file, library));
     await warm.shutdown();
+    const records = structuredLogRecords(warm.stderr());
+    assert.ok(!records.some((record) => record.event === "compiler.attempt.start"),
+      "the unchanged restart checked source instead of reusing the saved projects");
   } finally {
     await warm.abort();
   }
+  await tripwire.verify(native);
 }
 
 async function testFreshProviderCompletion() {
   const base = await makeBase("browser-catalog");
   const installed = sdkRoot();
+  const full = await installedBrowserSdkForTest();
+  const tripwire = await compilerTripwire(base, installed);
   await stageBrowserFixture(base);
   const selectedSdk = path.join(base, "sdk");
   for (const folder of ["share/lua/5.5", "lib/lua/5.5"]) {
     await cp(path.join(installed, folder), path.join(selectedSdk, folder), { recursive: true, dereference: true });
   }
   const targets = [
-    { name: "browser", sdk: installed, module: "browser", member: "binding", other: "fs" },
+    ...(full === null ? [] : [{ name: "browser", sdk: full, module: "browser", member: "binding", other: "fs" }]),
     { name: "explicit", sdk: selectedSdk, module: "browser", member: "binding", other: "fs" },
     { name: "native", module: "fs", member: "stat", other: "browser" }
   ];
@@ -1498,7 +1615,9 @@ async function testFreshProviderCompletion() {
       : `target = "${target.name}"\n`;
     target.source = await writeRoot(target.root, BROWSER_FALLBACK, ROOT_CONFIG + config);
   }
-  const session = new Session(launch(base, "debug", { EMSDK: path.join(base, "missing-emsdk") }));
+  const session = new Session(launch(base, "debug", {
+    ...tripwire.environment, EMSDK: path.join(base, "missing-emsdk")
+  }));
   try {
     await session.initialize({
       workspaceFolders: targets.map(({ root, name }) => ({ uri: uri(root), name })),
@@ -1536,6 +1655,7 @@ async function testFreshProviderCompletion() {
   } finally {
     await session.abort();
   }
+  await tripwire.verify(targets.find(({ name }) => name === "native").root);
 }
 
 function cachedBrowserForeign(root) {
@@ -1562,6 +1682,7 @@ async function testPackagedBrowser() {
   for (const folder of ["share/lua/5.5", "lib/lua/5.5"]) {
     await cp(path.join(hostSdk, folder), path.join(partial, folder), { recursive: true, dereference: true });
   }
+  const tripwire = await compilerTripwire(base, hostSdk);
   const other = path.join(base, "unusable-selection");
   const noTools = path.join(base, "no toolchain");
   await mkdir(noTools);
@@ -1615,7 +1736,7 @@ async function testPackagedBrowser() {
       await session.abort();
     }
   };
-  const offline = { EMSDK: noTools, PATH: noTools, CC: path.join(noTools, "not-host-cc") };
+  const offline = { ...tripwire.environment, EMSDK: noTools, PATH: noTools };
   await exercise(offline, async () => assert.equal(cachedBrowserForeign(base), undefined));
   await writeFile(header, headerSource);
   await writeFile(foreign, foreignSource);
@@ -1633,7 +1754,7 @@ async function testPackagedBrowser() {
   await assertOffline();
   if (process.env.TITAN_LS_TEST_BROWSER_LIVE === "1") {
     assert.ok(process.env.EMSDK, "a live browser receipt requires the pinned emsdk");
-    const live = { CC: path.join(noTools, "not-host-cc") };
+    const live = tripwire.environment;
     const assertLive = async () => exercise(live, async (session) => {
       assert.deepEqual((await pullDiagnostics(session, uri(foreign))).items, []);
       await pollHover(session, foreign, foreignSource, "narrow", /test_browser_long/,
@@ -1652,6 +1773,7 @@ async function testPackagedBrowser() {
     await writeFile(header, headerSource);
     await assertLive();
   }
+  await tripwire.verify();
 }
 
 async function testRootScopedSdkErrors() {

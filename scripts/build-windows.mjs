@@ -4,7 +4,7 @@ import { spawnSync } from "node:child_process";
 import { copyFile, lstat, mkdir, open, readFile, realpath, rm } from "node:fs/promises";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
-import { resolveTitanSdk, titanCompilerCommand } from "./titan-sdk.mjs";
+import { childEnvironment, resolveTitanSdk, titanCompilerCommand } from "./titan-sdk.mjs";
 
 export const runtimeDlls = [
   "lua55.dll", "libuv-1.dll", "libllhttp-9.4.dll", "libsqlite3-0.dll",
@@ -45,17 +45,6 @@ export function windowsApplicationArguments({ sourceRoot, directory, embeddedSou
     entry];
 }
 
-export function childEnvironment(inherited, overrides, removed = []) {
-  const replaced = new Set([...Object.keys(overrides), ...removed].map((name) => name.toUpperCase()));
-  const result = {};
-  // Windows environment names are case-insensitive. Node's spawn chooses one
-  // spelling when a JS object contains duplicates; remove all overridden forms.
-  for (const [name, value] of Object.entries(inherited)) {
-    if (!replaced.has(name.toUpperCase())) result[name] = value;
-  }
-  return { ...result, ...overrides };
-}
-
 export function buildProfileEnvironment(target, inherited, requestedProfile) {
   const selected = Object.fromEntries(Object.entries(inherited).map(([name, value]) => [name.toUpperCase(), value]));
   const profile = requestedProfile ?? selected.VSCODE_TITAN_BUILD_PROFILE ?? selected.TITAN_BUILD_PROFILE ??
@@ -66,7 +55,7 @@ export function buildProfileEnvironment(target, inherited, requestedProfile) {
   for (const key of ["TITAN_EXTRA_CPPFLAGS", "TITAN_EXTRA_CFLAGS", "TITAN_EXTRA_LDFLAGS"]) {
     if (selected[key] !== undefined) overrides[key] = selected[key];
   }
-  return childEnvironment(inherited, overrides);
+  return childEnvironment(inherited, overrides, [], "win32");
 }
 
 export function nativeBuildFlags(profile, { cppflags = [], cflags = [], ldflags = [] } = {}) {
