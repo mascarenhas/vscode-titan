@@ -1727,6 +1727,18 @@ function cachedBrowserForeign(root) {
   }
 }
 
+function cachedBrowserForeignOwners(root) {
+  const db = new DatabaseSync(path.join(root, ".titan-ls", "index.sqlite3"), { readOnly: true });
+  try {
+    return db.prepare(
+      "SELECT CAST(key AS TEXT) AS name FROM cache_meta " +
+      "WHERE CAST(key AS TEXT) GLOB 'browser_foreign_owner:*' ORDER BY key"
+    ).all().map(({ name }) => name.slice("browser_foreign_owner:".length));
+  } finally {
+    db.close();
+  }
+}
+
 // Publish a physical launcher at the same configured EMSDK path after the
 // worker has accepted a missing-emcc diagnostic. The launcher's delegated
 // Python script runs the actual pinned emcc with the same arguments.
@@ -1914,6 +1926,40 @@ async function testPackagedBrowser() {
     assert.equal(await delayed.calls(), before, "pure warm startup invoked Emscripten");
     assert.ok(!pureWarm.some(({ event }) => event === "compiler.attempt.start"),
       "pure warm startup rechecked saved source");
+
+    // A failed external check has no replacement manifest. The importer
+    // still carries a recovery edge, but that edge is not an FFI owner.
+    const external = path.join(base, "ext", "external.titan");
+    const importer = path.join(base, "src", "uses_external.browser.titan");
+    await mkdir(path.dirname(external));
+    await writeFile(path.join(base, "titan-config.lua"),
+      config.replace('source_module_roots = { "./src" }', 'source_module_roots = { "./src", "./ext" }'));
+    await writeFile(external, 'foreign import "stdint.h"\nfunction answer(): integer return 1 end\n');
+    await writeFile(importer, 'local dep = import "external"\nfunction answer(): integer return dep.answer() end\n');
+    const externalError = async (session) => {
+      await pullDiagnostics(session, uri(importer));
+      const db = new DatabaseSync(path.join(base, ".titan-ls", "index.sqlite3"), { readOnly: true });
+      try {
+        assert.equal(db.prepare("SELECT state FROM graph_modules WHERE name='uses_external'").get().state, 3);
+        assert.ok(db.prepare("SELECT 1 FROM graph_imports WHERE importer='uses_external' AND imported='external'").get(),
+          "the failed importer must keep the recovery edge");
+      } finally {
+        db.close();
+      }
+    };
+    await exercise(environment, async (session) => {
+      assert.deepEqual((await pullDiagnostics(session, uri(importer))).items, []);
+      assert.deepEqual(cachedBrowserForeignOwners(base), ["external", "uses_external"]);
+      await writeFile(external, 'function answer(): integer return "not_an_integer" end\n');
+      await externalError(session);
+      assert.deepEqual(cachedBrowserForeignOwners(base), []);
+      assert.equal(cachedBrowserForeign(base), undefined);
+    });
+    const beforeExternalWarm = await delayed.calls();
+    const externalWarm = await exercise(environment, externalError);
+    assert.equal(await delayed.calls(), beforeExternalWarm, "pure failed external warm startup invoked Emscripten");
+    assert.ok(!externalWarm.some(({ event }) => event === "compiler.attempt.start"),
+      "the unchanged failed external rechecked saved source");
   }
   await tripwire.verify();
 }

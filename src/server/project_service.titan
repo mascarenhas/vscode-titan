@@ -628,6 +628,14 @@ local function Service:restat_header_dependencies(
   return copy_header_dependencies(current), changed
 end
 
+local function Service:retire_external_browser_owner(module_name: string)
+  -- The graph keeps the last successful external manifest for comparison
+  -- and recovery edges. It is no longer an accepted C-probe observation.
+  if self.current_config.target == "browser" then
+    workspace_cache.write_browser_foreign_owner(self.graph.connection, module_name, nil)
+  end
+end
+
 local function Service:accept_revalidated_headers(
     module_name: string,
     current: {compiler_bridge.CHeaderDependency}, changed: boolean?): boolean
@@ -648,6 +656,7 @@ local function Service:accept_revalidated_headers(
         self.graph:invalidate_project(module_name)
       elseif self.metadata:has_external(module_name) or
              #self.graph:reverse_imports(module_name) > 0 then
+        self:retire_external_browser_owner(module_name)
         self.graph:invalidate_external_change(module_name)
       end
     end
@@ -778,18 +787,16 @@ local function Service:accept_revalidated_fingerprint(
     current: ExternalFingerprint)
   local previous? = self.metadata:fingerprint(current.module_name)
   local external? = self.metadata:external(current.module_name)
+  local matches_external = external ~= nil and external_matches_fingerprint(external, current)
   local changed = false
   if previous ~= nil then
     changed = not same_external_fingerprint(previous, current)
   else
-    changed = external ~= nil and
-              not external_matches_fingerprint(external, current)
+    changed = external ~= nil and not matches_external
   end
   local observation_changed = previous == nil or
     not same_observed_stamps(previous.stamps, current.stamps)
-  local refresh_external = external ~= nil and
-    external_matches_fingerprint(external, current) and
-    not same_observed_stamps(external.stamps, current.stamps)
+  local refresh_external = matches_external and not same_observed_stamps(external.stamps, current.stamps)
   if not changed and not observation_changed and not refresh_external then return end
   self:update_metadata(function ()
     if changed or previous == nil then
@@ -801,7 +808,14 @@ local function Service:accept_revalidated_fingerprint(
       self.metadata:refresh_external_observations(current.module_name, current.stamps)
       self.graph:refresh_file_observations(current.module_name, current.stamps)
     end
-    if changed then self.graph:invalidate_external_change(current.module_name) end
+    if changed then
+      -- A source-required preference can change even when the same external
+      -- source and its already accepted interface remain eligible.
+      if external ~= nil and not matches_external then
+        self:retire_external_browser_owner(current.module_name)
+      end
+      self.graph:invalidate_external_change(current.module_name)
+    end
   end)
 end
 
@@ -898,6 +912,7 @@ local function Service:revalidate_external_files()
           -- same interface. Cross external metadata nodes to every first project
           -- consumer; those projects' recomputed manifests govern propagation
           -- through the project graph.
+          self:retire_external_browser_owner(name)
           self.graph:invalidate_external_change(name)
         end)
       elseif not same_observed_stamps(current, external.stamps) then
@@ -1817,6 +1832,8 @@ local function Service:commit_or_raise(
   -- from the pre-analysis fingerprint establishes the next attempt's baseline
   -- and rejects this attempt before project tokens are committed.
   local external_candidates: {ExternalModule} = {}
+  local browser_c? = analysis.browser_foreign
+  local failed_pure_externals: {string}?
   local observed_fingerprints: {string: ExternalFingerprint} = {}
   local observed_names: {string} = {}
   local contextual_names: {string: boolean} = {}
@@ -1855,6 +1872,10 @@ local function Service:commit_or_raise(
         merge_observed_fingerprint(
           observed_fingerprints, observed_names,
           candidate_fingerprint(self, analysis, external))
+      elseif browser_c ~= nil and browser_c.checked[snapshot.module_name] and
+          not browser_c.owners[snapshot.module_name] then
+        if failed_pure_externals == nil then failed_pure_externals = {} end
+        failed_pure_externals[#failed_pure_externals + 1] = snapshot.module_name
       end
     end
   end
@@ -1895,6 +1916,12 @@ local function Service:commit_or_raise(
         if not validate_first_seen then
           self:update_metadata(function ()
             self.metadata:write_fingerprint(observed)
+            if browser_c ~= nil then
+              local external? = self.metadata:external(name)
+              if external ~= nil and not external_matches_fingerprint(external, observed) then
+                self:retire_external_browser_owner(name)
+              end
+            end
             self.graph:invalidate_external_change(name)
           end)
           if self.external_resolver ~= nil then unstable_external = true end
@@ -1984,7 +2011,6 @@ local function Service:commit_or_raise(
       true, true, self.graph:generation(), {}, {},
       self.graph:dirty_modules())
   end
-  local browser_c? = analysis.browser_foreign
   if browser_c ~= nil and browser_c.identity ~= nil then
     local incompatible: {workspace_cache.BrowserForeignOwner} = {}
     if not browser_c.conflicted then
@@ -2083,6 +2109,13 @@ local function Service:commit_or_raise(
       local observed: string?
       if browser_c.owners[external.module_name] then observed = browser_c.identity end
       workspace_cache.write_browser_foreign_owner(connection, external.module_name, observed)
+    end
+  end
+  -- A pure external check can fail before supplying a manifest. Retire its
+  -- former ownership even if a project keeps an edge for recovery.
+  if failed_pure_externals ~= nil then
+    for index = 1, #failed_pure_externals do
+      workspace_cache.write_browser_foreign_owner(connection, failed_pure_externals[index], nil)
     end
   end
 

@@ -45,7 +45,8 @@ Saved browser source revisions that reach the lazy C probe record the probe
 environment's identity or its unavailability in `cache_meta`. Failed checks
 own this observation too, even when they produced no header inputs. Ownership
 changes with accepted source revisions; a pure replacement or removal
-retires the old owner. The completed view records one identity only for
+retires the old owner, even if a failed external check retains an import
+edge for recovery. The completed view records one identity only for
 compatible owners. A new, incompatible observation invalidates the affected
 revisions and their dependants before the next view is committed.
 
