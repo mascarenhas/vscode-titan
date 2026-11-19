@@ -254,6 +254,9 @@ export async function buildWindows(target, {
       await copyChanged(path.join(directory, "lib/titan/0.6", name), path.join(repository, "lib/titan/0.6", name));
     }
     if (["stage", "package"].includes(target)) {
+      if (target === "stage") {
+        run(process.execPath, ["scripts/browser-semantic-pack.mjs", "--check-prefix", sdk]);
+      }
       run(process.execPath, ["node_modules/typescript/bin/tsc", "-p", "tsconfig.json", "--noEmit"]);
       run(process.execPath, ["scripts/esbuild.mjs"]);
       run(process.execPath, ["scripts/stage-lua-modules.mjs"], repository, { TITAN_PREFIX: sdk });

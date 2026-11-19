@@ -269,8 +269,8 @@ Use `validation` instead of `production` for a deliberately built validation
 companion. The offline verifier checks the compressed digest, exact regular
 members, manifest pairing, notices from the installed rock and the compiler's
 complete Wasm interface inventory. It installs only the three semantic files
-and refuses an existing partial or different pack. The package target never
-downloads or repairs inputs.
+in one directory rename and refuses an existing partial or different pack.
+The package target never downloads or repairs inputs.
 
 The checked-in smaller provider is for source-tree protocol tests, never
 packaging. To exercise real foreign C work against an extracted package, set

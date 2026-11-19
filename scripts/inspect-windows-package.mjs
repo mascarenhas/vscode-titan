@@ -42,10 +42,10 @@ export function readPackage(filename) {
   return new Promise((resolve, reject) => {
     yauzl.open(filename, { lazyEntries: true }, (error, zip) => {
       if (error) return reject(error);
-      const files = new Map(), names = new Set();
+      const files = new Map(), names = new Set(), modes = new Map();
       const fail = (cause) => { zip.close(); reject(cause); };
       zip.on("error", fail);
-      zip.on("end", () => resolve(files));
+      zip.on("end", () => resolve({ files, modes }));
       zip.on("entry", (entry) => {
         try {
           const name = entry.fileName;
@@ -55,7 +55,14 @@ export function readPackage(filename) {
           const mode = (entry.externalFileAttributes >>> 16) & 0o170000;
           assert(mode === 0 || mode === (name.endsWith("/") ? 0o040000 : 0o100000),
             `VSIX entry is not a regular file or directory: ${name}`);
-          if (name.endsWith("/")) return zip.readEntry();
+          if (name.endsWith("/")) {
+            const semanticRoot = `extension/dist/titan/${path.posix.dirname(semanticDirectory)}/`;
+            assert(!name.toLowerCase().startsWith(semanticRoot) ||
+              name === semanticRoot || name === `extension/dist/titan/${semanticDirectory}/`,
+            `unexpected browser semantic directory: ${name}`);
+            return zip.readEntry();
+          }
+          modes.set(name, (entry.externalFileAttributes >>> 16) & 0o777);
           zip.openReadStream(entry, (streamError, stream) => {
             if (streamError) return fail(streamError);
             const chunks = [];
@@ -84,7 +91,7 @@ export async function inspectPackage(filename, sdk, readobj, repository) {
   validateSdkIncludeInventory(includeEntries.map((entry) => `${entry.name}:${
     entry.isDirectory() ? "directory" : entry.isFile() ? "file" :
       entry.isSymbolicLink() ? "symbolic link" : "unsupported"}`), "win32");
-  const files = await readPackage(filename);
+  const { files, modes } = await readPackage(filename);
   const required = ["dist/extension.js", "package.json", "readme.md", "LICENSE.txt", "language-configuration.json",
     "syntaxes/titan.tmLanguage.json", "dist/notices/README.md",
     ...semanticNotices.map((name) => `dist/notices/titan/${name}`),
@@ -108,6 +115,12 @@ export async function inspectPackage(filename, sdk, readobj, repository) {
   "VSIX compiler inventory differs from selected SDK payload");
   for (const entry of payload) assert.equal(hash(files.get(payloadPrefix + entry.path)), entry.sha256,
     `VSIX compiler bytes differ: ${entry.path}`);
+  for (const entry of payload) {
+    if (entry.path.startsWith(`${semanticDirectory}/`)) {
+      assert.equal(modes.get(payloadPrefix + entry.path), entry.mode,
+        `VSIX browser semantic mode differs: ${entry.path}`);
+    }
+  }
   await verifyInstalledBrowserPack(sdk);
   await verifyBrowserNotices(sdk, (name) => files.get(`extension/dist/notices/titan/${name}`));
   for (const name of await tree(path.join(repository, "dist/notices"))) {
@@ -156,8 +169,10 @@ export async function inspectPackage(filename, sdk, readobj, repository) {
     });
     if (smoke.error) throw smoke.error;
     assert.equal(smoke.status, 0, `extracted Windows browser smoke failed: ${smoke.stderr}`);
-    process.stdout.write(smoke.stdout);
-    return { target: "win32-x64", vsixSha256: hash(await readFile(filename)), files: files.size, images: report };
+    return {
+      target: "win32-x64", vsixSha256: hash(await readFile(filename)), files: files.size, images: report,
+      browserAnalysis: smoke.stdout.trim()
+    };
   } finally { await rm(scratch, { recursive: true, force: true }); }
 }
 

@@ -1,8 +1,7 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { lstat, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { lstat, mkdir, mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { crc32, inflateRawSync } from "node:zlib";
@@ -129,9 +128,9 @@ export async function verifyInstalledBrowserPack(compiler, assets = compiler, pr
   }
 }
 
-async function privateBrowserDirectory(sdk) {
+async function ensureDirectories(sdk, directoryName) {
   let directory = sdk;
-  for (const component of semanticDirectory.split("/")) {
+  for (const component of directoryName.split("/")) {
     directory = path.join(directory, component);
     try { await mkdir(directory); } catch (error) { if (error.code !== "EEXIST") throw error; }
     assert((await lstat(directory)).isDirectory(), `browser pack destination is not a real directory: ${directory}`);
@@ -144,30 +143,36 @@ export async function installBrowserCompanion(sdk, archive, expected) {
   assert((await lstat(sdk)).isDirectory(), `browser pack SDK is not a real directory: ${sdk}`);
   const members = verifyBrowserCompanion(await regularBytes(path.dirname(archive), packName), expected);
   await verifyBrowserNotices(sdk, (name) => members.get(`share/titan/${name}`));
-  const staging = await mkdtemp(path.join(tmpdir(), "titan-browser-pack-"));
-  try {
-    const scratch = await privateBrowserDirectory(staging);
+  const parent = await ensureDirectories(sdk, path.posix.dirname(semanticDirectory));
+  const destination = path.join(sdk, semanticDirectory);
+  const current = await lstat(destination).catch((error) => {
+    if (error.code === "ENOENT") return null;
+    throw error;
+  });
+  if (current !== null) {
+    assert(current.isDirectory(), `browser pack destination is not a real directory: ${destination}`);
     for (const name of semanticFiles) {
-      await writeFile(path.join(scratch, name), members.get(`${semanticDirectory}/${name}`));
-    }
-    await verifyInstalledBrowserPack(sdk, staging, expected.profile);
-    const destination = await privateBrowserDirectory(sdk);
-    const missing = [];
-    for (const name of semanticFiles) {
-      try {
-        assert((await regularBytes(destination, name)).equals(members.get(`${semanticDirectory}/${name}`)),
-          `cached SDK browser semantic file differs from the exact companion: ${name}`);
-      } catch (error) {
+      const installed = await regularBytes(destination, name).catch((error) => {
         if (error.code !== "ENOENT") throw error;
-        missing.push(name);
-      }
+        throw new Error(`cached SDK has a partial browser companion, missing ${name}; provision a clean SDK`);
+      });
+      assert(installed.equals(members.get(`${semanticDirectory}/${name}`)),
+        `cached SDK browser semantic file differs from the exact companion: ${name}`);
     }
-    assert(missing.length === 0 || missing.length === semanticFiles.length,
-      "cached SDK has a partial browser companion; provision a clean SDK");
-    for (const name of missing) {
-      await writeFile(path.join(destination, name), members.get(`${semanticDirectory}/${name}`),
+    await verifyInstalledBrowserPack(sdk, sdk, expected.profile);
+    return;
+  }
+  // Stage on the same volume and publish the three verified files together.
+  // An interrupted install cannot leave a usable-looking partial directory.
+  const staging = await mkdtemp(path.join(parent, ".browser-pack-"));
+  try {
+    const scratch = await ensureDirectories(staging, semanticDirectory);
+    for (const name of semanticFiles) {
+      await writeFile(path.join(scratch, name), members.get(`${semanticDirectory}/${name}`),
         { flag: "wx", mode: 0o644 });
     }
+    await verifyInstalledBrowserPack(sdk, staging, expected.profile);
+    await rename(scratch, destination);
   } finally {
     await rm(staging, { recursive: true, force: true });
   }

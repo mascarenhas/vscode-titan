@@ -273,7 +273,15 @@ export async function sdkPayloadInventory(sdk, options) {
 
 export async function validateStagedLuaModules(sdk, destination, options) {
   const expected = (await sdkPayloadInventory(sdk, options)).filter((entry) => entry.type === "file");
-  const actual = (await inventory(destination)).filter((entry) => entry.type === "file");
+  const entries = await inventory(destination);
+  const browserTree = path.posix.dirname(semanticDirectory);
+  for (const entry of entries) {
+    if (entry.type === "directory" && entry.path !== semanticDirectory &&
+        entry.path.startsWith(`${browserTree}/`)) {
+      throw new Error(`unexpected staged browser semantic directory: ${entry.path}`);
+    }
+  }
+  const actual = entries.filter((entry) => entry.type === "file");
   if (JSON.stringify(actual.sort((a, b) => a.path.localeCompare(b.path))) !==
       JSON.stringify(expected.sort((a, b) => a.path.localeCompare(b.path)))) {
     throw new Error(`staged compiler module and SDK payload does not exactly match selected inputs from ${sdk}`);

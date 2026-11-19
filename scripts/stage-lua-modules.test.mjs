@@ -124,6 +124,10 @@ test("staging requires and copies the portable compiler path helper", async (con
       await writeFile(path.join(pack, "sdk-digests"), "not shipped\n");
       await assert.rejects(validateStagedLuaModules(sdk, destination), /does not exactly match selected inputs/);
       await rm(path.join(pack, "sdk-digests"));
+      const unexpectedDirectory = path.join(pack, "unused");
+      await mkdir(unexpectedDirectory);
+      await assert.rejects(validateStagedLuaModules(sdk, destination), /unexpected staged browser semantic directory/);
+      await rm(unexpectedDirectory, { recursive: true });
       await rm(path.join(sdk, semanticDirectory, "analysis-target"));
       await assert.rejects(stageLuaModules({ sdk, destination }), /browser semantic pack inventory changed/);
       await put(`${semanticDirectory}/analysis-target`, "analysis-target\n");
