@@ -283,7 +283,7 @@ local function prepare_completion_descriptors(snapshot: service.Snapshot,
         public_interface, source_interface, files, imports, headers, members, documentation[revision.name])
     end
   end
-  local binaries = compiler:completion_binary_catalog()
+  local binaries = compiler:completion_binary_catalog(not reusable)
   local access = loaded:workspace_store():acquire()
   defer access:release()
   -- The driver seeds the accepted browser SDK even without a saved import.
@@ -479,8 +479,7 @@ local function load_or_raise(project_root: string,
   cpu = logging.clock()
   wall = ffi.vscode_titan_monotonic_ms()
   local native_context = compiler:native_cache_identity()
-  if not cache:accept_native_context(native_context) or
-     not compiler:restore_browser_foreign(cache:browser_foreign_identity()) then
+  if not cache:accept_native_context(native_context) then
     cache = cache:rebuild()
     if not cache:accept_native_context(native_context) then
       raise "fresh workspace cache rejected its native context"
@@ -519,6 +518,14 @@ local function load_or_raise(project_root: string,
   }
   if loaded == nil then return nil,failure,nil end
   phase("input_validation",cpu,wall)
+  local browser = settings.target == "browser"
+  if browser then
+    local saved_foreign? = cache:browser_foreign_identity()
+    if saved_foreign ~= nil then
+      local observed? = compiler:observe_browser_foreign()
+      if observed ~= saved_foreign then loaded:invalidate_browser_foreign(observed) end
+    end
+  end
   local unpublished = cache:unpublished_projects()
   for index = 1, #unpublished do loaded:invalidate_cached_project(unpublished[index]) end
   restoring = project_restoration(compiler,loaded,cache)
@@ -536,8 +543,10 @@ local function load_or_raise(project_root: string,
         native_context = compiler:native_cache_identity()
         current_configuration = next_configuration
       end
+      local saved_foreign: string?
+      if browser then saved_foreign = cache:browser_foreign_identity() end
       cache:stage_context(snapshot.config.project_root,
-        inventory .. current_configuration, native_context, compiler:browser_foreign_identity())
+        inventory .. current_configuration, native_context, saved_foreign)
       local reusable = cache:prepare()
       if not reusable then
         local selected = cache:projects_to_export()

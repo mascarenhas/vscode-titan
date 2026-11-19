@@ -3,6 +3,7 @@
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
 import {
+  chmod,
   copyFile,
   cp,
   lstat,
@@ -1655,6 +1656,64 @@ async function testFreshProviderCompletion() {
   } finally {
     await session.abort();
   }
+  // No saved checker attempt may supply a catalog in this root. The explicit
+  // fixture also covers machines whose default SDK is native-only.
+  const empty = path.join(base, "empty");
+  const src = path.join(empty, "src");
+  const first = path.join(src, "first.browser.titan");
+  const shadow = path.join(src, "titan", "browser.browser.titan");
+  const shadowText = "function shadow(): string return 'project' end\n";
+  await mkdir(path.dirname(shadow), { recursive: true });
+  await writeFile(path.join(empty, "titan-config.lua"),
+    `${ROOT_CONFIG}target = "browser"\ncompiler_root = ${luaString(selectedSdk)}\n`);
+  const checkEmpty = async (label, overlap) => {
+    const session = new Session(launch(empty, "debug", {
+      ...tripwire.environment, EMSDK: path.join(base, "missing-emsdk")
+    }));
+    try {
+      await session.initialize({
+        workspaceFolders: [{ uri: uri(empty), name: label }],
+        initializationOptions: { trustedRoots: [base] }
+      });
+      session.notify("initialized", {});
+      assertReady(await pollSettled(session, 1, `${label} did not settle`), empty, label);
+      assert.deepEqual((await pullDiagnostics(session, uri(first))).items, []);
+      assert.equal(await exists(first), false);
+      const text = 'local dependency = import ""\n';
+      const document = { uri: uri(first), languageId: "titan", version: 1, text };
+      session.notify("textDocument/didOpen", { textDocument: document });
+      const assertInventory = async () => {
+        const imports = await pollCompletion(session, first, endOfToken(text, 'import "'), label);
+        assert.deepEqual(imports.map(({ label }) => label).filter((name) => name.startsWith("titan.")).sort(),
+          ["titan.browser", "titan.gc"]);
+        assert.equal(sdkDescriptor(empty, "titan.browser").provenance, "static");
+      };
+      await assertInventory();
+      if (overlap) {
+        await writeFile(shadow, shadowText);
+        await pollHover(session, shadow, shadowText, "shadow", /string/, "archive source overlap");
+        assert.equal(sdkDescriptor(empty, "titan.browser").provenance, "project");
+        assert.throws(() => sdkDescriptor(empty, "titan.gc"), /no saved descriptor/);
+        await rm(shadow);
+        await pullDiagnostics(session, uri(shadow));
+        await assertInventory();
+      }
+      const overlay = 'local std = import "browser"\nfunction answer() local value = std.binding end\n';
+      session.notify("textDocument/didChange", {
+        textDocument: { uri: document.uri, version: 2 }, contentChanges: [{ text: overlay }]
+      });
+      const members = await pollCompletion(session, first, endOfToken(overlay, "std."), `${label} members`);
+      assert.ok(members.some(({ label }) => label === "binding"));
+      await session.shutdown();
+      const attempts = structuredLogRecords(session.stderr()).filter(
+        ({ event }) => event === "compiler.attempt.start");
+      assert.deepEqual(attempts.map(({ root_module }) => root_module), overlap ? ["titan.browser"] : []);
+    } finally {
+      await session.abort();
+    }
+  };
+  await checkEmpty("empty browser", true);
+  await checkEmpty("warm empty browser", false);
   await tripwire.verify(targets.find(({ name }) => name === "native").root);
 }
 
@@ -1666,6 +1725,39 @@ function cachedBrowserForeign(root) {
   } finally {
     db.close();
   }
+}
+
+// Publish a physical launcher at the same configured EMSDK path after the
+// worker has accepted a missing-emcc diagnostic. The launcher's delegated
+// Python script runs the actual pinned emcc with the same arguments.
+async function delayedBrowserCompiler(base) {
+  const realSdk = process.env.EMSDK;
+  assert.ok(realSdk, "a live browser receipt requires the pinned emsdk");
+  const emsdk = path.join(base, "delayed emsdk");
+  const local = path.join(emsdk, "upstream", "emscripten");
+  const real = path.resolve(realSdk, "upstream", "emscripten");
+  const launcher = process.platform === "win32" ? "emcc.exe" : "emcc";
+  const trace = path.join(local, "calls");
+  await mkdir(local, { recursive: true });
+  await writeFile(path.join(local, "emcc.py"), [
+    "import os, pathlib, subprocess, sys",
+    'with pathlib.Path(__file__).with_name("calls").open("ab") as log:',
+    '    log.write(b"emcc\\n")',
+    'raise SystemExit(subprocess.call([sys.executable, "-E", os.environ["TITAN_TEST_REAL_EMCC"], *sys.argv[1:]]))',
+    ""
+  ].join("\n"));
+  return {
+    environment: {
+      EMSDK: emsdk, EM_CONFIG: process.env.EM_CONFIG || path.resolve(realSdk, ".emscripten"),
+      TITAN_TEST_REAL_EMCC: path.join(real, "emcc.py")
+    },
+    enable: async () => {
+      const program = path.join(local, launcher);
+      await copyFile(path.join(real, launcher), program);
+      if (process.platform !== "win32") await chmod(program, 0o755);
+    },
+    calls: async () => (await exists(trace) ? (await readFile(trace, "utf8")).trimEnd().split("\n").length : 0)
+  };
 }
 
 async function testPackagedBrowser() {
@@ -1730,6 +1822,7 @@ async function testPackagedBrowser() {
       assert.ok(definition === null || definition.length === 0, "binary interface supplied a source location");
       await check(session);
       await session.shutdown();
+      return structuredLogRecords(session.stderr());
     } catch (error) {
       throw new Error(`${error.message}\n${session.stderr().toString("utf8").slice(-14000)}`, { cause: error });
     } finally {
@@ -1752,8 +1845,15 @@ async function testPackagedBrowser() {
     assert.equal(cachedBrowserForeign(base), "browser-foreign-unavailable");
   });
   await assertOffline();
+  const pureSource = "function now_pure(): integer return 1 end\n";
+  await exercise(offline, async (session) => {
+    await writeFile(foreign, pureSource);
+    assert.deepEqual((await pullDiagnostics(session, uri(foreign))).items, []);
+    assert.equal(cachedBrowserForeign(base), undefined, "a pure edit left an unavailable compiler owner");
+  });
   if (process.env.TITAN_LS_TEST_BROWSER_LIVE === "1") {
     assert.ok(process.env.EMSDK, "a live browser receipt requires the pinned emsdk");
+    await writeFile(foreign, foreignSource);
     const live = tripwire.environment;
     const assertLive = async () => exercise(live, async (session) => {
       assert.deepEqual((await pullDiagnostics(session, uri(foreign))).items, []);
@@ -1772,6 +1872,48 @@ async function testPackagedBrowser() {
     });
     await writeFile(header, headerSource);
     await assertLive();
+
+    // The same worker must not let the next attempt's live fingerprint
+    // certify an earlier unavailable diagnostic for an unchanged source.
+    const delayed = await delayedBrowserCompiler(base);
+    const environment = { ...live, ...delayed.environment };
+    const second = path.join(base, "src", "second.browser.titan");
+    await exercise(environment, async (session) => {
+      assert.match(JSON.stringify((await pullDiagnostics(session, uri(foreign))).items), missing);
+      assert.equal(cachedBrowserForeign(base), "browser-foreign-unavailable");
+      assert.equal(await delayed.calls(), 0);
+      await delayed.enable();
+      await writeFile(second, foreignSource);
+      assert.deepEqual((await pullDiagnostics(session, uri(second))).items, []);
+      assert.deepEqual((await pullDiagnostics(session, uri(foreign))).items, []);
+      assert.match(cachedBrowserForeign(base), /^browser-foreign:sha256:/);
+      assert.ok(await delayed.calls() > 0, "no call reached the real Emscripten compiler");
+    });
+    const warm = await exercise(environment, async (session) => {
+      assert.deepEqual((await pullDiagnostics(session, uri(second))).items, []);
+      assert.deepEqual((await pullDiagnostics(session, uri(foreign))).items, []);
+    });
+    assert.ok(!warm.some(({ event }) => event === "compiler.attempt.start"),
+      "compatible FFI facts were not preserved on restart");
+    await exercise(environment, async (session) => {
+      const retained = cachedBrowserForeign(base);
+      await writeFile(second, pureSource);
+      assert.deepEqual((await pullDiagnostics(session, uri(second))).items, []);
+      assert.equal(cachedBrowserForeign(base), retained, "a pure edit dropped the remaining foreign owner");
+      assert.deepEqual((await pullDiagnostics(session, uri(foreign))).items, []);
+      await writeFile(foreign, pureSource);
+      assert.deepEqual((await pullDiagnostics(session, uri(foreign))).items, []);
+      assert.equal(cachedBrowserForeign(base), undefined, "the last foreign owner survived a pure replacement");
+    });
+    const before = await delayed.calls();
+    const pureWarm = await exercise(environment, async (session) => {
+      assert.deepEqual((await pullDiagnostics(session, uri(foreign))).items, []);
+      assert.deepEqual((await pullDiagnostics(session, uri(second))).items, []);
+      assert.equal(cachedBrowserForeign(base), undefined);
+    });
+    assert.equal(await delayed.calls(), before, "pure warm startup invoked Emscripten");
+    assert.ok(!pureWarm.some(({ event }) => event === "compiler.attempt.start"),
+      "pure warm startup rechecked saved source");
   }
   await tripwire.verify();
 }

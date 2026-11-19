@@ -36,8 +36,10 @@ from malformed source is out of scope.
 Private completion uses the current worker's accepted target and the same
 committed baseline as saved analysis. Shadowed and inactive variants never
 contribute candidates. For a browser root, import completion includes the
-accepted SDK's eligible module inventory even before the first saved import.
+accepted SDK's eligible module inventory even when no source has been saved.
 Member completion reads the Wasm interfaces from that captured catalog.
+If a saved source overlaps the archive, its catalog siblings stay hidden
+until the overlap is removed and a new saved view is published.
 Changing the target starts a new worker and replays the open documents, not
 the previous worker's temporary completion or hover facts.
 
@@ -142,10 +144,10 @@ creates a request Task. Every open selected contributor to the active folder
 module takes part. Open inactive target variants add nothing and receive no
 semantic completion. Other modules' editor text is ignored, so imports see one
 committed saved baseline. A new file-backed path works when the configured
-roots and the captured catalog prove an unambiguous host-selected module
-identity (`completion_discovery`). Untitled, unmapped, inactive, ambiguous,
-excluded and uncovered paths are deferred. Known saved ownership stays
-authoritative.
+roots and the captured catalog prove an unambiguous module identity selected
+for the root's target (`completion_discovery`). Untitled, unmapped, inactive,
+ambiguous, excluded and uncovered paths are deferred. Known saved ownership
+stays authoritative.
 
 The watcher publishes the `main.completion_*` configuration, exact provenance,
 source and header inventories, scalar members and body-free compiler

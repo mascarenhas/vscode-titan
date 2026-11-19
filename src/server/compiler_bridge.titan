@@ -298,6 +298,14 @@ record ModuleSnapshot
   provider_identity: compiler_io.LstatIdentity?
 end
 
+--- Lazy browser C observations belonging to the completed saved workset.
+record BrowserForeignAnalysis
+  const checked: {string: boolean}
+  const owners: {string: boolean}
+  identity: string?
+  conflicted: boolean
+end
+
 record Analysis
   root_module: string
   diagnostics: {Diagnostic}
@@ -309,6 +317,7 @@ record Analysis
   -- legitimately select source and binary simultaneously; that is not a
   -- binary-provider conflict.
   provider_conflicts: {string}
+  browser_foreign: BrowserForeignAnalysis?
 end
 
 -- Progress counts the saved source files in one exact dirty project workset.
@@ -526,7 +535,6 @@ record Compiler
   local selected_prefix: string?
   local snapshot_directory: string?
   local const browser: BrowserAnalysis?
-  local saved_browser_foreign: string?
 end
 
 local function fail<|T|>(module_name: string, message: string): T
@@ -1146,7 +1154,14 @@ local function accept_browser_analysis(driver: {string: value}, type_of: TypeOfF
   local identity = required_string(view["identity"], DRIVER_MODULE, "browser target identity")
   local file = required_string(view["provider_file"], DRIVER_MODULE, "browser provider file")
   local provider = selected_file_identity(file)
-  local accepted = BrowserAnalysis(driver, handle, directory, identity, provider, foreign_identity)
+  local accepted = BrowserAnalysis {
+    driver = driver,
+    handle = handle,
+    directory = directory,
+    identity = identity,
+    provider = provider,
+    foreign_identity = foreign_identity,
+  }
   browser_analysis = accepted
   return accepted
 end
@@ -1583,23 +1598,14 @@ local function Compiler:context_browser_foreign(context: value, validate: boolea
   return required_string(identity, DRIVER_MODULE, "browser foreign cache identity")
 end
 
-function Compiler:restore_browser_foreign(previous: string?): boolean
-  if previous == nil then return true end
-  if self.browser == nil then return false end
+function Compiler:observe_browser_foreign(): string?
   local permit = compiler_scheduler.acquire()
   defer permit:release()
   local configuration = self:install_configuration()
   defer configuration:apply()
   local context = self:new_context(nil)
   defer close_context(self, context)
-  local observed? = self:context_browser_foreign(context, true)
-  if observed ~= previous then return false end
-  self.saved_browser_foreign = previous
-  return true
-end
-
-function Compiler:browser_foreign_identity(): string?
-  return self.saved_browser_foreign
+  return self:context_browser_foreign(context, true)
 end
 
 local function close_loader_now(compiler: Compiler, loader: value)
@@ -4542,6 +4548,8 @@ local record AttemptResult
   entries: {string: value}
   failed: {string: boolean}
   completion_binaries: {CompletionBinary}
+  browser_foreign: string?
+  foreign_owners: {string: boolean}?
 end
 
 local function project_filename_owners(projects: {string: ProjectModule},
@@ -4667,6 +4675,75 @@ local function snapshot_profile_filename(snapshot: ModuleSnapshot): string
   end
 end
 
+local function Compiler:read_completion_binary_catalog(context: value,
+    identity: compiler_io.LstatIdentity?): {CompletionBinary}
+  local catalog = self.driver["completion_binary_catalog"] as function (value): value
+  local binaries = required_map(catalog(context), DRIVER_MODULE, "completion binary catalog")
+  local result: {CompletionBinary} = {}
+  for name, raw in iteration.pairs(binaries) do
+    local item = required_map(raw, DRIVER_MODULE, "completion binary")
+    result[#result + 1] = CompletionBinary.new(
+      name, item["serialized"], item["kind"], item["filename"], identity,
+      documentation_markdown(item["documentation"]))
+  end
+  return result
+end
+
+local function browser_foreign_owners(raw_context: {string: value},
+    imported: {string: value}, failed: {string: boolean},
+    root_module: string): {string: boolean}
+  local raw_owners = required_map(raw_context["browser_foreign_modules"],
+    DRIVER_MODULE, "browser foreign source owners")
+  local owners: {string: boolean} = {}
+  local queue: {string} = {}
+  for name, present in iteration.pairs(raw_owners) do
+    if not required_boolean(present, DRIVER_MODULE, "browser foreign source owner") then
+      raise BridgeError(DRIVER_MODULE, "invalid browser foreign source owner")
+    end
+    owners[name] = true
+    queue[#queue + 1] = name
+  end
+  if #queue == 0 then return owners end
+  -- Failed external source may not publish an imported row. Its requesting
+  -- root still owns the resulting failure.
+  if failed[root_module] and not owners[root_module] then
+    owners[root_module] = true
+    queue[#queue + 1] = root_module
+  end
+  local importers: {string: {string}} = {}
+  for name, raw in iteration.pairs(imported) do
+    local entry = required_map(raw, DRIVER_MODULE, "imported module")
+    local deps = entry["deps"]
+    if entry["kind"] == "source" and deps is {string: value} then
+      for dependency, enabled in iteration.pairs(deps as {string: value}) do
+        if enabled then
+          local consumers? = importers[dependency]
+          if consumers == nil then
+            consumers = {}
+            importers[dependency] = consumers
+          end
+          consumers[#consumers + 1] = name
+        end
+      end
+    end
+  end
+  local index = 1
+  while index <= #queue do
+    local consumers? = importers[queue[index]]
+    if consumers ~= nil then
+      for consumer_index = 1, #consumers do
+        local name = consumers[consumer_index]
+        if not owners[name] then
+          owners[name] = true
+          queue[#queue + 1] = name
+        end
+      end
+    end
+    index = index + 1
+  end
+  return owners
+end
+
 local function Compiler:run_attempt_inner(
     root_module: string, projects: {string: ProjectModule},
     overrides: {string: value},
@@ -4789,8 +4866,6 @@ local function Compiler:run_attempt_inner(
   local diagnostics: {Diagnostic} = {}
   local invoke = loader as function (string): (value, value, value, value)
   local raw_ok, interface_or_error, raw_errors = invoke(root_module)
-  local browser_foreign? = self:context_browser_foreign(context, false)
-  if browser_foreign ~= nil then self.saved_browser_foreign = browser_foreign end
   local ok = required_boolean(
     raw_ok, DRIVER_MODULE, "compiler loader result")
   if not ok then
@@ -4830,15 +4905,12 @@ local function Compiler:run_attempt_inner(
 
   local failed = failed_projects(
     root_module, diagnostics, projects, imported, not ok, normalization_work)
-  local catalog = self.driver["completion_binary_catalog"] as function (value): value
-  local binaries = required_map(catalog(context), DRIVER_MODULE, "completion binary catalog")
-  local completion_binaries: {CompletionBinary} = {}
-  for name, raw in iteration.pairs(binaries) do
-    local item = required_map(raw, DRIVER_MODULE, "completion binary")
-    completion_binaries[#completion_binaries + 1] = CompletionBinary.new(
-      name, item["serialized"], item["kind"], item["filename"], nil,
-      documentation_markdown(item["documentation"]))
+  local browser_foreign? = self:context_browser_foreign(context, false)
+  local foreign_owners: {string: boolean}?
+  if browser_foreign ~= nil then
+    foreign_owners = browser_foreign_owners(raw_context, imported, failed, root_module)
   end
+  local completion_binaries = self:read_completion_binary_catalog(context, nil)
   local checked_set: {string: boolean} = {}
   for index = 1, #checked do checked_set[checked[index]] = true end
   -- A loader that fails before publishing a module cannot add the root to the
@@ -4893,7 +4965,7 @@ local function Compiler:run_attempt_inner(
   end
   return AttemptResult.new(
     diagnostics, modules, contextual_resolutions, embedded_modules,
-    checked, entries, failed, completion_binaries)
+    checked, entries, failed, completion_binaries, browser_foreign, foreign_owners)
 end
 
 local function emit_attempt_terminal(
@@ -5061,6 +5133,10 @@ function Compiler:analyze_incremental(
   local embedded_modules: {string: boolean} = {}
 
   local completion_binaries: {CompletionBinary} = {}
+  local browser_foreign: BrowserForeignAnalysis?
+  if self.browser ~= nil then
+    browser_foreign = BrowserForeignAnalysis { checked = {}, owners = {}, conflicted = false }
+  end
 
   for index = 1, #ordered do
     local root = ordered[index]
@@ -5082,6 +5158,20 @@ function Compiler:analyze_incremental(
         mark_completed(finished.checked[checked_index])
       end
       if finished.failed[root] then mark_completed(root) end
+      if browser_foreign ~= nil then
+        for checked_index = 1, #finished.checked do
+          browser_foreign.checked[finished.checked[checked_index]] = true
+        end
+        if finished.browser_foreign ~= nil then
+          if browser_foreign.identity ~= nil and
+              browser_foreign.identity ~= finished.browser_foreign then
+            browser_foreign.conflicted = true
+          end
+          browser_foreign.identity = finished.browser_foreign
+          local owners: {string: boolean} = finished.foreign_owners
+          for name in iteration.pairs(owners) do browser_foreign.owners[name] = true end
+        end
+      end
       local attempt = finished
       completion_binaries = merge_completion_catalog(completion_binaries,
         attempt.completion_binaries)
@@ -5157,7 +5247,7 @@ function Compiler:analyze_incremental(
   stable_sort(provider_conflict_names, string_less, result_normalization_work)
   local result = Analysis.new(
     ordered[1], diagnostics, modules, contextual_resolutions,
-    binary_provider_observations, provider_conflict_names)
+    binary_provider_observations, provider_conflict_names, browser_foreign)
   emit_cache_stats(self)
   logging.emit("debug", "compiler.analysis.complete", {
     ["root_module"] = ordered[1],
@@ -5581,10 +5671,12 @@ function Compiler:browser_provider_file(): string?
   return nil
 end
 
-function Compiler:completion_binary_catalog(): {CompletionBinary}
+function Compiler:completion_binary_catalog(seed_browser: boolean?): {CompletionBinary}
   local checked: {string: boolean} = {}
   local valid: {string: boolean} = {}
   local result: {CompletionBinary} = {}
+  local browser? = self.browser
+  local captured_browser = false
   for index = 1, #self.completion_binaries do
     local binary = self.completion_binaries[index]
     local key = completion_provider_key(binary)
@@ -5595,7 +5687,30 @@ function Compiler:completion_binary_catalog(): {CompletionBinary}
         valid[key] = compiler_io.lstat_identity_is_current(identity)
       end
     end
-    if valid[key] then result[#result + 1] = binary end
+    if valid[key] then
+      result[#result + 1] = binary
+      if browser ~= nil and binary.kind == "static" and
+          binary.filename == browser.provider.path then
+        captured_browser = true
+      end
+    end
+  end
+  -- A saved view may have no checker attempt (e.g. an empty src directory).
+  -- Read only the accepted semantic provider; the saved graph still owns
+  -- source overlap and selected archive precedence.
+  if seed_browser and browser ~= nil and not captured_browser and
+      compiler_io.lstat_identity_is_current(browser.provider) then
+    local permit = compiler_scheduler.acquire()
+    defer permit:release()
+    local configuration = self:install_configuration()
+    defer configuration:apply()
+    local imported: value = self.driver["imported"]
+    defer self.driver["imported"] = imported
+    self.driver["imported"] = {} as {string: value}
+    local context = self:new_context(nil)
+    defer close_context(self, context)
+    local seed = self:read_completion_binary_catalog(context, browser.provider)
+    for index = 1, #seed do result[#result + 1] = seed[index] end
   end
   return result
 end

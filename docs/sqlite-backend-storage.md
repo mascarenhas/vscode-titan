@@ -41,12 +41,18 @@ triggers `Cache:rebuild`.
 `Cache:accept_native_context` likewise compares the stored `native_context`
 with `Compiler:native_cache_identity` and rebuilds on a mismatch.
 
-A browser cache whose saved analysis used a real C probe also stores that
-probe environment's identity, or its recorded unavailability. Reopening
-validates this marker before restoring the saved view. Installing or removing
-the pinned toolchain, or changing its C environment, rejects incompatible
-cached facts. Browser caches without such a marker never start Emscripten
-for ordinary typechecking or startup.
+Saved browser source revisions that reach the lazy C probe record the probe
+environment's identity or its unavailability in `cache_meta`. Failed checks
+own this observation too, even when they produced no header inputs. Ownership
+changes with accepted source revisions; a pure replacement or removal
+retires the old owner. The completed view records one identity only for
+compatible owners. A new, incompatible observation invalidates the affected
+revisions and their dependants before the next view is committed.
+
+Reopening validates the probe environment only if retained revisions still
+own it. A different environment rechecks the incompatible contributors
+rather than reusing their saved diagnostics or facts. A pure warm start does
+not invoke Emscripten.
 
 A rejected file, or one that SQLite reports as corrupt (`SQLITE_CORRUPT` or
 `SQLITE_NOTADB`), is deleted and recreated. Any other open failure logs
