@@ -1,0 +1,658 @@
+--- Typed boundary between compiler-owned Lua analysis data and language-server records.
+-- @module server.compiler_bridge
+
+foreign import "compiler_io_platform.h"
+local iteration = import "iteration"
+local lua = import "lua"
+local math = import "math"
+local strings = import "string"
+local paths = import "path"
+local async = import "async"
+local fs = import "fs"
+local content_identity = import "server.content_identity"
+local compiler_io = import "server.compiler_io"
+local compiler_scheduler = import "server.compiler_scheduler"
+local embedded_interfaces = import "server.embedded_interfaces"
+local root_settings = import "server.root_settings"
+local project_config = import "server.project_config"
+local selected_interfaces = import "server.selected_interfaces"
+local wire = import "server.wire"
+local logging = import "server.logging"
+local completion_types = import "server.completion_types"
+local documentation = import "server.documentation"
+
+local const COMPILER_ABI = "2"
+local const COMPILER_LANGUAGE_SERVER_API = 1
+local const COMPILER_LANGUAGE_SERVER_API_MARKER = "LANGUAGE_SERVER_API_VERSION"
+local const PARSER_MODULE = "titan-compiler.parser"
+local const CHECKER_MODULE = "titan-compiler.checker"
+local const TYPES_MODULE = "titan-compiler.types"
+local const DRIVER_MODULE = "titan-compiler.driver"
+local const C_PROBE_TRACE_STRING_BYTES = 4096
+
+-- Compiler graph normalization runs after the Lua compiler has published a
+-- checked module. Share one deterministic operation budget across every
+-- snapshot in that attempt so many individually small modules cannot starve
+-- protocol Tasks any more than one large aggregate can.
+local const NORMALIZATION_YIELD_CADENCE = 1024
+
+-- Keep only lexical AST children here. Ast.ExpSpreadIndex.spread is a DAG
+-- backreference to the carrier already emitted earlier in the expression
+-- list. Traversing it is redundant now and could mis-parent the carrier if
+-- expression-list traversal order changes.
+local const AST_CHILD_FIELDS: const {string} = {
+  "typeparams", "typeargs", "_nominal_typeargs",
+  "_surface_named_args",
+  "constraint", "class", "params",
+  "argtypes", "rettypes", "varargtype", "flexrettype", "block",
+  "decl", "decls", "value", "values", "type", "fields", "variants", "parts",
+  "name",
+  "members", "methods", "stats", "condition", "start", "finish",
+  "inc", "exps", "vars", "callexp", "exp", "first", "last",
+  "var", "arms",
+  "elseblock", "thens", "elsestat", "catchblock", "finallyblock",
+  "exp1", "exp2", "lhs", "rhs", "target", "args", "subtype",
+  "base", "keystype", "valuestype", "basetype",
+  "bindings", "index", "owner", "variant", "method",
+}
+
+record BridgeError
+  const module_name: string
+  const message: string
+end
+
+record SourceFile
+  const filename: string
+  const contents: string
+end
+
+record ProjectModule
+  const module_name: string
+  const files: {SourceFile}
+end
+
+record SourceClassification
+  const logical_basename: string?
+  const label: string?
+  const error: string?
+end
+
+record SourceLocation
+  const filename: string
+  const line: integer
+  const column: integer
+end
+
+record SourceSpan
+  const start: SourceLocation
+  const finish: SourceLocation
+end
+
+union DiagnosticKind
+  syntax()
+  type_error()
+  compiler()
+end
+
+record Diagnostic
+  const kind: DiagnosticKind
+  const message: string
+  const location: SourceLocation?
+  -- The active project root whose compiler attempt produced this diagnostic.
+  -- Explicit project-source locations remain the strongest ownership signal;
+  -- this preserves attribution for loader/finalization errors without one.
+  const owner_module: string?
+end
+
+record TypeInfo
+  const tag: string
+  const display: string
+end
+
+-- A named callable keeps its declaration-shaped surface at the dynamic
+-- compiler boundary. Function types deliberately omit parameter names, so a
+-- flattened TypeInfo cannot reconstruct this text later in hover handling.
+record CallableSignature
+  const display: string
+end
+
+-- Hover summaries are normalized while compiler-owned declaration graphs are
+-- still available. The semantic index renders and caches these typed values;
+-- hover requests never walk the dynamic compiler graph.
+union HoverSummaryKind
+  module_summary()
+  record_summary()
+  union_summary()
+  interface_summary()
+end
+
+record HoverSummarySection
+  const heading: string
+  const lines: {string}
+end
+
+record HoverSummary
+  const id: integer
+  const kind: HoverSummaryKind
+  const title: string
+  const sections: {HoverSummarySection}
+end
+
+record AdjustmentInfo
+  const kind: string
+  const operation: string?
+  const source: TypeInfo?
+  const target: TypeInfo?
+end
+
+union Adjustment
+  identity(AdjustmentInfo)
+  coercion(AdjustmentInfo)
+  gradual(AdjustmentInfo)
+  callable(AdjustmentInfo)
+  written(AdjustmentInfo)
+  other(AdjustmentInfo)
+end
+
+union NodeKind
+  declaration()
+  statement()
+  expression()
+  variable()
+  type_syntax()
+  other()
+end
+
+record Node
+  const id: integer
+  const parent_id: integer?
+  const tag: string
+  const kind: NodeKind
+  const location: SourceLocation?
+  const source_span: SourceSpan?
+  const name: string?
+  const is_local: boolean
+  const synthetic: boolean
+  const inferred_type: TypeInfo?
+  const declared_type: TypeInfo?
+  const original_type: TypeInfo?
+  const coerced_type: TypeInfo?
+  const adjustment: Adjustment?
+end
+
+union OccurrenceRole
+  definition()
+  reference()
+  write()
+  type_reference()
+  import_alias()
+end
+
+union DeclarationVisibility
+  block()
+  module()
+  exported()
+end
+
+record SymbolOccurrence
+  const name: string
+  const declaration_id: string?
+  const role: OccurrenceRole
+  const location: SourceLocation
+  const exact_span: SourceSpan?
+  const is_local: boolean
+  const visibility: DeclarationVisibility
+  const type_info: TypeInfo?
+  const callable_signature: CallableSignature?
+  const summary_id: integer?
+  -- A shorthand named case pattern spells both a local definition and a
+  -- selected union part. Keep its second identity without overlapping spans.
+  const case_part_id: string?
+  documentation: string?
+end
+
+record Import
+  const alias: string
+  const module_name: string
+  const source_required: boolean
+  const location: SourceLocation
+end
+
+record Manifest
+  const module_name: string
+  const serialized: string
+  const source_serialized: string?
+end
+
+union Provenance
+  project_source(main_file: string, source_files: {string})
+  external_source(main_file: string, source_files: {string})
+  dynamic_binary(provider_file: string)
+  static_binary(provider_file: string)
+end
+
+record ExternalResolutionRequest
+  const module_name: string
+  const source_required: boolean
+end
+
+-- A missing/error result deliberately carries no compiler type or AST. This
+-- is a pre-analysis topology fingerprint, not another compiler cache.
+record ExternalResolution
+  const module_name: string
+  const provenance: Provenance?
+  const error: string?
+end
+
+-- A compiled interface can expose a nominal type owned by another logical
+-- module without importing or linking that owner independently. This record
+-- carries only the physical interface provenance needed by the project cache.
+record ContextualResolution
+  const owner_module: string
+  const exposer_module: string
+  const provenance: Provenance
+  ordinary_lookup: boolean
+  -- Captured by CompilerIO when the compiler selected this provider. Nil means
+  -- the provider path was not observed, or repeated lstat calls in this one
+  -- incremental analysis disagreed and the result must be treated as
+  -- unvalidated by the project service.
+  const provider_identity: compiler_io.LstatIdentity?
+end
+
+-- Every ordinary binary provider selected by any root attempt remains visible
+-- until the project service publishes or rejects the complete analysis. This
+-- is distinct from final external snapshots: a later source-required attempt
+-- may legitimately leave a source snapshot for the same logical module.
+record BinaryProviderObservation
+  const module_name: string
+  const kind: string
+  const provider_file: string
+  const provider_identity: compiler_io.LstatIdentity?
+end
+
+union CHeaderDependencyKind
+  file()
+  search()
+  origin()
+end
+
+--- Return the stable textual tag for a C-header dependency kind.
+function CHeaderDependencyKind:name(): string
+  case self
+  when file() then return "file"
+  when search() then return "search"
+  when origin() then return "origin"
+  end
+end
+
+--- Return the persisted SQLite integer code for a C-header dependency kind.
+function CHeaderDependencyKind:code(): integer
+  case self
+  when file() then return 0
+  when search() then return 1
+  when origin() then return 2
+  end
+end
+
+--- Decode a textual tag into a CHeaderDependencyKind, or nil when unrecognized.
+function header_dependency_kind_from_name(name: string): CHeaderDependencyKind?
+  if name == "file" then return CHeaderDependencyKind.file() end
+  if name == "search" then return CHeaderDependencyKind.search() end
+  if name == "origin" then return CHeaderDependencyKind.origin() end
+  return nil
+end
+
+--- Decode a persisted SQLite integer code into a CHeaderDependencyKind, or nil.
+function header_dependency_kind_from_code(code: integer): CHeaderDependencyKind?
+  if code == 0 then return CHeaderDependencyKind.file() end
+  if code == 1 then return CHeaderDependencyKind.search() end
+  if code == 2 then return CHeaderDependencyKind.origin() end
+  return nil
+end
+
+-- `file` identities hash the exact bytes cdriver parsed. `search` identities
+-- describe one exact include candidate (including a miss). `origin` identities
+-- retain the realpath naming a C declaration's nominal scope, independently
+-- of that header's content identity.
+record HeaderObservation
+  const modified_seconds: integer
+  const modified_nanoseconds: integer
+  const physical_identity: string
+  const precision: string?
+  const size: integer?
+  const changed_seconds: integer?
+  const changed_nanoseconds: integer?
+end
+
+-- One validation pass shares physical observations without exposing compiler
+-- tables to project metadata or the SQL cache.
+record HeaderValidation
+  local const memo: value
+end
+
+function header_validation(): HeaderValidation
+  local memo: {string: value} = {}
+  return HeaderValidation(memo)
+end
+
+record CHeaderDependency
+  const kind: CHeaderDependencyKind
+  const path: string
+  const identity: string
+  const observation: HeaderObservation?
+end
+
+record ModuleSnapshot
+  const module_name: string
+  const provenance: Provenance
+  const manifest: Manifest?
+  const nodes: {Node}
+  const symbols: {SymbolOccurrence}
+  const imports: {Import}
+  c_header_dependencies: {CHeaderDependency}
+  const hover_summaries: {HoverSummary}?
+  -- Binary snapshots carry the exact followed provider object observed while
+  -- the compiler selected their interface. Nil is required for source
+  -- snapshots and for a binary path whose observations disagreed.
+  provider_identity: compiler_io.LstatIdentity?
+end
+
+--- Lazy browser C observations belonging to the completed saved workset.
+record BrowserForeignAnalysis
+  const checked: {string: boolean}
+  const owners: {string: boolean}
+  identity: string?
+  conflicted: boolean
+end
+
+record Analysis
+  const root_module: string
+  const diagnostics: {Diagnostic}
+  const modules: {ModuleSnapshot}
+  const contextual_resolutions: {ContextualResolution}
+  const binary_provider_observations: {BinaryProviderObservation}
+  -- Logical modules which selected different binary provider kind/path pairs
+  -- between root attempts. Source-required and ordinary imports may
+  -- legitimately select source and binary simultaneously; that is not a
+  -- binary-provider conflict.
+  const provider_conflicts: {string}
+  const browser_foreign: BrowserForeignAnalysis?
+end
+
+function Analysis:find_module(module_name: string): ModuleSnapshot?
+  for index = 1, #self.modules do
+    if self.modules[index].module_name == module_name then
+      return self.modules[index]
+    end
+  end
+  return nil
+end
+
+-- Progress counts the saved source files in one exact dirty project workset.
+-- Compiler-only external modules never enter this total.
+record AnalysisProgress
+  const completed_files: integer
+  const total_files: integer
+end
+
+type ProgressListener = function (AnalysisProgress): ()
+
+-- External source modules keep equality manifests and resolver metadata.
+-- Project modules separately retain restorable declared interfaces in Compiler;
+-- bodies exist only during fresh checking and semantic extraction.
+record CachedSourceInterface
+  const module_name: string
+  const serialized: string
+  const source_serialized: string
+  const main_file: string
+  const source_files: {string}
+  const imports: {Import}
+  const c_header_dependencies: {CHeaderDependency}
+end
+
+record ProjectPayload
+  const module_name: string
+  const payload: string
+  const header_inputs: {CHeaderDependency}?
+end
+
+-- A hole belongs to one immutable source/caret capture. Its compiler metadata
+-- never crosses the typed bridge, and is not a persistent cache payload.
+record CompletionHole
+  const filename: string
+  const contents: string
+  const caret_byte: integer
+  const replace_start: integer
+  const replace_finish: integer
+  const prefix: string
+  const kind: string
+  local const request: value
+end
+
+record CompletionAnalysis
+  const quality: string
+  const kind: string
+  const candidates: {completion_types.Candidate}
+  const scopes: {completion_types.Scope}
+  const observed_headers: {CHeaderDependency}?
+  const snapshot: ModuleSnapshot?
+end
+
+record CompletionBinary
+  const module_name: string
+  const serialized: string
+  const kind: string
+  const filename: string
+  const provider_identity: compiler_io.LstatIdentity?
+  const documentation: string?
+end
+
+type CacheLookup = function (string, string): (string?, {CHeaderDependency}?)
+type CachePublisher = function (string, string, string, {CHeaderDependency}): ()
+type CacheInputRefresher = function (string, string, {CHeaderDependency}): boolean
+type ProjectPayloadReader = function (string): (string?, {CHeaderDependency}?)
+type ProjectManifestInstaller = function (string): boolean
+
+-- Project configuration reaches the compiler through this named boundary.
+-- Nil source/binary roots retain the installed driver's defaults. Include
+-- roots extend the explicit SDK roots; project CPP flags follow inherited flags.
+record CompilerConfiguration
+  const source_roots: {string}?
+  const binary_root: string?
+  const include_roots: {string}?
+  const cppflags: string?
+  const use_selected_inventory: boolean?
+end
+
+--- Translate one observed project configuration for saved compiler work.
+function project_configuration(config: project_config.ProjectConfig): CompilerConfiguration
+  return CompilerConfiguration {
+    source_roots = config.source_module_roots,
+    binary_root = config.binary_modules_root,
+    include_roots = config.extra_ffi_include_dirs,
+    cppflags = config.extra_ffi_cppflags,
+    use_selected_inventory = config.use_selected_inventory,
+  }
+end
+
+local type RequireFunction = function (string): value
+local type TypeOfFunction = function (value): string
+local type BrowserForeignIdentity = function (value): (value, value)
+
+local record CompletionExport
+  const public_interface: string
+  const source_interface: string?
+  const provenance_key: string
+  const payload: string?
+  const candidates: {completion_types.Candidate}
+  const documentation: string?
+end
+
+local record BrowserAnalysis
+  const driver: {string: value}
+  const handle: value
+  const directory: string
+  const identity: string
+  const provider: compiler_io.LstatIdentity
+  const foreign_identity: BrowserForeignIdentity
+end
+
+local record SelectedSnapshot
+  const prefix: string
+  const driver: {string: value}
+  const identity: compiler_io.LstatIdentity
+  const inventory: {string: value}
+end
+
+-- Exact Lua driver globals have one representation for inherited defaults,
+-- accepted configuration, and the previous values restored after a call.
+local record DriverConfiguration
+  const driver: {string: value}
+  const source_path: value
+  const binary_path: value
+  const cppflags: value
+end
+
+record Compiler
+  local parser: {string: value}
+  local checker: {string: value}
+  local types: {string: value}
+  local driver: {string: value}
+  local type_of: TypeOfFunction
+  local interface_inventory: {string: value}?
+  local embedded_provider_file: string
+  local embedded_provider_identity: compiler_io.LstatIdentity
+  local io: compiler_io.CompilerIO
+  local project_entries: {string: value}
+  local configuration: CompilerConfiguration
+  local baseline: DriverConfiguration
+  local effective: DriverConfiguration
+  local include_dirs: {integer: value}
+  local cache_adapter: {string: value}?
+  local completion_exports: {string: CompletionExport}
+  local completion_binaries: {CompletionBinary}
+  -- An interface snapshot and a mapped-image identity are independent facts.
+  local const mapped_provider: boolean
+  local selected_prefix: string?
+  local snapshot_directory: string?
+  local const browser: BrowserAnalysis?
+end
+
+-- One compiler and semantic target live in a worker. The opaque driver handle
+-- remains valid across independent bridge loads, including saved rename.
+local browser_analysis: BrowserAnalysis? = nil
+
+-- One process hosts exactly one compiler. The worker selects an installed SDK
+-- before any compiler module loads, so the bridge keeps that selection and
+-- every later load derives its provider mode from it.
+local selected_compiler_root: string? = nil
+local selected_target: string? = nil
+local selected_snapshot: SelectedSnapshot? = nil
+
+local cached_target_driver: value = nil
+local cached_new_context: value = nil
+local cached_context_target: value = nil
+local cached_host_target: string? = nil
+
+local function fail<|T|>(module_name: string, message: string): T
+  raise BridgeError(module_name, message)
+end
+
+local function describe(candidate: value, type_of: TypeOfFunction): string
+  local kind = type_of(candidate)
+  if kind == "nil" then return "nil" end
+  return kind
+end
+
+local function required_map(candidate: value, module_name: string,
+                            subject: string): {string: value}
+  if not (candidate is {string: value}) then
+    return fail<|{string: value}|>(
+      module_name, subject .. " must be a Lua table")
+  end
+  return candidate as {string: value}
+end
+
+local function required_string(candidate: value, module_name: string,
+                               subject: string): string
+  if not (candidate is string) then
+    return fail<|string|>(module_name, subject .. " must be a string")
+  end
+  return candidate as string
+end
+
+local function optional_string(candidate: value, module_name: string,
+                               subject: string): string?
+  if candidate == nil then return nil end
+  return required_string(candidate, module_name, subject)
+end
+
+local function required_integer(candidate: value, module_name: string,
+                                subject: string): integer
+  local result: integer = candidate
+  return result
+catch
+  return fail<|integer|>(module_name,
+    subject .. " must carry an exact Lua integer")
+end
+
+local function required_boolean(candidate: value, module_name: string,
+                                subject: string): boolean
+  local result: boolean = candidate
+  return result
+catch
+  return fail<|boolean|>(module_name, subject .. " must be a boolean")
+end
+
+local function optional_boolean(candidate: value, module_name: string,
+                                subject: string): boolean
+  if candidate == nil or candidate == false then return false end
+  local result: boolean = candidate
+  return result
+catch
+  return fail<|boolean|>(module_name, subject .. " must be a boolean")
+end
+
+local function required_string_list(candidate: value, module_name: string,
+                                    subject: string): {string}
+  if not (candidate is {integer: value}) then
+    return fail<|{string}|>(module_name, subject .. " must be a Lua array")
+  end
+  local raw = candidate as {integer: value}
+  local result: {string} = {}
+  for index = 1, #raw do
+    result[index] = required_string(
+      raw[index], module_name, subject .. "[" .. index .. "]")
+  end
+  return result
+end
+
+local function required_value_list(candidate: value, subject: string):
+    {integer: value}
+  if not (candidate is {integer: value}) then
+    return fail<|{integer: value}|>(
+      TYPES_MODULE, subject .. " must be a Lua array")
+  end
+  return candidate as {integer: value}
+end
+
+local function optional_name_list(candidate: value, subject: string):
+    {string}?
+  if candidate == nil then return nil end
+  return required_string_list(candidate, TYPES_MODULE, subject)
+end
+
+local function checked_function(module: {string: value},
+                                module_name: string, member: string,
+                                type_of: TypeOfFunction): value
+  local candidate: value = module[member]
+  if type_of(candidate) ~= "function" then
+    return fail<|value|>(module_name,
+      "compiler API member '" .. member .. "' must be a function, found " ..
+      describe(candidate, type_of) ..
+      ". Install a Titan compiler implementing " ..
+      COMPILER_LANGUAGE_SERVER_API_MARKER .. " " ..
+      COMPILER_LANGUAGE_SERVER_API)
+  end
+  return candidate
+end

@@ -1,0 +1,746 @@
+-- SDK/target selection, driver bootstrap, configuration, and resolver context lifecycle.
+
+local function require_compiler_module(require_function: RequireFunction,
+                                       type_of: TypeOfFunction,
+                                       module_name: string): {string: value}
+  local loaded: value = nil
+  do
+    loaded = require_function(module_name)
+  catch
+    return fail<|{string: value}|>(module_name,
+      "cannot load compiler module through package.path/package.cpath: " ..
+      strings.tostring(error))
+  end
+  if type_of(loaded) ~= "table" then
+    return fail<|{string: value}|>(module_name,
+      "compiler module must return a table, found " ..
+      describe(loaded, type_of))
+  end
+  return required_map(loaded, module_name, "compiler module")
+end
+
+local function make_type_of(): TypeOfFunction
+  local chunk = lua.load("return type", "=compiler_bridge.type", nil)
+  local candidate: value = chunk()
+  return candidate as TypeOfFunction
+end
+
+local function require_driver_module(module_name: string): value
+  return lua.require(module_name)
+catch
+  local fallback = lua.load(
+    "return require(...)", "=compiler_bridge.require_driver", nil)
+  return fallback(module_name)
+end
+
+local function current_driver_module(): ({string: value}, TypeOfFunction)
+  local type_of = make_type_of()
+  return require_compiler_module(require_driver_module, type_of, DRIVER_MODULE),
+    type_of
+end
+
+local function capture_driver_configuration(
+    driver: {string: value}): DriverConfiguration
+  return DriverConfiguration(driver, driver["TITAN_SOURCE_PATH"],
+    driver["TITAN_BIN_PATH"], driver["EXTRA_CPPFLAGS"])
+end
+
+local function DriverConfiguration:apply()
+  self.driver["TITAN_SOURCE_PATH"] = self.source_path
+  self.driver["TITAN_BIN_PATH"] = self.binary_path
+  self.driver["EXTRA_CPPFLAGS"] = self.cppflags
+end
+
+-- The caller holds the scheduler permit until the previous globals are
+-- restored. No flag parsing or path construction happens inside this scope.
+local function Compiler:install_configuration(): DriverConfiguration
+  local previous = capture_driver_configuration(self.driver)
+  self.effective:apply()
+  return previous
+end
+
+local function Compiler:emit_cache_stats()
+  if not logging.enabled("debug") then return end
+  local query = checked_function(self.driver, DRIVER_MODULE,
+    "compiler_cache_stats", self.type_of) as function (value): value
+  local context: {string: value} = {["io"] = self.io}
+  local options: {string: value} = {["context"] = context}
+  local statistics = required_map(
+    query(options), DRIVER_MODULE, "compiler cache statistics")
+  local headers = required_map(
+    statistics["headers"], DRIVER_MODULE, "header cache statistics")
+  local conversion = required_map(
+    statistics["conversion"], DRIVER_MODULE, "FFI cache statistics")
+  logging.emit("debug", "compiler.cache.stats", {
+    ["header_lookups"] = headers["lookups"] as integer,
+    ["header_hits"] = headers["hits"] as integer,
+    ["header_misses"] = headers["misses"] as integer,
+    ["header_file_reads"] = headers["file_reads"] as integer,
+    ["header_file_hashes"] = headers["file_hashes"] as integer,
+    ["header_metadata_reuses"] = headers["metadata_reuses"] as integer,
+    ["header_search_checks"] = headers["search_checks"] as integer,
+    ["header_memo_reuses"] = headers["memo_reuses"] as integer,
+    ["conversion_lookups"] = conversion["lookups"] as integer,
+    ["conversion_hits"] = conversion["hits"] as integer,
+    ["conversion_misses"] = conversion["misses"] as integer,
+  })
+end
+
+function Compiler:log_cache_stats()
+  local permit = compiler_scheduler.acquire()
+  defer permit:release()
+  self:emit_cache_stats()
+end
+
+local function embedded_provider_identity(
+    candidate: {string: value}, provider_file: string):
+    compiler_io.LstatIdentity
+  local path = required_string(
+    candidate["path"], DRIVER_MODULE,
+    "embedded compiler provider identity.path")
+  if path ~= provider_file then
+    return fail<|compiler_io.LstatIdentity|>(
+      DRIVER_MODULE,
+      "embedded compiler provider identity path '" .. path ..
+      "' does not match provider_file '" .. provider_file .. "'")
+  end
+  local kind = required_string(
+    candidate["kind"], DRIVER_MODULE,
+    "embedded compiler provider identity.kind")
+  if kind ~= "file" then
+    return fail<|compiler_io.LstatIdentity|>(
+      DRIVER_MODULE,
+      "embedded compiler provider identity kind must be 'file', found '" ..
+      kind .. "'")
+  end
+  local native_identity?: string = candidate["native_identity"]
+  local device?: integer = nil
+  local inode?: integer = nil
+  if ffi.VSCODE_TITAN_WINDOWS ~= 0 then
+    if native_identity == nil or #native_identity == 0 or
+       candidate["device"] ~= nil or candidate["inode"] ~= nil then
+      return fail<|compiler_io.LstatIdentity|>(DRIVER_MODULE,
+        "Windows embedded provider requires its full opaque native identity")
+    end
+  else
+    device = required_integer(candidate["device"], DRIVER_MODULE,
+                              "embedded compiler provider identity.device")
+    inode = required_integer(candidate["inode"], DRIVER_MODULE,
+                             "embedded compiler provider identity.inode")
+    if native_identity ~= nil then
+      return fail<|compiler_io.LstatIdentity|>(DRIVER_MODULE,
+        "unexpected opaque identity for Unix embedded provider")
+    end
+  end
+  return compiler_io.LstatIdentity {
+    path = path,
+    size = required_integer(candidate["size"], DRIVER_MODULE,
+                            "embedded compiler provider identity.size"),
+    kind = kind,
+    device = device,
+    inode = inode,
+    modified_seconds = required_integer(
+      candidate["modified_seconds"], DRIVER_MODULE,
+      "embedded compiler provider identity.modified_seconds"),
+    modified_nanoseconds = required_integer(
+      candidate["modified_nanoseconds"], DRIVER_MODULE,
+      "embedded compiler provider identity.modified_nanoseconds"),
+    native_identity = native_identity,
+  }
+end
+
+-- An ordinary selected file never uses the mapped application's identity.
+local function selected_file_identity(
+    provider_file: string): compiler_io.LstatIdentity
+  local metadata? = fs.stat(provider_file)
+  if metadata == nil or metadata.kind ~= "file" then
+    return fail<|compiler_io.LstatIdentity|>(DRIVER_MODULE,
+      "selected compiler provider '" .. provider_file .. "' is missing")
+  end
+  return compiler_io.LstatIdentity {
+    path = provider_file,
+    size = metadata.size,
+    kind = metadata.kind,
+    device = metadata.device,
+    inode = metadata.inode,
+    modified_seconds = metadata.modified_seconds,
+    modified_nanoseconds = metadata.modified_nanoseconds,
+  }
+end
+
+local function selected_provider_file(compiler_root: string): string
+  return paths.to_slash(paths.join(compiler_root, root_settings.provider_entry()))
+end
+
+local function accept_browser_analysis(
+    driver: {string: value}, type_of: TypeOfFunction,
+    strategy: compiler_io.CompilerIO, prefix: string?): BrowserAnalysis
+  if browser_analysis ~= nil and browser_analysis.driver == driver then
+    return browser_analysis
+  end
+  local acquire = checked_function(driver, DRIVER_MODULE, "browser_analysis_target",
+    type_of) as function (string?, value): (value, value)
+  local foreign_identity: BrowserForeignIdentity = checked_function(
+    driver, DRIVER_MODULE, "browser_foreign_cache_identity", type_of)
+  local adapter: {string: value} = {["sha256_binary"] = content_identity.digest}
+  local options: {string: value} = {["io"] = strategy, ["cache_adapter"] = adapter}
+  local handle, failure = acquire(prefix, options)
+  if handle == nil then
+    return fail<|BrowserAnalysis|>(DRIVER_MODULE, strings.tostring(failure))
+  end
+  -- The public fields are exposed by __index on the compiler-owned handle.
+  local view = required_map(handle, DRIVER_MODULE, "browser analysis target")
+  local directory = required_string(
+    view["directory"], DRIVER_MODULE, "browser provider directory")
+  local identity = required_string(
+    view["identity"], DRIVER_MODULE, "browser target identity")
+  local file = required_string(
+    view["provider_file"], DRIVER_MODULE, "browser provider file")
+  local provider = selected_file_identity(file)
+  local accepted = BrowserAnalysis {
+    driver = driver,
+    handle = handle,
+    directory = directory,
+    identity = identity,
+    provider = provider,
+    foreign_identity = foreign_identity,
+  }
+  browser_analysis = accepted
+  return accepted
+end
+
+local function load_with(require_function: RequireFunction,
+                         interface_inventory: {string: value}?,
+                         provider_file: string?,
+                         embedded_identity: compiler_io.LstatIdentity?,
+                         mapped_provider: boolean,
+                         browser_target: boolean?,
+                         prefix: string?): Compiler
+  local type_of = make_type_of()
+  local parser = require_compiler_module(
+    require_function, type_of, PARSER_MODULE)
+  local checker = require_compiler_module(
+    require_function, type_of, CHECKER_MODULE)
+  local types = require_compiler_module(
+    require_function, type_of, TYPES_MODULE)
+  local driver = require_compiler_module(
+    require_function, type_of, DRIVER_MODULE)
+
+  local version = required_string(
+    driver["TITAN_ABI_VERSION"], DRIVER_MODULE, "TITAN_ABI_VERSION")
+  if version ~= COMPILER_ABI then
+    return fail<|Compiler|>(DRIVER_MODULE,
+      "incompatible Titan compiler ABI " .. version ..
+      "; this server requires " .. COMPILER_ABI)
+  end
+
+  local raw_language_server_api: value =
+    driver[COMPILER_LANGUAGE_SERVER_API_MARKER]
+  if raw_language_server_api == nil then
+    return fail<|Compiler|>(DRIVER_MODULE,
+      "Titan compiler ABI " .. version .. " is missing " ..
+      COMPILER_LANGUAGE_SERVER_API_MARKER ..
+      "; matching Titan ABI alone is insufficient. Install the Titan " ..
+      "compiler built for this vscode-titan server (language-server API " ..
+      COMPILER_LANGUAGE_SERVER_API .. ")")
+  end
+  local language_server_api: integer = 0
+  do
+    language_server_api = raw_language_server_api
+  catch
+    return fail<|Compiler|>(DRIVER_MODULE,
+      "incompatible Titan language-server API " ..
+      describe(raw_language_server_api, type_of) .. " for compiler ABI " ..
+      version .. "; this server requires " ..
+      COMPILER_LANGUAGE_SERVER_API_MARKER .. " " ..
+      COMPILER_LANGUAGE_SERVER_API ..
+      ". Install the matching Titan compiler; matching Titan ABI alone " ..
+      "is insufficient")
+  end
+  if language_server_api ~= COMPILER_LANGUAGE_SERVER_API then
+    return fail<|Compiler|>(DRIVER_MODULE,
+      "incompatible Titan language-server API " .. language_server_api ..
+      " for compiler ABI " .. version .. "; this server requires " ..
+      COMPILER_LANGUAGE_SERVER_API_MARKER .. " " ..
+      COMPILER_LANGUAGE_SERVER_API ..
+      ". Install the matching Titan compiler; matching Titan ABI alone " ..
+      "is insufficient")
+  end
+
+  checked_function(parser, PARSER_MODULE, "parse", type_of)
+  checked_function(parser, PARSER_MODULE, "error_to_string", type_of)
+  checked_function(checker, CHECKER_MODULE, "check", type_of)
+  checked_function(types, TYPES_MODULE, "tostring", type_of)
+  checked_function(types, TYPES_MODULE, "serialize", type_of)
+  checked_function(driver, DRIVER_MODULE, "defaultloader", type_of)
+  checked_function(
+    driver, DRIVER_MODULE, "new_c_header_analysis", type_of)
+  checked_function(driver, DRIVER_MODULE, "new_resolver_context", type_of)
+  checked_function(driver, DRIVER_MODULE, "finalize_resolver_context", type_of)
+  checked_function(driver, DRIVER_MODULE, "close_resolver_context", type_of)
+  checked_function(driver, DRIVER_MODULE, "close_loader", type_of)
+  checked_function(driver, DRIVER_MODULE, "resolve_external_modules", type_of)
+  checked_function(
+    driver, DRIVER_MODULE, "restat_c_header_dependencies", type_of)
+  checked_function(driver, DRIVER_MODULE, "split_shell_words", type_of)
+  checked_function(driver, DRIVER_MODULE, "encode_project_entry", type_of)
+  checked_function(driver, DRIVER_MODULE, "decode_project_entry", type_of)
+  checked_function(driver, DRIVER_MODULE, "compact_project_entry", type_of)
+  checked_function(driver, DRIVER_MODULE, "project_entries_registry", type_of)
+  checked_function(driver, DRIVER_MODULE, "language_server_cache_identity", type_of)
+  checked_function(driver, DRIVER_MODULE, "compiler_cache_stats", type_of)
+  checked_function(driver, DRIVER_MODULE, "classify_source_filename", type_of)
+  checked_function(driver, DRIVER_MODULE, "target_selection_labels", type_of)
+  checked_function(driver, DRIVER_MODULE, "target_label_applies", type_of)
+  checked_function(driver, DRIVER_MODULE, "context_target", type_of)
+  required_string_list(
+    driver["SOURCE_LABELS"], DRIVER_MODULE, "driver.SOURCE_LABELS")
+  required_map(driver["imported"], DRIVER_MODULE, "driver.imported")
+  required_map(types["registry"], TYPES_MODULE, "types.registry")
+
+  local baseline = capture_driver_configuration(driver)
+  local strategy = compiler_io.create()
+  local browser: BrowserAnalysis? = nil
+  if browser_target then
+    browser = accept_browser_analysis(driver, type_of, strategy, prefix)
+    embedded_identity = browser.provider
+    provider_file = browser.provider.path
+  end
+  return Compiler {
+    parser = parser,
+    checker = checker,
+    types = types,
+    driver = driver,
+    type_of = type_of,
+    interface_inventory = interface_inventory,
+    embedded_provider_file = provider_file,
+    embedded_provider_identity = embedded_identity,
+    io = strategy,
+    project_entries = {},
+    configuration = CompilerConfiguration(),
+    baseline = baseline,
+    effective = baseline,
+    include_dirs = {},
+    completion_exports = {},
+    completion_binaries = {},
+    mapped_provider = mapped_provider,
+    browser = browser,
+  }
+end
+
+local function Compiler:read_selected_snapshot(prefix: string): {string: value}
+  local identity = self.embedded_provider_identity
+  local file = self.embedded_provider_file
+  if not compiler_io.same_lstat_identity(identity, selected_file_identity(file)) then
+    raise "selected provider changed before interface extraction"
+  end
+  local cached? = selected_snapshot
+  if cached ~= nil and cached.prefix == prefix and cached.driver == self.driver then
+    if not compiler_io.same_lstat_identity(cached.identity, identity) then
+      raise "selected provider changed; restart the language server"
+    end
+    return cached.inventory
+  end
+  local started = logging.wall_clock()
+  local inventory = selected_interfaces.read(prefix, file)
+  if not compiler_io.same_lstat_identity(identity, selected_file_identity(file)) then
+    raise "selected provider changed during interface extraction"
+  end
+  selected_snapshot = SelectedSnapshot(prefix, self.driver, identity, inventory)
+  -- The cache entry is process-owned; only matching SDK search roots use it.
+  logging.emit("debug", "compiler.selected_interfaces", {
+    ["provider_file"] = file, ["wall_ms"] = logging.elapsed_wall_ms(started),
+  })
+  return inventory
+end
+
+local function Compiler:selected_inventory(): {string: value}?
+  local prefix? = self.selected_prefix
+  if prefix == nil then return nil end
+  if self.configuration.use_selected_inventory ~= true then return nil end
+  return self:read_selected_snapshot(prefix)
+catch
+  if error is async.CancellationReason then raise end
+  raise BridgeError(DRIVER_MODULE, "Cannot read selected Titan standard interfaces from '" ..
+    self.embedded_provider_file .. "' (compiler_root '" .. self.selected_prefix ..
+    "'): " .. strings.tostring(error))
+end
+
+--- Select an installed SDK whose compiler Lua modules this process will load.
+function select_compiler_root(compiler_root: string?, target: string?)
+  selected_compiler_root = compiler_root
+  selected_snapshot = nil
+  selected_target = target
+  browser_analysis = nil
+end
+
+--- Report the SDK prefix selected for this process, or nil for the build SDK.
+function compiler_root(): string?
+  return selected_compiler_root
+end
+
+--- Return the worker's accepted non-native analysis target.
+function analysis_target(): string?
+  return selected_target
+end
+
+function load(): Compiler
+  -- A new Compiler must capture inherited defaults after any active
+  -- compiler operation restores its temporary driver configuration.
+  local permit = compiler_scheduler.acquire()
+  defer permit:release()
+  local configured? = selected_compiler_root
+  if selected_target == "browser" then
+    if configured == nil and browser_analysis == nil then
+      embedded_interfaces.preload_compiler_support()
+    end
+    return load_with {
+      require_function = lua.require,
+      mapped_provider = false,
+      browser_target = true,
+      prefix = configured,
+    }
+  end
+  if configured ~= nil then
+    local provider_file = selected_provider_file(configured)
+    local compiler = load_with(
+      lua.require, nil, provider_file, selected_file_identity(provider_file), false)
+    if ffi.VSCODE_TITAN_WINDOWS ~= 0 then
+      compiler.selected_prefix = configured
+      compiler.snapshot_directory = project_config.physical_directory(paths.dirname(provider_file))
+      if compiler.snapshot_directory == nil then
+        return fail<|Compiler|>(
+          DRIVER_MODULE,
+          "selected provider directory cannot be resolved: " .. provider_file)
+      end
+    end
+    return compiler
+  end
+  local provider: {string: value} = {}
+  local raw_identity: {string: value} = {}
+  do
+    provider, raw_identity = embedded_interfaces.provider()
+  catch
+    raise BridgeError(
+      DRIVER_MODULE,
+      "cannot load embedded Titan compiler interfaces: " ..
+      strings.tostring(error))
+  end
+  local provider_file = required_string(
+    provider["provider_file"], DRIVER_MODULE,
+    "embedded_interface_provider.provider_file")
+  return load_with(
+    lua.require, provider, provider_file,
+    embedded_provider_identity(raw_identity, provider_file), true)
+end
+
+--- The physical SDK directory eligible for a selected Windows inventory.
+function Compiler:selected_inventory_directory(): string?
+  return self.snapshot_directory
+end
+
+function Compiler:compiler_abi(): string
+  return COMPILER_ABI
+end
+
+function Compiler:has_project_entry(module_name: string): boolean
+  return self.project_entries[module_name] ~= nil
+end
+
+function Compiler:drop_project_entry(module_name: string)
+  self.project_entries[module_name] = nil
+end
+
+local function copy_optional_roots(roots: {string}?): {string}?
+  if roots == nil then return nil end
+  return {...roots}
+end
+
+local function same_roots(left: {string}?, right: {string}?): boolean
+  if left == nil or right == nil then return left == right end
+  if #left ~= #right then return false end
+  for index = 1, #left do
+    if left[index] ~= right[index] then return false end
+  end
+  return true
+end
+
+function Compiler:configure(configuration: CompilerConfiguration)
+  local current = self.configuration
+  if current.binary_root == configuration.binary_root and
+     current.use_selected_inventory == configuration.use_selected_inventory and
+     current.cppflags == configuration.cppflags and
+     same_roots(current.source_roots, configuration.source_roots) and
+     same_roots(current.include_roots, configuration.include_roots) then return end
+
+  local cppflags? = configuration.cppflags
+  local effective_cppflags: value = self.effective.cppflags
+  if cppflags ~= current.cppflags then
+    local words: {string} = {}
+    if cppflags ~= nil and cppflags ~= "" then
+      local split = checked_function(self.driver, DRIVER_MODULE,
+        "split_shell_words", self.type_of) as function (string): (value, value)
+      local parsed, parse_error = split(cppflags)
+      if parsed == nil or parsed == false then
+        fail<|value|>(DRIVER_MODULE,
+          "invalid compiler cppflags: " .. strings.tostring(parse_error))
+      end
+      words = required_string_list(parsed, DRIVER_MODULE, "split compiler cppflags")
+    end
+    effective_cppflags = self.baseline.cppflags
+    if #words > 0 then
+      local effective: {integer: value} = {}
+      if effective_cppflags ~= nil and effective_cppflags ~= false then
+        local inherited = required_string_list(
+          effective_cppflags, DRIVER_MODULE, "inherited compiler CPP flags")
+        for index = 1, #inherited do effective[index] = inherited[index] end
+      end
+      for index = 1, #words do effective[#effective + 1] = words[index] end
+      effective_cppflags = effective
+    end
+  end
+  local source_path: value = self.baseline.source_path
+  if configuration.source_roots ~= nil then
+    local path = strings.writer()
+    for index = 1, #configuration.source_roots do
+      if index > 1 then path:write(";") end
+      path:write(configuration.source_roots[index])
+    end
+    source_path = path:drain()
+  end
+  local binary_path: value = self.baseline.binary_path
+  if configuration.binary_root ~= nil then binary_path = configuration.binary_root end
+  local includes: {integer: value} = {}
+  if configuration.include_roots ~= nil then
+    for index = 1, #configuration.include_roots do
+      includes[index] = configuration.include_roots[index]
+    end
+  end
+  -- Build the accepted snapshot and its Lua driver representation once.
+  -- Commit only after every field validates; caller mutations stay isolated.
+  local accepted = CompilerConfiguration {
+    source_roots = copy_optional_roots(configuration.source_roots),
+    binary_root = configuration.binary_root,
+    include_roots = copy_optional_roots(configuration.include_roots),
+    cppflags = cppflags,
+    use_selected_inventory = configuration.use_selected_inventory,
+  }
+  local effective = DriverConfiguration(
+    self.driver, source_path, binary_path, effective_cppflags)
+  self.configuration = accepted
+  self.effective = effective
+  self.include_dirs = includes
+  self.completion_binaries = {}
+end
+
+local function Compiler:new_context(supplied: {string: value}?): value
+  local create = checked_function(self.driver, DRIVER_MODULE,
+    "new_resolver_context", self.type_of) as function (value): value
+  local options: {string: value} = {}
+  if supplied ~= nil then options = supplied end
+  options["io"] = self.io
+  local browser? = self.browser
+  if browser ~= nil then
+    options["target"] = "browser"
+    options["analysis_only"] = true
+    options["browser_analysis_target"] = browser.handle
+  else
+    local inventory? = self.interface_inventory
+    -- Detached completion uses only its captured SQLite catalog.
+    if inventory == nil and options["completion_closed_world"] ~= true then
+      inventory = self:selected_inventory()
+    end
+    if inventory ~= nil then
+      options["embedded_interface_provider"] = inventory
+    elseif self.selected_prefix == nil then
+      -- Unix selected SDKs continue to resolve passive static archives.
+      options["prefer_static"] = true
+    end
+  end
+  if self.cache_adapter ~= nil then options["cache_adapter"] = self.cache_adapter end
+  options["extra_ffi_include_dirs"] = self.include_dirs
+  local context: value = create(options)
+  if self.type_of(context) ~= "table" then
+    return fail<|value|>(DRIVER_MODULE,
+      "driver.new_resolver_context returned " ..
+      describe(context, self.type_of) .. " instead of a table")
+  end
+  return context
+end
+
+local function Compiler:context_browser_foreign(
+    context: value, validate: boolean): string?
+  local browser? = self.browser
+  if browser == nil then return nil end
+  local options: {string: value} = {["context"] = context, ["validate"] = validate}
+  local identity, failure = browser.foreign_identity(options)
+  if failure ~= nil then
+    return fail<|string?|>(DRIVER_MODULE, strings.tostring(failure))
+  end
+  if identity == nil then return nil end
+  return required_string(identity, DRIVER_MODULE, "browser foreign cache identity")
+end
+
+function Compiler:observe_browser_foreign(): string?
+  local permit = compiler_scheduler.acquire()
+  defer permit:release()
+  local configuration = self:install_configuration()
+  defer configuration:apply()
+  local context = self:new_context(nil)
+  defer self:close_context(context)
+  return self:context_browser_foreign(context, true)
+end
+
+local function Compiler:close_loader_now(loader: value)
+  local raw_close = checked_function(
+    self.driver, DRIVER_MODULE, "close_loader", self.type_of)
+  local close = raw_close as function (value): (value, value)
+  local ok, close_error = close(loader)
+  if not ok then
+    fail<|value|>(DRIVER_MODULE,
+      "cannot close compiler resolver: " .. strings.tostring(close_error))
+  end
+end
+
+local function Compiler:close_context_now(context: value)
+  local raw_close = checked_function(
+    self.driver, DRIVER_MODULE, "close_resolver_context", self.type_of)
+  local close = raw_close as function (value): (value, value)
+  local ok, close_error = close(context)
+  if not ok then
+    fail<|value|>(DRIVER_MODULE,
+      "cannot close compiler resolver context: " ..
+      strings.tostring(close_error))
+  end
+end
+
+local function Compiler:close_loader(loader: value)
+  self:close_loader_now(loader)
+catch
+  if error is async.CancellationReason then
+    -- Cleanup I/O cannot be submitted by a Task with sticky cancellation.
+    -- Retain the Lua object in a fresh Task and wait for the current owner to
+    -- release the shared compiler permit before retrying the close.
+    async.run(function (): nil
+      local permit = compiler_scheduler.acquire()
+      defer permit:release()
+      self:close_loader_now(loader)
+      return nil
+    end)
+  end
+  raise
+end
+
+local function Compiler:close_context(context: value)
+  self:close_context_now(context)
+catch
+  if error is async.CancellationReason then
+    async.run(function (): nil
+      local permit = compiler_scheduler.acquire()
+      defer permit:release()
+      self:close_context_now(context)
+      return nil
+    end)
+  end
+  raise
+end
+
+-- Installation discovery belongs to the compiler, which deliberately
+-- defers physical path resolution until a resolver owns an I/O strategy.
+-- Initialize and close that resolver under the shared Lua-state permit before
+-- exposing the compiler's release-versioned library directory to project
+-- configuration.
+function Compiler:installed_binary_modules_root(): string
+  local permit = compiler_scheduler.acquire()
+  defer permit:release()
+  if self.browser ~= nil then return self.browser.directory end
+  if self.selected_prefix ~= nil and self.snapshot_directory ~= nil then
+    return self.snapshot_directory
+  end
+
+  local context = self:new_context(nil)
+  defer self:close_context(context)
+
+  local install_paths = required_map(
+    self.driver["INSTALL_PATHS"], DRIVER_MODULE,
+    "driver.INSTALL_PATHS")
+  return required_string(
+    install_paths["titan_bin"], DRIVER_MODULE,
+    "driver.INSTALL_PATHS.titan_bin")
+catch
+  if error is async.CancellationReason then raise end
+  if error is BridgeError then raise end
+  raise BridgeError(DRIVER_MODULE,
+    "compiler installation discovery failed: " .. strings.tostring(error))
+end
+
+function host_target(): string
+  local driver, type_of = current_driver_module()
+  local new_context_fn = checked_function(
+    driver, DRIVER_MODULE, "new_resolver_context", type_of)
+  local context_target_fn = checked_function(
+    driver, DRIVER_MODULE, "context_target", type_of)
+  if cached_host_target ~= nil and
+     cached_target_driver == (driver as value) and
+     cached_new_context == new_context_fn and
+     cached_context_target == context_target_fn then
+    return cached_host_target
+  end
+  local create_context = new_context_fn as function (value): value
+  local close_fn = checked_function(
+    driver, DRIVER_MODULE, "close_resolver_context", type_of) as
+    function (value): (value, value)
+  local context = create_context({} as {string: value})
+  defer close_fn(context)
+  local query = context_target_fn as function (value): (value, value)
+  local raw_target, raw_error = query(context)
+  if not (raw_target is string) or raw_target == "" then
+    return fail<|string|>(DRIVER_MODULE,
+      "cannot determine host target: " .. strings.tostring(raw_error))
+  end
+  local target: string = raw_target
+  cached_target_driver = driver
+  cached_new_context = new_context_fn
+  cached_context_target = context_target_fn
+  cached_host_target = target
+  return target
+end
+
+function source_labels(): {string}
+  local driver, type_of = current_driver_module()
+  return required_string_list(
+    driver["SOURCE_LABELS"], DRIVER_MODULE, "driver.SOURCE_LABELS")
+end
+
+function target_selection_labels(target: string): {string}
+  local driver, type_of = current_driver_module()
+  local select_labels = checked_function(
+    driver, DRIVER_MODULE, "target_selection_labels", type_of) as
+    function (string): value
+  return required_string_list(
+    select_labels(target), DRIVER_MODULE, "driver.target_selection_labels")
+end
+
+function target_label_applies(target: string, label: string): boolean
+  local driver, type_of = current_driver_module()
+  local applies = checked_function(
+    driver, DRIVER_MODULE, "target_label_applies", type_of) as
+    function (string, string): value
+  return required_boolean(
+    applies(target, label), DRIVER_MODULE, "driver.target_label_applies")
+end
+
+function classify_source_filename(basename: string): SourceClassification
+  local driver, type_of = current_driver_module()
+  local classify = checked_function(
+    driver, DRIVER_MODULE, "classify_source_filename", type_of) as
+    function (string): (value, value, value)
+  local raw_logical, raw_label, raw_error = classify(basename)
+  local logical? = optional_string(
+    raw_logical, DRIVER_MODULE, "classify_source_filename logical_basename")
+  local label? = optional_string(
+    raw_label, DRIVER_MODULE, "classify_source_filename label")
+  local message? = optional_string(
+    raw_error, DRIVER_MODULE, "classify_source_filename error")
+  return SourceClassification(logical, label, message)
+end

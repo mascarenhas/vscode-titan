@@ -1,0 +1,859 @@
+-- Header provenance, C-probe traces, external resolution, and binary provider fencing.
+
+-- These records are the complete language-server view of the compiler's
+-- C-probe lifecycle. Keep the dynamic Lua tables at this one boundary: source,
+-- argv, diagnostics, commands, and cache paths are intentionally absent.
+local record CProbeSemanticTrace
+  const module_name: string
+  const key: string
+  const probe_kind: string
+  const header_identity: string
+  const header_label: string
+  const outcome: string
+  const cache_tier: string
+  const repeated: boolean
+  const publication: string
+end
+
+local record CProbeExecutionTrace
+  const module_name: string
+  const key: string
+  const probe_kind: string
+  const batch_kind: string
+  const header_identity: string
+  const header_label: string
+  const outcome: string
+  const persistent_lookup: string
+  const publication: string
+  const started: boolean
+  const wall_ms: float?
+end
+
+local record NormalizedProvenance
+  const provenance: Provenance
+  const embedded_provider: boolean
+end
+
+local record NormalizedContextualResolution
+  const resolution: ContextualResolution
+  const embedded_provider: boolean
+end
+
+local record BinaryProviderSelection
+  const module_name: string
+  const kind: string
+  const provider_file: string
+  const embedded_provider: boolean
+end
+
+local function bounded_trace_string(candidate: value, subject: string,
+                                    allow_empty: boolean): string
+  local result = required_string(candidate, DRIVER_MODULE, subject)
+  if (not allow_empty and result == "") or
+     #result > C_PROBE_TRACE_STRING_BYTES then
+    local expectation = "a nonempty"
+    if allow_empty then expectation = "a" end
+    return fail<|string|>(DRIVER_MODULE,
+      subject .. " must be " .. expectation .. " string of at most " ..
+      C_PROBE_TRACE_STRING_BYTES .. " bytes")
+  end
+  return result
+end
+
+local function probe_trace_outcome(candidate: value,
+                                   subject: string): string
+  local result = bounded_trace_string(candidate, subject, false)
+  if result ~= "success" and result ~= "compiler_rejection" and
+     result ~= "infrastructure_failure" then
+    return fail<|string|>(DRIVER_MODULE,
+      subject .. " has unsupported value '" .. result .. "'")
+  end
+  return result
+end
+
+local function probe_trace_publication(candidate: value,
+                                       subject: string): string
+  local result = bounded_trace_string(candidate, subject, false)
+  if result ~= "not_applicable" and result ~= "published" and
+     result ~= "existing" and result ~= "failed" and
+     result ~= "conflict" and result ~= "disabled" and
+     result ~= "unstable_diagnostic" and result ~= "too_large" and
+     result ~= "diagnostic_not_persisted" and
+     result ~= "mixed" then
+    return fail<|string|>(DRIVER_MODULE,
+      subject .. " has unsupported value '" .. result .. "'")
+  end
+  return result
+end
+
+local function probe_trace_wall_ms(candidate: value,
+                                   subject: string): float?
+  if candidate == nil then return nil end
+  local result = candidate as float
+  if result < 0.0 or result ~= result or result >= math.huge then
+    return fail<|float?|>(DRIVER_MODULE,
+      subject .. " must be a finite nonnegative number")
+  end
+  return result
+catch
+  if error is BridgeError then raise end
+  return fail<|float?|>(DRIVER_MODULE,
+    subject .. " must be a finite nonnegative number")
+end
+
+local function normalize_c_probe_semantic_trace(
+    candidate: value): CProbeSemanticTrace
+  local subject = "compiler C-probe semantic trace"
+  local raw = required_map(candidate, DRIVER_MODULE, subject)
+  local event = bounded_trace_string(
+    raw["event"], subject .. ".event", false)
+  if event ~= "semantic_result" then
+    return fail<|CProbeSemanticTrace|>(DRIVER_MODULE,
+      subject .. ".event must be 'semantic_result'")
+  end
+  local key = bounded_trace_string(raw["key"], subject .. ".key", false)
+  if #key ~= 64 then
+    return fail<|CProbeSemanticTrace|>(DRIVER_MODULE,
+      subject .. ".key must be a 64-byte digest")
+  end
+  local tier = bounded_trace_string(
+    raw["cache_tier"], subject .. ".cache_tier", false)
+  if tier ~= "service" and tier ~= "analysis" and
+     tier ~= "persistent" and tier ~= "compiler" then
+    return fail<|CProbeSemanticTrace|>(DRIVER_MODULE,
+      subject .. ".cache_tier has unsupported value '" .. tier .. "'")
+  end
+  return CProbeSemanticTrace {
+    module_name = bounded_trace_string(raw["module"], subject .. ".module", true),
+    key = key,
+    probe_kind = bounded_trace_string(
+      raw["probe_kind"], subject .. ".probe_kind", false),
+    header_identity = bounded_trace_string(
+      raw["header_identity"], subject .. ".header_identity", true),
+    header_label = bounded_trace_string(
+      raw["header_label"], subject .. ".header_label", true),
+    outcome = probe_trace_outcome(raw["outcome"], subject .. ".outcome"),
+    cache_tier = tier,
+    repeated = required_boolean(
+      raw["repeated"], DRIVER_MODULE, subject .. ".repeated"),
+    publication = probe_trace_publication(
+      raw["publication"], subject .. ".publication"),
+  }
+end
+
+local function normalize_c_probe_execution_trace(
+    candidate: value): CProbeExecutionTrace
+  local subject = "compiler C-probe execution trace"
+  local raw = required_map(candidate, DRIVER_MODULE, subject)
+  local event = bounded_trace_string(
+    raw["event"], subject .. ".event", false)
+  if event ~= "compiler_execution" then
+    return fail<|CProbeExecutionTrace|>(DRIVER_MODULE,
+      subject .. ".event must be 'compiler_execution'")
+  end
+  local key = bounded_trace_string(raw["key"], subject .. ".key", false)
+  if #key ~= 64 then
+    return fail<|CProbeExecutionTrace|>(DRIVER_MODULE,
+      subject .. ".key must be a 64-byte digest")
+  end
+  local batch_kind = bounded_trace_string(
+    raw["batch_kind"], subject .. ".batch_kind", false)
+  if batch_kind ~= "single" and batch_kind ~= "batch" then
+    return fail<|CProbeExecutionTrace|>(DRIVER_MODULE,
+      subject .. ".batch_kind has unsupported value '" ..
+      batch_kind .. "'")
+  end
+  local lookup = bounded_trace_string(
+    raw["persistent_lookup"], subject .. ".persistent_lookup", false)
+  if lookup ~= "not_applicable" and lookup ~= "disabled" and
+     lookup ~= "memory" and lookup ~= "hit" and lookup ~= "miss" and
+     lookup ~= "invalid" and lookup ~= "io_error" and
+     lookup ~= "mixed" then
+    return fail<|CProbeExecutionTrace|>(DRIVER_MODULE,
+      subject .. ".persistent_lookup has unsupported value '" ..
+      lookup .. "'")
+  end
+  return CProbeExecutionTrace {
+    module_name = bounded_trace_string(raw["module"], subject .. ".module", true),
+    key = key,
+    probe_kind = bounded_trace_string(
+      raw["probe_kind"], subject .. ".probe_kind", false),
+    batch_kind = batch_kind,
+    header_identity = bounded_trace_string(
+      raw["header_identity"], subject .. ".header_identity", true),
+    header_label = bounded_trace_string(
+      raw["header_label"], subject .. ".header_label", true),
+    outcome = probe_trace_outcome(raw["outcome"], subject .. ".outcome"),
+    persistent_lookup = lookup,
+    publication = probe_trace_publication(
+      raw["publication"], subject .. ".publication"),
+    started = required_boolean(
+      raw["started"], DRIVER_MODULE, subject .. ".started"),
+    wall_ms = probe_trace_wall_ms(raw["wall_ms"], subject .. ".wall_ms"),
+  }
+end
+
+local function emit_c_probe_semantic_trace(root_module: string,
+                                           candidate: value)
+  local trace = normalize_c_probe_semantic_trace(candidate)
+  logging.emit("trace", "compiler.c_probe.semantic", {
+    ["root_module"] = root_module,
+    ["module_name"] = trace.module_name,
+    ["key"] = trace.key,
+    ["probe_kind"] = trace.probe_kind,
+    ["header_identity"] = trace.header_identity,
+    ["header_label"] = trace.header_label,
+    ["outcome"] = trace.outcome,
+    ["cache_tier"] = trace.cache_tier,
+    ["repeated"] = trace.repeated,
+    ["publication"] = trace.publication,
+  })
+end
+
+local function emit_c_probe_execution_trace(root_module: string,
+                                            candidate: value)
+  local trace = normalize_c_probe_execution_trace(candidate)
+  local fields: wire.Object = {
+    ["root_module"] = root_module,
+    ["module_name"] = trace.module_name,
+    ["key"] = trace.key,
+    ["probe_kind"] = trace.probe_kind,
+    ["batch_kind"] = trace.batch_kind,
+    ["header_identity"] = trace.header_identity,
+    ["header_label"] = trace.header_label,
+    ["outcome"] = trace.outcome,
+    ["persistent_lookup"] = trace.persistent_lookup,
+    ["publication"] = trace.publication,
+    ["started"] = trace.started,
+  }
+  if trace.wall_ms ~= nil then
+    fields["wall_ms"] = trace.wall_ms
+  end
+  logging.emit("trace", "compiler.c_probe.execution", fields)
+end
+
+-- Compiler observations preserve exact physical provenance spelling, including
+-- canonical extended Windows roots. Titan classifies native volumes; this
+-- boundary limits them to filesystem roots supported by the compiler adapter.
+local function metadata_drive(byte: integer): boolean
+  if byte >= 65 and byte <= 90 then return true end
+  return byte >= 97 and byte <= 122
+end
+
+local function metadata_unc_volume(volume: string, start: integer): boolean
+  local separator? = strings.find(volume, "/", start)
+  if separator == nil then return false end
+  local server = strings.sub(volume, start, separator - 1)
+  local share = strings.sub(volume, separator + 1)
+  return server ~= "" and server ~= "." and server ~= ".." and
+         share ~= "" and share ~= "." and share ~= ".." and
+         strings.find(share, "/") == nil
+end
+
+local function metadata_volume_root(component: string): boolean
+  if #component ~= 44 or strings.lower(strings.sub(component, 1, 7)) ~= "volume{" or
+     strings.sub(component, -1) ~= "}" then return false end
+  local guid = strings.sub(component, 8, -2)
+  for index = 1, 36 do
+    local byte: integer = strings.byte(guid, index)
+    if index == 9 or index == 14 or index == 19 or index == 24 then
+      if byte ~= 45 then return false end
+    else
+      local hex = false
+      if byte >= 48 and byte <= 57 then hex = true end
+      if byte >= 65 and byte <= 70 then hex = true end
+      if byte >= 97 and byte <= 102 then hex = true end
+      if not hex then return false end
+    end
+  end
+  return true
+end
+
+local function metadata_absolute_path(subject: string): boolean
+  if strings.find(subject, "\0") ~= nil or not paths.is_absolute(subject) then
+    return false
+  end
+  if ffi.VSCODE_TITAN_WINDOWS == 0 then return true end
+  local volume = paths.to_slash(paths.volume(subject))
+  if #volume == 2 then return metadata_drive(strings.byte(volume, 1)) end
+  if strings.sub(subject, 1, 4) == "\\\\?\\" then
+    -- Verbatim Windows provenance must retain native separators and only the
+    -- filesystem namespace forms supported by the compiler's I/O adapter.
+    if strings.find(subject, "/") ~= nil then return false end
+    local suffix = strings.sub(volume, 5)
+    if #suffix == 2 and strings.sub(suffix, 2) == ":" then
+      return metadata_drive(strings.byte(suffix, 1)) and
+             strings.sub(subject, #volume + 1, #volume + 1) == "\\"
+    end
+    if strings.upper(strings.sub(suffix, 1, 4)) == "UNC/" then
+      return metadata_unc_volume(suffix, 5)
+    end
+    return metadata_volume_root(suffix) and
+           strings.sub(subject, #volume + 1, #volume + 1) == "\\"
+  end
+  if strings.sub(volume, 1, 2) ~= "//" or
+     strings.sub(volume, 3, 3) == "?" or
+     strings.sub(volume, 3, 3) == "." then return false end
+  return metadata_unc_volume(volume, 3)
+end
+
+local function normalize_c_header_dependencies(
+    candidate: value, subject: string): {CHeaderDependency}
+  if candidate == nil then return {} end
+  if not (candidate is {integer: value}) then
+    return fail<|{CHeaderDependency}|>(
+      DRIVER_MODULE, subject .. " must be a Lua array")
+  end
+  local raw = candidate as {integer: value}
+  local result: {CHeaderDependency} = {}
+  local seen: {string: boolean} = {}
+  for index = 1, #raw do
+    local item = required_map(
+      raw[index], DRIVER_MODULE, subject .. "[" .. index .. "]")
+    local raw_kind = required_string(
+      item["kind"], DRIVER_MODULE,
+      subject .. "[" .. index .. "].kind")
+    local kind? = header_dependency_kind_from_name(raw_kind)
+    if kind == nil then
+      return fail<|{CHeaderDependency}|>(DRIVER_MODULE,
+        subject .. "[" .. index .. "] has unknown kind '" ..
+        raw_kind .. "'")
+    end
+    local path = required_string(
+      item["path"], DRIVER_MODULE,
+      subject .. "[" .. index .. "].path")
+    local identity = required_string(
+      item["identity"], DRIVER_MODULE,
+      subject .. "[" .. index .. "].identity")
+    if not metadata_absolute_path(path) then
+      return fail<|{CHeaderDependency}|>(DRIVER_MODULE,
+        subject .. "[" .. index .. "].path must be absolute")
+    elseif identity == "" then
+      return fail<|{CHeaderDependency}|>(DRIVER_MODULE,
+        subject .. "[" .. index .. "].identity must be nonempty")
+    end
+    local key = raw_kind .. "\0" .. path
+    if seen[key] then
+      return fail<|{CHeaderDependency}|>(DRIVER_MODULE,
+        subject .. " repeats " .. raw_kind .. " input '" .. path .. "'")
+    end
+    seen[key] = true
+    local observation: HeaderObservation? = nil
+    local raw_observation: value = item["observation"]
+    if raw_observation ~= nil then
+      local observed = required_map(raw_observation, DRIVER_MODULE,
+        subject .. "[" .. index .. "].observation")
+      local seconds = required_integer(observed["modified_seconds"], DRIVER_MODULE,
+        subject .. " observation.modified_seconds")
+      local nanoseconds = required_integer(observed["modified_nanoseconds"], DRIVER_MODULE,
+        subject .. " observation.modified_nanoseconds")
+      local physical = required_string(observed["physical_identity"], DRIVER_MODULE,
+        subject .. " observation.physical_identity")
+      if nanoseconds < 0 or nanoseconds >= 1000000000 or physical == "" then
+        return fail<|{CHeaderDependency}|>(DRIVER_MODULE,
+          subject .. " has an invalid header observation")
+      end
+      local precision? = optional_string(observed["precision"], DRIVER_MODULE,
+        subject .. " observation.precision")
+      local size?: integer
+      local changed_seconds?: integer
+      local changed_nanoseconds?: integer
+      local invalid = false
+      if precision ~= nil and precision ~= "ns" and precision ~= "coarse" then
+        invalid = true
+      end
+      if observed["size"] ~= nil then
+        local number = required_integer(observed["size"], DRIVER_MODULE,
+          subject .. " observation.size")
+        size = number
+        if number < 0 then invalid = true end
+      end
+      if observed["changed_seconds"] ~= nil then
+        changed_seconds = required_integer(observed["changed_seconds"], DRIVER_MODULE,
+          subject .. " observation.changed_seconds")
+      end
+      if observed["changed_nanoseconds"] ~= nil then
+        local number = required_integer(observed["changed_nanoseconds"], DRIVER_MODULE,
+          subject .. " observation.changed_nanoseconds")
+        changed_nanoseconds = number
+        if number < 0 or number >= 1000000000 then invalid = true end
+      end
+      if invalid or ((changed_seconds == nil) ~= (changed_nanoseconds == nil)) then
+        return fail<|{CHeaderDependency}|>(DRIVER_MODULE,
+          subject .. " has an invalid header observation")
+      end
+      observation = HeaderObservation {
+        modified_seconds = seconds,
+        modified_nanoseconds = nanoseconds,
+        physical_identity = physical,
+        precision = precision,
+        size = size,
+        changed_seconds = changed_seconds,
+        changed_nanoseconds = changed_nanoseconds,
+      }
+    end
+    result[index] = CHeaderDependency(kind, path, identity, observation)
+  end
+  return result
+end
+
+local function raw_c_header_dependencies(
+    dependencies: const? {CHeaderDependency}): {integer: value}
+  local result: {integer: value} = {}
+  for index = 1, #dependencies do
+    local dependency = dependencies[index]
+    local item: {string: value} = {
+      ["kind"] = dependency.kind:name(),
+      ["path"] = dependency.path,
+      ["identity"] = dependency.identity,
+    }
+    local observation? = dependency.observation
+    if observation ~= nil then
+      local observed: {string: value} = {
+        ["modified_seconds"] = observation.modified_seconds,
+        ["modified_nanoseconds"] = observation.modified_nanoseconds,
+        ["physical_identity"] = observation.physical_identity,
+        ["precision"] = observation.precision,
+        ["size"] = observation.size,
+        ["changed_seconds"] = observation.changed_seconds,
+        ["changed_nanoseconds"] = observation.changed_nanoseconds,
+      }
+      item["observation"] = observed
+    end
+    result[index] = item
+  end
+  return result
+end
+
+-- Recompute only the exact physical header bytes and ordered search candidates
+-- already reported by the compiler. The operation owns the global compiler
+-- permit but its Titan-backed I/O may suspend the current Task.
+function Compiler:restat_c_header_dependencies(
+    dependencies: {CHeaderDependency}, validation: HeaderValidation?):
+    ({CHeaderDependency}, boolean)
+  if #dependencies == 0 then return {}, false end
+  local permit = compiler_scheduler.acquire()
+  defer permit:release()
+  local previous_configuration = self:install_configuration()
+  defer previous_configuration:apply()
+  local context = self:new_context(nil)
+  defer self:close_context(context)
+  local raw_restat = checked_function(
+    self.driver, DRIVER_MODULE, "restat_c_header_dependencies", self.type_of)
+  local restat = raw_restat as function (value, value): (value, value, value)
+  if validation == nil then validation = header_validation() end
+  local options: {string: value} = {
+    ["context"] = context, ["header_validation"] = validation.memo,
+  }
+  local raw_result, raw_error, raw_changed = restat(
+    raw_c_header_dependencies(dependencies), options)
+  if raw_result == nil or raw_result == false then
+    return fail<|{CHeaderDependency}|>(DRIVER_MODULE,
+      "cannot restat C header dependencies: " ..
+      strings.tostring(raw_error)), false
+  end
+  local changed: boolean = raw_changed
+  return normalize_c_header_dependencies(
+    raw_result, "driver.restat_c_header_dependencies result"), changed
+catch
+  if error is async.CancellationReason then raise end
+  if error is BridgeError then raise end
+  raise BridgeError(DRIVER_MODULE,
+    "C header dependency restat failed: " .. strings.tostring(error))
+end
+
+-- Re-resolve known external import names under the currently configured paths
+-- without parsing source. The compiler driver returns only physical
+-- provenance; normalize it here so untyped Lua tables do not escape into the
+-- project service.
+function Compiler:resolve_external_modules(
+    project_modules: {string},
+    requests: {ExternalResolutionRequest}): {ExternalResolution}
+  local permit = compiler_scheduler.acquire()
+  defer permit:release()
+  local previous_configuration = self:install_configuration()
+  defer previous_configuration:apply()
+  local context = self:new_context(nil)
+  defer self:close_context(context)
+
+  local raw_projects: {string: value} = {}
+  for index = 1, #project_modules do
+    local name = project_modules[index]
+    if raw_projects[name] ~= nil then
+      return fail<|{ExternalResolution}|>(
+        DRIVER_MODULE, "duplicate project module '" .. name ..
+        "' in external resolution request")
+    end
+    raw_projects[name] = true
+  end
+  local raw_requests: {string: value} = {}
+  local requested: {string: boolean} = {}
+  for index = 1, #requests do
+    local request = requests[index]
+    if requested[request.module_name] then
+      return fail<|{ExternalResolution}|>(
+        DRIVER_MODULE, "duplicate external module '" ..
+        request.module_name .. "' in resolution request")
+    end
+    requested[request.module_name] = true
+    raw_requests[request.module_name] = request.source_required
+  end
+
+  local raw_resolver = checked_function(
+    self.driver, DRIVER_MODULE, "resolve_external_modules", self.type_of)
+  local resolver = raw_resolver as function (value, value, value): value
+  local options: {string: value} = { ["context"] = context }
+  local raw_results = required_map(
+    resolver(raw_requests, raw_projects, options), DRIVER_MODULE,
+    "driver.resolve_external_modules result")
+  for name in iteration.pairs(raw_results) do
+    if not requested[name] then
+      return fail<|{ExternalResolution}|>(DRIVER_MODULE,
+        "driver.resolve_external_modules returned unexpected module '" ..
+        name .. "'")
+    end
+  end
+
+  local result: {ExternalResolution} = {}
+  for index = 1, #requests do
+    local request = requests[index]
+    local subject = "external resolution for '" ..
+      request.module_name .. "'"
+    local raw = required_map(
+      raw_results[request.module_name], DRIVER_MODULE, subject)
+    local kind = required_string(raw["kind"], DRIVER_MODULE,
+                                 subject .. ".kind")
+    local provenance?: Provenance = nil
+    local message?: string = nil
+    if kind == "source" then
+      provenance = Provenance.external_source(
+        required_string(raw["main_file"], DRIVER_MODULE,
+                        subject .. ".main_file"),
+        required_string_list(raw["source_files"], DRIVER_MODULE,
+                             subject .. ".source_files"))
+    elseif kind == "dynamic" then
+      provenance = Provenance.dynamic_binary(
+        required_string(raw["provider_file"], DRIVER_MODULE,
+                        subject .. ".provider_file"))
+    elseif kind == "static" or kind == "embedded" then
+      provenance = Provenance.static_binary(
+        required_string(raw["provider_file"], DRIVER_MODULE,
+                        subject .. ".provider_file"))
+    elseif kind == "error" then
+      message = required_string(raw["message"], DRIVER_MODULE,
+                                subject .. ".message")
+    elseif kind ~= "missing" then
+      return fail<|{ExternalResolution}|>(DRIVER_MODULE,
+        subject .. " has unknown kind '" .. kind .. "'")
+    end
+    result[index] = ExternalResolution(
+      request.module_name, provenance, message)
+  end
+  return result
+catch
+  if error is async.CancellationReason then raise end
+  if error is BridgeError then raise end
+  raise BridgeError(DRIVER_MODULE,
+    "external module resolution failed: " .. strings.tostring(error))
+end
+
+local function provenance(entry: {string: value}, module_name: string,
+                          projects: {string: ProjectModule}): NormalizedProvenance
+  local kind = required_string(
+    entry["kind"], DRIVER_MODULE,
+    "compiler provenance for '" .. module_name .. "'.kind")
+  if kind == "source" then
+    local main_file = required_string(
+      entry["filename"], DRIVER_MODULE,
+      "compiler provenance for '" .. module_name .. "'.filename")
+    local source_files: {string} = {main_file}
+    if entry["source_files"] ~= nil then
+      source_files = required_string_list(
+        entry["source_files"], DRIVER_MODULE,
+        "compiler provenance for '" .. module_name .. "'.source_files")
+    end
+    if projects[module_name] ~= nil then
+      return NormalizedProvenance(
+        Provenance.project_source(main_file, source_files), false)
+    end
+    return NormalizedProvenance(
+      Provenance.external_source(main_file, source_files), false)
+  end
+  if kind == "dynamic" then
+    return NormalizedProvenance(
+      Provenance.dynamic_binary(required_string(
+        entry["filename"], DRIVER_MODULE,
+        "compiler provenance for '" .. module_name .. "'.filename")),
+      false)
+  end
+  if kind == "static" then
+    return NormalizedProvenance(
+      Provenance.static_binary(required_string(
+        entry["static_archive"], DRIVER_MODULE,
+        "compiler provenance for '" .. module_name .. "'.static_archive")),
+      false)
+  end
+  if kind == "embedded" then
+    return NormalizedProvenance(
+      Provenance.static_binary(required_string(
+        entry["filename"], DRIVER_MODULE,
+        "compiler provenance for '" .. module_name .. "'.filename")),
+      true)
+  end
+  return fail<|NormalizedProvenance|>(DRIVER_MODULE,
+    "unsupported compiler provenance kind '" .. kind .. "'")
+end
+
+local function normalize_contextual_resolutions(
+    context: value, work: NormalizationWork):
+    {NormalizedContextualResolution}
+  local raw_context = required_map(
+    context, DRIVER_MODULE, "compiler resolver context")
+  local raw_resolutions = required_map(
+    raw_context["contextual_resolutions"], DRIVER_MODULE,
+    "compiler resolver contextual_resolutions")
+  local result: {NormalizedContextualResolution} = {}
+  for key, candidate in iteration.pairs(raw_resolutions) do
+    work:account()
+    local raw = required_map(candidate, DRIVER_MODULE,
+      "compiler contextual resolution '" .. key .. "'")
+    local owner = required_string(
+      raw["owner"], DRIVER_MODULE,
+      "compiler contextual resolution '" .. key .. "'.owner")
+    local exposer = required_string(
+      raw["exposer"], DRIVER_MODULE,
+      "compiler contextual resolution '" .. key .. "'.exposer")
+    local kind = required_string(
+      raw["kind"], DRIVER_MODULE,
+      "compiler contextual resolution '" .. key .. "'.kind")
+    local provider_file = required_string(
+      raw["provider_file"], DRIVER_MODULE,
+      "compiler contextual resolution '" .. key .. "'.provider_file")
+    local origin?: Provenance = nil
+    if kind == "dynamic" then
+      origin = Provenance.dynamic_binary(provider_file)
+    elseif kind == "static" or kind == "embedded" then
+      origin = Provenance.static_binary(provider_file)
+    else
+      return fail<|{NormalizedContextualResolution}|>(DRIVER_MODULE,
+        "compiler contextual resolution '" .. key ..
+        "' has unsupported provenance kind '" .. kind .. "'")
+    end
+    local normalized_kind = kind
+    if normalized_kind == "embedded" then normalized_kind = "static" end
+    local normalized = NormalizedContextualResolution(
+      ContextualResolution {
+        owner_module = owner,
+        exposer_module = exposer,
+        provenance = origin,
+        ordinary_lookup = required_boolean(
+          raw["ordinary_lookup"], DRIVER_MODULE,
+          "compiler contextual resolution '" .. key ..
+          "'.ordinary_lookup"),
+      },
+      kind == "embedded")
+    local position = #result + 1
+    local identity = exposer .. "\0" .. owner .. "\0" ..
+                     normalized_kind .. "\0" .. provider_file
+    while position > 1 do
+      work:account()
+      local previous_normalized = result[position - 1]
+      local previous = previous_normalized.resolution
+      local previous_kind = "dynamic"
+      local previous_file = ""
+      case previous.provenance
+      when dynamic_binary{provider_file} then previous_file = provider_file
+      when static_binary{provider_file} then
+        previous_kind = "static"
+        previous_file = provider_file
+      else
+      end
+      local previous_identity = previous.exposer_module .. "\0" ..
+        previous.owner_module .. "\0" .. previous_kind .. "\0" ..
+        previous_file
+      if previous_identity <= identity then break end
+      result[position] = previous_normalized
+      position = position - 1
+    end
+    result[position] = normalized
+  end
+  return result
+end
+
+local function ContextualResolution:provider_file(): string
+  case self.provenance
+  when dynamic_binary{provider_file} then return provider_file
+  when static_binary{provider_file} then return provider_file
+  else
+    return fail<|string|>(DRIVER_MODULE,
+      "contextual owner has non-binary provider provenance")
+  end
+end
+
+-- The embedded provider never traverses the compiler's filesystem
+-- strategy. Its exact executable path is therefore stamped from the native
+-- live-image observation validated at the end of this analysis; every other
+-- binary provider retains the ordinary per-analysis lstat contract.
+local function Compiler:selected_provider_identity(
+    embedded_identity: compiler_io.LstatIdentity,
+    provider_file: string,
+    embedded_provider: boolean): compiler_io.LstatIdentity?
+  if embedded_provider or (self.browser ~= nil and
+     provider_file == self.embedded_provider_file) then
+    if provider_file ~= self.embedded_provider_file then
+      return fail<|compiler_io.LstatIdentity?|>(
+        DRIVER_MODULE,
+        "embedded compiler result names unexpected provider '" ..
+        provider_file .. "'")
+    end
+    return embedded_identity
+  end
+  return compiler_io.consistent_lstat_identity(self.io, provider_file)
+end
+
+local function Compiler:attach_contextual_provider_identities(
+    embedded_identity: compiler_io.LstatIdentity,
+    resolutions: const? {NormalizedContextualResolution}):
+    {ContextualResolution}
+  local result: {ContextualResolution} = {}
+  for index = 1, #resolutions do
+    local normalized = resolutions[index]
+    local source = normalized.resolution
+    local provider_file = source:provider_file()
+    result[index] = ContextualResolution {
+      owner_module = source.owner_module,
+      exposer_module = source.exposer_module,
+      provenance = source.provenance,
+      ordinary_lookup = source.ordinary_lookup,
+      provider_identity = self:selected_provider_identity(
+        embedded_identity, provider_file, normalized.embedded_provider),
+    }
+  end
+  return result
+end
+
+local function Compiler:attach_module_provider_identities(
+    embedded_identity: compiler_io.LstatIdentity,
+    modules: const? {ModuleSnapshot},
+    provider_conflicts: {string: boolean},
+    embedded_modules: {string: boolean})
+  for index = 1, #modules do
+    local snapshot = modules[index]
+    local provider_file?: string = nil
+    case snapshot.provenance
+    when dynamic_binary{selected = provider_file} then provider_file = selected
+    when static_binary{selected = provider_file} then provider_file = selected
+    else
+    end
+    if provider_file ~= nil and
+       not provider_conflicts[snapshot.module_name] then
+      snapshot.provider_identity = self:selected_provider_identity(
+        embedded_identity, provider_file,
+        embedded_modules[snapshot.module_name] == true)
+    end
+  end
+end
+
+local function ModuleSnapshot:binary_provider_selection(
+    embedded_provider: boolean): BinaryProviderSelection?
+  case self.provenance
+  when dynamic_binary{provider_file} then
+    return BinaryProviderSelection(
+      self.module_name, "dynamic", provider_file, embedded_provider)
+  when static_binary{provider_file} then
+    return BinaryProviderSelection(
+      self.module_name, "static", provider_file, embedded_provider)
+  else return nil
+  end
+end
+
+local function BinaryProviderSelection:selection_key(): string
+  local kind = self.kind
+  if self.embedded_provider then kind = "embedded" end
+  return kind .. "\0" .. self.provider_file
+end
+
+local function BinaryProviderSelection:observation_key(): string
+  return self.module_name .. "\0" .. self:selection_key()
+end
+
+local function observe_binary_provider_selection(
+    snapshot: ModuleSnapshot, embedded_provider: boolean,
+    selections: {string: string},
+    observation_keys: {string: boolean},
+    observations: {BinaryProviderSelection}, conflicts: {string: boolean})
+  local selection? = snapshot:binary_provider_selection(embedded_provider)
+  if selection == nil then return end
+  local observed = selection
+  local key = observed:selection_key()
+  local previous? = selections[observed.module_name]
+  if previous == nil then
+    selections[observed.module_name] = key
+  elseif previous ~= key then
+    conflicts[observed.module_name] = true
+  end
+  local observation_key = observed:observation_key()
+  if not observation_keys[observation_key] then
+    observation_keys[observation_key] = true
+    local position = #observations + 1
+    while position > 1 and
+          observations[position - 1]:observation_key() > observation_key do
+      observations[position] = observations[position - 1]
+      position = position - 1
+    end
+    observations[position] = observed
+  end
+end
+
+local function Compiler:attach_binary_provider_observations(
+    embedded_identity: compiler_io.LstatIdentity,
+    selections: const? {BinaryProviderSelection}): {BinaryProviderObservation}
+  local result: {BinaryProviderObservation} = {}
+  for index = 1, #selections do
+    local selection = selections[index]
+    result[index] = BinaryProviderObservation(
+      selection.module_name, selection.kind, selection.provider_file,
+      self:selected_provider_identity(
+        embedded_identity, selection.provider_file,
+        selection.embedded_provider))
+  end
+  return result
+end
+
+local function Compiler:observe_embedded_provider(): compiler_io.LstatIdentity
+  local raw_identity: {string: value} = {}
+  do
+    raw_identity = embedded_interfaces.identity()
+  catch
+    raise BridgeError(
+      DRIVER_MODULE,
+      "cannot observe embedded compiler provider '" ..
+      self.embedded_provider_file .. "': " .. strings.tostring(error))
+  end
+  return embedded_provider_identity(
+    raw_identity, self.embedded_provider_file)
+end
+
+local function Compiler:validate_embedded_provider_baseline():
+    compiler_io.LstatIdentity
+  if not self.mapped_provider then
+    local observed = selected_file_identity(self.embedded_provider_file)
+    if not compiler_io.same_lstat_identity(
+        self.embedded_provider_identity, observed) then
+      raise BridgeError(
+        DRIVER_MODULE,
+        "selected compiler provider '" .. self.embedded_provider_file ..
+        "' changed after compiler initialization; restart the language server")
+    end
+    return observed
+  end
+  local observed = self:observe_embedded_provider()
+  if not compiler_io.same_lstat_identity(
+      self.embedded_provider_identity, observed) then
+    raise BridgeError(
+      DRIVER_MODULE,
+      "embedded compiler provider '" .. self.embedded_provider_file ..
+      "' changed after compiler initialization; restart the language server")
+  end
+  return observed
+end
