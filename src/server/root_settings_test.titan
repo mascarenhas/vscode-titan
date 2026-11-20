@@ -167,8 +167,9 @@ function test_root_settings_local_override_only_selects_compiler_root(
 end
 
 local function run_untrusted_selection(base: string)
-  local prefix = make_prefix(base, "sdk")
-  fs.write_file(base .. "/titan-config.lua", "compiler_root = \"sdk\"\n")
+  make_prefix(base, "sdk")
+  fs.write_file(base .. "/titan-config.lua",
+    "-- compiler_root is selected below\nlocal name = \"compiler_root\"\ncompiler_root = \"sdk\"\n")
   fs.write_file(base .. "/marker.txt", "unused\n")
   local settings?, failure? = root_settings.load(
     roots.canonical(base), root_settings.create({}))
@@ -177,6 +178,7 @@ local function run_untrusted_selection(base: string)
   local actual = failure as root_settings.Error
   test.assert(actual.path == base .. "/titan-config.lua",
     "the trust failure did not name the file that set compiler_root")
+  test.assert(actual.line == 3, "the trust refusal did not point to the SDK write")
   test.assert(strings.find(actual.message, "trustedRoots") ~= nil,
     "the trust failure did not name initializationOptions.trustedRoots")
   test.assert(failure is root_settings.Error,
@@ -191,11 +193,52 @@ local function run_untrusted_selection(base: string)
     test.assert(refused,
       "the trust failure did not classify itself as an untrusted selection")
   end
+  local override = base .. "/titan-config.local.lua"
+  fs.write_file(override,
+    "-- compiler_root override\ncompiler_root = \"unused\"\ncompiler_root = \"sdk\"\n")
+  settings, failure = root_settings.load(roots.canonical(base), root_settings.create({}))
+  test.assert(settings == nil and failure.path == override and failure.line == 3,
+    "trust did not follow the effective local compiler_root write")
 end
 
 function test_root_settings_refuse_untrusted_compiler_root(
     _context: test.Context)
   with_root(run_untrusted_selection)
+end
+
+local function run_target_location(base: string)
+  local filename = base .. "/titan-config.lua"
+  local override = base .. "/titan-config.local.lua"
+  fs.write_file(override, 'compiler_root = "local-sdk"\n')
+  fs.write_file(filename, [[
+-- target = "ignored"
+compiler_root = "tracked-sdk"
+target = "native"
+local before = target
+if before == "native" then
+  _ENV.target = "wasm"
+end
+local after = target
+if false then target = "browser" end
+]])
+  local settings?, failure? = root_settings.load(base, trusted_root(base))
+  test.assert(settings == nil and failure.path == filename and failure.line == 6,
+    "invalid target did not come from its last executed assignment in the tracked file")
+  case failure.reason
+  when invalid_target() then
+    test.assert(failure.message == 'target must be "native" or "browser"')
+  else
+    raise "malformed target did not classify as an invalid target"
+  end
+  fs.unlink(override)
+  fs.write_file(filename, 'target = "wasm"\ntarget = nil\ninclude = { target or "./src" }\n')
+  settings, failure = root_settings.load(base, trusted_root(base))
+  test.assert(settings ~= nil and settings.target == nil and failure == nil,
+    "clearing the tracked target did not restore native selection")
+end
+
+function test_root_settings_locate_the_effective_tracked_target(_: test.Context)
+  with_root(run_target_location)
 end
 
 -- A configuration error has three distinct outcomes, and only one of them may
@@ -357,7 +400,8 @@ local function run_browser_selection(base: string)
     test.assert(settings == nil and failure ~= nil)
     case failure.reason
     when invalid_target() then
-      test.assert(failure.path == config_file)
+      test.assert(failure.path == config_file and failure.line == 2,
+        "the browser SDK diagnostic did not point to the target selector")
       test.assert(strings.find(failure.message, directory .. names[index], 1, true) ~= nil)
     else
       raise "browser layout error was not attributed to the tracked target"

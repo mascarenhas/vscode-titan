@@ -3903,6 +3903,93 @@ async function testCompletionConfigurationBoundary() {
   }
 }
 
+async function testConfigurationDiagnosticLocations() {
+  const base = await makeBase("configuration-location");
+  const sdk = luaString(sdkRoot());
+  const targetWithSdk = path.join(base, "target-with-sdk");
+  const targetWithoutSdk = path.join(base, "target-default-sdk");
+  const untrusted = path.join(base, "local-sdk");
+  const targetConfig = (sdkSetting, target) => [
+    '-- An earlier mention of target = "browser" is not a selection.',
+    sdkSetting,
+    'target = "native"',
+    'include = { "./src" }',
+    'source_module_roots = { "./src" }',
+    "local previous = target",
+    `target = "${target}"`,
+    "local current = target",
+    ""
+  ].join("\n");
+  const sdkSetting = `compiler_root = ${sdk}`;
+  const defaultSetting = "-- Use the default SDK.";
+  const first = await writeRoot(targetWithSdk, ROOT_A_SOURCE, targetConfig(sdkSetting, "wasm"));
+  const second = await writeRoot(targetWithoutSdk, ROOT_A_SOURCE, targetConfig(defaultSetting, "wasm"));
+  const third = await writeRoot(untrusted, ROOT_A_SOURCE);
+  const tracked = (root) => path.join(root, "titan-config.lua");
+  const localConfig = path.join(untrusted, "titan-config.local.lua");
+  await writeFile(localConfig, [
+    "-- compiler_root below overrides the default.",
+    'local key = "compiler_root"',
+    '_ENV[key] = "unused-sdk"',
+    `_ENV[key] = ${sdk}`,
+    "local selected = compiler_root",
+    ""
+  ].join("\n"));
+
+  const session = new Session(launch(base, "error"));
+  const publications = session.responses.diagnosticPublications;
+  async function refusal(file, message, line, start = 0) {
+    const report = await waitNotification(session, publications, start, (publication) =>
+      publication.uri === uri(file) &&
+      publication.diagnostics.some((diagnostic) =>
+        diagnostic.code === "configuration" && message.test(diagnostic.message)), `${file} configuration refusal`);
+    assert.equal(report.diagnostics.length, 1);
+    const point = { line, character: 0 };
+    assert.deepEqual(report.diagnostics[0].range, { start: point, end: point });
+  }
+  const cleared = (file, start) => waitNotification(session, publications, start, (publication) =>
+    publication.uri === uri(file) && publication.diagnostics.length === 0, `${file} diagnostic clearing`);
+  const targetError = /^target must be "native" or "browser"$/;
+  try {
+    const roots = [targetWithSdk, targetWithoutSdk, untrusted];
+    await session.initialize({
+      workspaceFolders: roots.map((root) => ({ uri: uri(root), name: path.basename(root) })),
+      initializationOptions: { trustedRoots: [targetWithSdk, targetWithoutSdk] }
+    });
+    session.notify("initialized", {});
+    await refusal(tracked(targetWithSdk), targetError, 6);
+    await refusal(tracked(targetWithoutSdk), targetError, 6);
+    await refusal(localConfig, /trustedRoots/, 3);
+    const refused = await session.status();
+    for (const root of roots) {
+      const entry = rootEntry(refused, root);
+      assert.equal(entry.state, "failed");
+      assert.equal(entry.workerPid, null);
+    }
+
+    const switched = publications.length;
+    await writeFile(tracked(untrusted), targetConfig(defaultSetting, "wasm"));
+    session.notify("workspace/didChangeConfiguration", {});
+    await cleared(localConfig, switched);
+    await refusal(tracked(untrusted), targetError, 6, switched);
+
+    const corrected = publications.length;
+    await writeFile(tracked(targetWithSdk), targetConfig(sdkSetting, "native"));
+    await writeFile(tracked(targetWithoutSdk), targetConfig(defaultSetting, "native"));
+    await writeFile(tracked(untrusted), ROOT_CONFIG);
+    await rm(localConfig);
+    session.notify("workspace/didChangeConfiguration", {});
+    for (const [root, source] of [[targetWithSdk, first], [targetWithoutSdk, second], [untrusted, third]]) {
+      await cleared(tracked(root), corrected);
+      await pollHover(session, source, ROOT_A_SOURCE, "doubled", /integer/,
+        `worker after correcting ${path.basename(root)}`);
+    }
+    await session.shutdown();
+  } finally {
+    await session.abort();
+  }
+}
+
 // These cases prove symlink semantics: a farmed SDK is a tree of links into the
 // session SDK, and one workspace folder is reached through a link.
 const SYMLINK_GROUPS = new Set(["sdk", "sdk-errors", "overlays", "shutdown-restart"]);
@@ -3918,6 +4005,7 @@ const groups = [
     if (process.platform === "win32") await testSelectedProviderAliasCatalog();
   }, "second SDK"],
   ["sdk-errors", testRootScopedSdkErrors, "root-scoped SDK errors"],
+  ["target-diagnostics", testConfigurationDiagnosticLocations, "configuration diagnostic selector locations"],
   ["completion-config", testCompletionConfigurationBoundary, "private completion across a saved configuration change"],
   ["browser-target", testBrowserTarget, "browser target and native target isolation"],
   ["browser-catalog", testFreshProviderCompletion, "fresh browser and native completion catalogs"],
