@@ -13,6 +13,7 @@ local content_identity = import "server.content_identity"
 local test_paths = import "server.test_paths"
 local completion_types = import "server.completion_types"
 local system = import "os"
+local compiler_io = import "server.compiler_io"
 
 
 local function fixture_headers_root(): string
@@ -1309,6 +1310,59 @@ function test_compiler_bridge_completion_catalog_owns_complete_pending_providers
       test.assert(#compiler:completion_binary_catalog() == 0,
         "configuration change retained an old provider selection")
     end, provider)
+  end)
+end
+
+function test_completion_catalog_merge_preserves_only_proven_replacement(context: test.Context)
+  local provider = "/providers/stock.so"
+  local identity = function (inode: integer): compiler_io.LstatIdentity
+    return compiler_io.LstatIdentity {
+      path = provider, kind = "file", device = 1, inode = inode, size = 100,
+      modified_seconds = 1, modified_nanoseconds = 0,
+    }
+  end
+  local capture = function (name: string, descriptor: string, ordinary: boolean,
+      observed: compiler_io.LstatIdentity?): bridge.CompletionBinary
+    return bridge.CompletionBinary {
+      module_name = name, serialized = descriptor, kind = "dynamic", filename = provider,
+      provider_identity = observed, replaces_group = ordinary,
+      documentation = descriptor,
+    }
+  end
+
+  context:run("shared_observations", function (_: test.Context)
+    local ordinary = capture("stock.rate", "ordinary", true, nil)
+    local contextual = capture("stock.rate", "contextual", false, nil)
+    local merged = bridge.merge_completion_catalog({ordinary}, {contextual}, true)
+    test.assert(#merged == 1 and merged[1].replaces_group,
+      "deduplicating the last ordinary member lost the pending group replacement")
+    test.assert(merged[1].serialized == "contextual" and merged[1].documentation == "contextual",
+      "deduplication did not keep the newest descriptor")
+  end)
+  context:run("contextual_then_ordinary", function (_: test.Context)
+    local rate = capture("stock.rate", "contextual rate", false, nil)
+    local quantity = capture("stock.quantity", "contextual quantity", false, nil)
+    local ordinary = capture("stock.rate", "ordinary", true, nil)
+    local merged = bridge.merge_completion_catalog({rate, quantity}, {ordinary}, true)
+    test.assert(#merged == 1 and merged[1] == ordinary,
+      "an ordinary recapture must replace the preceding provider cohort")
+  end)
+  context:run("separate_observations", function (_: test.Context)
+    local ordinary = capture("stock.rate", "ordinary", true, identity(2))
+    local same = capture("stock.rate", "same file", false, identity(2))
+    local different = capture("stock.rate", "different file", false, identity(3))
+    local unknown = capture("stock.rate", "unobserved", false, nil)
+    local matching = bridge.merge_completion_catalog({ordinary}, {same}, false)
+    test.assert(#matching == 1 and matching[1].replaces_group and
+                matching[1].provider_identity == same.provider_identity and
+                matching[1].serialized == same.serialized,
+      "a subsequent attempt for the same physical provider lost the pending replacement")
+    local changed = bridge.merge_completion_catalog({ordinary}, {different}, false)
+    test.assert(#changed == 1 and changed[1] == different and not changed[1].replaces_group,
+      "a new file at the same path inherited another provider's replacement")
+    local unproven = bridge.merge_completion_catalog({ordinary}, {unknown}, false)
+    test.assert(#unproven == 1 and unproven[1] == unknown and not unproven[1].replaces_group,
+      "an unobserved provider inherited replacement without identity proof")
   end)
 end
 

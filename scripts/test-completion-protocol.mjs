@@ -257,11 +257,15 @@ async function testContextualBinaryCompletion() {
     const firstSource = 'local via = import "via"\nfunction count(): integer return via.measure().count end\n';
     const secondSource = 'local other = import "other"\nfunction rate(): integer return other.read().percent end\n';
     const unrelatedSource = "function untouched(): integer return 1 end\n";
+    const rated = 'local rates = import "stock.rate"\n' +
+      "function rate(): integer return rates.Rate(25).percent end\n";
+    const measured = 'local units = import "stock.quantity"\n' + rated +
+      "function count(): integer return units.Quantity(7).count end\n";
     await writeFile(first, firstSource);
     await writeFile(second, secondSource);
     await writeFile(unrelated, unrelatedSource);
 
-    async function session(warm = false) {
+    async function session(phase = "cold") {
       const server = launch(project, "debug");
       const frames = new FrameReader(server.stdout);
       const diagnostics = collect(server.stderr);
@@ -335,47 +339,10 @@ async function testContextualBinaryCompletion() {
         send("initialized", {});
         assert.deepEqual((await pull(first)).items, []);
         assert.deepEqual((await pull(second)).items, []);
-        assertCatalog(["stock.quantity", "stock.rate"]);
-        await member(first, firstSource, "count");
-        await member(second, secondSource, "percent");
-        await imports("stock.quantity", "stock.sleeping");
-        if (!warm) {
-          await writeFile(unrelated, unrelatedSource.replace("return 1", "return 2"));
-          assert.deepEqual((await pull(unrelated)).items, []);
-          assertCatalog(["stock.quantity", "stock.rate"]);
-
-          // A failed saved check must not keep the previous owner alive
-          // through its old exposer edge. The other owner shares the file.
-          await writeFile(first, firstSource.replace("().count", "().missing"));
-          assert.match(JSON.stringify((await pull(first)).items), /missing/);
-          assertCatalog(["stock.rate"]);
-          await imports("stock.rate", "stock.quantity", "stock.sleeping");
-          await member(second, secondSource, "percent");
-
-          await writeFile(first, "function count(): integer return 1 end\n");
-          assert.deepEqual((await pull(first)).items, []);
-          assertCatalog(["stock.rate"]);
-          await writeFile(first, firstSource);
-          assert.deepEqual((await pull(first)).items, []);
-          assertCatalog(["stock.quantity", "stock.rate"]);
-          await member(first, firstSource, "count");
-        } else if (extension !== ".a") {
-          // A DSO capture contains observed members, not all its exports.
-          // Its remaining ordinary import recaptures the group after a drop.
-          const rated = 'local rates = import "stock.rate"\n' +
-            "function rate(): integer return rates.Rate(25).percent end\n";
-          const measured = 'local units = import "stock.quantity"\n' + rated +
-            "function count(): integer return units.Quantity(7).count end\n";
-          await writeFile(second, "function rate(): integer return 25 end\n");
-          await writeFile(first, measured);
-          assert.deepEqual((await pull(first)).items, []);
-          assert.deepEqual((await pull(second)).items, []);
-          assertCatalog(["stock.quantity", "stock.rate"], ["stock.quantity", "stock.rate"]);
-          await member(first, measured, "count");
-
-          await writeFile(first, rated);
-          assert.deepEqual((await pull(first)).items, []);
+        if (phase === "mixed") {
           assertCatalog(["stock.rate"], ["stock.rate"]);
+          await member(first, rated, "percent");
+          await member(second, secondSource, "percent");
           await imports("stock.rate", "stock.quantity", "stock.sleeping");
 
           // Windows can retain a mapped DLL; test removal there without
@@ -388,6 +355,39 @@ async function testContextualBinaryCompletion() {
             assertCatalog(["stock.rate"], ["stock.rate"]);
             await imports("stock.rate", "stock.quantity", "stock.sleeping");
           }
+        } else {
+          assertCatalog(["stock.quantity", "stock.rate"]);
+          await member(first, firstSource, "count");
+          await member(second, secondSource, "percent");
+          await imports("stock.quantity", "stock.sleeping");
+          if (phase === "cold") {
+            await writeFile(unrelated, unrelatedSource.replace("return 1", "return 2"));
+            assert.deepEqual((await pull(unrelated)).items, []);
+            assertCatalog(["stock.quantity", "stock.rate"]);
+
+            // A failed saved check must not keep the previous owner alive
+            // through its old exposer edge. The other owner shares the file.
+            await writeFile(first, firstSource.replace("().count", "().missing"));
+            assert.match(JSON.stringify((await pull(first)).items), /missing/);
+            assertCatalog(["stock.rate"]);
+            await imports("stock.rate", "stock.quantity", "stock.sleeping");
+            await member(second, secondSource, "percent");
+
+            await writeFile(first, "function count(): integer return 1 end\n");
+            assert.deepEqual((await pull(first)).items, []);
+            assertCatalog(["stock.rate"]);
+            await writeFile(first, firstSource);
+            assert.deepEqual((await pull(first)).items, []);
+            assertCatalog(["stock.quantity", "stock.rate"]);
+            await member(first, firstSource, "count");
+          } else if (extension !== ".a") {
+            await writeFile(second, "function rate(): integer return 25 end\n");
+            await writeFile(first, measured);
+            assert.deepEqual((await pull(first)).items, []);
+            assert.deepEqual((await pull(second)).items, []);
+            assertCatalog(["stock.quantity", "stock.rate"], ["stock.quantity", "stock.rate"]);
+            await member(first, measured, "count");
+          }
         }
         await ask("shutdown", null);
         send("exit");
@@ -395,7 +395,7 @@ async function testContextualBinaryCompletion() {
         assert.deepEqual(await withTimeout(exited, "contextual completion shutdown", 10_000),
           { code: 0, signal: null });
       } catch (cause) {
-        throw new Error(`${extension} contextual completion${warm ? " (warm)" : ""}: ${cause.message}\n` +
+        throw new Error(`${extension} contextual completion (${phase}): ${cause.message}\n` +
           diagnostics().toString("utf8"), { cause });
       } finally {
         if (server.exitCode === null && server.signalCode === null) {
@@ -405,7 +405,15 @@ async function testContextualBinaryCompletion() {
       }
     }
     await session();
-    await session(true);
+    await session("warm");
+    if (extension !== ".a") {
+      // Write both roots between workers so one saved refresh checks the
+      // ordinary root (app) before the independent contextual root (report).
+      // Both capture rate from the same DSO; neither now selects quantity.
+      await writeFile(first, rated);
+      await writeFile(second, secondSource);
+      await session("mixed");
+    }
     console.log(`contextual completion ${extension}: exact owners, dormancy, retirement, repair and warm reuse passed`);
   }
 }
