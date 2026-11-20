@@ -1,0 +1,908 @@
+-- Incremental and full project analysis attempts.
+
+local record AttemptResult
+  const diagnostics: {Diagnostic}
+  const modules: {ModuleSnapshot}
+  const contextual_resolutions: {NormalizedContextualResolution}
+  const embedded_modules: {string: boolean}
+  const checked: {string}
+  const entries: {string: value}
+  const failed: {string: boolean}
+  const completion_binaries: {CompletionBinary}
+  const browser_foreign: string?
+  const foreign_owners: {string: boolean}?
+end
+
+local function project_index(
+    modules: const? {ProjectModule}): {string: ProjectModule}
+  local result: {string: ProjectModule} = {}
+  for index = 1, #modules do
+    local module = modules[index]
+    if result[module.module_name] ~= nil then
+      return fail<|{string: ProjectModule}|>(
+        DRIVER_MODULE, "duplicate project module '" .. module.module_name .. "'")
+    end
+    if #module.files == 0 then
+      return fail<|{string: ProjectModule}|>(
+        DRIVER_MODULE, "project module '" .. module.module_name ..
+        "' has no saved source files")
+    end
+    result[module.module_name] = module
+  end
+  return result
+end
+
+local function canonical_source_output(driver: {string: value},
+    type_of: TypeOfFunction, filename: string): string
+  local classify = checked_function(
+    driver, DRIVER_MODULE, "classify_source_filename", type_of) as
+    function (string): (value, value, value)
+  local basename = paths.basename(filename)
+  local raw_logical, _, raw_error = classify(basename)
+  if raw_error ~= nil and raw_error ~= false then
+    return fail<|string|>(DRIVER_MODULE, strings.tostring(raw_error))
+  end
+  local logical? = optional_string(
+    raw_logical, DRIVER_MODULE, "classify_source_filename logical_basename")
+  if logical ~= nil and logical ~= basename and #filename >= #basename and
+     strings.sub(filename, #filename - #basename + 1) == basename then
+    return strings.sub(filename, 1, #filename - #basename) .. logical
+  end
+  return filename
+end
+
+local function ProjectModule:raw_source_descriptor(
+    supplied_driver: {string: value}?,
+    supplied_type_of: TypeOfFunction?): value
+  local files: {integer: value} = {}
+  local contents: {string: value} = {}
+  for index = 1, #self.files do
+    local source = self.files[index]
+    if contents[source.filename] ~= nil then
+      return fail<|value|>(DRIVER_MODULE,
+        "project module '" .. self.module_name ..
+        "' repeats source file '" .. source.filename .. "'")
+    end
+    files[index] = source.filename
+    contents[source.filename] = source.contents
+  end
+  local type_of = supplied_type_of or make_type_of()
+  local driver: {string: value} = {}
+  if supplied_driver ~= nil then
+    driver = supplied_driver
+  else
+    driver = require_compiler_module(
+      require_driver_module, type_of, DRIVER_MODULE)
+  end
+  local main = self.files[1].filename
+  local descriptor: {string: value} = {
+    ["kind"] = #self.files == 1 and "flat" or "folder",
+    ["main"] = main,
+    ["files"] = files,
+    ["contents"] = contents,
+    ["native_output"] = canonical_source_output(driver, type_of, main),
+    ["program_output"] = self.module_name,
+  }
+  return descriptor
+end
+
+local function project_loader_inputs(modules: const? {ProjectModule},
+    supplied_driver: {string: value}?,
+    supplied_type_of: TypeOfFunction?):
+    ({string: value}, {string: ProjectModule})
+  local projects = project_index(modules)
+  local overrides: {string: value} = {}
+  for index = 1, #modules do
+    local module = modules[index]
+    overrides[module.module_name] = module:raw_source_descriptor(
+      supplied_driver, supplied_type_of)
+  end
+  return overrides, projects
+end
+
+local function requested_modules(names: const? {string},
+                                 projects: {string: ProjectModule}):
+    ({string: boolean}, {string})
+  local requested: {string: boolean} = {}
+  local ordered: {string} = {}
+  for index = 1, #names do
+    local name = names[index]
+    if projects[name] == nil then
+      raise BridgeError(
+        DRIVER_MODULE, "analysis module '" .. name ..
+        "' is not in the project snapshot")
+    end
+    if not requested[name] then
+      requested[name] = true
+      ordered[#ordered + 1] = name
+    end
+  end
+  if #ordered == 0 then
+    raise BridgeError(
+      DRIVER_MODULE, "incremental analysis requires at least one module")
+  end
+  return requested, ordered
+end
+
+local function emit_analysis_progress(listener: ProgressListener,
+                                      completed_files: integer,
+                                      total_files: integer)
+  -- UI telemetry cannot affect compiler control flow. In particular, a
+  -- protocol/client listener is not another cancellation boundary.
+  listener(AnalysisProgress(completed_files, total_files))
+catch
+end
+
+local function cached_source_map(cached: const? {CachedSourceInterface},
+                                 projects: {string: ProjectModule}):
+    ({string: CachedSourceInterface}, {string: value})
+  local normalized: {string: CachedSourceInterface} = {}
+  local raw: {string: value} = {}
+  for index = 1, #cached do
+    local item = cached[index]
+    if projects[item.module_name] ~= nil then
+      raise BridgeError(
+        DRIVER_MODULE, "external cached interface '" .. item.module_name ..
+        "' collides with a project module")
+    end
+    if normalized[item.module_name] ~= nil then
+      raise BridgeError(
+        DRIVER_MODULE, "duplicate external cached interface '" ..
+        item.module_name .. "'")
+    end
+    if item.main_file == "" or item.serialized == "" or
+        item.source_serialized == "" then
+      raise BridgeError(
+        DRIVER_MODULE, "cached source interface '" .. item.module_name ..
+        "' has an empty filename or manifest")
+    end
+    normalized[item.module_name] = item
+    local source_files: {integer: value} = {}
+    for file_index = 1, #item.source_files do
+      source_files[file_index] = item.source_files[file_index]
+    end
+    local dependencies: {integer: value} = {}
+    local seen: {string: boolean} = {}
+    for import_index = 1, #item.imports do
+      local dependency = item.imports[import_index].module_name
+      if not seen[dependency] then
+        seen[dependency] = true
+        dependencies[#dependencies + 1] = dependency
+      end
+    end
+    local descriptor: {string: value} = {
+      ["serialized"] = item.serialized,
+      ["filename"] = item.main_file,
+      ["source_files"] = source_files,
+      ["dependencies"] = dependencies,
+      ["c_header_dependencies"] = raw_c_header_dependencies(item.c_header_dependencies),
+    }
+    raw[item.module_name] = descriptor
+  end
+  return normalized, raw
+end
+
+local function project_filename_owners(projects: {string: ProjectModule},
+                                       work: NormalizationWork):
+    {string: string}
+  local owners: {string: string} = {}
+  for name, project in iteration.pairs(projects) do
+    for index = 1, #project.files do
+      work:account()
+      owners[project.files[index].filename] = name
+    end
+  end
+  return owners
+end
+
+local function sorted_entry_names(entries: {string: value},
+                                  work: NormalizationWork): {string}
+  local result: {string} = {}
+  for name in iteration.pairs(entries) do
+    work:account()
+    result[#result + 1] = name
+  end
+  stable_sort(result, string_less, work)
+  return result
+end
+
+local function failed_projects(root_module: string,
+                               diagnostics: const? {Diagnostic},
+                               projects: {string: ProjectModule},
+                               imported: {string: value},
+                               loader_failed: boolean,
+                               work: NormalizationWork): {string: boolean}
+  local failed: {string: boolean} = {}
+  if #diagnostics == 0 and not loader_failed then return failed end
+  local owners = project_filename_owners(projects, work)
+  local importers: {string: {string}} = {}
+  -- A declaration manifest can serialize even when a function body failed.
+  -- Use source provenance and the compiler's direct dependency edges to carry
+  -- failure through source importers without rejecting healthy siblings.
+  for name, candidate in iteration.pairs(imported) do
+    work:account()
+    local entry = required_map(
+      candidate, DRIVER_MODULE, "driver.imported['" .. name .. "']")
+    if entry["kind"] == "source" then
+      local files = required_string_list(entry["source_files"], DRIVER_MODULE,
+        "compiler source files for '" .. name .. "'")
+      for index = 1, #files do
+        work:account()
+        if owners[files[index]] == nil then owners[files[index]] = name end
+      end
+      local dependencies: value = entry["deps"]
+      if dependencies is {string: value} then
+        for dependency, enabled in iteration.pairs(
+            dependencies as {string: value}) do
+          work:account()
+          if enabled then
+            local dependants? = importers[dependency]
+            if dependants == nil then
+              dependants = {}
+              importers[dependency] = dependants
+            end
+            dependants[#dependants + 1] = name
+          end
+        end
+      end
+    end
+  end
+  if loader_failed then failed[root_module] = true end
+  for index = 1, #diagnostics do
+    work:account()
+    local diagnostic = diagnostics[index]
+    local owner?: string = nil
+    if diagnostic.location ~= nil then
+      owner = owners[diagnostic.location.filename]
+    end
+    if owner == nil then owner = root_module end
+    failed[owner] = true
+  end
+  local pending: {string} = {}
+  for name in iteration.pairs(failed) do
+    pending[#pending + 1] = name
+  end
+  local current = 1
+  while current <= #pending do
+    local dependants? = importers[pending[current]]
+    if dependants ~= nil then
+      for index = 1, #dependants do
+        work:account()
+        local name = dependants[index]
+        if not failed[name] then
+          failed[name] = true
+          pending[#pending + 1] = name
+        end
+      end
+    end
+    current = current + 1
+  end
+  return failed
+end
+
+local function ProjectModule:failed_snapshot(): ModuleSnapshot
+  local files: {string} = {}
+  for index = 1, #self.files do
+    files[index] = self.files[index].filename
+  end
+  return ModuleSnapshot {
+    module_name = self.module_name,
+    provenance = Provenance.project_source(self.files[1].filename, files),
+    nodes = {},
+    symbols = {},
+    imports = {},
+    c_header_dependencies = {},
+  }
+end
+
+local function ModuleSnapshot:profile_filename(): string
+  case self.provenance
+  when project_source{main_file} then return main_file
+  when external_source{main_file} then return main_file
+  when dynamic_binary{provider_file} then return provider_file
+  when static_binary{provider_file} then return provider_file
+  end
+end
+
+local function browser_foreign_owners(raw_context: {string: value},
+    imported: {string: value}, failed: {string: boolean},
+    root_module: string): {string: boolean}
+  local raw_owners = required_map(raw_context["browser_foreign_modules"],
+    DRIVER_MODULE, "browser foreign source owners")
+  local owners: {string: boolean} = {}
+  local queue: {string} = {}
+  for name, present in iteration.pairs(raw_owners) do
+    if not required_boolean(present, DRIVER_MODULE, "browser foreign source owner") then
+      raise BridgeError(DRIVER_MODULE, "invalid browser foreign source owner")
+    end
+    owners[name] = true
+    queue[#queue + 1] = name
+  end
+  if #queue == 0 then return owners end
+  -- Failed external source may not publish an imported row. Its requesting
+  -- root still owns the resulting failure.
+  if failed[root_module] and not owners[root_module] then
+    owners[root_module] = true
+    queue[#queue + 1] = root_module
+  end
+  local importers: {string: {string}} = {}
+  for name, raw in iteration.pairs(imported) do
+    local entry = required_map(raw, DRIVER_MODULE, "imported module")
+    local deps = entry["deps"]
+    if entry["kind"] == "source" and deps is {string: value} then
+      for dependency, enabled in iteration.pairs(deps as {string: value}) do
+        if enabled then
+          local consumers? = importers[dependency]
+          if consumers == nil then
+            consumers = {}
+            importers[dependency] = consumers
+          end
+          consumers[#consumers + 1] = name
+        end
+      end
+    end
+  end
+  local index = 1
+  while index <= #queue do
+    local consumers? = importers[queue[index]]
+    if consumers ~= nil then
+      for consumer_index = 1, #consumers do
+        local name = consumers[consumer_index]
+        if not owners[name] then
+          owners[name] = true
+          queue[#queue + 1] = name
+        end
+      end
+    end
+    index = index + 1
+  end
+  return owners
+end
+
+local function Compiler:run_attempt_inner(
+    root_module: string, projects: {string: ProjectModule},
+    overrides: {string: value},
+    pending: {string: boolean}, cached: {string: CachedSourceInterface},
+    raw_cached_interfaces: {string: value},
+    c_header_analysis: value, header_inputs: value): AttemptResult
+  local normalization_work = NormalizationWork(0)
+  local options: {string: value} = {
+    ["io"] = self.io,
+    ["c_header_analysis"] = c_header_analysis,
+    ["analysis_only"] = true,
+  }
+  if header_inputs ~= nil then options["header_inputs"] = header_inputs end
+  local profiling = logging.enabled("trace")
+  if profiling then
+    local trace_header_phase:
+      function (string, string, string, string, float, string?): () =
+      function (header: string, resolved_header: string,
+                phase: string, outcome: string, cpu_ms: float,
+                trace_identity: string?)
+        local identity = trace_identity or ""
+        if identity == "" then
+          identity = resolved_header
+          if identity == "" then identity = header end
+        end
+        logging.emit("trace", "compiler.c_header.phase", {
+          ["root_module"] = root_module,
+          ["header"] = header,
+          ["resolved_header"] = resolved_header,
+          ["identity"] = identity,
+          ["phase"] = phase,
+          ["outcome"] = outcome,
+          ["cpu_ms"] = cpu_ms,
+        })
+      end
+    local trace_source_module:
+      function (string, string, string, float, float, float, float): () =
+      function (module_name: string, filename: string, outcome: string,
+                self_cpu_ms: float, total_cpu_ms: float,
+                parse_cpu_ms: float, check_cpu_ms: float)
+        logging.emit("trace", "compiler.source_module.profile", {
+          ["root_module"] = root_module,
+          ["module_name"] = module_name,
+          ["filename"] = filename,
+          ["outcome"] = outcome,
+          ["self_cpu_ms"] = self_cpu_ms,
+          ["total_cpu_ms"] = total_cpu_ms,
+          ["parse_cpu_ms"] = parse_cpu_ms,
+          ["check_cpu_ms"] = check_cpu_ms,
+        })
+      end
+    local trace_probe_cache:
+      function (string, string, boolean, string, string): () =
+      function (module_name: string, stage: string, hit: boolean,
+                key: string, path: string)
+        logging.emit("trace", "compiler.c_probe.cache", {
+          ["root_module"] = root_module,
+          ["module_name"] = module_name,
+          ["cache"] = "persistent success",
+          ["stage"] = stage,
+          ["hit"] = hit,
+          ["key"] = key,
+          ["path"] = path,
+        })
+      end
+    local trace_probe_semantic: function (value): () =
+      function (event: value)
+        emit_c_probe_semantic_trace(root_module, event)
+      end
+    local trace_probe_execution: function (value): () =
+      function (event: value)
+        emit_c_probe_execution_trace(root_module, event)
+      end
+    options["c_header_process_trace"] = trace_header_phase
+    options["source_process_trace"] = trace_source_module
+    options["c_probe_cache_trace"] = trace_probe_cache
+    options["c_probe_semantic_trace"] = trace_probe_semantic
+    options["c_probe_execution_trace"] = trace_probe_execution
+  end
+  local roots: {string: value} = {[root_module] = true}
+  local active_overrides: {string: value} = {}
+  local retained_entries: {string: value} = {}
+  local known_source_modules: {string: value} = {}
+  for name in iteration.pairs(projects) do
+    known_source_modules[name] = true
+    if pending[name] then
+      active_overrides[name] = overrides[name]
+    elseif self.project_entries[name] ~= nil then
+      retained_entries[name] = self.project_entries[name]
+    end
+  end
+  options["source_roots"] = roots
+  options["source_overrides"] = active_overrides
+  options["known_source_modules"] = known_source_modules
+  options["cached_source_entries"] = retained_entries
+  options["cached_interfaces"] = raw_cached_interfaces
+
+  local previous_imported: value = self.driver["imported"]
+  local previous_registry: value = self.types["registry"]
+  defer self.driver["imported"] = previous_imported
+  defer self.types["registry"] = previous_registry
+  local imported: {string: value} = {}
+  self.driver["imported"] = imported
+  self.types["registry"] = {} as {string: value}
+
+  local context = self:new_context(options)
+  defer self:close_context(context)
+  options["context"] = context
+
+  local raw_defaultloader = checked_function(
+    self.driver, DRIVER_MODULE, "defaultloader", self.type_of)
+  local defaultloader = raw_defaultloader as function (value, value): value
+  local static_dependencies: {string: value} = {}
+  local loader: value = defaultloader(static_dependencies, options)
+  if self.type_of(loader) ~= "function" then
+    return fail<|AttemptResult|>(DRIVER_MODULE,
+      "driver.defaultloader returned " .. describe(loader, self.type_of) ..
+      " instead of a function")
+  end
+  defer self:close_loader(loader)
+
+  local diagnostics: {Diagnostic} = {}
+  local invoke = loader as function (string): (value, value, value, value)
+  local raw_ok, interface_or_error, raw_errors = invoke(root_module)
+  local ok = required_boolean(
+    raw_ok, DRIVER_MODULE, "compiler loader result")
+  if not ok then
+    diagnostics[#diagnostics + 1] = parse_diagnostic(
+      required_string(
+        interface_or_error, DRIVER_MODULE, "compiler loader error"),
+      normalization_work, root_module)
+  else
+    append_diagnostics(
+      diagnostics,
+      normalize_diagnostics(raw_errors, normalization_work, root_module),
+      normalization_work)
+  end
+
+  local raw_context = required_map(
+    context, DRIVER_MODULE, "compiler resolver context")
+  local checked = required_string_list(
+    raw_context["checked_source_modules"], DRIVER_MODULE,
+    "compiler resolver checked_source_modules")
+
+  local raw_finalize = checked_function(
+    self.driver, DRIVER_MODULE, "finalize_resolver_context", self.type_of)
+  local finalize = raw_finalize as function (value): (value, value)
+  local finalized, raw_final_errors = finalize(context)
+  if finalized == nil or finalized == false then
+    append_diagnostics(
+      diagnostics,
+      normalize_diagnostics(
+        raw_final_errors, normalization_work, root_module),
+      normalization_work)
+  end
+  local contextual_resolutions: {NormalizedContextualResolution} = {}
+  if finalized ~= nil and finalized ~= false then
+    contextual_resolutions = normalize_contextual_resolutions(
+      context, normalization_work)
+  end
+
+  local failed = failed_projects(
+    root_module, diagnostics, projects, imported, not ok, normalization_work)
+  local browser_foreign? = self:context_browser_foreign(context, false)
+  local foreign_owners: {string: boolean}?
+  if browser_foreign ~= nil then
+    foreign_owners = browser_foreign_owners(raw_context, imported, failed, root_module)
+  end
+  local completion_binaries = self:read_completion_binary_catalog(context, nil)
+  local checked_set: {string: boolean} = {}
+  for index = 1, #checked do checked_set[checked[index]] = true end
+  -- A loader that fails before publishing a module cannot add the root to the
+  -- context's checked list. Its failed root still belongs in this attempt's
+  -- explicit result.
+  if not ok then checked_set[root_module] = true end
+
+  local modules: {ModuleSnapshot} = {}
+  local embedded_modules: {string: boolean} = {}
+  local entries: {string: value} = {}
+  local names = sorted_entry_names(imported, normalization_work)
+  for index = 1, #names do
+    local name = names[index]
+    local is_project = projects[name] ~= nil
+    if not is_project or checked_set[name] then
+      local valid = #diagnostics == 0
+      if is_project then valid = failed[name] ~= true end
+      local normalization_started = 0.0
+      if profiling then normalization_started = logging.clock() end
+      local normalized = self:snapshot_module(
+        name, imported[name], projects, cached, valid, normalization_work)
+      local snapshot = normalized.snapshot
+      modules[#modules + 1] = snapshot
+      if normalized.embedded_provider then embedded_modules[name] = true end
+      if profiling then
+        logging.emit("trace", "compiler.module.normalization", {
+          ["root_module"] = root_module,
+          ["module_name"] = name,
+          ["filename"] = snapshot:profile_filename(),
+          ["cpu_ms"] = logging.elapsed_ms(normalization_started),
+        })
+      end
+      if is_project and valid then
+        local compact = checked_function(self.driver, DRIVER_MODULE,
+          "compact_project_entry", self.type_of) as
+          function (value, value): (value, value)
+        local retained, failure = compact(imported[name], {
+          ["yield"] = async.yield,
+        } as {string: value})
+        if retained == nil or retained == false then
+          return fail<|AttemptResult|>(DRIVER_MODULE,
+            "cannot retain declared interface for '" .. name .. "': " ..
+            strings.tostring(failure))
+        end
+        entries[name] = retained
+      end
+    end
+  end
+  if checked_set[root_module] and imported[root_module] == nil then
+    modules[#modules + 1] = projects[root_module]:failed_snapshot()
+  end
+  return AttemptResult {
+    diagnostics = diagnostics,
+    modules = modules,
+    contextual_resolutions = contextual_resolutions,
+    embedded_modules = embedded_modules,
+    checked = checked,
+    entries = entries,
+    failed = failed,
+    completion_binaries = completion_binaries,
+    browser_foreign = browser_foreign,
+    foreign_owners = foreign_owners,
+  }
+end
+
+local function emit_attempt_terminal(
+    strategy: compiler_io.CompilerIO, attempt: integer, root_module: string,
+    outcome: string, result: AttemptResult?, debugging: boolean,
+    started_wall: integer, started_cpu: float)
+  local checkpoints = compiler_io.finish_attempt(strategy, attempt)
+  if debugging then
+    local checked = 0
+    local snapshots = 0
+    local diagnostics = 0
+    if result ~= nil then
+      checked = #result.checked
+      snapshots = #result.modules
+      diagnostics = #result.diagnostics
+    end
+    logging.emit("debug", "compiler.attempt.end", {
+      ["attempt"] = attempt,
+      ["root_module"] = root_module,
+      ["outcome"] = outcome,
+      ["checked_modules"] = checked,
+      ["completed_modules"] = checkpoints,
+      ["snapshots"] = snapshots,
+      ["diagnostics"] = diagnostics,
+      ["wall_ms"] = logging.elapsed_wall_ms(started_wall),
+      ["cpu_ms"] = logging.elapsed_ms(started_cpu),
+    })
+  catch
+  end
+end
+
+local function Compiler:run_attempt(
+    root_module: string, projects: {string: ProjectModule},
+    overrides: {string: value},
+    pending: {string: boolean}, cached: {string: CachedSourceInterface},
+    raw_cached_interfaces: {string: value},
+    c_header_analysis: value, header_inputs: value): AttemptResult
+  local attempt = compiler_io.begin_attempt(self.io, root_module)
+  local debugging = logging.enabled("debug")
+  local started_cpu = 0.0
+  local started_wall = 0
+  if debugging then
+    started_cpu = logging.clock()
+    started_wall = logging.wall_clock()
+    logging.emit("debug", "compiler.attempt.start", {
+      ["attempt"] = attempt,
+      ["root_module"] = root_module,
+    })
+  catch
+    debugging = false
+  end
+
+  local result?: AttemptResult = nil
+  do
+    result = self:run_attempt_inner(
+      root_module, projects, overrides, pending, cached,
+      raw_cached_interfaces, c_header_analysis, header_inputs)
+  catch
+    local outcome = "failed"
+    if error is async.CancellationReason then outcome = "cancelled" end
+    emit_attempt_terminal(
+      self.io, attempt, root_module, outcome, nil, debugging,
+      started_wall, started_cpu)
+    raise
+  end
+  emit_attempt_terminal(
+    self.io, attempt, root_module, "complete", result, debugging,
+    started_wall, started_cpu)
+  return result
+end
+
+function Compiler:analyze_incremental(
+    project_modules: {ProjectModule}, dirty_modules: {string},
+    cached_sources: {CachedSourceInterface},
+    progress_listener: ProgressListener?, header_inputs: {CHeaderDependency}?): Analysis
+  local started = logging.clock()
+  logging.emit("debug", "compiler.analysis.start", {
+    ["project_modules"] = #project_modules,
+    ["dirty_modules"] = #dirty_modules,
+    ["cached_sources"] = #cached_sources,
+  })
+  local overrides, projects = project_loader_inputs(
+    project_modules, self.driver, self.type_of)
+  local requested, ordered = requested_modules(dirty_modules, projects)
+  local cached, raw_cached_interfaces = cached_source_map(
+    cached_sources, projects)
+  local raw_header_inputs: value = nil
+  if header_inputs ~= nil then
+    local present = header_inputs
+    raw_header_inputs = raw_c_header_dependencies(present)
+  end
+
+  -- The compiler strategy reports every completed source module, including
+  -- transitive external modules and possible repeats across root attempts.
+  -- Reduce that stream to this request's unique dirty project modules and
+  -- advance by their saved constituent-file counts exactly once.
+  compiler_io.set_checkpoint_listener(self.io, nil)
+  defer compiler_io.set_checkpoint_listener(self.io, nil)
+  local mark_completed: function (string): () = function (_: string) end
+  if progress_listener ~= nil then
+    local notify: ProgressListener = progress_listener
+    local file_counts: {string: integer} = {}
+    local total_files = 0
+    for index = 1, #ordered do
+      local name = ordered[index]
+      local count = #projects[name].files
+      file_counts[name] = count
+      total_files = total_files + count
+    end
+    local completed: {string: boolean} = {}
+    local completed_files = 0
+    emit_analysis_progress(notify, 0, total_files)
+    mark_completed = function (module_name: string)
+      if completed[module_name] or not requested[module_name] then return end
+      completed[module_name] = true
+      completed_files = completed_files + file_counts[module_name]
+      emit_analysis_progress(notify, completed_files, total_files)
+    end
+    compiler_io.set_checkpoint_listener(
+      self.io, function (module_name: string?)
+        if module_name ~= nil then mark_completed(module_name) end
+      end)
+  end
+  local permit = compiler_scheduler.acquire()
+  defer permit:release()
+  local previous_configuration = self:install_configuration()
+  defer previous_configuration:apply()
+  compiler_io.begin_lstat_observations(self.io)
+  defer compiler_io.end_lstat_observations(self.io)
+  self:validate_embedded_provider_baseline()
+
+  local raw_new_c_header_analysis = checked_function(
+    self.driver, DRIVER_MODULE, "new_c_header_analysis", self.type_of)
+  local create_c_header_analysis =
+    raw_new_c_header_analysis as function (): value
+  local c_header_analysis = create_c_header_analysis()
+  if self.type_of(c_header_analysis) ~= "table" then
+    return fail<|Analysis|>(
+      DRIVER_MODULE, "driver.new_c_header_analysis returned " ..
+      describe(c_header_analysis, self.type_of) .. " instead of a table")
+  end
+
+  -- Purge deleted and invalidated project state before constructing any fresh
+  -- resolver. A dirty module can never be seeded from an older generation.
+  for name in iteration.pairs(self.project_entries) do
+    if projects[name] == nil or requested[name] then
+      self.project_entries[name] = nil
+    end
+  end
+
+  local pending: {string: boolean} = {}
+  for index = 1, #ordered do pending[ordered[index]] = true end
+  local diagnostics: {Diagnostic} = {}
+  local result_normalization_work = NormalizationWork(0)
+  local snapshots: {string: ModuleSnapshot} = {}
+  local binary_provider_selections: {string: string} = {}
+  local binary_provider_observation_keys: {string: boolean} = {}
+  local binary_provider_selection_list: {BinaryProviderSelection} = {}
+  local provider_conflicts: {string: boolean} = {}
+  local normalized_contextual_resolutions:
+    {NormalizedContextualResolution} = {}
+  local embedded_modules: {string: boolean} = {}
+
+  local completion_binaries: {CompletionBinary} = {}
+  local browser_foreign: BrowserForeignAnalysis?
+  if self.browser ~= nil then
+    browser_foreign = BrowserForeignAnalysis { checked = {}, owners = {}, conflicted = false }
+  end
+
+  for index = 1, #ordered do
+    local root = ordered[index]
+    if pending[root] then
+      local attempt_result?: AttemptResult = nil
+      do
+        attempt_result = self:run_attempt(
+          root, projects, overrides, pending, cached,
+          raw_cached_interfaces, c_header_analysis, raw_header_inputs)
+      catch
+        -- A non-cancellation compiler failure terminally processes this root
+        -- even when it fails before the driver's normal publish/yield point.
+        -- Cancellation makes no such completion claim.
+        if not (error is async.CancellationReason) then mark_completed(root) end
+        raise
+      end
+      local attempt: AttemptResult = attempt_result
+      for checked_index = 1, #attempt.checked do
+        mark_completed(attempt.checked[checked_index])
+      end
+      if attempt.failed[root] then mark_completed(root) end
+      if browser_foreign ~= nil then
+        for checked_index = 1, #attempt.checked do
+          browser_foreign.checked[attempt.checked[checked_index]] = true
+        end
+        if attempt.browser_foreign ~= nil then
+          if browser_foreign.identity ~= nil and
+              browser_foreign.identity ~= attempt.browser_foreign then
+            browser_foreign.conflicted = true
+          end
+          browser_foreign.identity = attempt.browser_foreign
+          local owners: {string: boolean} = attempt.foreign_owners
+          for name in iteration.pairs(owners) do browser_foreign.owners[name] = true end
+        end
+      end
+      completion_binaries = merge_completion_catalog(
+        completion_binaries, attempt.completion_binaries)
+      append_diagnostics(
+        diagnostics, attempt.diagnostics, result_normalization_work)
+      for module_index = 1, #attempt.modules do
+        local snapshot = attempt.modules[module_index]
+        local embedded_provider =
+          attempt.embedded_modules[snapshot.module_name] == true
+        observe_binary_provider_selection(
+          snapshot, embedded_provider, binary_provider_selections,
+          binary_provider_observation_keys,
+          binary_provider_selection_list, provider_conflicts)
+        snapshots[snapshot.module_name] = snapshot
+        embedded_modules[snapshot.module_name] = embedded_provider
+      end
+      for resolution_index = 1, #attempt.contextual_resolutions do
+        normalized_contextual_resolutions[
+          #normalized_contextual_resolutions + 1] =
+          attempt.contextual_resolutions[resolution_index]
+      end
+      for name, entry in iteration.pairs(attempt.entries) do
+        self.project_entries[name] = entry
+      end
+      for checked_index = 1, #attempt.checked do
+        local name = attempt.checked[checked_index]
+        if requested[name] then pending[name] = nil end
+      end
+      if attempt.failed[root] then pending[root] = nil end
+      -- Parsing may fail before the context publishes the root.
+      if snapshots[root] ~= nil then pending[root] = nil end
+    end
+  end
+
+  local modules: {ModuleSnapshot} = {}
+  for index = 1, #project_modules do
+    local name = project_modules[index].module_name
+    local snapshot? = snapshots[name]
+    if snapshot ~= nil then modules[#modules + 1] = snapshot end
+  end
+  local external_names: {string} = {}
+  for name in iteration.pairs(snapshots) do
+    if projects[name] == nil then
+      external_names[#external_names + 1] = name
+    end
+  end
+  stable_sort(external_names, string_less, result_normalization_work)
+  for index = 1, #external_names do
+    modules[#modules + 1] = snapshots[external_names[index]]
+  end
+  local final_embedded_identity = self:validate_embedded_provider_baseline()
+  local captured_binaries: {CompletionBinary} = {}
+  for index = 1, #completion_binaries do
+    local binary = completion_binaries[index]
+    local identity? = self:selected_provider_identity(
+      final_embedded_identity, binary.filename, binary.kind == "embedded")
+    captured_binaries[index] = CompletionBinary {
+      module_name = binary.module_name,
+      serialized = binary.serialized,
+      kind = binary.kind,
+      filename = binary.filename,
+      provider_identity = identity,
+      documentation = binary.documentation,
+    }
+  end
+  self:attach_module_provider_identities(
+    final_embedded_identity, modules, provider_conflicts, embedded_modules)
+  local contextual_resolutions = self:attach_contextual_provider_identities(
+    final_embedded_identity, normalized_contextual_resolutions)
+  local binary_provider_observations = self:attach_binary_provider_observations(
+    final_embedded_identity, binary_provider_selection_list)
+  local provider_conflict_names: {string} = {}
+  for name, conflicted in iteration.pairs(provider_conflicts) do
+    if conflicted then provider_conflict_names[#provider_conflict_names + 1] = name end
+  end
+  stable_sort(provider_conflict_names, string_less, result_normalization_work)
+  local result = Analysis {
+    root_module = ordered[1],
+    diagnostics = diagnostics,
+    modules = modules,
+    contextual_resolutions = contextual_resolutions,
+    binary_provider_observations = binary_provider_observations,
+    provider_conflicts = provider_conflict_names,
+    browser_foreign = browser_foreign,
+  }
+  self:emit_cache_stats()
+  logging.emit("debug", "compiler.analysis.complete", {
+    ["root_module"] = ordered[1],
+    ["diagnostics"] = #diagnostics,
+    ["snapshots"] = #modules,
+    ["cpu_ms"] = logging.elapsed_ms(started),
+  })
+  -- Fixed-point analysis can call us repeatedly before publication. Retain
+  -- pending provider groups until the saved owner commits, then release them.
+  self.completion_binaries = merge_completion_catalog(
+    self.completion_binaries, captured_binaries)
+  return result
+catch
+  if error is async.CancellationReason then raise end
+  if error is BridgeError then raise end
+  raise BridgeError(DRIVER_MODULE,
+    "compiler analysis failed: " .. strings.tostring(error))
+end
+
+function Compiler:analyze(root_module: string,
+                          project_modules: {ProjectModule}): Analysis
+  local roots: {string} = {root_module}
+  for index = 1, #project_modules do
+    local name = project_modules[index].module_name
+    if name ~= root_module then roots[#roots + 1] = name end
+  end
+  return self:analyze_incremental(project_modules, roots, {})
+end

@@ -1,0 +1,529 @@
+-- Editor buffer overlays, diagnostic clearing/replay, and session indexing status.
+
+-- An open buffer belongs to one root only: the most specific registered root
+-- that contains it, exactly like a request for that document.
+local function Router:overlay_belongs(slot: Slot, overlay: Overlay): boolean
+  local owner? = self.registry:owner(overlay.path)
+  if owner == nil then return false end
+  return owner.path == slot.root.path
+end
+
+-- Retain one editor buffer under the limits the worker's own BufferStore
+-- applies (`documents.limits`). An over-limit buffer keeps only its identity and
+-- version watermark, and is delivered as an unavailable contributor.
+local function Router:store_overlay(uri: string, path: string,
+                                    version: integer, text: string)
+  local existing? = self.overlays[path]
+  if existing == nil then
+    self.overlay_order[#self.overlay_order + 1] = path
+  else
+    local previous_text? = existing.text
+    if previous_text ~= nil then
+      self.overlay_bytes = self.overlay_bytes - #previous_text
+    end
+  end
+  local bounded = documents.limits()
+  local retained: string? = nil
+  if #text <= bounded.document_bytes and
+     self.overlay_bytes + #text <= bounded.workspace_bytes and
+     #self.overlay_order <= bounded.documents then
+    retained = text
+    self.overlay_bytes = self.overlay_bytes + #text
+  else
+    -- Same limits as the worker's BufferStore: the document stays an available
+    -- identity with no retained bytes, and replay marks it unavailable.
+    logging.emit("info", "overlay.unavailable", {
+      ["uri"] = uri,
+      ["bytes"] = #text,
+      ["retained_bytes"] = self.overlay_bytes,
+    })
+  end
+  local owner: string? = nil
+  if existing ~= nil then owner = existing.owner end
+  self.overlays[path] = Overlay {
+    uri = uri,
+    path = path,
+    version = version,
+    text = retained,
+    owner = owner,
+  }
+end
+
+local function Router:forget_overlay(path: string)
+  local existing? = self.overlays[path]
+  if existing == nil then return end
+  local text? = existing.text
+  if text ~= nil then
+    self.overlay_bytes = self.overlay_bytes - #text
+  end
+  self.overlays[path] = nil
+  local kept: {string} = {}
+  for index = 1, #self.overlay_order do
+    local candidate = self.overlay_order[index]
+    if candidate ~= path then kept[#kept + 1] = candidate end
+  end
+  self.overlay_order = kept
+end
+
+-- Overlays are stored and matched by the document's canonical path: a client
+-- may spell a file through a symlinked folder, and a restarted worker must still
+-- receive the buffer it was editing.
+local function Router:set_overlay(notification: lsp.DocumentNotification,
+                                  canonical: string)
+  case notification
+  when opened(item) then
+    self:store_overlay(item.document.uri, canonical, item.version, item.text)
+  when changed(item) then
+    local existing? = self.overlays[canonical]
+    if existing == nil then
+      self:store_overlay(item.document.uri, canonical, item.version, item.text)
+    else
+      self:store_overlay(existing.uri, canonical, item.version, item.text)
+    end
+  when closed() then
+    self:forget_overlay(canonical)
+  when saved() then
+  end
+end
+
+-- Deliver the router's copy of an open document to one worker: its retained text
+-- as a normal open, or the unavailable-contributor marker when the buffer is
+-- over the limits, which leaves the worker in the same state as an over-limit
+-- open received directly.
+local function Slot:deliver_overlay(overlay: Overlay)
+  local worker? = self.worker
+  if worker == nil then return end
+  local text? = overlay.text
+  if text ~= nil then
+    local document: wire.Object = {
+      ["uri"] = overlay.uri,
+      ["languageId"] = "titan",
+      ["version"] = overlay.version,
+      ["text"] = text,
+    }
+    local params: wire.Object = {["textDocument"] = document}
+    local envelope: wire.Object = {
+      ["jsonrpc"] = "2.0",
+      ["method"] = "textDocument/didOpen",
+      ["params"] = params,
+    }
+    if worker:send(wire.encode(envelope)) then
+      overlay.owner = self.root.path
+    end
+    return
+  end
+  local document: wire.Object = {
+    ["uri"] = overlay.uri,
+    ["languageId"] = "titan",
+  }
+  local params: wire.Object = {
+    ["textDocument"] = document, ["version"] = overlay.version,
+  }
+  local outcome = worker:request("titan/documentUnavailable", params,
+    UNAVAILABLE_DELIVERY_TIMEOUT_MILLISECONDS)
+  case outcome
+  when answered() then
+    overlay.owner = self.root.path
+  when failed(error_value) then
+    logging.emit("error", "overlay.unavailable.failure", {
+      ["root"] = self.root.path,
+      ["uri"] = overlay.uri,
+      ["message"] = strings.tostring(error_value),
+    })
+  when unavailable(message) then
+    logging.emit("debug", "overlay.unavailable.pending", {
+      ["root"] = self.root.path,
+      ["uri"] = overlay.uri,
+      ["message"] = message,
+    })
+  end
+end
+
+-- The root that no longer owns an open document must forget the buffer, so it
+-- cannot contribute unsaved facts the router no longer routes to it.
+local function Slot:close_overlay(overlay: Overlay)
+  local worker? = self.worker
+  if worker == nil or not state_ready(self.state) then return end
+  local params: wire.Object = {
+    ["textDocument"] = {["uri"] = overlay.uri},
+  }
+  worker:notify("textDocument/didClose", params)
+end
+
+local function Router:replay_overlays(slot: Slot)
+  for index = 1, #self.overlay_order do
+    local overlay = self.overlays[self.overlay_order[index]]
+    if self:overlay_belongs(slot, overlay) then
+      -- A worker that just started holds no buffers.
+      overlay.owner = nil
+      slot:deliver_overlay(overlay)
+    end
+  end
+end
+
+-- Publish an empty diagnostic set: the one publication that clears whatever a
+-- previous owner said about this document.
+local function Router:publish_empty_diagnostics(uri: value)
+  local diagnostics: wire.Array = {}
+  local params: wire.Object = {["uri"] = uri, ["diagnostics"] = diagnostics}
+  local envelope: wire.Object = {
+    ["jsonrpc"] = "2.0",
+    ["method"] = "textDocument/publishDiagnostics",
+    ["params"] = params,
+  }
+  self.output:push(wire.encode(envelope))
+end
+
+-- Clear every publication this root made for a document another root now owns.
+local function Router:clear_stale_diagnostics(slot: Slot)
+  local stale: {string} = {}
+  for uri, path in iteration.pairs(slot.published) do
+    local current? = self:owner_root(path)
+    local current_path = ""
+    if current ~= nil then current_path = current.path end
+    if current_path ~= slot.root.path then stale[#stale + 1] = uri end
+  end
+  for index = 1, #stale do
+    local uri = stale[index]
+    self:publish_empty_diagnostics(uri)
+    slot.published[uri] = nil
+    logging.emit("info", "diagnostics.cleared", {
+      ["root"] = slot.root.path,
+      ["uri"] = uri,
+    })
+  end
+end
+
+-- Worker loss must not forget uncleared rows. Leave transferred URIs for ordered
+-- ownership reconciliation; clear owned or unowned URIs without yielding.
+local function Slot:clear_worker_diagnostics(router: Router)
+  for uri, path in iteration.pairs(self.published) do
+    local current? = router.registry:owner(path)
+    if current == nil or current.path == self.root.path then
+      router:publish_empty_diagnostics(uri)
+      self.published[uri] = nil
+    end
+  end
+end
+
+-- A trust refusal is a diagnostic on the configuration file that selected the
+-- SDK: an editor must show why that root has no worker, and the notification
+-- is replaced by an empty publication once the selection is accepted.
+local function configuration_diagnostic_line(filename: string): integer
+  local source = fs.read_file(filename)
+  local offset? = strings.find(source, "compiler_root")
+  if offset == nil then return 0 end
+  local line = 0
+  for index = 1, offset - 1 do
+    if strings.byte(source, index) == 10 then line = line + 1 end
+  end
+  return line
+catch
+  if error is async.CancellationReason then raise end
+  return 0
+end
+
+local function Router:publish_configuration_diagnostic(slot: Slot,
+                                                       filename: string,
+                                                       message: string)
+  local uri: value = wire.null()
+  do
+    local encoded? = source_text.path_to_file_uri(roots.canonical(filename))
+    if encoded ~= nil then uri = encoded end
+  catch
+    if error is async.CancellationReason then raise end
+  end
+  local position: wire.Object = {
+    ["line"] = configuration_diagnostic_line(filename), ["character"] = 0,
+  }
+  local range: wire.Object = {["start"] = position, ["end"] = position}
+  local diagnostic: wire.Object = {
+    ["range"] = range,
+    ["severity"] = 1,
+    ["source"] = "Titan",
+    ["code"] = "configuration",
+    ["message"] = message,
+  }
+  local diagnostics: wire.Array = {diagnostic}
+  local params: wire.Object = {
+    ["uri"] = uri, ["diagnostics"] = diagnostics,
+  }
+  local envelope: wire.Object = {
+    ["jsonrpc"] = "2.0",
+    ["method"] = "textDocument/publishDiagnostics",
+    ["params"] = params,
+  }
+  self.output:push(wire.encode(envelope))
+  slot.diagnosed_file = filename
+end
+
+local function Router:clear_configuration_diagnostic(slot: Slot)
+  local filename? = slot.diagnosed_file
+  if filename == nil then return end
+  slot.diagnosed_file = nil
+  local uri: value = wire.null()
+  do
+    local encoded? = source_text.path_to_file_uri(roots.canonical(filename))
+    if encoded ~= nil then uri = encoded end
+  catch
+    if error is async.CancellationReason then raise end
+  end
+  self:publish_empty_diagnostics(uri)
+end
+
+local function Slot:is_indexing(): boolean
+  local status? = self.indexing_status
+  return status ~= nil and indexing_status.state_name(status.state) == "indexing"
+end
+
+-- One session timeline, not one watermark per root: clients display one status
+-- item. Only counted progress over an unchanged total continues an epoch;
+-- other visible busy changes start a bare-busy epoch and a zero-count baseline.
+local function Router:publish_indexing()
+  local busy = false
+  local initial = false
+  local counted = true
+  local completed_files = 0
+  local total_files = 0
+  local claimed = 0
+  local failure_slot: Slot? = nil
+  for index = 1, #self.order do
+    local slot = self.slots[self.order[index]]
+    if slot.root:claimed() then
+      claimed = claimed + 1
+      local status? = slot.indexing_status
+      if status ~= nil then
+        case status.state
+        when indexing() then
+          busy = true
+          initial = initial or status.initial
+          if status.completed_files == nil then
+            counted = false
+          else
+            completed_files = completed_files + status.completed_files
+            total_files = total_files + status.total_files
+          end
+        when failed() then
+          if failure_slot == nil then failure_slot = slot end
+        else
+        end
+      end
+    end
+  end
+  initial = self.initial_pending or initial
+  local previous? = self.indexing_status
+  if previous == nil and not busy and failure_slot == nil then return end
+  if previous == nil and not busy then
+    -- Settings or admission can fail before any worker starts. Strict clients
+    -- still require the initial busy frame before the terminal failure.
+    previous = indexing_status.Status {
+      state = indexing_status.State.indexing(), initial = true,
+      epoch = 1, generation = self.indexing_generation,
+    }
+    self.indexing_status = previous
+    self.output:push(indexing_status.notification(previous))
+  end
+  local epoch = 0
+  if previous ~= nil then
+    epoch = previous.epoch
+  end
+  local generation = self.indexing_generation
+  if busy then
+    -- Aggregate counters have the same safe-integer bound as worker counters.
+    counted = counted and total_files <= 9007199254740991
+    local reset = previous == nil
+    if previous ~= nil then
+      reset = indexing_status.state_name(previous.state) ~= "indexing" or
+        previous.initial ~= initial
+      if previous.completed_files ~= nil then
+        reset = reset or not counted or previous.total_files ~= total_files or
+          completed_files < previous.completed_files
+      end
+    end
+    if not reset and previous ~= nil and
+       ((not counted and previous.completed_files == nil) or
+        (counted and previous.completed_files == completed_files and
+         previous.total_files == total_files)) then return end
+    if reset then
+      epoch = epoch + 1
+      local status = indexing_status.Status {
+        state = indexing_status.State.indexing(), initial = initial,
+        epoch = epoch, generation = generation,
+      }
+      self.indexing_status = status
+      self.output:push(indexing_status.notification(status))
+    end
+    if not counted then return end
+    if reset or previous == nil or previous.completed_files == nil then
+      local baseline = indexing_status.Status {
+        state = indexing_status.State.indexing(), initial = initial,
+        epoch = epoch, generation = generation,
+        completed_files = 0, total_files = total_files,
+      }
+      self.indexing_status = baseline
+      self.output:push(indexing_status.notification(baseline))
+      if completed_files == 0 then return end
+    end
+    local status = indexing_status.Status {
+      state = indexing_status.State.indexing(), initial = initial,
+      epoch = epoch, generation = generation,
+      completed_files = completed_files, total_files = total_files,
+    }
+    self.indexing_status = status
+    self.output:push(indexing_status.notification(status))
+    return
+  end
+  if previous ~= nil then initial = previous.initial end
+  local state = indexing_status.State.ready()
+  local message: string? = nil
+  if failure_slot ~= nil then
+    state = indexing_status.State.failed()
+    message = failure_slot.indexing_status.message
+    if claimed > 1 then
+      message = failure_slot.root.path .. ": " .. (message or "Titan indexing failed")
+    end
+  end
+  if previous ~= nil and
+     indexing_status.state_name(previous.state) == indexing_status.state_name(state) and
+     previous.initial == initial and previous.generation == generation and
+     previous.message == message then return end
+  epoch = epoch + 1
+  if failure_slot == nil then self.initial_pending = false end
+  local status = indexing_status.Status {
+    state = state, initial = initial, epoch = epoch, generation = generation,
+    message = message,
+  }
+  self.indexing_status = status
+  self.output:push(indexing_status.notification(status))
+end
+
+local function Slot:set_failure(router: Router, message: string)
+  self.state = WorkerState.failed(message)
+  self.failure = message
+  local previous? = self.indexing_status
+  if previous ~= nil and indexing_status.state_name(previous.state) == "failed" and
+     previous.message == message then return end
+  self.indexing_status = indexing_status.Status {
+    state = indexing_status.State.failed(),
+    initial = previous == nil or previous.initial,
+    epoch = 0, message = message,
+  }
+  if self.root:claimed() then
+    router:publish_indexing()
+  end
+end
+
+local function Slot:clear_failure(router: Router, next_state: WorkerState)
+  self.state = next_state
+  self.failure = nil
+  local previous? = self.indexing_status
+  if previous ~= nil and indexing_status.state_name(previous.state) == "failed" then
+    self.indexing_status = nil
+    if self.root:claimed() then
+      router:publish_indexing()
+    end
+  end
+end
+
+local function Slot:require_diagnostic_replay()
+  self.replay_diagnostics = self.worker ~= nil and
+    self.replay_unavailable_generation ~= self.generation
+end
+
+local function Slot:on_indexing(router: Router, params: wire.Object)
+  local name? = wire.as_string(params["state"])
+  local epoch? = wire.as_integer(params["epoch"])
+  local initial? = wire.as_boolean(params["initial"])
+  if name == nil or epoch == nil or initial == nil then return end
+  local state = indexing_status.State.indexing()
+  if name == "ready" then
+    state = indexing_status.State.ready()
+  elseif name == "failed" then
+    state = indexing_status.State.failed()
+  elseif name ~= "indexing" then
+    return
+  end
+  local previous? = self.indexing_status
+  -- A worker's own stream is ordered; ignore an obsolete snapshot rather than
+  -- allowing it to roll back the root before aggregating it.
+  if previous ~= nil and epoch < previous.epoch then return end
+  local status = indexing_status.Status {
+    state = state, initial = initial, epoch = epoch,
+    generation = wire.as_integer(params["generation"]),
+    message = wire.as_string(params["message"]),
+    completed_files = wire.as_integer(params["completed_files"]),
+    total_files = wire.as_integer(params["total_files"]),
+  }
+  self.indexing_status = status
+  if not self.root:claimed() then return end
+  local completed = name == "ready" and
+    (previous == nil or indexing_status.state_name(previous.state) ~= "ready" or
+     previous.generation ~= status.generation)
+  -- Completions count where they are observed, whether or not a frame follows.
+  if completed then router.indexing_generation = router.indexing_generation + 1 end
+  router:publish_indexing()
+end
+
+-- Move per-document state with its owner. Every ownership change (folder add or
+-- removal, release, nested discovery, a root that stops) ends here: the document
+-- still open in the client is closed in the old owner, opened in the new one with
+-- the router's latest text (or its unavailable-contributor marker), and any
+-- diagnostics a root published for a document it no longer owns are cleared.
+local function Router:reconcile()
+  for index = 1, #self.overlay_order do
+    local overlay = self.overlays[self.overlay_order[index]]
+    local current? = self:owner_root(overlay.path)
+    local current_path = ""
+    if current ~= nil then current_path = current.path end
+    local delivered_path = overlay.owner or ""
+    if delivered_path ~= current_path then
+      overlay.owner = nil
+      if delivered_path ~= "" then
+        local old_slot? = self.slots[delivered_path]
+        if old_slot ~= nil then old_slot:close_overlay(overlay) end
+      end
+      if current ~= nil then
+        local slot = self:slot_for_root(current)
+        if slot.worker ~= nil and state_ready(slot.state) then
+          slot:deliver_overlay(overlay)
+        end
+      end
+    end
+  end
+  local root_paths = self:root_paths()
+  for index = 1, #root_paths do
+    local slot? = self.slots[root_paths[index]]
+    if slot ~= nil then
+      self:clear_stale_diagnostics(slot)
+      if slot.worker == nil then slot:clear_worker_diagnostics(self) end
+    end
+  end
+  -- Clear every old owner's rows before a worker that gained ownership replays.
+  for index = 1, #root_paths do
+    local slot? = self.slots[root_paths[index]]
+    if slot ~= nil and slot.replay_diagnostics and slot.root:claimed() then
+      slot:begin_transition()
+      defer slot:end_transition()
+      local worker? = slot.worker
+      if worker ~= nil and state_ready(slot.state) then
+        local params: wire.Object = {}
+        local outcome = worker:request("titan/republishDiagnostics",
+          params, UNAVAILABLE_DELIVERY_TIMEOUT_MILLISECONDS)
+        case outcome
+        when answered() then
+          slot.replay_diagnostics = false
+        when failed(failure) then
+          logging.emit("error", "diagnostics.replay.failure", {
+            ["root"] = slot.root.path, ["message"] = wire.encode(failure),
+          })
+        when unavailable(message) then
+          slot.replay_diagnostics = false
+          slot.replay_unavailable_generation = slot.generation
+          logging.emit("error", "diagnostics.replay.failure", {
+            ["root"] = slot.root.path, ["message"] = message,
+          })
+        end
+      end
+    end
+  end
+end

@@ -45,7 +45,7 @@ local record ProjectFile
 end
 
 function create(): Publisher
-  return Publisher.new(nil, {})
+  return Publisher(nil, {})
 end
 
 function Publisher:set_listener(listener: Listener?)
@@ -84,16 +84,16 @@ local function diagnostic_severity(kind: Kind): integer
   end
 end
 
-local function item_key(item: Item): string
+local function Item:key(): string
   -- Length-prefix the free-form message so separator characters inside it
   -- cannot alias another diagnostic. Fixed-count numeric fields make the rest
   -- of the key unambiguous while retaining O(n) per-file deduplication.
-  return diagnostic_code(item.kind) .. ":" ..
-    strings.tostring(item.range.start.line) .. ":" ..
-    strings.tostring(item.range.start.character) .. ":" ..
-    strings.tostring(item.range.finish.line) .. ":" ..
-    strings.tostring(item.range.finish.character) .. ":" ..
-    strings.tostring(#item.message) .. ":" .. item.message
+  return diagnostic_code(self.kind) .. ":" ..
+    self.range.start.line .. ":" ..
+    self.range.start.character .. ":" ..
+    self.range.finish.line .. ":" ..
+    self.range.finish.character .. ":" ..
+    #self.message .. ":" .. self.message
 end
 
 --- Encode one diagnostic item for push and pull alike.
@@ -133,7 +133,7 @@ local function project_files(snapshot: project_service.Snapshot):
     local module = snapshot.project_modules[module_index]
     for file_index = 1, #module.source_files do
       local source = module.source_files[file_index]
-      local file = ProjectFile.new(source.filename, source.contents, {})
+      local file = ProjectFile(source.filename, source.contents, {})
       ordered[#ordered + 1] = file
       by_path[source.filename] = file
     end
@@ -172,13 +172,21 @@ local function position_for_diagnostic(
     coordinates: source_text.CoordinateIndex,
     diagnostic: bridge.Diagnostic): source_text.Position
   local location? = diagnostic.location
-  if location == nil then return source_text.Position.new(0, 0) end
+  if location == nil then return source_text.Position(0, 0) end
   local offset? = coordinates:offset_for_lf_byte_position(
     location.line, location.column)
-  if offset == nil then return source_text.Position.new(0, 0) end
-  local position?, position_error? = coordinates:position_for_offset(offset)
-  if position == nil then return source_text.Position.new(0, 0) end
+  if offset == nil then return source_text.Position(0, 0) end
+  local position? = coordinates:position_for_offset(offset)
+  if position == nil then return source_text.Position(0, 0) end
   return position
+end
+
+local function coordinate_index_for(
+    contents: string, yield_now: Yield?): source_text.CoordinateIndex
+  if yield_now ~= nil then
+    return source_text.coordinate_index_with_yield(contents, yield_now)
+  end
+  return source_text.coordinate_index(contents)
 end
 
 local function build(snapshot: project_service.Snapshot,
@@ -189,51 +197,43 @@ local function build(snapshot: project_service.Snapshot,
   for file_index = 1, #ordered do
     local file = ordered[file_index]
     if #file.diagnostics > 0 then
-      local coordinates = source_text.coordinate_index(file.contents)
-      if yield_now ~= nil then
-        coordinates = source_text.coordinate_index_with_yield(
-          file.contents, yield_now)
-      end
+      local coordinates = coordinate_index_for(file.contents, yield_now)
       local items: {Item} = {}
       local seen: {string: boolean} = {}
       for diagnostic_index = 1, #file.diagnostics do
         local diagnostic = file.diagnostics[diagnostic_index]
         local position = position_for_diagnostic(coordinates, diagnostic)
-        local candidate = Item.new(
+        local candidate = Item(
           Kind.compiler(diagnostic.kind), diagnostic.message,
-          source_text.Span.new(position, position))
-        local key = item_key(candidate)
+          source_text.Span(position, position))
+        local key = candidate:key()
         if not seen[key] then
           seen[key] = true
           items[#items + 1] = candidate
         end
       end
-      local uri?, uri_error? = source_text.path_to_file_uri(file.filename)
+      local uri? = source_text.path_to_file_uri(file.filename)
       if uri ~= nil then
-        publications[#publications + 1] = Publication.new(uri, items)
+        publications[#publications + 1] = Publication(uri, items)
       end
     end
   end
   for issue_index = 1, #snapshot.discovery_issues do
     local issue = snapshot.discovery_issues[issue_index]
+    local kind?: Kind = nil
     case issue.kind
-    when unmapped_source() then
-      local uri?, uri_error? = source_text.path_to_file_uri(issue.path)
-      if uri ~= nil then
-        local position = source_text.Position.new(0, 0)
-        local item = Item.new(Kind.unmapped_source(), issue.message,
-                             source_text.Span.new(position, position))
-        publications[#publications + 1] = Publication.new(uri, {item})
-      end
-    when inactive_variant() then
-      local uri?, uri_error? = source_text.path_to_file_uri(issue.path)
-      if uri ~= nil then
-        local position = source_text.Position.new(0, 0)
-        local item = Item.new(Kind.inactive_variant(), issue.message,
-                             source_text.Span.new(position, position))
-        publications[#publications + 1] = Publication.new(uri, {item})
-      end
+    when unmapped_source() then kind = Kind.unmapped_source()
+    when inactive_variant() then kind = Kind.inactive_variant()
     else
+    end
+    if kind ~= nil then
+      local uri? = source_text.path_to_file_uri(issue.path)
+      if uri ~= nil then
+        local position = source_text.Position(0, 0)
+        publications[#publications + 1] = Publication(uri, {
+          Item(kind, issue.message, source_text.Span(position, position)),
+        })
+      end
     end
   end
   return publications
@@ -246,7 +246,7 @@ end
 
 function from_snapshot_with_yield(
     snapshot: project_service.Snapshot): {Publication}
-  return build(snapshot, function () async.yield() end)
+  return build(snapshot, async.yield)
 end
 
 -- Publication and replacement are nonyielding. The refresh owner can build a
@@ -268,7 +268,7 @@ function Publisher:publish(publications: {Publication})
   for index = 1, #self.published_order do
     local uri = self.published_order[index]
     if not next_published[uri] then
-      notify(listener, Publication.new(uri, {}))
+      notify(listener, Publication(uri, {}))
     end
   end
   self.published_order = next_order
@@ -278,7 +278,7 @@ function Publisher:clear()
   local listener? = self.listener
   if listener ~= nil then
     for index = 1, #self.published_order do
-      notify(listener, Publication.new(self.published_order[index], {}))
+      notify(listener, Publication(self.published_order[index], {}))
     end
   end
   self.published_order = {}
@@ -297,7 +297,7 @@ function result_id(items: {Item}): string
   local canonical = strings.writer()
   canonical:write(#items .. ":")
   for index = 1, #items do
-    local key = item_key(items[index])
+    local key = items[index]:key()
     canonical:write(#key .. ":" .. key)
   end
   -- The content-identity owner already spells a log-safe hexadecimal digest.

@@ -91,7 +91,7 @@ local function changed_bytes(before: string, after: string): ByteChange?
       strings.sub(after, #after - suffix - 1023, #after - suffix) do suffix = suffix + 1024 end
   while suffix < limit - first and strings.byte(before, #before - suffix) ==
       strings.byte(after, #after - suffix) do suffix = suffix + 1 end
-  return ByteChange.new(first, #before - suffix, #after - suffix)
+  return ByteChange(first, #before - suffix, #after - suffix)
 end
 
 local function HoverContext:follow(inputs: const {buffers.Input}): boolean
@@ -156,7 +156,7 @@ local function HoverFile:current_span(row: facts.Hover): source_text.ByteSpan?
       identifier_byte(strings.byte(self.latest.text, first)) then return nil end
   if identifier_byte(strings.byte(self.latest.text, finish)) and
       identifier_byte(strings.byte(self.latest.text, finish + 1)) then return nil end
-  return source_text.ByteSpan.new(first, finish)
+  return source_text.ByteSpan(first, finish)
 end
 
 local function hover_context(snapshot: facts.Snapshot, capture: buffers.Capture,
@@ -168,13 +168,19 @@ local function hover_context(snapshot: facts.Snapshot, capture: buffers.Capture,
       for input_index = 1, #capture.inputs do
         local document = capture.inputs[input_index]
         if document.path == input.filename then
-          files[#files + 1] = HoverFile.new(document, document, {}, false)
+          files[#files + 1] = HoverFile(document, document, {}, false)
         end
       end
     end
   end
-  return HoverContext.new(snapshot.id, files, source, capture.epoch, snapshot.saved_generation,
-    snapshot.module_name)
+  return HoverContext {
+    id = snapshot.id,
+    files = files,
+    source = source,
+    epoch = capture.epoch,
+    generation = snapshot.saved_generation,
+    module_name = snapshot.module_name,
+  }
 end
 
 record Service
@@ -199,29 +205,54 @@ record Service
   local minimum_saved_generation: integer
 end
 
-local HOVER_DEBOUNCE_MS = 200
+local const HOVER_DEBOUNCE_MS = 200
+local const MAX_RESTORATION_BYTES = 64 * 1024 * 1024
 
 local function empty(): dispatcher.SemanticOutcome
   return dispatcher.SemanticOutcome.result(lsp.completion_list_value(
-    lsp.CompletionList.new(true, {})))
+    lsp.CompletionList(true, {})))
 end
 
 function create(store: sql.Store, documents: buffers.BufferStore): Service
-  return Service.new(storage.open(store), documents, nil, nil, nil, nil, nil, nil, false, false, nil, 0, nil, nil,
-    nil, 0, nil, 0, 0)
+  return Service {
+    store = storage.open(store),
+    buffers = documents,
+    closed = false,
+    sync_needed = false,
+    requests = 0,
+    hover_session = 0,
+    saved_generation = 0,
+    minimum_saved_generation = 0,
+  }
 end
 
-local function open_paths(capture: buffers.Capture): {string}
+local function open_paths(capture: buffers.Capture): const {string}
   local paths: {string} = {}
   for index = 1, #capture.inputs do paths[#paths + 1] = capture.inputs[index].path end
   for index = 1, #capture.unavailable_paths do
     paths[#paths + 1] = capture.unavailable_paths[index]
   end
-  return paths
+  return paths as const {string}
+end
+
+local function open_documents(inputs: const? {buffers.Input}): {facts.OpenDocument}
+  local documents: {facts.OpenDocument} = {}
+  for index = 1, #inputs do
+    local input = inputs[index]
+    documents[index] = facts.OpenDocument {
+      uri = input.uri,
+      filename = input.path,
+      module_name = "",
+      session = input.session,
+      version = input.version,
+      contents = input.text,
+    }
+  end
+  return documents
 end
 
 local function module_for(path: string, baseline: storage.Baseline,
-                           paths: const {string}): string?
+                          paths: const {string}): string?
   local roots: {string} = {}
   if baseline.configuration.source_roots ~= nil then roots = baseline.configuration.source_roots end
   local name? = discovery.find(path, baseline.projects, roots,
@@ -238,7 +269,7 @@ local function contributor_key(filename: string): string
   local basename = file_paths.basename(filename)
   local classification = bridge.classify_source_filename(basename)
   if classification.logical_basename ~= nil then
-    return classification.logical_basename as string
+    return classification.logical_basename
   end
   return basename
 end
@@ -258,35 +289,35 @@ local function sort_files(files: {bridge.SourceFile}, main_file: string)
   end
 end
 
-local function active_module(request: Request): (bridge.ProjectModule?, {facts.Input})
+local function Request:active_module(paths: const {string}):
+    (bridge.ProjectModule?, {facts.Input})
   local files: {bridge.SourceFile} = {}
   local inputs: {facts.Input} = {}
   local indexes: {string: integer} = {}
   local main_file = ""
-  local paths = open_paths(request.capture)
-  for index = 1, #request.baseline.projects do
-    local project = request.baseline.projects[index]
-    if project.module_name == request.module_name then
+  for index = 1, #self.baseline.projects do
+    local project = self.baseline.projects[index]
+    if project.module_name == self.module_name then
       for file_index = 1, #project.files do
         local file = project.files[file_index]
-        files[#files + 1] = bridge.SourceFile.new(file.filename, file.contents)
+        files[#files + 1] = file
         indexes[file.filename] = #files
-        inputs[#inputs + 1] = facts.Input.new(file.filename, 0, 0, file.contents)
+        inputs[#inputs + 1] = facts.Input(file.filename, 0, 0, file.contents)
       end
       if #files > 0 then main_file = files[1].filename end
     end
   end
-  for index = 1, #request.capture.unavailable_paths do
-    if module_for(request.capture.unavailable_paths[index], request.baseline, paths) ==
-        request.module_name then return nil, {} end
+  for index = 1, #self.capture.unavailable_paths do
+    if module_for(self.capture.unavailable_paths[index], self.baseline, paths) ==
+        self.module_name then return nil, {} end
   end
-  for index = 1, #request.capture.inputs do
-    local input = request.capture.inputs[index]
-    if module_for(input.path, request.baseline, paths) == request.module_name then
+  for index = 1, #self.capture.inputs do
+    local input = self.capture.inputs[index]
+    if module_for(input.path, self.baseline, paths) == self.module_name then
       local ordinal? = indexes[input.path]
       if ordinal == nil then ordinal = #files + 1 end
-      files[ordinal] = bridge.SourceFile.new(input.path, input.text)
-      inputs[ordinal] = facts.Input.new(input.path, input.session, input.version, input.text)
+      files[ordinal] = bridge.SourceFile(input.path, input.text)
+      inputs[ordinal] = facts.Input(input.path, input.session, input.version, input.text)
       indexes[input.path] = ordinal
     end
   end
@@ -294,38 +325,44 @@ local function active_module(request: Request): (bridge.ProjectModule?, {facts.I
   if main_file == "" then
     -- A folder's final name identifies its main file. Discovery has already
     -- verified that the virtual resolver selects this exact provider.
-    local leaf = request.module_name
+    local leaf = self.module_name
     for index = 1, #leaf do
-      if strings.sub(request.module_name, index, index) == "." then
-        leaf = strings.sub(request.module_name, index + 1)
+      if strings.sub(self.module_name, index, index) == "." then
+        leaf = strings.sub(self.module_name, index + 1)
       end
     end
     for index = 1, #files do
       local file = files[index].filename
       if contributor_key(file) == leaf .. ".titan" then main_file = file end
     end
-    if main_file == "" then main_file = request.capture.document.path end
+    if main_file == "" then main_file = self.capture.document.path end
   end
   sort_files(files, main_file)
-  return bridge.ProjectModule.new(request.module_name, files), inputs
+  return bridge.ProjectModule(self.module_name, files), inputs
 end
 
 local function import_candidates(baseline: storage.Baseline): {facts.Candidate}
   local result: {facts.Candidate} = {}
   for index = 1, #baseline.modules do
     local item = baseline.modules[index]
-    result[#result + 1] = facts.Candidate.new(item.module_name, "module", item.module_name,
-      9, "Titan module", "", 0, 0, index, true, "public", "", "import", nil, item.documentation)
+    result[#result + 1] = facts.Candidate {
+      label = item.module_name,
+      lookup_domain = "module",
+      lookup_key = item.module_name,
+      kind = 9,
+      detail = "Titan module",
+      type_key = "",
+      scope_id = 0,
+      scope_depth = 0,
+      declaration_order = index,
+      available = true,
+      visibility = "public",
+      owner_key = "",
+      access_mode = "import",
+      documentation = item.documentation,
+    }
   end
   return result
-end
-
-local function header_kind(kind: bridge.CHeaderDependencyKind): integer
-  case kind
-  when file() then return 0
-  when search() then return 1
-  when origin() then return 2
-  end
 end
 
 local function completion_hovers(active: bridge.ProjectModule,
@@ -333,9 +370,8 @@ local function completion_hovers(active: bridge.ProjectModule,
     original: string): ({facts.Hover}, boolean)
   if analysis.snapshot == nil then return {}, false end
   if #analysis.snapshot.symbols > facts.MAX_HOVER_ROWS then return {}, false end
-  local prepared = semantic_features.prepare({active}, {analysis.snapshot},
-    function () async.yield() end)
-  local rows = prepared:completion_hovers(function () async.yield() end)
+  local prepared = semantic_features.prepare({active}, {analysis.snapshot}, async.yield)
+  local rows = prepared:completion_hovers(async.yield)
   local result: {facts.Hover} = {}
   local delta = 0
   local analysis_finish = 0
@@ -360,7 +396,7 @@ local function completion_hovers(active: bridge.ProjectModule,
       end
     end
     if include then
-      result[#result + 1] = facts.Hover.new(row.filename, first, finish, row.markdown)
+      result[#result + 1] = facts.Hover(row.filename, first, finish, row.markdown)
     end
   end
   return result, true
@@ -399,16 +435,26 @@ local function Service:prepare(request: Request): Prepared?
     local _, changed = validator:restat_c_header_dependencies(reusable.volatile_headers)
     if not changed and self:request_current(request) and
         self.store:current_generation(request.generation) and self:request_current(request) then
-      self.ready = Ready.new(reusable.id, reusable.key, reusable.prefix, reusable.range,
-        reusable.volatile_headers, self.requests, reusable.filename, reusable.session,
-        reusable.anchor, reusable.generation)
+      self.ready = Ready {
+        id = reusable.id,
+        key = reusable.key,
+        prefix = reusable.prefix,
+        range = reusable.range,
+        volatile_headers = reusable.volatile_headers,
+        validated_through = self.requests,
+        filename = reusable.filename,
+        session = reusable.session,
+        anchor = reusable.anchor,
+        generation = reusable.generation,
+      }
       return nil
     end
     if not self:request_current(request) then return nil end
     self.previous_ready = reusable
     self.ready = nil
   end
-  local module_name? = module_for(request.capture.document.path, request.baseline, open_paths(request.capture))
+  local paths = open_paths(request.capture)
+  local module_name? = module_for(request.capture.document.path, request.baseline, paths)
   if module_name == nil then return nil end
   request.module_name = module_name
   local capture = request.capture
@@ -416,7 +462,7 @@ local function Service:prepare(request: Request): Prepared?
   local caret? = coordinates:offset_for_position(capture.position)
   if caret == nil then return nil end
   local hole: bridge.CompletionHole? = nil
-  local range = source_text.Span.new(capture.position, capture.position)
+  local range = source_text.Span(capture.position, capture.position)
   if not request.hover_only then
     hole = bridge.prepare_completion(capture.document.path, capture.document.text, caret)
     if hole == nil then return nil end
@@ -424,19 +470,19 @@ local function Service:prepare(request: Request): Prepared?
     if replacement == nil then return nil end
     range = replacement
   end
-  local active?, inputs = active_module(request)
+  local active?, inputs = request:active_module(paths)
   if active == nil then return nil end
   if hole ~= nil then
     for index = 1, #active.files do
       if active.files[index].filename == capture.document.path then
-        active.files[index] = bridge.SourceFile.new(capture.document.path, hole.contents)
+        active.files[index] = bridge.SourceFile(capture.document.path, hole.contents)
       end
     end
   end
-  local result = bridge.CompletionAnalysis.new("complete", "source", {}, {})
+  local result = bridge.CompletionAnalysis("complete", "source", {}, {})
   local volatile_headers: {bridge.CHeaderDependency} = {}
   if hole ~= nil and hole.kind == "import" then
-    result = bridge.CompletionAnalysis.new("complete", "import", import_candidates(request.baseline), {})
+    result = bridge.CompletionAnalysis("complete", "import", import_candidates(request.baseline), {})
   else
     local compiler = bridge.load()
     compiler:configure(request.baseline.configuration)
@@ -477,28 +523,32 @@ local function Service:prepare(request: Request): Prepared?
       if module.module_name ~= request.module_name then
         if module.provenance == "project" or module.provenance == "external" then
           if needed[module.module_name] then
-          local payload? = self.store:read_descriptor(request.baseline.generation, module.module_name)
-          if payload ~= nil then
-            if payload.header_inputs ~= nil then
-              for header_index = 1, #payload.header_inputs do
-                captured_headers[#captured_headers + 1] = payload.header_inputs[header_index]
+            local payload? = self.store:read_descriptor(request.baseline.generation, module.module_name)
+            if payload ~= nil then
+              if payload.header_inputs ~= nil then
+                for header_index = 1, #payload.header_inputs do
+                  captured_headers[#captured_headers + 1] = payload.header_inputs[header_index]
+                end
+              end
+              bytes = bytes + #payload.payload
+              if bytes > MAX_RESTORATION_BYTES then return nil end
+              local files: {bridge.SourceFile} = {}
+              for file_index = 1, #module.source_files do
+                files[file_index] = bridge.SourceFile(module.source_files[file_index], "")
+              end
+              if #files > 0 then
+                restoration[#restoration + 1] = bridge.ProjectModule(module.module_name, files)
+                payloads[#payloads + 1] = payload
               end
             end
-            bytes = bytes + #payload.payload
-            if bytes > 64 * 1024 * 1024 then return nil end
-            local files: {bridge.SourceFile} = {}
-            for file_index = 1, #module.source_files do
-              files[file_index] = bridge.SourceFile.new(module.source_files[file_index], "")
-            end
-            if #files > 0 then
-              restoration[#restoration + 1] = bridge.ProjectModule.new(module.module_name, files)
-              payloads[#payloads + 1] = payload
-            end
-          end
           end
         elseif module.public_interface ~= "" then
-          binaries[#binaries + 1] = bridge.CompletionBinary.new(module.module_name,
-            module.public_interface, module.provenance, module.main_file)
+          binaries[#binaries + 1] = bridge.CompletionBinary {
+            module_name = module.module_name,
+            serialized = module.public_interface,
+            kind = module.provenance,
+            filename = module.main_file,
+          }
         end
       end
     end
@@ -519,7 +569,7 @@ local function Service:prepare(request: Request): Prepared?
         local captured = false
         for saved_index = 1, #captured_headers do
           local saved = captured_headers[saved_index]
-          if header_kind(saved.kind) == header_kind(observed.kind) and saved.path == observed.path then
+          if saved.kind:code() == observed.kind:code() and saved.path == observed.path then
             captured = true
             if saved.identity ~= observed.identity then return nil end
           end
@@ -544,10 +594,26 @@ local function Service:prepare(request: Request): Prepared?
     prefix = hole.prefix
   end
   local hovers, usable = completion_hovers(active, result, hole, capture.document.text)
-  return Prepared.new(facts.Snapshot.new(request.key, request.module_name,
-    request.baseline.generation, capture.epoch, request.key, capture.document.path,
-    capture.document.session, capture.document.version, caret,
-    first, finish, prefix, result.quality, inputs, result.scopes, result.candidates, hovers),
+  return Prepared(
+    facts.Snapshot {
+      id = request.key,
+      module_name = request.module_name,
+      saved_generation = request.baseline.generation,
+      buffer_epoch = capture.epoch,
+      context_key = request.key,
+      filename = capture.document.path,
+      document_session = capture.document.session,
+      document_version = capture.document.version,
+      caret_byte = caret,
+      replace_start = first,
+      replace_finish = finish,
+      prefix = prefix,
+      quality = result.quality,
+      inputs = inputs,
+      scopes = result.scopes,
+      candidates = result.candidates,
+      hovers = hovers,
+    },
     range, volatile_headers, usable)
 end
 
@@ -556,87 +622,81 @@ local function Service:run(): nil
     if self.sync_needed then
       self.sync_needed = false
       local epoch = self.buffers:epoch()
-      local inputs = self.buffers:inputs()
-      local documents: {facts.OpenDocument} = {}
-      for index = 1, #inputs do
-        local input = inputs[index]
-        documents[index] = facts.OpenDocument.new(input.uri, input.path, "",
-          input.session, input.version, input.text)
-      end
+      local documents = open_documents(self.buffers:inputs())
       self.store:sync_documents(documents, epoch,
         function (): boolean return not self.closed and self.buffers:epoch() == epoch end)
     end
     if self.pending ~= nil or self.pending_hover ~= nil then
-    local request? = self.pending
-    if self.pending ~= nil then
-      request = self.pending
-      self.pending = nil
-    else
-      request = self.pending_hover
-      self.pending_hover = nil
-    end
-    if request == nil then raise "completion worker lost its pending request" end
-    self.active = request
-    do
-      local paths = open_paths(request.capture)
-      local documents: {facts.OpenDocument} = {}
-      for index = 1, #request.capture.inputs do
-        local input = request.capture.inputs[index]
-        documents[index] = facts.OpenDocument.new(input.uri, input.path,
-          "", input.session, input.version, input.text)
+      local request? = self.pending
+      if request ~= nil then
+        self.pending = nil
+      else
+        request = self.pending_hover
+        self.pending_hover = nil
       end
-      local current = function (): boolean
-        return self:request_current(request) and
-          (not request.hover_only or request.capture.document.path == self.hover_path and
-            request.capture.document.session == self.hover_session)
-      end
-      if self.store:sync_documents(documents, request.capture.epoch, current) then
-        local task = async.run<|Prepared?, value|>(function (): Prepared? return self:prepare(request) end)
-        self.preparation = task
-        case async.join(task)
-        when succeeded(prepared) then
-          if prepared ~= nil and current() then
-            -- Unsaved-only headers have no watcher-owned freshness. A later
-            -- hover does not run compiler probes, so these facts cannot be
-            -- retained as an exact hover context between completion requests.
-            local existing? = self.hover_context
-            local previous_id: string? = nil
-            if existing ~= nil then previous_id = existing.id end
-            local keep_source = not request.hover_only and existing ~= nil and existing.source and
-              existing.epoch == request.capture.epoch and existing.generation == request.generation and
-              existing.module_name == prepared.snapshot.module_name
-            -- The writer can commit before this waiter resumes. An intervening
-            -- edit must not let the resumed waiter install its old capture.
-            if not keep_source and prepared.hover_usable and #prepared.volatile_headers == 0 and current() and
-                self.store:publish_hover(prepared.snapshot, current, previous_id) and current() then
-              self.hover_context = hover_context(prepared.snapshot, request.capture, request.hover_only)
-            end
-            -- Do not expose fresh candidates before their usable hover artifact
-            -- is accepted: selecting the snippet can immediately advance the
-            -- buffer and cancel publication for this capture.
-            if not request.hover_only and current() and self.store:publish(prepared.snapshot, current) and current() then
-              self.ready = Ready.new(prepared.snapshot.id, request.key,
-                prepared.snapshot.prefix, prepared.range, prepared.volatile_headers, self.requests,
-                request.capture.document.path, request.capture.document.session,
-                strings.sub(request.capture.document.text, 1, prepared.snapshot.replace_start),
-                request.generation)
-              self.previous_ready = self.ready
-            end
-          end
-        when failed(failure) then
-          logging.emit("debug", "completion.prepare.failure", {["message"] = strings.tostring(failure.error)})
-        when cancelled() then
-          self.ready = nil
-        else
-          raise "completion join returned running task"
+      if request == nil then raise "completion worker lost its pending request" end
+      self.active = request
+      do
+        local documents = open_documents(request.capture.inputs)
+        local current = function (): boolean
+          return self:request_current(request) and
+            (not request.hover_only or request.capture.document.path == self.hover_path and
+              request.capture.document.session == self.hover_session)
         end
-        self.preparation = nil
+        if self.store:sync_documents(documents, request.capture.epoch, current) then
+          local task = async.run<|Prepared?, value|>(function (): Prepared? return self:prepare(request) end)
+          self.preparation = task
+          case async.join(task)
+          when succeeded(prepared) then
+            if prepared ~= nil and current() then
+              -- Unsaved-only headers have no watcher-owned freshness. A later
+              -- hover does not run compiler probes, so these facts cannot be
+              -- retained as an exact hover context between completion requests.
+              local existing? = self.hover_context
+              local previous_id: string? = nil
+              if existing ~= nil then previous_id = existing.id end
+              local keep_source = not request.hover_only and existing ~= nil and existing.source and
+                existing.epoch == request.capture.epoch and existing.generation == request.generation and
+                existing.module_name == prepared.snapshot.module_name
+              -- The writer can commit before this waiter resumes. An intervening
+              -- edit must not let the resumed waiter install its old capture.
+              if not keep_source and prepared.hover_usable and #prepared.volatile_headers == 0 and current() and
+                  self.store:publish_hover(prepared.snapshot, current, previous_id) and current() then
+                self.hover_context = hover_context(prepared.snapshot, request.capture, request.hover_only)
+              end
+              -- Do not expose fresh candidates before their usable hover artifact
+              -- is accepted: selecting the snippet can immediately advance the
+              -- buffer and cancel publication for this capture.
+              if not request.hover_only and current() and self.store:publish(prepared.snapshot, current) and current() then
+                self.ready = Ready {
+                  id = prepared.snapshot.id,
+                  key = request.key,
+                  prefix = prepared.snapshot.prefix,
+                  range = prepared.range,
+                  volatile_headers = prepared.volatile_headers,
+                  validated_through = self.requests,
+                  filename = request.capture.document.path,
+                  session = request.capture.document.session,
+                  anchor = strings.sub(request.capture.document.text, 1, prepared.snapshot.replace_start),
+                  generation = request.generation,
+                }
+                self.previous_ready = self.ready
+              end
+            end
+          when failed(failure) then
+            logging.emit("debug", "completion.prepare.failure", {["message"] = strings.tostring(failure.error)})
+          when cancelled() then
+            self.ready = nil
+          else
+            raise "completion join returned running task"
+          end
+          self.preparation = nil
+        end
+      catch
+        if error is async.CancellationReason then raise end
+        logging.emit("debug", "completion.failure", {["message"] = strings.tostring(error)})
       end
-    catch
-      if error is async.CancellationReason then raise end
-      logging.emit("debug", "completion.failure", {["message"] = strings.tostring(error)})
-    end
-    self.active = nil
+      self.active = nil
     end
   end
   return nil
@@ -651,7 +711,7 @@ local function Service:schedule_hover()
   self.debounce = async.run<|nil, value|>(function (): nil
     timer.sleep(HOVER_DEBOUNCE_MS)
     if self.closed or self.hover_path == nil then return nil end
-    local capture? = self.buffers:capture(self.hover_path, source_text.Position.new(0, 0))
+    local capture? = self.buffers:capture(self.hover_path, source_text.Position(0, 0))
     if capture == nil or capture.document.session ~= self.hover_session then return nil end
     local generation = self.store:saved_generation()
     if generation <= 0 then return nil end
@@ -659,9 +719,16 @@ local function Service:schedule_hover()
     local key = "hover:" .. generation .. ":" .. capture.epoch .. ":" .. self.requests
     -- Explicit completion remains the foreground request. Its preparation can
     -- finish first; source analysis then fills the hole with actual editor text.
-    self.pending_hover = Request.new(capture, generation, nil, "", key, self.requests, nil, true)
+    self.pending_hover = Request {
+      capture = capture,
+      generation = generation,
+      module_name = "",
+      key = key,
+      sequence = self.requests,
+      hover_only = true,
+    }
     if self.worker == nil or self.worker:status():has_finished() then
-      self.worker = async.run<|nil, value|>(function (): nil return self:run() end)
+      self.worker = async.run<|nil, value|>(self:run)
     end
     return nil
   end)
@@ -672,7 +739,7 @@ function Service:changed()
     self.hover_context = nil
   end
   if self.hover_path ~= nil then
-    local capture? = self.buffers:capture(self.hover_path, source_text.Position.new(0, 0))
+    local capture? = self.buffers:capture(self.hover_path, source_text.Position(0, 0))
     if capture == nil then self.hover_session = 0
     else self.hover_session = capture.document.session end
   end
@@ -687,7 +754,7 @@ function Service:changed()
   self.sync_needed = true
   self:schedule_hover()
   if not self.closed and (self.worker == nil or self.worker:status():has_finished()) then
-    self.worker = async.run<|nil, value|>(function (): nil return self:run() end)
+    self.worker = async.run<|nil, value|>(self:run)
   end
 end
 
@@ -718,13 +785,20 @@ local function encode(selected: facts.Selection, range: source_text.Span,
   local finish = source_text.coordinate_index(capture.document.text):offset_for_position(range.finish)
   for index = 1, #selected.candidates do
     local candidate = selected.candidates[index]
-    items[index] = lsp.CompletionItem.new(candidate.label, candidate.kind, candidate.detail,
-      strings.format("%04d", index), candidate.label, lsp.TextEdit.new(range, candidate.label),
-      lsp.completion_call_snippet(capture.document.text, finish, candidate.call_snippet),
-      candidate.documentation)
+    items[index] = lsp.CompletionItem {
+      label = candidate.label,
+      kind = candidate.kind,
+      detail = candidate.detail,
+      sort_text = strings.format("%04d", index),
+      filter_text = candidate.label,
+      edit = lsp.TextEdit(range, candidate.label),
+      call_snippet = lsp.completion_call_snippet(
+        capture.document.text, finish, candidate.call_snippet),
+      documentation = candidate.documentation,
+    }
   end
   return dispatcher.SemanticOutcome.result(lsp.completion_list_value(
-    lsp.CompletionList.new(selected.is_incomplete, items), options))
+    lsp.CompletionList(selected.is_incomplete, items), options))
 end
 
 local function Service:provisional(request: Request): dispatcher.SemanticOutcome?
@@ -751,13 +825,13 @@ local function Service:answer(request: Request): dispatcher.SemanticOutcome
   if self.ready == nil or not self.ready:valid_for(request) then
     if self.active == nil or self.active.key ~= request.key then self.pending = request end
     if self.worker == nil or self.worker:status():has_finished() then
-      self.worker = async.run<|nil, value|>(function (): nil return self:run() end)
+      self.worker = async.run<|nil, value|>(self:run)
     end
     local provisional? = self:provisional(request)
     if provisional ~= nil then return provisional end
     -- The request owns no compiler task or scheduler permit. A held hydration
     -- permit therefore yields a bounded, truthful retryable response.
-    for attempt = 1, 15 do
+    for _ = 1, 15 do
       if self.ready ~= nil and self.ready:valid_for(request) then break end
       if not self:request_current(request) then return empty() end
       if self.worker:status():has_finished() then break end
@@ -789,7 +863,15 @@ function Service:capture(request: dispatcher.CompletionRequest): coordinator.Com
   local key = generation .. ":" .. capture.epoch .. ":" .. capture.document.session ..
     ":" .. capture.document.version .. ":" .. capture.position.line .. ":" .. capture.position.character
   self.requests = self.requests + 1
-  local captured = Request.new(capture, generation, nil, "", key, self.requests, request.options, false)
+  local captured = Request {
+    capture = capture,
+    generation = generation,
+    module_name = "",
+    key = key,
+    sequence = self.requests,
+    options = request.options,
+    hover_only = false,
+  }
   if self.hover_path ~= capture.document.path or self.hover_session ~= capture.document.session then
     self.pending_hover = nil
     local debounce? = self.debounce
@@ -841,7 +923,7 @@ local function Service:read_hover(capture: buffers.Capture,
 end
 
 function Service:hover(capture: buffers.Capture): dispatcher.SemanticOutcome?
-  for attempt = 1, 2 do
+  for _ = 1, 2 do
     local context? = self.hover_context
     if self.closed or context == nil or not self.buffers:current(capture) then return nil end
     local outcome? = self:read_hover(capture, context)

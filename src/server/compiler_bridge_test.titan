@@ -5719,10 +5719,9 @@ function test_compiler_bridge_raw_source_descriptor_uses_canonical_native_output
   local host = bridge.host_target()
   local root = test_paths.workspace_root() .. "/src"
   local flat_main = root .. "/pkg/service." .. host .. ".titan"
-  local flat_descriptor = bridge.raw_source_descriptor(
-    bridge.ProjectModule.new("pkg.service", {
-      bridge.SourceFile.new(flat_main, "function run(): integer return 1 end\n"),
-    })) as {string: value}
+  local flat_descriptor = bridge.ProjectModule("pkg.service", {
+    bridge.SourceFile(flat_main, "function run(): integer return 1 end\n"),
+  }):raw_source_descriptor() as {string: value}
   test.assert(flat_descriptor["kind"] == "flat" and
               flat_descriptor["main"] == flat_main and
               flat_descriptor["native_output"] == root .. "/pkg/service.titan",
@@ -5730,21 +5729,19 @@ function test_compiler_bridge_raw_source_descriptor_uses_canonical_native_output
 
   local folder_main = root .. "/pkg/folder/folder." .. host .. ".titan"
   local folder_contrib = root .. "/pkg/folder/ops.native.titan"
-  local folder_descriptor = bridge.raw_source_descriptor(
-    bridge.ProjectModule.new("pkg.folder", {
-      bridge.SourceFile.new(folder_main, "function run(): integer return 1 end\n"),
-      bridge.SourceFile.new(folder_contrib, "function extra(): integer return 2 end\n"),
-    })) as {string: value}
+  local folder_descriptor = bridge.ProjectModule("pkg.folder", {
+    bridge.SourceFile(folder_main, "function run(): integer return 1 end\n"),
+    bridge.SourceFile(folder_contrib, "function extra(): integer return 2 end\n"),
+  }):raw_source_descriptor() as {string: value}
   test.assert(folder_descriptor["kind"] == "folder" and
               folder_descriptor["main"] == folder_main and
               folder_descriptor["native_output"] ==
                 root .. "/pkg/folder/folder.titan",
               "folder variant descriptor did not use canonical logical native_output")
 
-  local single_folder = bridge.raw_source_descriptor(
-    bridge.ProjectModule.new("pkg.folder", {
-      bridge.SourceFile.new(folder_main, "function run(): integer return 1 end\n"),
-    })) as {string: value}
+  local single_folder = bridge.ProjectModule("pkg.folder", {
+    bridge.SourceFile(folder_main, "function run(): integer return 1 end\n"),
+  }):raw_source_descriptor() as {string: value}
   test.assert(single_folder["native_output"] ==
               root .. "/pkg/folder/folder.titan",
               "one-file folder variant descriptor lost canonical logical native_output")
@@ -5815,4 +5812,33 @@ function test_compiler_bridge_analyzes_variant_modules_and_ignores_titan_target_
                 second:find_module("consumer") ~= nil,
                 "cached variant source entry failed incremental reuse")
   end)
+end
+
+function test_compiler_bridge_header_dependency_kind_codecs(_context: test.Context)
+  local file_kind = bridge.CHeaderDependencyKind.file()
+  local search_kind = bridge.CHeaderDependencyKind.search()
+  local origin_kind = bridge.CHeaderDependencyKind.origin()
+  test.assert(file_kind:name() == "file" and file_kind:code() == 0,
+              "file kind codec mismatch")
+  test.assert(search_kind:name() == "search" and search_kind:code() == 1,
+              "search kind codec mismatch")
+  test.assert(origin_kind:name() == "origin" and origin_kind:code() == 2,
+              "origin kind codec mismatch")
+  local decoded_file? = bridge.header_dependency_kind_from_name("file")
+  local decoded_search? = bridge.header_dependency_kind_from_name("search")
+  local decoded_origin? = bridge.header_dependency_kind_from_name("origin")
+  test.assert(decoded_file ~= nil and decoded_file:code() == 0 and
+              decoded_search ~= nil and decoded_search:code() == 1 and
+              decoded_origin ~= nil and decoded_origin:code() == 2 and
+              bridge.header_dependency_kind_from_name("unknown") == nil,
+              "header_dependency_kind_from_name mismatch")
+  local from_zero? = bridge.header_dependency_kind_from_code(0)
+  local from_one? = bridge.header_dependency_kind_from_code(1)
+  local from_two? = bridge.header_dependency_kind_from_code(2)
+  test.assert(from_zero ~= nil and from_zero:name() == "file" and
+              from_one ~= nil and from_one:name() == "search" and
+              from_two ~= nil and from_two:name() == "origin" and
+              bridge.header_dependency_kind_from_code(-1) == nil and
+              bridge.header_dependency_kind_from_code(3) == nil,
+              "header_dependency_kind_from_code mismatch")
 end

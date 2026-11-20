@@ -18,12 +18,12 @@ foreign import "compiler_io_platform.h"
 type CheckpointListener = function (string?): ()
 
 local record CompilerProgress
-  attempt: integer
-  root_module: string
+  const attempt: integer
+  const root_module: string
   completed_modules: integer
-  timing: boolean
-  started_wall_seconds: integer
-  started_cpu: float
+  const timing: boolean
+  const started_wall_seconds: integer
+  const started_cpu: float
 end
 
 -- This is the followed filesystem identity observed when lstat found a
@@ -32,14 +32,14 @@ end
 -- while the compiler still receives unchanged lstat semantics.
 --- Exact followed filesystem identity observed during one compiler analysis.
 record LstatIdentity
-  path: string
-  size: integer
-  kind: string
-  device: integer?
-  inode: integer?
-  modified_seconds: integer
-  modified_nanoseconds: integer
-  native_identity: string?
+  const path: string
+  const size: integer
+  const kind: string
+  const device: integer?
+  const inode: integer?
+  const modified_seconds: integer
+  const modified_nanoseconds: integer
+  const native_identity: string?
 end
 
 local record LstatObservation
@@ -86,13 +86,12 @@ end
 
 --- Create an isolated compiler I/O strategy and its observation state.
 function create(): CompilerIO
-  return CompilerIO.new(false, 0, nil, nil, false, {})
-end
-
-local function copy_lstat_identity(source: LstatIdentity): LstatIdentity
-  return LstatIdentity.new(
-    source.path, source.size, source.kind, source.device, source.inode,
-    source.modified_seconds, source.modified_nanoseconds, source.native_identity)
+  return CompilerIO {
+    proxy_marker = false,
+    next_attempt = 0,
+    observing_lstats = false,
+    lstat_observations = {},
+  }
 end
 
 --- Compare all recorded filesystem identity fields without narrowing host bit patterns.
@@ -109,9 +108,15 @@ function same_lstat_identity(left: LstatIdentity,
 end
 
 local function identity_for(path: string, metadata: fs.Stat): LstatIdentity
-  return LstatIdentity.new(
-    path, metadata.size, metadata.kind, metadata.device, metadata.inode,
-    metadata.modified_seconds, metadata.modified_nanoseconds)
+  return LstatIdentity {
+    path = path,
+    size = metadata.size,
+    kind = metadata.kind,
+    device = metadata.device,
+    inode = metadata.inode,
+    modified_seconds = metadata.modified_seconds,
+    modified_nanoseconds = metadata.modified_nanoseconds,
+  }
 end
 
 -- Only the Windows embedded provider carries an opaque identity. Its native
@@ -138,7 +143,7 @@ end
 local function same_optional_lstat_identity(left: LstatIdentity?,
                                              right: LstatIdentity?): boolean
   if left == nil or right == nil then return left == nil and right == nil end
-  return same_lstat_identity(left as LstatIdentity, right as LstatIdentity)
+  return same_lstat_identity(left, right)
 end
 
 local function CompilerIO:observe_lstat(path: string,
@@ -146,7 +151,7 @@ local function CompilerIO:observe_lstat(path: string,
   if not self.observing_lstats then return end
   local previous? = self.lstat_observations[path]
   if previous == nil then
-    self.lstat_observations[path] = LstatObservation.new(identity, true)
+    self.lstat_observations[path] = LstatObservation(identity, true)
   elseif previous.consistent and
          not same_optional_lstat_identity(previous.identity, identity) then
     previous.consistent = false
@@ -176,7 +181,7 @@ function consistent_lstat_identity(strategy: CompilerIO,
      observation.identity == nil then
     return nil
   end
-  return copy_lstat_identity(observation.identity as LstatIdentity)
+  return observation.identity
 end
 
 -- The bridge installs this only for the lifetime of one incremental analysis.
@@ -200,9 +205,14 @@ local function CompilerIO:begin_attempt(root_module: string): integer
   catch
     -- Optional telemetry cannot prevent a compiler attempt from starting.
   end
-  self.progress = CompilerProgress.new(
-    self.next_attempt, root_module, 0, timing, started_wall_seconds,
-    started_cpu)
+  self.progress = CompilerProgress {
+    attempt = self.next_attempt,
+    root_module = root_module,
+    completed_modules = 0,
+    timing = timing,
+    started_wall_seconds = started_wall_seconds,
+    started_cpu = started_cpu,
+  }
   return self.next_attempt
 end
 
@@ -267,7 +277,7 @@ function CompilerIO:stat(path: string): ({string: value}?, string?)
   if not valid then return nil, path_error end
   local metadata? = fs.stat(path)
   if not metadata then return nil, nil end
-  return stat_map(metadata as fs.Stat), nil
+  return stat_map(metadata), nil
 catch
   return nil, failure_message(error)
 end
@@ -280,7 +290,6 @@ function CompilerIO:lstat(path: string): ({string: value}?, string?)
     self:observe_lstat(path, nil)
     return nil, nil
   end
-  local lstat_metadata = metadata as fs.Stat
   if self.observing_lstats then
     -- Do not change the public lstat result when this validation-only follow
     -- fails. Cancellation remains authoritative because the extra stat is a
@@ -291,14 +300,14 @@ function CompilerIO:lstat(path: string): ({string: value}?, string?)
         self:observe_lstat(path, nil)
       else
         self:observe_lstat(
-          path, identity_for(path, followed as fs.Stat))
+          path, identity_for(path, followed))
       end
     catch
       if error is async.CancellationReason then raise end
       self:observe_lstat(path, nil)
     end
   end
-  return stat_map(lstat_metadata), nil
+  return stat_map(metadata), nil
 catch
   if error is async.CancellationReason then raise end
   return nil, failure_message(error)
@@ -327,7 +336,7 @@ function CompilerIO:executable(path: string): (boolean?, string?)
   return query(path)
 end
 
-local function read_bounded_chunks(reader: function (integer): string?,
+local function read_bounded_chunks(reader: function (integer?): string?,
                                    max_bytes: integer): string
   local output = strings.writer()
   local remaining = max_bytes + 1
@@ -355,9 +364,7 @@ function CompilerIO:read_file(path: string,
     -- bounded prefix and never materialize the rest of a large replacement.
     local file = fs.open(path, "r")
     defer file:close()
-    return read_bounded_chunks(function (remaining: integer): string?
-      return file:read(remaining)
-    end, max_bytes), nil
+    return read_bounded_chunks(file:read, max_bytes), nil
   end
   return fs.read_file(path), nil
 catch
@@ -393,20 +400,20 @@ catch
 end
 
 local record ReleasedReservation
-  path: string?
-  message: string?
+  const path: string?
+  const message: string?
 end
 
-local function release_reservation(strategy: CompilerIO): ReleasedReservation
-  local reservation?, reservation_error? = strategy:tmpname()
+local function CompilerIO:release_reservation(): ReleasedReservation
+  local reservation?, reservation_error? = self:tmpname()
   if not reservation then
-    return ReleasedReservation.new(nil, reservation_error)
+    return ReleasedReservation { message = reservation_error }
   end
-  local removed?, remove_error? = strategy:unlink(reservation as string)
+  local removed?, remove_error? = self:unlink(reservation)
   if not removed then
-    return ReleasedReservation.new(nil, remove_error)
+    return ReleasedReservation { message = remove_error }
   end
-  return ReleasedReservation.new(reservation, nil)
+  return ReleasedReservation { path = reservation }
 end
 
 function CompilerIO:write_file(path: string,
@@ -421,9 +428,9 @@ function CompilerIO:write_file(path: string,
   -- calling compiler Task is cancelled while joining it, the child still owns
   -- enough state to finish the unlink instead of losing a completed tmpname.
   local release = async.run<|ReleasedReservation, value|>(
-    function (): ReleasedReservation return release_reservation(self) end)
+    self:release_reservation)
   local reservation?: string = nil
-  case async.join<|ReleasedReservation, value|>(release)
+  case async.join(release)
   when succeeded(result) then
     if not result.path then return nil, result.message end
     reservation = result.path
@@ -435,7 +442,7 @@ function CompilerIO:write_file(path: string,
     return nil, "temporary-name reservation task did not finish"
   end
   local temporary = path .. "." ..
-    paths.basename(reservation as string) .. ".tmp"
+    paths.basename(reservation) .. ".tmp"
   return write_atomic(path, contents, temporary)
 end
 
@@ -491,7 +498,7 @@ function CompilerIO:unlink(path: string,
     return true, nil
   end
   local metadata? = fs.lstat(path)
-  if metadata and (metadata as fs.Stat).kind == "directory" then
+  if metadata and metadata.kind == "directory" then
     return nil, "cannot unlink directory '" .. path .. "'"
   end
   fs.unlink(path)
@@ -543,7 +550,11 @@ local record TmpnameHandoff
 end
 
 function CompilerIO:tmpname(): (string?, string?)
-  local handoff = TmpnameHandoff.new(nil, nil, false, false, false)
+  local handoff = TmpnameHandoff {
+    accepted = false,
+    abandoned = false,
+    finished = false,
+  }
   async.run<|nil, value|>(function (): nil
     do
       local path = fs.tmpname()
@@ -651,10 +662,10 @@ local function normalize_argv(candidate: value):
   local argv: {string} = {}
   for index = 1, length do
     local raw? = source[index]
-    if raw == nil or not ((raw as value) is string) then
+    if raw == nil or not (raw is string) then
       return nil, "command argument " .. index .. " must be a string"
     end
-    local argument = (raw as value) as string
+    local argument = raw as string
     local nul? = strings.find(argument, "\0")
     if nul then
       return nil, "command argument " .. index .. " contains a NUL byte"
@@ -696,22 +707,20 @@ end
 local function required_input(candidate: system.InputStream?,
                               subject: string): system.InputStream
   if not candidate then raise subject .. " was not captured" end
-  return candidate as system.InputStream
+  return candidate
 end
 
 local function required_output(candidate: system.OutputStream?,
                                subject: string): system.OutputStream
   if not candidate then raise subject .. " was not captured" end
-  return candidate as system.OutputStream
+  return candidate
 end
 
 local function kill_owned_process(process: system.Process)
-  do
-    if process:is_running() then process:kill("kill") end
-  catch
-    -- The child may have exited between the OS query and the signal. Its
-    -- already-started wait Task below remains the authoritative reaper.
-  end
+  if process:is_running() then process:kill("kill") end
+catch
+  -- The child may have exited between the OS query and the signal. Its
+  -- already-started wait Task below remains the authoritative reaper.
 end
 
 local function capture_failure(command: string, diagnostic: string,
@@ -736,80 +745,77 @@ local function capture_process(process: system.Process,
   local reader = async.run<|string, value|>(function (): string
     return read_all(output)
   end)
-  local waiter = async.run<|system.ExitStatus, value|>(
-    function (): system.ExitStatus return process:wait() end)
+  local waiter = async.run<|system.ExitStatus, value|>(process:wait)
 
-  do
-    input:close()
-    local read_status, wait_status = async.join_two(reader, waiter)
+  input:close()
+  local read_status, wait_status = async.join_two(reader, waiter)
 
-    local captured? : string = nil
-    case read_status
-    when succeeded(bytes) then captured = bytes
-    when failed(failure) then
-      return capture_failure(
-        command, "could not capture command output: " ..
-        failure_message(failure.error), true)
-    when cancelled() then
-      return capture_failure(
-        command, "captured command reader was cancelled", true)
-    else
-      return capture_failure(
-        command, "captured command reader did not finish", true)
-    end
-
-    local status?: system.ExitStatus = nil
-    case wait_status
-    when succeeded(exit_status) then status = exit_status
-    when failed(failure) then
-      return capture_failure(
-        command, (captured as string) ..
-        "\nfailed waiting for command: " .. failure_message(failure.error),
-        true)
-    when cancelled() then
-      return capture_failure(
-        command, "captured command wait was cancelled", true)
-    else
-      return capture_failure(
-        command, "captured command wait did not finish", true)
-    end
-
-    local actual = status as system.ExitStatus
-    local signal?: integer = nil
-    if actual.signal_number > 0 then signal = actual.signal_number end
-    local interrupted = signal ~= nil
-    local why = "exit"
-    local normalized_status = actual.code
-    local shell_status?: integer = nil
-    if interrupted then
-      why = "signal"
-      normalized_status = signal
-      if normalized_status >= 1 and normalized_status <= 64 then
-        shell_status = 128 + normalized_status
-      end
-    end
-    local missing = not interrupted and
-      (actual.code == 126 or actual.code == 127)
-    local succeeded = actual.code == 0
-    if interrupted then succeeded = false end
-
-    local result: {string: value} = {
-      ["started"] = not missing,
-      ["ok"] = succeeded,
-      ["status"] = normalized_status,
-      ["interrupted"] = interrupted,
-      ["command"] = command,
-      ["diagnostic"] = captured as string,
-      ["output"] = captured as string,
-    }
-    if signal then result["signal"] = signal end
-    if shell_status then result["shell_status"] = shell_status as integer end
-    result["why"] = why
-    return result
-  catch
-    kill_owned_process(process)
-    raise
+  local captured = ""
+  case read_status
+  when succeeded(bytes) then captured = bytes
+  when failed(failure) then
+    return capture_failure(
+      command, "could not capture command output: " ..
+      failure_message(failure.error), true)
+  when cancelled() then
+    return capture_failure(
+      command, "captured command reader was cancelled", true)
+  else
+    return capture_failure(
+      command, "captured command reader did not finish", true)
   end
+
+  local status?: system.ExitStatus = nil
+  case wait_status
+  when succeeded(exit_status) then status = exit_status
+  when failed(failure) then
+    return capture_failure(
+      command, captured ..
+      "\nfailed waiting for command: " .. failure_message(failure.error),
+      true)
+  when cancelled() then
+    return capture_failure(
+      command, "captured command wait was cancelled", true)
+  else
+    return capture_failure(
+      command, "captured command wait did not finish", true)
+  end
+
+  local actual = status
+  local signal?: integer = nil
+  if actual.signal_number > 0 then signal = actual.signal_number end
+  local interrupted = signal ~= nil
+  local why = "exit"
+  local normalized_status = actual.code
+  local shell_status?: integer = nil
+  if interrupted then
+    why = "signal"
+    normalized_status = signal
+    if normalized_status >= 1 and normalized_status <= 64 then
+      shell_status = 128 + normalized_status
+    end
+  end
+  local missing = not interrupted and
+    (actual.code == 126 or actual.code == 127)
+  local succeeded = actual.code == 0
+  if interrupted then succeeded = false end
+
+  local result: {string: value} = {
+    ["started"] = not missing,
+    ["ok"] = succeeded,
+    ["status"] = normalized_status,
+    ["interrupted"] = interrupted,
+    ["command"] = command,
+    ["diagnostic"] = captured,
+    ["output"] = captured,
+  }
+  if signal then result["signal"] = signal end
+  if shell_status then result["shell_status"] = shell_status end
+  result["why"] = why
+  return result
+catch
+  kill_owned_process(process)
+  raise
 end
 
 local function capture_spawned_process(process: system.Process,
@@ -900,8 +906,7 @@ local function spawn_and_capture(env_arguments: {string}, command: string,
     env_arguments, command, merged)
   local elapsed? = elapsed_monotonic_ms(started, monotonic_ms())
   if elapsed ~= nil then
-    local measured = elapsed as float
-    result["wall_ms"] = measured
+    result["wall_ms"] = elapsed
   end
   return result
 end
@@ -909,20 +914,18 @@ end
 local function run_checked(argv_value: value,
                            options_value: value): {string: value}
   local argv?, argv_error? = normalize_argv(argv_value)
-  if not argv then return invalid_run(argv_error as string) end
+  if not argv then return invalid_run(argv_error) end
   if #argv == 0 then return invalid_run("command is empty") end
   local merged?, options_error? = merge_stderr(options_value)
-  if merged == nil then return invalid_run(options_error as string) end
+  if merged == nil then return invalid_run(options_error) end
 
-  local arguments = argv as {string}
-  local should_merge = merged as boolean
-  local command = command_label(arguments, should_merge)
+  local command = command_label(argv, merged)
   local env_arguments: {string} = {"LANG=C", "LC_ALL=C"}
-  for index = 1, #arguments do
-    env_arguments[#env_arguments + 1] = arguments[index]
+  for index = 1, #argv do
+    env_arguments[#env_arguments + 1] = argv[index]
   end
 
-  return spawn_and_capture(env_arguments, command, should_merge)
+  return spawn_and_capture(env_arguments, command, merged)
 catch
   if error is async.CancellationReason then raise end
   return invalid_run("command must be a dense argument array")

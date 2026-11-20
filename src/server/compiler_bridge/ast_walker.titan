@@ -1,0 +1,1160 @@
+-- AST traversal, symbol occurrences, diagnostics, and manifest serialization.
+
+local record Walker
+  const compiler: Compiler
+  const module_name: string
+  local const work: NormalizationWork
+  const nodes: {Node}
+  const symbols: {SymbolOccurrence}
+  const imports: {Import}
+  local const seen: {value: boolean}
+  local const hover_summaries: {HoverSummary}
+  local const summary_ids: {string: integer}
+  local const summary_views: {string: integer}
+  local case_variant: value
+end
+
+local record NormalizedModule
+  const snapshot: ModuleSnapshot
+  const embedded_provider: boolean
+end
+
+local function raw_location(candidate: value, subject: string): SourceLocation
+  local loc = required_map(candidate, DRIVER_MODULE, subject)
+  local filename = required_string(
+    loc["filename"], DRIVER_MODULE, subject .. ".filename")
+  local line = required_integer(
+    loc["line"], DRIVER_MODULE, subject .. ".line")
+  local column = required_integer(
+    loc["col"], DRIVER_MODULE, subject .. ".col")
+  if line < 1 or column < 1 then
+    return fail<|SourceLocation|>(
+      DRIVER_MODULE, subject .. " must use positive line and column values")
+  end
+  return SourceLocation(filename, line, column)
+end
+
+local function optional_location(node: {string: value},
+                                 subject: string): SourceLocation?
+  local candidate: value = node["loc"]
+  if candidate == nil then return nil end
+  return raw_location(candidate, subject .. ".loc")
+end
+
+local function optional_field_location(node: {string: value}, field: string,
+                                       subject: string): SourceLocation?
+  local candidate: value = node[field]
+  if candidate == nil then return nil end
+  return raw_location(candidate, subject .. "." .. field)
+end
+
+local function semantic_location(node: {string: value},
+                                 subject: string): SourceLocation?
+  local exact? = optional_field_location(node, "_name_loc", subject)
+  if exact ~= nil then return exact end
+  return optional_location(node, subject)
+end
+
+-- `_end_loc` is the start of the closing `end`/`until`. `_structure_loc`
+-- exists only for an explicit `do ... end` StatBlock; all other parser-marked
+-- structures begin at their ordinary diagnostic location.
+local function structural_span(node: {string: value},
+                               subject: string): SourceSpan?
+  local finish? = optional_field_location(node, "_end_loc", subject)
+  if finish == nil then return nil end
+  local start? = optional_field_location(node, "_structure_loc", subject)
+  if start == nil then start = optional_location(node, subject) end
+  if start == nil then
+    return fail<|SourceSpan|>(DRIVER_MODULE,
+      subject .. " has _end_loc without a structural start")
+  end
+  if start.filename ~= finish.filename then
+    return fail<|SourceSpan|>(DRIVER_MODULE,
+      subject .. " structural span crosses source files")
+  end
+  if finish.line < start.line or
+     (finish.line == start.line and finish.column < start.column) then
+    return fail<|SourceSpan|>(DRIVER_MODULE,
+      subject .. " structural span finishes before it starts")
+  end
+  return SourceSpan(start, finish)
+end
+
+local function exact_name_span(location: SourceLocation,
+                               name: string): SourceSpan
+  return SourceSpan(
+    location,
+    SourceLocation(location.filename, location.line, location.column + #name))
+end
+
+local function Compiler:adjustment_info(candidate: value,
+                                        subject: string): AdjustmentInfo
+  local raw = required_map(candidate, TYPES_MODULE, subject)
+  local kind = required_string(raw["kind"], TYPES_MODULE, subject .. ".kind")
+  local operation: string? = optional_string(
+    raw["op"], TYPES_MODULE, subject .. ".op")
+  local source: TypeInfo? = nil
+  local target: TypeInfo? = nil
+  if raw["source"] ~= nil then
+    source = self:render_type(raw["source"], subject .. ".source")
+  end
+  if raw["target"] ~= nil then
+    target = self:render_type(raw["target"], subject .. ".target")
+  end
+  if kind == "direct_coercion" then
+    local nested = required_map(
+      raw["coercion"], TYPES_MODULE, subject .. ".coercion")
+    operation = optional_string(
+      nested["op"], TYPES_MODULE, subject .. ".coercion.op")
+  end
+  return AdjustmentInfo(kind, operation, source, target)
+end
+
+local function Compiler:normalize_adjustment(candidate: value,
+                                             subject: string): Adjustment
+  local info = self:adjustment_info(candidate, subject)
+  if info.kind == "identity" then return Adjustment.identity(info) end
+  if info.kind == "direct_coercion" then
+    return Adjustment.coercion(info)
+  end
+  if info.kind == "gradual_view" then return Adjustment.gradual(info) end
+  if info.kind == "callable" then return Adjustment.callable(info) end
+  if info.kind == "written_cast" then return Adjustment.written(info) end
+  return Adjustment.other(info)
+end
+
+local function node_kind(tag: string): NodeKind
+  if strings.sub(tag, 1, 12) == "Ast.TopLevel"
+      or tag == "Ast.Decl" or tag == "Ast.UnionVariant"
+      or tag == "Ast.InterfaceMethod" then
+    return NodeKind.declaration()
+  end
+  if strings.sub(tag, 1, 8) == "Ast.Stat" or tag == "Ast.Then"
+      or tag == "Ast.CaseArm" then
+    return NodeKind.statement()
+  end
+  if strings.sub(tag, 1, 7) == "Ast.Exp" or strings.sub(tag, 1, 8) == "Ast.Args"
+      or tag == "Ast.Field" then
+    return NodeKind.expression()
+  end
+  if strings.sub(tag, 1, 7) == "Ast.Var" then
+    return NodeKind.variable()
+  end
+  if strings.sub(tag, 1, 8) == "Ast.Type"
+      or tag == "Ast.TypeParam" then
+    return NodeKind.type_syntax()
+  end
+  return NodeKind.other()
+end
+
+local function node_name(node: {string: value}, tag: string): string?
+  if tag == "Ast.TopLevelMethod" or tag == "Ast.TopLevelStatic"
+      or tag == "Ast.TopLevelFunc" or tag == "Ast.TopLevelForeignFunc"
+      or tag == "Ast.TopLevelTypeAlias" or tag == "Ast.TopLevelRecord"
+      or tag == "Ast.TopLevelForeignTypeAlias"
+      or tag == "Ast.TopLevelUnion" or tag == "Ast.TopLevelInterface"
+      or tag == "Ast.Decl" or tag == "Ast.UnionVariant"
+      or tag == "Ast.InterfaceMethod" or tag == "Ast.TypeParam"
+      or tag == "Ast.VarName" or tag == "Ast.VarDot"
+      or tag == "Ast.TypeName" or tag == "Ast.TypeQualName"
+      or tag == "Ast.TypeForeignName"
+      or tag == "Ast.ExpMethodRef" or tag == "Ast.CaseArm" then
+    return optional_string(node["name"], DRIVER_MODULE, tag .. ".name")
+  end
+  if tag == "Ast.Field" then
+    local name: value = node["name"]
+    if name == nil then return nil end
+    if name is string then return name as string end
+    required_map(name, DRIVER_MODULE, tag .. ".name")
+    return nil
+  end
+  if tag == "Ast.ArgsMethod" or tag == "Ast.ArgsNamedMethod" then
+    return optional_string(node["method"], DRIVER_MODULE, tag .. ".method")
+  end
+  if tag == "Ast.TopLevelImport" then
+    return optional_string(
+      node["localname"], DRIVER_MODULE, tag .. ".localname")
+  end
+  return nil
+end
+
+local function foreign_namespace_member(node: {string: value},
+                                         tag: string): boolean
+  return tag == "Type.ModuleMember" and node["_foreign_namespace"] == true
+end
+
+local function node_is_local(node: {string: value}): boolean
+  local tag = required_string(node["_tag"], DRIVER_MODULE, "AST _tag")
+  if tag == "Ast.TopLevelForeignTypeAlias" then
+    -- Foreign aliases are always source-local.
+    return true
+  end
+  if tag == "Ast.TopLevelForeignFunc" and node["islocal"] == nil then
+    -- The published 0.6 compiler predates public foreign functions and omits
+    -- this marker. Current compilers explicitly distinguish public and local.
+    return true
+  end
+  if tag == "Ast.TopLevelImport" then
+    -- Titan module aliases are local bindings even without an AST marker.
+    -- Nameless foreign directives introduce no binding of their own.
+    return true
+  end
+  if tag == "Checker.ForeignNamespace" or
+      foreign_namespace_member(node, tag) then return true end
+  if optional_boolean(node["islocal"], DRIVER_MODULE, "AST islocal") then
+    return true
+  end
+  local depth: value = node["_funcdepth"]
+  if depth ~= nil then
+    return required_integer(depth, DRIVER_MODULE, "AST _funcdepth") > 0
+  end
+  return false
+end
+
+local function node_is_synthetic(node: {string: value}, tag: string): boolean
+  return optional_boolean(
+      node["_record_constructor"], DRIVER_MODULE, tag .. "._record_constructor")
+    or optional_boolean(
+      node["_union_constructor"], DRIVER_MODULE, tag .. "._union_constructor")
+    or optional_boolean(
+      node["_implicit_coercion"], DRIVER_MODULE, tag .. "._implicit_coercion")
+end
+
+local function node_has_synthetic_children(node: {string: value},
+                                           tag: string): boolean
+  return optional_boolean(
+      node["_record_constructor"], DRIVER_MODULE, tag .. "._record_constructor")
+    or optional_boolean(
+      node["_union_constructor"], DRIVER_MODULE, tag .. "._union_constructor")
+end
+
+local function declaration_namespace(raw: {string: value}, tag: string): string
+  if tag == "Ast.TopLevelForeignTypeAlias" then return "foreign_type" end
+  if tag == "Ast.TopLevelTypeAlias" or tag == "Ast.TopLevelInterface"
+      or tag == "Type.Interface" or tag == "Type.GenericAlias" then
+    return "type"
+  end
+  if tag == "Checker.TypeMember" then
+    local target = required_map(
+      raw["type"], DRIVER_MODULE, "Checker.TypeMember.type")
+    -- Qualified record/union type syntax wraps the ordinary module member.
+    -- Its type mentions and constructor namespace refer to one declaration.
+    -- Aliases and Interfaces instead carry their target type directly, even
+    -- when an alias offers the same constructor syntax as a nominal owner.
+    if target["_tag"] ~= "Type.ModuleMember" then return "type" end
+  end
+  return "value"
+end
+
+local function module_declaration_identity(module_name: string,
+                                           raw: {string: value},
+                                           tag: string, name: string): string
+  local visibility = node_is_local(raw) and "source:" or "export:"
+  return visibility .. module_name .. ":" ..
+    declaration_namespace(raw, tag) .. ":" .. name
+end
+
+local function ast_identity(module_name: string, raw: {string: value},
+                            tag: string, name: string): string
+  if strings.sub(tag, 1, 12) == "Ast.TopLevel"
+      and tag ~= "Ast.TopLevelImport"
+      and tag ~= "Ast.TopLevelForeignImport" then
+    return module_declaration_identity(module_name, raw, tag, name)
+  end
+  local location: SourceLocation? = semantic_location(
+    raw, "symbol declaration")
+  if not location then return "ast:" .. module_name .. ":" .. tag .. ":" .. name end
+  return "ast:" .. module_name .. ":" .. location.filename .. ":" ..
+    location.line .. ":" .. location.column .. ":" .. name
+end
+
+local function declaration_identity(module_name: string, candidate: value): string?
+  if candidate == nil then return nil end
+  local raw = required_map(candidate, DRIVER_MODULE, "symbol declaration")
+  local tag = required_string(
+    raw["_tag"], DRIVER_MODULE, "symbol declaration._tag")
+  if tag == "Checker.ForeignNamespace" then
+    local namespace_type = required_map(
+      raw["_type"], DRIVER_MODULE, "foreign namespace._type")
+    if raw["name"] ~= "ffi" or raw["_builtin"] ~= true or
+        namespace_type["_tag"] ~= "Type.CModule" or
+        namespace_type["name"] ~= "ffi" then
+      return fail<|string|>(DRIVER_MODULE, "invalid builtin foreign namespace")
+    end
+    -- This compiler-owned namespace has written references but no source
+    -- declaration. Each module has its own combined C environment.
+    return "builtin:" .. module_name .. ":ffi"
+  end
+  if foreign_namespace_member(raw, tag) then
+    return "foreign:" .. module_name .. ":value:" .. required_string(
+      raw["name"], DRIVER_MODULE, "foreign namespace member.name")
+  end
+  if tag == "Ast.Decl" then
+    local canonical: value = raw["_decl"]
+    if canonical ~= nil and canonical ~= candidate then
+      return declaration_identity(module_name, canonical)
+    end
+  end
+  if strings.sub(tag, 1, 4) == "Ast." then
+    local name: string? = optional_string(
+      raw["name"], DRIVER_MODULE, "symbol declaration.name")
+    if tag == "Ast.TopLevelForeignImport" then return nil end
+    if tag == "Ast.TopLevelImport" then
+      name = optional_string(
+        raw["localname"], DRIVER_MODULE, "symbol declaration.localname")
+    elseif tag == "Ast.TopLevelVar" then
+      local declaration = required_map(
+        raw["decl"], DRIVER_MODULE, "Ast.TopLevelVar.decl")
+      name = required_string(
+        declaration["name"], DRIVER_MODULE, "Ast.TopLevelVar.decl.name")
+    end
+    if not name then return nil end
+    return ast_identity(module_name, raw, tag, name)
+  end
+  if strings.sub(tag, 1, 5) == "Type." and
+      (strings.sub(tag, 1, 6) == "Type.C" or tag == "Type.Invalid") then
+    -- Foreign/compiler-only descriptors have no navigable Titan declaration
+    -- in V1. Do not manufacture a project identity for them.
+    return nil
+  end
+  if strings.sub(tag, 1, 8) == "Checker." and
+      tag ~= "Checker.TypeMember" and tag ~= "Checker.Parameter" then
+    return nil
+  end
+  local name = required_string(
+    raw["name"], DRIVER_MODULE, "symbol declaration.name")
+  if tag == "Checker.Parameter" then
+    local owner_kind = required_string(
+      raw["owner_kind"], DRIVER_MODULE,
+      "Checker.Parameter.owner_kind")
+    if owner_kind ~= "module" and owner_kind ~= "member" then
+      return fail<|string|>(DRIVER_MODULE,
+        "Checker.Parameter.owner_kind must be 'module' or 'member'")
+    end
+    local owner_name = required_string(
+      raw["owner_name"], DRIVER_MODULE,
+      "Checker.Parameter.owner_name")
+    local callable_name = required_string(
+      raw["callable_name"], DRIVER_MODULE,
+      "Checker.Parameter.callable_name")
+    local index = required_integer(
+      raw["index"], DRIVER_MODULE, "Checker.Parameter.index")
+    if index < 1 then
+      return fail<|string|>(DRIVER_MODULE,
+        "Checker.Parameter.index must be positive")
+    end
+    if raw["_foreign_namespace"] == true then
+      return "foreign:" .. module_name .. ":parameter:" ..
+        callable_name .. ":" .. index .. ":" .. name
+    end
+    return "parameter:" .. owner_kind .. ":" .. owner_name .. ":" ..
+      callable_name .. ":" .. index .. ":" .. name
+  end
+  if tag == "Type.Field" or tag == "Type.Variant"
+      or tag == "Type.Method" or tag == "Type.StaticMethod" then
+    local fqtn = required_string(
+      raw["fqtn"], DRIVER_MODULE, "symbol declaration.fqtn")
+    return "member:" .. fqtn .. ":" .. name
+  end
+  local owner: string? = optional_string(
+    raw["modname"], DRIVER_MODULE, "symbol declaration.modname")
+  if tag == "Type.Record" or tag == "Type.Union"
+      or tag == "Type.Interface" then
+    local split = 0
+    for index = 1, #name do
+      if strings.byte(name, index) == 46 then split = index end
+    end
+    if split == 0 or split == #name then
+      return fail<|string|>(TYPES_MODULE,
+        "nominal declaration name '" .. name .. "' is not fully qualified")
+    end
+    owner = strings.sub(name, 1, split - 1)
+    name = strings.sub(name, split + 1)
+  end
+  if not owner then
+    owner = optional_string(
+      raw["fqtn"], DRIVER_MODULE, "symbol declaration.fqtn")
+  end
+  if not owner then owner = module_name end
+  return module_declaration_identity(owner, raw, tag, name)
+end
+
+local function declaration_local(candidate: value): boolean
+  if candidate == nil then return false end
+  local raw = required_map(candidate, DRIVER_MODULE, "symbol declaration")
+  return node_is_local(raw)
+end
+
+local function declaration_visibility(candidate: value,
+                                      localness: boolean):
+    DeclarationVisibility
+  if candidate ~= nil then
+    local raw = required_map(candidate, DRIVER_MODULE, "symbol declaration")
+    local tag = required_string(
+      raw["_tag"], DRIVER_MODULE, "symbol declaration._tag")
+    if tag == "Checker.Parameter" or tag == "Ast.TypeParam" or
+       tag == "Type.Parameter" or tag == "Type.TypeParameter" then
+      return DeclarationVisibility.block()
+    elseif tag == "Ast.Decl" then
+      -- Module variables and aggregate fields resolve through `_decl` to a
+      -- top-level/member descriptor before this helper. A remaining Ast.Decl
+      -- is therefore a lexical binding: local, parameter, loop binding, or
+      -- the implicit method receiver.
+      return DeclarationVisibility.block()
+    end
+  end
+  if localness then return DeclarationVisibility.module() end
+  return DeclarationVisibility.exported()
+end
+
+local function semantic_declaration(node: {string: value}, tag: string): value
+  if tag == "Ast.ExpMethodRef" or tag == "Ast.ArgsMethod"
+      or tag == "Ast.ArgsNamedMethod" then
+    local declared: value = node["_declared_method"]
+    if declared ~= nil then return declared end
+  end
+  local declaration: value = node["_decl"]
+  if declaration ~= nil then return declaration end
+  if tag == "Ast.ExpMethodRef" or tag == "Ast.ArgsMethod"
+      or tag == "Ast.ArgsNamedMethod" then
+    return node["_method"]
+  end
+  if tag == "Ast.CaseArm" then return node["_variant"] end
+  if tag == "Ast.Field" then return node["_field"] end
+  return nil
+end
+
+local function occurrence_role(name: string): OccurrenceRole
+  if name == "definition" then return OccurrenceRole.definition() end
+  if name == "write" then return OccurrenceRole.write() end
+  if name == "type_reference" then return OccurrenceRole.type_reference() end
+  if name == "import_alias" then return OccurrenceRole.import_alias() end
+  return OccurrenceRole.reference()
+end
+
+local function exact_occurrence_span(node: {string: value}, tag: string,
+                                     name: string): SourceSpan?
+  -- Issue #91 explicitly leaves navigation to Titan FFI declarations out of
+  -- V1. Calls may still carry a stable identity for hover/references, but the
+  -- foreign declaration itself must not become a navigable project target or
+  -- a rename anchor.
+  if tag == "Ast.TopLevelForeignFunc" or
+      tag == "Ast.TopLevelForeignTypeAlias" then return nil end
+  local name_location? = optional_field_location(
+    node, "_name_loc", tag)
+  if name_location ~= nil then
+    return exact_name_span(name_location, name)
+  end
+  -- The compiler marks every source-written identifier with `_name_loc`.
+  -- Lowerings reuse a nearby diagnostic `loc` for generated names, so that
+  -- broader location must never be promoted into an exact navigation span.
+  return nil
+end
+
+local function union_part_identity(variant: {string: value},
+                                   part: {string: value}): string
+  -- Constructor named arguments already use this canonical parameter identity.
+  -- Type.Field.fqtn alone is insufficient: two variants may reuse a part name.
+  return "parameter:member:" .. required_string(
+    variant["fqtn"], TYPES_MODULE, "union variant.fqtn") .. ":" ..
+    required_string(variant["name"], TYPES_MODULE, "union variant.name") .. ":" ..
+    required_integer(part["index"], TYPES_MODULE, "union part.index") .. ":" ..
+    required_string(part["name"], TYPES_MODULE, "union part.name")
+end
+
+local function Walker:intern_summary(kind: HoverSummaryKind, title: string,
+                                     sections: {HoverSummarySection}): integer
+  local key = summary_content_key(kind, title, sections, self.work)
+  local old? = self.summary_ids[key]
+  if old ~= nil then return old end
+  local id = #self.hover_summaries + 1
+  self.hover_summaries[id] = HoverSummary(id, kind, title, sections)
+  self.summary_ids[key] = id
+  return id
+end
+
+local function Walker:summary_id(candidate: value, source_node: value,
+                                  subject: string): integer?
+  local descriptor = self.compiler:unwrap_summary_descriptor(
+    candidate, subject)
+  if descriptor == nil then return nil end
+  local kind: HoverSummaryKind? = nil
+  local title: string? = nil
+  local sections: {HoverSummarySection}? = nil
+  local descriptor_tag = type_tag(descriptor, subject)
+  local descriptor_module = summary_descriptor_module(
+    descriptor, descriptor_tag, subject)
+  local imported_module? = source_import_module(candidate)
+  if imported_module == nil then
+    imported_module = source_import_module(source_node)
+  end
+  -- Source imports grant private visibility only in the module named by that
+  -- import. An alias/re-export may normalize to an owner in another module,
+  -- but source visibility is deliberately non-transitive.
+  local include_source = descriptor_module == self.module_name or
+    imported_module == descriptor_module
+  local arguments: {integer: value}? = nil
+  if descriptor_tag ~= "Type.Module" then
+    local descriptor_raw = required_map(descriptor, TYPES_MODULE, subject)
+    local owner_name = required_string(
+      descriptor_raw["name"], TYPES_MODULE, subject .. ".name")
+    arguments = occurrence_type_arguments(
+      source_node, owner_name, subject .. " occurrence")
+  end
+  local argument_key = self.compiler:summary_argument_key(
+    arguments, subject .. " arguments")
+  local view_key = summary_view_key(
+    descriptor, descriptor_tag, include_source, argument_key, subject)
+  local memoized? = self.summary_views[view_key]
+  if memoized ~= nil then return memoized end
+  if descriptor_tag == "Type.Module" then
+    kind, title, sections = self.compiler:module_summary(
+      descriptor, include_source, subject, self.work)
+  else
+    kind, title, sections = self.compiler:aggregate_summary(
+      descriptor, arguments, include_source, subject, self.work)
+  end
+  if kind == nil or title == nil or sections == nil then return nil end
+  local summary_id = self:intern_summary(kind, title, sections)
+  self.summary_views[view_key] = summary_id
+  return summary_id
+end
+
+local function Walker:already_seen(candidate: value): boolean
+  if self.seen[candidate] then return true end
+  self.seen[candidate] = true
+  return false
+end
+
+local function Walker:add_occurrence(node: {string: value}, tag: string,
+                                     name: string, role_name: string,
+                                     location: SourceLocation,
+                                     local_hint: boolean?,
+                                     parent_tag: string?,
+                                     part_identity: string?,
+                                     case_part_id: string?)
+  local declaration: value = semantic_declaration(node, tag)
+  local declaration_id: string? = nil
+  local localness = node_is_local(node)
+  if declaration ~= nil then
+    declaration_id = declaration_identity(self.module_name, declaration)
+    localness = declaration_local(declaration)
+  elseif role_name == "definition" and local_hint == false then
+    declaration_id = "export:" .. self.module_name .. ":" ..
+      declaration_namespace(node, tag) .. ":" .. name
+  elseif role_name == "definition" and
+      parent_tag == "Ast.TopLevelVar" and local_hint == true then
+    -- A top-level variable's source identifier is the nested Ast.Decl, while
+    -- references point back to Ast.TopLevelVar. Join those two compiler shapes
+    -- without turning lexical Ast.Decl bindings into module identities.
+    declaration_id = "source:" .. self.module_name .. ":value:" .. name
+  elseif role_name == "definition" or role_name == "import_alias" then
+    declaration_id = declaration_identity(self.module_name, node)
+  end
+  if part_identity ~= nil then declaration_id = part_identity end
+  if local_hint ~= nil then localness = local_hint end
+
+  local span? = exact_occurrence_span(node, tag, name)
+  local signature_candidate: value = declaration
+  if tag == "Ast.TopLevelFunc" or tag == "Ast.TopLevelForeignFunc"
+      or tag == "Ast.TopLevelMethod" or tag == "Ast.TopLevelStatic"
+      or tag == "Ast.InterfaceMethod" then
+    -- Declaration occurrences own the frozen surface callable metadata. The
+    -- semantic identity may instead be the canonical Type.Method descriptor.
+    signature_candidate = node
+  elseif signature_candidate == nil then
+    signature_candidate = node
+  end
+  local visibility_candidate: value = declaration
+  if visibility_candidate == nil then
+    visibility_candidate = node
+  end
+  self.symbols[#self.symbols + 1] = SymbolOccurrence {
+    name = name,
+    declaration_id = declaration_id,
+    role = occurrence_role(role_name),
+    location = location,
+    exact_span = span,
+    is_local = localness,
+    visibility = declaration_visibility(visibility_candidate, localness),
+    type_info = self.compiler:optional_type(node, "_type", tag),
+    callable_signature = self.compiler:callable_signature(
+      self.module_name, signature_candidate, node,
+      tag .. " callable declaration"),
+    summary_id = self:summary_id(
+      signature_candidate, node, tag .. " hover summary declaration"),
+    case_part_id = case_part_id,
+    documentation = node_documentation(node),
+  }
+end
+
+local function Walker:add_bound_occurrence(name: string, declaration: value,
+                                            location: SourceLocation,
+                                            role: OccurrenceRole)
+  local declaration_id = declaration_identity(
+    self.module_name, declaration)
+  local localness = declaration_local(declaration)
+  local inferred: TypeInfo? = nil
+  if declaration ~= nil then
+    local raw = required_map(declaration, DRIVER_MODULE, "bound declaration")
+    if raw["_tag"] == "Checker.ForeignNamespace" then
+      inferred = self.compiler:optional_type(
+        raw, "_type", "bound foreign namespace")
+    end
+  end
+  self.symbols[#self.symbols + 1] = SymbolOccurrence {
+    name = name,
+    declaration_id = declaration_id,
+    role = role,
+    location = location,
+    exact_span = exact_name_span(location, name),
+    is_local = localness,
+    visibility = declaration_visibility(declaration, localness),
+    type_info = inferred,
+    summary_id = self:summary_id(
+      declaration, declaration, "bound hover summary declaration"),
+    documentation = node_documentation(declaration),
+  }
+end
+
+local function Walker:add_import(node: {string: value},
+                                 location: SourceLocation)
+  local alias = required_string(
+    node["localname"], DRIVER_MODULE, "Ast.TopLevelImport.localname")
+  local module_name = required_string(
+    node["modname"], DRIVER_MODULE, "Ast.TopLevelImport.modname")
+  local source_required = optional_boolean(
+    node["source_required"], DRIVER_MODULE,
+    "Ast.TopLevelImport.source_required")
+  self.imports[#self.imports + 1] = Import(
+    alias, module_name, source_required, location)
+end
+
+local function Walker:visit_any(candidate: value, parent_id: integer?,
+                                role_name: string, local_hint: boolean?,
+                                synthetic_parent: boolean)
+  if candidate == nil then return end
+  if self.compiler.type_of(candidate) ~= "table" then return end
+  local table_value = candidate as {string: value}
+  local raw_tag: value = table_value["_tag"]
+  if raw_tag is string and
+      strings.sub(raw_tag as string, 1, 4) == "Ast." then
+    self:visit_node(
+      candidate, parent_id, role_name, local_hint, synthetic_parent)
+    return
+  end
+
+  local list = candidate as {integer: value}
+  for index = 1, #list do
+    self:visit_any(
+      list[index], parent_id, role_name, local_hint, synthetic_parent)
+  end
+end
+
+local function Walker:visit_node(candidate: value, parent_id: integer?,
+                                 role_name: string, local_hint: boolean?,
+                                 synthetic_parent: boolean)
+  if self:already_seen(candidate) then return end
+  self.work:account()
+  local raw = required_map(candidate, DRIVER_MODULE, "AST node")
+  local tag = required_string(raw["_tag"], DRIVER_MODULE, "AST node._tag")
+  if strings.sub(tag, 1, 4) ~= "Ast." then
+    fail<|value|>(DRIVER_MODULE, "invalid AST tag '" .. tag .. "'")
+  end
+  local previous_case = self.case_variant
+  if tag == "Ast.CaseArm" then self.case_variant = raw["_variant"] end
+  local location? = semantic_location(raw, tag)
+  local source_span? = structural_span(raw, tag)
+  local name? = node_name(raw, tag)
+  local inferred? = self.compiler:optional_type(raw, "_type", tag)
+  local declared? = self.compiler:optional_type(raw, "_declared_type", tag)
+  local adjustment: Adjustment? = nil
+  local original: TypeInfo? = nil
+  local coerced: TypeInfo? = nil
+  local raw_adjustment: value = raw["_adjustment"]
+  if raw_adjustment == nil then
+    raw_adjustment = raw["_assignment_adjustment"]
+  end
+  if raw_adjustment ~= nil then
+    adjustment = self.compiler:normalize_adjustment(
+      raw_adjustment, tag .. " adjustment")
+    local detail: AdjustmentInfo? = nil
+    case adjustment
+    when identity(item) then detail = item
+    when coercion(item) then detail = item
+    when gradual(item) then detail = item
+    when callable(item) then detail = item
+    when written(item) then detail = item
+    when other(item) then detail = item
+    end
+    if detail then
+      original = detail.source
+      coerced = detail.target
+    end
+  end
+
+  local id = #self.nodes + 1
+  local synthetic = synthetic_parent or node_is_synthetic(raw, tag)
+  local children_synthetic = synthetic_parent or
+    node_has_synthetic_children(raw, tag)
+  local localness = node_is_local(raw)
+  if local_hint ~= nil then localness = local_hint end
+  self.nodes[id] = Node {
+    id = id,
+    parent_id = parent_id,
+    tag = tag,
+    kind = node_kind(tag),
+    location = location,
+    source_span = source_span,
+    name = name,
+    is_local = localness,
+    synthetic = synthetic,
+    inferred_type = inferred,
+    declared_type = declared,
+    original_type = original,
+    coerced_type = coerced,
+    adjustment = adjustment,
+  }
+
+  local parent_tag: string? = nil
+  if parent_id then parent_tag = self.nodes[parent_id].tag end
+  local part_identity: string? = nil
+  local selected_part_id: string? = nil
+  local selected_part_name: string? = nil
+  local part_location: SourceLocation? = nil
+  local shorthand = false
+  if tag == "Ast.Decl" and parent_tag == "Ast.UnionVariant"
+      and parent_id ~= nil and raw["_decl"] is {string: value} then
+    local part = required_map(raw["_decl"], TYPES_MODULE, "union part declaration")
+    local variant_name? = self.nodes[parent_id].name
+    if variant_name ~= nil then
+      part_identity = "parameter:member:" .. required_string(
+        part["fqtn"], TYPES_MODULE, "union part.fqtn") .. ":" ..
+        variant_name .. ":" .. required_integer(
+        part["index"], TYPES_MODULE, "union part.index") .. ":" ..
+        required_string(part["name"], TYPES_MODULE, "union part.name")
+    end
+  elseif tag == "Ast.Decl" and raw["part"] is string
+      and self.case_variant is {string: value}
+      and raw["_part"] is {string: value} then
+    selected_part_name = raw["part"] as string
+    selected_part_id = union_part_identity(
+      self.case_variant as {string: value}, raw["_part"] as {string: value})
+    part_location = optional_field_location(raw, "_part_loc", tag)
+    if part_location ~= nil and location ~= nil then
+      shorthand = part_location.filename == location.filename and
+        part_location.line == location.line and
+        part_location.column == location.column
+    end
+  end
+  if not synthetic and location and name then
+    local role = role_name
+    if strings.sub(tag, 1, 12) == "Ast.TopLevel"
+        or tag == "Ast.Decl" or tag == "Ast.UnionVariant"
+        or tag == "Ast.TypeParam"
+        or tag == "Ast.InterfaceMethod" then
+      role = tag == "Ast.TopLevelImport" and "import_alias" or "definition"
+    elseif tag == "Ast.TypeName" or tag == "Ast.TypeQualName" or
+        tag == "Ast.TypeForeignName" then
+      role = "type_reference"
+    end
+    local shorthand_id: string? = nil
+    if shorthand then shorthand_id = selected_part_id end
+    self:add_occurrence(
+      raw, tag, name, role, location, local_hint, parent_tag,
+      part_identity, shorthand_id)
+  end
+  if not synthetic and not shorthand and selected_part_id ~= nil
+      and selected_part_name ~= nil and part_location ~= nil then
+    local part_type? = self.compiler:optional_type(raw, "_declared_type", tag)
+    if part_type == nil then
+      part_type = self.compiler:optional_type(raw, "_type", tag)
+    end
+    self.symbols[#self.symbols + 1] = SymbolOccurrence {
+      name = selected_part_name,
+      declaration_id = selected_part_id,
+      role = OccurrenceRole.reference(),
+      location = part_location,
+      exact_span = exact_name_span(part_location, selected_part_name),
+      is_local = false,
+      visibility = DeclarationVisibility.exported(),
+      type_info = part_type,
+    }
+  end
+  if not synthetic and tag == "Ast.TypeQualName" then
+    local module_location? = optional_field_location(
+      raw, "_module_loc", tag)
+    if module_location ~= nil then
+      local module_name = required_string(
+        raw["module"], DRIVER_MODULE, tag .. ".module")
+      self:add_bound_occurrence(
+        module_name, raw["_module_decl"], module_location,
+        OccurrenceRole.reference())
+    end
+  end
+  if not synthetic and (tag == "Ast.TopLevelMethod"
+      or tag == "Ast.TopLevelStatic") then
+    local owner_location? = optional_field_location(
+      raw, "_owner_loc", tag)
+    if owner_location ~= nil then
+      local owner_name = required_string(
+        raw["class"], DRIVER_MODULE, tag .. ".class")
+      self:add_bound_occurrence(
+        owner_name, raw["_owner_decl"], owner_location,
+        OccurrenceRole.type_reference())
+    end
+  end
+  if not synthetic and tag == "Ast.TopLevelImport" and location then
+    self:add_import(raw, location)
+  end
+
+  if tag == "Ast.StatAssign" then
+    self:visit_any(raw["vars"], id, "write", nil, children_synthetic)
+  elseif tag == "Ast.TopLevelVar" then
+    self:visit_any(
+      raw["decl"], id, "definition", node_is_local(raw), children_synthetic)
+  elseif tag == "Ast.TopLevelFunc" or tag == "Ast.TopLevelForeignFunc"
+      or tag == "Ast.TopLevelMethod" or tag == "Ast.TopLevelStatic" then
+    self:visit_any(
+      raw["params"], id, "definition", true, children_synthetic)
+  elseif tag == "Ast.StatDecl" or tag == "Ast.StatFor"
+      or tag == "Ast.StatForIn" then
+    self:visit_any(
+      raw["decls"], id, "definition", true, children_synthetic)
+    self:visit_any(
+      raw["decl"], id, "definition", true, children_synthetic)
+  end
+
+  for index = 1, #AST_CHILD_FIELDS do
+    self:visit_any(
+      raw[AST_CHILD_FIELDS[index]], id, "reference", nil, children_synthetic)
+  end
+  self.case_variant = previous_case
+end
+
+local function Compiler:walk_ast(module_name: string,
+                                 candidate: value, work: NormalizationWork):
+    ({Node}, {SymbolOccurrence}, {Import}, {HoverSummary})
+  if self.type_of(candidate) ~= "table" then
+    raise BridgeError(
+      DRIVER_MODULE, "annotated AST root must be a Lua table")
+  end
+  local walker = Walker {
+    compiler = self,
+    module_name = module_name,
+    work = work,
+    nodes = {},
+    symbols = {},
+    imports = {},
+    seen = {},
+    hover_summaries = {},
+    summary_ids = {},
+    summary_views = {},
+  }
+  walker:visit_any(candidate, nil, "reference", nil, false)
+  return walker.nodes, walker.symbols, walker.imports,
+         walker.hover_summaries
+end
+
+-- External annotated ASTs exist only long enough to recover dependency edges.
+-- Avoid normalizing nodes, occurrences, and especially aggregate summaries
+-- that the snapshot must immediately discard.
+local function Compiler:imports_from_ast(candidate: value,
+                                         work: NormalizationWork): {Import}
+  if self.type_of(candidate) ~= "table" then
+    raise BridgeError(
+      DRIVER_MODULE, "annotated AST root must be a Lua table")
+  end
+  local imports: {Import} = {}
+  local roots = candidate as {integer: value}
+  for index = 1, #roots do
+    work:account()
+    local root: value = roots[index]
+    if root is {string: value} then
+      local raw = root as {string: value}
+      if raw["_tag"] == "Ast.TopLevelImport" then
+        local location? = semantic_location(raw, "Ast.TopLevelImport")
+        if location ~= nil then
+          imports[#imports + 1] = Import(
+            required_string(
+              raw["localname"], DRIVER_MODULE,
+              "Ast.TopLevelImport.localname"),
+            required_string(
+              raw["modname"], DRIVER_MODULE,
+              "Ast.TopLevelImport.modname"),
+            optional_boolean(
+              raw["source_required"], DRIVER_MODULE,
+              "Ast.TopLevelImport.source_required"),
+            location)
+        end
+      end
+    end
+  end
+  return imports
+end
+
+local function diagnostic_body(message: string, start: integer): string
+  if start > #message then return "" end
+  return strings.sub(message, start)
+end
+
+local function parse_diagnostic(message: string,
+                                work: NormalizationWork,
+                                owner_module: string?): Diagnostic
+  local search = 1
+  while search <= #message do
+    work:account()
+    local first: integer? = strings.find(message, ":", search)
+    if not first then break end
+    local second: integer? = strings.find(message, ":", first + 1)
+    if not second then break end
+    local third: integer? = strings.find(message, ":", second + 1)
+    if not third then break end
+    local raw_line = strings.sub(message, first + 1, second - 1)
+    local raw_column = strings.sub(message, second + 1, third - 1)
+    local line: integer? = math.tointeger(raw_line)
+    local column: integer? = math.tointeger(raw_column)
+    if line and column and line > 0 and column > 0 then
+      local body = diagnostic_body(message, third + 2)
+      local kind = DiagnosticKind.compiler()
+      if strings.sub(body, 1, 14) == "syntax error: " then
+        kind = DiagnosticKind.syntax()
+      elseif strings.sub(body, 1, 12) == "type error: " then
+        kind = DiagnosticKind.type_error()
+      end
+      return Diagnostic {
+        kind = kind,
+        message = body,
+        location = SourceLocation(strings.sub(message, 1, first - 1), line, column),
+        owner_module = owner_module,
+      }
+    end
+    search = first + 1
+  end
+  return Diagnostic {
+    kind = DiagnosticKind.compiler(),
+    message = message,
+    owner_module = owner_module,
+  }
+end
+
+local function normalize_diagnostics(candidate: value,
+                                     work: NormalizationWork,
+                                     owner_module: string?): {Diagnostic}
+  if candidate == nil or candidate == false then
+    return fail<|{Diagnostic}|>(
+      DRIVER_MODULE, "compiler error list must be a Lua table")
+  end
+  if not (candidate is {integer: value}) then
+    return fail<|{Diagnostic}|>(
+      DRIVER_MODULE, "compiler error list must be a Lua table")
+  end
+  local raw = candidate as {integer: value}
+  local diagnostics: {Diagnostic} = {}
+  for index = 1, #raw do
+    work:account()
+    diagnostics[index] = parse_diagnostic(
+      required_string(
+        raw[index], DRIVER_MODULE, "compiler error " .. index), work,
+      owner_module)
+  end
+  return diagnostics
+end
+
+local function append_diagnostics(target: {Diagnostic},
+                                  source: const? {Diagnostic},
+                                  work: NormalizationWork)
+  for index = 1, #source do
+    work:account()
+    target[#target + 1] = source[index]
+  end
+end
+
+local function Compiler:serialize_manifest(module_name: string,
+                                           candidate: value,
+                                           source_serialized: string?): Manifest
+  local raw_type = required_map(
+    candidate, TYPES_MODULE, "module interface for '" .. module_name .. "'")
+  local tag = required_string(
+    raw_type["_tag"], TYPES_MODULE,
+    "module interface for '" .. module_name .. "'._tag")
+  if tag ~= "Type.Module" then
+    return fail<|Manifest|>(TYPES_MODULE,
+      "module interface for '" .. module_name ..
+      "' must have tag Type.Module, found " .. tag)
+  end
+  local raw_serializer = checked_function(
+    self.types, TYPES_MODULE, "serialize", self.type_of)
+  local serializer = raw_serializer as function (value): value
+  local serialized: value = nil
+  do
+    serialized = serializer(candidate)
+  catch
+    return fail<|Manifest|>(TYPES_MODULE,
+      "cannot serialize public manifest for '" .. module_name .. "': " ..
+      strings.tostring(error))
+  end
+  return Manifest(module_name, required_string(
+    serialized, TYPES_MODULE,
+    "types.serialize result for '" .. module_name .. "'"),
+    source_serialized)
+end
+
+local function Compiler:snapshot_module(module_name: string,
+                                        candidate: value,
+                                        projects: {string: ProjectModule},
+                                        cached: {string: CachedSourceInterface},
+                                        valid_manifest: boolean,
+                                        work: NormalizationWork): NormalizedModule
+  local entry = required_map(
+    candidate, DRIVER_MODULE, "driver.imported['" .. module_name .. "']")
+  local normalized_origin = provenance(entry, module_name, projects)
+  local origin = normalized_origin.provenance
+  local manifest: Manifest? = nil
+  if valid_manifest then
+    local cached_source? = cached[module_name]
+    if cached_source ~= nil then
+      manifest = Manifest(
+        module_name, cached_source.serialized,
+        cached_source.source_serialized)
+    else
+      local source_serialized: string? = nil
+      case origin
+      when project_source() then
+        source_serialized = required_string(
+          entry["source_manifest"], DRIVER_MODULE,
+          "compiler source manifest for '" .. module_name .. "'")
+        if source_serialized == "" then
+          return fail<|NormalizedModule|>(
+            DRIVER_MODULE, "compiler source manifest for '" ..
+            module_name .. "' must not be empty")
+        end
+      when external_source() then
+        source_serialized = required_string(
+          entry["source_manifest"], DRIVER_MODULE,
+          "compiler source manifest for '" .. module_name .. "'")
+        if source_serialized == "" then
+          return fail<|NormalizedModule|>(
+            DRIVER_MODULE, "compiler source manifest for '" ..
+            module_name .. "' must not be empty")
+        end
+      when dynamic_binary() then
+      when static_binary() then
+      end
+      manifest = self:serialize_manifest(
+        module_name, entry["type"], source_serialized)
+    end
+  end
+  local nodes: {Node} = {}
+  local symbols: {SymbolOccurrence} = {}
+  local imports: {Import} = {}
+  local hover_summaries: {HoverSummary} = {}
+  local header_dependencies = normalize_c_header_dependencies(
+    entry["c_header_dependencies"],
+    "driver.imported['" .. module_name .. "'].c_header_dependencies")
+  local raw_ast: value = entry["ast"]
+  if projects[module_name] ~= nil then
+    if raw_ast == nil then
+      return fail<|NormalizedModule|>(DRIVER_MODULE,
+        "project source '" .. module_name .. "' has no annotated AST")
+    end
+    nodes, symbols, imports, hover_summaries = self:walk_ast(
+      module_name, raw_ast, work)
+  elseif cached[module_name] ~= nil then
+    local cached_source = cached[module_name]
+    for index = 1, #cached_source.imports do
+      work:account()
+      imports[index] = cached_source.imports[index]
+    end
+  elseif raw_ast ~= nil then
+    -- External ASTs exist only for this transient compiler attempt. Normalize
+    -- their dependency edges, then immediately discard the compiler graph.
+    imports = self:imports_from_ast(raw_ast, work)
+  else
+    local dependencies: {string} = {}
+    local raw_dependencies: value = entry["deps"]
+    if raw_dependencies is {string: value} then
+      for dependency, enabled in iteration.pairs(
+          raw_dependencies as {string: value}) do
+        work:account()
+        if enabled then
+          local position = #dependencies + 1
+          while position > 1 and
+              dependencies[position - 1] > dependency do
+            work:account()
+            dependencies[position] = dependencies[position - 1]
+            position = position - 1
+          end
+          dependencies[position] = dependency
+        end
+      end
+    end
+    local filename = "<" .. module_name .. ">"
+    case origin
+    when external_source{main_file} then filename = main_file
+    when dynamic_binary{provider_file} then filename = provider_file
+    when static_binary{provider_file} then filename = provider_file
+    when project_source() then
+    end
+    for index = 1, #dependencies do
+      work:account()
+      imports[index] = Import(
+        dependencies[index], dependencies[index], false,
+        SourceLocation(filename, 1, 1))
+    end
+  end
+  if valid_manifest and manifest ~= nil and projects[module_name] == nil then
+    local payload: string? = nil
+    local provenance_key = ""
+    case origin
+    when external_source{main_file, source_files} then
+      provenance_key = completion_source_key(main_file, source_files, header_dependencies)
+    else
+    end
+    if entry["kind"] == "source" and entry["ast"] ~= nil then
+      local encode = self.driver["encode_project_entry"] as
+        function (value, value): (value, value)
+      local encoded, failure = encode(entry, {
+        ["sha256_binary"] = content_identity.digest,
+        ["yield"] = async.yield,
+      } as {string: value})
+      if encoded is string then payload = encoded end
+      if payload == nil then
+        raise BridgeError(DRIVER_MODULE,
+          "cannot retain external completion descriptor for '" .. module_name ..
+          "': " .. strings.tostring(failure))
+      end
+    end
+    local module = completion_module()
+    local describe = module["describe"] as function (value): value
+    local facts = required_map(describe(entry), "titan-compiler.completion", "descriptor facts")
+    -- Source entries restored from public-only equality manifests cannot
+    -- replace a previously captured full source-collaboration descriptor.
+    local previous? = self.completion_exports[module_name]
+    if payload ~= nil or previous == nil or
+        previous.public_interface ~= manifest.serialized or
+        previous.source_interface ~= manifest.source_serialized or
+        previous.provenance_key ~= provenance_key then
+      self.completion_exports[module_name] = CompletionExport {
+        public_interface = manifest.serialized,
+        source_interface = manifest.source_serialized,
+        provenance_key = provenance_key,
+        payload = payload,
+        candidates = completion_candidates(facts["candidates"]),
+        documentation = documentation_markdown(facts["documentation"]),
+      }
+    end
+  end
+  return NormalizedModule(
+    ModuleSnapshot {
+      module_name = module_name,
+      provenance = origin,
+      manifest = manifest,
+      nodes = nodes,
+      symbols = symbols,
+      imports = imports,
+      c_header_dependencies = header_dependencies,
+      hover_summaries = hover_summaries,
+    },
+    normalized_origin.embedded_provider)
+end

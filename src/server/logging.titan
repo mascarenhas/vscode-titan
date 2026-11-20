@@ -14,7 +14,7 @@ local configured_rank = 0
 local configured_name = "off"
 local output: response_queue.ResponseQueue? = nil
 local writer: async.Task<|nil, value|>? = nil
-local STRING_SAMPLE_LIMIT = 8
+local const STRING_SAMPLE_LIMIT = 8
 
 local function level_rank(level: string): integer?
   if level == "off" then return 0 end
@@ -112,7 +112,7 @@ local function stop_writer(queue: response_queue.ResponseQueue,
   -- Stderr logging is best-effort. In particular, an EPIPE or other terminal
   -- writer failure during teardown must not replace the protocol/server result
   -- that caused close to run.
-  async.join<|nil, value|>(task)
+  async.join(task)
 end
 
 --- Finish queued stderr log writes and retire the logging owner.
@@ -128,25 +128,23 @@ end
 --- Encode one structured log event with optional scalar fields.
 function format(level: string, event: string,
                 fields: wire.Object?): string?
-  do
-    if not enabled(level) then return nil end
-    local entry: wire.Object = {
-      ["level"] = level,
-      ["event"] = event,
-    }
-    if fields ~= nil then
-      for key, item in iteration.pairs<|string, value|>(fields) do
-        entry[key] = item
-      end
+  if not enabled(level) then return nil end
+  local entry: wire.Object = {
+    ["level"] = level,
+    ["event"] = event,
+  }
+  if fields ~= nil then
+    for key, item in iteration.pairs(fields) do
+      entry[key] = item
     end
-    return "titan-language-server " .. wire.encode(entry)
-  catch
-    -- Diagnostic data can originate in filesystem/native errors and is not
-    -- guaranteed to be valid UTF-8. A malformed optional log record must never
-    -- terminate the watcher, compiler owner, or task-terminal callback that
-    -- attempted to emit it.
-    return nil
   end
+  return "titan-language-server " .. wire.encode(entry)
+catch
+  -- Diagnostic data can originate in filesystem/native errors and is not
+  -- guaranteed to be valid UTF-8. A malformed optional log record must never
+  -- terminate the watcher, compiler owner, or task-terminal callback that
+  -- attempted to emit it.
+  return nil
 end
 
 -- A worker process already writes structured records. Forwarding the exact
@@ -154,23 +152,19 @@ end
 -- interleave with a router record.
 --- Queue one already-formatted stderr line owned by another process.
 function raw(entry: string)
-  do
-    local queue? = output
-    if queue ~= nil and #entry > 0 then queue:push(entry) end
-  catch
-    return
-  end
+  local queue? = output
+  if queue ~= nil and #entry > 0 then queue:push(entry) end
+catch
+  return
 end
 
 --- Queue one severity-filtered structured event without writing to protocol stdout.
 function emit(level: string, event: string, fields: wire.Object?)
-  do
-    local rendered? = format(level, event, fields)
-    local queue? = output
-    if rendered ~= nil and queue ~= nil then queue:push(rendered) end
-  catch
-    -- The queue may have just been stopped during teardown. Logging is
-    -- deliberately best-effort and cannot change the caller's control flow.
-    return
-  end
+  local rendered? = format(level, event, fields)
+  local queue? = output
+  if rendered ~= nil and queue ~= nil then queue:push(rendered) end
+catch
+  -- The queue may have just been stopped during teardown. Logging is
+  -- deliberately best-effort and cannot change the caller's control flow.
+  return
 end

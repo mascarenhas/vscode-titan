@@ -84,7 +84,7 @@ local function statuses(subject: router.Router): {wire.Object}
   while subject.output:pending() > 0 do
     local envelope = response(subject.output:take())
     if envelope["method"] == "titan/indexingStatus" then
-      result[#result + 1] = wire.as_object(envelope["params"]) as wire.Object
+      result[#result + 1] = wire.as_object(envelope["params"])
     end
   end
   return result
@@ -164,7 +164,7 @@ local function add_root(subject: router.Router, base: string,
   local root = base .. "/" .. mode
   fs.mkdir(root)
   fs.write_file(root .. "/main.titan", "-- fixture input\n")
-  return router.slot_for_root(subject, subject.registry:add_folder(root))
+  return subject:slot_for_root(subject.registry:add_folder(root))
 end
 
 local function wait_ready(slot: router.Slot)
@@ -187,15 +187,15 @@ local function reclaim(subject: router.Router, slot: router.Slot)
 end
 
 local function restart(subject: router.Router, slot: router.Slot)
-  router.begin_transition(slot)
-  defer router.end_transition(slot)
-  router.restart_worker(subject, slot, "test restart")
+  slot:begin_transition()
+  defer slot:end_transition()
+  subject:restart_worker(slot, "test restart")
 end
 
 function test_router_aggregates_overlapping_indexing_worksets(_context: test.Context)
   local subject = indexing_router()
-  local outer = router.slot_for_root(subject, subject.registry:add_folder("/outer"))
-  local inner = router.slot_for_root(subject, subject.registry:add_folder("/outer/inner"))
+  local outer = subject:slot_for_root(subject.registry:add_folder("/outer"))
+  local inner = subject:slot_for_root(subject.registry:add_folder("/outer/inner"))
   outer:on_indexing(subject, {
     ["state"] = "indexing", ["initial"] = false, ["epoch"] = 7,
   })
@@ -256,7 +256,7 @@ end
 function test_router_counts_completions_before_its_first_visible_frame(
     _context: test.Context)
   local subject = indexing_router()
-  local outer = router.slot_for_root(subject, subject.registry:add_folder("/outer"))
+  local outer = subject:slot_for_root(subject.registry:add_folder("/outer"))
   outer:on_indexing(subject, {
     ["state"] = "ready", ["initial"] = true, ["epoch"] = 1, ["generation"] = 1,
   })
@@ -284,7 +284,7 @@ end
 
 function test_router_first_failure_retains_earlier_completions(_context: test.Context)
   local subject = indexing_router()
-  local outer = router.slot_for_root(subject, subject.registry:add_folder("/outer"))
+  local outer = subject:slot_for_root(subject.registry:add_folder("/outer"))
   outer:on_indexing(subject, {
     ["state"] = "ready", ["initial"] = true, ["epoch"] = 1, ["generation"] = 1,
   })
@@ -300,8 +300,8 @@ end
 
 function test_router_busy_precedes_failure(_context: test.Context)
   local subject = indexing_router()
-  local outer = router.slot_for_root(subject, subject.registry:add_folder("/outer"))
-  local inner = router.slot_for_root(subject, subject.registry:add_folder("/outer/inner"))
+  local outer = subject:slot_for_root(subject.registry:add_folder("/outer"))
+  local inner = subject:slot_for_root(subject.registry:add_folder("/outer/inner"))
   outer:on_indexing(subject, {
     ["state"] = "indexing", ["initial"] = false, ["epoch"] = 4,
   })
@@ -330,8 +330,8 @@ end
 
 function test_router_stop_only_republishes_changed_busy_worksets(_context: test.Context)
   local subject = indexing_router()
-  local outer = router.slot_for_root(subject, subject.registry:add_folder("/outer"))
-  local inner = router.slot_for_root(subject, subject.registry:add_folder("/outer/inner"))
+  local outer = subject:slot_for_root(subject.registry:add_folder("/outer"))
+  local inner = subject:slot_for_root(subject.registry:add_folder("/outer/inner"))
   outer:on_indexing(subject, {
     ["state"] = "indexing", ["initial"] = true, ["epoch"] = 1,
   })
@@ -340,7 +340,7 @@ function test_router_stop_only_republishes_changed_busy_worksets(_context: test.
     ["state"] = "ready", ["initial"] = true, ["epoch"] = 1, ["generation"] = 1,
   })
   local ready = take_status(subject)
-  router.stop_slot(subject, outer, "shutdown")
+  subject:stop_slot(outer, "shutdown")
   test.assert(subject.output:pending() == 0 and
     subject.indexing_status.epoch == wire.as_integer(ready["epoch"]),
     "stopping a ready worker manufactured an indexing epoch")
@@ -348,11 +348,11 @@ function test_router_stop_only_republishes_changed_busy_worksets(_context: test.
     ["state"] = "indexing", ["initial"] = true, ["epoch"] = 1,
   })
   local busy = take_status(subject)
-  router.stop_slot(subject, outer, "idle")
+  subject:stop_slot(outer, "idle")
   test.assert(subject.output:pending() == 0 and
     subject.indexing_status.epoch == wire.as_integer(busy["epoch"]),
     "stopping a terminal worker reset another root's busy workset")
-  router.stop_slot(subject, inner, "shutdown")
+  subject:stop_slot(inner, "shutdown")
   local stopped = take_status(subject)
   test.assert(stopped["state"] == "ready" and
     wire.as_integer(stopped["epoch"]) > wire.as_integer(busy["epoch"]) and
@@ -364,14 +364,14 @@ function test_router_stop_only_republishes_changed_busy_worksets(_context: test.
   take_status(subject)
   subject:remove_root("/outer/inner")
   take_status(subject)
-  router.stop_slot(subject, inner, "released")
+  subject:stop_slot(inner, "released")
   test.assert(subject.output:pending() == 0,
     "stopping an excluded root reset the claimed roots' indexing status")
 end
 
 function test_router_rejects_non_boolean_initial_status(_context: test.Context)
   local subject = indexing_router()
-  local slot = router.slot_for_root(subject, subject.registry:add_folder("/outer"))
+  local slot = subject:slot_for_root(subject.registry:add_folder("/outer"))
   local object: wire.Object = {}
   local invalid: {value} = {0, "true", wire.null(), object}
   for index = 1, #invalid do
@@ -397,7 +397,7 @@ function test_router_activation_failures_end_optimistic_indexing(context: test.C
         local subject = fixture_router(base)
         defer subject:close()
         local slot = add_root(subject, base, mode)
-        local active?, message? = router.activate(subject, slot)
+        local active?, message? = subject:activate(slot)
         test.assert(active == nil and message ~= nil and not slot:is_indexing(),
           "a failed initialize retained its optimistic busy contribution")
         local observed = statuses(subject)
@@ -466,14 +466,14 @@ function test_router_changed_settings_replace_ready_with_failed(_context: test.C
     local subject = fixture_router(base)
     defer subject:close()
     local slot = add_root(subject, base, "accept")
-    test.assert(router.activate(subject, slot) ~= nil, "the worker did not activate")
+    test.assert(subject:activate(slot) ~= nil, "the worker did not activate")
     wait_ready(slot)
     local ready = last_status(subject)
     fs.write_file(slot.root.path .. "/titan-config.lua", "compiler_root = 3\n")
-    router.begin_transition(slot)
+    slot:begin_transition()
     do
-      defer router.end_transition(slot)
-      router.revalidate(subject, slot, true)
+      defer slot:end_transition()
+      subject:revalidate(slot, true)
     end
     local failed = last_status(subject)
     test.assert(failed["state"] == "failed" and
@@ -490,7 +490,7 @@ function test_router_restart_forgets_worker_epoch_and_fences_every_old_callback(
     local subject = fixture_router(base)
     defer subject:close()
     local slot = add_root(subject, base, "accept")
-    test.assert(router.activate(subject, slot) ~= nil, "the worker did not activate")
+    test.assert(subject:activate(slot) ~= nil, "the worker did not activate")
     wait_ready(slot)
     local old = slot.worker
     old.listener.on_notification("titan/indexingStatus", {
@@ -532,7 +532,7 @@ function test_router_busy_restart_has_no_intermediate_ready(_context: test.Conte
     local subject = fixture_router(base)
     defer subject:close()
     local slot = add_root(subject, base, "indexing")
-    test.assert(router.activate(subject, slot) ~= nil, "the worker did not activate")
+    test.assert(subject:activate(slot) ~= nil, "the worker did not activate")
     wait_until(function (): boolean return slot.indexing_status ~= nil end)
     slot:on_indexing(subject, {
       ["state"] = "indexing", ["initial"] = true, ["epoch"] = 1,
@@ -560,8 +560,8 @@ function test_router_initial_scope_survives_another_roots_refresh(_context: test
     fs.mkdir(base .. "/b")
     local first = add_root(subject, base .. "/a", "indexing")
     local second = add_root(subject, base .. "/b", "quiet")
-    test.assert(router.activate(subject, first) ~= nil, "first worker did not activate")
-    test.assert(router.activate(subject, second) ~= nil, "second worker did not activate")
+    test.assert(subject:activate(first) ~= nil, "first worker did not activate")
+    test.assert(subject:activate(second) ~= nil, "second worker did not activate")
     first:on_indexing(subject, {
       ["state"] = "ready", ["initial"] = true, ["epoch"] = 1, ["generation"] = 1,
     })
@@ -606,7 +606,7 @@ function test_router_release_and_reclaim_restore_busy_and_crashed_snapshots(
     local subject = fixture_router(base)
     defer subject:close()
     local slot = add_root(subject, base, "indexing")
-    test.assert(router.activate(subject, slot) ~= nil, "the worker did not activate")
+    test.assert(subject:activate(slot) ~= nil, "the worker did not activate")
     wait_until(function (): boolean return slot.indexing_status ~= nil end)
     statuses(subject)
     subject:remove_root(slot.root.path)
@@ -632,7 +632,7 @@ function test_router_release_and_reclaim_restore_busy_and_crashed_snapshots(
     test.assert(subject.indexing_status.generation == 0,
       "membership changes counted a completed worker publication")
     local message = subject.indexing_status.message
-    router.stop_slot(subject, slot, "idle")
+    subject:stop_slot(slot, "idle")
     test.assert(indexing_status.state_name(slot.indexing_status.state) == "failed" and
       slot.indexing_status.message == message and
       indexing_status.state_name(subject.indexing_status.state) == "failed" and
@@ -643,7 +643,7 @@ function test_router_release_and_reclaim_restore_busy_and_crashed_snapshots(
     test.assert(released["state"] == "ready" and released["message"] == nil,
       "release retained an excluded root's failure")
     fs.write_file(slot.root.path .. "/titan-config.lua", "")
-    local discovered? = router.owner_root(subject, slot.root.path .. "/main.titan")
+    local discovered? = subject:owner_root(slot.root.path .. "/main.titan")
     test.assert(discovered ~= nil and take_status(subject)["state"] == "failed",
       "config discovery hid a reclaimed crashed snapshot without replay")
   end)
@@ -655,7 +655,7 @@ function test_router_released_worker_exit_clears_unowned_diagnostics(
     local subject = fixture_router(base)
     defer subject:close()
     local slot = add_root(subject, base, "accept")
-    test.assert(router.activate(subject, slot) ~= nil, "the worker did not activate")
+    test.assert(subject:activate(slot) ~= nil, "the worker did not activate")
     wait_ready(slot)
     local uri = source_text.path_to_file_uri(slot.root.path .. "/main.titan")
     test.assert(#take_diagnostics(subject, uri) > 0 and slot.published[uri] ~= nil,
@@ -725,9 +725,9 @@ function test_router_exited_worker_retains_transferred_diagnostics_until_reconci
     defer subject:close()
     local outer = add_root(subject, base, "nested-diagnostics")
     local inner = add_root(subject, outer.root.path, "accept")
-    test.assert(router.activate(subject, outer) ~= nil, "outer worker did not activate")
+    test.assert(subject:activate(outer) ~= nil, "outer worker did not activate")
     wait_ready(outer)
-    test.assert(router.activate(subject, inner) ~= nil, "inner worker did not activate")
+    test.assert(subject:activate(inner) ~= nil, "inner worker did not activate")
     wait_ready(inner)
     local uri = source_text.path_to_file_uri(inner.root.path .. "/main.titan")
     test.assert(#take_diagnostics(subject, uri) > 0 and inner.published[uri] ~= nil,
@@ -757,9 +757,9 @@ function test_router_returned_ownership_clears_a_dead_workers_diagnostics(
     defer subject:close()
     local outer = add_root(subject, base, "nested-diagnostics")
     local inner = add_root(subject, outer.root.path, "accept")
-    test.assert(router.activate(subject, outer) ~= nil, "outer worker did not activate")
+    test.assert(subject:activate(outer) ~= nil, "outer worker did not activate")
     wait_ready(outer)
-    test.assert(router.activate(subject, inner) ~= nil, "inner worker did not activate")
+    test.assert(subject:activate(inner) ~= nil, "inner worker did not activate")
     wait_ready(inner)
     local uri = source_text.path_to_file_uri(inner.root.path .. "/main.titan")
     test.assert(#take_diagnostics(subject, uri) > 0 and inner.published[uri] ~= nil,
@@ -788,7 +788,7 @@ function test_router_restarted_released_worker_replays_when_ownership_returns(
     local subject = fixture_router(base)
     defer subject:close()
     local slot = add_root(subject, base, "accept")
-    test.assert(router.activate(subject, slot) ~= nil, "the worker did not activate")
+    test.assert(subject:activate(slot) ~= nil, "the worker did not activate")
     wait_ready(slot)
     local uri = source_text.path_to_file_uri(slot.root.path .. "/main.titan")
     test.assert(#take_diagnostics(subject, uri) > 0, "the peer published no diagnostic")
@@ -812,7 +812,7 @@ function test_router_failed_replay_remains_pending_without_status_churn(
     local subject = fixture_router(base)
     defer subject:close()
     local slot = add_root(subject, base, "replay-failed-once")
-    test.assert(router.activate(subject, slot) ~= nil, "the worker did not activate")
+    test.assert(subject:activate(slot) ~= nil, "the worker did not activate")
     wait_ready(slot)
     local ready = last_status(subject)
     subject:remove_root(slot.root.path)
@@ -838,15 +838,15 @@ function test_router_cancelled_stop_restores_stopping_flag(_context: test.Contex
     local subject = fixture_router(base)
     defer subject:close()
     local slot = add_root(subject, base, "shutdown-hang")
-    test.assert(router.activate(subject, slot) ~= nil, "the worker did not activate")
+    test.assert(subject:activate(slot) ~= nil, "the worker did not activate")
     wait_ready(slot)
-    local stopping = async.run<|nil, value|>(function (): nil
-      router.stop_slot(subject, slot, "cancelled shutdown")
+    local stopping = async.run(function (): nil
+      subject:stop_slot(slot, "cancelled shutdown")
       return nil
     end)
     wait_until(function (): boolean return slot.stopping end)
     stopping:cancel(async.CancellationReason.simple("test stop cancellation"))
-    local terminal = async.join<|nil, value|>(stopping)
+    local terminal = async.join(stopping)
     test.assert(terminal:as_string() == "cancelled" and not slot.stopping and
       not slot.transitioning, "cancellation stranded stopping or its transition")
   end)
@@ -854,9 +854,9 @@ end
 
 local function revalidate_now(subject: router.Router, slot: router.Slot,
                               force: boolean): boolean
-  router.begin_transition(slot)
-  defer router.end_transition(slot)
-  return router.revalidate(subject, slot, force)
+  slot:begin_transition()
+  defer slot:end_transition()
+  return subject:revalidate(slot, force)
 end
 
 function test_router_repaired_settings_retract_the_failed_snapshot(context: test.Context)
@@ -868,7 +868,7 @@ function test_router_repaired_settings_retract_the_failed_snapshot(context: test
         local subject = fixture_router(base)
         defer subject:close()
         local slot = add_root(subject, base, "accept")
-        test.assert(router.activate(subject, slot) ~= nil, "the worker did not activate")
+        test.assert(subject:activate(slot) ~= nil, "the worker did not activate")
         wait_ready(slot)
         local ready = last_status(subject)
         fs.write_file(slot.root.path .. "/titan-config.lua", "compiler_root = 3\n")
@@ -907,18 +907,18 @@ function test_router_worker_cap_failure_recovers_after_room_is_available(
     fs.mkdir(base .. "/b")
     local busy = add_root(subject, base .. "/a", "indexing")
     local waiting = add_root(subject, base .. "/b", "accept")
-    test.assert(router.activate(subject, busy) ~= nil, "the first worker did not activate")
-    local active?, message? = router.activate(subject, waiting)
+    test.assert(subject:activate(busy) ~= nil, "the first worker did not activate")
+    local active?, message? = subject:activate(waiting)
     test.assert(active == nil and message ~= nil and
       router.state_name(waiting.state) == "failed" and
       waiting.failure == message and waiting.indexing_status.message == message,
       "worker-cap refusal did not record one consistent failure")
     statuses(subject)
     subject:remove_root(busy.root.path)
-    router.stop_slot(subject, busy, "released")
+    subject:stop_slot(busy, "released")
     test.assert(last_status(subject)["state"] == "failed",
       "the waiting root's failure disappeared before a retry")
-    test.assert(router.activate(subject, waiting) ~= nil,
+    test.assert(subject:activate(waiting) ~= nil,
       "the waiting worker did not activate after capacity became available")
     wait_ready(waiting)
     local recovered = last_status(subject)
@@ -934,12 +934,12 @@ function test_router_unanswered_stop_clears_worker_diagnostics(_context: test.Co
     local subject = fixture_router(base)
     defer subject:close()
     local slot = add_root(subject, base, "shutdown-exit")
-    test.assert(router.activate(subject, slot) ~= nil, "the worker did not activate")
+    test.assert(subject:activate(slot) ~= nil, "the worker did not activate")
     wait_ready(slot)
     local uri = source_text.path_to_file_uri(slot.root.path .. "/main.titan")
     test.assert(slot.published[uri] ~= nil, "the worker published no diagnostic")
     while subject.output:pending() > 0 do subject.output:take() end
-    router.stop_slot(subject, slot, "worker exit during shutdown")
+    subject:stop_slot(slot, "worker exit during shutdown")
     local cleared = false
     while subject.output:pending() > 0 do
       local envelope = response(subject.output:take())
@@ -960,7 +960,7 @@ function test_router_unavailable_replay_is_not_retried_for_the_same_worker(
     local subject = fixture_router(base)
     defer subject:close()
     local slot = add_root(subject, base, "replay-unavailable")
-    test.assert(router.activate(subject, slot) ~= nil, "the worker did not activate")
+    test.assert(subject:activate(slot) ~= nil, "the worker did not activate")
     wait_ready(slot)
     local worker = slot.worker
     defer worker:kill()
@@ -973,7 +973,7 @@ function test_router_unavailable_replay_is_not_retried_for_the_same_worker(
       test.assert(count == 0, "the replay peer received an unexpected request")
     else raise "the replay peer did not report its request count"
     end
-    worker_process.close_input(worker)
+    worker:close_input()
     subject:remove_root(slot.root.path)
     subject:reconcile()
     reclaim(subject, slot)
@@ -1001,7 +1001,7 @@ function test_router_exited_replay_settles_unavailable_without_retry(_context: t
     local subject = fixture_router(base)
     defer subject:close()
     local slot = add_root(subject, base, "replay-exit")
-    test.assert(router.activate(subject, slot) ~= nil, "the worker did not activate")
+    test.assert(subject:activate(slot) ~= nil, "the worker did not activate")
     wait_ready(slot)
     subject:remove_root(slot.root.path)
     subject:reconcile()

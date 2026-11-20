@@ -15,11 +15,11 @@ local sql = import "server.workspace_store"
 local header_store = import "server.header_store"
 foreign import "compiler_io_clock.h"
 
-local function phase(name: string,cpu: float,wall: float)
+local function phase(name: string, cpu: float, wall: float)
   local elapsed = ffi.vscode_titan_monotonic_ms() - wall
   if elapsed < 0.0 then elapsed = 0.0 end
-  logging.emit("debug","cache.startup.phase",{
-    ["phase"] = name,["cpu_ms"] = logging.elapsed_ms(cpu),["wall_ms"] = elapsed,
+  logging.emit("debug", "cache.startup.phase", {
+    ["phase"] = name, ["cpu_ms"] = logging.elapsed_ms(cpu), ["wall_ms"] = elapsed,
   })
 end
 
@@ -45,8 +45,8 @@ end
 -- Catalog-only siblings belong to a complete physical provider. Saved graph
 -- names always win, and a recapture replaces all prior siblings of its owner.
 local function completion_catalog(connection: sqlite3.Connection,
-    snapshot: service.Snapshot, binaries: {bridge.CompletionBinary}, reusable: boolean,
-    browser_provider: string?):
+    snapshot: service.Snapshot, binaries: const? {bridge.CompletionBinary},
+    reusable: boolean, browser_provider: string?):
     ({completion_store.SavedDescriptor}, {string})
   local browser_provider_key: string? = nil
   if browser_provider ~= nil then
@@ -119,7 +119,12 @@ local function completion_catalog(connection: sqlite3.Connection,
     if graph_names[name] == nil and not blocked[key] and not replaced[key] and
        keep then
       names[#names + 1] = name
-      choices[name] = bridge.CompletionBinary.new(name, "", kind, sql.bytes(row, 3))
+      choices[name] = bridge.CompletionBinary {
+        module_name = name,
+        serialized = "",
+        kind = kind,
+        filename = sql.bytes(row, 3),
+      }
     end
   end
   for index = 1, #binaries do
@@ -152,9 +157,19 @@ local function completion_catalog(connection: sqlite3.Connection,
     local binary = choices[name]
     retained[#retained + 1] = name
     if fresh[name] then
-      descriptors[#descriptors + 1] = completion_store.SavedDescriptor.new(
-        name, 0, 2, binary.kind, binary.filename, nil,
-        binary.serialized, nil, {}, {}, {}, {}, binary.documentation)
+      descriptors[#descriptors + 1] = completion_store.SavedDescriptor {
+        module_name = name,
+        revision = 0,
+        state = 2,
+        provenance = binary.kind,
+        main_file = binary.filename,
+        public_interface = binary.serialized,
+        source_files = {},
+        imports = {},
+        header_inputs = {},
+        candidates = {},
+        documentation = binary.documentation,
+      }
     end
   end
   return descriptors, retained
@@ -167,10 +182,11 @@ local function prepare_completion_descriptors(snapshot: service.Snapshot,
     ({completion_store.SavedDescriptor}, {string})
   local changed: {CompletionRevision} = {}
   local retained: {string} = {}
+  local exists = false
   do
     local access = loaded:workspace_store():acquire()
     defer access:release()
-    local exists = sql.scalar_integer(access.connection,
+    exists = sql.scalar_integer(access.connection,
       "SELECT count(*) FROM main.sqlite_master WHERE type='table' AND name IN " ..
       "('completion_descriptors','completion_source_files','completion_imports','completion_header_inputs','completion_members','completion_configuration','completion_roots')") == 7
     local query = "SELECT name,revision,state,provenance FROM main.graph_modules ORDER BY name"
@@ -185,10 +201,10 @@ local function prepare_completion_descriptors(snapshot: service.Snapshot,
       if exists and row:get(4) == 0 then
         unchanged = sql.scalar_integer(access.connection,
           "SELECT count(*) FROM main.completion_descriptors WHERE module_name=? AND revision=? AND state=?",
-          sqlite3.Blob.new(name), revision, state) ~= 0
+          sqlite3.Blob(name), revision, state) ~= 0
       end
       if not unchanged then
-        changed[#changed + 1] = CompletionRevision.new(name, revision, state)
+        changed[#changed + 1] = CompletionRevision(name, revision, state)
       end
     end
   end
@@ -201,6 +217,16 @@ local function prepare_completion_descriptors(snapshot: service.Snapshot,
     candidates[exported[index].module_name] = exported[index].candidates
     documentation[exported[index].module_name] = exported[index].documentation
   end
+  local projects_by_name: {string: service.ProjectModule} = {}
+  for index = 1, #snapshot.project_modules do
+    local project = snapshot.project_modules[index]
+    projects_by_name[project.module_name] = project
+  end
+  local externals_by_name: {string: service.ExternalModule} = {}
+  for index = 1, #snapshot.external_modules do
+    local external = snapshot.external_modules[index]
+    externals_by_name[external.module_name] = external
+  end
   local descriptors: {completion_store.SavedDescriptor} = {}
   for index = 1, #changed do
     local revision = changed[index]
@@ -211,76 +237,91 @@ local function prepare_completion_descriptors(snapshot: service.Snapshot,
     local provenance = "project"
     local public_interface = ""
     local source_interface: string? = nil
-    for project_index = 1, #snapshot.project_modules do
-      local project = snapshot.project_modules[project_index]
-      if project.module_name == revision.name then
-        for file_index = 1, #project.source_files do
-          files[file_index] = project.source_files[file_index].filename
+    local project? = projects_by_name[revision.name]
+    if project ~= nil then
+      for file_index = 1, #project.source_files do
+        files[file_index] = project.source_files[file_index].filename
+      end
+      if #files > 0 then main_file = files[1] end
+      if project.compiler_snapshot ~= nil then
+        imports = project.compiler_snapshot.imports
+        headers = project.compiler_snapshot.c_header_dependencies
+        if project.compiler_snapshot.manifest ~= nil then
+          public_interface = project.compiler_snapshot.manifest.serialized
+          source_interface = project.compiler_snapshot.manifest.source_serialized
         end
-        if #files > 0 then main_file = files[1] end
-        if project.compiler_snapshot ~= nil then
-          imports = project.compiler_snapshot.imports
-          headers = project.compiler_snapshot.c_header_dependencies
-          if project.compiler_snapshot.manifest ~= nil then
-            public_interface = project.compiler_snapshot.manifest.serialized
-            source_interface = project.compiler_snapshot.manifest.source_serialized
-          end
-        else
-          -- Failed or unchanged body-free projects may have no live snapshot.
-          -- Header provenance belongs to the accepted graph revision, not RAM.
-          local access = loaded:workspace_store():acquire()
-          defer access:release()
-          local saved_headers? = header_store.read(access.connection, 0, revision.name)
-          if saved_headers ~= nil then headers = saved_headers end
-        end
+      else
+        -- Failed or unchanged body-free projects may have no live snapshot.
+        -- Header provenance belongs to the accepted graph revision, not RAM.
+        local access = loaded:workspace_store():acquire()
+        defer access:release()
+        local saved_headers? = header_store.read(access.connection, 0, revision.name)
+        if saved_headers ~= nil then headers = saved_headers end
       end
     end
-    for external_index = 1, #snapshot.external_modules do
-      local external = snapshot.external_modules[external_index]
-      if external.module_name == revision.name then
-        imports = external.compiler_imports
-        headers = external.c_header_dependencies
-        public_interface = external.manifest.public_digest
-        source_interface = external.manifest.source_digest
-        case external.origin
-        when source{source_main_file = main_file; source_files} then
-          provenance = "external"
-          main_file = source_main_file
-          files = source_files
-        when dynamic_binary{provider_file} then
-          provenance = "dynamic"
-          main_file = provider_file
-        when static_binary{provider_file} then
-          provenance = "static"
-          main_file = provider_file
-        end
+    local external? = externals_by_name[revision.name]
+    if external ~= nil then
+      imports = external.compiler_imports
+      headers = external.c_header_dependencies
+      public_interface = external.manifest.public_digest
+      source_interface = external.manifest.source_digest
+      case external.origin
+      when source{source_main_file = main_file; source_files} then
+        provenance = "external"
+        main_file = source_main_file
+        files = source_files
+      when dynamic_binary{provider_file} then
+        provenance = "dynamic"
+        main_file = provider_file
+      when static_binary{provider_file} then
+        provenance = "static"
+        main_file = provider_file
       end
     end
     local members: {completion_types.Candidate} = {}
     local selected_members? = candidates[revision.name]
     if selected_members ~= nil then members = selected_members end
-    local payload: string? = nil
-    local descriptor = completion_store.SavedDescriptor.new(
-      revision.name, revision.revision, revision.state, provenance, main_file, nil,
-      public_interface, source_interface, files, imports, headers, members, documentation[revision.name])
+    local descriptor = completion_store.SavedDescriptor {
+      module_name = revision.name,
+      revision = revision.revision,
+      state = revision.state,
+      provenance = provenance,
+      main_file = main_file,
+      public_interface = public_interface,
+      source_interface = source_interface,
+      source_files = files,
+      imports = imports,
+      header_inputs = headers,
+      candidates = members,
+      documentation = documentation[revision.name],
+    }
     local unchanged = false
-    if provenance ~= "project" then
+    if provenance ~= "project" and exists then
       local access = loaded:workspace_store():acquire()
       defer access:release()
-      if sql.scalar_integer(access.connection,
-          "SELECT count(*) FROM main.sqlite_master WHERE type='table' AND name IN " ..
-          "('completion_descriptors','completion_source_files','completion_imports','completion_header_inputs','completion_members','completion_configuration','completion_roots')") == 7 then
-        unchanged = completion_store.descriptor_matches(access.connection, descriptor)
-      end
+      unchanged = completion_store.descriptor_matches(access.connection, descriptor)
     end
     if not unchanged then
       if provenance == "external" then
-        payload = compiler:external_completion_payload(revision.name,
+        local payload? = compiler:external_completion_payload(revision.name,
           public_interface, source_interface, main_file, files, headers)
+        descriptor = completion_store.SavedDescriptor {
+          module_name = revision.name,
+          revision = revision.revision,
+          state = revision.state,
+          provenance = provenance,
+          main_file = main_file,
+          payload = payload,
+          public_interface = public_interface,
+          source_interface = source_interface,
+          source_files = files,
+          imports = imports,
+          header_inputs = headers,
+          candidates = members,
+          documentation = documentation[revision.name],
+        }
       end
-      descriptors[#descriptors + 1] = completion_store.SavedDescriptor.new(
-        revision.name, revision.revision, revision.state, provenance, main_file, payload,
-        public_interface, source_interface, files, imports, headers, members, documentation[revision.name])
+      descriptors[#descriptors + 1] = descriptor
     end
   end
   local binaries = compiler:completion_binary_catalog(not reusable)
@@ -304,13 +345,7 @@ local function analysis_header_inputs(request: service.AnalysisRequest):
     local dependencies = request.header_fingerprints[index].dependencies
     for dependency_index = 1, #dependencies do
       local input = dependencies[dependency_index]
-      local kind = "file"
-      case input.kind
-      when file() then
-      when search() then kind = "search"
-      when origin() then kind = "origin"
-      end
-      local key = kind .. "\0" .. input.path .. "\0" .. input.identity
+      local key = input.kind:name() .. "\0" .. input.path .. "\0" .. input.identity
       if not seen[key] then
         seen[key] = true
         inputs[#inputs + 1] = input
@@ -330,12 +365,12 @@ record Restoration
 end
 
 function restoration(work: function (): {string}): Restoration
-  return Restoration.new(work,nil,false)
+  return Restoration { work = work, consumed = false }
 end
 
 function Restoration:start(on_miss: (function (): ())?)
   if self.task ~= nil then return end
-  self.task = async.run<|{string},value|>(function (): {string}
+  self.task = async.run<|{string}, value|>(function (): {string}
     -- READY and the completed SQL View are visible before decoding starts.
     async.yield()
     local missing = self.work()
@@ -347,7 +382,7 @@ end
 function Restoration:finish(loaded: service.Service)
   self:start()
   local missing: {string} = {}
-  case async.join<|{string},value|>(self.task)
+  case async.join(self.task)
   when succeeded(result) then missing = result
   when failed(failure) then raise failure.error
   when cancelled() then
@@ -382,7 +417,7 @@ local function project_restoration(compiler: bridge.Compiler,
   return restoration(function (): {string}
     local cpu = logging.clock()
     local wall = ffi.vscode_titan_monotonic_ms()
-    logging.emit("debug","cache.projects.restoration_start",{
+    logging.emit("debug", "cache.projects.restoration_start", {
       ["candidates"] = #candidates,
     })
     local names: {string} = {}
@@ -394,21 +429,21 @@ local function project_restoration(compiler: bridge.Compiler,
     end
     local restored: {string: boolean} = {}
     do
-      compiler:restore_project_cache(project_inputs(loaded:latest()),names,
-        function (name: string): (string?,{bridge.CHeaderDependency}?)
+      compiler:restore_project_cache(project_inputs(loaded:latest()), names,
+        function (name: string): (string?, {bridge.CHeaderDependency}?)
           local payload? = cache:project_payload(selected[name])
-          if payload == nil then return nil,nil end
-          return payload.payload,payload.header_inputs
+          if payload == nil then return nil, nil end
+          return payload.payload, payload.header_inputs
         end,
         function (name: string): boolean
           local candidate = selected[name]
-          local accepted = loaded:accepts_project_manifest(name,candidate.revision)
+          local accepted = loaded:accepts_project_manifest(name, candidate.revision)
           if accepted then restored[name] = true end
           return accepted
         end)
     catch
       if error is async.CancellationReason then raise end
-      logging.emit("debug","cache.projects.restoration_miss",{
+      logging.emit("debug", "cache.projects.restoration_miss", {
         ["message"] = strings.tostring(error),
       })
     end
@@ -417,14 +452,14 @@ local function project_restoration(compiler: bridge.Compiler,
       if not restored[names[index]] then missing[#missing + 1] = names[index] end
     end
     compiler:log_cache_stats()
-    phase("project_restoration",cpu,wall)
+    phase("project_restoration", cpu, wall)
     return missing
   end)
 end
 
 local function load_or_raise(project_root: string,
     progress_listener: bridge.ProgressListener?,
-    snapshot_listener: service.SnapshotListener?): (service.Service?,service.Error?,Restoration?)
+    snapshot_listener: service.SnapshotListener?): (service.Service?, service.Error?, Restoration?)
   local cpu = logging.clock()
   local wall = ffi.vscode_titan_monotonic_ms()
   local compiler: bridge.Compiler?
@@ -442,7 +477,7 @@ local function load_or_raise(project_root: string,
   local settings?, config_error? = config.load(
     project_root, installed_root, selected_inventory_directory)
   if settings == nil then
-    return nil,service.Error.new(config_error.path,config_error.message),nil
+    return nil, service.Error(config_error.path, config_error.message), nil
   end
   if settings.target ~= bridge.analysis_target() then
     return nil, service.Error(settings.config_file or project_root,
@@ -459,55 +494,41 @@ local function load_or_raise(project_root: string,
       if loaded ~= nil then loaded:close() else cache.store:close() end
     end
   end
-  local inventory = compiler:cache_identity(function (path: string): string
-    return cache:inventory_identity(path)
-  end)
+  local inventory = compiler:cache_identity(cache:inventory_identity)
   local current_configuration = settings:semantic_identity()
   local compatibility = inventory .. current_configuration
-  cache = cache:validate_inventory(settings.project_root,compatibility)
-  phase("inventory",cpu,wall)
-  compiler:configure_cache(
-    function (kind: string,key: string): (string?,{bridge.CHeaderDependency}?)
-      return cache:lookup(kind,key)
-    end,
-    function (kind: string,key: string,payload: string,inputs: {bridge.CHeaderDependency})
-      cache:stage(kind,key,payload,inputs)
-    end,
-    function (kind: string,key: string,inputs: {bridge.CHeaderDependency}): boolean
-      return cache:refresh_inputs(kind,key,inputs)
-    end)
+  cache = cache:validate_inventory(settings.project_root, compatibility)
+  phase("inventory", cpu, wall)
+  compiler:configure_cache(cache:lookup, cache:stage, cache:refresh_inputs)
   cpu = logging.clock()
   wall = ffi.vscode_titan_monotonic_ms()
   local native_context = compiler:native_cache_identity()
   if not cache:accept_native_context(native_context) then
     cache = cache:rebuild()
+    compiler:configure_cache(cache:lookup, cache:stage, cache:refresh_inputs)
     if not cache:accept_native_context(native_context) then
       raise "fresh workspace cache rejected its native context"
     end
   end
-  phase("native_context",cpu,wall)
+  phase("native_context", cpu, wall)
   local analyzer: service.Analyzer = function (
       request: service.AnalysisRequest): bridge.Analysis
     if restoring ~= nil and loaded ~= nil then restoring:finish(loaded) end
     compiler:configure(bridge.project_configuration(request.config))
-    return compiler:analyze_incremental(request.project_modules,request.dirty_modules,
-      request.cached_sources,progress_listener,analysis_header_inputs(request))
+    return compiler:analyze_incremental(request.project_modules, request.dirty_modules,
+      request.cached_sources, progress_listener, analysis_header_inputs(request))
   end
   local resolver: service.ExternalResolver = function (
-      current: config.ProjectConfig,projects: {string},
+      current: config.ProjectConfig, projects: {string},
       requests: {bridge.ExternalResolutionRequest}): {bridge.ExternalResolution}
     compiler:configure(bridge.project_configuration(current))
-    return compiler:resolve_external_modules(projects,requests)
+    return compiler:resolve_external_modules(projects, requests)
   end
-  local restater: service.HeaderRestater = function (
-      inputs: {bridge.CHeaderDependency},validation: bridge.HeaderValidation?):
-      ({bridge.CHeaderDependency},boolean)
-    return compiler:restat_c_header_dependencies(inputs,validation)
-  end
+  local restater: service.HeaderRestater = compiler:restat_c_header_dependencies
   local failure?: service.Error
   cpu = logging.clock()
   wall = ffi.vscode_titan_monotonic_ms()
-  loaded,failure = service.create {
+  loaded, failure = service.create {
     settings = settings,
     installed_binary_modules_root = installed_root,
     analyzer = analyzer,
@@ -516,8 +537,8 @@ local function load_or_raise(project_root: string,
     store = cache.store,
     selected_inventory_directory = selected_inventory_directory,
   }
-  if loaded == nil then return nil,failure,nil end
-  phase("input_validation",cpu,wall)
+  if loaded == nil then return nil, failure, nil end
+  phase("input_validation", cpu, wall)
   local browser = settings.target == "browser"
   if browser then
     local saved_foreign? = cache:browser_foreign_identity()
@@ -528,15 +549,15 @@ local function load_or_raise(project_root: string,
   end
   local unpublished = cache:unpublished_projects()
   for index = 1, #unpublished do loaded:invalidate_cached_project(unpublished[index]) end
-  restoring = project_restoration(compiler,loaded,cache)
+  restoring = project_restoration(compiler, loaded, cache)
   local completion_descriptors: {completion_store.SavedDescriptor} = {}
   local completion_modules: {string} = {}
-  local completion_configuration = bridge.CompilerConfiguration.new()
+  local completion_configuration = bridge.CompilerConfiguration()
   local completion_include: {string} = {}
   local completion_exclude: {string} = {}
   local completion_inactive: {string} = {}
-  loaded:set_publication_hooks(service.PublicationHooks.new(
-    function (snapshot: service.Snapshot): boolean
+  loaded:set_publication_hooks(service.PublicationHooks {
+    prepare = function (snapshot: service.Snapshot): boolean
       local next_configuration = loaded:semantic_configuration()
       if next_configuration ~= current_configuration then
         compiler:configure(bridge.project_configuration(snapshot.config))
@@ -551,7 +572,7 @@ local function load_or_raise(project_root: string,
       if not reusable then
         local selected = cache:projects_to_export()
         if #selected > 0 then
-          cache:set_projects(compiler:export_projects(project_inputs(snapshot),selected))
+          cache:set_projects(compiler:export_projects(project_inputs(snapshot), selected))
         end
       end
       completion_descriptors, completion_modules =
@@ -571,43 +592,42 @@ local function load_or_raise(project_root: string,
       completion_inactive = inactive
       return reusable
     end,
-    function (connection: sqlite3.Connection)
+    publish = function (connection: sqlite3.Connection)
       cache:publish(connection)
       completion_store.publish_saved(connection, completion_descriptors,
         completion_modules, completion_configuration, completion_include,
         completion_exclude, completion_inactive)
     end,
-    function ()
+    committed = function ()
       cache:publication_committed()
       compiler:release_completion_exports()
-    end))
+    end,
+  })
   local report?, refresh_error? = loaded:run_pending(snapshot_listener)
-  if report == nil then return nil,refresh_error,nil end
+  if report == nil then return nil, refresh_error, nil end
   if not cache:can_reuse_publication() then
     restoring:finish(loaded)
-    report,refresh_error = loaded:run_pending()
-    if report == nil then return nil,refresh_error,nil end
+    report, refresh_error = loaded:run_pending()
+    if report == nil then return nil, refresh_error, nil end
   end
   compiler:log_cache_stats()
   complete = true
-  return loaded,nil,restoring
+  return loaded, nil, restoring
 end
 
-function load(project_root: string,progress_listener: bridge.ProgressListener?,
-               snapshot_listener: service.SnapshotListener?):
-    (service.Service?,service.Error?,Restoration?)
-  do
-    return load_or_raise(project_root,progress_listener,snapshot_listener)
-  catch
-    if error is async.CancellationReason then raise end
-    if error is bridge.BridgeError then
-      local failure = error as bridge.BridgeError
-      return nil,service.Error.new(failure.module_name,failure.message),nil
-    end
-    if error is service.Error then return nil,error as service.Error,nil end
-    if error is sqlite3.Error then
-      return nil,service.Error.new(project_root,(error as sqlite3.Error).message),nil
-    end
-    return nil,service.Error.new(project_root,strings.tostring(error)),nil
+function load(project_root: string, progress_listener: bridge.ProgressListener?,
+              snapshot_listener: service.SnapshotListener?):
+    (service.Service?, service.Error?, Restoration?)
+  return load_or_raise(project_root, progress_listener, snapshot_listener)
+catch
+  if error is async.CancellationReason then raise end
+  if error is bridge.BridgeError then
+    local failure = error as bridge.BridgeError
+    return nil, service.Error(failure.module_name, failure.message), nil
   end
+  if error is service.Error then return nil, error as service.Error, nil end
+  if error is sqlite3.Error then
+    return nil, service.Error(project_root, (error as sqlite3.Error).message), nil
+  end
+  return nil, service.Error(project_root, strings.tostring(error)), nil
 end

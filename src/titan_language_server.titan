@@ -10,7 +10,6 @@ local application = import "server.application"
 local bridge = import "server.compiler_bridge"
 local diagnostics = import "server.diagnostics"
 local dispatcher = import "server.dispatcher"
-local coordinator = import "server.coordinator"
 local lsp = import "server.lsp_types"
 local framing = import "server.framing"
 local indexing_status = import "server.indexing_status"
@@ -26,8 +25,8 @@ local source_text = import "server.source_text"
 local wire = import "server.wire"
 local workspace_cache = import "server.workspace_cache"
 
-local UNAVAILABLE_DOCUMENT_METHOD = "titan/documentUnavailable"
-local INVALID_PARAMS = -32602
+local const UNAVAILABLE_DOCUMENT_METHOD = "titan/documentUnavailable"
+local const INVALID_PARAMS = -32602
 
 local record Options
   const worker: boolean
@@ -75,14 +74,12 @@ local function parse_options(args: {string}): Options
 end
 
 local function absolute_root(candidate: string?): string
-  local requested? = candidate
-  if requested == nil then return fs.pwd() end
-  local resolved?, failure? = source_text.resolve_path(
-    fs.pwd(), requested as string)
+  if candidate == nil then return fs.pwd() end
+  local resolved?, failure? = source_text.resolve_path(fs.pwd(), candidate)
   if resolved == nil then
     raise "invalid --root path: " .. failure.message
   end
-  return resolved as string
+  return resolved
 end
 
 -- A worker reports the process identity the router publishes as workerPid,
@@ -109,25 +106,52 @@ end
 local function unavailable_document(request: dispatcher.SemanticRequest,
                                    server: application.Application):
     dispatcher.SemanticOutcome
-  local object? = wire.as_object(request.params)
-  if object == nil then
+  local params? = wire.as_object(request.params)
+  if params == nil then
     return dispatcher.SemanticOutcome.failure(INVALID_PARAMS,
       "params must be an object")
   end
-  local params = object as wire.Object
   local document?, document_error? = lsp.parse_document(params)
   if document == nil then
     return dispatcher.SemanticOutcome.failure(INVALID_PARAMS,
-      (document_error as lsp.Error).message)
+      document_error.message)
   end
   local version? = wire.as_integer(params["version"])
   if version == nil then
     return dispatcher.SemanticOutcome.failure(INVALID_PARAMS,
       "params.version must be an integer")
   end
-  server:on_unavailable_document(document as lsp.TextDocument,
-    version as integer)
+  server:on_unavailable_document(document, version)
   return dispatcher.SemanticOutcome.result(wire.null())
+end
+
+local function log_server_failure(err: value, trace: string)
+  if err is protocol.ProtocolError then
+    local failure: protocol.ProtocolError = err
+    logging.emit("error", "server.failure", {
+      ["message"] = failure.message,
+    })
+  elseif err is framing.FrameError then
+    local failure: framing.FrameError = err
+    logging.emit("error", "server.failure", {
+      ["message"] = failure.message,
+    })
+  elseif err is async.OperationError then
+    local failure: async.OperationError = err
+    logging.emit("error", "server.failure", {
+      ["operation"] = failure.operation,
+      ["message"] = failure.message,
+      ["name"] = failure.name,
+    })
+  else
+    local details = strings.tostring(err)
+    if #trace > 0 then
+      details = details .. "\nstack traceback:\n" .. trace
+    end
+    logging.emit("error", "server.failure", {
+      ["message"] = details,
+    })
+  end
 end
 
 local function serve(root: string): integer
@@ -137,14 +161,15 @@ local function serve(root: string): integer
     ["probe_cache_prefix"] = os.getenv("TITAN_PREFIX"),
     ["compiler_root"] = bridge.compiler_root(),
   })
-  local result = 1
+  defer logging.emit("info", "server.stop", nil)
   do
     local server = application.create(root)
     defer server:close()
-    local diagnostic_listener: diagnostics.Listener? = nil
-    result = protocol.run(
-      os.stdin, os.stdout,
-      function (request: dispatcher.SemanticRequest): dispatcher.SemanticOutcome
+    local diagnostic_listener: diagnostics.Listener?
+    return protocol.run {
+      source = os.stdin,
+      target = os.stdout,
+      handler = function (request: dispatcher.SemanticRequest): dispatcher.SemanticOutcome
         if request.method == UNAVAILABLE_DOCUMENT_METHOD then
           return unavailable_document(request, server)
         end
@@ -156,8 +181,8 @@ local function serve(root: string): integer
         end
         return server:handle(request)
       end,
-      function () server:start_indexing() end,
-      function (sink: protocol.NotificationSink)
+      initialized_handler = server:start_indexing,
+      notification_binder = function (sink: protocol.NotificationSink)
         server:set_indexing_listener(function (status: indexing_status.Status)
           sink(indexing_status.notification(status))
         end)
@@ -166,52 +191,20 @@ local function serve(root: string): integer
         end
         server:set_diagnostics_listener(diagnostic_listener)
       end,
-      function () server:stop_diagnostics() end,
-      function (notification: lsp.DocumentNotification)
-        server:on_document(notification)
-      end,
-      function (request: dispatcher.CompletionRequest): coordinator.CompletionWork
-        return server:capture_completion(request)
-      end,
-      function (request: dispatcher.SemanticRequest): coordinator.CompletionWork
-        return server:capture_hover(request)
-      end,
-      wire.encode(info_envelope()) as string,
-      function (requests: outbound_requests.OutboundRequests,
-                capabilities: lsp.CapabilitiesReader)
+      shutdown_handler = server:stop_diagnostics,
+      document_handler = server:on_document,
+      completion_capture = server:capture_completion,
+      hover_capture = server:capture_hover,
+      startup_notification = wire.encode(info_envelope()),
+      client_binder = function (requests: outbound_requests.OutboundRequests,
+                                capabilities: lsp.CapabilitiesReader)
         server:set_client_channel(requests, capabilities)
-      end)
+      end,
+    }
   catch
-    if error is protocol.ProtocolError then
-      local failure = error as protocol.ProtocolError
-      logging.emit("error", "server.failure", {
-        ["message"] = failure.message,
-      })
-    elseif error is framing.FrameError then
-      local failure = error as framing.FrameError
-      logging.emit("error", "server.failure", {
-        ["message"] = failure.message,
-      })
-    elseif error is async.OperationError then
-      local failure = error as async.OperationError
-      logging.emit("error", "server.failure", {
-        ["operation"] = failure.operation,
-        ["message"] = failure.message,
-        ["name"] = failure.name,
-      })
-    else
-      local details = strings.tostring(error)
-      if #traceback > 0 then
-        details = details .. "\nstack traceback:\n" .. traceback
-      end
-      logging.emit("error", "server.failure", {
-        ["message"] = details,
-      })
-    end
-    result = 1
+    log_server_failure(error, traceback)
+    return 1
   end
-  logging.emit("info", "server.stop", nil)
-  return result
 end
 
 local function serve_router(root: string, executable: string): integer
@@ -226,43 +219,20 @@ local function serve_router(root: string, executable: string): integer
     ["probe_cache_prefix"] = root_settings.probe_prefix(
       inherited_probe, launch_root),
   })
-  local result = 1
+  defer logging.emit("info", "server.stop", nil)
   do
-    result = router.run(
+    return router.run(
       os.stdin, os.stdout,
-      router.LaunchOptions.new(
-        executable, launch_root, inherited_probe, titan_root))
+      router.LaunchOptions {
+        executable = executable,
+        root = launch_root,
+        probe_prefix = inherited_probe,
+        titan_root = titan_root,
+      })
   catch
-    if error is protocol.ProtocolError then
-      local failure = error as protocol.ProtocolError
-      logging.emit("error", "server.failure", {
-        ["message"] = failure.message,
-      })
-    elseif error is framing.FrameError then
-      local failure = error as framing.FrameError
-      logging.emit("error", "server.failure", {
-        ["message"] = failure.message,
-      })
-    elseif error is async.OperationError then
-      local failure = error as async.OperationError
-      logging.emit("error", "server.failure", {
-        ["operation"] = failure.operation,
-        ["message"] = failure.message,
-        ["name"] = failure.name,
-      })
-    else
-      local details = strings.tostring(error)
-      if #traceback > 0 then
-        details = details .. "\nstack traceback:\n" .. traceback
-      end
-      logging.emit("error", "server.failure", {
-        ["message"] = details,
-      })
-    end
-    result = 1
+    log_server_failure(error, traceback)
+    return 1
   end
-  logging.emit("info", "server.stop", nil)
-  return result
 end
 
 --- Configure the compiler environment and serve the requested mode.
@@ -272,7 +242,7 @@ function main(args: {string}): integer
     local path, cpath = lua_paths.configure()
     local selected? = options.compiler_root
     if selected ~= nil then
-      path, cpath = lua_paths.select_compiler_root(selected as string)
+      path, cpath = lua_paths.select_compiler_root(selected)
     end
     io.print("package.path=" .. path)
     io.print("package.cpath=" .. cpath)
@@ -309,7 +279,7 @@ function main(args: {string}): integer
       target = nil
     end
     if selected ~= nil then
-      lua_paths.select_compiler_root(selected as string)
+      lua_paths.select_compiler_root(selected)
       bridge.select_compiler_root(selected, target)
     else
       lua_paths.configure()

@@ -8,6 +8,9 @@ local strings = import "string"
 local source_text = import "server.source_text"
 local timer = import "timer"
 
+local const INITIAL_RETRY_DELAY_MS = 25
+local const MAX_RETRY_DELAY_MS = 1000
+
 -- These directories are the complete watch authority for one project. Callers
 -- discover them from the project source/configuration roots; this module never
 -- derives another registration from a notification path.
@@ -55,18 +58,18 @@ end
 -- The private backend is the deterministic test seam. Production constructs
 -- one wrapper around one fs.Watcher; no dynamic values cross this boundary.
 local record Backend
-  canonicalize_directory: function (string): string
-  watch: function (string): ()
-  stop: function (string): ()
-  is_watching: function (string): boolean
-  clear: function (): ()
-  poll: function (): {BackendEvent}
+  const canonicalize_directory: function (string): string
+  const watch: function (string): ()
+  const stop: function (string): ()
+  const is_watching: function (string): boolean
+  const clear: function (): ()
+  const poll: function (): {BackendEvent}
 end
 
 --- Runtime-bound owner of project directory registrations and notification draining.
 record ProjectWatcher
-  local backend: Backend
-  local callback: RediscoveryCallback
+  local const backend: Backend
+  local const callback: RediscoveryCallback
   local active: {string: boolean}
   local active_order: {string}
   local poll_task: async.Task<|nil, value|>?
@@ -125,32 +128,25 @@ local function append_change(changes: {PathChange},
   end
 end
 
-local function normalized_scope(backend: Backend,
-                                scope: DirectoryScope):
+local function Backend:normalized_scope(scope: DirectoryScope):
     ({string}, {string: boolean})
   local paths: {string} = {}
   local present: {string: boolean} = {}
   for index = 1, #scope.project_directories do
-    local path = backend.canonicalize_directory(
+    local path = self.canonicalize_directory(
       scope.project_directories[index])
     append_unique(paths, present, path)
   end
   for index = 1, #scope.configuration_directories do
-    local path = backend.canonicalize_directory(
+    local path = self.canonicalize_directory(
       scope.configuration_directories[index])
     append_unique(paths, present, path)
   end
   return paths, present
 end
 
-local function copy_paths(paths: {string}): {string}
-  local copy: {string} = {}
-  for index = 1, #paths do copy[index] = paths[index] end
-  return copy
-end
-
 function ProjectWatcher:watched_directories(): {string}
-  return copy_paths(self.active_order)
+  return {...self.active_order}
 end
 
 function ProjectWatcher:is_stopped(): boolean
@@ -159,7 +155,7 @@ end
 
 local function ProjectWatcher:retire_missing_registrations(): boolean
   local changed = false
-  local snapshot = copy_paths(self.active_order)
+  local snapshot = {...self.active_order}
   for index = 1, #snapshot do
     local path = snapshot[index]
     if not self.backend.is_watching(path) then
@@ -190,22 +186,22 @@ local function ProjectWatcher:publish(events: {BackendEvent})
 
   local watch_set_changed = self:retire_missing_registrations()
   if #changes > 0 or #failures > 0 or watch_set_changed then
-    self.callback(RediscoveryBatch.new(
+    self.callback(RediscoveryBatch(
       changes, failures, watch_set_changed))
   end
 end
 
 local function ProjectWatcher:report_poll_failure(failure: value)
   if self.poll_cancel_expected or self.stopped then return end
-  self.callback(RediscoveryBatch.new({}, {
-    WatchFailure.new(
+  self.callback(RediscoveryBatch({}, {
+    WatchFailure(
       0, "project_watcher", strings.tostring(failure),
       "project_watcher.poll"),
   }, false))
 end
 
 local function ProjectWatcher:poll_loop(): nil
-  local retry_delay = 25
+  local retry_delay = INITIAL_RETRY_DELAY_MS
   while not self.stopped and #self.active_order > 0 do
     local events: {BackendEvent}? = nil
     do
@@ -229,13 +225,15 @@ local function ProjectWatcher:poll_loop(): nil
         end
         raise
       end
-      if retry_delay < 1000 then
+      if retry_delay < MAX_RETRY_DELAY_MS then
         retry_delay = retry_delay * 2
-        if retry_delay > 1000 then retry_delay = 1000 end
+        if retry_delay > MAX_RETRY_DELAY_MS then
+          retry_delay = MAX_RETRY_DELAY_MS
+        end
       end
     end
     if events ~= nil then
-      retry_delay = 25
+      retry_delay = INITIAL_RETRY_DELAY_MS
       self:publish(events)
     end
   end
@@ -247,9 +245,7 @@ local function ProjectWatcher:start_polling()
   if self.stopped or #self.active_order == 0 or self.poll_task ~= nil then
     return
   end
-  self.poll_task = async.run<|nil, value|>(function (): nil
-    return self:poll_loop()
-  end)
+  self.poll_task = async.run<|nil, value|>(self:poll_loop)
 end
 
 local function ProjectWatcher:begin_operation()
@@ -294,9 +290,9 @@ function ProjectWatcher:reconcile(scope: DirectoryScope)
   self:pause_polling(true)
   defer self:start_polling()
 
-  local target_order, target = normalized_scope(self.backend, scope)
+  local target_order, target = self.backend:normalized_scope(scope)
 
-  local old_order = copy_paths(self.active_order)
+  local old_order = {...self.active_order}
   for index = 1, #old_order do
     local path = old_order[index]
     if not target[path] then
@@ -338,7 +334,7 @@ function ProjectWatcher:stop()
 
   local failed = false
   local failure: value = nil
-  local snapshot = copy_paths(self.active_order)
+  local snapshot = {...self.active_order}
   for index = 1, #snapshot do
     do
       self.backend.stop(snapshot[index])
@@ -382,18 +378,6 @@ local function fs_backend(): Backend
     end
     return canonical
   end
-  local watch = function (path: string)
-    watcher:watch(path)
-  end
-  local stop = function (path: string)
-    watcher:stop(path)
-  end
-  local is_watching = function (path: string): boolean
-    return watcher:is_watching(path)
-  end
-  local clear = function ()
-    watcher:clear()
-  end
   local poll = function (): {BackendEvent}
     local native = watcher:poll()
     local events: {BackendEvent} = {}
@@ -406,21 +390,34 @@ local function fs_backend(): Backend
       when deleted(path) then
         events[#events + 1] = BackendEvent.deleted(native_path(path))
       when error(failure) then
-        events[#events + 1] = BackendEvent.failed(WatchFailure.new(
+        events[#events + 1] = BackendEvent.failed(WatchFailure(
           failure.code, failure.name, failure.message, failure.operation))
       end
     end
     return events
   end
-  return Backend.new(
-    canonicalize, watch, stop, is_watching, clear, poll)
+  return Backend {
+    canonicalize_directory = canonicalize,
+    watch = watcher:watch,
+    stop = watcher:stop,
+    is_watching = watcher:is_watching,
+    clear = watcher:clear,
+    poll = poll,
+  }
 end
 
 local function start_with_backend(backend: Backend, scope: DirectoryScope,
                                   callback: RediscoveryCallback):
     ProjectWatcher
-  local owner = ProjectWatcher.new(
-    backend, callback, {}, {}, nil, false, false, false)
+  local owner = ProjectWatcher {
+    backend = backend,
+    callback = callback,
+    active = {},
+    active_order = {},
+    poll_cancel_expected = false,
+    operation_active = false,
+    stopped = false,
+  }
   owner:reconcile(scope)
   return owner
 end

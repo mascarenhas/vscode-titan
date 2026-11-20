@@ -11,9 +11,9 @@ local source_text = import "server.source_text"
 local content_identity = import "server.content_identity"
 
 record Error
-  path: string
-  message: string
-  target_selection: boolean?
+  const path: string
+  const message: string
+  const target_selection: boolean?
 end
 
 --- One evaluated configuration file's global assignments.
@@ -21,48 +21,42 @@ type Environment = {value: value}
 --- Absent-or-evaluated configuration, including a missing optional file.
 type OptionalEnvironment = Environment?
 
-local LOCAL_CONFIG_FILE_NAME = "titan-config.local.lua"
+local const LOCAL_CONFIG_FILE_NAME = "titan-config.local.lua"
 
 local function configuration_path(root: string): string
-  return paths.to_slash(paths.join(root, "titan-config.lua"))
+  return source_text.join_path(root, "titan-config.lua")
 end
 
 local function local_configuration_path(root: string): string
-  return paths.to_slash(paths.join(root, LOCAL_CONFIG_FILE_NAME))
+  return source_text.join_path(root, LOCAL_CONFIG_FILE_NAME)
 end
 
 --- Normalized project discovery, source roots, native flags, and provider settings.
 record ProjectConfig
-  project_root: string
-  config_file: string?
-  include: {string}
-  exclude: {string}
-  source_module_roots: {string}
-  binary_modules_root: string
-  extra_ffi_include_dirs: {string}
-  extra_ffi_cppflags: string?
-  compiler_root: string?
-  compiler_root_file: string?
+  const project_root: string
+  const config_file: string?
+  const include: {string}
+  const exclude: {string}
+  const source_module_roots: {string}
+  const binary_modules_root: string
+  const extra_ffi_include_dirs: {string}
+  const extra_ffi_cppflags: string?
+  const compiler_root: string?
+  const compiler_root_file: string?
   const use_selected_inventory: boolean?
   -- Nil selects the compiler's native host label, not the label "native".
-  target: string?
-end
-
-local function copy_paths(source: {string}): {string}
-  local result: {string} = {}
-  for index = 1, #source do result[index] = source[index] end
-  return result
+  const target: string?
 end
 
 function ProjectConfig:copy(): ProjectConfig
-  return ProjectConfig.new {
+  return ProjectConfig {
     project_root = self.project_root,
     config_file = self.config_file,
-    include = copy_paths(self.include),
-    exclude = copy_paths(self.exclude),
-    source_module_roots = copy_paths(self.source_module_roots),
+    include = {...self.include},
+    exclude = {...self.exclude},
+    source_module_roots = {...self.source_module_roots},
     binary_modules_root = self.binary_modules_root,
-    extra_ffi_include_dirs = copy_paths(self.extra_ffi_include_dirs),
+    extra_ffi_include_dirs = {...self.extra_ffi_include_dirs},
     extra_ffi_cppflags = self.extra_ffi_cppflags,
     compiler_root = self.compiler_root,
     compiler_root_file = self.compiler_root_file,
@@ -97,7 +91,7 @@ function ProjectConfig:semantic_identity(): string
 end
 
 local function fail<|T|>(path: string, message: string): T
-  raise Error.new(path, message)
+  raise Error(path, message)
 end
 
 local function absolute_project_root(path: string): string
@@ -307,18 +301,28 @@ local function normalize_environment(config_file: string?,
   local include_dirs = normalize_paths(
     error_path, project_root, raw_include_dirs,
     "extra_ffi_include_dirs", {})
-  local cppflags: string? = optional_string(
+  local cppflags? = optional_string(
     error_path, raw_cppflags, "extra_ffi_cppflags")
-  local compiler_root: string? = nil
+  local compiler_root: string?
   if raw_compiler_root ~= nil then
     local source_file = compiler_root_file or error_path
     compiler_root = normalize_compiler_root(
       source_file, project_root, raw_compiler_root)
   end
-  return ProjectConfig.new(
-    project_root, config_file, include, exclude, source_module_roots,
-    binary_root, include_dirs, cppflags, compiler_root, compiler_root_file,
-    use_selected_inventory, normalize_target(error_path, raw_target))
+  return ProjectConfig {
+    project_root = project_root,
+    config_file = config_file,
+    include = include,
+    exclude = exclude,
+    source_module_roots = source_module_roots,
+    binary_modules_root = binary_root,
+    extra_ffi_include_dirs = include_dirs,
+    extra_ffi_cppflags = cppflags,
+    compiler_root = compiler_root,
+    compiler_root_file = compiler_root_file,
+    use_selected_inventory = use_selected_inventory,
+    target = normalize_target(error_path, raw_target),
+  }
 end
 
 -- Configuration is data, not an extension hook. Evaluate it with an empty
@@ -336,7 +340,7 @@ local function evaluate(config_file: string): Environment?
       paths.basename(config_file) .. " is not a regular file")
   end
   local environment: Environment = {}
-  local returned: value = nil
+  local returned: value
   do
     local source = fs.read_file(config_file)
     local chunk = lua.load(source, "@" .. config_file, environment)
@@ -361,7 +365,7 @@ end
 local function evaluate_local(config_file: string): Environment?
   local environment? = evaluate(config_file)
   if environment == nil then return nil end
-  for key, item in iteration.pairs(environment as Environment) do
+  for key, _ in iteration.pairs(environment) do
     if not (key is string) or (key as string) ~= "compiler_root" then
       return fail<|OptionalEnvironment|>(config_file,
         "titan-config.local.lua may only assign compiler_root")
@@ -386,9 +390,9 @@ local function load_or_raise(project_root: string,
   if tracked == nil then
     actual_config_file = nil
   else
-    environment = tracked as Environment
+    environment = tracked
   end
-  local compiler_root_file: string? = nil
+  local compiler_root_file: string?
   local local_file = local_configuration_path(root)
   local overrides? = evaluate_local(local_file)
   if overrides ~= nil and overrides["compiler_root"] ~= nil then
@@ -402,9 +406,9 @@ end
 
 --- Compiler SDK and analysis target selection, read before a worker exists.
 record CompilerRoot
-  compiler_root: string?
-  compiler_root_file: string?
-  target: string?
+  const compiler_root: string?
+  const compiler_root_file: string?
+  const target: string?
 end
 
 -- The router must select an SDK and evaluate trust before a worker exists, and
@@ -422,56 +426,54 @@ end
 --     it is also a selection error.
 --- Read the effective compiler_root and associated tracked analysis target.
 function load_compiler_root(project_root: string): (CompilerRoot?, Error?)
+  local root = absolute_project_root(project_root)
+  local local_file = local_configuration_path(root)
+  local overrides? = evaluate_local(local_file)
+  local override_root: string?
+  if overrides ~= nil then
+    local raw = overrides["compiler_root"]
+    if raw ~= nil then
+      override_root = normalize_compiler_root(local_file, root, raw)
+    end
+  end
+  local config_file = configuration_path(root)
+  local tracked: OptionalEnvironment
+  local tracked_error: Error?
   do
-    local root = absolute_project_root(project_root)
-    local local_file = local_configuration_path(root)
-    local overrides? = evaluate_local(local_file)
-    local override_root: string? = nil
-    if overrides ~= nil then
-      local raw = (overrides as Environment)["compiler_root"]
-      if raw ~= nil then
-        override_root = normalize_compiler_root(local_file, root, raw)
-      end
-    end
-    local config_file = configuration_path(root)
-    local tracked: OptionalEnvironment = nil
-    local tracked_error: Error? = nil
-    do
-      tracked = evaluate(config_file)
-    catch
-      if error is async.CancellationReason then raise end
-      if error is Error then
-        tracked_error = error as Error
-      else
-        raise
-      end
-    end
-    if tracked_error ~= nil then
-      -- An override exists, so this root exists to select an SDK; a tracked file
-      -- that cannot be read makes that selection unverifiable.
-      if overrides ~= nil then return nil, tracked_error as Error end
-      return CompilerRoot.new(nil, nil), nil
-    end
-    local tracked_root: string? = nil
-    local tracked_file: string? = nil
-    local target: string? = nil
-    if tracked ~= nil then
-      local raw = (tracked as Environment)["compiler_root"]
-      if raw ~= nil then
-        tracked_root = normalize_compiler_root(config_file, root, raw)
-        tracked_file = config_file
-      end
-      target = normalize_target(config_file, tracked["target"])
-    end
-    if override_root ~= nil then
-      return CompilerRoot.new(override_root, local_file, target), nil
-    end
-    return CompilerRoot.new(tracked_root, tracked_file, target), nil
+    tracked = evaluate(config_file)
   catch
     if error is async.CancellationReason then raise end
-    if error is Error then return nil, error as Error end
-    return nil, Error.new(project_root, strings.tostring(error))
+    if error is Error then
+      tracked_error = error as Error
+    else
+      raise
+    end
   end
+  if tracked_error ~= nil then
+    -- An override exists, so this root exists to select an SDK; a tracked file
+    -- that cannot be read makes that selection unverifiable.
+    if overrides ~= nil then return nil, tracked_error end
+    return CompilerRoot {}, nil
+  end
+  local tracked_root: string?
+  local tracked_file: string?
+  local target: string?
+  if tracked ~= nil then
+    local raw = tracked["compiler_root"]
+    if raw ~= nil then
+      tracked_root = normalize_compiler_root(config_file, root, raw)
+      tracked_file = config_file
+    end
+    target = normalize_target(config_file, tracked["target"])
+  end
+  if override_root ~= nil then
+    return CompilerRoot(override_root, local_file, target), nil
+  end
+  return CompilerRoot(tracked_root, tracked_file, target), nil
+catch
+  if error is async.CancellationReason then raise end
+  if error is Error then return nil, error as Error end
+  return nil, Error(project_root, strings.tostring(error))
 end
 
 -- The caller supplies the installed library-versioned directory reported by
@@ -483,12 +485,10 @@ function load(project_root: string,
               installed_binary_modules_root: string,
               selected_inventory_directory: string?):
     (ProjectConfig?, Error?)
-  do
-    return load_or_raise(project_root, installed_binary_modules_root,
-      selected_inventory_directory), nil
-  catch
-    if error is async.CancellationReason then raise end
-    if error is Error then return nil, error as Error end
-    return nil, Error.new(project_root, strings.tostring(error))
-  end
+  return load_or_raise(project_root, installed_binary_modules_root,
+    selected_inventory_directory), nil
+catch
+  if error is async.CancellationReason then raise end
+  if error is Error then return nil, error as Error end
+  return nil, Error(project_root, strings.tostring(error))
 end

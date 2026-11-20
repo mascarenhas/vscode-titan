@@ -1,0 +1,595 @@
+--- Own project scans, bounded compiler work, provenance revalidation, and accepted publication.
+-- @module server.project_service
+
+local async = import "async"
+local sqlite3 = import "sqlite3"
+local fs = import "fs"
+local strings = import "string"
+local compiler_bridge = import "server.compiler_bridge"
+local compiler_io = import "server.compiler_io"
+local logging = import "server.logging"
+local project_config = import "server.project_config"
+local project_discovery = import "server.project_discovery"
+local project_graph = import "server.project_graph"
+local metadata = import "server.project_metadata"
+local sql = import "server.workspace_store"
+local content_identity = import "server.content_identity"
+local workspace_cache = import "server.workspace_cache"
+
+record Error
+  const path: string
+  const message: string
+end
+
+type SourceFileSnapshot = metadata.SourceFileSnapshot
+
+-- `dirty` means an input changed and compiler work is required. A failed
+-- result is instead current for its exact revision: it carries authoritative
+-- diagnostics but no semantic AST until a relevant input invalidates it.
+union ProjectAnalysisState
+  clean()
+  failed()
+  dirty()
+end
+
+record ProjectModule
+  const module_name: string
+  const source_files: {SourceFileSnapshot}
+  const compiler_snapshot: compiler_bridge.ModuleSnapshot?
+  const diagnostics: {compiler_bridge.Diagnostic}
+  const analysis_state: ProjectAnalysisState
+end
+
+function ProjectModule:compiler_input(): compiler_bridge.ProjectModule
+  local files: {compiler_bridge.SourceFile} = {}
+  for index = 1, #self.source_files do
+    local file = self.source_files[index]
+    files[index] = compiler_bridge.SourceFile(file.filename, file.contents)
+  end
+  return compiler_bridge.ProjectModule(self.module_name, files)
+end
+
+type ExternalOrigin = metadata.ExternalOrigin
+type ExternalModule = metadata.ExternalModule
+type ExternalFingerprint = metadata.ExternalFingerprint
+type HeaderFingerprint = metadata.HeaderFingerprint
+
+--- Accepted saved-project state with module metadata, diagnostics, and generation.
+record Snapshot
+  const generation: integer
+  const config: project_config.ProjectConfig
+  const discovery_issues: {project_discovery.Issue}
+  const project_directories: {string}
+  const project_modules: {ProjectModule}
+  const external_modules: {ExternalModule}
+  const dirty_modules: {string}
+end
+
+-- project_modules is the immutable saved-file catalog available to the bridge;
+-- dirty_modules is the exact work set. check_tokens capture those modules'
+-- graph revisions before analysis, so a same-generation dependency
+-- invalidation cannot publish an obsolete result.
+--- Captured dirty-module work fenced by project configuration and generation.
+record AnalysisRequest
+  const generation: integer
+  const config: project_config.ProjectConfig
+  const root_module: string
+  const project_modules: {compiler_bridge.ProjectModule}
+  const dirty_modules: {string}
+  const cached_sources: {compiler_bridge.CachedSourceInterface}
+  const external_fingerprints: {ExternalFingerprint}
+  const header_fingerprints: {HeaderFingerprint}
+  const check_tokens: {project_graph.CheckToken}
+end
+
+type Analyzer = function (AnalysisRequest): compiler_bridge.Analysis
+type ExternalResolver = function (
+  project_config.ProjectConfig, {string},
+  {compiler_bridge.ExternalResolutionRequest}):
+  {compiler_bridge.ExternalResolution}
+type HeaderRestater = function ({compiler_bridge.CHeaderDependency},
+                      compiler_bridge.HeaderValidation?):
+                      ({compiler_bridge.CHeaderDependency}, boolean)
+-- Lifecycle owners use the saved snapshot after discovery to establish their
+-- watcher before compiler analysis begins. The cold loader immediately scans
+-- once more after its first callback, closing the initial
+-- scan-to-registration gap, and publishes that post-registration snapshot
+-- before analysis.
+type SnapshotListener = function (Snapshot): ()
+
+--- Transaction hooks coordinating project metadata and scalar semantic publication.
+record PublicationHooks
+  const prepare: function (Snapshot): boolean
+  const publish: function (sqlite3.Connection): ()
+  const committed: (function (): ())?
+end
+
+record Counters
+  const file_reads: integer
+  const analysis_runs: integer
+  const project_modules_submitted: integer
+  const external_file_reads: integer
+  const file_hashes: integer
+  const external_file_hashes: integer
+end
+
+record RefreshReport
+  const analyzed: boolean
+  const stale: boolean
+  const generation: integer
+  const committed_modules: {string}
+  const failed_modules: {string}
+  const dirty_modules: {string}
+end
+
+local type ProjectState = metadata.ProjectState
+
+--- Own one project graph, compiler work queue, provenance, and accepted publication.
+record Service
+  local const project_root: string
+  local const installed_binary_modules_root: string
+  local const analyzer: Analyzer
+  local const external_resolver: ExternalResolver?
+  local const header_restater: HeaderRestater?
+  local current_config: project_config.ProjectConfig
+  local catalog: project_discovery.Discovery
+  local const graph: project_graph.Graph<|compiler_bridge.ModuleSnapshot|>
+  local const store: sql.Store
+  local const metadata: metadata.Metadata
+  local read_count: integer
+  local external_read_count: integer
+  local hash_count: integer
+  local external_hash_count: integer
+  local analysis_count: integer
+  local submitted_count: integer
+  local analysis_active: boolean
+  local analysis_task: async.Task<|value, value|>?
+  local publication_hooks: PublicationHooks?
+  local const selected_inventory_directory: string?
+  local configuration_identity: string
+end
+
+local function fail<|T|>(path: string, message: string): T
+  raise Error(path, message)
+end
+
+local function service_error(project_root: string, cause: value): Error
+  if cause is Error then return cause end
+  if cause is compiler_bridge.BridgeError then
+    local failure: compiler_bridge.BridgeError = cause
+    return Error(failure.module_name, failure.message)
+  end
+  if cause is sqlite3.Error then
+    local failure: sqlite3.Error = cause
+    return Error(project_root, failure.operation .. ": " .. failure.message)
+  end
+  if cause is async.OperationError then
+    local failure: async.OperationError = cause
+    return Error(project_root, failure.operation .. ": " .. failure.message ..
+      " (" .. failure.name .. ")")
+  end
+  return Error(project_root, strings.tostring(cause))
+end
+
+-- Call after collecting filesystem/compiler observations and while holding
+-- the Store lease. An observation baseline and the work it invalidates must
+-- survive a process interruption together. Nested adapters borrow the caller's
+-- transaction; only the outer updater owns COMMIT/ROLLBACK.
+local function Service:update_metadata(body: function (): ())
+  local connection = self.graph.connection
+  if not connection:get_autocommit() then
+    body()
+    return
+  end
+  local saved_asts = self.graph:checkpoint_asts()
+  connection:set_autocommit(false)
+  local complete = false
+  defer do
+    if not complete then
+      connection:rollback()
+      self.graph:restore_asts(saved_asts)
+    end
+  end
+  body()
+  connection:commit()
+  complete = true
+end
+
+local function same_header_dependencies(
+    left: const? {compiler_bridge.CHeaderDependency},
+    right: const? {compiler_bridge.CHeaderDependency}): boolean
+  if #left ~= #right then return false end
+  for index = 1, #left do
+    local before = left[index]
+    local after = right[index]
+    if before.kind:name() ~= after.kind:name() or
+       before.path ~= after.path or before.identity ~= after.identity then
+      return false
+    end
+  end
+  return true
+end
+
+local function same_header_observations(
+    left: const? {compiler_bridge.CHeaderDependency},
+    right: const? {compiler_bridge.CHeaderDependency}): boolean
+  if not same_header_dependencies(left, right) then return false end
+  for index = 1, #left do
+    local before? = left[index].observation
+    local after? = right[index].observation
+    if before == nil then
+      if after ~= nil then return false end
+    elseif after == nil or
+           before.modified_seconds ~= after.modified_seconds or
+           before.modified_nanoseconds ~= after.modified_nanoseconds or
+           before.physical_identity ~= after.physical_identity or
+           before.precision ~= after.precision or before.size ~= after.size or
+           before.changed_seconds ~= after.changed_seconds or
+           before.changed_nanoseconds ~= after.changed_nanoseconds then
+      return false
+    end
+  end
+  return true
+end
+
+local function header_dependency_digest(
+    dependencies: const? {compiler_bridge.CHeaderDependency}): string
+  local output = strings.writer()
+  for index = 1, #dependencies do
+    local dependency = dependencies[index]
+    local kind = dependency.kind:name()
+    output:write(#kind .. ":" .. kind .. ":")
+    output:write(#dependency.path .. ":" .. dependency.path .. ":")
+    output:write(#dependency.identity .. ":" .. dependency.identity .. ";")
+  end
+  return output:drain()
+end
+
+local function origin_identity(origin: ExternalOrigin?): string
+  if origin == nil then return "missing" end
+  case origin
+  when source{main_file; source_files} then
+    local output = strings.writer()
+    output:write("source:" .. #main_file .. ":" .. main_file)
+    for index = 1, #source_files do
+      local path = source_files[index]
+      output:write(":" .. #path .. ":" .. path)
+    end
+    return output:drain()
+  when dynamic_binary{provider_file} then
+    return "dynamic:" .. #provider_file .. ":" .. provider_file
+  when static_binary{provider_file} then
+    return "static:" .. #provider_file .. ":" .. provider_file
+  end
+end
+
+local function same_observed_stamp(left: project_graph.FileStamp,
+                                   right: project_graph.FileStamp): boolean
+  return left.path == right.path and
+         left.modified_seconds == right.modified_seconds and
+         left.modified_nanoseconds == right.modified_nanoseconds and
+         left.size == right.size and left.identity == right.identity and
+         left.physical_identity == right.physical_identity
+end
+
+local function same_stamp(left: project_graph.FileStamp,
+                          right: project_graph.FileStamp): boolean
+  if left.path ~= right.path or left.size ~= right.size or
+     left.identity ~= right.identity or
+     left.physical_identity ~= right.physical_identity then return false end
+  if left.identity == nil then return same_observed_stamp(left, right) end
+  return true
+end
+
+local function same_observed_stamps(
+    left: const? {project_graph.FileStamp},
+    right: const? {project_graph.FileStamp}): boolean
+  if #left ~= #right then return false end
+  for index = 1, #left do
+    if not same_observed_stamp(left[index], right[index]) then return false end
+  end
+  return true
+end
+
+local function same_stamps(left: const? {project_graph.FileStamp},
+                           right: const? {project_graph.FileStamp}): boolean
+  if #left ~= #right then return false end
+  for index = 1, #left do
+    if not same_stamp(left[index], right[index]) then return false end
+  end
+  return true
+end
+
+local function same_external_fingerprint(left: ExternalFingerprint,
+                                         right: ExternalFingerprint): boolean
+  local same_error = left.error == right.error
+  -- Resolver error prose is not physical topology. A failed project seeds an
+  -- origin-less baseline before the resolver has produced its own message;
+  -- repeated observations of the same missing provider must remain stable.
+  if left.origin == nil and right.origin == nil and
+     #left.stamps == 0 and #right.stamps == 0 then
+    same_error = true
+  end
+  return left.module_name == right.module_name and
+         left.source_required == right.source_required and
+         left.topology_resolved == right.topology_resolved and
+         same_error and
+         origin_identity(left.origin) == origin_identity(right.origin) and
+         same_stamps(left.stamps, right.stamps)
+end
+
+local function external_matches_fingerprint(
+    external: ExternalModule,
+    fingerprint: ExternalFingerprint): boolean
+  return fingerprint.error == nil and
+         origin_identity(external.origin) ==
+           origin_identity(fingerprint.origin) and
+         same_stamps(external.stamps, fingerprint.stamps)
+end
+
+local function contains_name(names: const? {string}, name: string): boolean
+  for index = 1, #names do
+    if names[index] == name then return true end
+  end
+  return false
+end
+
+local function insert_name(names: {string}, name: string)
+  if contains_name(names, name) then return end
+  local position = #names + 1
+  while position > 1 and name < names[position - 1] do
+    names[position] = names[position - 1]
+    position = position - 1
+  end
+  names[position] = name
+end
+
+local function remove_name(names: {string}, name: string)
+  for index = 1, #names do
+    if names[index] == name then
+      for following = index, #names - 1 do
+        names[following] = names[following + 1]
+      end
+      names[#names] = nil
+      return
+    end
+  end
+end
+
+-- Graph owns only equality comparisons. Reloadable declared interfaces stay
+-- with compiler entries and external metadata, independently of these hashes.
+local function comparison_manifest(manifest: project_graph.Manifest):
+    project_graph.Manifest
+  return project_graph.Manifest(
+    content_identity.digest(manifest.public_digest),
+    content_identity.digest(manifest.source_digest))
+end
+
+local function Service:forget_header_fingerprint(module_name: string)
+  self.metadata:remove_header(module_name)
+end
+
+local function Service:remember_header_fingerprint(
+    module_name: string,
+    dependencies: {compiler_bridge.CHeaderDependency})
+  self.metadata:write_header(module_name, dependencies)
+end
+
+local function Service:retire_external_browser_owner(module_name: string)
+  -- The graph keeps the last successful external manifest for comparison
+  -- and recovery edges. It is no longer an accepted C-probe observation.
+  if self.current_config.target == "browser" then
+    workspace_cache.write_browser_foreign_owner(
+      self.graph.connection, module_name, nil)
+  end
+end
+
+function Service:counters(): Counters
+  return Counters {
+    file_reads = self.read_count,
+    analysis_runs = self.analysis_count,
+    project_modules_submitted = self.submitted_count,
+    external_file_reads = self.external_read_count,
+    file_hashes = self.hash_count,
+    external_file_hashes = self.external_hash_count,
+  }
+end
+
+function Service:direct_imports(module_name: string):
+    {project_graph.ImportEdge}
+  local access = self.store:acquire()
+  defer access:release()
+  return self.graph:direct_imports(module_name)
+end
+
+function Service:reverse_imports(module_name: string):
+    {project_graph.ReverseImport}
+  local access = self.store:acquire()
+  defer access:release()
+  return self.graph:reverse_imports(module_name)
+end
+
+function Service:project_ast(module_name: string):
+    compiler_bridge.ModuleSnapshot?
+  local access = self.store:acquire()
+  defer access:release()
+  return self.graph:project_ast(module_name)
+end
+
+function Service:external_module(module_name: string): ExternalModule?
+  local access = self.store:acquire()
+  defer access:release()
+  return self.metadata:external(module_name)
+end
+
+-- Discovery records only watched directories traversed below the configured
+-- include roots. External provenance and excluded watch subtrees are never
+-- added here.
+function Service:project_directories(): {string}
+  return {...self.catalog.directories}
+end
+
+local function Service:latest_inner(): Snapshot
+  local projects: {ProjectModule} = {}
+  local project_names = self.metadata:project_names()
+  for index = 1, #project_names do
+    local name = project_names[index]
+    local state = self.metadata:project(name)
+    local analysis_state = ProjectAnalysisState.clean()
+    if self.graph:is_dirty(name) then
+      analysis_state = ProjectAnalysisState.dirty()
+    elseif self.graph:is_failed(name) then
+      analysis_state = ProjectAnalysisState.failed()
+    end
+    projects[index] = ProjectModule {
+      module_name = name,
+      source_files = state.source_files,
+      compiler_snapshot = state.compiler_snapshot,
+      diagnostics = state.diagnostics,
+      analysis_state = analysis_state,
+    }
+  end
+  local externals: {ExternalModule} = {}
+  local external_names = self.metadata:external_names()
+  for index = 1, #external_names do
+    externals[index] = self.metadata:external(external_names[index])
+  end
+  local issues: {project_discovery.Issue} = {...self.catalog.issues}
+  return Snapshot {
+    generation = self.graph:generation(),
+    config = self.current_config:copy(),
+    discovery_issues = issues,
+    project_directories = self:project_directories(),
+    project_modules = projects,
+    external_modules = externals,
+    dirty_modules = self.graph:dirty_modules(),
+  }
+end
+
+--- Return the newest accepted saved-project snapshot.
+function Service:latest(): Snapshot
+  local access = self.store:acquire()
+  defer access:release()
+  return self:latest_inner()
+end
+
+function Service:workspace_store(): sql.Store
+  return self.store
+end
+
+function Service:set_publication_hooks(hooks: PublicationHooks)
+  self.publication_hooks = hooks
+end
+
+function Service:prepare_publication(snapshot: Snapshot): boolean
+  if self.publication_hooks == nil then return false end
+  return self.publication_hooks.prepare(snapshot)
+end
+
+function Service:publish_prepared(connection: sqlite3.Connection)
+  if self.publication_hooks ~= nil then self.publication_hooks.publish(connection) end
+end
+
+function Service:publication_committed()
+  if self.publication_hooks ~= nil and self.publication_hooks.committed ~= nil then
+    self.publication_hooks.committed()
+  end
+  -- The caller still owns the publication Store lease. No AST is needed by a
+  -- completed SQL view, even when the module remains clean for future imports.
+  self.graph:release_project_snapshots()
+end
+
+function Service:accepts_project_manifest(module_name: string,
+    expected_revision: integer): boolean
+  local access = self.store:acquire()
+  defer access:release()
+  return self.graph:accepts_project_manifest(module_name, expected_revision)
+end
+
+function Service:invalidate_cached_project(module_name: string)
+  local access = self.store:acquire()
+  defer access:release()
+  self.graph:invalidate_project(module_name)
+end
+
+--- Release the owned workspace storage and retained project state.
+function Service:close()
+  local active? = self.analysis_task
+  if active ~= nil then
+    if active == async.running() then
+      raise "project service cannot close from its own analyzer"
+    end
+    -- Cancellation is not a drain: the accepted updater must finish any native
+    -- COMMIT/ROLLBACK before its connection can be closed.
+    async.join(active)
+  end
+  self.store:close()
+end
+
+--- Return the semantic settings accepted by the latest saved discovery.
+function Service:semantic_configuration(): string
+  return self.configuration_identity
+end
+
+local function create_or_raise(settings: project_config.ProjectConfig,
+    installed_binary_modules_root: string, analyzer: Analyzer,
+    external_resolver: ExternalResolver?, header_restater: HeaderRestater?,
+    existing_store: sql.Store?, selected_inventory_directory: string?): Service
+  local loaded = settings:copy()
+  local found?, discovery_error? = project_discovery.discover(
+    loaded.include, loaded.exclude, loaded.source_module_roots, loaded.target)
+  if found == nil then
+    return fail<|Service|>(discovery_error.path, discovery_error.message)
+  end
+  local store? = existing_store
+  if store == nil then store = sql.open(":memory:") end
+  local initialized = false
+  defer do
+    if not initialized and existing_store == nil then store:close() end
+  end
+  local access = store:acquire()
+  defer access:release()
+  local graph = project_graph.create<|compiler_bridge.ModuleSnapshot|>(access.connection)
+  graph:restart_interrupted_checks()
+  local saved_metadata = metadata.create(access.connection, graph)
+  local service = Service {
+    project_root = loaded.project_root,
+    installed_binary_modules_root = installed_binary_modules_root,
+    analyzer = analyzer,
+    external_resolver = external_resolver,
+    header_restater = header_restater,
+    current_config = loaded,
+    catalog = found,
+    graph = graph,
+    store = store,
+    metadata = saved_metadata,
+    read_count = 0,
+    external_read_count = 0,
+    hash_count = 0,
+    external_hash_count = 0,
+    analysis_count = 0,
+    submitted_count = 0,
+    analysis_active = false,
+    selected_inventory_directory = selected_inventory_directory,
+    configuration_identity = "",
+  }
+  service:accept_discovery(loaded, found)
+  initialized = true
+  return service
+end
+
+-- On success Service owns the supplied Store until close. On failure its
+-- caller retains that Store; an omitted Store is created and owned here.
+-- Configuration is already normalized by the caller. Initial discovery uses it
+-- once; later scans reload the workspace file with the same installed default.
+--- Create a project service from normalized settings and injectable analysis owners.
+function create(settings: project_config.ProjectConfig,
+    installed_binary_modules_root: string, analyzer: Analyzer,
+    external_resolver: ExternalResolver?, header_restater: HeaderRestater?,
+    store: sql.Store?, selected_inventory_directory: string?): (Service?, Error?)
+  return create_or_raise(settings, installed_binary_modules_root,
+    analyzer, external_resolver, header_restater, store, selected_inventory_directory), nil
+catch
+  if error is async.CancellationReason then raise end
+  return nil, service_error(settings.project_root, error)
+end

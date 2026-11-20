@@ -1,0 +1,625 @@
+-- Background refresh chains, view publication, epoch fencing, and progress status.
+
+local function bounded_log_message(message: string): string
+  if #message <= MAX_LOGGED_MESSAGE_BYTES then return message end
+  local finish = MAX_LOGGED_MESSAGE_BYTES - 3
+  -- Avoid cutting a well-formed UTF-8 scalar before JSON encoding. Invalid
+  -- input still remains best-effort and is rejected by logging.format.
+  while finish > 0 do
+    local following = strings.byte(message, finish + 1)
+    if following < 128 or following > 191 then break end
+    finish = finish - 1
+  end
+  return strings.sub(message, 1, finish) .. "..."
+end
+
+local function project_inputs(snapshot: project_service.Snapshot,
+                              replaced_modules: {string}):
+    ({bridge.ProjectModule}, {bridge.ModuleSnapshot})
+  local projects: {bridge.ProjectModule} = {}
+  local snapshots: {bridge.ModuleSnapshot} = {}
+  local replaced: {string: boolean} = {}
+  for index = 1, #replaced_modules do replaced[replaced_modules[index]] = true end
+  for module_index = 1, #snapshot.project_modules do
+    local module = snapshot.project_modules[module_index]
+    -- Retain every saved module in Features even when it has no semantic
+    -- snapshot. Besides providing source coordinates, this makes rename
+    -- preflight compile the complete saved project and therefore reject an
+    -- edit if an invalid module could contain an unindexed reference.
+    projects[module_index] = module:compiler_input()
+    case module.analysis_state
+    when clean() then
+      if #module.diagnostics > 0 then
+        raise Error("clean Titan project module '" .. module.module_name ..
+          "' has compiler diagnostics")
+      end
+      if replaced[module.module_name] then
+        if module.compiler_snapshot == nil then
+          raise Error(
+            "clean Titan project module '" .. module.module_name ..
+            "' has no fresh compiler snapshot for semantic replacement")
+        end
+        snapshots[#snapshots + 1] = module.compiler_snapshot
+      end
+    when failed() then
+      -- The diagnostics are current for this exact saved revision, but a
+      -- failed module deliberately contributes no compiler snapshot.
+    when dirty() then
+      -- Saved or dependency inputs changed; indexing is still outstanding.
+    end
+  end
+  return projects, snapshots
+end
+
+local function dirty_signature(names: const? {string}): string
+  local output = strings.writer()
+  for index = 1, #names do
+    output:write(#names[index] .. ":" .. names[index])
+  end
+  return output:drain()
+end
+
+local function publication_revision(connection: sqlite3.Connection): string
+  local generation = stores.scalar_integer(connection,
+    "SELECT generation FROM main.graph_state WHERE singleton=1")
+  local output = strings.writer()
+  output:write(generation .. ":")
+  local statement = connection:prepare(
+    "SELECT name,provenance,state,revision FROM main.graph_modules ORDER BY name")
+  defer statement:close()
+  local cursor = statement:query()
+  defer cursor:close()
+  for row in cursor:fetch do
+    local name = row:get(1) as string
+    output:write(#name .. ":" .. name .. ":" ..
+      (row:get(2) as integer) .. ":" .. (row:get(3) as integer) .. ":" ..
+      (row:get(4) as integer) .. ";")
+  end
+  return output:drain()
+end
+
+local function joined_view(task: async.Task<|RefreshOutcome, value|>):
+    (View?, Error?)
+  case async.join(task)
+  when succeeded(outcome) then
+    case outcome
+    when ready(view) then return view, nil
+    when failure(item) then return nil, item
+    end
+  when failed(item) then
+    return nil, runtime_error(item.error)
+  when cancelled() then
+    return nil, Error("project refresh was cancelled")
+  else
+    return nil, Error("project refresh did not finish")
+  end
+  return nil, Error("project refresh produced no result")
+end
+
+-- Keep watcher policy behind one method so the refresh state-machine tests can
+-- deterministically inject the same coalesced hint without depending on kernel
+-- event timing.
+function Application:note_saved_change()
+  if self.closed then return end
+  self.change_epoch = self.change_epoch + 1
+  logging.emit("debug", "indexing.saved_change", {
+    ["epoch"] = self.change_epoch,
+    ["refresh_active"] = self.refresh_task ~= nil,
+  })
+  self:start_refresh(false, "saved_change")
+end
+
+local function Application:publish_view(service: project_service.Service,
+    snapshot: project_service.Snapshot, reuse: View?): View
+  local store = service:workspace_store()
+  local configuration = service:semantic_configuration()
+  local revision = ""
+  local plan: semantic_index.PublicationPlan?
+  do
+    local access = store:acquire()
+    defer access:release()
+    if stores.scalar_integer(access.connection,
+        "SELECT generation FROM main.graph_state WHERE singleton=1") ~= snapshot.generation then
+      raise Error("saved Titan project changed before semantic preparation; retry")
+    end
+    revision = publication_revision(access.connection)
+    if reuse == nil then
+      local rows = stores.rows(access.connection,
+        "SELECT name,revision,state FROM main.graph_modules " ..
+        "WHERE provenance=0 ORDER BY name")
+      local modules: {semantic_index.ModulePublication} = {}
+      for index = 1, #rows do
+        local row = rows[index]
+        modules[index] = semantic_index.ModulePublication(
+          row:get(1) as string, row:get(2) as integer, row:get(3) as integer)
+      end
+      plan = semantic_index.publication_plan(access.connection, modules)
+    end
+  end
+  self:reconcile_watcher(snapshot)
+  -- Source extraction and cache serialization can yield without monopolizing
+  -- the Store. Requests keep reading the preceding completed SQL revision.
+  local warm_reuse = service:prepare_publication(snapshot)
+  local prepared: semantic_features.PreparedView?
+  if reuse == nil and not warm_reuse then
+    self.view_builds = self.view_builds + 1
+    local projects, snapshots = project_inputs(snapshot, plan.replaced_modules)
+    prepared = semantic_features.prepare_update(
+      projects, snapshots, plan, async.yield)
+  end
+  local diagnostic_rows = diagnostics.from_snapshot_with_yield(snapshot)
+  local access = store:acquire()
+  defer access:release()
+  local connection = access.connection
+  if publication_revision(connection) ~= revision then
+    raise Error("saved Titan project changed during semantic preparation; retry")
+  end
+  local generation = stores.scalar_integer(connection,
+    "SELECT published_generation FROM main.store_state WHERE singleton=1")
+  if reuse ~= nil then
+    semantic_index.check_generation(connection, reuse.published_generation)
+  elseif not warm_reuse then
+    generation = generation + 1
+  end
+  connection:set_autocommit(false)
+  do
+    -- Schema recreation belongs to the same accepted publication as its rows.
+    -- A rollback must preserve missing tables so the retry still rebuilds all
+    -- facts instead of trusting empty recreated tables at old revisions.
+    semantic_features.initialize_schema(connection)
+    published_diagnostics.initialize_schema(connection)
+    if prepared ~= nil then prepared:publish(connection) end
+    published_diagnostics.publish(connection, diagnostic_rows)
+    service:publish_prepared(connection)
+    stores.execute(connection,
+      "UPDATE main.store_state SET published_generation=? WHERE singleton=1", generation)
+    connection:commit()
+  catch
+    -- Only the uncancelled updater owns this transaction; request cancellation
+    -- detaches a reader and Application.close joins the updater before close.
+    if not connection:get_autocommit() then connection:rollback() end
+    raise
+  end
+  service:publication_committed()
+  local features = (reuse ~= nil and reuse.features) or
+    semantic_features.open(store, generation)
+  return View {
+    work_generation = snapshot.generation,
+    published_generation = generation,
+    dirty_signature = dirty_signature(snapshot.dirty_modules),
+    features = features,
+    configuration = configuration,
+  }
+end
+
+local function Application:install_view(snapshot: project_service.Snapshot): View
+  -- Establish the watcher before validation so a failed initial compiler
+  -- snapshot can still observe the save which repairs it.
+  return self:publish_view(self.service, snapshot, nil)
+end
+
+local function Application:refresh_once(): RefreshOutcome
+  local service? = self.service
+  if service == nil then
+    self:ensure_provisional_watcher()
+    local loaded?, load_error?, restoration? = self.project_loader(
+      self.project_root, self:emit_compiler_progress, self:reconcile_watcher)
+    if loaded == nil then
+      local message = "cannot load Titan project"
+      if load_error ~= nil then
+        message = load_error.path .. ": " .. load_error.message
+      end
+      return RefreshOutcome.failure(Error(message))
+    end
+    self.service = loaded
+    self.restoration = restoration
+    return RefreshOutcome.ready(self:install_view(loaded:latest()))
+  end
+
+  -- Saved changes and rename preflight share the foreground updater. Join
+  -- outside a Store lease before mutating the live compiler or graph.
+  local restoration? = self.restoration
+  if restoration ~= nil then
+    restoration:finish(service)
+    self.restoration = nil
+  end
+  local report?, refresh_error? = service:refresh(self:reconcile_watcher)
+  if report == nil then
+    local message = "cannot refresh Titan project"
+    if refresh_error ~= nil then
+      message = refresh_error.path .. ": " .. refresh_error.message
+    end
+    return RefreshOutcome.failure(Error(message))
+  end
+  local snapshot = service:latest()
+  local completed? = self.completed_view
+  if completed ~= nil and completed.work_generation ==
+       report.generation and #report.committed_modules == 0 and
+     #report.failed_modules == 0 and
+     completed.configuration == service:semantic_configuration() and
+     completed.dirty_signature == dirty_signature(snapshot.dirty_modules) then
+    -- A refresh still rediscovers directories and external inputs. When its
+    -- semantic generation and pending-work membership did not change and no
+    -- clean or failed project result was published, retain the immutable
+    -- Features. In particular, a same-generation external invalidation can
+    -- turn a formerly clean module into a failed one; that result must
+    -- rebuild the View so its preceding AST is no longer exposed.
+    return RefreshOutcome.ready(self:publish_view(service, snapshot, completed))
+  end
+  return RefreshOutcome.ready(self:install_view(snapshot))
+catch
+  if error is async.CancellationReason then raise end
+  return RefreshOutcome.failure(runtime_error(error))
+end
+
+local function Application:status_generation(): integer?
+  local completed? = self.completed_view
+  if completed == nil then return nil end
+  return completed.published_generation
+end
+
+local function Application:emit_indexing_status(
+    state: indexing_status.State, message: string?,
+    completed_files: integer?, total_files: integer?)
+  if self.closed then return end
+  local listener? = self.indexing_listener
+  if listener == nil then return end
+  local epoch = self.change_epoch
+  case state
+  when indexing() then
+    if self.active_refresh_epoch ~= nil then
+      epoch = self.active_refresh_epoch
+    end
+  else
+  end
+  do
+    listener(indexing_status.Status {
+      state = state,
+      initial = self.refresh_chain_initial,
+      epoch = epoch,
+      generation = self:status_generation(),
+      message = message,
+      completed_files = completed_files,
+      total_files = total_files,
+    })
+  catch
+    -- Encoding optional status output must not retire the indexing work that
+    -- owns the saved generation. Other listener failures keep their behavior.
+    if error is json.Error then
+      local json_error: json.Error = error
+      if json_error.position == nil and
+         (json_error.code == "invalid_utf8" or
+          json_error.code == "limit_exceeded") then
+        return
+      end
+    end
+    raise
+  end
+end
+
+local function Application:emit_compiler_progress(
+    progress: bridge.AnalysisProgress)
+  -- A compiler can outlive its owning protocol listener while close/cancel is
+  -- unwinding. Only an active refresh pass may publish progress.
+  if self.refresh_chain == nil or self.active_refresh_epoch == nil then return end
+  self:emit_indexing_status(
+    indexing_status.State.indexing(), nil,
+    progress.completed_files, progress.total_files)
+  self.progress:report(progress.completed_files, progress.total_files)
+end
+
+local function Application:begin_refresh_chain(reason: string)
+  if self.refresh_chain ~= nil then return end
+  self.refresh_chain_initial = self.completed_view == nil
+  local first_pass = self.refresh_passes
+  self.refresh_chains = self.refresh_chains + 1
+  local chain = RefreshChain {
+    id = self.refresh_chains,
+    reason = reason,
+    first_pass = first_pass,
+    started_wall = logging.wall_clock(),
+    started_cpu = logging.clock(),
+  }
+  self.refresh_chain = chain
+  logging.emit("info", "indexing.chain.start", {
+    ["chain"] = chain.id,
+    ["reason"] = chain.reason,
+    ["epoch"] = self.change_epoch,
+    ["initial"] = self.refresh_chain_initial,
+  })
+  self:emit_indexing_status(indexing_status.State.indexing())
+end
+
+local function Application:complete_refresh_chain(
+    outcome: string, attempted_epoch: integer, message: string?)
+  local chain? = self.refresh_chain
+  if chain == nil then return end
+  -- Clear control state before best-effort telemetry. A platform clock or
+  -- malformed diagnostic field must never keep a completed chain active.
+  self.refresh_chain = nil
+  do
+    local fields: wire.Object = {
+      ["chain"] = chain.id,
+      ["reason"] = chain.reason,
+      ["outcome"] = outcome,
+      ["initial"] = self.refresh_chain_initial,
+      ["attempted_epoch"] = attempted_epoch,
+      ["completed_epoch"] = self.completed_epoch,
+      ["pending_epoch"] = self.change_epoch,
+      ["passes"] = self.refresh_passes - chain.first_pass,
+      ["wall_ms"] = logging.elapsed_wall_ms(chain.started_wall),
+      ["cpu_ms"] = logging.elapsed_ms(chain.started_cpu),
+    }
+    local generation? = self:status_generation()
+    if generation ~= nil then
+      fields["generation"] = generation
+    end
+    if message ~= nil then
+      fields["message"] = bounded_log_message(message)
+    end
+    local level = "info"
+    if outcome == "failed" then level = "error" end
+    logging.emit(level, "indexing.chain.complete", fields)
+  catch
+  end
+end
+
+local function Application:start_refresh(force: boolean, reason: string):
+    async.Task<|RefreshOutcome, value|>?
+  if self.closed or self.refresh_task ~= nil then return self.refresh_task end
+  if not force then
+    if self.completed_view ~= nil and
+       self.completed_epoch >= self.change_epoch then
+      return nil
+    end
+    local failed_epoch? = self.failed_epoch
+    if self.refresh_failure ~= nil and failed_epoch ~= nil and
+       failed_epoch >= self.change_epoch then
+      return nil
+    end
+  end
+
+  local target_epoch = self.change_epoch
+  self.active_refresh_epoch = target_epoch
+  self:begin_refresh_chain(reason)
+  if reason == "coalesced_follow_up" then
+    -- A refresh chain stays continuously busy, but progress belongs to one
+    -- exact saved epoch/workset. Clear the preceding pass's N/M immediately so
+    -- the client cannot display a completed old workset during this scan.
+    self:emit_indexing_status(indexing_status.State.indexing())
+  end
+  local chain = self.refresh_chain
+  local task = async.run<|RefreshOutcome, value|>(function (): RefreshOutcome
+    local started = logging.clock()
+    self.refresh_passes = self.refresh_passes + 1
+    logging.emit("debug", "indexing.pass.start", {
+      ["chain"] = chain.id,
+      ["chain_reason"] = chain.reason,
+      ["trigger"] = reason,
+      ["epoch"] = target_epoch,
+      ["force"] = force,
+      ["pass"] = self.refresh_passes,
+      ["follow_up"] = self.refresh_passes > chain.first_pass + 1,
+    })
+    -- A client which advertises work-done progress sees one begin for the
+    -- whole contiguous period, before this pass performs compiler work.
+    self.progress:start(self.refresh_chain_initial)
+    local completed = self:refresh_once()
+    local outcome_name = "unknown"
+    local outcome_message: string?
+    case completed
+    when failure(refresh_error) then
+      outcome_name = "failed"
+      outcome_message = refresh_error.message
+      self.refresh_failure = refresh_error
+      self.failed_epoch = target_epoch
+      -- A failed refresh cannot validate diagnostics from the preceding saved
+      -- epoch. Clear them while the watcher waits for a repair.
+      self.diagnostic_publisher:clear()
+    when ready(view) then
+      outcome_name = "ready"
+      -- Publish every successful pass even when a later hint arrived. Retain
+      -- and serve that immutable generation while the single coalesced
+      -- follow-up runs.
+      local previous? = self.completed_view
+      -- A warm SQL catalog can seed private work before the first View.
+      -- It cannot authorize retention across that first accepted publication.
+      local configuration_boundary = previous == nil or
+        previous.configuration ~= view.configuration
+      self.completed_view = view
+      if self.completion ~= nil then
+        self.completion:saved_changed(view.published_generation, configuration_boundary)
+      end
+      self.completed_epoch = target_epoch
+      self.refresh_failure = nil
+      self.failed_epoch = nil
+      if self.diagnostic_publisher:enabled() and
+         self.change_epoch == target_epoch then
+        local diagnostic_publications = published_diagnostics.read(
+          self.service:workspace_store(), view.published_generation)
+        -- Reading published rows can yield. Publish only if no newer save
+        -- arrived during that work; the coalesced follow-up owns the replacement.
+        if self.change_epoch == target_epoch then
+          self.diagnostic_publisher:publish(diagnostic_publications)
+        end
+      end
+    end
+
+    logging.emit("debug", "indexing.pass.complete", {
+      ["chain"] = chain.id,
+      ["trigger"] = reason,
+      ["epoch"] = target_epoch,
+      ["outcome"] = outcome_name,
+      ["pending_epoch"] = self.change_epoch,
+      ["cpu_ms"] = logging.elapsed_ms(started),
+    })
+
+    self.refresh_task = nil
+    self.active_refresh_epoch = nil
+    if not self.closed and self.change_epoch > target_epoch then
+      -- Start at most one next-turn pass for every burst. Epoch comparison,
+      -- rather than clearing a boolean, preserves a hint delivered at any
+      -- yielding point in scan, analysis, view construction, or reconciliation.
+      self:start_refresh(false, "coalesced_follow_up")
+    else
+      self:complete_refresh_chain(
+        outcome_name, target_epoch, outcome_message)
+      -- Progress ends only after the completed view and its diagnostics are
+      -- published, so a request issued after `end` sees that generation.
+      case completed
+      when failure(refresh_error) then
+        self:emit_indexing_status(
+          indexing_status.State.failed(), refresh_error.message)
+        self.progress:finish(refresh_error.message)
+      when ready() then
+        self:emit_indexing_status(indexing_status.State.ready())
+        self.progress:finish()
+        local restoration? = self.restoration
+        if restoration ~= nil and not self.closed then
+          -- Recovery belongs to the ordinary single writer. This callback
+          -- only schedules it while readers retain the completed SQL View.
+          restoration:start(self:note_saved_change)
+        end
+      end
+    end
+    return completed
+  catch
+    -- Cover refresh, diagnostic conversion/publication, logging, and status
+    -- delivery with the same terminal cleanup. No post-refresh exception may
+    -- strand the active epoch or suppress all later saved-file refreshes.
+    self.refresh_task = nil
+    self.active_refresh_epoch = nil
+    if error is async.CancellationReason then
+      self:complete_refresh_chain("cancelled", target_epoch)
+      self.progress:finish()
+      raise
+    end
+    -- Terminal cleanup must not depend on any best-effort output path.
+    self.failed_epoch = target_epoch
+    do self.diagnostic_publisher:clear() catch end
+    -- An unexpected exception must still close this chain's progress period;
+    -- otherwise the reporter stays busy and every later chain is silent.
+    do self.progress:finish("Titan indexing failed") catch self.progress:reset() end
+    -- Preserve the original exceptional value. Its normalization is not
+    -- allowed to become another failure merely to enrich telemetry.
+    self:complete_refresh_chain("failed", target_epoch)
+    raise
+  end)
+  self.refresh_task = task
+  return task
+end
+
+-- Idempotently ensure that the initial or watcher-requested index is running.
+-- The initialized lifecycle hook calls this without waiting for project I/O.
+--- Start the coalesced background indexing owner after initialization.
+function Application:start_indexing()
+  self:start_refresh(false, "initialized")
+end
+
+-- Read-only features use the last completed immutable View without probing
+-- disk again. Saved project watcher hints start one coalesced refresh; while
+-- it is running, the preceding View remains serviceable rather than blocking
+-- requests or returning empty results. Intentionally unwatched external inputs
+-- are revalidated by the next saved-project refresh or strict rename refresh.
+-- A terminal refresh failure is authoritative for that saved epoch and is not
+-- retried by unchanged read-only requests; a later saved hint or strict rename
+-- may retry it.
+local function Application:current_view(): (View?, Error?)
+  if self.closed then
+    return nil, Error("language server application is closed")
+  end
+
+  -- This joins/starts work only when a saved watcher epoch is pending. An
+  -- unchanged hover/definition/folding request must not rescan the entire
+  -- source tree merely to return an already immutable semantic generation.
+  self:start_refresh(false, "semantic_request")
+  local refresh_error? = self.refresh_failure
+  local failed_epoch? = self.failed_epoch
+  if refresh_error ~= nil and failed_epoch ~= nil and
+     failed_epoch >= self.change_epoch then
+    return nil, refresh_error
+  end
+  local completed? = self.completed_view
+  if completed ~= nil then return completed, nil end
+  return nil, nil
+end
+
+-- Rename produces edits against saved bytes, so it must never use the
+-- responsive completed-generation fallback. Always await the current stable
+-- refresh and let the caller perform the existing post-preflight generation
+-- check with a second fresh refresh.
+local function Application:fresh_view(): (View?, Error?)
+  if self.closed then
+    return nil, Error("language server application is closed")
+  end
+  local task? = self.refresh_task
+  if task == nil then task = self:start_refresh(true, "rename") end
+  if task == nil then
+    local completed? = self.completed_view
+    if completed ~= nil then return completed, nil end
+    return nil, Error("project refresh did not start")
+  end
+  local view?, view_error? = joined_view(task)
+  if view == nil then return nil, view_error end
+  if self.completed_epoch < self.change_epoch or self.refresh_task ~= nil then
+    return nil, Error("saved Titan project changed while indexing; retry")
+  end
+  return view, nil
+end
+
+-- Every pull is a freshness barrier. It asks for one saved-change pass through
+-- the same coalescing path a watcher hint uses, then answers from the generation
+-- that pass completed, so a dependency or another contributor of the requested
+-- document's module is revalidated before the report is read. A pass that finds
+-- nothing dirty is a scan only: the generation keeps its items and therefore its
+-- resultIds, and no analysis runs.
+local function Application:fresh_view_for(): (View?, Error?)
+  if self.closed then
+    return nil, Error("language server application is closed")
+  end
+  self:note_saved_change()
+  while true do
+    if self.closed then
+      return nil, Error("language server application is closed")
+    end
+    local running? = self.refresh_task
+    if running ~= nil then
+      async.join(running)
+    else
+      local view?, view_error? = self:current_view()
+      if view_error ~= nil then return nil, view_error end
+      if view ~= nil and self.change_epoch <= self.completed_epoch then
+        return view, nil
+      end
+      return nil, Error("saved project refresh did not start")
+    end
+  end
+  return nil, Error("saved project refresh did not settle")
+end
+
+local function Application:published_items(view: View, uri: string):
+    {diagnostics.Item}?
+  return published_diagnostics.read_uri(
+    self.service:workspace_store(), view.published_generation, uri)
+catch
+  if error is semantic_index.StaleView then return nil end
+  raise
+end
+
+local function Application:indexing_metrics(): IndexingMetrics
+  return IndexingMetrics {
+    refresh_passes = self.refresh_passes,
+    view_builds = self.view_builds,
+    refresh_chain_active = self.refresh_chain ~= nil,
+  }
+end
+
+local function Application:snapshot_for_testing(): project_service.Snapshot?
+  local service? = self.service
+  if service == nil then return nil end
+  return service:latest()
+end
+
+local function Application:change_epoch_for_testing(): integer
+  return self.change_epoch
+end

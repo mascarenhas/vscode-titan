@@ -81,14 +81,19 @@ record Graph<|A|>
 end
 
 local record Module
-  provenance: integer
-  state: integer
-  recovering: boolean
-  revision: integer
-  manifest: Manifest?
+  const provenance: integer
+  const state: integer
+  const recovering: boolean
+  const revision: integer
+  const manifest: Manifest?
 end
 
-local function copy_stamps(stamps: {FileStamp}): {FileStamp}
+local function optional_blob(candidate: string?): value
+  if candidate == nil then return nil end
+  return sqlite3.Blob(candidate)
+end
+
+local function copy_stamps(stamps: const? {FileStamp}): {FileStamp}
   local result: {FileStamp} = {}
   for index = 1, #stamps do
     local stamp = stamps[index]
@@ -119,14 +124,6 @@ local function same_visibility(left: ImportVisibility,
   return source_required(left) == source_required(right)
 end
 
-local function copy_visibility(
-    visibility: ImportVisibility): ImportVisibility
-  if source_required(visibility) then
-    return ImportVisibility.source_required()
-  end
-  return ImportVisibility.ordinary()
-end
-
 local function edge_less(left: ImportEdge, right: ImportEdge): boolean
   if left.module_name ~= right.module_name then
     return left.module_name < right.module_name
@@ -139,12 +136,10 @@ local function same_edge(left: ImportEdge, right: ImportEdge): boolean
          same_visibility(left.visibility, right.visibility)
 end
 
-local function normalize_imports(imports: {ImportEdge}): {ImportEdge}
+local function normalize_imports(imports: const? {ImportEdge}): {ImportEdge}
   local result: {ImportEdge} = {}
   for index = 1, #imports do
-    local source = imports[index]
-    local edge = ImportEdge.new(
-      source.module_name, copy_visibility(source.visibility))
+    local edge = imports[index]
     local duplicate = false
     local position = #result + 1
     for current = 1, #result do
@@ -167,7 +162,8 @@ local function normalize_imports(imports: {ImportEdge}): {ImportEdge}
   return result
 end
 
-local function same_observations(left: {FileStamp}, right: {FileStamp}): boolean
+local function same_observations(left: const? {FileStamp},
+                                 right: const? {FileStamp}): boolean
   if #left ~= #right then return false end
   for index = 1, #left do
     local a = left[index]
@@ -183,7 +179,8 @@ local function same_observations(left: {FileStamp}, right: {FileStamp}): boolean
   return true
 end
 
-local function same_stamps(left: {FileStamp}, right: {FileStamp}): boolean
+local function same_stamps(left: const? {FileStamp},
+                           right: const? {FileStamp}): boolean
   if #left ~= #right then return false end
   for index = 1, #left do
     local a = left[index]
@@ -203,7 +200,8 @@ local function same_manifest(left: Manifest, right: Manifest): boolean
          left.source_digest == right.source_digest
 end
 
-local function same_imports(left: {ImportEdge}, right: {ImportEdge}): boolean
+local function same_imports(left: const? {ImportEdge},
+                            right: const? {ImportEdge}): boolean
   if #left ~= #right then return false end
   for index = 1, #left do
     if not same_edge(left[index], right[index]) then return false end
@@ -225,51 +223,57 @@ local function add_sorted_name(names: {string}, module_name: string)
   names[#names + 1] = module_name
 end
 
-local function name_set(names: {string}): {string: boolean}
+local function name_set(names: const? {string}): {string: boolean}
   local result: {string: boolean} = {}
   for index = 1, #names do result[names[index]] = true end
   return result
 end
 
-function initialize_schema(connection: sqlite3.Connection)
-  sql.execute(connection, "CREATE TABLE IF NOT EXISTS main.graph_state (" ..
+local const SCHEMA_STATEMENTS: const {string} = {
+  "CREATE TABLE IF NOT EXISTS main.graph_state (" ..
     "singleton INTEGER PRIMARY KEY CHECK(singleton=1), generation INTEGER NOT NULL, " ..
-    "work_revision INTEGER NOT NULL)")
-  sql.execute(connection, "INSERT OR IGNORE INTO main.graph_state VALUES(1,0,0)")
-  sql.execute(connection, "CREATE TABLE IF NOT EXISTS main.graph_modules (" ..
+    "work_revision INTEGER NOT NULL)",
+  "INSERT OR IGNORE INTO main.graph_state VALUES(1,0,0)",
+  "CREATE TABLE IF NOT EXISTS main.graph_modules (" ..
     "name TEXT PRIMARY KEY COLLATE BINARY, provenance INTEGER NOT NULL, " ..
     "state INTEGER NOT NULL, recovering INTEGER NOT NULL, revision INTEGER NOT NULL, " ..
     "public_digest BLOB, source_digest BLOB, " ..
     "CHECK(provenance BETWEEN 0 AND 2), CHECK(state BETWEEN 0 AND 3), " ..
-    "CHECK((public_digest IS NULL)=(source_digest IS NULL))) WITHOUT ROWID")
-  sql.execute(connection, "CREATE TABLE IF NOT EXISTS main.graph_files (" ..
+    "CHECK((public_digest IS NULL)=(source_digest IS NULL))) WITHOUT ROWID",
+  "CREATE TABLE IF NOT EXISTS main.graph_files (" ..
     "module_name TEXT NOT NULL REFERENCES graph_modules(name) ON DELETE CASCADE, " ..
     "path TEXT NOT NULL COLLATE BINARY, seconds INTEGER NOT NULL, " ..
     "nanoseconds INTEGER NOT NULL, size INTEGER NOT NULL, identity BLOB, physical_identity BLOB, " ..
-    "PRIMARY KEY(module_name,path)) WITHOUT ROWID")
+    "PRIMARY KEY(module_name,path)) WITHOUT ROWID",
   -- imported deliberately has no foreign key: incoming edges to a missing
   -- provider must survive its removal and wake importers when it reappears.
-  sql.execute(connection, "CREATE TABLE IF NOT EXISTS main.graph_imports (" ..
+  "CREATE TABLE IF NOT EXISTS main.graph_imports (" ..
     "importer TEXT NOT NULL REFERENCES graph_modules(name) ON DELETE CASCADE, " ..
     "imported TEXT NOT NULL COLLATE BINARY, visibility INTEGER NOT NULL, " ..
     "PRIMARY KEY(importer,imported,visibility), " ..
-    "CHECK(visibility IN (0,1))) WITHOUT ROWID")
-  sql.execute(connection, "CREATE INDEX IF NOT EXISTS main.graph_reverse " ..
-    "ON graph_imports(imported,importer,visibility)")
-  sql.execute(connection, "CREATE INDEX IF NOT EXISTS main.graph_project_work " ..
-    "ON graph_modules(provenance,state,name)")
+    "CHECK(visibility IN (0,1))) WITHOUT ROWID",
+  "CREATE INDEX IF NOT EXISTS main.graph_reverse " ..
+    "ON graph_imports(imported,importer,visibility)",
+  "CREATE INDEX IF NOT EXISTS main.graph_project_work " ..
+    "ON graph_modules(provenance,state,name)",
+}
+
+function initialize_schema(connection: sqlite3.Connection)
+  for index = 1, #SCHEMA_STATEMENTS do
+    sql.execute(connection, SCHEMA_STATEMENTS[index])
+  end
 end
 
 --- Open a typed graph over the supplied SQLite connection.
 function create<|A|>(connection: sqlite3.Connection): Graph<|A|>
   initialize_schema(connection)
-  return Graph<|A|>.new(connection, {})
+  return Graph<|A|>(connection, {})
 end
 
 function Graph:checkpoint_asts(): AstSnapshot<|A|>
   local copy: {string: A} = {}
-  for name, ast in iteration.pairs<|string, A|>(self.asts) do copy[name] = ast end
-  return AstSnapshot<|A|>.new(copy)
+  for name, ast in iteration.pairs(self.asts) do copy[name] = ast end
+  return AstSnapshot<|A|>(copy)
 end
 
 function Graph:restore_asts(snapshot: AstSnapshot<|A|>)
@@ -285,14 +289,20 @@ local function Graph:module(module_name: string): Module?
   defer cursor:close()
   local row? = cursor:fetch()
   if row == nil then return nil end
-  local public_digest: sqlite3.Blob? = row:get(5)
-  local source_digest: sqlite3.Blob? = row:get(6)
+  local public_digest? = sql.optional_bytes(row, 5)
+  local source_digest? = sql.optional_bytes(row, 6)
   local output: Manifest?
   if public_digest ~= nil and source_digest ~= nil then
-    output = Manifest.new(public_digest.bytes, source_digest.bytes)
+    output = Manifest(public_digest, source_digest)
   end
   local recovering: integer = row:get(3)
-  return Module.new(row:get(1), row:get(2), recovering ~= 0, row:get(4), output)
+  return Module {
+    provenance = row:get(1),
+    state = row:get(2),
+    recovering = recovering ~= 0,
+    revision = row:get(4),
+    manifest = output,
+  }
 end
 
 local function Graph:names(query: string, ...: value): {string}
@@ -336,67 +346,29 @@ local function Graph:dirty_project(module_name: string): boolean
     "WHERE name=? AND provenance=0", revision, module_name) ~= 0
 end
 
-local function Graph:set_stamps(module_name: string, stamps: {FileStamp})
+local function Graph:set_stamps(module_name: string, stamps: const? {FileStamp})
   sql.execute(self.connection,
     "DELETE FROM main.graph_files WHERE module_name=?", module_name)
-  local first = 1
-  while first <= #stamps do
-    -- At most 196 parameters, below Titan's 200-position call bound.
-    local last = first + 27
-    if last > #stamps then last = #stamps end
-    local query = "INSERT INTO main.graph_files VALUES "
-    local bindings: {value} = {}
-    for index = first, last do
-      if index > first then query = query .. "," end
-      local stamp = stamps[index]
-      local offset = #bindings
-      bindings[offset + 1] = module_name
-      bindings[offset + 2] = stamp.path
-      bindings[offset + 3] = stamp.modified_seconds
-      bindings[offset + 4] = stamp.modified_nanoseconds
-      bindings[offset + 5] = stamp.size
-      query = query .. "(?,?,?,?,?"
-      if stamp.identity ~= nil then
-        query = query .. ",?"
-        bindings[#bindings + 1] = sqlite3.Blob.new(stamp.identity)
-      else
-        -- Array nil assignment removes a slot, so NULL is SQL syntax while
-        -- every present value remains a bound parameter.
-        query = query .. ",NULL"
-      end
-      if stamp.physical_identity ~= nil then
-        query = query .. ",?"
-        bindings[#bindings + 1] = sqlite3.Blob.new(stamp.physical_identity)
-      else
-        query = query .. ",NULL"
-      end
-      query = query .. ")"
-    end
-    sql.execute(self.connection, query, ...bindings)
-    first = last + 1
+  local insert = sql.batch(self.connection, "INSERT INTO main.graph_files VALUES ", 7)
+  for index = 1, #stamps do
+    local stamp = stamps[index]
+    insert:append(module_name, stamp.path, stamp.modified_seconds,
+      stamp.modified_nanoseconds, stamp.size, optional_blob(stamp.identity),
+      optional_blob(stamp.physical_identity))
   end
+  insert:flush()
 end
 
-local function Graph:set_imports(module_name: string, imports: {ImportEdge})
+local function Graph:set_imports(module_name: string, imports: const? {ImportEdge})
   sql.execute(self.connection,
     "DELETE FROM main.graph_imports WHERE importer=?", module_name)
-  local first = 1
-  while first <= #imports do
-    local last = first + 49
-    if last > #imports then last = #imports end
-    local query = "INSERT OR IGNORE INTO main.graph_imports VALUES "
-    local bindings: {value} = {}
-    for index = first, last do
-      if index > first then query = query .. "," end
-      query = query .. "(?,?,?)"
-      local edge = imports[index]
-      bindings[#bindings + 1] = module_name
-      bindings[#bindings + 1] = edge.module_name
-      bindings[#bindings + 1] = visibility_rank(edge.visibility)
-    end
-    sql.execute(self.connection, query, ...bindings)
-    first = last + 1
+  local insert = sql.batch(
+    self.connection, "INSERT OR IGNORE INTO main.graph_imports VALUES ", 3)
+  for index = 1, #imports do
+    local edge = imports[index]
+    insert:append(module_name, edge.module_name, visibility_rank(edge.visibility))
   end
+  insert:flush()
 end
 
 -- The recursive relation crosses metadata-only external nodes and stops at
@@ -479,14 +451,14 @@ function Graph:file_stamps(module_name: string): {FileStamp}
   defer cursor:close()
   local result: {FileStamp} = {}
   for row in cursor:fetch do
-    local identity_blob: sqlite3.Blob? = row:get(5)
-    local identity: string?
-    if identity_blob ~= nil then identity = identity_blob.bytes end
-    local physical_blob: sqlite3.Blob? = row:get(6)
-    local physical_identity: string?
-    if physical_blob ~= nil then physical_identity = physical_blob.bytes end
-    result[#result + 1] = FileStamp.new(row:get(1), row:get(2), row:get(3), row:get(4),
-      identity, physical_identity)
+    result[#result + 1] = FileStamp {
+      path = row:get(1),
+      modified_seconds = row:get(2),
+      modified_nanoseconds = row:get(3),
+      size = row:get(4),
+      identity = sql.optional_bytes(row, 5),
+      physical_identity = sql.optional_bytes(row, 6),
+    }
   end
   return result
 end
@@ -509,7 +481,7 @@ function Graph:direct_imports(module_name: string): {ImportEdge}
     local visibility: integer = row:get(2)
     local access = ImportVisibility.ordinary()
     if visibility == 1 then access = ImportVisibility.source_required() end
-    result[#result + 1] = ImportEdge.new(row:get(1), access)
+    result[#result + 1] = ImportEdge(row:get(1), access)
   end
   return result
 end
@@ -526,7 +498,7 @@ function Graph:reverse_imports(module_name: string): {ReverseImport}
     local visibility: integer = row:get(2)
     local access = ImportVisibility.ordinary()
     if visibility == 1 then access = ImportVisibility.source_required() end
-    result[#result + 1] = ReverseImport.new(row:get(1), access)
+    result[#result + 1] = ReverseImport(row:get(1), access)
   end
   return result
 end
@@ -620,12 +592,12 @@ function Graph:observe_project(module_name: string,
   if existing ~= nil and existing.provenance == 0 then
     if same_stamps(self:file_stamps(module_name), normalized) then
       self:refresh_file_observations(module_name, normalized)
-      return ChangeReport.new(false, self:generation(), {})
+      return ChangeReport(false, self:generation(), {})
     end
     self:advance_generation()
     self:set_stamps(module_name, normalized)
     self:dirty_project(module_name)
-    return ChangeReport.new(true, self:generation(), {})
+    return ChangeReport(true, self:generation(), {})
   end
   self:advance_generation()
   sql.execute(self.connection, "DELETE FROM main.graph_modules WHERE name=?", module_name)
@@ -635,17 +607,17 @@ function Graph:observe_project(module_name: string,
   self.asts[module_name] = nil
   self:set_stamps(module_name, normalized)
   local invalidated = self:invalidate_importers(module_name, nil, nil, true, {})
-  return ChangeReport.new(true, self:generation(), invalidated)
+  return ChangeReport(true, self:generation(), invalidated)
 end
 
 function Graph:invalidate_project(module_name: string): ChangeReport
   local entry? = self:module(module_name)
   if entry == nil or entry.provenance ~= 0 then
-    return ChangeReport.new(false, self:generation(), {})
+    return ChangeReport(false, self:generation(), {})
   end
   self:advance_generation()
   self:dirty_project(module_name)
-  return ChangeReport.new(true, self:generation(), {})
+  return ChangeReport(true, self:generation(), {})
 end
 
 --- Reserve a dirty module for checking and capture its generation token.
@@ -655,7 +627,7 @@ function Graph:begin_project_check(module_name: string): CheckToken?
     module_name) == 0 then return nil end
   local entry? = self:module(module_name)
   if entry == nil then raise "project disappeared while holding store access" end
-  return CheckToken.new(module_name, self:generation(), entry.revision)
+  return CheckToken(module_name, self:generation(), entry.revision)
 end
 
 local function Graph:accepts(token: CheckToken): Module?
@@ -691,8 +663,8 @@ function Graph:commit_project(token: CheckToken, manifest: Manifest,
   self:set_imports(token.module_name, imports)
   sql.execute(self.connection,
     "UPDATE main.graph_modules SET state=2,recovering=0,public_digest=?,source_digest=? " ..
-    "WHERE name=?", sqlite3.Blob.new(manifest.public_digest),
-    sqlite3.Blob.new(manifest.source_digest), token.module_name)
+    "WHERE name=?", sqlite3.Blob(manifest.public_digest),
+    sqlite3.Blob(manifest.source_digest), token.module_name)
   self.asts[token.module_name] = ast
   local invalidated = self:invalidate_importers(
     token.module_name, entry.manifest, manifest, false, {})
@@ -718,20 +690,20 @@ local function Graph:upsert_external(module_name: string, provenance: integer,
        old_manifest ~= nil and same_manifest(old_manifest, manifest) and
        same_imports(self:direct_imports(module_name), normalized_imports) then
       self:refresh_file_observations(module_name, normalized_stamps)
-      return ChangeReport.new(false, self:generation(), {})
+      return ChangeReport(false, self:generation(), {})
     end
   end
   if advance then self:advance_generation() end
   sql.execute(self.connection, "DELETE FROM main.graph_modules WHERE name=?", module_name)
   sql.execute(self.connection,
     "INSERT INTO main.graph_modules VALUES(?,?,2,0,0,?,?)", module_name, provenance,
-    sqlite3.Blob.new(manifest.public_digest), sqlite3.Blob.new(manifest.source_digest))
+    sqlite3.Blob(manifest.public_digest), sqlite3.Blob(manifest.source_digest))
   self.asts[module_name] = nil
   self:set_stamps(module_name, normalized_stamps)
   self:set_imports(module_name, normalized_imports)
   local invalidated = self:invalidate_importers(
     module_name, old_manifest, manifest, force, satisfied)
-  return ChangeReport.new(true, self:generation(), invalidated)
+  return ChangeReport(true, self:generation(), invalidated)
 end
 
 function Graph:upsert_external_source(module_name: string, stamps: {FileStamp},
@@ -781,10 +753,10 @@ end
 
 function Graph:remove_module(module_name: string): ChangeReport
   local entry? = self:module(module_name)
-  if entry == nil then return ChangeReport.new(false, self:generation(), {}) end
+  if entry == nil then return ChangeReport(false, self:generation(), {}) end
   self:advance_generation()
   sql.execute(self.connection, "DELETE FROM main.graph_modules WHERE name=?", module_name)
   self.asts[module_name] = nil
   local invalidated = self:invalidate_importers(module_name, entry.manifest, nil, true, {})
-  return ChangeReport.new(true, self:generation(), invalidated)
+  return ChangeReport(true, self:generation(), invalidated)
 end

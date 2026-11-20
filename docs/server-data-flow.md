@@ -1,331 +1,257 @@
-# Server configuration and data flow
+# Chapter 1: Process Architecture, Multi-Root Routing, and Configuration
 
-The extension launches one native server per workspace folder. The process runs
-in one of two modes selected by `main` in `src/titan_language_server.titan`:
+Language-server state inside a Titan compiler process is process-wide: the embedded Lua interpreter, compiler driver globals (`TITAN_SOURCE_PATH`, `TITAN_BIN_PATH`, `EXTRA_CPPFLAGS`), native `.so`/`.dll` bindings, the C-probe cache directory, and the SQLite connection cannot safely host two roots with different SDKs or build targets at once. `vscode-titan` resolves that constraint with process isolation. One native executable operates in two modes, separating client session ownership from compiler execution.
 
-- The **router** (default) owns the client session (`router.run` in
-  `src/server/router.titan`). It reads the client's workspace folders, routes
-  each document to the most specific of the roots and its nearest ancestor
-  configuration (`owner_root`, `Roots:owner`, `roots.discover`), and starts one
-  **worker** process per root (`worker_process.spawn` in
-  `src/server/worker_process.titan`). It never loads the compiler.
-- The **worker** (`--worker --root PATH`) is one root's server: it changes its
-  working directory to that root, and `application.create(root)` owns that
-  root's project service, index, watchers and caches. `--compiler-root PREFIX`
-  selects an SDK before compiler modules load. The router passes either
-  `--target native` or `--target browser`. Both choices are immutable for
-  that worker.
+## Two modes in one executable
 
-Process isolation is what makes several roots possible: compiler Lua, driver
-globals, native modules, the probe prefix, the SQLite store and the Lua heap are
-process-wide, so one process hosts exactly one root, SDK and target. The
-router sets each worker's `TITAN_PREFIX`, so probe caches never mix.
+`main` in [`src/titan_language_server.titan`](../src/titan_language_server.titan) parses CLI flags into an immutable `Options` record and selects one of two modes:
 
-`root_settings.load` and `root_settings.sdk_identity` in
-`src/server/root_settings.titan` also record each root's settings fingerprint
-and the stat identity of the SDK files that decide its compiler. The router
-re-observes them at most once per second, on the routing path and on a
-periodic sweep, and immediately for every root on
-`workspace/didChangeConfiguration`. A change stops that root's worker after a
-bounded drain, starts a fresh worker with the accepted settings and replays the
-root's open documents; no other root is touched. Removing a workspace folder is
-not such a change: the router releases the root and keeps its worker for a later
-re-add (`Router:remove_root`), so only idle eviction or the worker cap stops it. A tracked `titan-config.lua`
-edit that leaves the effective selection alone restarts nothing, because the
-worker rescans it.
+- **Router mode** (default) runs `run` in [`src/server/router/router.titan`](../src/server/router/router.titan). It owns the client stdio stream, tracks workspace folders, resolves each document to its most specific root, and supervises one **worker** process per active root. The router loads zero compiler Lua modules.
+- **Worker mode** (`--worker --root PATH`) changes its working directory to the canonical root, locks its SDK (`--compiler-root PREFIX`) and analysis target (`--target native` or `--target browser`) before loading compiler Lua, sets `TITAN_PREFIX` for probe-cache isolation, and binds one `application.Application` to framed stdio through `protocol.run`.
 
-The extension maps symlinked workspace roots and their documents to physical
-paths on the wire and maps returned locations back to the editor's workspace
-spelling (`createWorkspaceUriConverters` in `src/extension/workspaceUris.ts`).
-On Windows, `relativeWorkspaceUriPath` in `src/extension/uriPaths.ts` compares
-only the drive letter case-insensitively in local file URIs. `isNestedWorkspace`
-in `src/extension/extension.ts` uses the same rule. On the server,
-`source_text.file_uri_to_path` normalizes the drive and separators before the
-router resolves physical paths and uses them for root and document ownership.
-The remainder of each path is case-sensitive.
-Remote workspace URIs are translated at the same protocol boundary.
+Both modes configure structured stderr logging via `logging.start` with `defer logging.close()`. Inside `serve`, named arguments on `protocol.run` and Titan bound methods (`server:start_indexing`, `server:on_document`, `server:capture_completion`) wire the application directly to the protocol loop without boilerplate forwarding closures:
 
-Completion has a separate [unsaved input and TEMP publication path](completion.md).
-Its dependency baseline is the committed saved publication. The saved-file
-features read the `main` semantic facts described in
-[workspace storage](sqlite-backend-storage.md).
+```titan
+local record Options
+  const worker: boolean
+  const root: string?
+  const compiler_root: string?
+  const print_paths: boolean
+  const target: string?
+end
+
+local function serve(root: string): integer
+  -- ...
+  do
+    local server = application.create(root)
+    defer server:close()
+    -- ...
+    return protocol.run {
+      source = os.stdin,
+      target = os.stdout,
+      -- ...
+      initialized_handler = server:start_indexing,
+      shutdown_handler = server:stop_diagnostics,
+      document_handler = server:on_document,
+      completion_capture = server:capture_completion,
+      hover_capture = server:capture_hover,
+      startup_notification = wire.encode(info_envelope()),
+    }
+  catch
+    log_server_failure(error, traceback)
+    return 1
+  end
+end
+```
+*Source: [`src/titan_language_server.titan`](../src/titan_language_server.titan) — `Options`, `serve`*
+
+Each bound method evaluates its `server` receiver once when `protocol.run` is invoked, and `defer server:close()` guarantees project watchers, restoration Tasks, and SQLite handles close on every exit path.
+
+## Multi-root router as a folder module
+
+The router owns four orthogonal concerns — session dispatch, root ownership, child lifecycle, and diagnostic reconciliation — over one shared state graph. Splitting `server.router` into a four-file **folder module** keeps each concern focused while preserving module-private encapsulation on `Router` and `Slot`:
+
+- [`src/server/router/router.titan`](../src/server/router/router.titan) *(folder main)* — Declares all imports, constants, `WorkerState`, `Overlay`, `Forwarded`, `Outbound`, `Slot`, `LaunchOptions`, `Router`, `create`, `Router:handle`, `Router:close`, and `run`.
+- [`src/server/router/client_routing.titan`](../src/server/router/client_routing.titan) — Owns document ownership lookup (`Router:owner_root`), `titan/workspaceStatus` reporting (`Router:status_value`), request and cancellation forwarding, and `workspace/didChangeWorkspaceFolders`.
+- [`src/server/router/worker_lifecycle.titan`](../src/server/router/worker_lifecycle.titan) — Owns cooperative slot transitions (`Slot:begin_transition`), worker spawning, throttled settings/SDK revalidation (`Router:revalidate`), crash accounting, LRU cap eviction (`Router:make_room`), idle sweeps (`Router:run_housekeeping`), and shutdown.
+- [`src/server/router/overlays_and_diagnostics.titan`](../src/server/router/overlays_and_diagnostics.titan) — Owns bounded open-buffer retention, diagnostic ownership reconciliation (`Router:reconcile`), and session-wide `titan/indexingStatus` aggregation (`Router:publish_indexing`).
+
+In Titan, contributor files inside a folder module share the main file's private records, unions, constants, and `local function Owner:method` declarations without exporting them to external importers:
+
+```titan
+union WorkerState
+  inactive()
+  starting()
+  ready()
+  failed(string)
+  evicted()
+end
+
+record Slot
+  const root: roots.Root
+  local worker: worker_process.WorkerProcess?
+  local state: WorkerState
+  local generation: integer
+  -- ...
+  local const published: {string: string}
+  local transitioning: boolean
+  local const token: async.ResumeToken
+end
+
+record Router
+  const options: LaunchOptions
+  const output: response_queue.ResponseQueue
+  local const registry: roots.Roots
+  local const slots: {string: Slot}
+  local const overlays: {string: Overlay}
+  local retired: {worker_process.WorkerProcess}
+  -- ...
+  local housekeeping: async.Task<|nil, value|>?
+end
+```
+*Source: [`src/server/router/router.titan`](../src/server/router/router.titan) — `WorkerState`, `Slot`, `Router`*
+
+Because both the client message loop (`run`) and the background housekeeping Task (`Router:run_housekeeping`) can inspect or stop a root's worker, every worker state mutation executes inside `Slot:begin_transition()` paired with `defer slot:end_transition()`. A competing caller suspends on `slot.token` until the active transition settles. When a worker is detached during a restart or failure, the router appends it to `self.retired` *before* any suspension point so a shutdown that cancels housekeeping closes every retired child process and relay Task.
+
+`load` and `sdk_identity` in [`src/server/root_settings.titan`](../src/server/root_settings.titan) record each root's settings fingerprint and the stat tuple of the SDK files that select its compiler. The router re-observes them at most once per second on both the routing path and the housekeeping sweep, and immediately across all roots on `workspace/didChangeConfiguration`. A settings or SDK change drains forwarded requests for a bounded window, stops that root's worker, launches a replacement with the accepted selection, and replays open editor buffers without affecting other roots. Removing a workspace folder releases the root while leaving its warm worker alive (`Router:remove_root`) until idle timeout or worker-cap eviction stops it. A tracked `titan-config.lua` edit that leaves `compiler_root` and `target` unchanged triggers zero restarts; the worker reloads those project fields on its own scan.
+
+## Supervising child worker processes
+
+`spawn` in [`src/server/worker_process.titan`](../src/server/worker_process.titan) launches the same executable with `os.spawn(executable, arguments, os.with_env("TITAN_PREFIX", probe_prefix))` and starts three cooperative relay Tasks: `WorkerProcess:read_messages` decodes `Content-Length` frames from child stdout, `WorkerProcess:await_exit` calls `child:wait()` to observe exit codes or signals, and `WorkerProcess:read_diagnostics` drains structured stderr logs into the router's single stderr queue.
+
+Because `os.InputStream` satisfies Titan's `io.ReaderCloser` Interface, `io.lines(source)` iterates complete lines without manual chunk buffering or newline splitting:
+
+```titan
+local function WorkerProcess:read_diagnostics(): nil
+  if self.error_stream == nil then return nil end
+  local source = self.error_stream
+  self.error_stream = nil
+  for line in io.lines(source) do
+    logging.raw(line)
+  end
+  return nil
+catch
+  if error is async.CancellationReason then raise end
+  return nil
+end
+```
+*Source: [`src/server/worker_process.titan`](../src/server/worker_process.titan) — `WorkerProcess:read_diagnostics`*
+
+Re-raising `async.CancellationReason` inside `catch` is a codebase-wide invariant: swallowing cancellation turns cooperative Task shutdown into a lost termination signal.
+
+## Canonical roots and URI mapping
+
+Editors may spell paths through symlinked workspace folders, remote URI schemes, or filenames whose parent directories do not yet exist on disk. The VS Code client translates symlinked workspace roots and documents to physical paths on the wire and maps returned locations back to the editor's workspace spelling (`createWorkspaceUriConverters` in [`src/extension/workspaceUris.ts`](../src/extension/workspaceUris.ts)). On Windows, `relativeWorkspaceUriPath` in [`src/extension/uriPaths.ts`](../src/extension/uriPaths.ts) and `isNestedWorkspace` in [`src/extension/extension.ts`](../src/extension/extension.ts) compare only the drive letter case-insensitively while treating the path suffix case-sensitively. Remote workspace URIs cross the same converter boundary.
+
+On the server, `file_uri_to_path` in [`src/server/source_text.titan`](../src/server/source_text.titan) normalizes drives and separators, and `canonical` in [`src/server/roots.titan`](../src/server/roots.titan) computes physical identity by walking upward until `fs.realpath` resolves the deepest existing ancestor, then reattaching the unresolved suffix:
+
+```titan
+function canonical(path: string): string
+  local candidate = normalize_platform(path)
+  local suffix: {string} = {}
+  while true do
+    do
+      local resolved = paths.to_slash(fs.realpath(candidate))
+      for index = #suffix, 1, -1 do
+        resolved = join(resolved, suffix[index])
+      end
+      return normalize_platform(resolved)
+    catch
+      if error is async.CancellationReason then raise end
+    end
+    local parent = parent_path(candidate)
+    if parent == candidate then return candidate end
+    local name = paths.basename(candidate)
+    if name == "" then return candidate end
+    suffix[#suffix + 1] = name
+    candidate = parent
+  end
+  return candidate
+end
+```
+*Source: [`src/server/roots.titan`](../src/server/roots.titan) — `canonical`*
+
+Registered roots carry an `Origin` union (`folder`, `discovered`, or `released`). `Roots:owner` selects the claimed root with the longest canonical path containing the document, ignoring released roots until a folder addition or nested `titan-config.lua` discovery claims them again:
+
+```titan
+function Roots:owner(subject: string): Root?
+  local best: Root? = nil
+  for index = 1, #self.order do
+    local entry = self.entries[self.order[index]]
+    if entry:claimed() and contains(entry.path, subject) then
+      if best == nil or #entry.path > #best.path then best = entry end
+    end
+  end
+  return best
+end
+```
+*Source: [`src/server/roots.titan`](../src/server/roots.titan) — `Roots:owner`*
+
+`Router:owner_root` in [`src/server/router/client_routing.titan`](../src/server/router/client_routing.titan) pairs `Roots:owner` with `roots.discover` (memoized per containing root and directory in `Router.discovered`), so a nested project with its own `titan-config.lua` always becomes its own root rather than falling under an enclosing workspace folder.
 
 ## Where compiler inputs come from
 
-The [README](../README.md#project-configuration) describes what each
-`titan-config.lua` field means to users. This table gives the owner of each
-input.
+User-facing `titan-config.lua` settings live in [Using the Titan VS Code Extension](vscode-extension.md) and [Using the Standalone Language Server](language-server.md). Each input crosses one authoritative server owner:
 
 | Input | Owner and interpretation |
 | --- | --- |
-| Compiler Lua and native Lua module paths | The extension sets `TITAN_LS_LUA_PATH` and `TITAN_LS_LUA_CPATH` from its packaged trees or explicit settings (`readCompilerDiscoveryConfiguration` in `src/extension/clientConfig.ts`). `lua_paths.configure` assigns them, or the [standalone defaults](../README.md#standalone-server), to `package.path` and `package.cpath` before compiler modules load. A worker started with `--compiler-root` ignores both and takes the prefix's own `share/lua/5.5` and `lib/lua/5.5` instead (`lua_paths.select_compiler_root`), which also removes the inherited `TITAN_PATH`, `TITAN_PATH_0_6` and `TITAN_SOURCE_PATH`. Removing them matters: the driver treats an empty string as a configured path, so blanking them would replace the selected prefix's own default provider path with an empty list. These paths are separate from Titan source and provider paths. |
-| Compiler installation root | The extension reports the packaged `dist/titan` payload, which `createServerLaunchOptions` passes as `TITAN_ROOT`. A root's `compiler_root` (tracked `titan-config.lua` or the `titan-config.local.lua` override) is resolved by the router before it starts that worker, checked for the SDK layout (`root_settings.validate_prefix` in `src/server/root_settings.titan`) and passed as `--compiler-root`. The compiler takes its SDK headers, Lua sources and library layout from that root and never from a Lua search path; the server links the runtime archive, so the payload carries no `lib/titan` providers. |
-| Root membership and trust | `src/server/roots.titan` owns canonical roots, folder references, discovered roots, released roots and most-specific containment (`Roots:add_folder`, `Roots:remove_folder`, `Roots:drop`, `Roots:owner`, `roots.discover`). A folder removal only drops a reference: the root stays registered as released, `Roots:owner` ignores it until a folder or a discovered configuration claims it again, and the router drops it (`Roots:drop`) when its warm worker stops. The router's owner for a document is the most specific of the known roots containing it and its nearest ancestor `titan-config.lua` (`owner_root` in `src/server/router.titan`), so a nested project is its own root and a folder root without configuration cannot claim one. `Trust:allows` in `src/server/root_settings.titan` decides trust from `initializationOptions.trustedRoots` plus `TITAN_LS_TRUSTED_ROOTS`, and `root_settings.load` refuses an untrusted or unusable `compiler_root` before a worker exists. |
-| Saved project discovery and watching | `project_config` loads `include` and `exclude` and resolves them against the workspace root. `project_discovery` selects variants for the worker's accepted target using compiler-owned source-selection rules (`TITAN_TARGET` is ignored); `exclude` narrows only the watcher set. |
-| Titan source module roots | `source_module_roots` is an ordered array in `ProjectConfig` and `CompilerConfiguration`. Only `Compiler:configure` joins it with `;` into the driver's `TITAN_SOURCE_PATH`. It also determines logical module names and canonical `native_output` paths (`raw_source_descriptor` in `src/server/compiler_bridge.titan`). |
-| Titan binary providers | `binary_modules_root` defaults to the compiler's installed root (`Compiler:installed_binary_modules_root`). It is independent of the Lua native-module path. |
-| C include directories | `extra_ffi_include_dirs` is an ordered, normalized array. Resolver contexts receive it from the accepted compiler configuration, in addition to the compiler's explicit SDK roots. There is no parent-directory SDK search. |
-| Compilation flags | The compiler driver captures the inherited `TITAN_EXTRA_CPPFLAGS`, `TITAN_EXTRA_CFLAGS` and `TITAN_EXTRA_LDFLAGS`. `Compiler:configure` splits `extra_ffi_cppflags` with the driver's `split_shell_words` and appends the words after the inherited preprocessing flags. The project file cannot change C or linker flags. |
-| C probe cache | The router computes one prefix per root (`root_settings.probe_prefix` in `src/server/root_settings.titan`) and passes it as the worker's `TITAN_PREFIX` before the compiler loads: `<root>/.titan-ls` when nothing was inherited, otherwise `<TITAN_PREFIX>/roots/<digest>` keyed by the canonical root. A worker started without the router applies the same default to its own root. The prefix changes only probe storage, not compiler, provider or SDK discovery, and not the database location. |
+| Compiler Lua and native Lua module paths | The extension sets `TITAN_LS_LUA_PATH` and `TITAN_LS_LUA_CPATH` from its packaged trees or settings (`readCompilerDiscoveryConfiguration` in [`src/extension/clientConfig.ts`](../src/extension/clientConfig.ts)). `configure` in [`src/server/lua_paths.titan`](../src/server/lua_paths.titan) assigns them (or standalone defaults) to `package.path` and `package.cpath` before compiler modules load. A worker started with `--compiler-root` ignores both variables, selects the prefix's `share/lua/5.5` and `lib/lua/5.5` (`select_compiler_root`), and unsets `TITAN_PATH`, `TITAN_PATH_0_6`, and `TITAN_SOURCE_PATH`. Unsetting rather than blanking them is required because the driver treats `""` as an explicit empty provider path. |
+| Compiler installation root | The extension passes its packaged `dist/titan` directory as `TITAN_ROOT` (`createServerLaunchOptions` in [`src/extension/clientConfig.ts`](../src/extension/clientConfig.ts)). A root's `compiler_root` (in `titan-config.lua` or `titan-config.local.lua`) is validated by `validate_prefix` in [`src/server/root_settings.titan`](../src/server/root_settings.titan) and passed as `--compiler-root`. The compiler resolves SDK headers, Lua sources, and library layout solely from that root; the server links the runtime archive statically, so the packaged payload carries no `lib/titan` providers. |
+| Root membership and trust | [`src/server/roots.titan`](../src/server/roots.titan) owns canonical roots, folder references, discovery, released roots, and containment (`Roots:add_folder`, `Roots:remove_folder`, `Roots:drop`, `Roots:owner`, `roots.discover`). `Router:owner_root` in [`src/server/router/client_routing.titan`](../src/server/router/client_routing.titan) resolves each document to the most specific registered root or nearest ancestor `titan-config.lua`. `Trust:allows` in [`src/server/root_settings.titan`](../src/server/root_settings.titan) combines `initializationOptions.trustedRoots` and `TITAN_LS_TRUSTED_ROOTS`, and `root_settings.load` rejects an untrusted or malformed `compiler_root` before starting a worker. |
+| Saved project discovery and watching | [`src/server/project_config.titan`](../src/server/project_config.titan) evaluates `include` and `exclude` in an empty Lua environment and resolves them against the project root. [`src/server/project_discovery.titan`](../src/server/project_discovery.titan) selects source variants for the worker's target via compiler-owned rules (ignoring `TITAN_TARGET`); `exclude` narrows only the watcher set. |
+| Titan source module roots | `source_module_roots` is an ordered array in `ProjectConfig` and `CompilerConfiguration`. `Compiler:configure` in [`src/server/compiler_bridge/loader.titan`](../src/server/compiler_bridge/loader.titan) joins it with `;` into `TITAN_SOURCE_PATH`. It also determines logical module names and canonical `native_output` paths (`ProjectModule:raw_source_descriptor` in [`src/server/compiler_bridge/analysis.titan`](../src/server/compiler_bridge/analysis.titan)). |
+| Titan binary providers | `binary_modules_root` defaults to the compiler's installed root (`Compiler:installed_binary_modules_root` in [`src/server/compiler_bridge/loader.titan`](../src/server/compiler_bridge/loader.titan)) and is independent of Lua native-module paths. |
+| C include directories | `extra_ffi_include_dirs` is an ordered, normalized array supplied to resolver contexts alongside the compiler's explicit SDK roots, with zero parent-directory SDK search. |
+| Compilation flags | The driver inherits `TITAN_EXTRA_CPPFLAGS`, `TITAN_EXTRA_CFLAGS`, and `TITAN_EXTRA_LDFLAGS`. `Compiler:configure` splits `extra_ffi_cppflags` via the driver's `split_shell_words` and appends those words after inherited preprocessing flags. Project configuration cannot alter C compiler or linker flags. |
+| C probe cache | `probe_prefix` in [`src/server/root_settings.titan`](../src/server/root_settings.titan) assigns each root its own `TITAN_PREFIX` before compiler load: `<root>/.titan-ls` when unset, or `<TITAN_PREFIX>/roots/<digest>` keyed by canonical root. A direct `--worker` launch applies the same default. `TITAN_PREFIX` affects only probe storage, never compiler discovery or SQLite database placement. |
 
-With the default prefix, the compiler stores probe results under
-`.titan-ls/var/cache/titan-probes/2`, beside `.titan-ls/index.sqlite3`. Probe
-keys are hashes of the raw C source, while results also depend on a root's SDK
-headers and flags, so no two roots share a probe directory. The README's
-[workspace cache](../README.md#workspace-cache) section explains how to clear
-the cache.
+Under the default prefix, compiler C-probe caches live in `.titan-ls/var/cache/titan-probes/2` beside `.titan-ls/index.sqlite3`. Because probe keys hash raw C source while results depend on SDK headers and flags, per-root prefixes keep probe caches completely isolated.
 
 ## Compiler compatibility
 
-`compiler_bridge.load` requires the driver's `TITAN_ABI_VERSION` to equal
-`COMPILER_ABI` (`"2"`) and its `LANGUAGE_SERVER_API_VERSION` to equal
-`COMPILER_LANGUAGE_SERVER_API` (`1`). A matching ABI alone is rejected. The
-bridge then checks every driver entry point it calls (`checked_function`).
-Examples are `restat_c_header_dependencies`, `split_shell_words`, and the
-project-entry codecs. `AGENTS.md` states the rule for keeping the API version
-at `1`.
+`load` in [`src/server/compiler_bridge/loader.titan`](../src/server/compiler_bridge/loader.titan) checks that the loaded driver exports `TITAN_ABI_VERSION == COMPILER_ABI` (`"2"`) and `LANGUAGE_SERVER_API_VERSION == COMPILER_LANGUAGE_SERVER_API` (`1`), then verifies every required driver, parser, checker, and types entry point with `checked_function` ([`src/server/compiler_bridge/compiler_bridge.titan`](../src/server/compiler_bridge/compiler_bridge.titan)). Both the executable's default SDK and any per-root `compiler_root` pass the same gate, turning mismatches into root-scoped errors naming the failing prefix.
 
-The check is the same for the executable's build SDK and for a root's selected
-SDK, so a mismatch is a root-scoped error naming the prefix. A selected Unix
-SDK uses its ordinary static archive (`prefer_static`). A selected Windows
-SDK uses `Compiler:selected_inventory` in `src/server/compiler_bridge.titan`
-to query `lib/titan/0.6/titan.dll` in a separate interpreter, once per worker.
-The resolver receives the interface inventory without the build SDK's C
-profile. The selected DLL is reobserved as an ordinary file, not as the
-server's mapped provider. An explicitly different `binary_modules_root`
-keeps ordinary filesystem lookup. Every saved refresh resolves directory
-aliases without replacing the configured path. Whether the alias still
-names the SDK directory is part of the saved configuration and cache
-identities. A retarget or removal rechecks the project and replaces its
-completion catalog, even if no saved file imports the provider. Detached
-completion reads the catalog from the accepted saved generation. If project
-source overlaps the inventory, the compiler rejects it and may inspect that
-SDK's DLL through ordinary lookup. The DLL stays mapped until
-worker exit; the worker's own native runtime never changes.
+Provider interface discovery follows the host platform:
 
-The default worker gets its bare `titan` compiler support table from the
-executable. A selected worker instead loads `lib/lua/5.5/titan.so` or
-`titan.dll` from its SDK, just like the selected SDK's other compiler
-dependencies. This support module must match the worker's Lua/Titan ABI.
-The router observes its file identity for restarts and the worker includes
-its bytes in cache compatibility. It does not select the worker's Titan
-runtime or standard-library provider.
-
-`inventory.validate` in `scripts/standard-interface-inventory.lua` accepts
-the original 23 modules or all 26, including `titan.protobuf`, `titan.thread`
-and `titan.transfer`. Partial additional groups and unexpected modules are
-rejected.
-
-On Unix, the script generates the embedded metadata-only interface provider
-from the SDK's `lib/titan/0.6/titan.a`, including the build target's C type
-profile. The compiler can therefore typecheck standard-library imports,
-including reflection, without a C compiler or SDK. The generated C registers
-only the compiler's bare `titan` support table in `package.preload`. It does
-not register or initialize the native `titan.*` modules. On Windows,
-`src/server/embedded_interfaces_windows.c` reads interfaces from the loaded
-standard-provider DLL; see
-[native builds](native-build.md#windows-embedded-interfaces).
+- **Selected Unix SDK:** Uses the SDK's static archive (`lib/titan/0.6/titan.a`) directly via `prefer_static`.
+- **Selected Windows SDK:** `Compiler:selected_inventory` in [`src/server/compiler_bridge/loader.titan`](../src/server/compiler_bridge/loader.titan) invokes [`src/server/selected_interfaces.titan`](../src/server/selected_interfaces.titan) once per worker to read `lib/titan/0.6/titan.dll` in the selected SDK's own Lua interpreter, supplying the interface inventory without the build SDK's C profile. Each saved refresh resolves directory aliases (`project_config.physical_directory`) without rewriting the configured path, folds whether the alias matches the SDK directory into configuration and cache identity, and updates the completion catalog on retarget or removal. An explicit non-SDK `binary_modules_root` uses ordinary filesystem lookup. If project source overlaps the inventory, the compiler rejects the overlap and may inspect that SDK's DLL through ordinary lookup; the DLL stays mapped until worker exit while the worker's own native runtime remains unchanged.
+- **Compiler support table:** Default workers register the executable's bare `titan` compiler support table in `package.preload` without initializing native `titan.*` modules; selected workers load `lib/lua/5.5/titan.so` or `titan.dll` from their SDK (matching the worker's Lua/Titan ABI). The router watches that file's stat identity for restarts, and the worker hashes its bytes into cache compatibility.
+- **Standard-library inventory:** `inventory.validate` in [`scripts/standard-interface-inventory.lua`](../scripts/standard-interface-inventory.lua) accepts either the 23-module baseline or the full 26-module set including `titan.protobuf`, `titan.thread`, and `titan.transfer`. On Unix, build-time code generation embeds metadata-only interfaces from `lib/titan/0.6/titan.a` (including the target C type profile) so the compiler typechecks standard-library imports without a C compiler or SDK on disk. On Windows, [`src/server/embedded_interfaces_windows.c`](../src/server/embedded_interfaces_windows.c) reads interfaces from the loaded standard-provider DLL; see [Appendix A](native-build.md#windows-embedded-interfaces).
 
 ### Browser analysis
 
-The router reads the tracked `target` along with the SDK choice and observes
-the three browser asset files for reinstalls. The worker validates an
-`analysis-target` descriptor against the Wasm provider `titan.a` and the
-`absent-modules` list in the selected SDK's `lib/titan-browser/0.6`. The
-default VSIX uses its own pack at the same relative path. An explicit SDK
-never borrows package files.
+When `titan-config.lua` sets `target = "browser"`, the router validates and watches three SDK assets under `lib/titan-browser/0.6/`: `analysis-target`, `absent-modules`, and `titan.a`. The packaged VSIX ships its own pack at the same relative path; an explicit `compiler_root` uses its own pack exclusively.
 
-The compiler bridge keeps one validated analysis handle per worker and
-supplies it to saved checks, topology resolution, cache validation, rename
-and private completion. The default browser worker registers the executable's
-bare `titan` compiler support but never opens its native interface inventory
-for browser analysis. It reads Wasm type metadata; it cannot compile or link.
-Only real foreign C work activates the lazy Emscripten 6.0.13 probe path. A
-missing toolchain applies to that source, not to the rest of the browser root.
+The compiler bridge keeps one validated browser analysis handle per worker and supplies it to saved analysis, topology resolution, cache validation, rename preflight, and private completion. A default browser worker registers the executable's bare `titan` support table without opening its native standard-library inventory. Analysis reads Wasm type metadata directly and activates the lazy Emscripten 6.0.13 probe path only for sources that contain foreign C declarations, confining any missing-toolchain error to those files.
 
 ## One production composition path
 
-`project_loader.load` loads the compiler and one normalized project
-configuration. It validates workspace-cache compatibility and wires the real
-compiler callbacks, the persisted cache and the `Restoration` callbacks.
-`project_service.create` builds the Service from that accepted
-configuration. `Application` owns the background restoration Task and the
-transaction that publishes the completed semantic view. Service owns
-discovery, graph state and commits, invalidation and the publication hooks.
-Test fixtures inject callbacks through the same constructor. Tests that need a
-real compiler use the production loader.
+Inside a worker, one linear composition chain owns startup and refresh:
 
-Service construction copies the accepted configuration with `ProjectConfig:copy`
-before discovery can yield, then consumes that discovery once. Later scans
-reload the configuration. The rescan after watcher registration is
-deliberate: it covers changes between the initial scan and registration.
-Snapshots that the Service publishes are defensive copies, so consumers cannot
-change Service settings by editing one.
+1. `load` in [`src/server/project_loader.titan`](../src/server/project_loader.titan) loads the compatible compiler, evaluates `project_config.load`, validates the workspace cache against compiler and configuration identities, and wires the real analyzer, external resolver, header restater, publication hooks, and background `Restoration` handle.
+2. `create` in [`src/server/project_service/project_service.titan`](../src/server/project_service/project_service.titan) builds the `Service` that owns discovery, dependency graph updates, provenance revalidation, and SQLite commits. Unit fixtures inject mock callbacks through the same constructor; tests requiring a real compiler call `project_loader.load`.
+3. `create` in [`src/server/application/application.titan`](../src/server/application/application.titan) owns the background restoration Task, directory watchers, refresh chains, semantic view publication, and LSP request handlers. A second scan runs immediately after watcher registration to close the window between initial discovery and live watch events.
 
-The loader and the independent rename preflight map normalized settings into
-the named `CompilerConfiguration` fields. The Compiler owns the accepted copy
-and its effective driver values. `Compiler:configure` compares unchanged
-configuration before it parses flags or converts paths, and prepares changed
-configuration once. Compiler operations apply and restore the driver globals
-(`DriverConfiguration:apply`) under the `compiler_scheduler` permit. Analysis,
-external resolution and native cache identity all derive resolver options
-from that same accepted state.
+Every field on `ProjectConfig` ([`src/server/project_config.titan`](../src/server/project_config.titan)) and `Snapshot` ([`src/server/project_service/project_service.titan`](../src/server/project_service/project_service.titan)) is declared `const`, preventing consumers from rebinding configuration or snapshot members. When accepting initial settings or publishing a `Snapshot`, `Service` isolates its mutable path arrays with array spreads (`{...self.include}`, `{...self.catalog.issues}`) so external callers cannot mutate live service state.
 
-`ProjectModule:compiler_input` converts saved module and source snapshots for
-the loader's cache restoration and export, and for Application's snapshot
-preparation. Each caller selects its own module set. Service's incremental
-preparation uses its mutable state through `bridge_project`, a separate
-work-state boundary. These conversions keep no compiler bodies and add no
-cached representation.
-
-## Compiler boundary
-
-`compiler_bridge` normalizes compiler Lua tables into typed records. The other
-server layers never traverse untyped `value` maps. The AST walker visits only
-the lexical child fields in `AST_CHILD_FIELDS`, in order, and excludes DAG
-backreferences such as `Ast.ExpSpreadIndex.spread`. Changes to the compiler or
-server content identity invalidate incompatible saved metadata, without
-changing API or cache version numbers; see
-[workspace storage](sqlite-backend-storage.md#location-and-opening).
-
-Compilation and semantic extraction stay outside the short SQL publication
-transactions. Cancellation still drains owned work and restoration before
-stores close. Structured SQLite, compiler and async errors keep useful detail
-when they become Service failures.
+Both the loader and independent rename preflight map normalized settings into named `CompilerConfiguration` fields ([`src/server/compiler_bridge/compiler_bridge.titan`](../src/server/compiler_bridge/compiler_bridge.titan)). `Compiler:configure` compares unchanged fields before parsing flags or joining paths, and `DriverConfiguration:apply` ([`src/server/compiler_bridge/loader.titan`](../src/server/compiler_bridge/loader.titan)) installs and restores driver globals under the `compiler_scheduler` permit ([Chapter 3](compiler-bridge.md)). Analysis, external resolution, and native cache identity all derive resolver options from that accepted state. Compilation and semantic extraction run outside short SQL publication transactions, cancellation drains owned work and restoration before stores close, and structured SQLite, compiler, and async errors preserve diagnostic detail when wrapped as `Service` failures. For cache export and snapshot preparation, `ProjectModule:compiler_input` produces body-free input records, while incremental analysis builds its workset directly from `Service` metadata via `bridge_project` in [`src/server/project_service/analysis_commit.titan`](../src/server/project_service/analysis_commit.titan). Saved-file queries read committed `main.*` SQLite tables ([Chapter 4](sqlite-backend-storage.md#location-and-opening), [Chapter 5](semantic-features.md)), while unsaved completion reads generation-fenced baselines into connection-local `temp.*` tables ([Chapter 6](completion.md#input-and-publication-ownership)).
 
 ## Protocol boundary
 
-`router.run` and `protocol.run` read stdin and write stdout, which carries only
-`Content-Length`-framed JSON-RPC. The router reuses the worker's transport
-(`protocol.new_input_queue`, `read_messages`, `write_messages`,
-`response_queue`) and forwards original message bytes after decoding only what
-it routes on. `logging` writes structured records to stderr.
-`framing` limits the header block to 64 KiB and a message body to 16 MiB. It
-rejects duplicate `Content-Length` or `Content-Type` headers. An optional
-`Content-Type` must be `application/vscode-jsonrpc`, and may add only a
-`charset` parameter of `utf-8` (or the legacy `utf8`). `wire`
-decodes and encodes JSON with `titan.json`, using native Maps and Arrays, an
-explicit null sentinel (`wire.null`) and a nesting limit of 128. `dispatcher`
-turns request IDs into the nominal `RequestId` union and routes semantic
-requests, completion and document notifications. `lifecycle` owns the
-`initialize`/`shutdown`/`exit` states and the advertised capabilities; the
-router enables its workspace-folder capability and only the router advertises
-it. The custom `titan/indexingStatus` notification (`indexing_status`) drives
-the extension's language-status item. `Router:publish_indexing` aggregates the
-latest snapshots of claimed roots onto one session timeline: busy while any
-root indexes, otherwise failed while any root's latest snapshot failed,
-otherwise ready. Busy stays initial until the first session ready; afterward it
-is initial if any indexing root is initial. File counters are summed only when
-every indexing root reports them; otherwise busy has no counters. Publication
-follows the visible state, initial scope and counters: an unchanged busy aggregate
-emits nothing, including when another root completes. The first counted snapshot
-after bare busy establishes a zero-count baseline in that epoch. Once counted,
-only progress over the same total without regression continues the epoch;
-other visible busy changes start a newer bare-busy epoch. Failure messages
-identify the failed root when more than one root is claimed.
-Terminal snapshots survive idle worker eviction; releasing a root excludes its
-snapshot until that root is claimed again, independently of diagnostic replay.
-Lifecycle changes publish only when the visible aggregate changes: an unchanged
-release, reclaim, replay or unclaimed exit does not manufacture an epoch. A busy
-restart replaces the old workset without an intermediate ready frame.
-The slot's snapshot also drives idle admission: startup installs a synthetic busy
-snapshot until the worker reports its first frame.
-An initialization or settings failure ends the root's busy contribution with a
-failed snapshot; an exit that already published terminal is not published again.
-If admission fails before any worker starts, initial bare busy precedes failed.
-Slot failure transitions keep the lifecycle state, failure message and indexing
-snapshot together. Repairing settings retracts their prior failure even before
-another worker starts.
+### Transport and capability negotiation
 
-The notification's session `generation` counts completed publications from claimed
-roots when their snapshots are accepted, even before the first visible frame.
-It is monotonic across worker restarts and root release, reclaim and eviction;
-replaying a warm root does not count another completion. Completions hidden
-behind unchanged busy are retained for the next ready frame without a
-generation-only busy publication. Session generation is not a worker's
-saved generation: pull-diagnostic generations and work-done progress tokens
-remain worker-local. Session epochs likewise never restart when another root
-or replacement worker starts, so clients with one watermark accept every root.
-A worker detached from its slot is owned by the router (`Router.retired`)
-before any suspension, so a shutdown that cancels a restart still releases its
-process and relay Tasks.
+Both `router.run` and `protocol.run` read `Content-Length`-framed JSON-RPC from stdin and write framed replies exclusively to stdout through one writer Task. The router reuses `protocol.new_input_queue`, `protocol.read_messages`, `protocol.write_messages`, and `response_queue.ResponseQueue`, forwarding original client request bytes after decoding only the routing fields. [Chapter 2](protocol-and-concurrency.md) covers framing limits, `wire` encoding, queue backpressure, and outbound request ownership in detail.
 
-The router also filters diagnostics by ownership: a worker's
-`textDocument/publishDiagnostics` for a URI is forwarded only when that worker
-owns the URI, so a nested root's outer worker cannot publish for an inner root's
-documents. Ownership can move at runtime (a folder add or removal, a release, a
-nested discovery, a worker that stops), and every such change ends in one
-reconciliation step (`Router:reconcile`): a document the client still has open is
-closed in the old owner and opened in the new one with the router's latest text,
-and diagnostics a root published for a document it no longer owns are cleared
-with an empty publication. A tracked publication is forgotten only after its
-empty diagnostic publication is emitted. After reconciliation, a slot without a
-worker tracks no publications. Every worker started while its root is released
-owes a replay when ownership returns. Worker loss clears owned or unowned URIs
-immediately, including when a controlled stop kills an unanswered worker.
-Transferred URIs stay tracked until reconciliation clears the old publication
-before replay. A file fixed or deleted before replacement startup cannot retain
-a stale diagnostic. Every worker callback is
-fenced by its captured generation, including a diagnostic frame whose path lookup
-suspended across process exit or replacement. A warm worker replays its completed
-diagnostics when its root gains ownership, whether its own folder is re-added or
-an enclosing root regains documents from a released nested folder. After
-old-owner clearing, the router requests `titan/republishDiagnostics`, and the
-worker reattaches its listener through `Application:set_diagnostics_listener`.
-A rejected replay remains pending for the next reconciliation. Replay uses the
-short delivery timeout; an unavailable reply stops retries against that worker,
-including after another ownership change. A new worker can replay normally.
-The accepted view's persisted rows remain the single diagnostic source.
-Listener attachment is immediate, but replay requires a completed publication
-for the current saved epoch and no failed refresh. A hint or replacement view
-arriving while the SQL read waits invalidates that replay. The attached
-listener then receives the next accepted publication. This applies to first
-attachment and warm reattachment, with no router-side snapshot. The router
-retains each open document's text under the
-same limits the worker applies (`document_buffers.limits`); a buffer it cannot
-retain is replayed as an unavailable contributor (`titan/documentUnavailable`),
-never as the saved bytes. It forwards `$/cancelRequest` to the worker that owns the request id,
-and it remaps a worker-to-client request under a router-allocated id
-(`router.worker_response_body` restores the worker's id on the reply), so a
-later worker feature can ask the client questions. `titan/workspaceStatus`
-answers from the root registry plus each worker's own report of its process
-identity, SDK and probe prefix, so every registered root appears whether or not
-its worker has started; the
-[README](../README.md#multiple-roots-in-one-server-session) owns its fields.
-Every root transition is logged with the root path.
+Both modes answer `initialize` through `lifecycle.Lifecycle` ([`src/server/lifecycle.titan`](../src/server/lifecycle.titan)), with workspace-folder support enabled solely in the router. `lsp.client_capabilities` ([`src/server/lsp_types.titan`](../src/server/lsp_types.titan)) parses `window.workDoneProgress` and `initializationOptions.pullDiagnostics` once at initialization so the router advertises the exact capabilities its workers expect.
 
-The client capabilities that gate an advertisement are parsed once, at
-`initialize`: `lsp.client_capabilities` reads `window.workDoneProgress` and
-`initializationOptions.pullDiagnostics`, `lifecycle` stores the record, and
-`Dispatcher:client_capabilities` exposes it. `window.workDoneProgress` enables
-indexing work-done progress; `pullDiagnostics = false` omits
-`diagnosticProvider`. Both modes answer `initialize` through `lifecycle`, so the
-router advertises exactly what its workers observe. The
-[README](../README.md#indexing-and-diagnostics) describes the client-visible
-behavior.
+### Session indexing status aggregation
 
-The protocol layer also owns server-initiated requests. `outbound_requests`
-allocates string identifiers (`titan/<n>`), writes each request through the same
-sole writer as replies, and routes a client response — an object with an `id`
-and no `method` — to its waiting Task. A response with an unknown identifier is
-logged and dropped rather than answered, and both `shutdown` and session close
-fail every request still pending so its waiting Task unwinds. `indexing_progress`
-owns one work-done period per refresh chain: it requests the token, then
-publishes `$/progress` for that chain only, and `Application` ends the period
-after the completed view and its diagnostics are published. Progress tokens
-embed the server's process id, so the router forwards `$/progress` unchanged
-instead of rewriting a token shared across workers. `textDocument/diagnostic`
-(`Application:handle_diagnostic`) is routed by document URI like every other
-document request and is a freshness barrier through
-`Application:fresh_view_for`: the pull calls the same `note_saved_change` path a
-watcher hint uses, coalescing with any in-flight chain, and answers only from the
-generation that pass completed. The protocol layer therefore never inspects one
-file's recorded `project_graph.FileStamp` to decide freshness; every saved input
-the requested document's report can depend on — its module's other contributors,
-its dependencies and their dependencies — is revalidated by that pass. A pass
-that finds nothing dirty is a scan only: no analysis runs, the items are
-unchanged and so is their `resultId`, which keeps `unchanged` answers working.
-A pull whose pass fails reports that failure, and a cancelled pull is answered as
-cancelled. It answers from `published_diagnostics.read_uri`, the same rows push
-reads, and `diagnostics.report` encodes the report with a `resultId` derived from
-those items.
+Clients display one status indicator across all active roots, driven by `titan/indexingStatus` notifications. `Router:publish_indexing` in [`src/server/router/overlays_and_diagnostics.titan`](../src/server/router/overlays_and_diagnostics.titan) folds every claimed root's latest snapshot onto a single monotonic session timeline:
+
+- **Aggregate precedence:** `indexing` while any claimed root indexes; otherwise `failed` while any claimed root's latest snapshot failed (prefixing the root path when more than one root is claimed); otherwise `ready`.
+- **Initial scope and counters:** Busy stays `initial = true` until the first session `ready`, and thereafter whenever any indexing root reports `initial = true`. File counters are summed (bounded by the safe integer limit `9007199254740991`) only when every indexing root supplies counts.
+- **Epoch monotonicity:** Unchanged visible busy aggregates emit zero frames. After bare busy, the first counted snapshot emits a zero-count baseline in the same epoch; once counted, only non-regressing progress over an identical total stays in that epoch, while other visible busy transitions advance to a fresh bare-busy epoch. Session epochs never reset across worker restarts.
+- **Session generation:** `Router.indexing_generation` increments when a claimed root accepts a new `ready` publication, even when hidden behind another root's busy state, and carries forward to the next visible `ready` frame. It is distinct from worker-local saved generations.
+- **Lifecycle edge cases:** Starting a worker installs a synthetic initial busy snapshot until its first worker frame arrives. Terminal snapshots survive idle worker eviction; releasing a root excludes its snapshot until reclaimed. Settings or admission failures before worker startup emit an initial bare-busy frame before `failed`, and repairing settings clears prior failure state before any worker restarts.
+
+### Overlay replay and diagnostic ownership
+
+Worker callbacks are fenced by each slot's captured `generation` so frames whose canonicalization suspended across worker exit or replacement cannot resurrect retired state. Diagnostic notifications (`textDocument/publishDiagnostics`) pass through to the client only when `Router:owner_root` confirms the sender owns the document URI.
+
+Every message that can shift ownership (folder add/remove, release, nested discovery, or worker stop) ends in one reconciliation pass (`Router:reconcile` in [`src/server/router/overlays_and_diagnostics.titan`](../src/server/router/overlays_and_diagnostics.titan)):
+
+1. **Buffer migration:** Open documents whose owner changed are closed in the previous owner (`textDocument/didClose`) and opened in the new owner using the router's retained text. Buffers exceeding `document_buffers.limits` are retained as versioned unavailable markers and replayed via `titan/documentUnavailable` rather than falling back to saved bytes.
+2. **Stale diagnostic clearing:** Any URI a root published that belongs to another root — or to a stopped worker — is cleared with an empty `textDocument/publishDiagnostics` before the entry is removed from `Slot.published`. After reconciliation, a slot without a worker tracks zero publications. Worker loss clears owned or unowned URIs synchronously (`Slot:clear_worker_diagnostics`) while leaving transferred URIs for ordered reconciliation.
+3. **Warm diagnostic replay:** Every worker started while its root is released owes a replay when ownership returns. After old-owner rows clear, any claimed ready worker marked `replay_diagnostics` receives `titan/republishDiagnostics`, which reattaches `Application:set_diagnostics_listener` ([`src/server/application/application.titan`](../src/server/application/application.titan)). Listener attachment is immediate, while replay requires a completed publication for the current saved epoch without a failed refresh; a watcher hint or replacement view arriving during the SQL read invalidates that replay, and the attached listener receives the next accepted publication. A rejected replay stays pending for the next reconciliation; a timed-out replay suppresses retries for that worker generation (`replay_unavailable_generation`).
+
+The router also forwards `$/cancelRequest` to the worker holding the forwarded request ID, remaps worker-to-client requests under router-allocated IDs (`worker_response_body` in [`src/server/router/client_routing.titan`](../src/server/router/client_routing.titan) restores the worker's ID on reply), and answers `titan/workspaceStatus` from the root registry combined with each worker's observed `titan/workerInfo` report (`pid`, `titanRoot`, `probePrefix`).
+
+### Work-done progress and pull diagnostics
+
+`Reporter` in [`src/server/indexing_progress.titan`](../src/server/indexing_progress.titan) owns one `$/progress` period per contiguous refresh chain, embedding the worker's process ID in each progress token so the router forwards `$/progress` verbatim without token rewriting.
+
+Pull diagnostics (`textDocument/diagnostic`) route by document URI to `Application:handle_diagnostic` in [`src/server/application/handlers.titan`](../src/server/application/handlers.titan), which acts as a freshness barrier via `Application:fresh_view_for` in [`src/server/application/indexing_lifecycle.titan`](../src/server/application/indexing_lifecycle.titan). Calling `note_saved_change()` coalesces with any active refresh chain and revalidates every saved input affecting the document (sibling contributors and transitive dependencies) without inspecting a single `FileStamp` shortcut. A clean scan reuses the existing generation and `resultId` so `unchanged` responses work without reanalysis; answers read from `published_diagnostics.read_uri` ([`src/server/published_diagnostics.titan`](../src/server/published_diagnostics.titan)) and encode through `diagnostics.report` ([`src/server/diagnostics.titan`](../src/server/diagnostics.titan)).
+
+---
+
+[Table of Contents](index.md) | Next: [Chapter 2: Framing, JSON-RPC Transport, and Cooperative Concurrency](protocol-and-concurrency.md) →

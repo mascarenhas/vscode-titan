@@ -15,13 +15,16 @@ type Array = {value}
 local record NullToken
 end
 
-local null_token: value = nil
-local MAX_INPUT_BYTES = 16 * 1024 * 1024
+local const MAX_INPUT_BYTES = 16 * 1024 * 1024
 -- An error response must accommodate any string ID accepted inside an input
 -- frame, plus its fixed envelope, even when the original result is too large.
-local MAX_OUTPUT_BYTES = 16 * 1024 * 1024 + 4096
-local MAX_NESTING = 128
-local PEG_MATCH_STACK_LIMIT = 2048
+local const MAX_OUTPUT_BYTES = 16 * 1024 * 1024 + 4096
+local const MAX_NESTING = 128
+local const PEG_MATCH_STACK_LIMIT = 2048
+
+local const null_token: value
+local const DECODE_OPTIONS: (const {json.DecodeOption})?
+local const ENCODE_OPTIONS: (const {json.EncodeOption})?
 
 --- Return the shared explicit protocol null token.
 function null(): value
@@ -35,22 +38,12 @@ end
 
 --- Decode JSON while preserving explicit nulls with the protocol sentinel.
 function decode(source: string): value
-  return json.decode(source, nil,
-    json.DecodeOption.null_value(null_token),
-    json.DecodeOption.max_depth(MAX_NESTING),
-    json.DecodeOption.max_bytes(MAX_INPUT_BYTES),
-    -- Every source value consumes at least one byte, so this adds no smaller
-    -- input limit than framing already imposes.
-    json.DecodeOption.max_nodes(MAX_INPUT_BYTES))
+  return json.decode(source, nil, ...DECODE_OPTIONS)
 end
 
 --- Encode native protocol JSON values using the explicit null sentinel.
 function encode(subject: value): string
-  return json.encode(subject,
-    json.EncodeOption.null_value(null_token),
-    json.EncodeOption.max_depth(MAX_NESTING),
-    json.EncodeOption.max_bytes(MAX_OUTPUT_BYTES),
-    json.EncodeOption.max_nodes(MAX_OUTPUT_BYTES))
+  return json.encode(subject, ...ENCODE_OPTIONS)
 end
 
 function as_object(subject: value): Object?
@@ -93,5 +86,21 @@ do
   -- application's private PEG engine once with room for 128 nested containers
   -- and their sibling alternatives; JSON itself never changes this setting.
   peg.set_max_stack(PEG_MATCH_STACK_LIMIT)
-  null_token = NullToken.new()
+  null_token = NullToken()
+  local decode_options: const {json.DecodeOption} = {
+    json.DecodeOption.null_value(null_token),
+    json.DecodeOption.max_depth(MAX_NESTING),
+    json.DecodeOption.max_bytes(MAX_INPUT_BYTES),
+    -- Every source value consumes at least one byte, so this adds no smaller
+    -- input limit than framing already imposes.
+    json.DecodeOption.max_nodes(MAX_INPUT_BYTES),
+  }
+  local encode_options: const {json.EncodeOption} = {
+    json.EncodeOption.null_value(null_token),
+    json.EncodeOption.max_depth(MAX_NESTING),
+    json.EncodeOption.max_bytes(MAX_OUTPUT_BYTES),
+    json.EncodeOption.max_nodes(MAX_OUTPUT_BYTES),
+  }
+  DECODE_OPTIONS = decode_options
+  ENCODE_OPTIONS = encode_options
 end

@@ -1,0 +1,428 @@
+-- Saved hover extraction/rendering and structural + long-comment folding.
+
+local record LongBracket
+  const level: integer
+  const contents_start: integer
+end
+
+local function same_type(left: bridge.TypeInfo?,
+                         right: bridge.TypeInfo?): boolean
+  if left == nil or right == nil then return left == nil and right == nil end
+  return left.tag == right.tag and left.display == right.display
+end
+
+local function SavedFile:compiler_offset(location: bridge.SourceLocation): integer?
+  if location.line < 1 or location.column < 1 then return nil end
+  local start? = self.coordinates:lf_line_start(location.line)
+  local finish? = self.coordinates:lf_line_finish(location.line)
+  if start == nil or finish == nil then return nil end
+  local target = start + location.column - 1
+  if target > finish then return nil end
+  return target
+end
+
+local function hover_key(filename: string, offset: integer, name: string): string
+  return #filename .. ":" .. filename .. offset .. ":" .. name
+end
+
+local function node_score(node: bridge.Node): integer
+  local score = 0
+  if node.inferred_type ~= nil then score = score + 1 end
+  if node.declared_type ~= nil then score = score + 2 end
+  if node.original_type ~= nil and node.coerced_type ~= nil then score = score + 4 end
+  return score
+end
+
+-- These lookups are local to extraction; a published Features owns no ASTs.
+local function hover_nodes(snapshot: bridge.ModuleSnapshot,
+                           files: {string: SavedFile}, state: ExtractionState):
+    ({string: bridge.Node}, {integer: bridge.Node})
+  local selected: {string: bridge.Node} = {}
+  local by_id: {integer: bridge.Node} = {}
+  for index = 1, #snapshot.nodes do
+    state:account()
+    local node = snapshot.nodes[index]
+    by_id[node.id] = node
+    local location? = node.location
+    if not node.synthetic and location ~= nil and node.name ~= nil then
+      local saved? = files[location.filename]
+      if saved ~= nil then
+        local offset? = saved:compiler_offset(location)
+        if offset ~= nil then
+          local key = hover_key(location.filename, offset, node.name)
+          local old? = selected[key]
+          -- Equal richness deliberately prefers the later preorder child.
+          if old == nil or node_score(node) >= node_score(old) then selected[key] = node end
+        end
+      end
+    end
+  end
+  return selected, by_id
+end
+
+local function semantic_container(kind: bridge.NodeKind): boolean
+  case kind
+  when expression() then return true
+  when variable() then return true
+  when type_syntax() then return true
+  else return false
+  end
+end
+
+local function node_covers_occurrence(node: bridge.Node, saved: SavedFile,
+                                      occurrence: indexer.Occurrence): boolean
+  local location? = node.location
+  if location ~= nil and location.filename == occurrence.filename and
+     saved:compiler_offset(location) == occurrence.byte_span.start
+  then
+    return true
+  end
+  local span? = node.source_span
+  if span == nil or not semantic_container(node.kind) or
+     span.start.filename ~= occurrence.filename or
+     span.finish.filename ~= occurrence.filename then
+    return false
+  end
+  local start? = saved:compiler_offset(span.start)
+  local finish? = saved:compiler_offset(span.finish)
+  return start ~= nil and finish ~= nil and
+         start <= occurrence.byte_span.start and
+         occurrence.byte_span.start < finish
+end
+
+local function materialize_hover(occurrence: indexer.Occurrence,
+                                 saved: SavedFile,
+                                 nodes: {string: bridge.Node},
+                                 by_id: {integer: bridge.Node},
+                                 state: ExtractionState): MaterializedHover
+  local inferred: bridge.TypeInfo? = nil
+  local declared: bridge.TypeInfo? = nil
+  local original: bridge.TypeInfo? = nil
+  local coerced: bridge.TypeInfo? = nil
+  local current? = nodes[hover_key(
+    occurrence.filename, occurrence.byte_span.start, occurrence.name)]
+  while current ~= nil and node_covers_occurrence(current, saved, occurrence) do
+    state:account()
+    if inferred == nil and current.inferred_type ~= nil then inferred = current.inferred_type end
+    if declared == nil and current.declared_type ~= nil then declared = current.declared_type end
+    if original == nil and coerced == nil and current.original_type ~= nil and
+       current.coerced_type ~= nil and not same_type(current.original_type, current.coerced_type) then
+      original = current.original_type
+      coerced = current.coerced_type
+    end
+    local parent_id? = current.parent_id
+    if parent_id == nil then current = nil else current = by_id[parent_id] end
+  end
+  if inferred == nil then inferred = occurrence.type_info end
+  return MaterializedHover {
+    filename = occurrence.filename,
+    byte_start = occurrence.byte_span.start,
+    inferred_type = inferred,
+    declared_type = declared,
+    original_type = original,
+    coerced_type = coerced,
+  }
+end
+
+function Features:hover(filename: string, position: source_text.Position): Hover?
+  local occurrence? = self.index:occurrence_at(filename, position)
+  if occurrence == nil then return nil end
+  local inferred: bridge.TypeInfo? = nil
+  local declared: bridge.TypeInfo? = nil
+  local original: bridge.TypeInfo? = nil
+  local coerced: bridge.TypeInfo? = nil
+  do
+    local access = self.store:acquire()
+    defer access:release()
+    indexer.check_generation(access.connection, self.published_generation)
+    local rows = workspace_store.rows(access.connection,
+      "SELECT inferred_tag,inferred_display,declared_tag,declared_display," ..
+      "original_tag,original_display,coerced_tag,coerced_display " ..
+      "FROM main.semantic_hovers WHERE filename=? AND byte_start=?",
+      indexer.blob(filename), occurrence.byte_span.start)
+    if #rows == 0 then return nil end
+    local row = rows[1]
+    inferred = indexer.row_type(row, 1)
+    declared = indexer.row_type(row, 3)
+    original = indexer.row_type(row, 5)
+    coerced = indexer.row_type(row, 7)
+  end
+  return Hover {
+    range = occurrence.span,
+    inferred_type = inferred,
+    declared_type = declared,
+    original_type = original,
+    coerced_type = coerced,
+    visibility = occurrence.visibility,
+    callable_signature = occurrence.callable_signature,
+    summary_markdown = self.index:hover_summary(occurrence),
+    documentation = occurrence.documentation,
+  }
+end
+
+local function write_type_line(output: strings.StringWriter, label: string,
+                               info: bridge.TypeInfo?)
+  if info == nil then return end
+  output:write("- ")
+  output:write(label)
+  output:write(": `")
+  output:write(info.display)
+  output:write("`\n")
+end
+
+function Hover:markdown(): string
+  local output = strings.writer()
+  local displayed_type? = self.inferred_type
+  if displayed_type == nil then displayed_type = self.declared_type end
+  if displayed_type == nil then displayed_type = self.original_type end
+  if self.summary_markdown ~= nil then
+    output:write(self.summary_markdown)
+  elseif self.callable_signature ~= nil then
+    output:write("- Signature: `")
+    output:write(self.callable_signature.display)
+    output:write("`\n")
+  else
+    write_type_line(output, "Type", displayed_type)
+  end
+  if self.summary_markdown ~= nil then
+    output:write("\n")
+  end
+  if self.coerced_type ~= nil and displayed_type ~= nil and
+     not same_type(self.coerced_type, displayed_type) then
+    write_type_line(output, "Cast to", self.coerced_type)
+  end
+  output:write("- Visibility: ")
+  case self.visibility
+  when block() then output:write("block\n")
+  when module() then output:write("module\n")
+  when exported() then output:write("exported\n")
+  end
+  if self.documentation ~= nil then output:write("\n" .. self.documentation) end
+  return output:drain()
+end
+
+-- Completion preparation shares the saved hover renderer, but exports only
+-- scalar rows. Its caller maps the disposable source spans back to editor
+-- text before publishing them in TEMP.
+function PreparedView:completion_hovers(yield_now: Yield?): {completion_types.Hover}
+  local result: {completion_types.Hover} = {}
+  if #self.index.occurrences > completion_types.MAX_HOVER_ROWS then return result end
+  local state = ExtractionState(yield_now, 0)
+  local bytes = 0
+  local by_location: {string: MaterializedHover} = {}
+  for index = 1, #self.hovers do
+    state:account()
+    local hover = self.hovers[index]
+    by_location[hover_key(hover.filename, hover.byte_start, "")] = hover
+  end
+  for index = 1, #self.index.occurrences do
+    state:account()
+    local occurrence = self.index.occurrences[index]
+    local materialized = by_location[hover_key(occurrence.filename,
+      occurrence.byte_span.start, "")]
+    local hover = Hover {
+      range = occurrence.span,
+      inferred_type = materialized.inferred_type,
+      declared_type = materialized.declared_type,
+      original_type = materialized.original_type,
+      coerced_type = materialized.coerced_type,
+      visibility = occurrence.visibility,
+      callable_signature = occurrence.callable_signature,
+      summary_markdown = self.index:hover_summary(occurrence),
+      documentation = occurrence.documentation,
+    }
+    local markdown = hover:markdown()
+    bytes = bytes + #occurrence.filename + #markdown + 64
+    if bytes > completion_types.MAX_HOVER_BYTES then return {} end
+    result[index] = completion_types.Hover(occurrence.filename,
+      occurrence.byte_span.start, occurrence.byte_span.finish, markdown)
+  end
+  return result
+end
+
+local function SavedFile:lsp_span_for_compiler_span(
+    span: bridge.SourceSpan): source_text.Span
+  if span.start.filename ~= span.finish.filename then
+    return fail<|source_text.Span|>(
+      "compiler structural span crosses source files")
+  end
+  local start? = self:compiler_offset(span.start)
+  local finish? = self:compiler_offset(span.finish)
+  if start == nil or finish == nil or finish < start then
+    return fail<|source_text.Span|>(
+      "compiler structural span is outside the saved source")
+  end
+  local converted?, conversion_error? = self.coordinates:span_for_offsets(
+    start, finish)
+  if converted == nil then
+    local detail = "invalid UTF-8 boundary"
+    if conversion_error ~= nil then detail = conversion_error.message end
+    return fail<|source_text.Span|>(
+      "cannot convert compiler structural span: " .. detail)
+  end
+  return converted
+end
+
+-- Titan's compiler AST intentionally drops comments. Mirror only the lexical
+-- long-bracket boundary used by the Titan lexer; all language structures
+-- continue to come from compiler source spans.
+local function long_bracket(source: string, index: integer,
+                            state: ExtractionState): LongBracket?
+  if index > #source or strings.byte(source, index) ~= 91 then return nil end
+  local cursor = index + 1
+  while cursor <= #source and strings.byte(source, cursor) == 61 do
+    state:account()
+    cursor = cursor + 1
+  end
+  if cursor > #source or strings.byte(source, cursor) ~= 91 then return nil end
+  return LongBracket(cursor - index - 1, cursor + 1)
+end
+
+local function LongBracket:finish(source: string,
+                                  state: ExtractionState): integer?
+  local index = self.contents_start
+  while index <= #source do
+    state:account()
+    if strings.byte(source, index) == 93 then
+      local cursor = index + 1
+      local equals = 0
+      while equals < self.level and cursor <= #source and
+          strings.byte(source, cursor) == 61 do
+        state:account()
+        cursor = cursor + 1
+        equals = equals + 1
+      end
+      if equals == self.level and cursor <= #source and
+          strings.byte(source, cursor) == 93 then
+        return cursor + 1
+      end
+    end
+    index = index + 1
+  end
+  return nil
+end
+
+local function skip_short_string(source: string, index: integer,
+                                 state: ExtractionState): integer
+  local delimiter: integer = strings.byte(source, index)
+  local cursor = index + 1
+  while cursor <= #source do
+    state:account()
+    local byte: integer = strings.byte(source, cursor)
+    if byte == delimiter then return cursor + 1 end
+    if byte == 92 then
+      if cursor == #source then return #source + 1 end
+      local escaped: integer = strings.byte(source, cursor + 1)
+      if cursor + 2 <= #source then
+        local following: integer = strings.byte(source, cursor + 2)
+        if (escaped == 10 and following == 13) or
+            (escaped == 13 and following == 10) then
+          cursor = cursor + 3
+        else
+          cursor = cursor + 2
+        end
+      else
+        cursor = cursor + 2
+      end
+    else
+      cursor = cursor + 1
+    end
+  end
+  return #source + 1
+end
+
+local function SavedFile:append_comment_fold(filename: string,
+                                             start_offset: integer,
+                                             finish_offset: integer,
+                                             folds: {MaterializedFold},
+                                             state: ExtractionState)
+  local source = self.contents
+  local start?, start_error? = self.coordinates:position_for_offset(start_offset)
+  local finish?, finish_error? = self.coordinates:position_for_offset(finish_offset)
+  if start_error ~= nil or finish_error ~= nil or
+      start == nil or finish == nil then
+    return
+  end
+  -- If anything follows the closing delimiter on its line, keep that whole
+  -- line visible rather than folding unrelated source text with the comment.
+  local end_line = finish.line
+  local cursor = finish_offset + 1
+  while cursor <= #source do
+    state:account()
+    local byte: integer = strings.byte(source, cursor)
+    if byte == 10 or byte == 13 then break end
+    if byte ~= 9 and byte ~= 11 and byte ~= 12 and byte ~= 32 then
+      end_line = end_line - 1
+      break
+    end
+    cursor = cursor + 1
+  end
+  if end_line <= start.line then return end
+  -- SQLite deduplicates and orders these during publication/query.
+  folds[#folds + 1] = MaterializedFold(filename, lsp.FoldingRange {
+    start_line = start.line,
+    end_line = end_line,
+    kind = "comment",
+  })
+end
+
+local function SavedFile:append_long_comment_folds(filename: string,
+                                                   folds: {MaterializedFold},
+                                                   state: ExtractionState)
+  local source = self.contents
+  local index = 1
+  while index <= #source do
+    state:account()
+    local byte: integer = strings.byte(source, index)
+    if byte == 34 or byte == 39 then
+      index = skip_short_string(source, index, state)
+    elseif byte == 91 then
+      local literal? = long_bracket(source, index, state)
+      if literal == nil then
+        index = index + 1
+      else
+        local finish? = literal:finish(source, state)
+        if finish == nil then return end
+        index = finish
+      end
+    elseif byte == 45 and index < #source and
+        strings.byte(source, index + 1) == 45 then
+      local comment? = long_bracket(source, index + 2, state)
+      if comment == nil then
+        index = index + 2
+        while index <= #source and strings.byte(source, index) ~= 10 do
+          state:account()
+          index = index + 1
+        end
+      else
+        local finish? = comment:finish(source, state)
+        if finish == nil then return end
+        self:append_comment_fold(filename, index - 1, finish - 1, folds, state)
+        index = finish
+      end
+    else
+      index = index + 1
+    end
+  end
+end
+
+function Features:folding_ranges(filename: string): {lsp.FoldingRange}
+  local access = self.store:acquire()
+  defer access:release()
+  indexer.check_generation(access.connection, self.published_generation)
+  local statement = access.connection:prepare(
+    "SELECT start_line,end_line,kind FROM main.semantic_folds WHERE filename=? " ..
+    "ORDER BY start_line,end_line DESC")
+  defer statement:close()
+  local cursor = statement:query(indexer.blob(filename))
+  defer cursor:close()
+  local result: {lsp.FoldingRange} = {}
+  for row in cursor:fetch do
+    result[#result + 1] = lsp.FoldingRange {
+      start_line = row:get(1),
+      end_line = row:get(2),
+      kind = indexer.optional_bytes(row, 3),
+    }
+  end
+  return result
+end

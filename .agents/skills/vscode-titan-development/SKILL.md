@@ -175,14 +175,15 @@ declared interfaces for manifests. Read specialized expression annotations for
 hover; do not replace them with generic declaration signatures or infer missing
 type arguments from source text. Native compilation still owns runtime lowering.
 
-For multi-part unions, follow [union-payload-parts.md](../../../docs/union-payload-parts.md).
+For multi-part unions, follow [semantic-features.md](../../../docs/semantic-features.md).
 Traverse `parts`, case `bindings` and constructor `values`. Keep part identity
 qualified by its variant; a named-pattern alias is a separate local binding.
 A shorthand pattern selects a part and declares a local at the same span: rename
 must expand it to `alias = part` when either side changes. Preserve that dual
 meaning in saved SQL facts and invalidate incompatible caches. Prefer direct
 parts for variant-only wrapper data; retain records with independent APIs,
-methods or shared mutable ownership, using the documented server payload audit.
+methods or shared mutable ownership, following
+[Server data models](../../../docs/semantic-features.md#server-data-models).
 
 Architecture reviews should examine the entire server. Configuration flow is
 one example: trace environment inputs and project configuration to the compiler

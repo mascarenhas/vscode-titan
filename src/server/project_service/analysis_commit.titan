@@ -1,0 +1,1283 @@
+-- Workset preparation, atomic SQLite publication commit, and fixed-point refresh.
+
+local function bridge_project(state: ProjectState):
+    compiler_bridge.ProjectModule
+  local files: {compiler_bridge.SourceFile} = {}
+  for index = 1, #state.source_files do
+    local source = state.source_files[index]
+    files[index] = compiler_bridge.SourceFile(source.filename, source.contents)
+  end
+  return compiler_bridge.ProjectModule(state.module_name, files)
+end
+
+local function stamp_digest(stamps: const? {project_graph.FileStamp}): string
+  local output = strings.writer()
+  for index = 1, #stamps do
+    local stamp = stamps[index]
+    output:write(#stamp.path .. ":")
+    output:write(stamp.path)
+    output:write(":" .. stamp.size .. ";")
+    if stamp.identity ~= nil then
+      output:write(#stamp.identity .. ":" .. stamp.identity)
+    else
+      output:write("uncertified:" .. stamp.modified_seconds .. ":" ..
+        stamp.modified_nanoseconds)
+    end
+    if stamp.physical_identity ~= nil then
+      output:write(";" .. #stamp.physical_identity .. ":" .. stamp.physical_identity)
+    end
+  end
+  return output:drain()
+end
+
+local function analyzed_input_digest(
+    source_stamps: string,
+    dependencies: const? {compiler_bridge.CHeaderDependency}): string
+  local headers = header_dependency_digest(dependencies)
+  return #source_stamps .. ":" .. source_stamps ..
+         #headers .. ":" .. headers
+end
+
+local function graph_manifest(snapshot: compiler_bridge.ModuleSnapshot):
+    project_graph.Manifest?
+  if snapshot.manifest == nil then return nil end
+  local source? = snapshot.manifest.source_serialized
+  if source == nil then return nil end
+  return project_graph.Manifest(
+    content_identity.digest(snapshot.manifest.serialized),
+    content_identity.digest(source))
+end
+
+local function Service:prepare_work_avoiding(
+    blocked_revisions: {string: integer}): AnalysisRequest?
+  local dirty = self.graph:dirty_modules()
+  if #dirty == 0 then return nil end
+  local project_names = self.metadata:project_names()
+  if #project_names == 0 then return nil end
+
+  local selected: {string} = {}
+  local tokens: {project_graph.CheckToken} = {}
+  for index = 1, #dirty do
+    local token? = self.graph:begin_project_check(dirty[index])
+    if token ~= nil then
+      if blocked_revisions[token.module_name] == token.revision then
+        self.graph:abort_project_check(token)
+      else
+        selected[#selected + 1] = token.module_name
+        tokens[#tokens + 1] = token
+      end
+    end
+  end
+  if #selected == 0 then return nil end
+
+  local modules: {compiler_bridge.ProjectModule} = {}
+  for index = 1, #project_names do
+    local name = project_names[index]
+    modules[index] = bridge_project(self.metadata:project(name))
+  end
+
+  local cached_sources: {compiler_bridge.CachedSourceInterface} = {}
+  local external_names = self.metadata:external_names()
+  for index = 1, #external_names do
+    local external = self.metadata:external(external_names[index])
+    -- A stamp mismatch marks old serialized metadata as untrusted until this
+    -- analysis encounters and republishes the external source. Binary provider
+    -- resolution is always left to the compiler.
+    local trusted = external.analyzed_input_identity ~= nil and
+                    external.analyzed_input_identity ==
+                      analyzed_input_digest(
+                        stamp_digest(external.stamps),
+                        external.c_header_dependencies)
+    local header_fingerprint? = self.metadata:header(external.module_name)
+    trusted = trusted and header_fingerprint ~= nil and
+              same_header_dependencies(
+                external.c_header_dependencies,
+                header_fingerprint.dependencies)
+    if self.external_resolver ~= nil then
+      local fingerprint? = self.metadata:fingerprint(external.module_name)
+      trusted = trusted and fingerprint ~= nil and
+                external_matches_fingerprint(external, fingerprint)
+    end
+    if trusted then
+      case external.origin
+      when source{main_file; source_files} then
+        cached_sources[#cached_sources + 1] =
+          compiler_bridge.CachedSourceInterface {
+            module_name = external.module_name,
+            serialized = external.manifest.public_digest,
+            source_serialized = external.manifest.source_digest,
+            main_file = main_file,
+            source_files = source_files,
+            imports = external.compiler_imports,
+            c_header_dependencies = external.c_header_dependencies,
+          }
+      else
+      end
+    end
+  end
+
+  local fingerprints: {ExternalFingerprint} = {}
+  local fingerprint_names = self.metadata:fingerprint_names()
+  for index = 1, #fingerprint_names do
+    local fingerprint? = self.metadata:fingerprint(fingerprint_names[index])
+    if fingerprint ~= nil then
+      fingerprints[#fingerprints + 1] = fingerprint
+    end
+  end
+  local header_fingerprints: {HeaderFingerprint} = {}
+  local header_names = self.metadata:header_names()
+  for index = 1, #header_names do
+    local fingerprint? = self.metadata:header(header_names[index])
+    if fingerprint ~= nil then
+      header_fingerprints[#header_fingerprints + 1] = fingerprint
+    end
+  end
+  local request = AnalysisRequest {
+    generation = self.graph:generation(),
+    config = self.current_config:copy(),
+    root_module = selected[1],
+    project_modules = modules,
+    dirty_modules = selected,
+    cached_sources = cached_sources,
+    external_fingerprints = fingerprints,
+    header_fingerprints = header_fingerprints,
+    check_tokens = tokens,
+  }
+  logging.emit("debug", "analysis.workset", {
+    ["generation"] = request.generation,
+    ["root_module"] = request.root_module,
+    ["dirty_modules"] = logging.summarize_strings(request.dirty_modules),
+    ["cached_sources"] = #request.cached_sources,
+    ["external_fingerprints"] = #request.external_fingerprints,
+    ["header_fingerprints"] = #request.header_fingerprints,
+  })
+  return request
+end
+
+--- Capture the next bounded dirty-module analysis request.
+function Service:prepare_work(): AnalysisRequest?
+  local access = self.store:acquire()
+  defer access:release()
+  -- Fixed-point iterations may skip scan. Hash observed headers before the
+  -- short transaction which selects tokens and snapshots their SQL metadata.
+  self:revalidate_known_headers()
+  local request: AnalysisRequest?
+  self:update_metadata(function () request = self:prepare_work_avoiding({}) end)
+  return request
+end
+
+local function graph_imports(snapshot: compiler_bridge.ModuleSnapshot):
+    {project_graph.ImportEdge}
+  local result: {project_graph.ImportEdge} = {}
+  for index = 1, #snapshot.imports do
+    local source = snapshot.imports[index]
+    local visibility = project_graph.ImportVisibility.ordinary()
+    if source.source_required then
+      visibility = project_graph.ImportVisibility.source_required()
+    end
+    result[index] = project_graph.ImportEdge(source.module_name, visibility)
+  end
+  return result
+end
+
+-- A nil-manifest compiler snapshot can be an explicit transitive-failure
+-- result, but the bridge's loader-level fallback has no complete import frame.
+-- Retain the last successful frame and merge anything the failed attempt did
+-- observe. A later successful commit replaces this conservative union with the
+-- exact current imports.
+local function Service:failed_project_imports(
+    module_name: string,
+    snapshot: compiler_bridge.ModuleSnapshot?):
+    {project_graph.ImportEdge}
+  local result = self.graph:direct_imports(module_name)
+  if snapshot ~= nil then
+    local observed = graph_imports(snapshot)
+    for index = 1, #observed do result[#result + 1] = observed[index] end
+  end
+  return result
+end
+
+local function same_header_input(
+    left: compiler_bridge.CHeaderDependency,
+    right: compiler_bridge.CHeaderDependency): boolean
+  return left.kind:name() == right.kind:name() and left.path == right.path
+end
+
+-- The same fallback cannot prove that an empty header closure is complete.
+-- Preserve the prior closure, replacing identities for paths observed by this
+-- attempt and appending newly observed inputs. This keeps edits, restoration,
+-- and include-shadow changes capable of scheduling recovery.
+local function Service:failed_project_headers(
+    module_name: string,
+    snapshot: compiler_bridge.ModuleSnapshot?):
+    ({compiler_bridge.CHeaderDependency}, boolean)
+  local result: {compiler_bridge.CHeaderDependency} = {}
+  local known = false
+  local previous? = self.metadata:header(module_name)
+  if previous ~= nil then
+    result = previous.dependencies
+    known = true
+  end
+  if snapshot ~= nil then
+    local observed = snapshot.c_header_dependencies
+    if #observed > 0 then known = true end
+    for observed_index = 1, #observed do
+      local dependency = observed[observed_index]
+      local replaced = false
+      for result_index = 1, #result do
+        if same_header_input(result[result_index], dependency) then
+          result[result_index] = dependency
+          replaced = true
+          break
+        end
+      end
+      if not replaced then
+        result[#result + 1] = dependency
+      end
+    end
+  end
+  return result, known
+end
+
+local function Service:publish_failed_project(
+    module_name: string, state: ProjectState,
+    token: project_graph.CheckToken,
+    snapshot: compiler_bridge.ModuleSnapshot?,
+    diagnostics: {compiler_bridge.Diagnostic}): boolean
+  local imports = self:failed_project_imports(module_name, snapshot)
+  local headers, headers_known = self:failed_project_headers(
+    module_name, snapshot)
+  if not self.graph:fail_project_check(token, imports) then return false end
+  -- Failed results leave the work queue, so an unresolved ordinary import must
+  -- acquire a durable missing-provider baseline now. External trees are not
+  -- watched; later semantic-request topology probes compare against this
+  -- physical absence and dirty the failed importer when a provider appears.
+  if self.external_resolver ~= nil then
+    for index = 1, #imports do
+      local edge = imports[index]
+      local name = edge.module_name
+      if not self.metadata:has_project(name) and not self.metadata:has_external(name) then
+        local requires_source = false
+        case edge.visibility
+        when source_required() then requires_source = true
+        when ordinary() then
+        end
+        local previous? = self.metadata:fingerprint(name)
+        if previous == nil then
+          self.metadata:write_fingerprint(ExternalFingerprint {
+            module_name = name,
+            source_required = requires_source,
+            topology_resolved = true,
+            stamps = {},
+          })
+        elseif previous.origin == nil and
+               requires_source and not previous.source_required then
+          self.metadata:write_fingerprint(ExternalFingerprint {
+            module_name = name,
+            source_required = true,
+            topology_resolved = previous.topology_resolved,
+            stamps = previous.stamps,
+            error = previous.error,
+          })
+        end
+      end
+    end
+  end
+  state.diagnostics = diagnostics
+  state.compiler_snapshot = snapshot
+  self.graph:set_project_snapshot(module_name, snapshot)
+  self.metadata:write_diagnostics(module_name, diagnostics)
+  if headers_known then self:remember_header_fingerprint(module_name, headers) end
+  return true
+end
+
+local function Service:external_candidate(
+    snapshot: compiler_bridge.ModuleSnapshot,
+    contextual_resolutions: const? {compiler_bridge.ContextualResolution}):
+    ExternalModule?
+  if snapshot.manifest == nil then return nil end
+  local stamps: {project_graph.FileStamp} = {}
+  local prior_stamps: {project_graph.FileStamp} = {}
+  local fingerprint? = self.metadata:fingerprint(snapshot.module_name)
+  if fingerprint ~= nil then
+    prior_stamps = fingerprint.stamps
+  else
+    local external? = self.metadata:external(snapshot.module_name)
+    if external ~= nil then prior_stamps = external.stamps end
+  end
+  local origin?: ExternalOrigin
+  local analyzed_input_identity: string? = nil
+  case snapshot.provenance
+  when external_source{main_file; source_files} then
+    for index = 1, #source_files do
+      local path = source_files[index]
+      local stamp? = self:stamp_for(path, find_stamp(prior_stamps, path))
+      if stamp == nil then
+        return fail<|ExternalModule|>(source_files[index],
+          "external source disappeared while compiler results were committed")
+      end
+      stamps[index] = stamp
+    end
+    origin = ExternalOrigin.source(main_file, {...source_files})
+    analyzed_input_identity = analyzed_input_digest(
+      stamp_digest(stamps), snapshot.c_header_dependencies)
+  when dynamic_binary{provider_file} then
+    local stamp? = self:stamp_for(provider_file,
+      find_stamp(prior_stamps, provider_file))
+    if stamp == nil then
+      return fail<|ExternalModule|>(provider_file,
+        "external binary disappeared while compiler results were committed")
+    end
+    stamps[1] = stamp
+    origin = ExternalOrigin.dynamic_binary(provider_file)
+  when static_binary{provider_file} then
+    local stamp? = self:stamp_for(provider_file,
+      find_stamp(prior_stamps, provider_file))
+    if stamp == nil then
+      return fail<|ExternalModule|>(provider_file,
+        "external static provider disappeared while compiler results were committed")
+    end
+    stamps[1] = stamp
+    origin = ExternalOrigin.static_binary(provider_file)
+  when project_source() then
+    return nil
+  end
+  local imports = graph_imports(snapshot)
+  for index = 1, #contextual_resolutions do
+    local resolution = contextual_resolutions[index]
+    if resolution.exposer_module == snapshot.module_name then
+      imports[#imports + 1] = project_graph.ImportEdge(
+        resolution.owner_module, project_graph.ImportVisibility.ordinary())
+    end
+  end
+  return ExternalModule {
+    module_name = snapshot.module_name,
+    origin = origin,
+    manifest = project_graph.Manifest(
+      snapshot.manifest.serialized,
+      snapshot.manifest.source_serialized or snapshot.manifest.serialized),
+    stamps = stamps,
+    analyzed_input_identity = analyzed_input_identity,
+    imports = imports,
+    compiler_imports = snapshot.imports,
+    c_header_dependencies = {...snapshot.c_header_dependencies},
+  }
+end
+
+local function project_snapshot_map(
+    analysis: compiler_bridge.Analysis):
+    {string: compiler_bridge.ModuleSnapshot}
+  local result: {string: compiler_bridge.ModuleSnapshot} = {}
+  for index = 1, #analysis.modules do
+    local snapshot = analysis.modules[index]
+    case snapshot.provenance
+    when project_source() then result[snapshot.module_name] = snapshot
+    else
+    end
+  end
+  return result
+end
+
+local function Service:diagnostic_owner(
+    diagnostic: compiler_bridge.Diagnostic, fallback: string): string
+  if diagnostic.location ~= nil then
+    local owner? = self.catalog:owner_for_file(diagnostic.location.filename)
+    if owner ~= nil then return owner end
+  end
+  if diagnostic.owner_module ~= nil then
+    return diagnostic.owner_module
+  end
+  return fallback
+end
+
+local function Service:diagnostics_by_module(
+    analysis: compiler_bridge.Analysis, attempted: const? {string}):
+    {string: {compiler_bridge.Diagnostic}}
+  local result: {string: {compiler_bridge.Diagnostic}} = {}
+  for index = 1, #attempted do
+    result[attempted[index]] = {}
+  end
+  for index = 1, #analysis.diagnostics do
+    local diagnostic = analysis.diagnostics[index]
+    local owner = self:diagnostic_owner(diagnostic, analysis.root_module)
+    local bucket? = result[owner]
+    if bucket == nil then
+      bucket = {}
+      result[owner] = bucket
+    end
+    bucket[#bucket + 1] = diagnostic
+  end
+  return result
+end
+
+local function project_commit_order(
+    names: const? {string},
+    snapshots: {string: compiler_bridge.ModuleSnapshot}): {string}
+  local pending: {string: boolean} = {}
+  local project: {string: boolean} = {}
+  for index = 1, #names do
+    pending[names[index]] = true
+    project[names[index]] = true
+  end
+
+  local result: {string} = {}
+  while #result < #names do
+    local progressed = false
+    for index = 1, #names do
+      local name = names[index]
+      if pending[name] then
+        local ready = true
+        local snapshot? = snapshots[name]
+        if snapshot ~= nil then
+          for import_index = 1, #snapshot.imports do
+            local dependency = snapshot.imports[import_index].module_name
+            if project[dependency] and pending[dependency] then
+              ready = false
+              break
+            end
+          end
+        end
+        if ready then
+          pending[name] = nil
+          result[#result + 1] = name
+          progressed = true
+        end
+      end
+    end
+    if not progressed then
+      -- The compiler normally rejects import cycles. Preserve deterministic
+      -- progress for a malformed injected result; the graph will leave any
+      -- re-invalidated cycle member dirty for the next analysis.
+      for index = 1, #names do
+        local name = names[index]
+        if pending[name] then
+          pending[name] = nil
+          result[#result + 1] = name
+        end
+      end
+    end
+  end
+  return result
+end
+
+local function Service:replace_external(
+    external: ExternalModule, satisfied_projects: {string})
+  case external.origin
+  when source() then
+    self.graph:publish_external_source(
+      external.module_name, external.stamps, comparison_manifest(external.manifest),
+      external.imports, satisfied_projects)
+  when dynamic_binary() then
+    self.graph:publish_external_binary(
+      external.module_name, external.stamps, comparison_manifest(external.manifest),
+      external.imports, satisfied_projects)
+  when static_binary() then
+    self.graph:publish_external_binary(
+      external.module_name, external.stamps, comparison_manifest(external.manifest),
+      external.imports, satisfied_projects)
+  end
+  self.metadata:write_external(external)
+  self:remember_header_fingerprint(
+    external.module_name, external.c_header_dependencies)
+end
+
+local function AnalysisRequest:check_token(
+    module_name: string): project_graph.CheckToken?
+  for index = 1, #self.check_tokens do
+    local token = self.check_tokens[index]
+    if token.module_name == module_name then return token end
+  end
+  return nil
+end
+
+local function AnalysisRequest:external_fingerprint(
+    module_name: string): ExternalFingerprint?
+  for index = 1, #self.external_fingerprints do
+    local fingerprint = self.external_fingerprints[index]
+    if fingerprint.module_name == module_name then return fingerprint end
+  end
+  return nil
+end
+
+local function Service:analysis_source_required(
+    analysis: compiler_bridge.Analysis, module_name: string): boolean
+  local replaced_importers: {string: boolean} = {}
+  for index = 1, #analysis.modules do
+    replaced_importers[analysis.modules[index].module_name] = true
+  end
+
+  -- Preserve requirements from clean importers absent from this partial
+  -- result, then replace every analyzed importer's old edges with its current
+  -- compiler imports.
+  local reverse = self.graph:reverse_imports(module_name)
+  for index = 1, #reverse do
+    local edge = reverse[index]
+    if not replaced_importers[edge.importer] then
+      case edge.visibility
+      when source_required() then return true
+      else
+      end
+    end
+  end
+  for index = 1, #analysis.modules do
+    local snapshot = analysis.modules[index]
+    for import_index = 1, #snapshot.imports do
+      local edge = snapshot.imports[import_index]
+      if edge.module_name == module_name and edge.source_required then
+        return true
+      end
+    end
+  end
+  return false
+end
+
+local function Service:candidate_fingerprint(
+    analysis: compiler_bridge.Analysis,
+    external: ExternalModule): ExternalFingerprint
+  return ExternalFingerprint {
+    module_name = external.module_name,
+    source_required = self:analysis_source_required(
+      analysis, external.module_name),
+    topology_resolved = true,
+    origin = external.origin,
+    stamps = external.stamps,
+  }
+end
+
+local function Service:contextual_fingerprint(
+    resolution: compiler_bridge.ContextualResolution): ExternalFingerprint
+  local raw = compiler_bridge.ExternalResolution {
+    module_name = resolution.owner_module,
+    provenance = resolution.provenance,
+  }
+  local observed = self:fingerprint_from_resolution(raw, false,
+    self.metadata:fingerprint(resolution.owner_module))
+  return ExternalFingerprint {
+    module_name = observed.module_name,
+    source_required = false,
+    topology_resolved = resolution.ordinary_lookup,
+    origin = observed.origin,
+    stamps = observed.stamps,
+    error = observed.error,
+  }
+end
+
+local function same_provider_identity(
+    identity: compiler_io.LstatIdentity): boolean
+  return compiler_io.lstat_identity_is_current(identity)
+end
+
+local function same_provider_identity_claim(
+    left: compiler_io.LstatIdentity?,
+    right: compiler_io.LstatIdentity?): boolean
+  if left == nil or right == nil then return left == nil and right == nil end
+  return compiler_io.same_lstat_identity(left, right)
+end
+
+local function binary_provider_key(module_name: string, kind: string,
+                                   provider_file: string): string
+  return module_name .. "\0" .. kind .. "\0" .. provider_file
+end
+
+local function binary_provider_observation_is_current(
+    observation: compiler_bridge.BinaryProviderObservation): boolean
+  if observation.kind ~= "dynamic" and observation.kind ~= "static" then
+    return false
+  end
+  local identity? = observation.provider_identity
+  return identity ~= nil and
+         identity.path == observation.provider_file and
+         same_provider_identity(identity)
+end
+
+-- A first-seen contextual owner is safe to publish in the analysis which
+-- discovered it only when every compiler observation for that logical owner
+-- still names the exact followed provider object. Merely statting provenance
+-- after analysis cannot distinguish stable discovery from replacement while
+-- package.loadlib was consuming the provider.
+local function contextual_provider_is_current(
+    analysis: compiler_bridge.Analysis, module_name: string): boolean
+  local found = false
+  for index = 1, #analysis.contextual_resolutions do
+    local resolution = analysis.contextual_resolutions[index]
+    if resolution.owner_module == module_name then
+      found = true
+      local provider_file?: string = nil
+      case resolution.provenance
+      when dynamic_binary{selected_provider = provider_file} then provider_file = selected_provider
+      when static_binary{selected_provider = provider_file} then provider_file = selected_provider
+      else return false
+      end
+      local identity? = resolution.provider_identity
+      if identity == nil or
+         identity.path ~= provider_file or
+         not same_provider_identity(identity) then
+        return false
+      end
+    end
+  end
+  return found
+end
+
+local function same_external_observation(left: ExternalFingerprint,
+                                         right: ExternalFingerprint): boolean
+  return left.module_name == right.module_name and
+         left.error == right.error and
+         origin_identity(left.origin) == origin_identity(right.origin) and
+         same_stamps(left.stamps, right.stamps)
+end
+
+local function merge_observed_fingerprint(
+    observed: {string: ExternalFingerprint}, names: {string},
+    candidate: ExternalFingerprint)
+  local existing? = observed[candidate.module_name]
+  if existing == nil then
+    observed[candidate.module_name] = candidate
+    insert_name(names, candidate.module_name)
+    return
+  end
+  if not same_external_observation(existing, candidate) then
+    raise Error(candidate.module_name,
+      "compiler reported conflicting physical providers for contextual owner")
+  end
+  observed[candidate.module_name] = ExternalFingerprint {
+    module_name = candidate.module_name,
+    source_required = existing.source_required or candidate.source_required,
+    topology_resolved = existing.topology_resolved or candidate.topology_resolved,
+    origin = existing.origin,
+    stamps = existing.stamps,
+    error = existing.error,
+  }
+end
+
+local function Service:abort_request_inner(request: AnalysisRequest)
+  for index = 1, #request.check_tokens do
+    self.graph:abort_project_check(request.check_tokens[index])
+  end
+end
+
+local function Service:abort_request(request: AnalysisRequest)
+  local access = self.store:acquire()
+  defer access:release()
+  self:abort_request_inner(request)
+end
+
+local function Service:current_generation(): integer
+  local access = self.store:acquire()
+  defer access:release()
+  return self.graph:generation()
+end
+
+local function Service:stale_report(analyzed: boolean): RefreshReport
+  return RefreshReport {
+    analyzed = analyzed,
+    stale = true,
+    generation = self.graph:generation(),
+    committed_modules = {},
+    failed_modules = {},
+    dirty_modules = self.graph:dirty_modules(),
+  }
+end
+
+local function Service:incompatible_browser_foreign(observed: string?):
+    {workspace_cache.BrowserForeignOwner}
+  local owners = workspace_cache.browser_foreign_owners(self.graph.connection)
+  local incompatible: {workspace_cache.BrowserForeignOwner} = {}
+  for index = 1, #owners do
+    if owners[index].identity ~= observed then
+      incompatible[#incompatible + 1] = owners[index]
+    end
+  end
+  return incompatible
+end
+
+local function Service:retire_browser_foreign(
+    owners: const? {workspace_cache.BrowserForeignOwner})
+  if #owners == 0 then return end
+  self:update_metadata(function ()
+    for index = 1, #owners do
+      local owner = owners[index]
+      local name = owner.module_name
+      if owner.project then
+        self.graph:invalidate_project(name)
+        self.graph:invalidate_external_change(name)
+      else
+        -- Retrying the importer is insufficient if it can still seed an
+        -- external source interface checked by the incompatible toolchain.
+        self.graph:remove_module(name)
+        self.metadata:remove_external(name)
+        self:forget_header_fingerprint(name)
+      end
+      workspace_cache.write_browser_foreign_owner(self.graph.connection, name, nil)
+    end
+  end)
+end
+
+function Service:invalidate_browser_foreign(observed: string?)
+  local access = self.store:acquire()
+  defer access:release()
+  self:retire_browser_foreign(self:incompatible_browser_foreign(observed))
+end
+
+local function Service:commit_or_raise(
+    request: AnalysisRequest,
+    analysis: compiler_bridge.Analysis): RefreshReport
+  if request.generation ~= self.graph:generation() then
+    self:abort_request_inner(request)
+    return self:stale_report(true)
+  end
+
+  local project_snapshots = project_snapshot_map(analysis)
+  local module_diagnostics = self:diagnostics_by_module(
+    analysis, request.dirty_modules)
+
+  -- Compiler work may yield while a save is completed before its watcher
+  -- callback is dispatched. Re-run the complete
+  -- saved-file/config discovery immediately before publication; unchanged
+  -- files reuse their captured bytes, while any changed membership or stamp
+  -- advances the graph generation and rejects this result.
+  self:scan_or_raise()
+  if request.generation ~= self.graph:generation() then
+    self:abort_request_inner(request)
+    return self:stale_report(true)
+  end
+
+  if self.external_resolver ~= nil then
+    -- A topology probe performed by the pre-publication scan must still match
+    -- every immutable input supplied to this compiler request. External graph
+    -- invalidation changes check revisions rather than the saved-file
+    -- generation, so make this rejection explicit before any project commit.
+    for index = 1, #request.external_fingerprints do
+      local before = request.external_fingerprints[index]
+      local current? = self.metadata:fingerprint(before.module_name)
+      if current == nil or
+         not same_external_fingerprint(before, current) then
+        self:abort_request_inner(request)
+        return self:stale_report(true)
+      end
+    end
+  end
+
+  -- Header invalidation changes project revisions (or external consumers), not
+  -- necessarily the saved-file generation. The immutable request baseline must
+  -- still be the one selected before compiler work began.
+  for index = 1, #request.header_fingerprints do
+    local before = request.header_fingerprints[index]
+    local current? = self.metadata:header(before.module_name)
+    if current == nil or
+       not same_header_dependencies(before.dependencies,
+                                    current.dependencies) then
+      self:abort_request_inner(request)
+      return self:stale_report(true)
+    end
+  end
+
+  -- Stat compiler-observed external provenance only after the final topology
+  -- probe. Publication is all-or-nothing: a new external or any difference
+  -- from the pre-analysis fingerprint establishes the next attempt's baseline
+  -- and rejects this attempt before project tokens are committed.
+  local external_candidates: {ExternalModule} = {}
+  local browser_c? = analysis.browser_foreign
+  local failed_pure_externals: {string}?
+  local observed_fingerprints: {string: ExternalFingerprint} = {}
+  local observed_names: {string} = {}
+  local contextual_names: {string: boolean} = {}
+  local snapshot_binary_keys: {string: string} = {}
+  local snapshot_binaries:
+    {string: compiler_bridge.ModuleSnapshot} = {}
+  local snapshot_binary_names: {string} = {}
+  local binary_observation_keys: {string: boolean} = {}
+  local binary_observations:
+    {string: compiler_bridge.BinaryProviderObservation} = {}
+  local unstable_external = false
+  for index = 1, #analysis.modules do
+    local snapshot = analysis.modules[index]
+    case snapshot.provenance
+    when project_source() then
+    else
+      case snapshot.provenance
+      when dynamic_binary{provider_file} then
+        snapshot_binary_keys[snapshot.module_name] =
+          binary_provider_key(
+            snapshot.module_name, "dynamic", provider_file)
+        snapshot_binaries[snapshot.module_name] = snapshot
+        insert_name(snapshot_binary_names, snapshot.module_name)
+      when static_binary{provider_file} then
+        snapshot_binary_keys[snapshot.module_name] =
+          binary_provider_key(
+            snapshot.module_name, "static", provider_file)
+        snapshot_binaries[snapshot.module_name] = snapshot
+        insert_name(snapshot_binary_names, snapshot.module_name)
+      else
+      end
+      local external? = self:external_candidate(
+        snapshot, analysis.contextual_resolutions)
+      if external ~= nil then
+        external_candidates[#external_candidates + 1] = external
+        merge_observed_fingerprint(
+          observed_fingerprints, observed_names,
+          self:candidate_fingerprint(analysis, external))
+      elseif browser_c ~= nil and browser_c.checked[snapshot.module_name] and
+          not browser_c.owners[snapshot.module_name] then
+        if failed_pure_externals == nil then failed_pure_externals = {} end
+        failed_pure_externals[#failed_pure_externals + 1] = snapshot.module_name
+      end
+    end
+  end
+  for index = 1, #analysis.binary_provider_observations do
+    local observation = analysis.binary_provider_observations[index]
+    local key = binary_provider_key(
+      observation.module_name, observation.kind,
+      observation.provider_file)
+    binary_observation_keys[key] = true
+    binary_observations[key] = observation
+  end
+  for index = 1, #analysis.contextual_resolutions do
+    local observed = self:contextual_fingerprint(
+      analysis.contextual_resolutions[index])
+    contextual_names[observed.module_name] = true
+    merge_observed_fingerprint(
+      observed_fingerprints, observed_names, observed)
+  end
+  local staged_fingerprints: {ExternalFingerprint} = {}
+  for index = 1, #observed_names do
+    local name = observed_names[index]
+    if self.external_resolver ~= nil or contextual_names[name] then
+      local observed = observed_fingerprints[name]
+      local before? = request:external_fingerprint(name)
+      local changed = before == nil or
+                      not same_external_fingerprint(before, observed)
+      if changed then
+        local validate_first_seen = false
+        if before == nil and contextual_names[name] then
+          -- Defer both invalidation and retry until the final provider
+          -- postvalidation below. Stable discovery belongs to this exact
+          -- compiler result and is not itself an input change.
+          validate_first_seen = true
+        end
+        if before == nil and snapshot_binary_keys[name] ~= nil then
+          validate_first_seen = true
+        end
+        if not validate_first_seen then
+          self:update_metadata(function ()
+            self.metadata:write_fingerprint(observed)
+            if browser_c ~= nil then
+              local external? = self.metadata:external(name)
+              if external ~= nil and not external_matches_fingerprint(external, observed) then
+                self:retire_external_browser_owner(name)
+              end
+            end
+            self.graph:invalidate_external_change(name)
+          end)
+          if self.external_resolver ~= nil then unstable_external = true end
+        else
+          -- This first-seen baseline is valid only if the provider checks
+          -- below succeed. Publish it with the checked project graph.
+          staged_fingerprints[#staged_fingerprints + 1] = observed
+        end
+      end
+    end
+  end
+
+  -- All filesystem/provenance work above may yield. Immediately before the
+  -- first graph publication, restat both the immutable pre-analysis closure
+  -- and every closure the compiler just observed. The first protects clean
+  -- cached modules used by this request; the second protects newly discovered
+  -- direct/transitive headers and first-seen external source modules.
+  local unstable_headers = false
+  local header_validation = compiler_bridge.header_validation()
+  for index = 1, #request.header_fingerprints do
+    local before = request.header_fingerprints[index]
+    local current, changed = self:restat_header_dependencies(
+      before.module_name, before.dependencies, header_validation)
+    if changed or not same_header_dependencies(before.dependencies, current) then
+      self:accept_revalidated_headers(before.module_name, current, changed)
+      unstable_headers = true
+    elseif not same_header_observations(before.dependencies, current) then
+      self:accept_revalidated_headers(before.module_name, current, false)
+    end
+  end
+  for index = 1, #analysis.modules do
+    local snapshot = analysis.modules[index]
+    local current, changed = self:restat_header_dependencies(
+      snapshot.module_name, snapshot.c_header_dependencies, header_validation)
+    if changed or not same_header_dependencies(
+        snapshot.c_header_dependencies, current) then
+      self:accept_revalidated_headers(snapshot.module_name, current, changed)
+      unstable_headers = true
+    else
+      snapshot.c_header_dependencies = current
+    end
+  end
+  if unstable_headers then
+    self:abort_request_inner(request)
+    return self:stale_report(true)
+  end
+  local invalid_provider_names: {string} = {}
+  for index = 1, #analysis.provider_conflicts do
+    insert_name(invalid_provider_names, analysis.provider_conflicts[index])
+  end
+  for index = 1, #observed_names do
+    local name = observed_names[index]
+    if contextual_names[name] and
+       not contextual_provider_is_current(analysis, name) then
+      insert_name(invalid_provider_names, name)
+    end
+  end
+  for index = 1, #analysis.binary_provider_observations do
+    local observation = analysis.binary_provider_observations[index]
+    if not binary_provider_observation_is_current(observation) then
+      insert_name(invalid_provider_names, observation.module_name)
+    end
+  end
+  for index = 1, #snapshot_binary_names do
+    local name = snapshot_binary_names[index]
+    local expected? = snapshot_binary_keys[name]
+    local snapshot? = snapshot_binaries[name]
+    local observation?: compiler_bridge.BinaryProviderObservation = nil
+    if expected ~= nil then observation = binary_observations[expected] end
+    if expected == nil or not binary_observation_keys[expected] or
+       snapshot == nil or observation == nil or
+       not same_provider_identity_claim(
+         snapshot.provider_identity, observation.provider_identity) then
+      insert_name(invalid_provider_names, name)
+    end
+  end
+  for index = 1, #invalid_provider_names do
+    self.graph:invalidate_external_change(invalid_provider_names[index])
+    unstable_external = true
+  end
+  if unstable_external then
+    self:abort_request_inner(request)
+    return self:stale_report(true)
+  end
+  if browser_c ~= nil and browser_c.identity ~= nil then
+    local incompatible: {workspace_cache.BrowserForeignOwner} = {}
+    if not browser_c.conflicted then
+      incompatible = self:incompatible_browser_foreign(browser_c.identity)
+    end
+    if browser_c.conflicted or #incompatible > 0 then
+      -- Abort the old tokens before advancing the graph generation. A fresh
+      -- fixed-point pass must recheck this request and the incompatible
+      -- retained contributors together, not publish a mixed environment.
+      self:abort_request_inner(request)
+      self:retire_browser_foreign(incompatible)
+      return self:stale_report(true)
+    end
+  end
+
+  local connection = self.graph.connection
+  local saved_asts = self.graph:checkpoint_asts()
+  connection:set_autocommit(false)
+  local published = false
+  defer do
+    if not published then
+      connection:rollback()
+      self.graph:restore_asts(saved_asts)
+    end
+  end
+  local committed: {string} = {}
+  local failed: {string} = {}
+  for index = 1, #staged_fingerprints do
+    self.metadata:write_fingerprint(staged_fingerprints[index])
+  end
+  local order = project_commit_order(request.dirty_modules, project_snapshots)
+  for index = 1, #order do
+    local name = order[index]
+    local state? = self.metadata:project(name)
+    local snapshot? = project_snapshots[name]
+    local token? = request:check_token(name)
+    if state ~= nil and token ~= nil then
+      local accepted = false
+      local diagnostics? = module_diagnostics[name]
+      if diagnostics == nil then diagnostics = {} end
+      if snapshot == nil and #diagnostics == 0 then
+        -- The compiler bridge emits an explicit nil-manifest snapshot for a
+        -- project invalidated transitively by another module's diagnostic.
+        -- With neither that snapshot nor an owned diagnostic there is no
+        -- evidence of a completed result for this token. Reject the malformed
+        -- analysis instead of turning an omission into a terminal failure.
+        raise Error(
+          name, "compiler analysis omitted the attempted project module")
+      elseif #diagnostics == 0 and snapshot ~= nil then
+        local manifest? = graph_manifest(snapshot)
+        if manifest ~= nil then
+          case self.graph:commit_project(
+              token, manifest, graph_imports(snapshot), snapshot)
+          when accepted() then
+            state.diagnostics = diagnostics
+            state.compiler_snapshot = snapshot
+            self.metadata:write_diagnostics(name, diagnostics)
+            accepted = true
+            self:remember_header_fingerprint(
+              name, snapshot.c_header_dependencies)
+            committed[#committed + 1] = name
+          when stale() then
+          end
+        else
+          if self:publish_failed_project(
+              name, state, token, snapshot, diagnostics) then
+            accepted = true
+            failed[#failed + 1] = name
+          end
+        end
+      else
+        -- A compiler error is a result for this exact saved revision, but does
+        -- not publish an annotated AST or manifest. Record it as current and
+        -- retry only after source/dependency/provider/header invalidation.
+        if self:publish_failed_project(
+            name, state, token, snapshot, diagnostics) then
+          accepted = true
+          failed[#failed + 1] = name
+        end
+      end
+      if accepted and browser_c ~= nil and browser_c.owners[name] then
+        workspace_cache.write_browser_foreign_owner(connection, name, browser_c.identity)
+      end
+    end
+  end
+
+  -- External candidates were observed while producing this exact request.
+  -- Publish them after project tokens are resolved, suppressing invalidation of
+  -- those same analyzed roots while still reaching other clean consumers.
+  for index = 1, #external_candidates do
+    local external = external_candidates[index]
+    self:replace_external(external, request.dirty_modules)
+    if browser_c ~= nil and browser_c.checked[external.module_name] then
+      local observed: string?
+      if browser_c.owners[external.module_name] then observed = browser_c.identity end
+      workspace_cache.write_browser_foreign_owner(connection, external.module_name, observed)
+    end
+  end
+  -- A pure external check can fail before supplying a manifest. Retire its
+  -- former ownership even if a project keeps an edge for recovery.
+  if failed_pure_externals ~= nil then
+    for index = 1, #failed_pure_externals do
+      workspace_cache.write_browser_foreign_owner(connection, failed_pure_externals[index], nil)
+    end
+  end
+
+  local report = RefreshReport {
+    analyzed = true,
+    stale = false,
+    generation = self.graph:generation(),
+    committed_modules = committed,
+    failed_modules = failed,
+    dirty_modules = self.graph:dirty_modules(),
+  }
+  connection:commit()
+  published = true
+  return report
+end
+
+--- Accept completed analysis only after generation and input provenance revalidation.
+function Service:commit(request: AnalysisRequest,
+                        analysis: compiler_bridge.Analysis):
+    (RefreshReport?, Error?)
+  local access = self.store:acquire()
+  defer access:release()
+  defer self:abort_request_inner(request)
+  do
+    return self:commit_or_raise(request, analysis), nil
+  catch
+    if error is async.CancellationReason then raise end
+    return nil, service_error(self.project_root, error)
+  end
+end
+
+local function Service:analyze_or_raise(
+    request: AnalysisRequest): RefreshReport
+  if request.generation ~= self:current_generation() then
+    self:abort_request(request)
+    return RefreshReport {
+      analyzed = false,
+      stale = true,
+      generation = self:current_generation(),
+      committed_modules = {},
+      failed_modules = {},
+      dirty_modules = self:latest().dirty_modules,
+    }
+  end
+  if self.analysis_active then
+    return fail<|RefreshReport|>(self.project_root,
+      "compiler analysis is already active for this project")
+  end
+  self.analysis_active = true
+  defer self.analysis_active = false
+  self.analysis_task = async.running()
+  defer self.analysis_task = nil
+  defer self:abort_request(request)
+  self.analysis_count = self.analysis_count + 1
+  self.submitted_count = self.submitted_count + #request.dirty_modules
+  local started = logging.clock()
+  logging.emit("debug", "analysis.start", {
+    ["generation"] = request.generation,
+    ["root_module"] = request.root_module,
+    ["dirty_modules"] = logging.summarize_strings(request.dirty_modules),
+  })
+  local analysis = self.analyzer(request)
+  local report?, commit_error? = self:commit(request, analysis)
+  if report == nil then raise commit_error end
+  logging.emit("debug", "analysis.complete", {
+    ["generation"] = report.generation,
+    ["root_module"] = request.root_module,
+    ["stale"] = report.stale,
+    ["committed_modules"] = logging.summarize_strings(report.committed_modules),
+    ["failed_modules"] = logging.summarize_strings(report.failed_modules),
+    ["remaining_dirty"] = logging.summarize_strings(report.dirty_modules),
+    ["cpu_ms"] = logging.elapsed_ms(started),
+  })
+  return report
+end
+
+function Service:analyze(request: AnalysisRequest):
+    (RefreshReport?, Error?)
+  return self:analyze_or_raise(request), nil
+catch
+  if error is async.CancellationReason then raise end
+  return nil, service_error(self.project_root, error)
+end
+
+local function Service:prune_unreachable_externals()
+  local reachable_names = self.graph:reachable_external_modules()
+  local reachable: {string: boolean} = {}
+  for index = 1, #reachable_names do
+    reachable[reachable_names[index]] = true
+  end
+  local old_names = self.metadata:external_names()
+  for index = 1, #old_names do
+    local name = old_names[index]
+    if not reachable[name] and self.graph:prune_external(name) then
+      self.metadata:remove_external(name)
+      self:forget_header_fingerprint(name)
+      self.metadata:remove_fingerprint(name)
+    end
+  end
+  local pending_names = self.metadata:fingerprint_names()
+  for index = 1, #pending_names do
+    local name = pending_names[index]
+    if not self.metadata:has_external(name) and
+       #self.graph:reverse_imports(name) == 0 then
+      self.metadata:remove_fingerprint(name)
+    end
+  end
+  local header_names = self.metadata:header_names()
+  for index = 1, #header_names do
+    local name = header_names[index]
+    if not self.metadata:has_project(name) and not self.metadata:has_external(name) and
+       #self.graph:reverse_imports(name) == 0 then
+      self:forget_header_fingerprint(name)
+    end
+  end
+end
+
+local function Service:analyze_to_fixed_point(): (RefreshReport?, Error?)
+  local committed: {string} = {}
+  local failed: {string} = {}
+  local analyzed = false
+  local saw_stale = false
+  local iteration_count = 0
+
+  while true do
+    local request? = self:prepare_work()
+    if request == nil then break end
+    iteration_count = iteration_count + 1
+    local report?, analysis_error? = self:analyze(request)
+    if report == nil then return nil, analysis_error end
+    analyzed = true
+    if report.stale then saw_stale = true end
+
+    for index = 1, #report.committed_modules do
+      local name = report.committed_modules[index]
+      insert_name(committed, name)
+      remove_name(failed, name)
+    end
+    for index = 1, #report.failed_modules do
+      local name = report.failed_modules[index]
+      insert_name(failed, name)
+    end
+  end
+
+  -- Absence from one partial compiler result says nothing about externals used
+  -- by clean modules. Prune only after the graph reaches a fixed point and only
+  -- by reachability from every committed project import edge.
+  local access = self.store:acquire()
+  defer access:release()
+  self:update_metadata(self:prune_unreachable_externals)
+  local report = RefreshReport {
+    analyzed = analyzed,
+    stale = saw_stale,
+    generation = self.graph:generation(),
+    committed_modules = committed,
+    failed_modules = failed,
+    dirty_modules = self.graph:dirty_modules(),
+  }
+  logging.emit("debug", "analysis.fixed_point", {
+    ["generation"] = report.generation,
+    ["iterations"] = iteration_count,
+    ["analyzed"] = report.analyzed,
+    ["stale"] = report.stale,
+    ["committed_modules"] = logging.summarize_strings(committed),
+    ["failed_modules"] = logging.summarize_strings(failed),
+    ["remaining_dirty"] = logging.summarize_strings(report.dirty_modules),
+  })
+  return report, nil
+end
+
+--- Scan and run pending analysis until the saved-project snapshot settles.
+function Service:refresh(snapshot_listener: SnapshotListener?):
+    (RefreshReport?, Error?)
+  local started = logging.clock()
+  logging.emit("debug", "project.refresh.start", {
+    ["generation"] = self:current_generation(),
+  })
+  local scanned?, scan_error? = self:scan()
+  if scanned == nil then
+    logging.emit("error", "project.refresh.failure", {
+      ["path"] = scan_error.path,
+      ["message"] = scan_error.message,
+      ["cpu_ms"] = logging.elapsed_ms(started),
+    })
+    return nil, scan_error
+  end
+  if snapshot_listener ~= nil then
+    snapshot_listener(scanned)
+  end
+  local report?, refresh_error? = self:analyze_to_fixed_point()
+  if report == nil then
+    logging.emit("error", "project.refresh.failure", {
+      ["path"] = refresh_error.path,
+      ["message"] = refresh_error.message,
+      ["cpu_ms"] = logging.elapsed_ms(started),
+    })
+    return nil, refresh_error
+  end
+  logging.emit("info", "project.refresh.complete", {
+    ["generation"] = report.generation,
+    ["analyzed"] = report.analyzed,
+    ["committed"] = #report.committed_modules,
+    ["failed"] = #report.failed_modules,
+    ["dirty"] = #report.dirty_modules,
+    ["cpu_ms"] = logging.elapsed_ms(started),
+  })
+  return report, nil
+end
+
+function Service:run_pending(snapshot_listener: SnapshotListener?):
+    (RefreshReport?, Error?)
+  if snapshot_listener ~= nil then
+    -- Register from the first complete discovery before compiler work can
+    -- yield for an extended period. A second scan after registration catches
+    -- a save in the finite interval between that discovery and the watcher.
+    snapshot_listener(self:latest())
+    local rescanned?, scan_error? = self:scan()
+    if rescanned == nil then return nil, scan_error end
+    snapshot_listener(rescanned)
+  catch
+    if error is async.CancellationReason then raise end
+    return nil, service_error(self.project_root, error)
+  end
+
+  local report?, refresh_error? = self:analyze_to_fixed_point()
+  return report, refresh_error
+end

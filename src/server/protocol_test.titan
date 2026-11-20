@@ -236,3 +236,33 @@ end
 function test_protocol_recovers_after_rejected_json_bodies(_context: test.Context)
   test_runtime.run(recovers_after_rejected_json_bodies)
 end
+
+function test_protocol_input_queue_preserves_fifo_order_across_resets(
+    _context: test.Context)
+  test_runtime.run(function ()
+    local queue = protocol.new_input_queue()
+    queue:push(protocol.InputEvent.failure("first"))
+    queue:push(protocol.InputEvent.failure("second"))
+    queue:push(protocol.InputEvent.eof())
+
+    local observed: {string} = {}
+    for _ = 1, 3 do
+      case queue:take()
+      when failure(message) then observed[#observed + 1] = message
+      when eof() then observed[#observed + 1] = "eof"
+      else test.assert(false, "unexpected queue event")
+      end
+    end
+    test.assert(#observed == 3 and observed[1] == "first" and
+                observed[2] == "second" and observed[3] == "eof",
+                "input queue reordered queued events")
+
+    queue:push(protocol.InputEvent.failure("after-reset"))
+    case queue:take()
+    when failure(message) then
+      test.assert(message == "after-reset",
+                  "input queue lost event after empty reset")
+    else test.assert(false, "input queue lost post-reset failure")
+    end
+  end)
+end

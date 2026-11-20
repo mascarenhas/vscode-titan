@@ -1,0 +1,1043 @@
+-- Type formatting, callable signatures, documentation normalization, and hover summaries.
+
+local record PendingSummaryLine
+  const rank: integer
+  const name: string
+  const display: string
+end
+
+local record NormalizationWork
+  pending: integer
+end
+
+local function NormalizationWork:account()
+  self.pending = self.pending + 1
+  if self.pending < NORMALIZATION_YIELD_CADENCE then return end
+  self.pending = 0
+  async.yield()
+end
+
+local function summary_line_less(left: PendingSummaryLine,
+                                 right: PendingSummaryLine): boolean
+  if left.rank ~= right.rank then return left.rank < right.rank end
+  if left.name ~= right.name then return left.name < right.name end
+  return left.display < right.display
+end
+
+local function string_less(left: string, right: string): boolean
+  return left < right
+end
+
+-- Summaries can contain every member of a large module or aggregate. Keep the
+-- normalization O(n log n), just like semantic occurrence normalization.
+local function stable_sort<|T|>(items: {T},
+    less: function (T, T): boolean, work: NormalizationWork)
+  local count = #items
+  if count < 2 then return end
+  local source = items
+  local target: {T} = {}
+  local source_is_input = true
+  local width = 1
+  while width < count do
+    local first = 1
+    while first <= count do
+      local left = first
+      local left_finish = first + width - 1
+      if left_finish > count then left_finish = count end
+      local right = left_finish + 1
+      local right_finish = right + width - 1
+      if right_finish > count then right_finish = count end
+      local output = first
+      while left <= left_finish and right <= right_finish do
+        work:account()
+        if less(source[right], source[left]) then
+          target[output] = source[right]
+          right = right + 1
+        else
+          target[output] = source[left]
+          left = left + 1
+        end
+        output = output + 1
+      end
+      while left <= left_finish do
+        work:account()
+        target[output] = source[left]
+        left = left + 1
+        output = output + 1
+      end
+      while right <= right_finish do
+        work:account()
+        target[output] = source[right]
+        right = right + 1
+        output = output + 1
+      end
+      first = right_finish + 1
+    end
+    local swap = source
+    source = target
+    target = swap
+    source_is_input = not source_is_input
+    if width > count // 2 then width = count else width = width * 2 end
+  end
+  if not source_is_input then
+    for index = 1, count do
+      work:account()
+      items[index] = source[index]
+    end
+  end
+end
+
+local function summary_lines(items: {PendingSummaryLine},
+                             work: NormalizationWork): {string}
+  stable_sort(items, summary_line_less, work)
+  local result: {string} = {}
+  for index = 1, #items do
+    work:account()
+    result[index] = items[index].display
+  end
+  return result
+end
+
+local function type_tag(candidate: value, subject: string): string
+  local raw = required_map(candidate, TYPES_MODULE, subject)
+  local tag = required_string(raw["_tag"], TYPES_MODULE, subject .. "._tag")
+  if strings.sub(tag, 1, 5) ~= "Type." then
+    return fail<|string|>(TYPES_MODULE,
+      subject .. " has invalid type tag '" .. tag .. "'")
+  end
+  return tag
+end
+
+local function Compiler:render_type(candidate: value,
+                                    subject: string): TypeInfo
+  local raw = required_map(candidate, TYPES_MODULE, subject)
+  local tag = type_tag(candidate, subject)
+  local display = ""
+  if tag == "Type.Module" then
+    display = "module " .. required_string(
+      raw["name"], TYPES_MODULE, subject .. ".name")
+  elseif tag == "Type.ModuleMember" or tag == "Type.ModuleVariable"
+      or tag == "Type.Field" then
+    local nested: value = raw["type"]
+    if nested == nil then
+      return fail<|TypeInfo|>(TYPES_MODULE,
+        subject .. " has no nested member type")
+    end
+    display = self:render_type(nested, subject .. ".type").display
+  else
+    local raw_renderer = checked_function(
+      self.types, TYPES_MODULE, "tostring", self.type_of)
+    local renderer = raw_renderer as function (value): value
+    local rendered: value = nil
+    do
+      rendered = renderer(candidate)
+    catch
+      return fail<|TypeInfo|>(TYPES_MODULE,
+        "cannot render " .. subject .. ": " .. strings.tostring(error))
+    end
+    display = required_string(
+      rendered, TYPES_MODULE, "types.tostring result for " .. subject)
+  end
+  return TypeInfo(tag, display)
+end
+
+local function Compiler:optional_type(node: {string: value},
+                                      field: string, subject: string): TypeInfo?
+  local candidate: value = node[field]
+  if candidate == nil then return nil end
+  return self:render_type(candidate, subject .. "." .. field)
+end
+
+--- Validate a compiler documentation payload and detach its ordered tags.
+function normalize_documentation(candidate: value): documentation.Documentation?
+  if candidate == nil then return nil end
+  local module_name = "titan-compiler.documentation"
+  local raw = required_map(candidate, module_name, "documentation")
+  local tags = required_value_list(raw["tags"], "documentation.tags")
+  local detached: {documentation.Tag} = {}
+  for index = 1, #tags do
+    local tag = required_map(tags[index], module_name, "documentation tag")
+    detached[index] = documentation.Tag(
+      required_string(tag["name"], module_name, "documentation tag.name"),
+      required_string(tag["value"], module_name, "documentation tag.value"))
+  end
+  return documentation.Documentation(
+    required_string(raw["summary"], module_name, "documentation.summary"),
+    required_string(raw["description"], module_name, "documentation.description"),
+    detached)
+end
+
+local function documentation_markdown(candidate: value): string?
+  local document? = normalize_documentation(candidate)
+  if document == nil then return nil end
+  local rendered = document:markdown()
+  if rendered == "" then return nil end
+  return rendered
+end
+
+local function node_documentation(candidate: value): string?
+  local module = required_map(lua.require("titan-compiler.documentation"),
+    "titan-compiler.documentation", "documentation API")
+  local for_node = module["for_node"] as function (value): value
+  return documentation_markdown(for_node(candidate))
+end
+
+local function Compiler:write_type_parameters(
+    output: strings.StringWriter, candidate: value, subject: string)
+  if candidate == nil then return end
+  local parameters = required_value_list(candidate, subject)
+  if #parameters == 0 then return end
+  output:write("<|")
+  for index = 1, #parameters do
+    if index > 1 then output:write(", ") end
+    output:write(self:render_type(
+      parameters[index], subject .. "[" .. index .. "]").display)
+  end
+  output:write("|>")
+end
+
+local function Compiler:write_callable_results(
+    output: strings.StringWriter,
+    results: {integer: value}, flexible: value, subject: string)
+  output:write(": ")
+  local parenthesized = #results ~= 1 or flexible ~= nil
+  if parenthesized then output:write("(") end
+  for index = 1, #results do
+    if index > 1 then output:write(", ") end
+    output:write(self:render_type(
+      results[index], subject .. ".rettypes[" .. index .. "]").display)
+  end
+  if flexible ~= nil then
+    if #results > 0 then output:write(", ") end
+    output:write("...: ")
+    output:write(self:render_type(
+      flexible, subject .. ".flexrettype").display)
+  end
+  if parenthesized then output:write(")") end
+end
+
+local function Compiler:render_callable_type(
+    candidate: value, owner: string,
+    separator: string, name: string, supplied_names: value,
+    subject: string, display_owner: string?): CallableSignature?
+  local raw = required_map(candidate, TYPES_MODULE, subject)
+  local tag = required_string(raw["_tag"], TYPES_MODULE, subject .. "._tag")
+  local type_parameters: value = raw["typeparams"]
+  if tag == "Type.FunctionScheme" then
+    candidate = raw["signature"]
+    raw = required_map(candidate, TYPES_MODULE, subject .. ".signature")
+    tag = required_string(
+      raw["_tag"], TYPES_MODULE, subject .. ".signature._tag")
+  elseif tag == "Type.Method" or tag == "Type.StaticMethod" then
+    owner = required_string(raw["fqtn"], TYPES_MODULE, subject .. ".fqtn")
+    separator = tag == "Type.Method" and ":" or "."
+    name = required_string(raw["name"], TYPES_MODULE, subject .. ".name")
+    supplied_names = raw["paramnames"]
+  end
+  if display_owner ~= nil then owner = display_owner end
+  local c_function = tag == "Type.CFunction"
+  if tag ~= "Type.Function" and tag ~= "Type.Method"
+      and tag ~= "Type.StaticMethod" and not c_function then
+    return nil
+  end
+
+  local parameters = required_value_list(
+    raw["params"], subject .. ".params")
+  local results: {integer: value} = {}
+  if not c_function then
+    results = required_value_list(
+      raw["rettypes"], subject .. ".rettypes")
+  end
+  local names? = optional_name_list(
+    supplied_names, subject .. ".paramnames")
+  if names ~= nil and #names ~= #parameters then
+    return fail<|CallableSignature|>(
+      TYPES_MODULE, subject .. ".paramnames must match params")
+  end
+
+  local output = strings.writer()
+  output:write(owner)
+  output:write(separator)
+  output:write(name)
+  self:write_type_parameters(
+    output, type_parameters, subject .. ".typeparams")
+  output:write("(")
+  for index = 1, #parameters do
+    if index > 1 then output:write(", ") end
+    if names ~= nil then
+      output:write(names[index])
+      output:write(": ")
+    end
+    output:write(self:render_type(
+      parameters[index], subject .. ".params[" .. index .. "]").display)
+  end
+  local variable: value = raw["varargtype"]
+  if c_function and optional_boolean(
+      raw["vararg"], TYPES_MODULE, subject .. ".vararg") then
+    if #parameters > 0 then output:write(", ") end
+    output:write("...")
+  elseif variable ~= nil then
+    if #parameters > 0 then output:write(", ") end
+    output:write("...: ")
+    output:write(self:render_type(
+      variable, subject .. ".varargtype").display)
+  end
+  output:write(")")
+  if c_function then
+    local result: value = raw["ret"]
+    output:write(": ")
+    if type_tag(result, subject .. ".ret") == "Type.CVoid" then
+      output:write("()")
+    else
+      output:write(self:render_type(result, subject .. ".ret").display)
+    end
+  else
+    self:write_callable_results(
+      output, results, raw["flexrettype"], subject)
+  end
+  return CallableSignature(output:drain())
+end
+
+local function written_module_alias(candidate: value): string?
+  if not (candidate is {string: value}) then return nil end
+  local node = candidate as {string: value}
+  if node["_tag"] ~= "Ast.VarDot" then return nil end
+  local expression: value = node["exp"]
+  if not (expression is {string: value}) then return nil end
+  local exp = expression as {string: value}
+  if exp["_tag"] ~= "Ast.ExpVar" then return nil end
+  local variable: value = exp["var"]
+  if not (variable is {string: value}) then return nil end
+  local var = variable as {string: value}
+  if var["_tag"] ~= "Ast.VarName" or not (var["name"] is string) then
+    return nil
+  end
+  return var["name"] as string
+end
+
+local function Compiler:callable_signature(
+    module_name: string, candidate: value,
+    source_node: value, subject: string): CallableSignature?
+  if candidate == nil then return nil end
+  local raw = required_map(candidate, DRIVER_MODULE, subject)
+  local tag = required_string(raw["_tag"], DRIVER_MODULE, subject .. "._tag")
+  if tag == "Ast.TopLevelFunc" or tag == "Ast.TopLevelForeignFunc" then
+    local declared: value = raw["_declared_type"]
+    local field = "._declared_type"
+    if declared == nil then
+      declared = raw["_type"]
+      field = "._type"
+    end
+    return self:render_callable_type(
+      declared, module_name, ".",
+      required_string(raw["name"], DRIVER_MODULE, subject .. ".name"),
+      raw["_paramnames"], subject .. field, nil)
+  elseif tag == "Ast.TopLevelMethod" or tag == "Ast.TopLevelStatic"
+      or tag == "Ast.InterfaceMethod" then
+    local declared: value = raw["_declared_type"]
+    local field = "._declared_type"
+    if declared == nil then
+      declared = raw["_type"]
+      field = "._type"
+    end
+    return self:render_callable_type(
+      declared, module_name, ".", "", nil, subject .. field, nil)
+  elseif tag == "Type.ModuleMember" then
+    local owner = required_string(
+      raw["modname"], TYPES_MODULE, subject .. ".modname")
+    local member_type = required_map(
+      raw["type"], TYPES_MODULE, subject .. ".type")
+    if member_type["_tag"] == "Type.CFunction" and
+       raw["_foreign_namespace"] == true then
+      local alias? = written_module_alias(source_node)
+      if alias ~= nil then owner = alias end
+    end
+    return self:render_callable_type(
+      member_type, owner, ".",
+      required_string(raw["name"], TYPES_MODULE, subject .. ".name"),
+      raw["paramnames"], subject .. ".type", nil)
+  elseif tag == "Type.Method" or tag == "Type.StaticMethod" then
+    local display_owner: string? = nil
+    if tag == "Type.StaticMethod" and source_node is {string: value} then
+      local source = source_node as {string: value}
+      local applied: value = source["_closed_generic_declaration"]
+      if applied ~= nil then
+        -- Identity remains canonical; hover uses the checked application that
+        -- analysis-only checking retains on this written namespace selector.
+        candidate = required_map(applied, TYPES_MODULE,
+          subject .. "._closed_generic_declaration")
+        local fqtn = required_string(raw["fqtn"], TYPES_MODULE, subject .. ".fqtn")
+        local owner = self:registered_owner(fqtn)
+        local arguments: value = source["_generic_owner_arguments"]
+        if owner ~= nil and arguments ~= nil then
+          display_owner = self:applied_owner_title(owner,
+            required_value_list(arguments, subject .. "._generic_owner_arguments"),
+            subject)
+        end
+      end
+    end
+    return self:render_callable_type(
+      candidate, module_name, ".", "", nil, subject, display_owner)
+  end
+  return nil
+end
+
+local function visibility_prefix(raw: {string: value}): string
+  if optional_boolean(raw["islocal"], TYPES_MODULE, "member.islocal") then
+    return "local "
+  end
+  return ""
+end
+
+local function Compiler:field_summary_line(candidate: value,
+                                           subject: string): PendingSummaryLine
+  local raw = required_map(candidate, TYPES_MODULE, subject)
+  if type_tag(candidate, subject) ~= "Type.Field" then
+    return fail<|PendingSummaryLine|>(TYPES_MODULE,
+      subject .. " must be a Type.Field")
+  end
+  local name = required_string(raw["name"], TYPES_MODULE, subject .. ".name")
+  local output = strings.writer()
+  output:write(visibility_prefix(raw))
+  if optional_boolean(raw["isconst"], TYPES_MODULE, subject .. ".isconst") then
+    output:write("const ")
+  end
+  output:write(name)
+  output:write(": ")
+  output:write(self:render_type(raw["type"], subject .. ".type").display)
+  return PendingSummaryLine(0, name, output:drain())
+end
+
+local function Compiler:variant_summary_line(candidate: value,
+                                             subject: string): PendingSummaryLine
+  local raw = required_map(candidate, TYPES_MODULE, subject)
+  if type_tag(candidate, subject) ~= "Type.Variant" then
+    return fail<|PendingSummaryLine|>(TYPES_MODULE,
+      subject .. " must be a Type.Variant")
+  end
+  local name = required_string(raw["name"], TYPES_MODULE, subject .. ".name")
+  local output = strings.writer()
+  output:write(visibility_prefix(raw))
+  output:write(name)
+  output:write("(")
+  local parts = required_value_list(raw["parts"], subject .. ".parts")
+  for index = 1, #parts do
+    if index > 1 then output:write(", ") end
+    output:write(self:field_summary_line(
+      parts[index], subject .. ".parts[" .. index .. "]").display)
+  end
+  output:write(")")
+  return PendingSummaryLine(0, name, output:drain())
+end
+
+local function Compiler:aggregate_callable_line(
+    candidate: value, owner: string, subject: string): PendingSummaryLine
+  local raw = required_map(candidate, TYPES_MODULE, subject)
+  local name = required_string(raw["name"], TYPES_MODULE, subject .. ".name")
+  local signature? = self:render_callable_type(
+    candidate, owner, ".", name, raw["paramnames"], subject, owner)
+  if signature == nil then
+    return fail<|PendingSummaryLine|>(TYPES_MODULE,
+      subject .. " must be a method or associated function")
+  end
+  return PendingSummaryLine(0, name, visibility_prefix(raw) .. signature.display)
+end
+
+local function Compiler:specialized_owner(candidate: value,
+                                          arguments: {integer: value}?,
+                                          subject: string): value
+  if arguments == nil or #arguments == 0 then return candidate end
+  local raw = required_map(candidate, TYPES_MODULE, subject)
+  local scope: value = raw["scope"]
+  if scope == nil then return candidate end
+  local raw_substitute = checked_function(
+    self.types, TYPES_MODULE, "substitute", self.type_of)
+  local substitute = raw_substitute as function (value, value, value): value
+  local specialized: value = nil
+  do
+    specialized = substitute(candidate, scope, arguments)
+  catch
+    return fail<|value|>(TYPES_MODULE,
+      "cannot specialize " .. subject .. ": " .. strings.tostring(error))
+  end
+  return specialized
+end
+
+local function Compiler:registered_owner(fqtn: string): value
+  local registry: value = self.types["registry"]
+  if registry is {string: value} then
+    return (registry as {string: value})[fqtn]
+  end
+  return nil
+end
+
+local function Compiler:unwrap_summary_descriptor(candidate: value,
+                                                  subject: string): value
+  if not (candidate is {string: value}) then return nil end
+  local raw = candidate as {string: value}
+  local raw_tag: value = raw["_tag"]
+  if not (raw_tag is string) then return nil end
+  local tag = raw_tag as string
+  if tag == "Type.Module" or tag == "Type.Record" or
+     tag == "Type.Union" or tag == "Type.Interface" then
+    return candidate
+  elseif tag == "Type.ModuleMember" or tag == "Checker.TypeMember" then
+    return self:unwrap_summary_descriptor(raw["type"], subject .. ".type")
+  elseif tag == "Type.Nominal" then
+    local fqtn = required_string(
+      raw["fqtn"], TYPES_MODULE, subject .. ".fqtn")
+    return self:registered_owner(fqtn)
+  elseif tag == "Type.GenericAlias" then
+    local fqtn = required_string(
+      raw["target_owner_fqtn"], TYPES_MODULE,
+      subject .. ".target_owner_fqtn")
+    return self:registered_owner(fqtn)
+  elseif tag == "Ast.Decl" and raw["name"] == "self" and
+         raw["_name_loc"] == nil then
+    -- `self` is a lexical value declaration, but its nominal type is the
+    -- record or union whose complete cached summary is useful at the use site.
+    return self:unwrap_summary_descriptor(raw["_type"], subject .. "._type")
+  elseif tag == "Ast.TopLevelImport" then
+    local resolved: value = raw["_declared_type"]
+    local field = "._declared_type"
+    if resolved == nil then
+      resolved = raw["_type"]
+      field = "._type"
+    end
+    return self:unwrap_summary_descriptor(resolved, subject .. field)
+  elseif tag == "Ast.TopLevelRecord" or tag == "Ast.TopLevelUnion" or
+         tag == "Ast.TopLevelInterface" then
+    local nested = self:unwrap_summary_descriptor(
+      raw["_type"], subject .. "._type")
+    if nested is {string: value} then
+      local nested_raw = nested as {string: value}
+      if nested_raw["name"] is string then
+        local canonical = self:registered_owner(nested_raw["name"] as string)
+        if canonical ~= nil then return canonical end
+      end
+    end
+    return nested
+  end
+  return nil
+end
+
+local function occurrence_type_arguments(source_node: value,
+                                         owner_name: string,
+                                         subject: string): {integer: value}?
+  if not (source_node is {string: value}) then return nil end
+  local raw = source_node as {string: value}
+  local namespace_arguments: value = raw["_generic_namespace_arguments"]
+  if namespace_arguments ~= nil then
+    return required_value_list(
+      namespace_arguments, subject .. "._generic_namespace_arguments")
+  end
+  local surface_arguments: value = raw["typeargs"]
+  if surface_arguments ~= nil then
+    local surface = required_value_list(
+      surface_arguments, subject .. ".typeargs")
+    if #surface > 0 then
+      local arguments: {integer: value} = {}
+      local resolved_surface = true
+      for index = 1, #surface do
+        local argument = required_map(
+          surface[index], DRIVER_MODULE,
+          subject .. ".typeargs[" .. index .. "]")
+        local resolved: value = argument["_resolved_typearg"]
+        if resolved == nil then
+          -- Generic application checking records the resolved argument on
+          -- the written syntax; accept ordinary checked type annotations too.
+          resolved = argument["_type"]
+        end
+        if resolved == nil then
+          -- Incomplete checked syntax may not have a resolved argument.
+          -- Prefer the nominal annotation below when one is available.
+          resolved_surface = false
+          break
+        end
+        arguments[index] = resolved
+      end
+      if resolved_surface then return arguments end
+    end
+  end
+  local annotated: value = raw["_type"]
+  if annotated is {string: value} then
+    local annotated_raw = annotated as {string: value}
+    if annotated_raw["_tag"] == "Type.Nominal" and
+       annotated_raw["fqtn"] == owner_name then
+      local arguments: value = annotated_raw["args"]
+      if arguments == nil then return {} end
+      return required_value_list(arguments, subject .. "._type.args")
+    end
+  end
+  return nil
+end
+
+local function Compiler:applied_owner_title(owner: value,
+                                            arguments: {integer: value}?,
+                                            subject: string): string
+  if arguments == nil or #arguments == 0 then
+    return self:render_type(owner, subject).display
+  end
+  local raw = required_map(owner, TYPES_MODULE, subject)
+  local output = strings.writer()
+  output:write(required_string(
+    raw["name"], TYPES_MODULE, subject .. ".name"))
+  output:write("<|")
+  for index = 1, #arguments do
+    if index > 1 then output:write(", ") end
+    output:write(self:render_type(
+      arguments[index], subject .. ".arguments[" .. index .. "]").display)
+  end
+  output:write("|>")
+  return output:drain()
+end
+
+local function Compiler:aggregate_summary(
+    descriptor: value,
+    arguments: {integer: value}?, include_local: boolean, subject: string,
+    work: NormalizationWork):
+    (HoverSummaryKind?, string?, {HoverSummarySection}?)
+  local raw = required_map(descriptor, TYPES_MODULE, subject)
+  local tag = type_tag(descriptor, subject)
+  if tag ~= "Type.Record" and tag ~= "Type.Union" and
+     tag ~= "Type.Interface" then return nil, nil, nil end
+  local specialized = self:specialized_owner(descriptor, arguments, subject)
+  raw = required_map(specialized, TYPES_MODULE, subject .. " specialized")
+  local title = self:applied_owner_title(descriptor, arguments, subject)
+  local sections: {HoverSummarySection} = {}
+
+  if tag == "Type.Union" then
+    local variants: {PendingSummaryLine} = {}
+    local variant_names: {string: boolean} = {}
+    local raw_variants = required_value_list(
+      raw["variants"], subject .. ".variants")
+    for index = 1, #raw_variants do
+      work:account()
+      local variant_raw = required_map(
+        raw_variants[index], TYPES_MODULE,
+        subject .. ".variants[" .. index .. "]")
+      local line = self:variant_summary_line(
+        raw_variants[index], subject .. ".variants[" .. index .. "]")
+      variant_names[line.name] = true
+      if include_local or not optional_boolean(
+          variant_raw["islocal"], TYPES_MODULE,
+          subject .. ".variants[" .. index .. "].islocal") then
+        variants[#variants + 1] = line
+      end
+    end
+    if #variants > 0 then
+      sections[#sections + 1] = HoverSummarySection(
+        "Variants", summary_lines(variants, work))
+    end
+
+    local functions: {PendingSummaryLine} = {}
+    local raw_functions = required_map(
+      raw["functions"], TYPES_MODULE, subject .. ".functions")
+    for name, candidate in iteration.pairs(raw_functions) do
+      work:account()
+      local candidate_raw = required_map(
+        candidate, TYPES_MODULE, subject .. ".functions['" .. name .. "']")
+      if not variant_names[name] and (include_local or not optional_boolean(
+          candidate_raw["islocal"], TYPES_MODULE,
+          subject .. ".functions['" .. name .. "'].islocal")) then
+        functions[#functions + 1] = self:aggregate_callable_line(
+          candidate, title, subject .. ".functions['" .. name .. "']")
+      end
+    end
+    if #functions > 0 then
+      sections[#sections + 1] = HoverSummarySection(
+        "Functions", summary_lines(functions, work))
+    end
+  else
+    local fields: {PendingSummaryLine} = {}
+    local raw_fields = required_value_list(raw["fields"], subject .. ".fields")
+    for index = 1, #raw_fields do
+      work:account()
+      local field_raw = required_map(
+        raw_fields[index], TYPES_MODULE,
+        subject .. ".fields[" .. index .. "]")
+      if include_local or not optional_boolean(
+          field_raw["islocal"], TYPES_MODULE,
+          subject .. ".fields[" .. index .. "].islocal") then
+        fields[#fields + 1] = self:field_summary_line(
+          raw_fields[index], subject .. ".fields[" .. index .. "]")
+      end
+    end
+    if #fields > 0 then
+      sections[#sections + 1] = HoverSummarySection(
+        "Fields", summary_lines(fields, work))
+    end
+
+    if tag == "Type.Record" then
+      local functions: {PendingSummaryLine} = {}
+      local raw_functions = required_map(
+        raw["functions"], TYPES_MODULE, subject .. ".functions")
+      for name, candidate in iteration.pairs(raw_functions) do
+        work:account()
+        local candidate_raw = required_map(
+          candidate, TYPES_MODULE,
+          subject .. ".functions['" .. name .. "']")
+        if include_local or not optional_boolean(
+            candidate_raw["islocal"], TYPES_MODULE,
+            subject .. ".functions['" .. name .. "'].islocal") then
+          functions[#functions + 1] = self:aggregate_callable_line(
+            candidate, title, subject .. ".functions['" .. name .. "']")
+        end
+      end
+      if #functions > 0 then
+        sections[#sections + 1] = HoverSummarySection(
+          "Functions", summary_lines(functions, work))
+      end
+    end
+  end
+
+  local methods: {PendingSummaryLine} = {}
+  if tag == "Type.Interface" then
+    local raw_methods = required_value_list(
+      raw["methods"], subject .. ".methods")
+    for index = 1, #raw_methods do
+      work:account()
+      local candidate_raw = required_map(
+        raw_methods[index], TYPES_MODULE,
+        subject .. ".methods[" .. index .. "]")
+      if include_local or not optional_boolean(
+          candidate_raw["islocal"], TYPES_MODULE,
+          subject .. ".methods[" .. index .. "].islocal") then
+        methods[#methods + 1] = self:aggregate_callable_line(
+          raw_methods[index], title, subject .. ".methods[" .. index .. "]")
+      end
+    end
+  else
+    local raw_methods = required_map(
+      raw["methods"], TYPES_MODULE, subject .. ".methods")
+    for name, candidate in iteration.pairs(raw_methods) do
+      work:account()
+      local candidate_raw = required_map(
+        candidate, TYPES_MODULE,
+        subject .. ".methods['" .. name .. "']")
+      if include_local or not optional_boolean(
+          candidate_raw["islocal"], TYPES_MODULE,
+          subject .. ".methods['" .. name .. "'].islocal") then
+        methods[#methods + 1] = self:aggregate_callable_line(
+          candidate, title, subject .. ".methods['" .. name .. "']")
+      end
+    end
+  end
+  if #methods > 0 then
+    sections[#sections + 1] = HoverSummarySection(
+      "Methods", summary_lines(methods, work))
+  end
+
+  if tag == "Type.Record" then
+    return HoverSummaryKind.record_summary(), title, sections
+  elseif tag == "Type.Union" then
+    return HoverSummaryKind.union_summary(), title, sections
+  end
+  return HoverSummaryKind.interface_summary(), title, sections
+end
+
+local function Compiler:append_type_parameters(
+    output: strings.StringWriter, raw: {string: value}, subject: string)
+  self:write_type_parameters(
+    output, raw["typeparams"], subject .. ".typeparams")
+end
+
+local function Compiler:module_nominal_line(
+    raw: {string: value}, member_name: string,
+    kind: string, subject: string, force_local: boolean): string
+  local output = strings.writer()
+  if force_local then output:write("local ")
+  else output:write(visibility_prefix(raw)) end
+  output:write(kind)
+  output:write(" ")
+  output:write(member_name)
+  self:append_type_parameters(output, raw, subject)
+  return output:drain()
+end
+
+local function Compiler:append_module_member(
+    module_name: string, candidate: value,
+    rank: integer, subject: string, target: {PendingSummaryLine})
+  local raw = required_map(candidate, TYPES_MODULE, subject)
+  local tag = type_tag(candidate, subject)
+  if tag ~= "Type.ModuleMember" and tag ~= "Type.ModuleVariable" then
+    return fail<|value|>(TYPES_MODULE,
+      subject .. " must be a module member")
+  end
+  local name = required_string(raw["name"], TYPES_MODULE, subject .. ".name")
+  local member_type: value = raw["type"]
+  local member_raw = required_map(
+    member_type, TYPES_MODULE, subject .. ".type")
+  local member_tag = type_tag(member_type, subject .. ".type")
+  local display = ""
+  if member_tag == "Type.Record" then
+    display = self:module_nominal_line(
+      member_raw, name, "record", subject .. ".type", false)
+  elseif member_tag == "Type.Union" then
+    display = self:module_nominal_line(
+      member_raw, name, "union", subject .. ".type", false)
+  elseif member_tag == "Type.Interface" then
+    display = self:module_nominal_line(
+      member_raw, name, "interface", subject .. ".type", false)
+  elseif tag == "Type.ModuleMember" and
+         (member_tag == "Type.Function" or
+          member_tag == "Type.FunctionScheme" or
+          member_tag == "Type.CFunction") then
+    local signature? = self:render_callable_type(
+      member_type, module_name, ".", name,
+      raw["paramnames"], subject .. ".type", nil)
+    if signature == nil then
+      return fail<|value|>(TYPES_MODULE,
+        subject .. " callable has no signature")
+    end
+    display = visibility_prefix(raw) .. signature.display
+  else
+    local output = strings.writer()
+    output:write(visibility_prefix(raw))
+    if optional_boolean(
+        raw["isconst"], TYPES_MODULE, subject .. ".isconst") then
+      output:write("const ")
+    end
+    output:write(name)
+    output:write(": ")
+    output:write(self:render_type(member_type, subject .. ".type").display)
+    display = output:drain()
+  end
+  target[#target + 1] = PendingSummaryLine(rank, name, display)
+end
+
+local function Compiler:append_module_type_members(
+    candidate: value, rank: integer,
+    subject: string, target: {PendingSummaryLine},
+    seen: {string: boolean}, source_only: boolean,
+    work: NormalizationWork)
+  if candidate == nil then return end
+  local raw = required_map(candidate, TYPES_MODULE, subject)
+  for name, member in iteration.pairs(raw) do
+    work:account()
+    if not seen[name] then
+      -- A source interface may decorate the public entry by name as well as
+      -- expose genuinely source-only type members. The public view wins.
+      seen[name] = true
+      local member_subject = subject .. "['" .. name .. "']"
+      local member_raw = required_map(
+        member, TYPES_MODULE, member_subject)
+      local tag = type_tag(member, member_subject)
+      local display = ""
+      if tag == "Type.Record" then
+        display = self:module_nominal_line(
+          member_raw, name, "record", member_subject, source_only)
+      elseif tag == "Type.Union" then
+        display = self:module_nominal_line(
+          member_raw, name, "union", member_subject, source_only)
+      elseif tag == "Type.Interface" then
+        display = self:module_nominal_line(
+          member_raw, name, "interface", member_subject, source_only)
+      else
+        local output = strings.writer()
+        if source_only then output:write("local ")
+        else output:write(visibility_prefix(member_raw)) end
+        output:write("type ")
+        output:write(name)
+        if tag == "Type.GenericAlias" then
+          self:append_type_parameters(output, member_raw, member_subject)
+          local rendered = self:render_type(member, member_subject).display
+          local equals? = strings.find(rendered, " = ")
+          if equals == nil then
+            return fail<|value|>(TYPES_MODULE,
+              member_subject .. " generic alias has no rendered target")
+          end
+          output:write(strings.sub(rendered, equals))
+        else
+          output:write(" = ")
+          output:write(self:render_type(member, member_subject).display)
+        end
+        display = output:drain()
+      end
+      target[#target + 1] = PendingSummaryLine(rank, name, display)
+    end
+  end
+end
+
+local function Compiler:module_summary(
+    descriptor: value, include_source: boolean,
+    subject: string, work: NormalizationWork):
+    (HoverSummaryKind?, string?, {HoverSummarySection}?)
+  if type_tag(descriptor, subject) ~= "Type.Module" then
+    return nil, nil, nil
+  end
+  local raw = required_map(descriptor, TYPES_MODULE, subject)
+  local module_name = required_string(
+    raw["name"], TYPES_MODULE, subject .. ".name")
+  local members: {PendingSummaryLine} = {}
+  local value_members_seen: {string: boolean} = {}
+  local public_members: {integer: value} = {}
+  if raw["members"] ~= nil then
+    public_members = required_value_list(
+      raw["members"], subject .. ".members")
+  end
+  for index = 1, #public_members do
+    work:account()
+    local member_subject = subject .. ".members[" .. index .. "]"
+    local member_raw = required_map(
+      public_members[index], TYPES_MODULE, member_subject)
+    local name = required_string(
+      member_raw["name"], TYPES_MODULE, member_subject .. ".name")
+    if not value_members_seen[name] then
+      value_members_seen[name] = true
+      self:append_module_member(
+        module_name, public_members[index], 0, member_subject, members)
+    end
+  end
+  local source_members: value = raw["source_members"]
+  if include_source and source_members ~= nil then
+    local source_list = required_value_list(
+      source_members, subject .. ".source_members")
+    for index = 1, #source_list do
+      work:account()
+      local member_subject = subject .. ".source_members[" .. index .. "]"
+      local member_raw = required_map(
+        source_list[index], TYPES_MODULE, member_subject)
+      local name = required_string(
+        member_raw["name"], TYPES_MODULE, member_subject .. ".name")
+      if not value_members_seen[name] then
+        value_members_seen[name] = true
+        self:append_module_member(
+          module_name, source_list[index], 1, member_subject, members)
+      end
+    end
+  end
+  local type_members_seen: {string: boolean} = {}
+  self:append_module_type_members(
+    raw["type_members"], 2,
+    subject .. ".type_members", members, type_members_seen, false, work)
+  if include_source then
+    self:append_module_type_members(
+      raw["source_type_members"], 3,
+      subject .. ".source_type_members", members, type_members_seen, true,
+      work)
+  end
+  local sections: {HoverSummarySection} = {}
+  if #members > 0 then
+    sections[1] = HoverSummarySection(
+      "Members", summary_lines(members, work))
+  end
+  return HoverSummaryKind.module_summary(), module_name, sections
+end
+
+local function source_import_declaration(candidate: value): boolean
+  if not (candidate is {string: value}) then return false end
+  local raw = candidate as {string: value}
+  if raw["_tag"] ~= "Ast.TopLevelImport" then return false end
+  return raw["_source_import"] == true or raw["source_required"] == true
+end
+
+local function source_import_name(candidate: value): string?
+  if not source_import_declaration(candidate) then return nil end
+  local raw = candidate as {string: value}
+  local modname: value = raw["modname"]
+  if modname is string then return modname as string end
+  return nil
+end
+
+local function source_import_module(candidate: value): string?
+  if not (candidate is {string: value}) then return nil end
+  local raw = candidate as {string: value}
+  local tag: value = raw["_tag"]
+  local imported? = source_import_name(candidate)
+  if imported ~= nil then return imported end
+  imported = source_import_name(raw["_module_decl"])
+  if imported ~= nil then return imported end
+  imported = source_import_name(raw["_import_decl"])
+  if imported ~= nil then return imported end
+  imported = source_import_name(raw["_decl"])
+  if imported ~= nil then return imported end
+  if tag == "Ast.VarDot" then
+    return source_import_module(raw["exp"])
+  elseif tag == "Ast.ExpVar" then
+    return source_import_module(raw["var"])
+  end
+  return nil
+end
+
+local function HoverSummaryKind:key(): string
+  case self
+  when module_summary() then return "module"
+  when record_summary() then return "record"
+  when union_summary() then return "union"
+  when interface_summary() then return "interface"
+  end
+end
+
+local function append_summary_key_part(output: strings.StringWriter,
+                                       candidate: string)
+  output:write(#candidate .. ":")
+  output:write(candidate)
+end
+
+local function summary_content_key(kind: HoverSummaryKind, title: string,
+                                   sections: const? {HoverSummarySection},
+                                   work: NormalizationWork): string
+  local output = strings.writer()
+  append_summary_key_part(output, kind:key())
+  append_summary_key_part(output, title)
+  for section_index = 1, #sections do
+    work:account()
+    local section = sections[section_index]
+    append_summary_key_part(output, section.heading)
+    for line_index = 1, #section.lines do
+      work:account()
+      append_summary_key_part(output, section.lines[line_index])
+    end
+    append_summary_key_part(output, "")
+  end
+  return output:drain()
+end
+
+local function Compiler:summary_argument_key(
+    arguments: {integer: value}?, subject: string): string
+  if arguments == nil or #arguments == 0 then return "" end
+  local output = strings.writer()
+  for index = 1, #arguments do
+    append_summary_key_part(output, self:render_type(
+      arguments[index], subject .. "[" .. index .. "]").display)
+  end
+  return output:drain()
+end
+
+local function summary_view_key(descriptor: value, descriptor_tag: string,
+                                include_source: boolean,
+                                argument_key: string,
+                                subject: string): string
+  local raw = required_map(descriptor, TYPES_MODULE, subject)
+  local output = strings.writer()
+  append_summary_key_part(output, descriptor_tag)
+  append_summary_key_part(output, required_string(
+    raw["name"], TYPES_MODULE, subject .. ".name"))
+  append_summary_key_part(output, include_source and "source" or "public")
+  append_summary_key_part(output, argument_key)
+  return output:drain()
+end
+
+local function aggregate_owner_module(name: string,
+                                      subject: string): string
+  local split = 0
+  for index = 1, #name do
+    if strings.byte(name, index) == 46 then split = index end
+  end
+  if split == 0 or split == #name then
+    return fail<|string|>(TYPES_MODULE,
+      subject .. " name '" .. name .. "' is not fully qualified")
+  end
+  return strings.sub(name, 1, split - 1)
+end
+
+local function summary_descriptor_module(descriptor: value,
+                                         descriptor_tag: string,
+                                         subject: string): string
+  local raw = required_map(descriptor, TYPES_MODULE, subject)
+  local name = required_string(
+    raw["name"], TYPES_MODULE, subject .. ".name")
+  if descriptor_tag == "Type.Module" then return name end
+  return aggregate_owner_module(name, subject)
+end

@@ -1,0 +1,251 @@
+-- Saved semantic, diagnostic, and rename LSP request handlers.
+
+local record HoverRequest
+  const params: lsp.DocumentPosition
+  const capture: document_buffers.Capture?
+  const epoch: integer
+  const tracked: boolean
+end
+
+local function parse_error(item: lsp.Error?): dispatcher.SemanticOutcome
+  if item == nil then
+    return failure(INVALID_PARAMS, "Invalid params")
+  end
+  return failure(item.code, item.message)
+end
+
+local function location_result(location: semantic_features.Location?):
+    value
+  if location == nil then return wire.null() end
+  return lsp.location_value(location.uri, location.range)
+end
+
+local function locations_result(
+    locations: const? {semantic_features.Location}): wire.Array
+  local result: wire.Array = {}
+  for index = 1, #locations do
+    result[index] = lsp.location_value(
+      locations[index].uri, locations[index].range)
+  end
+  return result
+end
+
+local function folding_result(ranges: const? {lsp.FoldingRange}): wire.Array
+  local result: wire.Array = {}
+  for index = 1, #ranges do
+    result[index] = lsp.folding_range_value(ranges[index])
+  end
+  return result
+end
+
+local function default_rename_analyzer(
+    snapshot: project_service.Snapshot,
+    projects: {bridge.ProjectModule}): bridge.Analysis
+  local compiler = bridge.load()
+  compiler:configure(bridge.project_configuration(snapshot.config))
+  return compiler:analyze(snapshot.project_modules[1].module_name, projects)
+end
+
+local function Application:snapshot_hover(
+    params: lsp.DocumentPosition): HoverRequest
+  return HoverRequest {
+    params = params,
+    capture = self.buffers:capture(params.path, params.position),
+    epoch = self.buffers:epoch(),
+    tracked = self.buffers:tracked(params.path),
+  }
+end
+
+local function Application:handle_definition(
+    request: dispatcher.SemanticRequest): dispatcher.SemanticOutcome
+  local params?, params_error? = lsp.parse_document_position(request.params)
+  if params == nil then return parse_error(params_error) end
+  local view?, view_error? = self:current_view()
+  if view == nil then
+    if view_error ~= nil then
+      return failure(REQUEST_FAILED, view_error.message)
+    end
+    return dispatcher.SemanticOutcome.result(wire.null())
+  end
+  return dispatcher.SemanticOutcome.result(location_result(
+    view.features:definition(params.path, params.position)))
+end
+
+local function Application:handle_references(
+    request: dispatcher.SemanticRequest): dispatcher.SemanticOutcome
+  local params?, params_error? = lsp.parse_references(request.params)
+  if params == nil then return parse_error(params_error) end
+  local view?, view_error? = self:current_view()
+  if view == nil then
+    if view_error ~= nil then
+      return failure(REQUEST_FAILED, view_error.message)
+    end
+    local result: wire.Array = {}
+    return dispatcher.SemanticOutcome.result(result)
+  end
+  return dispatcher.SemanticOutcome.result(locations_result(
+    view.features:references(
+      params.document.path, params.document.position,
+      params.include_declaration)))
+end
+
+local function Application:handle_hover(
+    request: dispatcher.SemanticRequest, captured: HoverRequest?):
+    dispatcher.SemanticOutcome
+  if captured == nil then
+    local params?, params_error? = lsp.parse_document_position(request.params)
+    if params == nil then return parse_error(params_error) end
+    captured = self:snapshot_hover(params)
+  end
+  local params = captured.params
+  local capture? = captured.capture
+  if self.buffers:epoch() ~= captured.epoch or
+     (capture == nil and captured.tracked) then
+    return dispatcher.SemanticOutcome.result(wire.null())
+  end
+  if capture ~= nil and self.completion ~= nil then
+    local ephemeral? = self.completion:hover(capture)
+    if ephemeral ~= nil then return ephemeral end
+  end
+  local view?, view_error? = self:current_view()
+  if view == nil then
+    if view_error ~= nil then
+      return failure(REQUEST_FAILED, view_error.message)
+    end
+    return dispatcher.SemanticOutcome.result(wire.null())
+  end
+  if capture ~= nil then
+    local matches = view.features:matches_source(params.path, capture.document.text)
+    if not matches or not self.buffers:current(capture) then
+      return dispatcher.SemanticOutcome.result(wire.null())
+    end
+  end
+  local hover? = view.features:hover(params.path, params.position)
+  if hover == nil or self.buffers:epoch() ~= captured.epoch then
+    return dispatcher.SemanticOutcome.result(wire.null())
+  end
+  return dispatcher.SemanticOutcome.result(
+    lsp.hover_value(hover:markdown(), hover.range))
+catch
+  if error is async.CancellationReason then raise end
+  if error is semantic_index.StaleView then
+    return failure(REQUEST_FAILED, "saved Titan project changed while reading; retry")
+  end
+  return failure(INTERNAL_ERROR, runtime_error(error).message)
+end
+
+local function Application:handle_folding(
+    request: dispatcher.SemanticRequest): dispatcher.SemanticOutcome
+  local params?, params_error? = lsp.parse_document(request.params)
+  if params == nil then return parse_error(params_error) end
+  local view?, view_error? = self:current_view()
+  if view == nil then
+    if view_error ~= nil then
+      return failure(REQUEST_FAILED, view_error.message)
+    end
+    local result: wire.Array = {}
+    return dispatcher.SemanticOutcome.result(result)
+  end
+  return dispatcher.SemanticOutcome.result(folding_result(
+    view.features:folding_ranges(params.path)))
+end
+
+-- Pull diagnostics answer from the same published rows push uses, so both
+-- channels always agree. The reported resultId identifies this document's
+-- items exactly, which lets a client keep its previous report.
+local function Application:handle_diagnostic(
+    request: dispatcher.SemanticRequest): dispatcher.SemanticOutcome
+  local params?, params_error? = lsp.parse_diagnostic(request.params)
+  if params == nil then return parse_error(params_error) end
+  -- Publication rows carry this server's own URI spelling, so answer under the
+  -- same spelling rather than the client's equivalent but differently escaped
+  -- one.
+  local uri? = source_text.path_to_file_uri(params.document.path)
+  if uri == nil then
+    return failure(INVALID_PARAMS, "textDocument.uri is not a local file URI")
+  end
+  while true do
+    local view?, view_error? = self:fresh_view_for()
+    if view == nil then
+      return failure(REQUEST_FAILED, view_error.message)
+    end
+    local items? = self:published_items(view, uri)
+    if items ~= nil then
+      -- Honour a cancellation which arrived while the pull waited for the
+      -- saved generation it had to answer from.
+      async.checkpoint()
+      return dispatcher.SemanticOutcome.result(
+        diagnostics.report(items, params.previous_result_id))
+    end
+    -- A newer publication was installed while acquiring the store lease; answer
+    -- from that completed generation instead of this stale one.
+  end
+  return failure(INTERNAL_ERROR, "diagnostic pull did not complete")
+end
+
+local function Application:rename_analysis(
+    view: View, candidate: semantic_features.RenameCandidate):
+    (bridge.Analysis?, Error?)
+  local service = self.service
+  local snapshot = service:latest()
+  if snapshot.generation ~= view.work_generation then
+    raise semantic_index.StaleView(view.work_generation, snapshot.generation)
+  end
+  do
+    local access = service:workspace_store():acquire()
+    defer access:release()
+    semantic_index.check_generation(access.connection, view.published_generation)
+  end
+  if #snapshot.project_modules == 0 then
+    return nil, Error("cannot rename in an empty Titan project")
+  end
+  do
+    return self.rename_analyzer(snapshot, candidate:edited_project_modules()), nil
+  catch
+    if error is async.CancellationReason then raise end
+    return nil, runtime_error(error)
+  end
+end
+
+local function Application:handle_rename(
+    request: dispatcher.SemanticRequest): dispatcher.SemanticOutcome
+  local params?, params_error? = lsp.parse_rename(request.params)
+  if params == nil then return parse_error(params_error) end
+  local view?, view_error? = self:fresh_view()
+  if view == nil then return failure(REQUEST_FAILED, view_error.message) end
+
+  local candidate?, rename_error? = view.features:rename(
+    params.document.path, params.document.position, params.new_name)
+  if rename_error ~= nil then
+    return failure(REQUEST_FAILED, rename_error.message)
+  end
+  if candidate == nil then
+    return failure(REQUEST_FAILED, "no project symbol exists at the position")
+  end
+
+  local analysis?, analysis_error? = self:rename_analysis(view, candidate)
+  if analysis == nil then
+    return failure(INTERNAL_ERROR, analysis_error.message)
+  end
+  local verified?, preflight_error? = candidate:preflight(analysis)
+  if verified == nil then
+    local message = "candidate rename failed compiler preflight"
+    if preflight_error ~= nil then message = preflight_error.message end
+    return failure(REQUEST_FAILED, message)
+  end
+
+  -- Compiler preflight works from an immutable copy of the saved generation.
+  -- Revalidate disk state before publishing edits so a save that happened
+  -- during the request cannot make the WorkspaceEdit target an older file.
+  local latest?, latest_error? = self:fresh_view()
+  if latest == nil then
+    return failure(REQUEST_FAILED, latest_error.message)
+  end
+  if latest.work_generation ~= view.work_generation or
+     latest.published_generation ~= view.published_generation then
+    return failure(
+      REQUEST_FAILED, "saved Titan project changed during rename; retry")
+  end
+  return dispatcher.SemanticOutcome.result(
+    lsp.workspace_edit_value(verified:document_edits()))
+end

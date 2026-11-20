@@ -3,13 +3,14 @@
 
 local async = import "async"
 local sqlite3 = import "sqlite3"
+local strings = import "string"
 
 -- One connection is leased for a complete logical operation. The updater owns
 -- transactions; a request only reads while holding its lease. Releasing access
 -- never commits, rolls back, or closes somebody else's operation.
 local record Waiter
-  task: async.Task<|value, value|>
-  token: async.ResumeToken
+  const task: async.Task<|value, value|>
+  const token: async.ResumeToken
   queued: boolean
   reserved: boolean
 end
@@ -17,7 +18,7 @@ end
 --- Exclusive SQLite connection lease with idempotent release.
 record Access
   const connection: sqlite3.Connection
-  local release_owner: function (): ()
+  local const owner: Store
   local released: boolean
 end
 
@@ -28,6 +29,17 @@ record Store
   local waiters: {Waiter}
   local closing: boolean
   local closed: boolean
+end
+
+--- Multi-row SQLite INSERT batch backed by a linear-time StringWriter.
+record Batch
+  local const connection: sqlite3.Connection
+  local const prefix: string
+  local const columns: integer
+  local const row_limit: integer
+  local const writer: strings.StringWriter
+  local bindings: {value}
+  local rows: integer
 end
 
 function execute(connection: sqlite3.Connection, sql: string,
@@ -72,6 +84,55 @@ function optional_bytes(row: sqlite3.Row, column: integer): string?
   return blob.bytes
 end
 
+--- Create a bounded multi-row INSERT batch for a fixed column count.
+-- Row limits stay safely below Titan's 200-argument variadic call bound.
+function batch(connection: sqlite3.Connection, prefix: string,
+               columns: integer, row_limit: integer?): Batch
+  if columns < 1 or columns > 196 then
+    raise "workspace store batch column count must be between 1 and 196"
+  end
+  local max_rows = 196 // columns
+  local limit = row_limit or max_rows
+  if limit < 1 then limit = 1 end
+  if limit > max_rows then limit = max_rows end
+  local writer = strings.writer()
+  writer:write(prefix)
+  return Batch(connection, prefix, columns, limit, writer, {}, 0)
+end
+
+--- Execute and reset any buffered rows in this batch.
+function Batch:flush()
+  if self.rows == 0 then return end
+  execute(self.connection, self.writer:drain(), ...self.bindings)
+  self.writer:write(self.prefix)
+  self.bindings = {}
+  self.rows = 0
+end
+
+--- Append one row of values (nil emits SQL NULL) and flush when full.
+function Batch:append(...: value)
+  local supplied = #...
+  if supplied > self.columns then
+    raise "workspace store batch row exceeds declared column count"
+  end
+  if self.rows > 0 then self.writer:write(",") end
+  self.writer:write("(")
+  for column = 1, self.columns do
+    if column > 1 then self.writer:write(",") end
+    local item: value = nil
+    if column <= supplied then item = ...[column] end
+    if item == nil then
+      self.writer:write("NULL")
+    else
+      self.writer:write("?")
+      self.bindings[#self.bindings + 1] = item
+    end
+  end
+  self.writer:write(")")
+  self.rows = self.rows + 1
+  if self.rows >= self.row_limit then self:flush() end
+end
+
 --- Open workspace SQLite storage and configure its connection policy.
 function open(path: string): Store
   local connection = sqlite3.connect(path)
@@ -97,7 +158,7 @@ function open(path: string): Store
     "CREATE TABLE IF NOT EXISTS main.cache_meta (" ..
     "key BLOB PRIMARY KEY, value BLOB NOT NULL) WITHOUT ROWID")
   initialized = true
-  return Store.new(connection, false, {}, false, false)
+  return Store(connection, false, {}, false, false)
 end
 
 local function Store:grant_next()
@@ -130,17 +191,15 @@ end
 local function Store:acquire_owner(): Access
   if not self.active then
     self.active = true
-    return Access.new(self.connection,
-      function () self:release_owner() end, false)
+    return Access(self.connection, self, false)
   end
-  local waiter = Waiter.new(async.running(),
-    async.ResumeToken.new("server.workspace_store"), true, false)
+  local waiter = Waiter(async.running(),
+    async.ResumeToken("server.workspace_store"), true, false)
   self.waiters[#self.waiters + 1] = waiter
   do
     async.suspend(waiter.token, function () self:abandon(waiter) end)
     waiter.queued = false
-    return Access.new(self.connection,
-      function () self:release_owner() end, false)
+    return Access(self.connection, self, false)
   catch
     -- A granted waiter can be cancelled before its scheduled resume executes.
     self:abandon(waiter)
@@ -158,7 +217,7 @@ end
 function Access:release()
   if self.released then return end
   self.released = true
-  self.release_owner()
+  self.owner:release_owner()
 end
 
 --- Close workspace storage after active access has retired.

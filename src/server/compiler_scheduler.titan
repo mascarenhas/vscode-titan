@@ -9,15 +9,15 @@ local logging = import "server.logging"
 -- own that state at a time even when an analysis cooperatively yields.
 
 local record Waiter
-  task: async.Task<|value, value|>
-  resume_token: async.ResumeToken
+  const task: async.Task<|value, value|>
+  const resume_token: async.ResumeToken
   queued: boolean
   reserved: boolean
 end
 
 --- Exclusive compiler-state lease released exactly once by its owner.
 record Permit
-  local release_owner: function (): ()
+  local const owner: Scheduler
   local released: boolean
 end
 
@@ -29,7 +29,7 @@ end
 
 --- Create an independent compiler permit scheduler.
 function create(): Scheduler
-  return Scheduler.new(false, {})
+  return Scheduler(false, {})
 end
 
 local function Scheduler:grant_next()
@@ -77,11 +77,11 @@ function Scheduler:acquire(): Permit
       ["waited"] = false,
       ["queued"] = 0,
     })
-    return Permit.new(function () self:release_owner() end, false)
+    return Permit(self, false)
   end
 
-  local waiter = Waiter.new(
-    async.running(), async.ResumeToken.new("server.compiler_scheduler"),
+  local waiter = Waiter(
+    async.running(), async.ResumeToken("server.compiler_scheduler"),
     true, false)
   self.waiters[#self.waiters + 1] = waiter
   local started = logging.clock()
@@ -97,7 +97,7 @@ function Scheduler:acquire(): Permit
       ["wait_cpu_ms"] = logging.elapsed_ms(started),
       ["queued"] = #self.waiters,
     })
-    return Permit.new(function () self:release_owner() end, false)
+    return Permit(self, false)
   catch
     -- Resume delivery closes its zero timer before re-entering this Task, so
     -- cancellation can be injected after the cancellation action was cleared.
@@ -111,7 +111,7 @@ function Permit:release()
   if self.released then return end
   self.released = true
   logging.emit("trace", "compiler.scheduler.release", nil)
-  self.release_owner()
+  self.owner:release_owner()
 end
 
 local shared_scheduler: Scheduler? = nil
@@ -119,5 +119,5 @@ local shared_scheduler: Scheduler? = nil
 --- Acquire the process-wide compiler-state permit.
 function acquire(): Permit
   if shared_scheduler == nil then shared_scheduler = create() end
-  return (shared_scheduler as Scheduler):acquire()
+  return shared_scheduler:acquire()
 end

@@ -1,0 +1,773 @@
+-- Binary graph cache, workspace cache identity, and private completion bridge.
+
+local function CompletionBinary:provider_key(): string
+  return self.kind .. "\0" .. self.filename
+end
+
+-- A resolver captures complete selected providers, not independent names.
+-- Replace recaptured inventories as a unit so removed siblings cannot survive.
+local function merge_completion_catalog(previous: const? {CompletionBinary},
+    captured: const? {CompletionBinary}): {CompletionBinary}
+  local replaced: {string: boolean} = {}
+  for index = 1, #captured do replaced[captured[index]:provider_key()] = true end
+  local result: {CompletionBinary} = {}
+  for index = 1, #previous do
+    local binary = previous[index]
+    if binary.kind ~= "embedded" and not replaced[binary:provider_key()] then
+      result[#result + 1] = binary
+    end
+  end
+  for index = 1, #captured do result[#result + 1] = captured[index] end
+  return result
+end
+
+local function completion_source_key(main_file: string, files: const? {string},
+    inputs: const? {CHeaderDependency}): string
+  local output = strings.writer()
+  output:write(#main_file .. ":" .. main_file .. ";" .. #files .. ";")
+  for index = 1, #files do
+    local file = files[index]
+    output:write(#file .. ":" .. file .. ";")
+  end
+  output:write(#inputs .. ";")
+  for index = 1, #inputs do
+    local input = inputs[index]
+    output:write(input.kind:name() .. ";" .. #input.path .. ":" .. input.path .. ";" ..
+      #input.identity .. ":" .. input.identity .. ";")
+  end
+  return content_identity.digest(output:drain())
+end
+
+local function Compiler:read_completion_binary_catalog(context: value,
+    identity: compiler_io.LstatIdentity?): {CompletionBinary}
+  local catalog = self.driver["completion_binary_catalog"] as function (value): value
+  local binaries = required_map(catalog(context), DRIVER_MODULE, "completion binary catalog")
+  local result: {CompletionBinary} = {}
+  for name, raw in iteration.pairs(binaries) do
+    local item = required_map(raw, DRIVER_MODULE, "completion binary")
+    result[#result + 1] = CompletionBinary {
+      module_name = name,
+      serialized = item["serialized"],
+      kind = item["kind"],
+      filename = item["filename"],
+      provider_identity = identity,
+      documentation = documentation_markdown(item["documentation"]),
+    }
+  end
+  return result
+end
+
+function Compiler:configure_cache(lookup: CacheLookup,
+                                  publish: CachePublisher,
+                                  refresh_inputs: CacheInputRefresher?)
+  local get: function (string, string): (string?, value) = function (
+      kind: string, key: string): (string?, value)
+    local payload?, inputs? = lookup(kind, key)
+    if inputs == nil then return payload, nil end
+    local present = inputs
+    return payload, raw_c_header_dependencies(present)
+  end
+  local put: function (string, string, string, value): boolean = function (
+      kind: string, key: string, payload: string, raw_inputs: value): boolean
+    local inputs: {CHeaderDependency} = {}
+    if raw_inputs ~= nil then
+      inputs = normalize_c_header_dependencies(raw_inputs, "persisted header inputs")
+    end
+    publish(kind, key, payload, inputs)
+    return true
+  end
+  local adapter: {string: value} = {
+    ["get"] = get,
+    ["put"] = put,
+    ["sha256_binary"] = content_identity.digest,
+    ["yield"] = async.yield,
+  }
+  if refresh_inputs ~= nil then
+    local refresh: CacheInputRefresher = refresh_inputs
+    adapter["refresh_inputs"] = function (
+        kind: string, key: string, inputs: value): boolean
+      return refresh(kind, key, normalize_c_header_dependencies(
+        inputs, "refreshed persisted header inputs"))
+    end
+  end
+  self.cache_adapter = adapter
+end
+
+local function cache_project_files(
+    projects: const? {ProjectModule}): {string: value}
+  local files: {string: value} = {}
+  for module_index = 1, #projects do
+    for file_index = 1, #projects[module_index].files do
+      files[projects[module_index].files[file_index].filename] = true
+    end
+  end
+  return files
+end
+
+function Compiler:export_projects(projects: {ProjectModule}, selected_names: {string}):
+    {ProjectPayload}
+  local started = logging.clock()
+  local permit = compiler_scheduler.acquire()
+  defer permit:release()
+  local encode = checked_function(self.driver, DRIVER_MODULE,
+    "encode_project_entry", self.type_of) as function (value, value): (value, value)
+  local current_projects = project_index(projects)
+  local files = cache_project_files(projects)
+  local options: {string: value} = {
+    ["project_files"] = files,
+    ["sha256_binary"] = content_identity.digest,
+    ["yield"] = async.yield,
+  }
+  local result: {ProjectPayload} = {}
+  local encoded_names: {string} = {}
+  local payload_bytes = 0
+  for index = 1, #selected_names do
+    local name = selected_names[index]
+    local entry: value = self.project_entries[name]
+    if current_projects[name] ~= nil and entry ~= nil then
+      local raw, failure = encode(entry, options)
+      if raw is string then
+        local encoded: string = raw
+        result[#result + 1] = ProjectPayload(name, encoded)
+        encoded_names[#encoded_names + 1] = name
+        payload_bytes = payload_bytes + #encoded
+      else
+        logging.emit("debug", "cache.project.unrepresentable", {
+          ["module"] = name, ["message"] = strings.tostring(failure),
+        })
+      end
+    end
+    -- Only the compiler permit is held. Let ordinary SQL feature requests
+    -- keep reading the preceding publication between independent payloads.
+    if index < #selected_names then async.yield() end
+  end
+  logging.emit("debug", "cache.projects.encode", {
+    ["modules"] = #result, ["bytes"] = payload_bytes,
+    ["cpu_ms"] = logging.elapsed_ms(started),
+    ["module_names"] = logging.summarize_strings(encoded_names),
+  })
+  return result
+end
+
+-- Decode declared interfaces and validate their canonical owners before
+-- attaching anything to the live compiler. Completed SQL facts already own
+-- body-derived semantics; restoration never reconstructs or walks an AST.
+function Compiler:restore_project_cache(projects: {ProjectModule},
+    names: {string}, read: ProjectPayloadReader,
+    install: ProjectManifestInstaller): {string}
+  local started = logging.clock()
+  local permit = compiler_scheduler.acquire()
+  defer permit:release()
+  local decode = checked_function(self.driver, DRIVER_MODULE,
+    "decode_project_entry", self.type_of) as function (string, value): (value, value)
+  local make_registry = checked_function(self.driver, DRIVER_MODULE,
+    "project_entries_registry", self.type_of) as function (value, value): (value, value)
+  local project_map = project_index(projects)
+  local files = cache_project_files(projects)
+  local entries: {string: value} = {}
+  for index = 1, #names do
+    local name = names[index]
+    local payload?, header_inputs? = read(name)
+    if payload ~= nil and project_map[name] ~= nil then
+      local options: {string: value} = {
+        ["module_name"] = name,
+        ["project_files"] = files,
+        ["sha256_binary"] = content_identity.digest,
+        ["yield"] = async.yield,
+      }
+      if header_inputs ~= nil then
+        local present = header_inputs
+        options["header_inputs"] = raw_c_header_dependencies(present)
+      end
+      local entry, failure = decode(payload, options)
+      if entry ~= nil and entry ~= false then
+        entries[name] = entry
+      else
+        logging.emit("debug", "cache.project.miss", {
+          ["module"] = name, ["message"] = strings.tostring(failure),
+        })
+      end
+    end
+    if index < #names then async.yield() end
+  end
+  local registry, registry_error = make_registry(entries, {["yield"] = async.yield})
+  if registry == nil or registry == false then
+    logging.emit("debug", "cache.project.registry_miss", {
+      ["message"] = strings.tostring(registry_error),
+    })
+    return {}
+  end
+  required_map(registry, DRIVER_MODULE, "restored project registry")
+  local result: {string} = {}
+  for index = 1, #projects do
+    local name = projects[index].module_name
+    local entry: value = entries[name]
+    if entry ~= nil then
+      if install(name) then
+        self.project_entries[name] = entry
+        result[#result + 1] = name
+      else
+        self:drop_project_entry(name)
+      end
+    catch
+      if error is async.CancellationReason then raise end
+      self:drop_project_entry(name)
+      logging.emit("debug", "cache.project.installation_miss", {
+        ["module"] = name, ["message"] = strings.tostring(error),
+      })
+    end
+  end
+  logging.emit("debug", "cache.projects.restore", {
+    ["requested"] = #names, ["restored"] = #result,
+    ["cpu_ms"] = logging.elapsed_ms(started),
+  })
+  return result
+end
+
+function Compiler:restore_projects(projects: {ProjectModule},
+                                    payloads: {ProjectPayload}): {string}
+  local names: {string} = {}
+  local saved: {string: string} = {}
+  local observed: {string: {CHeaderDependency}} = {}
+  for index = 1, #payloads do
+    local item = payloads[index]
+    names[index] = item.module_name
+    saved[item.module_name] = item.payload
+    if item.header_inputs ~= nil then observed[item.module_name] = item.header_inputs end
+  end
+  return self:restore_project_cache(projects, names,
+    function (name: string): (string?, {CHeaderDependency}?)
+      return saved[name], observed[name]
+    end,
+    function (_: string): boolean return true end)
+end
+
+local function completion_module(): {string: value}
+  return required_map(lua.require("titan-compiler.completion"),
+    "titan-compiler.completion", "completion API")
+end
+
+local function completion_integer(raw: {string: value}, key: string,
+                                  fallback: integer): integer
+  if raw[key] == nil then return fallback end
+  return required_integer(raw[key], "titan-compiler.completion", key)
+end
+
+local function completion_string(raw: {string: value}, key: string,
+                                 fallback: string): string
+  if raw[key] == nil then return fallback end
+  return required_string(raw[key], "titan-compiler.completion", key)
+end
+
+-- The compiler's scalar completion type intentionally omits declaration
+-- parameter names. Observe its existing fact conversion while the checked,
+-- specialized type and declaration are together. Only private preparation
+-- installs this adapter, under the compiler permit; saved descriptors keep
+-- their compiler-owned schema and identity.
+local function Compiler:completion_presentation(row: {string: value},
+    name: string, candidate: value, declaration: value)
+  -- Function aliases are callable types, but completing one in a type
+  -- annotation must keep the compiler's type presentation and plain name.
+  if row["lookup_domain"] ~= "value" and row["lookup_domain"] ~= "foreign-value" then return end
+  local raw = required_map(candidate, TYPES_MODULE, "completion callable")
+  local tag = raw["_tag"]
+  if tag == "Type.FunctionScheme" then
+    raw = required_map(raw["signature"], TYPES_MODULE, "completion callable signature")
+    tag = raw["_tag"]
+  end
+  if tag ~= "Type.Function" and tag ~= "Type.CFunction" then return end
+  local names: value = raw["paramnames"]
+  if declaration is {string: value} then
+    local declared = declaration as {string: value}
+    names = declared["paramnames"]
+    if names == nil then names = declared["_paramnames"] end
+    if names == nil then names = raw["paramnames"] end
+  end
+  local signature? = self:render_callable_type(candidate, "", "", name,
+    names, "completion callable", nil)
+  if signature ~= nil then row["detail"] = signature.display end
+  local parameters = required_value_list(raw["params"], "completion callable.params")
+  local parameter_names? = optional_name_list(names, "completion callable.paramnames")
+  local output = strings.writer()
+  output:write(name)
+  output:write("(")
+  for index = 1, #parameters do
+    if index > 1 then output:write(", ") end
+    local placeholder = "arg" .. index
+    if parameter_names ~= nil then placeholder = parameter_names[index] end
+    output:write("${" .. index .. ":")
+    for byte_index = 1, #placeholder do
+      local byte = strings.sub(placeholder, byte_index, byte_index)
+      if byte == "\\" or byte == "$" or byte == "}" then output:write("\\") end
+      output:write(byte)
+    end
+    output:write("}")
+  end
+  -- Keep variadic tails open without inventing an operand named `...`.
+  if #parameters == 0 and (raw["varargtype"] ~= nil or raw["vararg"] == true) then
+    output:write("$1")
+  end
+  output:write(")$0")
+  row["call_snippet"] = output:drain()
+end
+
+local function Compiler:observe_completion_facts(): function (): ()
+  local module = completion_module()
+  local previous: value = module["fact"]
+  local original = previous as function (...: value): (...: value)
+  module["fact"] = function (name: value, candidate: value, declaration: value,
+      domain: value, owner: value, mode: value, depth: value,
+      private: value, spelling_only: value): value
+    local fact: value = original(name, candidate, declaration, domain, owner,
+      mode, depth, private, spelling_only)
+    if fact ~= nil then
+      local row = required_map(fact, "titan-compiler.completion", "candidate")
+      self:completion_presentation(row, name, candidate, declaration)
+    end
+    return fact
+  end
+  return function () module["fact"] = previous end
+end
+
+local function completion_candidates(raw: value): {completion_types.Candidate}
+  local result: {completion_types.Candidate} = {}
+  if raw == nil then return result end
+  local rows = required_value_list(raw, "completion candidates")
+  for index = 1, #rows do
+    local row = required_map(rows[index], "titan-compiler.completion", "candidate")
+    local label = required_string(row["name"], "titan-compiler.completion", "name")
+    local domain = completion_string(row, "lookup_domain", "term")
+    local visibility = completion_string(row, "visibility", "exported")
+    if row["islocal"] == true then visibility = "private" end
+    result[index] = completion_types.Candidate {
+      label = label,
+      lookup_domain = domain,
+      lookup_key = completion_string(row, "lookup_key", label),
+      kind = completion_integer(row, "kind", 6),
+      detail = completion_string(row, "detail", ""),
+      type_key = completion_string(row, "type_key", ""),
+      scope_id = completion_integer(row, "scope_id", 0),
+      scope_depth = completion_integer(row, "scope_depth", 0),
+      declaration_order = completion_integer(row, "declaration_order", 0),
+      available = row["available"] ~= false,
+      visibility = visibility,
+      owner_key = completion_string(row, "owner_key", ""),
+      access_mode = completion_string(row, "access_mode", "lexical"),
+      call_snippet = optional_string(row["call_snippet"], "titan-compiler.completion", "call_snippet"),
+      documentation = documentation_markdown(row["documentation"]),
+    }
+  end
+  return result
+end
+
+local function completion_scopes(raw: value): {completion_types.Scope}
+  local result: {completion_types.Scope} = {}
+  if raw == nil then return result end
+  local rows = required_value_list(raw, "completion scopes")
+  for index = 1, #rows do
+    local row = required_map(rows[index], "titan-compiler.completion", "scope")
+    local parent: integer? = nil
+    if row["parent_id"] ~= nil then
+      parent = completion_integer(row, "parent_id", 0)
+    end
+    result[index] = completion_types.Scope {
+      id = completion_integer(row, "id", index),
+      parent_id = parent,
+      kind = completion_string(row, "kind", "lexical"),
+      filename = completion_string(row, "filename", ""),
+      byte_start = completion_integer(row, "byte_start", 0),
+      byte_finish = completion_integer(row, "byte_finish", 0),
+    }
+  end
+  return result
+end
+
+function prepare_completion(filename: string, contents: string,
+                            caret_byte: integer): CompletionHole?
+  local permit = compiler_scheduler.acquire()
+  defer permit:release()
+  local module = completion_module()
+  local prepare = module["prepare"] as function (string, string, integer): (value, value)
+  local prepared = prepare(filename, contents, caret_byte)
+  if prepared == nil then return nil end
+  local raw = required_map(prepared, "titan-compiler.completion", "prepared hole")
+  return CompletionHole {
+    filename = filename,
+    contents = required_string(raw["text"], "titan-compiler.completion", "analysis text"),
+    caret_byte = caret_byte,
+    replace_start = completion_integer(raw, "replacement_start", caret_byte),
+    replace_finish = completion_integer(raw, "replacement_end", caret_byte),
+    prefix = completion_string(raw, "prefix", ""),
+    kind = completion_string(raw, "kind", "lexical"),
+    request = raw["request"],
+  }
+end
+
+function completion_dependencies(project: ProjectModule): {string}?
+  local permit = compiler_scheduler.acquire()
+  defer permit:release()
+  local module = completion_module()
+  local dependencies = module["dependencies"] as function (value): (value, value)
+  local files: {value} = {}
+  for index = 1, #project.files do
+    local file = project.files[index]
+    files[index] = {["filename"] = file.filename, ["contents"] = file.contents} as {string: value}
+  end
+  local raw = dependencies(files)
+  if raw == nil then return nil end
+  local rows = required_value_list(raw, "completion dependencies")
+  local result: {string} = {}
+  for index = 1, #rows do
+    local row = required_map(rows[index], "titan-compiler.completion", "dependency")
+    result[index] = required_string(row["module_name"], "titan-compiler.completion", "dependency name")
+  end
+  return result
+end
+
+-- Saved indexing invokes this while its accepted entries still own the full
+-- declared manifest. SQL completion never calls this method or reads entries.
+function Compiler:export_completion_facts(names: {string}): {completion_types.ModuleFacts}
+  local permit = compiler_scheduler.acquire()
+  defer permit:release()
+  local module = completion_module()
+  local describe = module["describe"] as function (value): value
+  local result: {completion_types.ModuleFacts} = {}
+  for index = 1, #names do
+    local name = names[index]
+    local entry: value = self.project_entries[name]
+    if entry ~= nil then
+      local facts = required_map(describe(entry), "titan-compiler.completion", "descriptor facts")
+      result[#result + 1] = completion_types.ModuleFacts(
+        name, completion_candidates(facts["candidates"]),
+        documentation_markdown(facts["documentation"]))
+    elseif self.completion_exports[name] ~= nil then
+      result[#result + 1] = completion_types.ModuleFacts(
+        name, self.completion_exports[name].candidates,
+        self.completion_exports[name].documentation)
+    end
+    if index < #names then async.yield() end
+  end
+  return result
+end
+
+function Compiler:external_completion_payload(name: string,
+    public_interface: string, source_interface: string?, main_file: string,
+    source_files: {string}, header_inputs: {CHeaderDependency}): string?
+  local exported? = self.completion_exports[name]
+  if exported == nil or exported.public_interface ~= public_interface or
+      exported.source_interface ~= source_interface or
+      exported.provenance_key ~= completion_source_key(main_file, source_files, header_inputs) then return nil end
+  return exported.payload
+end
+
+function Compiler:release_completion_exports()
+  self.completion_exports = {}
+  self.completion_binaries = {}
+end
+
+--- The accepted browser standard-provider path, distinct from other static archives.
+function Compiler:browser_provider_file(): string?
+  if self.browser ~= nil then return self.browser.provider.path end
+  return nil
+end
+
+function Compiler:completion_binary_catalog(seed_browser: boolean?): {CompletionBinary}
+  local checked: {string: boolean} = {}
+  local valid: {string: boolean} = {}
+  local result: {CompletionBinary} = {}
+  local browser? = self.browser
+  local captured_browser = false
+  for index = 1, #self.completion_binaries do
+    local binary = self.completion_binaries[index]
+    local key = binary:provider_key()
+    if not checked[key] then
+      checked[key] = true
+      local identity? = binary.provider_identity
+      if identity ~= nil then
+        valid[key] = compiler_io.lstat_identity_is_current(identity)
+      end
+    end
+    if valid[key] then
+      result[#result + 1] = binary
+      if browser ~= nil and binary.kind == "static" and
+          binary.filename == browser.provider.path then
+        captured_browser = true
+      end
+    end
+  end
+  -- A saved view may have no checker attempt (e.g. an empty src directory).
+  -- Read only the accepted semantic provider; the saved graph still owns
+  -- source overlap and selected archive precedence.
+  if seed_browser and browser ~= nil and not captured_browser and
+      compiler_io.lstat_identity_is_current(browser.provider) then
+    local permit = compiler_scheduler.acquire()
+    defer permit:release()
+    local configuration = self:install_configuration()
+    defer configuration:apply()
+    local imported: value = self.driver["imported"]
+    defer self.driver["imported"] = imported
+    self.driver["imported"] = {} as {string: value}
+    local context = self:new_context(nil)
+    defer self:close_context(context)
+    local seed = self:read_completion_binary_catalog(context, browser.provider)
+    for index = 1, #seed do result[#result + 1] = seed[index] end
+  end
+  return result
+end
+
+-- The caller owns a private Compiler and restores only detached entries from
+-- one committed saved baseline before entering this operation. Every source
+-- override is captured text; no open buffer in another module is consulted.
+-- With no hole, check the real source through the same closed resolver and
+-- return its optional semantic snapshot without inventing caret candidates.
+function Compiler:analyze_completion(root_module: string,
+    projects: {ProjectModule}, cached: {CachedSourceInterface},
+    hole: CompletionHole?, header_inputs: {CHeaderDependency}?,
+    binaries: {CompletionBinary}?): CompletionAnalysis
+  local permit = compiler_scheduler.acquire()
+  defer permit:release()
+  local restore_facts: (function (): ())? = nil
+  if hole ~= nil then restore_facts = self:observe_completion_facts() end
+  defer do if restore_facts ~= nil then restore_facts() end end
+  local kind = "source"
+  if hole ~= nil then kind = hole.kind end
+  local previous = self:install_configuration()
+  defer previous:apply()
+  local overrides, project_map = project_loader_inputs(
+    projects, self.driver, self.type_of)
+  local _, interfaces = cached_source_map(cached, project_map)
+  local active: {string: value} = {}
+  local entries: {string: value} = {}
+  local known: {string: value} = {}
+  for name, entry in iteration.pairs(self.project_entries) do
+    if name ~= root_module then entries[name] = entry end
+  end
+  for name in iteration.pairs(project_map) do
+    known[name] = true
+    if name == root_module then
+      active[name] = overrides[name]
+    elseif self.project_entries[name] ~= nil then
+      entries[name] = self.project_entries[name]
+    end
+  end
+  local options: {string: value} = {
+    ["analysis_only"] = true,
+    ["completion_closed_world"] = true,
+    ["transient_caches"] = true,
+    ["source_roots"] = {[root_module] = true} as {string: value},
+    ["source_overrides"] = active,
+    ["known_source_modules"] = known,
+    ["cached_source_entries"] = entries,
+    ["cached_interfaces"] = interfaces,
+  }
+  if hole ~= nil then options["completion"] = hole.request end
+  local binary_entries: {string: value} = {}
+  if binaries ~= nil then
+    for index = 1, #binaries do
+      local binary = binaries[index]
+      binary_entries[binary.module_name] = {
+        ["serialized"] = binary.serialized, ["kind"] = binary.kind,
+        ["filename"] = binary.filename,
+      } as {string: value}
+    end
+  end
+  options["cached_binary_interfaces"] = binary_entries
+  if header_inputs ~= nil then
+    local present = header_inputs
+    options["header_inputs"] = raw_c_header_dependencies(present)
+  end
+  local previous_imported: value = self.driver["imported"]
+  local previous_registry: value = self.types["registry"]
+  defer self.driver["imported"] = previous_imported
+  defer self.types["registry"] = previous_registry
+  local imported: {string: value} = {}
+  self.driver["imported"] = imported
+  local make_registry = self.driver["project_entries_registry"] as function (value, value): (value, value)
+  local registry = make_registry(entries, {["yield"] = async.yield} as {string: value})
+  if registry == nil or registry == false then
+    return CompletionAnalysis {
+      quality = "unresolved",
+      kind = kind,
+      candidates = {},
+      scopes = {},
+    }
+  end
+  self.types["registry"] = registry
+  local context = self:new_context(options)
+  defer self:close_context(context)
+  options["context"] = context
+  local defaultloader = self.driver["defaultloader"] as function (value, value): value
+  local loader = defaultloader({} as {string: value}, options)
+  defer self:close_loader(loader)
+  local invoke = loader as function (string): (value, value, value, value)
+  local succeeded: value, _, raw_errors: value = invoke(root_module)
+  local entry = imported[root_module]
+  if entry == nil then
+    return CompletionAnalysis {
+      quality = "unresolved",
+      kind = kind,
+      candidates = {},
+      scopes = {},
+    }
+  end
+  local raw_entry = required_map(entry, DRIVER_MODULE, "completion root entry")
+  if hole ~= nil and raw_entry["completion"] == nil then
+    return CompletionAnalysis {
+      quality = "unresolved",
+      kind = kind,
+      candidates = {},
+      scopes = {},
+    }
+  end
+  local snapshot: ModuleSnapshot? = nil
+  if raw_entry["ast"] ~= nil then
+    snapshot = self:snapshot_module(root_module, entry, project_map, {},
+      false, NormalizationWork(0)).snapshot
+  catch
+    -- A dummy or an ordinary checker error can leave annotations unfinished.
+    -- Optional hover normalization must preserve usable caret candidates;
+    -- source-only callers keep their preceding accepted hover on failure.
+    if error is async.CancellationReason then raise end
+    logging.emit("debug", "completion.hover.failure", {
+      ["module"] = root_module, ["message"] = strings.tostring(error),
+    })
+  end
+  if hole == nil then
+    local quality = "partial"
+    if succeeded == true and raw_errors is {integer: value} and
+        #(raw_errors as {integer: value}) == 0 then quality = "complete" end
+    if snapshot == nil then quality = "unresolved" end
+    return CompletionAnalysis {
+      quality = quality,
+      kind = kind,
+      candidates = {},
+      scopes = {},
+      observed_headers = normalize_c_header_dependencies(
+        raw_entry["c_header_dependencies"], "private source header inputs"),
+      snapshot = snapshot,
+    }
+  end
+  local raw = required_map(raw_entry["completion"], "titan-compiler.completion", "analysis")
+  return CompletionAnalysis {
+    quality = completion_string(raw, "quality", "unresolved"),
+    kind = completion_string(raw, "kind", kind),
+    candidates = completion_candidates(raw["candidates"]),
+    scopes = completion_scopes(raw["scopes"]),
+    observed_headers = normalize_c_header_dependencies(
+      raw_entry["c_header_dependencies"], "completion header inputs"),
+    snapshot = snapshot,
+  }
+end
+
+local function hash_compiler_tree(directory: string, output: strings.StringWriter,
+    fingerprint: function (string): string)
+  local entries = fs.list(directory)
+  local names: {string} = {}
+  for index = 1, #entries do names[index] = entries[index] end
+  stable_sort(names, string_less, NormalizationWork(0))
+  for index = 1, #names do
+    local path = paths.join(directory, names[index])
+    local metadata? = fs.stat(path)
+    if metadata ~= nil then
+      if metadata.kind == "directory" then
+        hash_compiler_tree(path, output, fingerprint)
+      elseif metadata.kind == "file" and strings.sub(path, -4) == ".lua" then
+        output:write(#path .. ":" .. path)
+        output:write(fingerprint(path))
+      end
+    end
+  end
+end
+
+-- The native world can consult extracted C definitions, so the workspace
+-- transport must be configured before this second compatibility check.
+function Compiler:native_cache_identity(): string
+  local permit = compiler_scheduler.acquire()
+  defer permit:release()
+  local previous_configuration = self:install_configuration()
+  defer previous_configuration:apply()
+  local context = self:new_context(nil)
+  defer self:close_context(context)
+  local cache_identity = checked_function(self.driver, DRIVER_MODULE,
+    "language_server_cache_identity", self.type_of) as function (value): (value, value)
+  local options: {string: value} = {["context"] = context}
+  local raw, failure = cache_identity(options)
+  if not (raw is string) then
+    return fail<|string|>(
+      DRIVER_MODULE, "cannot identify compiler cache context: " .. strings.tostring(failure))
+  end
+  self:emit_cache_stats()
+  local identity: string = raw
+  if self.selected_prefix ~= nil then
+    identity = identity .. (self.configuration.use_selected_inventory == true
+      and "\0selected inventory" or "\0ordinary lookup")
+  end
+  return content_identity.digest(identity)
+end
+
+-- Resolve the inventory before any C probing. This namespace is sufficient to
+-- open the transport: each header/conversion key also carries its native world.
+-- Project restoration additionally requires native_cache_identity above.
+function Compiler:cache_identity(observed_fingerprint: (function (string): string)?): string
+  local permit = compiler_scheduler.acquire()
+  defer permit:release()
+  local output = strings.writer()
+  -- This key names what it digests: the compiler Lua trees, their native
+  -- dependencies and this server image. The workspace cache schema is enforced
+  -- separately by `PRAGMA user_version`, so it stays out of this identity.
+  output:write("titan-ls-compiler-inventory-api-" .. COMPILER_LANGUAGE_SERVER_API)
+  local fingerprint: function (string): string = function (path: string): string
+    return content_identity.file(path, fs.read_file(path))
+  end
+  if observed_fingerprint ~= nil then fingerprint = observed_fingerprint end
+  -- The reviewed Lua helper only resolves the active package search paths.
+  -- Filesystem reads and fingerprints stay in typed Titan below this boundary.
+  local raw_resolve: value = lua.load([[
+return function(name, native)
+  return package.searchpath(name, native and package.cpath or package.path)
+end
+]], "=compiler_bridge.cache_module_path", nil)()
+  local resolve = raw_resolve as function (string, boolean): (string?, string?)
+  local compiler_path?, compiler_error? = resolve(DRIVER_MODULE, false)
+  local parser_path?, parser_error? = resolve("c-parser.cdriver", false)
+  if compiler_path == nil or parser_path == nil then
+    return fail<|string|>(DRIVER_MODULE, "cannot identify compiler sources: " ..
+      strings.tostring(compiler_error) .. strings.tostring(parser_error))
+  end
+  hash_compiler_tree(paths.dirname(compiler_path), output, fingerprint)
+  hash_compiler_tree(paths.dirname(parser_path), output, fingerprint)
+  local dependencies = {"relabel", "inspect", "lfs", "lpeglabel", "luv"}
+  for index = 1, #dependencies do
+    local path?, path_error? = resolve(dependencies[index], index > 2)
+    if path == nil then
+      return fail<|string|>(
+        DRIVER_MODULE, "cannot identify compiler dependency: " .. strings.tostring(path_error))
+    end
+    output:write(#path .. ":" .. path)
+    output:write(fingerprint(path))
+  end
+  if not self.mapped_provider and (self.browser == nil or selected_compiler_root ~= nil) then
+    local support?, failure? = resolve("titan", true)
+    if support == nil then
+      return fail<|string|>(DRIVER_MODULE,
+        "cannot identify selected Titan compiler support: " .. strings.tostring(failure))
+    end
+    output:write(#support .. ":" .. support)
+    output:write(fingerprint(support))
+  end
+  -- This image owns the complete static provider and embedded target/interface
+  -- inventory, including libraries not linked by application declarations.
+  if self.browser ~= nil then
+    output:write(self.browser.identity)
+    output:write(#self.embedded_provider_file .. ":" .. self.embedded_provider_file)
+    output:write(content_identity.stat_identity(self.embedded_provider_file))
+    output:write(fingerprint(embedded_interfaces.server_image()))
+  elseif self.mapped_provider then
+    output:write(fingerprint(self.embedded_provider_file))
+  else
+    -- A selected SDK's provider archive is far larger than this executable and
+    -- is already fenced by its stat tuple on every analysis attempt.
+    output:write(content_identity.stat_identity(self.embedded_provider_file))
+  end
+  return content_identity.digest(output:drain())
+end
