@@ -206,26 +206,12 @@ local function Slot:clear_worker_diagnostics(router: Router)
   end
 end
 
--- A trust refusal is a diagnostic on the configuration file that selected the
--- SDK: an editor must show why that root has no worker, and the notification
--- is replaced by an empty publication once the selection is accepted.
-local function configuration_diagnostic_line(filename: string): integer
-  local source = fs.read_file(filename)
-  local offset? = strings.find(source, "compiler_root")
-  if offset == nil then return 0 end
-  local line = 0
-  for index = 1, offset - 1 do
-    if strings.byte(source, index) == 10 then line = line + 1 end
-  end
-  return line
-catch
-  if error is async.CancellationReason then raise end
-  return 0
-end
-
+-- The refusal owns the location from the configuration it evaluated. Do not
+-- reopen that file: it may already contain a newer selection.
 local function Router:publish_configuration_diagnostic(slot: Slot,
-                                                       filename: string,
-                                                       message: string)
+                                                       failure: root_settings.Error)
+  local filename = failure.path
+  if slot.diagnosed_file ~= filename then self:clear_configuration_diagnostic(slot) end
   local uri: value = wire.null()
   do
     local encoded? = source_text.path_to_file_uri(roots.canonical(filename))
@@ -233,16 +219,15 @@ local function Router:publish_configuration_diagnostic(slot: Slot,
   catch
     if error is async.CancellationReason then raise end
   end
-  local position: wire.Object = {
-    ["line"] = configuration_diagnostic_line(filename), ["character"] = 0,
-  }
+  local line = (failure.line or 1) - 1
+  local position: wire.Object = {["line"] = line, ["character"] = 0}
   local range: wire.Object = {["start"] = position, ["end"] = position}
   local diagnostic: wire.Object = {
     ["range"] = range,
     ["severity"] = 1,
     ["source"] = "Titan",
     ["code"] = "configuration",
-    ["message"] = message,
+    ["message"] = failure.message,
   }
   local diagnostics: wire.Array = {diagnostic}
   local params: wire.Object = {

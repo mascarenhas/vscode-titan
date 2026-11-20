@@ -14,12 +14,45 @@ record Error
   const path: string
   const message: string
   const target_selection: boolean?
+  const line: integer?
 end
 
 --- One evaluated configuration file's global assignments.
 type Environment = {value: value}
 --- Absent-or-evaluated configuration, including a missing optional file.
 type OptionalEnvironment = Environment?
+
+local type SelectorLines = {string: integer}
+local type SelectorObserver =
+  function (Environment, string): (SelectorLines, function (): ())
+
+-- Only the two selectors need a write trap. Other globals stay in the
+-- ordinary environment; selector reads see the current values, including
+-- nil after a clear. None of the observer's helpers enters that environment.
+local const observe_selectors = lua.load([=[
+local getinfo, rawset, setmetatable = debug.getinfo, rawset, setmetatable
+return function(environment, source)
+  local selectors, lines = {}, {}
+  setmetatable(environment, {
+    __index = selectors,
+    __newindex = function(env, name, item)
+      if name == "target" or name == "compiler_root" then
+        selectors[name] = item
+        local info = item ~= nil and getinfo(2, "Sl")
+        lines[name] = info and info.source == source and info.currentline > 0
+          and info.currentline or nil
+      else
+        rawset(env, name, item)
+      end
+    end,
+  })
+  return lines, function()
+    setmetatable(environment, nil)
+    environment.target = selectors.target
+    environment.compiler_root = selectors.compiler_root
+  end
+end
+]=], "=config_selector_observer", nil)() as SelectorObserver
 
 local const LOCAL_CONFIG_FILE_NAME = "titan-config.local.lua"
 
@@ -231,10 +264,11 @@ local function normalize_compiler_root(config_file: string,
   return resolve_config_path(config_file, project_root, text, "compiler_root")
 end
 
-local function normalize_target(config_file: string, candidate: value): string?
+local function normalize_target(config_file: string, candidate: value,
+                                line: integer?): string?
   if candidate == nil or candidate == "native" then return nil end
   if candidate == "browser" then return "browser" end
-  raise Error(config_file, "target must be \"native\" or \"browser\"", true)
+  raise Error(config_file, "target must be \"native\" or \"browser\"", true, line)
 end
 
 local function normalize_environment(config_file: string?,
@@ -332,46 +366,54 @@ end
 -- accepting a returned table would silently support a second, incompatible
 -- configuration format. A missing file yields nil, and a non-file path is an
 -- error.
-local function evaluate(config_file: string): Environment?
+local function evaluate(config_file: string, observe: boolean?): (Environment?, SelectorLines?)
   local metadata? = fs.stat(config_file)
-  if metadata == nil then return nil end
+  if metadata == nil then return nil, nil end
   if metadata.kind ~= "file" then
     return fail<|OptionalEnvironment|>(config_file,
-      paths.basename(config_file) .. " is not a regular file")
+      paths.basename(config_file) .. " is not a regular file"), nil
   end
   local environment: Environment = {}
   local returned: value
+  local lines: SelectorLines?
   do
     local source = fs.read_file(config_file)
-    local chunk = lua.load(source, "@" .. config_file, environment)
+    local chunk_name = "@" .. config_file
+    local finish: (function (): ())?
+    if observe then
+      lines, finish = observe_selectors(environment, chunk_name)
+    end
+    local chunk = lua.load(source, chunk_name, environment)
     returned = chunk()
+    if finish ~= nil then finish() end
   catch
     if error is async.CancellationReason then raise end
     return fail<|OptionalEnvironment|>(config_file,
       "cannot evaluate " .. paths.basename(config_file) .. ": " ..
-      strings.tostring(error))
+      strings.tostring(error)), nil
   end
   if returned ~= nil then
     return fail<|OptionalEnvironment|>(config_file,
       paths.basename(config_file) ..
-      " must use global assignments and return no value")
+      " must use global assignments and return no value"), nil
   end
-  return environment
+  return environment, lines
 end
 
 -- The untracked local override exists for one job: naming a machine-specific
 -- SDK prefix without dirtying the tracked configuration. Every other key is
 -- rejected rather than silently shadowing the tracked file.
-local function evaluate_local(config_file: string): Environment?
-  local environment? = evaluate(config_file)
-  if environment == nil then return nil end
+local function evaluate_local(config_file: string, observe: boolean?):
+    (Environment?, SelectorLines?)
+  local environment?, lines? = evaluate(config_file, observe)
+  if environment == nil then return nil, nil end
   for key, _ in iteration.pairs(environment) do
     if not (key is string) or (key as string) ~= "compiler_root" then
       return fail<|OptionalEnvironment|>(config_file,
-        "titan-config.local.lua may only assign compiler_root")
+        "titan-config.local.lua may only assign compiler_root"), nil
     end
   end
-  return environment
+  return environment, lines
 end
 
 local function load_or_raise(project_root: string,
@@ -409,6 +451,8 @@ record CompilerRoot
   const compiler_root: string?
   const compiler_root_file: string?
   const target: string?
+  const compiler_root_line: integer?
+  const target_line: integer?
 end
 
 -- The router must select an SDK and evaluate trust before a worker exists, and
@@ -428,7 +472,7 @@ end
 function load_compiler_root(project_root: string): (CompilerRoot?, Error?)
   local root = absolute_project_root(project_root)
   local local_file = local_configuration_path(root)
-  local overrides? = evaluate_local(local_file)
+  local overrides?, override_lines? = evaluate_local(local_file, true)
   local override_root: string?
   if overrides ~= nil then
     local raw = overrides["compiler_root"]
@@ -438,9 +482,10 @@ function load_compiler_root(project_root: string): (CompilerRoot?, Error?)
   end
   local config_file = configuration_path(root)
   local tracked: OptionalEnvironment
+  local tracked_lines: SelectorLines?
   local tracked_error: Error?
   do
-    tracked = evaluate(config_file)
+    tracked, tracked_lines = evaluate(config_file, true)
   catch
     if error is async.CancellationReason then raise end
     if error is Error then
@@ -458,18 +503,26 @@ function load_compiler_root(project_root: string): (CompilerRoot?, Error?)
   local tracked_root: string?
   local tracked_file: string?
   local target: string?
+  local compiler_root_line: integer?
+  local target_line: integer?
+  if tracked_lines ~= nil then
+    compiler_root_line = tracked_lines["compiler_root"]
+    target_line = tracked_lines["target"]
+  end
   if tracked ~= nil then
     local raw = tracked["compiler_root"]
     if raw ~= nil then
       tracked_root = normalize_compiler_root(config_file, root, raw)
       tracked_file = config_file
     end
-    target = normalize_target(config_file, tracked["target"])
+    target = normalize_target(config_file, tracked["target"], target_line)
   end
   if override_root ~= nil then
-    return CompilerRoot(override_root, local_file, target), nil
+    local override_line: integer?
+    if override_lines ~= nil then override_line = override_lines["compiler_root"] end
+    return CompilerRoot(override_root, local_file, target, override_line, target_line), nil
   end
-  return CompilerRoot(tracked_root, tracked_file, target), nil
+  return CompilerRoot(tracked_root, tracked_file, target, compiler_root_line, target_line), nil
 catch
   if error is async.CancellationReason then raise end
   if error is Error then return nil, error as Error end
