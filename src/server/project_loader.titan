@@ -42,9 +42,9 @@ local function binary_provider_key(kind: string, filename: string): string
   return kind .. "\0" .. filename
 end
 
--- Ordinary captures replace the provider's previous catalog group. An unselected
--- provider can contribute the exact binary owners reached through compiled
--- interfaces from a clean project, never its other members.
+-- Ordinary captures replace the provider's previously saved catalog group.
+-- Only selected archives carry sibling inventories. A DSO member not in the
+-- graph always needs exact authorization through a clean compiled exposer.
 local function completion_catalog(connection: sqlite3.Connection,
     snapshot: service.Snapshot, binaries: const? {bridge.CompletionBinary},
     reusable: boolean, browser_provider: string?):
@@ -118,13 +118,16 @@ local function completion_catalog(connection: sqlite3.Connection,
       recaptured_contextual[binary.module_name] = true
     end
     local provenance? = graph_names[binary.module_name]
-    if provenance ~= nil and provenance ~= 2 then blocked[key] = true end
+    if binary.kind ~= "dynamic" and provenance ~= nil and provenance ~= 2 then
+      blocked[key] = true
+    end
   end
   for index = 1, #previous do
     local row = previous[index]
-    local key = binary_provider_key(row:get(2), sql.bytes(row, 3))
+    local kind: string = row:get(2)
+    local key = binary_provider_key(kind, sql.bytes(row, 3))
     local provenance? = graph_names[sql.bytes(row, 1)]
-    if not replaced[key] and provenance ~= nil and provenance ~= 2 then
+    if kind ~= "dynamic" and not replaced[key] and provenance ~= nil and provenance ~= 2 then
       blocked[key] = true
     end
   end
@@ -139,7 +142,7 @@ local function completion_catalog(connection: sqlite3.Connection,
     local keep = false
     if kind == "embedded" then
       keep = reusable
-    elseif key == browser_provider_key or selected[key] then
+    elseif key == browser_provider_key or (kind == "static" and selected[key]) then
       keep = reusable or clean_providers[key] == true
     elseif contextual[name] == key then
       keep = not recaptured_contextual[name]
@@ -160,7 +163,7 @@ local function completion_catalog(connection: sqlite3.Connection,
     local key = binary_provider_key(binary.kind, binary.filename)
     if graph_names[binary.module_name] == nil and not blocked[key] and
        (binary.kind == "embedded" or key == browser_provider_key or
-        selected[key] == true or contextual[binary.module_name] == key) then
+        (binary.kind == "static" and selected[key]) or contextual[binary.module_name] == key) then
       local previous? = choices[binary.module_name]
       if previous == nil then
         names[#names + 1] = binary.module_name

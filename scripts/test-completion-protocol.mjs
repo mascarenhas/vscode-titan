@@ -344,16 +344,43 @@ async function testContextualBinaryCompletion() {
           await member(first, rated, "percent");
           await member(second, secondSource, "percent");
           await imports("stock.rate", "stock.quantity", "stock.sleeping");
+        } else if (phase === "contextual-first" || phase === "ordinary-first") {
+          const contextual = phase === "contextual-first" ? first : second;
+          const ordinary = contextual === first ? second : first;
+          assertCatalog(["stock.quantity", "stock.rate"], ["stock.rate"]);
+          await member(contextual, firstSource, "count");
+          await member(ordinary, rated, "percent");
+          await imports("stock.quantity", "stock.sleeping");
+          console.log(`${extension} ${phase}: contextual and ordinary members completed`);
 
-          // Windows can retain a mapped DLL; test removal there without
-          // requiring the OS to replace that running worker's image on disk.
-          if (extension === ".so") {
-            const staged = path.join(providers, "stock.next");
-            await copyFile(path.join(replacement, "stock.so"), staged);
-            await rename(staged, provider);
-            assert.deepEqual((await pull(first)).items, []);
+          if (phase === "ordinary-first") {
+            // A failed attempt can capture quantity but cannot authorize it.
+            await writeFile(second, firstSource.replace("().count", "().missing"));
+            assert.match(JSON.stringify((await pull(second)).items), /missing/);
             assertCatalog(["stock.rate"], ["stock.rate"]);
             await imports("stock.rate", "stock.quantity", "stock.sleeping");
+
+            await writeFile(second, firstSource);
+            assert.deepEqual((await pull(second)).items, []);
+            assertCatalog(["stock.quantity", "stock.rate"], ["stock.rate"]);
+
+            // No DSO recapture on this refresh: the old SQL row must still
+            // retire even though the DSO remains ordinarily selected.
+            await writeFile(second, unrelatedSource);
+            assert.deepEqual((await pull(second)).items, []);
+            assertCatalog(["stock.rate"], ["stock.rate"]);
+            await imports("stock.rate", "stock.quantity", "stock.sleeping");
+
+            // Windows can retain a mapped DLL; test removal there without
+            // requiring the OS to replace that running worker's image on disk.
+            if (extension === ".so") {
+              const staged = path.join(providers, "stock.next");
+              await copyFile(path.join(replacement, "stock.so"), staged);
+              await rename(staged, provider);
+              assert.deepEqual((await pull(first)).items, []);
+              assertCatalog(["stock.rate"], ["stock.rate"]);
+              await imports("stock.rate", "stock.quantity", "stock.sleeping");
+            }
           }
         } else {
           assertCatalog(["stock.quantity", "stock.rate"]);
@@ -413,6 +440,16 @@ async function testContextualBinaryCompletion() {
       await writeFile(first, rated);
       await writeFile(second, secondSource);
       await session("mixed");
+
+      // Quantity has left the ordinary graph. Reintroduce it only through
+      // the facade. Edit both roots between workers for one saved workset;
+      // root names (app, report) determine the analysis order.
+      await writeFile(first, firstSource);
+      await writeFile(second, rated);
+      await session("contextual-first");
+      await writeFile(first, rated);
+      await writeFile(second, firstSource);
+      await session("ordinary-first");
     }
     console.log(`contextual completion ${extension}: exact owners, dormancy, retirement, repair and warm reuse passed`);
   }

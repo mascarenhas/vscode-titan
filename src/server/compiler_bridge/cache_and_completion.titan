@@ -4,46 +4,51 @@ local function CompletionBinary:provider_key(): string
   return self.kind .. "\0" .. self.filename
 end
 
--- Ordinary captures replace the provider's previous catalog group.
--- Contextual-only captures from independent roots can share a physical file.
+-- An ordinary recapture replaces a static inventory. A DSO has no captured
+-- inventory: keep its exact member observations for saved-graph admission.
 -- The incoming array is owned by this merge and its entries may be replaced.
 local function merge_completion_catalog(previous: const? {CompletionBinary},
     captured: {CompletionBinary}, shared_observations: boolean): {CompletionBinary}
-  local replaced: {string: boolean} = {}
+  local groups: {string: CompletionBinary} = {}
   local members: {string: integer} = {}
   for index = 1, #captured do
     local binary = captured[index]
     local key = binary:provider_key()
-    if binary.replaces_group then replaced[key] = true end
+    if groups[key] == nil or binary.replaces_group then groups[key] = binary end
     members[key .. "\0" .. binary.module_name] = index
   end
   local result: {CompletionBinary} = {}
   for index = 1, #previous do
     local binary = previous[index]
     local key = binary:provider_key()
-    if binary.kind ~= "embedded" and not replaced[key] then
+    local group? = groups[key]
+    local before? = binary.provider_identity
+    local after?: compiler_io.LstatIdentity = nil
+    if group ~= nil then after = group.provider_identity end
+    -- Attempts in one analysis share observations validated at its end.
+    -- Across analyses a different or unobserved file cannot inherit bytes
+    -- or group replacement, even at the same pathname.
+    local coherent = group == nil or shared_observations or
+      (before ~= nil and after ~= nil and
+        (before == after or compiler_io.same_lstat_identity(before, after)))
+    if binary.kind ~= "embedded" and coherent and
+        (binary.kind == "dynamic" or group == nil or not group.replaces_group) then
       local overlap? = members[key .. "\0" .. binary.module_name]
       if overlap == nil then
         result[#result + 1] = binary
-      elseif binary.replaces_group then
+      elseif binary.replaces_group and group ~= nil and not group.replaces_group then
         local newer = captured[overlap]
-        local before? = binary.provider_identity
-        local after? = newer.provider_identity
         -- Keep the newest descriptor without losing the pending ordinary
-        -- replacement. Attempts in one analysis share the lstat observations
-        -- validated at its end; separate analyses must agree on the identity.
-        if shared_observations or (before ~= nil and after ~= nil and
-            compiler_io.same_lstat_identity(before, after)) then
-          captured[overlap] = CompletionBinary {
-            module_name = newer.module_name,
-            serialized = newer.serialized,
-            kind = newer.kind,
-            filename = newer.filename,
-            provider_identity = after,
-            replaces_group = true,
-            documentation = newer.documentation,
-          }
-        end
+        -- replacement when no other incoming entry carries it.
+        captured[overlap] = CompletionBinary {
+          module_name = newer.module_name,
+          serialized = newer.serialized,
+          kind = newer.kind,
+          filename = newer.filename,
+          provider_identity = newer.provider_identity,
+          replaces_group = true,
+          documentation = newer.documentation,
+        }
       end
     end
   end
