@@ -83,7 +83,7 @@ modules' SQL facts. External source and binary modules retain manifests and
 provenance only. Compiler-observed C-header dependency closures are metadata.
 Keep large compiler payloads out of foreign-key parent key indexes. Completion
 descriptors use a rowid table with a separate unique module key; update
-`SCHEMA_VERSION` (discard-and-rebuild without migration while prerelease) when
+`SCHEMA_VERSION` (incompatible caches are discarded without migration) when
 changing that layout, and keep large interface BLOBs out of catalog eviction
 queries.
 
@@ -103,13 +103,15 @@ complete sibling inventories; dynamic providers capture only exact observed
 members. Accumulate captures by physical provider across independent roots and
 fixed-point passes, replace recaptured ordinary groups completely, and release
 pending captures after publication or configuration changes. Validate pending
-provider identities from compiler observations; retain a contextual-only DSO
-descriptor across an ordinary-only partial refresh only on a capture-time
-provider witness matching the current validated external stamp, never by path
-match alone or on stale, unwitnessed, or potentially stale mapped-DSO captures,
-and keep source overlap rejecting the entire static provider. Retain embedded
+provider identities from compiler observations; admit a fresh contextual-only
+DSO descriptor only when a clean compiled exposer and the worker's first
+possible mapping match the current scope-0 stamp, and retain an existing row
+across ordinary recaptures only when its stored `provider_witness` matches both
+the followed physical object and content digest—never from path match or
+ordinary selection alone, and never eclipsing a valid row with an ineligible
+recapture. Source overlap rejects the entire static provider. Retain embedded
 inventories during compatible warm startup. Test unrelated refresh, provider
-replacement/removal, and warm restoration.
+replacement/removal, timestamp-only touches, and warm restoration.
 Decode descriptors only during private preparation; selection reads indexed
 scalar facts under one connection
 lease. Add deterministic held/free compiler-permit tests and measure preparation
