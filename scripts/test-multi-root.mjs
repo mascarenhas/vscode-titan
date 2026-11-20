@@ -3950,6 +3950,7 @@ async function testConfigurationDiagnosticLocations() {
   const cleared = (file, start) => waitNotification(session, publications, start, (publication) =>
     publication.uri === uri(file) && publication.diagnostics.length === 0, `${file} diagnostic clearing`);
   const targetError = /^target must be "native" or "browser"$/;
+  const sdkError = /^compiler_root '.*' is not an installed Titan SDK: missing lib\/lua\/5[.]5\/titan[.](so|dll)$/;
   try {
     const roots = [targetWithSdk, targetWithoutSdk, untrusted];
     await session.initialize({
@@ -3973,14 +3974,51 @@ async function testConfigurationDiagnosticLocations() {
     await cleared(localConfig, switched);
     await refusal(tracked(untrusted), targetError, 6, switched);
 
+    // A valid browser selector does not own a missing base SDK support module.
+    const brokenSdk = path.join(base, "broken-sdk");
+    const driverFile = path.join(brokenSdk, "share", "lua", "5.5", "titan-compiler", "driver.lua");
+    await mkdir(path.dirname(driverFile), { recursive: true });
+    await writeFile(driverFile, "return {}\n");
+    const brokenSelection = `compiler_root = ${luaString(brokenSdk)}`;
+    const trustedOverride = path.join(targetWithoutSdk, "titan-config.local.lua");
+    const broken = publications.length;
+    await writeFile(tracked(targetWithSdk), targetConfig(brokenSelection, "browser"));
+    await writeFile(tracked(targetWithoutSdk), targetConfig(sdkSetting, "browser"));
+    await writeFile(trustedOverride, `-- Override the tracked SDK.\n\n${brokenSelection}\n`);
+    session.notify("workspace/didChangeConfiguration", {});
+    await refusal(tracked(targetWithSdk), sdkError, 1, broken);
+    await cleared(tracked(targetWithoutSdk), broken);
+    await refusal(trustedOverride, sdkError, 2, broken);
+    const brokenRoots = await session.status();
+    for (const root of [targetWithSdk, targetWithoutSdk]) {
+      const entry = rootEntry(brokenRoots, root);
+      assert.equal(entry.state, "failed");
+      assert.equal(entry.workerPid, null);
+      assert.match(entry.failure, sdkError);
+    }
+
+    const nativeFailure = publications.length;
+    await writeFile(tracked(targetWithSdk), targetConfig(brokenSelection, "native"));
+    session.notify("workspace/didChangeConfiguration", {});
+    await cleared(tracked(targetWithSdk), nativeFailure);
+    const native = rootEntry(await session.status(), targetWithSdk);
+    assert.equal(native.state, "failed");
+    assert.equal(native.workerPid, null);
+    assert.match(native.failure, /is not an installed Titan SDK/);
+    assert.ok(!publications.slice(nativeFailure).some((publication) =>
+      publication.uri === uri(tracked(targetWithSdk)) && publication.diagnostics.length > 0),
+      "a native SDK layout failure unexpectedly published a configuration diagnostic");
+
     const corrected = publications.length;
     await writeFile(tracked(targetWithSdk), targetConfig(sdkSetting, "native"));
     await writeFile(tracked(targetWithoutSdk), targetConfig(defaultSetting, "native"));
     await writeFile(tracked(untrusted), ROOT_CONFIG);
     await rm(localConfig);
+    await rm(trustedOverride);
     session.notify("workspace/didChangeConfiguration", {});
+    await cleared(trustedOverride, corrected);
     for (const [root, source] of [[targetWithSdk, first], [targetWithoutSdk, second], [untrusted, third]]) {
-      await cleared(tracked(root), corrected);
+      if (root === untrusted) await cleared(tracked(root), corrected);
       await pollHover(session, source, ROOT_A_SOURCE, "doubled", /integer/,
         `worker after correcting ${path.basename(root)}`);
     }
