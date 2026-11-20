@@ -35,7 +35,7 @@ Each fact has one home. Elsewhere, link to it in one line.
 | Ch. 1: Process architecture, multi-root routing (`server.router`), configuration inputs, compiler compatibility, browser analysis, composition path | `docs/server-data-flow.md` |
 | Ch. 2: Framing, JSON-RPC wire/reflect codecs, lifecycle/dispatch, O(1) queues, pre-Task capture, cancellation, outbound requests, stderr logging | `docs/protocol-and-concurrency.md` |
 | Ch. 3: External compiler bridge (`server.compiler_bridge`), cooperative permit, AST traversal, declaration documentation rendering, C FFI, `CompilerIO` proxy isolation | `docs/compiler-bridge.md` |
-| Ch. 4: Discovery, watch filtering, fixed-point refresh (`server.project_service`), SQLite leases/batching, schema-8 cache compatibility, header provenance, startup revalidation | `docs/sqlite-backend-storage.md` |
+| Ch. 4: Discovery, watch filtering, fixed-point refresh (`server.project_service`), SQLite leases/batching, schema-1 cache compatibility, header provenance, startup revalidation | `docs/sqlite-backend-storage.md` |
 | Ch. 5: Saved-file navigation, hover, folding, diagnostics, multi-part union shorthand rename (`server.semantic_features`), server data-model rules (`#server-data-models`), `server.application` lifecycle | `docs/semantic-features.md` |
 | Ch. 6: Unsaved completion, live hover after completion, TEMP storage and bounds | `docs/completion.md` |
 | Appendix A: Compiler-owned native builds, build profiles, test execution, output trees, paired browser semantic pack, CI, experimental Windows driver | `docs/native-build.md` |

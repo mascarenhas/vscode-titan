@@ -86,7 +86,7 @@ The 46 logical production Titan modules (plus five C/header helpers and eight Ty
 - `server.project_service` *(folder module, 3 files)* — Incremental refresh engine: [`project_service.titan`](../src/server/project_service/project_service.titan), [`scan_and_provenance.titan`](../src/server/project_service/scan_and_provenance.titan), [`analysis_commit.titan`](../src/server/project_service/analysis_commit.titan).
 - `server.project_loader` ([`src/server/project_loader.titan`](../src/server/project_loader.titan)) — Production compiler wiring, cache validation, and deferred cached-body `Restoration`.
 - `server.workspace_store` ([`src/server/workspace_store.titan`](../src/server/workspace_store.titan)) — Cooperative SQLite connection leases and batched multi-row `INSERT` writers.
-- `server.workspace_cache` ([`src/server/workspace_cache.titan`](../src/server/workspace_cache.titan)) — Schema-8 workspace cache compatibility, binary payload staging, and publication reuse.
+- `server.workspace_cache` ([`src/server/workspace_cache.titan`](../src/server/workspace_cache.titan)) — Schema-1 workspace cache compatibility, binary payload staging, and publication reuse.
 - `server.header_store` ([`src/server/header_store.titan`](../src/server/header_store.titan)) — Four-scope normalized C-header dependency closure storage.
 - `server.source_text` ([`src/server/source_text.titan`](../src/server/source_text.titan)) — UTF-16/byte-offset binary search, path normalization, and file URI conversion.
 
