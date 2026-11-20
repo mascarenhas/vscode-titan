@@ -13,6 +13,7 @@ local content_identity = import "server.content_identity"
 local test_paths = import "server.test_paths"
 local completion_types = import "server.completion_types"
 local system = import "os"
+local compiler_io = import "server.compiler_io"
 
 
 local function fixture_headers_root(): string
@@ -140,14 +141,19 @@ return function(mode, contextual_provider_file, workspace_root, headers_root, sd
     if mode == "completion-catalog" then
       local name = context.checked_source_modules[1]
       if name == "fixture.first" or name == "fixture.second" then
-        local provider = contextual_provider_file ..
-          (name == "fixture.second" and ".second" or "")
-        assert(context.io:lstat(provider))
-        local suffix = context.catalog_replacement and ".fresh" or ".old"
-        return { [name .. suffix] = {
-          serialized = "interface:" .. name .. suffix,
-          kind = "static", filename = provider,
-        } }
+        local selected_name = name .. ".selected"
+        local selected = assert(driver.imported[selected_name])
+        local sibling = name .. (context.catalog_replacement and ".fresh" or ".old")
+        return {
+          [selected_name] = {
+            serialized = "interface:" .. selected_name,
+            kind = "static", filename = selected.static_archive,
+          },
+          [sibling] = {
+            serialized = "interface:" .. sibling,
+            kind = "static", filename = selected.static_archive,
+          },
+        }
       end
     end
     return {}
@@ -631,10 +637,20 @@ return function(mode, contextual_provider_file, workspace_root, headers_root, sd
         end
       end
       local context = assert(options.context)
-      if mode == "completion-catalog" then
+      if mode == "completion-catalog" and (name == "fixture.first" or name == "fixture.second") then
         local source = options.source_overrides[name]
         context.catalog_replacement = source and
           source.contents[source.main] == "replacement"
+        -- An ordinary selected member makes this a complete archive capture,
+        -- unlike a lookup of one member through contextual provenance.
+        local provider = contextual_provider_file ..
+          (name == "fixture.second" and ".second" or "")
+        assert(context.io:lstat(provider))
+        local selected_name = name .. ".selected"
+        driver.imported[selected_name] = {
+          kind = "static", static_archive = provider,
+          type = module_type(selected_name), c_header_dependencies = {},
+        }
       end
       context.checked_source_modules[
         #context.checked_source_modules + 1] = name
@@ -1260,17 +1276,18 @@ function test_compiler_bridge_completion_catalog_owns_complete_pending_providers
         bridge.ProjectModule.new("fixture.last", {bridge.SourceFile.new(test_paths.workspace_root() .. "/last.titan", "old")}),
       }
       compiler:analyze_incremental(projects, {"fixture.first", "fixture.second", "fixture.last"}, {})
-      test.assert(#compiler:completion_binary_catalog() == 2,
+      test.assert(#compiler:completion_binary_catalog() == 4,
         "independent root attempts replaced earlier provider siblings")
       compiler:analyze_incremental(projects, {"fixture.last"}, {})
-      test.assert(#compiler:completion_binary_catalog() == 2,
+      test.assert(#compiler:completion_binary_catalog() == 4,
         "a later fixed-point iteration lost an unpublished provider")
       projects[1] = bridge.ProjectModule.new("fixture.first", {
         bridge.SourceFile.new(test_paths.workspace_root() .. "/first.titan", "replacement"),
       })
       compiler:analyze_incremental(projects, {"fixture.first"}, {})
       local catalog = compiler:completion_binary_catalog()
-      test.assert(#catalog == 2)
+      test.assert(#catalog == 4,
+        "recapture must retire the removed sibling and preserve the other archive")
       local fresh = false
       for index = 1, #catalog do
         test.assert(catalog[index].module_name ~= "fixture.first.old",
@@ -1280,8 +1297,11 @@ function test_compiler_bridge_completion_catalog_owns_complete_pending_providers
       test.assert(fresh, "recaptured provider lost its replacement inventory")
       fs.write_file(provider, "same pathname now contains a replaced archive")
       catalog = compiler:completion_binary_catalog()
-      test.assert(#catalog == 1 and catalog[1].filename == second,
-        "stale pending provider bytes survived a same-path replacement")
+      test.assert(#catalog == 2, "stale pending provider bytes survived a same-path replacement")
+      for index = 1, #catalog do
+        test.assert(catalog[index].filename == second,
+          "replacement retired descriptors from the wrong archive")
+      end
       compiler:release_completion_exports()
       test.assert(#compiler:completion_binary_catalog() == 0,
         "accepted publication retained pending compiler catalog memory")
@@ -1290,6 +1310,63 @@ function test_compiler_bridge_completion_catalog_owns_complete_pending_providers
       test.assert(#compiler:completion_binary_catalog() == 0,
         "configuration change retained an old provider selection")
     end, provider)
+  end)
+end
+
+function test_completion_catalog_merge_preserves_only_proven_replacement(context: test.Context)
+  local provider = "/providers/stock.so"
+  local identity = function (inode: integer): compiler_io.LstatIdentity
+    return compiler_io.LstatIdentity {
+      path = provider, kind = "file", device = 1, inode = inode, size = 100,
+      modified_seconds = 1, modified_nanoseconds = 0,
+    }
+  end
+  local capture = function (name: string, descriptor: string, ordinary: boolean,
+      observed: compiler_io.LstatIdentity?): bridge.CompletionBinary
+    return bridge.CompletionBinary {
+      module_name = name, serialized = descriptor, kind = "dynamic", filename = provider,
+      provider_identity = observed, replaces_group = ordinary,
+      documentation = descriptor,
+    }
+  end
+
+  context:run("shared_observations", function (_: test.Context)
+    local ordinary = capture("stock.rate", "ordinary", true, nil)
+    local contextual = capture("stock.rate", "contextual", false, nil)
+    local merged = bridge.merge_completion_catalog({ordinary}, {contextual}, true)
+    test.assert(#merged == 1 and merged[1].replaces_group,
+      "deduplicating the last ordinary member lost the pending group replacement")
+    test.assert(merged[1].serialized == "contextual" and merged[1].documentation == "contextual",
+      "deduplication did not keep the newest descriptor")
+  end)
+  context:run("contextual_then_ordinary", function (_: test.Context)
+    local rate = capture("stock.rate", "contextual rate", false, nil)
+    local quantity = capture("stock.quantity", "contextual quantity", false, nil)
+    local ordinary = capture("stock.rate", "ordinary", true, nil)
+    local merged = bridge.merge_completion_catalog({rate, quantity}, {ordinary}, true)
+    test.assert(#merged == 2 and merged[1] == quantity and merged[2] == ordinary,
+      "an ordinary DSO capture dropped a different exact observation")
+  end)
+  context:run("separate_observations", function (_: test.Context)
+    local ordinary = capture("stock.rate", "ordinary", true, identity(2))
+    local same = capture("stock.rate", "same file", false, identity(2))
+    local different = capture("stock.rate", "different file", false, identity(3))
+    local unknown = capture("stock.rate", "unobserved", false, nil)
+    local matching = bridge.merge_completion_catalog({ordinary}, {same}, false)
+    test.assert(#matching == 1 and matching[1].replaces_group and
+                matching[1].provider_identity == same.provider_identity and
+                matching[1].serialized == same.serialized,
+      "a subsequent attempt for the same physical provider lost the pending replacement")
+    local changed = bridge.merge_completion_catalog({ordinary}, {different}, false)
+    test.assert(#changed == 1 and changed[1] == different and not changed[1].replaces_group,
+      "a new file at the same path inherited another provider's replacement")
+    local old_sibling = capture("stock.quantity", "old sibling", false, ordinary.provider_identity)
+    changed = bridge.merge_completion_catalog({ordinary, old_sibling}, {different}, false)
+    test.assert(#changed == 1 and changed[1] == different,
+      "the prior file's independently observed sibling survived a physical replacement")
+    local unproven = bridge.merge_completion_catalog({ordinary}, {unknown}, false)
+    test.assert(#unproven == 1 and unproven[1] == unknown and not unproven[1].replaces_group,
+      "an unobserved provider inherited replacement without identity proof")
   end)
 end
 

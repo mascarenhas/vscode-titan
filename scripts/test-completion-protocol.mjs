@@ -1,11 +1,14 @@
 import assert from "node:assert/strict";
-import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { spawnSync } from "node:child_process";
+import { copyFile, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import * as path from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { pathToFileURL } from "node:url";
 import {
   FrameReader, collect, exitOf, frame, launch, makePhysicalTemporaryRoot,
   request, structuredLogRecords, waitForIndexing, withTimeout
 } from "./test-server-protocol.mjs";
+import { compilerDiscoveryEnvironment, titanCompilerCommand } from "./titan-sdk.mjs";
 
 assert.ok(process.argv[2], "usage: node scripts/test-completion-protocol.mjs PATH-TO-SERVER");
 const root = await makePhysicalTemporaryRoot("vscode-titan-completion-");
@@ -192,6 +195,264 @@ function assertCurrentHoverWhenReady(result, text, token, expected, label, occur
   if (result === null) return;
   assert.match(result.contents.value, expected, label);
   assert.deepEqual(result.range, rangeOf(text, token, occurrence), label);
+}
+
+async function testContextualBinaryCompletion() {
+  const prefix = process.env.TITAN_ROOT;
+  assert.ok(prefix, "the completion protocol fixture requires the matched SDK");
+  const producer = path.join(root, "contextual-producer");
+  const built = path.join(root, "contextual-build");
+  const library = path.join(producer, "stock");
+  await mkdir(library, { recursive: true });
+  await writeFile(path.join(library, "quantity.titan"), "record Quantity\n  count: integer\nend\n");
+  await writeFile(path.join(library, "rate.titan"), "record Rate\n  percent: integer\nend\n");
+  await writeFile(path.join(library, "sleeping.titan"), "const unused = 42\n");
+  await writeFile(path.join(producer, "via.titan"),
+    'local units = import "stock.quantity"\n' +
+    "function measure(): units.Quantity return units.Quantity(7) end\n");
+  await writeFile(path.join(producer, "other.titan"),
+    'local rates = import "stock.rate"\n' +
+    "function read(): rates.Rate return rates.Rate(25) end\n");
+
+  function compile(output, imports, ...modules) {
+    const invocation = titanCompilerCommand(prefix,
+      ["-q", "--tree", producer, "--output", output, ...modules]);
+    const env = { ...compilerDiscoveryEnvironment(), TITAN_ROOT: prefix, TITAN_PROBE_CACHE_DISABLE: "1" };
+    if (imports) env.TITAN_PATH_0_6 = imports;
+    const result = spawnSync(invocation.command, invocation.args,
+      { env, cwd: producer, encoding: "utf8", windowsHide: true, timeout: 120_000 });
+    assert.ifError(result.error);
+    assert.equal(result.status, 0, `${invocation.args.join(" ")}\n${result.stdout}\n${result.stderr}`);
+  }
+  const owner = path.join(built, "owner");
+  compile(owner, undefined, "stock.quantity", "stock.rate", "stock.sleeping");
+  const replacement = path.join(built, "replacement");
+  if (process.platform !== "win32") {
+    await writeFile(path.join(library, "quantity.titan"), "record Quantity\n  amount: integer\nend\n");
+    compile(replacement, undefined, "stock.quantity", "stock.rate", "stock.sleeping");
+  }
+  const via = path.join(built, "via");
+  const other = path.join(built, "other");
+  // Only stock's compiled output is on the producer's dependency path.
+  await rm(library, { recursive: true });
+  compile(via, owner, "via");
+  compile(other, owner, "other");
+
+  const formats = process.platform === "win32" ? [".dll"] : [".a", ".so"];
+  for (const extension of formats) {
+    const project = path.join(root, `contextual-${extension.slice(1)}`);
+    const src = path.join(project, "src");
+    const providers = path.join(project, "providers");
+    await mkdir(src, { recursive: true });
+    await mkdir(providers);
+    const provider = path.join(providers, `stock${extension}`);
+    await copyFile(path.join(owner, `stock${extension}`), provider);
+    await copyFile(path.join(via, `via${extension}`), path.join(providers, `via${extension}`));
+    await copyFile(path.join(other, `other${extension}`), path.join(providers, `other${extension}`));
+    await writeFile(path.join(project, "titan-config.lua"),
+      'include = { "./src" }\nsource_module_roots = { "./src" }\nbinary_modules_root = "./providers"\n');
+    const first = path.join(src, "app.titan");
+    const second = path.join(src, "report.titan");
+    const unrelated = path.join(src, "unrelated.titan");
+    const firstSource = 'local via = import "via"\nfunction count(): integer return via.measure().count end\n';
+    const secondSource = 'local other = import "other"\nfunction rate(): integer return other.read().percent end\n';
+    const unrelatedSource = "function untouched(): integer return 1 end\n";
+    const rated = 'local rates = import "stock.rate"\n' +
+      "function rate(): integer return rates.Rate(25).percent end\n";
+    const measured = 'local units = import "stock.quantity"\n' + rated +
+      "function count(): integer return units.Quantity(7).count end\n";
+    await writeFile(first, firstSource);
+    await writeFile(second, secondSource);
+    await writeFile(unrelated, unrelatedSource);
+
+    async function session(phase = "cold") {
+      const server = launch(project, "debug");
+      const frames = new FrameReader(server.stdout);
+      const diagnostics = collect(server.stderr);
+      const exited = exitOf(server);
+      let id = 0;
+      const send = (method, params) => server.stdin.write(frame({ jsonrpc: "2.0", method, params }));
+      async function ask(method, params) {
+        const response = await request(server, frames, ++id, method, params, 30_000);
+        assert.equal(response.error, undefined, JSON.stringify(response));
+        return response.result;
+      }
+      const document = (file) => ({ uri: uri(file) });
+      const pull = (file) => ask("textDocument/diagnostic", { textDocument: document(file) });
+      function assertCatalog(names, ordinary = []) {
+        const database = new DatabaseSync(path.join(project, ".titan-ls", "index.sqlite3"), { readOnly: true });
+        try {
+          const rows = database.prepare("SELECT module_name,provenance,main_file " +
+            "FROM completion_descriptors WHERE CAST(module_name AS TEXT) LIKE 'stock.%' ORDER BY module_name").all();
+          assert.deepEqual(rows.map(({ module_name }) => Buffer.from(module_name).toString()), names);
+          for (const row of rows) {
+            assert.equal(row.provenance, extension === ".a" ? "static" : "dynamic");
+            assert.equal(path.normalize(Buffer.from(row.main_file).toString()), path.normalize(provider));
+          }
+          const selected = database.prepare("SELECT name FROM external_records " +
+            "WHERE CAST(name AS TEXT) LIKE 'stock.%' ORDER BY name").all();
+          assert.deepEqual(selected.map(({ name }) => Buffer.from(name).toString()), ordinary,
+            "unexpected ordinary stock provider selections");
+        } finally {
+          database.close();
+        }
+      }
+      async function suggestions(file, caret, expected) {
+        const deadline = performance.now() + 30_000;
+        let result;
+        do {
+          result = await ask("textDocument/completion", { textDocument: document(file), position: caret.position });
+          if (result.items.some((item) => item.label === expected) || !result.isIncomplete) break;
+          await new Promise((resolve) => setTimeout(resolve, 25));
+        } while (performance.now() < deadline);
+        assert.ok(result.items.some((item) => item.label === expected),
+          `${extension}: missing ${expected} completion: ${JSON.stringify(result)}`);
+        return result;
+      }
+      async function member(file, contents, name) {
+        // Select a token occurring only after the receiver, not the function name.
+        const caret = marked(contents.replace(`.${name}`, `.${name[0]}@${name.slice(1)}`));
+        send("textDocument/didOpen", {
+          textDocument: { ...document(file), languageId: "titan", version: 1, text: caret.text }
+        });
+        const saved = await ask("textDocument/hover", { textDocument: document(file), position: caret.position });
+        assert.match(saved?.contents?.value ?? "", /integer/, `${extension}: saved ${name} hover`);
+        const result = await suggestions(file, caret, name);
+        assert.equal(result.items.find((item) => item.label === name)?.detail, "integer");
+        send("textDocument/didClose", { textDocument: document(file) });
+      }
+      async function imports(expected, ...absent) {
+        const caret = marked('local item = import "stock.@"\n');
+        send("textDocument/didOpen", {
+          textDocument: { ...document(unrelated), languageId: "titan", version: 1, text: caret.text }
+        });
+        excludes(await suggestions(unrelated, caret, expected), ...absent);
+        send("textDocument/didClose", { textDocument: document(unrelated) });
+      }
+      try {
+        const initialized = await ask("initialize", {
+          rootUri: uri(project),
+          workspaceFolders: [{ uri: uri(project), name: "contextual provider" }],
+          capabilities: { textDocument: { diagnostic: {} } }
+        });
+        assert.ok(initialized.capabilities.diagnosticProvider);
+        send("initialized", {});
+        assert.deepEqual((await pull(first)).items, []);
+        assert.deepEqual((await pull(second)).items, []);
+        if (phase === "mixed") {
+          assertCatalog(["stock.rate"], ["stock.rate"]);
+          await member(first, rated, "percent");
+          await member(second, secondSource, "percent");
+          await imports("stock.rate", "stock.quantity", "stock.sleeping");
+        } else if (phase === "contextual-first" || phase === "ordinary-first") {
+          const contextual = phase === "contextual-first" ? first : second;
+          const ordinary = contextual === first ? second : first;
+          assertCatalog(["stock.quantity", "stock.rate"], ["stock.rate"]);
+          await member(contextual, firstSource, "count");
+          await member(ordinary, rated, "percent");
+          await imports("stock.quantity", "stock.sleeping");
+          console.log(`${extension} ${phase}: contextual and ordinary members completed`);
+
+          if (phase === "ordinary-first") {
+            // A failed attempt can capture quantity but cannot authorize it.
+            await writeFile(second, firstSource.replace("().count", "().missing"));
+            assert.match(JSON.stringify((await pull(second)).items), /missing/);
+            assertCatalog(["stock.rate"], ["stock.rate"]);
+            await imports("stock.rate", "stock.quantity", "stock.sleeping");
+
+            await writeFile(second, firstSource);
+            assert.deepEqual((await pull(second)).items, []);
+            assertCatalog(["stock.quantity", "stock.rate"], ["stock.rate"]);
+
+            // No DSO recapture on this refresh: the old SQL row must still
+            // retire even though the DSO remains ordinarily selected.
+            await writeFile(second, unrelatedSource);
+            assert.deepEqual((await pull(second)).items, []);
+            assertCatalog(["stock.rate"], ["stock.rate"]);
+            await imports("stock.rate", "stock.quantity", "stock.sleeping");
+
+            // Windows can retain a mapped DLL; test removal there without
+            // requiring the OS to replace that running worker's image on disk.
+            if (extension === ".so") {
+              const staged = path.join(providers, "stock.next");
+              await copyFile(path.join(replacement, "stock.so"), staged);
+              await rename(staged, provider);
+              assert.deepEqual((await pull(first)).items, []);
+              assertCatalog(["stock.rate"], ["stock.rate"]);
+              await imports("stock.rate", "stock.quantity", "stock.sleeping");
+            }
+          }
+        } else {
+          assertCatalog(["stock.quantity", "stock.rate"]);
+          await member(first, firstSource, "count");
+          await member(second, secondSource, "percent");
+          await imports("stock.quantity", "stock.sleeping");
+          if (phase === "cold") {
+            await writeFile(unrelated, unrelatedSource.replace("return 1", "return 2"));
+            assert.deepEqual((await pull(unrelated)).items, []);
+            assertCatalog(["stock.quantity", "stock.rate"]);
+
+            // A failed saved check must not keep the previous owner alive
+            // through its old exposer edge. The other owner shares the file.
+            await writeFile(first, firstSource.replace("().count", "().missing"));
+            assert.match(JSON.stringify((await pull(first)).items), /missing/);
+            assertCatalog(["stock.rate"]);
+            await imports("stock.rate", "stock.quantity", "stock.sleeping");
+            await member(second, secondSource, "percent");
+
+            await writeFile(first, "function count(): integer return 1 end\n");
+            assert.deepEqual((await pull(first)).items, []);
+            assertCatalog(["stock.rate"]);
+            await writeFile(first, firstSource);
+            assert.deepEqual((await pull(first)).items, []);
+            assertCatalog(["stock.quantity", "stock.rate"]);
+            await member(first, firstSource, "count");
+          } else if (extension !== ".a") {
+            await writeFile(second, "function rate(): integer return 25 end\n");
+            await writeFile(first, measured);
+            assert.deepEqual((await pull(first)).items, []);
+            assert.deepEqual((await pull(second)).items, []);
+            assertCatalog(["stock.quantity", "stock.rate"], ["stock.quantity", "stock.rate"]);
+            await member(first, measured, "count");
+          }
+        }
+        await ask("shutdown", null);
+        send("exit");
+        server.stdin.end();
+        assert.deepEqual(await withTimeout(exited, "contextual completion shutdown", 10_000),
+          { code: 0, signal: null });
+      } catch (cause) {
+        throw new Error(`${extension} contextual completion (${phase}): ${cause.message}\n` +
+          diagnostics().toString("utf8"), { cause });
+      } finally {
+        if (server.exitCode === null && server.signalCode === null) {
+          server.kill();
+          await withTimeout(exited, "contextual completion cleanup", 5_000).catch(() => server.kill("SIGKILL"));
+        }
+      }
+    }
+    await session();
+    await session("warm");
+    if (extension !== ".a") {
+      // Write both roots between workers so one saved refresh checks the
+      // ordinary root (app) before the independent contextual root (report).
+      // Both capture rate from the same DSO; neither now selects quantity.
+      await writeFile(first, rated);
+      await writeFile(second, secondSource);
+      await session("mixed");
+
+      // Quantity has left the ordinary graph. Reintroduce it only through
+      // the facade. Edit both roots between workers for one saved workset;
+      // root names (app, report) determine the analysis order.
+      await writeFile(first, firstSource);
+      await writeFile(second, rated);
+      await session("contextual-first");
+      await writeFile(first, rated);
+      await writeFile(second, firstSource);
+      await session("ordinary-first");
+    }
+    console.log(`contextual completion ${extension}: exact owners, dormancy, retirement, repair and warm reuse passed`);
+  }
 }
 
 try {
@@ -626,6 +887,7 @@ try {
   console.log(JSON.stringify({ completion: "passed", measurements, memory,
     preparation: prepare.map(({ module, cpu_ms, wall_ms }) => ({ module, cpu_ms, wall_ms })),
     selection: select.map(({ cpu_ms, wall_ms }) => ({ cpu_ms, wall_ms })) }));
+  await testContextualBinaryCompletion();
 } catch (cause) {
   throw new Error(`${cause.message}\n${stderr().toString("utf8")}`, { cause });
 } finally {

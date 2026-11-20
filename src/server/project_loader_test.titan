@@ -5,6 +5,7 @@ local loader = import "server.project_loader.titan"
 local service = import "server.project_service"
 local config = import "server.project_config"
 local graph = import "server.project_graph"
+local metadata = import "server.project_metadata"
 local storage = import "server.completion_store"
 local sql = import "server.workspace_store"
 local runtime = import "server.test_runtime"
@@ -25,12 +26,13 @@ local function module(connection: sqlite3.Connection, name: string, provenance: 
   sql.execute(connection, "INSERT INTO main.graph_modules VALUES(?,?,?,0,1,NULL,NULL)", name, provenance, state)
 end
 
-local function fixture(connection: sqlite3.Connection)
-  graph.initialize_schema(connection)
+local function fixture(connection: sqlite3.Connection): metadata.Metadata
+  local state = metadata.create(connection, graph.create<|bridge.ModuleSnapshot|>(connection))
   module(connection, "app", 0, 2)
   module(connection, "unrelated", 0, 2)
   module(connection, "vendor.seed", 2, 2)
   sql.execute(connection, "INSERT INTO main.graph_imports VALUES('app','vendor.seed',0)")
+  return state
 end
 
 local function publish(connection: sqlite3.Connection, current: service.Snapshot,
@@ -55,8 +57,14 @@ function test_project_loader_catalog_survives_unrelated_refresh_and_replaces_pro
     fixture(connection)
     local current = snapshot({selected("vendor.seed", "/binary/vendor.a")})
     publish(connection, current, {
-      bridge.CompletionBinary.new("vendor.old", "old", "static", "/binary/vendor.a"),
-      bridge.CompletionBinary.new("vendor.shared", "before", "static", "/binary/vendor.a"),
+      bridge.CompletionBinary {
+        module_name = "vendor.old", serialized = "old", kind = "static",
+        filename = "/binary/vendor.a", replaces_group = true,
+      },
+      bridge.CompletionBinary {
+        module_name = "vendor.shared", serialized = "before", kind = "static",
+        filename = "/binary/vendor.a", replaces_group = true,
+      },
     }, false)
     publish(connection, current, {}, false)
     test.assert(count(connection, "vendor.old") == 1,
@@ -65,8 +73,14 @@ function test_project_loader_catalog_survives_unrelated_refresh_and_replaces_pro
     -- must not reject the replacement provider's now-disjoint inventory.
     module(connection, "vendor.old", 0, 2)
     publish(connection, current, {
-      bridge.CompletionBinary.new("vendor.shared", "after", "static", "/binary/vendor.a"),
-      bridge.CompletionBinary.new("vendor.new", "new", "static", "/binary/vendor.a"),
+      bridge.CompletionBinary {
+        module_name = "vendor.shared", serialized = "after", kind = "static",
+        filename = "/binary/vendor.a", replaces_group = true,
+      },
+      bridge.CompletionBinary {
+        module_name = "vendor.new", serialized = "new", kind = "static",
+        filename = "/binary/vendor.a", replaces_group = true,
+      },
     }, false)
     test.assert(count(connection, "vendor.old") == 0 and count(connection, "vendor.new") == 1)
     local rows = sql.rows(connection,
@@ -74,6 +88,51 @@ function test_project_loader_catalog_survives_unrelated_refresh_and_replaces_pro
     test.assert(sql.bytes(rows[1], 1) == "after", "recaptured sibling kept its old descriptor")
     publish(connection, snapshot({}), {}, false)
     test.assert(count(connection, "vendor.new") == 0, "deselected provider retained catalog-only siblings")
+  end)
+end
+
+function test_project_loader_dynamic_catalog_requires_exact_live_authorization(_: test.Context)
+  runtime.run(function ()
+    local store = sql.open(":memory:")
+    defer store:close()
+    local access = store:acquire()
+    defer access:release()
+    local connection = access.connection
+    local state = fixture(connection)
+    local provider = "/binary/vendor.so"
+    local current = snapshot({service.ExternalModule(
+      "vendor.seed", service.ExternalOrigin.dynamic_binary(provider),
+      graph.Manifest("public", "public"), {}, nil, {}, {}, {})})
+    sql.execute(connection, "INSERT INTO main.graph_imports VALUES('vendor.seed','vendor.contextual',0)")
+    state:write_fingerprint(metadata.ExternalFingerprint {
+      module_name = "vendor.contextual", source_required = false, topology_resolved = true,
+      origin = service.ExternalOrigin.dynamic_binary(provider),
+      stamps = {graph.FileStamp {
+        path = provider, modified_seconds = 1, modified_nanoseconds = 0,
+        size = 100, identity = "provider bytes",
+      }},
+    })
+    local ordinary = bridge.CompletionBinary {
+      module_name = "vendor.seed", serialized = "ordinary", kind = "dynamic",
+      filename = provider, replaces_group = true,
+    }
+    local contextual = bridge.CompletionBinary("vendor.contextual", "exact", "dynamic", provider)
+    local dormant = bridge.CompletionBinary("vendor.dormant", "dormant", "dynamic", provider)
+    publish(connection, current, {contextual, ordinary, dormant}, false)
+    test.assert(count(connection, "vendor.contextual") == 1 and
+                count(connection, "vendor.dormant") == 0,
+      "fresh DSO members did not follow their exact authorization")
+    publish(connection, current, {}, true)
+    test.assert(count(connection, "vendor.contextual") == 1,
+      "an unrelated publication lost a still-authorized contextual descriptor")
+    publish(connection, current, {ordinary}, true)
+    test.assert(count(connection, "vendor.contextual") == 0,
+      "a provider recapture reused a contextual descriptor it did not observe")
+    publish(connection, current, {contextual}, false)
+    sql.execute(connection, "DELETE FROM main.graph_imports WHERE importer='vendor.seed'")
+    publish(connection, current, {}, true)
+    test.assert(count(connection, "vendor.contextual") == 0,
+      "a selected DSO kept a previous descriptor after its authorization was dropped")
   end)
 end
 

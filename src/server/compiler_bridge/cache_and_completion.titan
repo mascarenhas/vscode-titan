@@ -4,17 +4,52 @@ local function CompletionBinary:provider_key(): string
   return self.kind .. "\0" .. self.filename
 end
 
--- A resolver captures complete selected providers, not independent names.
--- Replace recaptured inventories as a unit so removed siblings cannot survive.
+-- An ordinary recapture replaces a static inventory. A DSO has no captured
+-- inventory: keep its exact member observations for saved-graph admission.
+-- The incoming array is owned by this merge and its entries may be replaced.
 local function merge_completion_catalog(previous: const? {CompletionBinary},
-    captured: const? {CompletionBinary}): {CompletionBinary}
-  local replaced: {string: boolean} = {}
-  for index = 1, #captured do replaced[captured[index]:provider_key()] = true end
+    captured: {CompletionBinary}, shared_observations: boolean): {CompletionBinary}
+  local groups: {string: CompletionBinary} = {}
+  local members: {string: integer} = {}
+  for index = 1, #captured do
+    local binary = captured[index]
+    local key = binary:provider_key()
+    if groups[key] == nil or binary.replaces_group then groups[key] = binary end
+    members[key .. "\0" .. binary.module_name] = index
+  end
   local result: {CompletionBinary} = {}
   for index = 1, #previous do
     local binary = previous[index]
-    if binary.kind ~= "embedded" and not replaced[binary:provider_key()] then
-      result[#result + 1] = binary
+    local key = binary:provider_key()
+    local group? = groups[key]
+    local before? = binary.provider_identity
+    local after?: compiler_io.LstatIdentity = nil
+    if group ~= nil then after = group.provider_identity end
+    -- Attempts in one analysis share observations validated at its end.
+    -- Across analyses a different or unobserved file cannot inherit bytes
+    -- or group replacement, even at the same pathname.
+    local coherent = group == nil or shared_observations or
+      (before ~= nil and after ~= nil and
+        (before == after or compiler_io.same_lstat_identity(before, after)))
+    if binary.kind ~= "embedded" and coherent and
+        (binary.kind == "dynamic" or group == nil or not group.replaces_group) then
+      local overlap? = members[key .. "\0" .. binary.module_name]
+      if overlap == nil then
+        result[#result + 1] = binary
+      elseif binary.replaces_group and group ~= nil and not group.replaces_group then
+        local newer = captured[overlap]
+        -- Keep the newest descriptor without losing the pending ordinary
+        -- replacement when no other incoming entry carries it.
+        captured[overlap] = CompletionBinary {
+          module_name = newer.module_name,
+          serialized = newer.serialized,
+          kind = newer.kind,
+          filename = newer.filename,
+          provider_identity = newer.provider_identity,
+          replaces_group = true,
+          documentation = newer.documentation,
+        }
+      end
     end
   end
   for index = 1, #captured do result[#result + 1] = captured[index] end
@@ -39,18 +74,23 @@ local function completion_source_key(main_file: string, files: const? {string},
 end
 
 local function Compiler:read_completion_binary_catalog(context: value,
-    identity: compiler_io.LstatIdentity?): {CompletionBinary}
+    identity: compiler_io.LstatIdentity?,
+    selected_providers: {string: boolean}?):
+    {CompletionBinary}
   local catalog = self.driver["completion_binary_catalog"] as function (value): value
   local binaries = required_map(catalog(context), DRIVER_MODULE, "completion binary catalog")
   local result: {CompletionBinary} = {}
   for name, raw in iteration.pairs(binaries) do
     local item = required_map(raw, DRIVER_MODULE, "completion binary")
+    local kind: string = item["kind"]
+    local filename: string = item["filename"]
     result[#result + 1] = CompletionBinary {
       module_name = name,
       serialized = item["serialized"],
-      kind = item["kind"],
-      filename = item["filename"],
+      kind = kind,
+      filename = filename,
       provider_identity = identity,
+      replaces_group = selected_providers ~= nil and selected_providers[kind .. "\0" .. filename] == true,
       documentation = documentation_markdown(item["documentation"]),
     }
   end
@@ -509,7 +549,7 @@ function Compiler:completion_binary_catalog(seed_browser: boolean?): {Completion
     self.driver["imported"] = {} as {string: value}
     local context = self:new_context(nil)
     defer self:close_context(context)
-    local seed = self:read_completion_binary_catalog(context, browser.provider)
+    local seed = self:read_completion_binary_catalog(context, browser.provider, nil)
     for index = 1, #seed do result[#result + 1] = seed[index] end
   end
   return result
