@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { copyFile, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { copyFile, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import * as path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { pathToFileURL } from "node:url";
@@ -226,6 +226,11 @@ async function testContextualBinaryCompletion() {
   }
   const owner = path.join(built, "owner");
   compile(owner, undefined, "stock.quantity", "stock.rate", "stock.sleeping");
+  const replacement = path.join(built, "replacement");
+  if (process.platform !== "win32") {
+    await writeFile(path.join(library, "quantity.titan"), "record Quantity\n  amount: integer\nend\n");
+    compile(replacement, undefined, "stock.quantity", "stock.rate", "stock.sleeping");
+  }
   const via = path.join(built, "via");
   const other = path.join(built, "other");
   // Only stock's compiled output is on the producer's dependency path.
@@ -270,7 +275,7 @@ async function testContextualBinaryCompletion() {
       }
       const document = (file) => ({ uri: uri(file) });
       const pull = (file) => ask("textDocument/diagnostic", { textDocument: document(file) });
-      function assertCatalog(names) {
+      function assertCatalog(names, ordinary = []) {
         const database = new DatabaseSync(path.join(project, ".titan-ls", "index.sqlite3"), { readOnly: true });
         try {
           const rows = database.prepare("SELECT module_name,provenance,main_file " +
@@ -280,9 +285,10 @@ async function testContextualBinaryCompletion() {
             assert.equal(row.provenance, extension === ".a" ? "static" : "dynamic");
             assert.equal(path.normalize(Buffer.from(row.main_file).toString()), path.normalize(provider));
           }
-          assert.equal(database.prepare("SELECT count(*) AS n FROM external_records " +
-            "WHERE CAST(name AS TEXT) LIKE 'stock.%'").get().n, 0,
-          "contextual owners must not become ordinary imports");
+          const selected = database.prepare("SELECT name FROM external_records " +
+            "WHERE CAST(name AS TEXT) LIKE 'stock.%' ORDER BY name").all();
+          assert.deepEqual(selected.map(({ name }) => Buffer.from(name).toString()), ordinary,
+            "unexpected ordinary stock provider selections");
         } finally {
           database.close();
         }
@@ -353,6 +359,35 @@ async function testContextualBinaryCompletion() {
           assert.deepEqual((await pull(first)).items, []);
           assertCatalog(["stock.quantity", "stock.rate"]);
           await member(first, firstSource, "count");
+        } else if (extension !== ".a") {
+          // A DSO capture contains observed members, not all its exports.
+          // Its remaining ordinary import recaptures the group after a drop.
+          const rated = 'local rates = import "stock.rate"\n' +
+            "function rate(): integer return rates.Rate(25).percent end\n";
+          const measured = 'local units = import "stock.quantity"\n' + rated +
+            "function count(): integer return units.Quantity(7).count end\n";
+          await writeFile(second, "function rate(): integer return 25 end\n");
+          await writeFile(first, measured);
+          assert.deepEqual((await pull(first)).items, []);
+          assert.deepEqual((await pull(second)).items, []);
+          assertCatalog(["stock.quantity", "stock.rate"], ["stock.quantity", "stock.rate"]);
+          await member(first, measured, "count");
+
+          await writeFile(first, rated);
+          assert.deepEqual((await pull(first)).items, []);
+          assertCatalog(["stock.rate"], ["stock.rate"]);
+          await imports("stock.rate", "stock.quantity", "stock.sleeping");
+
+          // Windows can retain a mapped DLL; test removal there without
+          // requiring the OS to replace that running worker's image on disk.
+          if (extension === ".so") {
+            const staged = path.join(providers, "stock.next");
+            await copyFile(path.join(replacement, "stock.so"), staged);
+            await rename(staged, provider);
+            assert.deepEqual((await pull(first)).items, []);
+            assertCatalog(["stock.rate"], ["stock.rate"]);
+            await imports("stock.rate", "stock.quantity", "stock.sleeping");
+          }
         }
         await ask("shutdown", null);
         send("exit");

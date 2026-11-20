@@ -4,7 +4,7 @@ local function CompletionBinary:provider_key(): string
   return self.kind .. "\0" .. self.filename
 end
 
--- Only selected archive captures replace a whole provider inventory.
+-- Ordinary captures replace the provider's previous catalog group.
 -- Contextual-only captures from independent roots can share a physical file.
 local function merge_completion_catalog(previous: const? {CompletionBinary},
     captured: const? {CompletionBinary}): {CompletionBinary}
@@ -13,7 +13,7 @@ local function merge_completion_catalog(previous: const? {CompletionBinary},
   for index = 1, #captured do
     local binary = captured[index]
     local key = binary:provider_key()
-    if binary.complete_archive then replaced[key] = true end
+    if binary.replaces_group then replaced[key] = true end
     members[key .. "\0" .. binary.module_name] = true
   end
   local result: {CompletionBinary} = {}
@@ -48,21 +48,22 @@ end
 
 local function Compiler:read_completion_binary_catalog(context: value,
     identity: compiler_io.LstatIdentity?,
-    selected_archives: {string: boolean}?):
+    selected_providers: {string: boolean}?):
     {CompletionBinary}
   local catalog = self.driver["completion_binary_catalog"] as function (value): value
   local binaries = required_map(catalog(context), DRIVER_MODULE, "completion binary catalog")
   local result: {CompletionBinary} = {}
   for name, raw in iteration.pairs(binaries) do
     local item = required_map(raw, DRIVER_MODULE, "completion binary")
+    local kind: string = item["kind"]
+    local filename: string = item["filename"]
     result[#result + 1] = CompletionBinary {
       module_name = name,
       serialized = item["serialized"],
-      kind = item["kind"],
-      filename = item["filename"],
+      kind = kind,
+      filename = filename,
       provider_identity = identity,
-      complete_archive = item["kind"] == "static" and selected_archives ~= nil and
-                         selected_archives[item["filename"]] == true,
+      replaces_group = selected_providers ~= nil and selected_providers[kind .. "\0" .. filename] == true,
       documentation = documentation_markdown(item["documentation"]),
     }
   end

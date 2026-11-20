@@ -5,6 +5,7 @@ local loader = import "server.project_loader.titan"
 local service = import "server.project_service"
 local config = import "server.project_config"
 local graph = import "server.project_graph"
+local metadata = import "server.project_metadata"
 local storage = import "server.completion_store"
 local sql = import "server.workspace_store"
 local runtime = import "server.test_runtime"
@@ -26,7 +27,7 @@ local function module(connection: sqlite3.Connection, name: string, provenance: 
 end
 
 local function fixture(connection: sqlite3.Connection)
-  graph.initialize_schema(connection)
+  metadata.create(connection, graph.create<|bridge.ModuleSnapshot|>(connection))
   module(connection, "app", 0, 2)
   module(connection, "unrelated", 0, 2)
   module(connection, "vendor.seed", 2, 2)
@@ -55,8 +56,14 @@ function test_project_loader_catalog_survives_unrelated_refresh_and_replaces_pro
     fixture(connection)
     local current = snapshot({selected("vendor.seed", "/binary/vendor.a")})
     publish(connection, current, {
-      bridge.CompletionBinary.new("vendor.old", "old", "static", "/binary/vendor.a"),
-      bridge.CompletionBinary.new("vendor.shared", "before", "static", "/binary/vendor.a"),
+      bridge.CompletionBinary {
+        module_name = "vendor.old", serialized = "old", kind = "static",
+        filename = "/binary/vendor.a", replaces_group = true,
+      },
+      bridge.CompletionBinary {
+        module_name = "vendor.shared", serialized = "before", kind = "static",
+        filename = "/binary/vendor.a", replaces_group = true,
+      },
     }, false)
     publish(connection, current, {}, false)
     test.assert(count(connection, "vendor.old") == 1,
@@ -65,8 +72,14 @@ function test_project_loader_catalog_survives_unrelated_refresh_and_replaces_pro
     -- must not reject the replacement provider's now-disjoint inventory.
     module(connection, "vendor.old", 0, 2)
     publish(connection, current, {
-      bridge.CompletionBinary.new("vendor.shared", "after", "static", "/binary/vendor.a"),
-      bridge.CompletionBinary.new("vendor.new", "new", "static", "/binary/vendor.a"),
+      bridge.CompletionBinary {
+        module_name = "vendor.shared", serialized = "after", kind = "static",
+        filename = "/binary/vendor.a", replaces_group = true,
+      },
+      bridge.CompletionBinary {
+        module_name = "vendor.new", serialized = "new", kind = "static",
+        filename = "/binary/vendor.a", replaces_group = true,
+      },
     }, false)
     test.assert(count(connection, "vendor.old") == 0 and count(connection, "vendor.new") == 1)
     local rows = sql.rows(connection,
