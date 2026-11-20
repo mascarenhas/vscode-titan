@@ -527,7 +527,6 @@ local function Compiler:run_attempt_inner(
   if browser_foreign ~= nil then
     foreign_owners = browser_foreign_owners(raw_context, imported, failed, root_module)
   end
-  local completion_binaries = self:read_completion_binary_catalog(context, nil)
   local checked_set: {string: boolean} = {}
   for index = 1, #checked do checked_set[checked[index]] = true end
   -- A loader that fails before publishing a module cannot add the root to the
@@ -537,6 +536,7 @@ local function Compiler:run_attempt_inner(
 
   local modules: {ModuleSnapshot} = {}
   local embedded_modules: {string: boolean} = {}
+  local selected_archives: {string: boolean} = {}
   local entries: {string: value} = {}
   local names = sorted_entry_names(imported, normalization_work)
   for index = 1, #names do
@@ -552,6 +552,12 @@ local function Compiler:run_attempt_inner(
       local snapshot = normalized.snapshot
       modules[#modules + 1] = snapshot
       if normalized.embedded_provider then embedded_modules[name] = true end
+      if not normalized.embedded_provider then
+        case snapshot.provenance
+        when static_binary{provider_file} then selected_archives[provider_file] = true
+        else
+        end
+      end
       if profiling then
         logging.emit("trace", "compiler.module.normalization", {
           ["root_module"] = root_module,
@@ -587,7 +593,7 @@ local function Compiler:run_attempt_inner(
     checked = checked,
     entries = entries,
     failed = failed,
-    completion_binaries = completion_binaries,
+    completion_binaries = self:read_completion_binary_catalog(context, nil, selected_archives),
     browser_foreign = browser_foreign,
     foreign_owners = foreign_owners,
   }
@@ -855,6 +861,7 @@ function Compiler:analyze_incremental(
       kind = binary.kind,
       filename = binary.filename,
       provider_identity = identity,
+      complete_archive = binary.complete_archive,
       documentation = binary.documentation,
     }
   end

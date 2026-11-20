@@ -4,16 +4,24 @@ local function CompletionBinary:provider_key(): string
   return self.kind .. "\0" .. self.filename
 end
 
--- A resolver captures complete selected providers, not independent names.
--- Replace recaptured inventories as a unit so removed siblings cannot survive.
+-- Only selected archive captures replace a whole provider inventory.
+-- Contextual-only captures from independent roots can share a physical file.
 local function merge_completion_catalog(previous: const? {CompletionBinary},
     captured: const? {CompletionBinary}): {CompletionBinary}
   local replaced: {string: boolean} = {}
-  for index = 1, #captured do replaced[captured[index]:provider_key()] = true end
+  local members: {string: boolean} = {}
+  for index = 1, #captured do
+    local binary = captured[index]
+    local key = binary:provider_key()
+    if binary.complete_archive then replaced[key] = true end
+    members[key .. "\0" .. binary.module_name] = true
+  end
   local result: {CompletionBinary} = {}
   for index = 1, #previous do
     local binary = previous[index]
-    if binary.kind ~= "embedded" and not replaced[binary:provider_key()] then
+    local key = binary:provider_key()
+    if binary.kind ~= "embedded" and not replaced[key] and
+       not members[key .. "\0" .. binary.module_name] then
       result[#result + 1] = binary
     end
   end
@@ -39,7 +47,9 @@ local function completion_source_key(main_file: string, files: const? {string},
 end
 
 local function Compiler:read_completion_binary_catalog(context: value,
-    identity: compiler_io.LstatIdentity?): {CompletionBinary}
+    identity: compiler_io.LstatIdentity?,
+    selected_archives: {string: boolean}?):
+    {CompletionBinary}
   local catalog = self.driver["completion_binary_catalog"] as function (value): value
   local binaries = required_map(catalog(context), DRIVER_MODULE, "completion binary catalog")
   local result: {CompletionBinary} = {}
@@ -51,6 +61,8 @@ local function Compiler:read_completion_binary_catalog(context: value,
       kind = item["kind"],
       filename = item["filename"],
       provider_identity = identity,
+      complete_archive = item["kind"] == "static" and selected_archives ~= nil and
+                         selected_archives[item["filename"]] == true,
       documentation = documentation_markdown(item["documentation"]),
     }
   end
@@ -509,7 +521,7 @@ function Compiler:completion_binary_catalog(seed_browser: boolean?): {Completion
     self.driver["imported"] = {} as {string: value}
     local context = self:new_context(nil)
     defer self:close_context(context)
-    local seed = self:read_completion_binary_catalog(context, browser.provider)
+    local seed = self:read_completion_binary_catalog(context, browser.provider, nil)
     for index = 1, #seed do result[#result + 1] = seed[index] end
   end
   return result

@@ -42,8 +42,9 @@ local function binary_provider_key(kind: string, filename: string): string
   return kind .. "\0" .. filename
 end
 
--- Catalog-only siblings belong to a complete physical provider. Saved graph
--- names always win, and a recapture replaces all prior siblings of its owner.
+-- Only selected providers contribute complete inventories. An unselected
+-- provider can contribute the exact binary owners reached through compiled
+-- interfaces from a clean project, never its other members.
 local function completion_catalog(connection: sqlite3.Connection,
     snapshot: service.Snapshot, binaries: const? {bridge.CompletionBinary},
     reusable: boolean, browser_provider: string?):
@@ -56,13 +57,32 @@ local function completion_catalog(connection: sqlite3.Connection,
   local graph_rows = sql.rows(connection, "SELECT name,provenance FROM main.graph_modules")
   for index = 1, #graph_rows do graph_names[graph_rows[index]:get(1)] = graph_rows[index]:get(2) end
   local clean: {string: boolean} = {}
+  local contextual: {string: string} = {}
   local reachable = sql.rows(connection,
     "WITH RECURSIVE reachable(name) AS (" ..
     "SELECT imported FROM main.graph_imports AS e JOIN main.graph_modules AS m ON m.name=e.importer " ..
     "WHERE m.provenance=0 AND m.state=2 UNION " ..
     "SELECT imported FROM reachable AS r JOIN main.graph_modules AS m ON m.name=r.name " ..
-    "JOIN main.graph_imports AS e ON e.importer=r.name WHERE m.provenance<>0) SELECT name FROM reachable")
-  for index = 1, #reachable do clean[reachable[index]:get(1)] = true end
+    "JOIN main.graph_imports AS e ON e.importer=r.name WHERE m.provenance<>0 AND m.state=2), " ..
+    "contextual(name) AS (SELECT DISTINCT e.imported FROM reachable AS r " ..
+    "JOIN main.graph_modules AS m ON m.name=r.name AND m.provenance=2 AND m.state=2 " ..
+    "JOIN main.graph_imports AS e ON e.importer=m.name WHERE e.visibility=0) " ..
+    "SELECT r.name,o.kind,o.main_path FROM reachable AS r " ..
+    "LEFT JOIN contextual AS c ON c.name=r.name " ..
+    "LEFT JOIN main.external_observations AS o ON o.name=CAST(c.name AS BLOB) " ..
+    "AND o.kind IN (1,2) AND o.error IS NULL AND EXISTS (" ..
+    "SELECT 1 FROM main.external_files AS f WHERE f.scope=0 AND f.module=o.name " ..
+    "AND f.path=o.main_path AND f.identity IS NOT NULL)")
+  for index = 1, #reachable do
+    local row = reachable[index]
+    local name: string = row:get(1)
+    clean[name] = true
+    local kind?: integer = row:get(2)
+    if kind ~= nil and graph_names[name] == nil then
+      contextual[name] = binary_provider_key(kind == 1 and "dynamic" or "static",
+        sql.bytes(row, 3))
+    end
+  end
   local selected: {string: boolean} = {}
   local clean_providers: {string: boolean} = {}
   for index = 1, #snapshot.external_modules do
@@ -86,11 +106,17 @@ local function completion_catalog(connection: sqlite3.Connection,
       "WHERE provenance IN ('static','dynamic','embedded') ORDER BY module_name")
   end
   local replaced: {string: boolean} = {}
+  local recaptured_contextual: {string: boolean} = {}
   local blocked: {string: boolean} = {}
   for index = 1, #binaries do
     local binary = binaries[index]
     local key = binary_provider_key(binary.kind, binary.filename)
-    replaced[key] = true
+    if binary.kind == "embedded" or key == browser_provider_key or
+       (binary.complete_archive and selected[key]) then
+      replaced[key] = true
+    elseif contextual[binary.module_name] == key then
+      recaptured_contextual[binary.module_name] = true
+    end
     local provenance? = graph_names[binary.module_name]
     if provenance ~= nil and provenance ~= 2 then blocked[key] = true end
   end
@@ -115,6 +141,8 @@ local function completion_catalog(connection: sqlite3.Connection,
       keep = reusable
     elseif key == browser_provider_key or selected[key] then
       keep = reusable or clean_providers[key] == true
+    elseif contextual[name] == key then
+      keep = not recaptured_contextual[name]
     end
     if graph_names[name] == nil and not blocked[key] and not replaced[key] and
        keep then
@@ -131,7 +159,8 @@ local function completion_catalog(connection: sqlite3.Connection,
     local binary = binaries[index]
     local key = binary_provider_key(binary.kind, binary.filename)
     if graph_names[binary.module_name] == nil and not blocked[key] and
-       (binary.kind == "embedded" or key == browser_provider_key or selected[key] == true) then
+       (binary.kind == "embedded" or key == browser_provider_key or
+        selected[key] == true or contextual[binary.module_name] == key) then
       local previous? = choices[binary.module_name]
       if previous == nil then
         names[#names + 1] = binary.module_name
@@ -140,13 +169,16 @@ local function completion_catalog(connection: sqlite3.Connection,
       elseif binary.kind == "embedded" then
         choices[binary.module_name] = binary
         fresh[binary.module_name] = true
-      elseif previous.kind ~= "embedded" and
-             binary.filename > previous.filename then
-        -- Preserve the compiler's deterministic catalog ordering. Ordinary
-        -- graph selections remain authoritative; invalid archive overlap still
-        -- belongs to the compiler's resolver diagnostics.
-        choices[binary.module_name] = binary
-        fresh[binary.module_name] = true
+      elseif previous.kind ~= "embedded" then
+        local authorized? = contextual[binary.module_name]
+        local previous_key = binary_provider_key(previous.kind, previous.filename)
+        -- An exact observed owner wins over an unrelated captured sibling,
+        -- without changing the compiler's order among ordinary inventories.
+        if (authorized == key and authorized ~= previous_key) or
+           (authorized ~= previous_key and binary.filename > previous.filename) then
+          choices[binary.module_name] = binary
+          fresh[binary.module_name] = true
+        end
       end
     end
   end
