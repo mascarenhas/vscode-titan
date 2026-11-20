@@ -158,8 +158,51 @@ function test_project_loader_dynamic_catalog_requires_exact_live_authorization(_
       "a selected DSO kept a previous descriptor after its authorization was dropped")
     sql.execute(connection, "INSERT INTO main.graph_imports VALUES('vendor.seed','vendor.contextual',0)")
     publish(connection, current, {contextual}, false)
+    -- Simulate a validated stamp after a touch without changing the mapped
+    -- file observation. A new capture cannot certify those two versions.
+    local touched = graph.FileStamp {
+      path = before.path, modified_seconds = before.modified_seconds + 5,
+      modified_nanoseconds = before.modified_nanoseconds, size = before.size,
+      identity = before.identity, physical_identity = before.physical_identity,
+    }
+    state:write_fingerprint(metadata.ExternalFingerprint {
+      module_name = "vendor.contextual", source_required = false, topology_resolved = true,
+      origin = origin, stamps = {touched},
+    })
+    local uncertified = bridge.CompletionBinary("vendor.contextual", "uncertified", "dynamic", provider)
+    publish(connection, current, {ordinary, uncertified}, true)
+    local rows = sql.rows(connection, "SELECT public_interface,provider_witness " ..
+      "FROM main.completion_descriptors WHERE module_name=?", sqlite3.Blob("vendor.contextual"))
+    test.assert(#rows == 1 and sql.bytes(rows[1], 1) == "exact" and
+      sql.optional_bytes(rows[1], 2) == identity.saved_file_content_witness(before.physical_identity, before.identity),
+      "an uncertified recapture eclipsed the already witnessed bytes after a touch")
+
+    -- A different physical object cannot reuse the witness, even with the
+    -- same digest. Replay the old row below for the independent byte change.
+    local saved = storage.SavedDescriptor {
+      module_name = "vendor.contextual", revision = 0, state = 2, provenance = "dynamic",
+      main_file = provider, public_interface = sql.bytes(rows[1], 1),
+      source_files = {}, imports = {}, header_inputs = {}, candidates = {},
+      provider_witness = sql.bytes(rows[1], 2),
+    }
+    local other = identity.observe(temporary)
+    test.assert(other.physical_identity ~= before.physical_identity)
+    state:write_fingerprint(metadata.ExternalFingerprint {
+      module_name = "vendor.contextual", source_required = false, topology_resolved = true,
+      origin = origin, stamps = {graph.FileStamp {
+        path = provider, size = touched.size, identity = touched.identity,
+        modified_seconds = touched.modified_seconds, modified_nanoseconds = touched.modified_nanoseconds,
+        physical_identity = other.physical_identity,
+      }},
+    })
+    publish(connection, current, {ordinary}, true)
+    test.assert(count(connection, "vendor.contextual") == 0,
+      "matching bytes on a different physical object reused the old witness")
+    storage.publish_saved(connection, {saved}, {"vendor.contextual"}, bridge.CompilerConfiguration())
     fs.write_file(provider, "replacement provider bytes")
     local after = stamp_provider("replacement provider bytes")
+    test.assert(after.physical_identity == before.physical_identity,
+      "changed-content test did not keep the same physical provider")
     state:write_fingerprint(metadata.ExternalFingerprint {
       module_name = "vendor.contextual", source_required = false, topology_resolved = true,
       origin = origin, stamps = {after},

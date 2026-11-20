@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { copyFile, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { copyFile, mkdir, readFile, rename, rm, stat, utimes, writeFile } from "node:fs/promises";
 import * as path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { pathToFileURL } from "node:url";
@@ -264,6 +264,7 @@ async function testContextualBinaryCompletion() {
       "function rate(): integer return rates.Rate(25).percent end\n";
     const measured = 'local units = import "stock.quantity"\n' + rated +
       "function count(): integer return units.Quantity(7).count end\n";
+    const touchedFacade = firstSource + "\n-- Recheck the facade after touching the provider.\n";
     await writeFile(first, firstSource);
     await writeFile(second, secondSource);
     await writeFile(unrelated, unrelatedSource);
@@ -375,6 +376,10 @@ async function testContextualBinaryCompletion() {
           assert.ok(firstDiagnostics.items.length > 0 && secondDiagnostics.items.length > 0);
           assertCatalog(undefined, [], ["stock.quantity", "stock.sleeping"]);
           await excludesMember(second, firstSource.replace("().count", "().amount"), "amount");
+        } else if (phase === "warm-touched") {
+          assertCatalog(["stock.quantity", "stock.rate"], ["stock.rate"]);
+          await member(second, touchedFacade, "count");
+          await imports("stock.quantity", "stock.sleeping");
         } else if (phase === "mixed") {
           assertCatalog(["stock.rate"], ["stock.rate"]);
           await member(first, rated, "percent");
@@ -416,6 +421,31 @@ async function testContextualBinaryCompletion() {
             await writeFile(second, firstSource);
             assert.deepEqual((await pull(second)).items, []);
             assertCatalog(["stock.quantity", "stock.rate"], ["stock.rate"]);
+
+            // Change only the file's timestamp. Each publisher must preserve
+            // the already witnessed bytes, including after an unprovable live
+            // facade recapture by this still-resident worker.
+            const before = await stat(provider);
+            await utimes(provider, before.atime, new Date(before.mtimeMs + 5000));
+            const after = await stat(provider);
+            assert.equal(after.ino, before.ino);
+            assert.equal(after.dev, before.dev);
+            assert.notEqual(after.mtimeMs, before.mtimeMs);
+
+            await writeFile(unrelated, unrelatedSource.replace("return 1", "return 3"));
+            assert.deepEqual((await pull(unrelated)).items, []);
+            assertCatalog(["stock.quantity", "stock.rate"], ["stock.rate"]);
+            await member(second, firstSource, "count");
+
+            await writeFile(first, rated.replace("Rate(25)", "Rate(27)"));
+            assert.deepEqual((await pull(first)).items, []);
+            assertCatalog(["stock.quantity", "stock.rate"], ["stock.rate"]);
+            await member(second, firstSource, "count");
+
+            await writeFile(second, touchedFacade);
+            assert.deepEqual((await pull(second)).items, []);
+            assertCatalog(["stock.quantity", "stock.rate"], ["stock.rate"]);
+            await member(second, touchedFacade, "count");
           } else if (extension === ".so") {
             // The old image remains resident even though the analyzed path now
             // points to a new provider. It cannot authenticate a saved row.
@@ -493,7 +523,14 @@ async function testContextualBinaryCompletion() {
       await writeFile(first, rated);
       await writeFile(second, firstSource);
       await session("ordinary-first");
-      await replaceProvider(replacement);
+      await session("warm-touched");
+      // Unlike a touch, new bytes on the very same object invalidate the old
+      // witness. Do this after shutdown, including on Windows.
+      const beforeRewrite = await stat(provider);
+      await writeFile(provider, await readFile(path.join(replacement, `stock${extension}`)));
+      const afterRewrite = await stat(provider);
+      assert.equal(afterRewrite.ino, beforeRewrite.ino);
+      assert.equal(afterRewrite.dev, beforeRewrite.dev);
       await session("replaced");
       await rm(provider);
       await session("removed");
