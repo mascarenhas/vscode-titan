@@ -27,16 +27,20 @@ Each fact has one home. Elsewhere, link to it in one line.
 
 | Topic | Home |
 | --- | --- |
-| Users: features, build commands, settings, `titan-config.lua`, workspace cache, logging, packaging, Windows limits | `README.md` |
-| Compiler-owned native builds, build profiles, test execution, output trees, CI, Windows driver | `docs/native-build.md` |
-| Configuration inputs, compiler compatibility, loader and Service composition | `docs/server-data-flow.md` |
-| SQLite schema, cache compatibility, header provenance, startup revalidation | `docs/sqlite-backend-storage.md` |
-| Completion, hover after completion, TEMP storage and bounds | `docs/completion.md` |
-| Declaration documentation | `docs/documentation.md` |
-| Multi-part unions and server data-model rules | `docs/union-payload-parts.md` |
-| Native line coverage | `docs/coverage.md` |
-| Benchmark scripts, measured conclusions, retired evidence records | `docs/benchmarks.md` |
-| Codex plugin and query client | `docs/codex.md` |
+| Happy-path quickstart: VS Code VSIX, standalone CLI, local builds and F5 | `README.md` |
+| VS Code extension usage: VSIX install, editing features, `titan-config.lua`, settings, multi-root/symlink/remote workspaces, logs, `.titan-ls` cache, Windows notes | `docs/vscode-extension.md` |
+| Standalone language server usage: CLI install, compiler discovery, `initializationOptions`, multi-root routing, per-root `compiler_root` and `trustedRoots`, `titan/workspaceStatus`, `omp` setup, probe cache layout | `docs/language-server.md` |
+| Codex plugin and `titan-lsp-query.mjs` query client | `docs/codex.md` |
+| Implementation book (*Inside `vscode-titan`*): architecture diagram, codebase map, Titan feature showcase matrix, Table of Contents | `docs/index.md` |
+| Ch. 1: Process architecture, multi-root routing (`server.router`), configuration inputs, compiler compatibility, browser analysis, composition path | `docs/server-data-flow.md` |
+| Ch. 2: Framing, JSON-RPC wire/reflect codecs, lifecycle/dispatch, O(1) queues, pre-Task capture, cancellation, outbound requests, stderr logging | `docs/protocol-and-concurrency.md` |
+| Ch. 3: External compiler bridge (`server.compiler_bridge`), cooperative permit, AST traversal, declaration documentation rendering, C FFI, `CompilerIO` proxy isolation | `docs/compiler-bridge.md` |
+| Ch. 4: Discovery, watch filtering, fixed-point refresh (`server.project_service`), SQLite leases/batching, schema-8 cache compatibility, header provenance, startup revalidation | `docs/sqlite-backend-storage.md` |
+| Ch. 5: Saved-file navigation, hover, folding, diagnostics, multi-part union shorthand rename (`server.semantic_features`), server data-model rules (`#server-data-models`), `server.application` lifecycle | `docs/semantic-features.md` |
+| Ch. 6: Unsaved completion, live hover after completion, TEMP storage and bounds | `docs/completion.md` |
+| Appendix A: Compiler-owned native builds, build profiles, test execution, output trees, paired browser semantic pack, CI, experimental Windows driver | `docs/native-build.md` |
+| Appendix B: Native executable line coverage | `docs/coverage.md` |
+| Appendix C: Benchmark scripts, measured conclusions, retired evidence records (`#retired-evidence-records`) | `docs/benchmarks.md` |
 
 Documentation rules:
 

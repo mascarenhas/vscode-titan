@@ -1,251 +1,166 @@
-# Completion from editor buffers
+# Chapter 6: Unsaved Buffers — Private Completion and Live Hover
 
-Completion analyzes unsaved text. Once a completion request activates private
-analysis, hover follows edits to the active module. Definition, references,
-rename, folding and diagnostics still describe saved files.
+Completion analyzes unsaved editor buffers against one committed saved baseline, and once a completion request activates private analysis, hover follows edits to the active module as well. Definition, references, rename, folding, and diagnostics remain anchored to saved files.
 
-The server enables completion at startup through
-`Coordinator:configure_completion`. `initialize_result` in
-`src/server/lifecycle.titan` then advertises full-document synchronization
-(`change: 1`), `.` and `:` trigger characters and `labelDetailsSupport`.
-The usual editor completion command also works in lexical, import-name,
-qualified-type and foreign-type positions. Inside a `foreign function`, whose
-signature and body write C types without `foreign`, the C type after an
-annotation's `:` (parameters, results, locals, numeric `for`) or a cast's `as`
-is a foreign-type position too; the compiler finds the enclosing function from
-the tokens before the caret. These positions offer only C primitives and the
-types of the module's C environment, not Titan types.
+At startup, `Coordinator:configure_completion` in [`src/server/coordinator.titan`](../src/server/coordinator.titan) enables document synchronization and completion routing. `initialize_result` in [`src/server/lifecycle.titan`](../src/server/lifecycle.titan) advertises full-document sync (`change: 1`), `.` and `:` trigger characters, and `labelDetailsSupport`. Explicit completion invocation works in lexical, import-name, qualified-type, and foreign-type positions. Inside a `foreign function`, where signatures and bodies write C types without a `foreign` prefix, types after `:` (parameters, results, locals, numeric `for`) and casts after `as` are foreign-type positions determined from tokens before the caret; those positions offer only C primitives and the module's C environment.
 
-Candidates come from compiler lookup at the caret: lexical bindings, visible
-module members, constructors and static functions, record and interface
-fields, instance methods, C aggregate fields, and the actual `ffi` value
-binding. Foreign types have their own C namespace, which local `ffi` shadowing
-does not affect. Direct source imports keep their private Titan visibility. C
-include inheritance follows its own compiler rules.
+Candidates originate from compiler lookup at the caret: lexical bindings, visible module members, constructors and static functions, record and interface fields, instance methods, C aggregate fields, and the `ffi` value binding. Foreign types occupy a separate C namespace unaffected by local `ffi` shadowing. Direct `.titan` source imports retain their private Titan visibility, and C include inheritance follows compiler rules. Declaration and module doc comments appear in completion documentation and hover; see [Declaration documentation](compiler-bridge.md#declaration-documentation).
 
-Declaration and module doc comments appear in completion extra information and
-in hover; see [declaration documentation](documentation.md).
+Completion edits replace the entire active identifier, including any suffix after the caret. Foreign-type completions replace only the name leaf while preserving pointer and qualifier syntax, and multiword C primitives insert their complete spelling. Comments and unrelated string literals produce no candidates, and unresolved receivers or syntax errors can yield empty or incomplete lists.
 
-Edits replace the entire active name, including any suffix after the caret.
-Foreign completions replace only the name leaf and keep pointer and qualifier
-syntax. Multiword primitives insert their complete spelling. Comments and
-unrelated string literals have no candidates. Unresolved receivers and
-unrelated syntax errors can produce empty or incomplete lists. General recovery
-from malformed source is out of scope.
-
-Private completion uses the current worker's accepted target and the same
-committed baseline as saved analysis. Shadowed and inactive variants never
-contribute candidates. For a browser root, import completion includes the
-accepted SDK's eligible module inventory even when no source has been saved.
-Member completion reads the Wasm interfaces from that captured catalog.
-If a saved source overlaps the archive, its catalog siblings stay hidden
-until the overlap is removed and a new saved view is published.
-Changing the target starts a new worker and replays the open documents, not
-the previous worker's temporary completion or hover facts.
+Private analysis inherits the worker's accepted target and committed saved baseline; shadowed and inactive target variants never contribute candidates. For a browser root, import completion includes the accepted SDK's eligible module inventory even before any source file is saved (`Compiler:completion_binary_catalog` with `seed_browser`), and member completion reads Wasm interfaces from that captured catalog. If saved source overlaps a browser archive module, its catalog siblings stay hidden until the overlap is removed and a new saved view commits. Changing the target starts a fresh worker and replays open editor buffers without carrying over the previous worker's temporary completion or hover facts.
 
 ## Callable presentation and insertion
 
-`Compiler:completion_presentation` in `src/server/compiler_bridge.titan`
-renders callables in value positions. The `label` and `filterText` stay the
-bare name. `detail` carries the full signature with parameter names, generic
-parameters and results. Clients that support `labelDetails` also see the
-signature suffix next to the name.
+`Compiler:completion_presentation` in [`src/server/compiler_bridge/cache_and_completion.titan`](../src/server/compiler_bridge/cache_and_completion.titan) formats callables appearing in value and foreign-value positions. `label` and `filterText` remain the bare identifier, `detail` carries the full declaration signature (parameter names, generic parameters, and results), and clients advertising `labelDetailsSupport` receive the signature suffix in `labelDetails.detail`.
 
-For snippet-capable clients, the call snippet is
-`choose(${1:first}, ${2:second})$0`, with the declaration's parameter names as
-placeholders. Unnamed parameters use `arg1`, `arg2` and so on; the signature
-does not invent names for them. The placeholders escape `\`, `$` and `}`.
-Bound methods list only their explicit arguments. A zero-argument call inserts
-`name()$0`. A function with only a variadic tail gets one empty tab stop.
-Type positions, including type aliases, always insert plain names.
-`completion_call_snippet` in `src/server/lsp_types.titan` drops the snippet
-when arguments already follow the token. This covers positional, named,
-generic, string and long-bracket arguments, also across comments, and it keeps
-the whole-token replacement range.
+For snippet-capable clients, callable items carry a call snippet such as `choose(${1:first}, ${2:second})$0` using declared parameter names as placeholders (`arg1`, `arg2`, and so on when parameters are unnamed, without inventing names in the displayed signature). Placeholders escape `\`, `$`, and `}`. Bound methods include only explicit arguments; zero-argument callables insert `name()$0`; a variadic-only callable inserts a single empty tab stop (`$1`). Type positions, including function type aliases, always insert plain names. `completion_call_snippet` in [`src/server/lsp_types.titan`](../src/server/lsp_types.titan) suppresses the snippet when call or generic arguments (`(`, `{`, `<|`, quoted or long-bracket strings) already follow the identifier across whitespace or comments while keeping the whole-token replacement range.
 
-`titan.completion.insertCallSnippets` defaults to `true`. Turn it off to insert
-plain names when you take function or bound-method references. Standalone
-clients send `initializationOptions.insertCallSnippets: false`. Clients without
-snippet support always receive a plain identifier. The setting is the explicit
-escape hatch because the compiler's completion context does not expose the
-expected callable type at the hole. Signature display does not depend on the
-insertion policy.
+`titan.completion.insertCallSnippets` defaults to `true` (standalone clients send `initializationOptions.insertCallSnippets: false`). Disabling it inserts plain identifiers when taking function or bound-method references, because the compiler's completion context does not expose an expected callable type at the caret. Clients lacking `snippetSupport` always receive plain text; signature display is independent of insertion policy.
 
-During private preparation, `Compiler:observe_completion_facts` wraps the
-compiler's `titan-compiler.completion` `fact` observer while specialized type
-and declaration metadata is still available. The wrapper reuses the
-named-signature renderer and restores the original observer on every exit,
-before the compiler permit is released. Saved compiler descriptors keep their
-compiler-owned schema. Only TEMP candidates carry insertion presentation.
+Because the compiler's scalar completion facts omit declaration parameter names, private preparation attaches a scoped observer around `titan-compiler.completion`'s `fact` function while specialized types and declarations are live. `Compiler:analyze_completion` installs the wrapper under the compiler permit and restores the original function via `defer` on every exit, keeping saved compiler descriptors untouched:
+
+```titan
+local function Compiler:observe_completion_facts(): function (): ()
+  local module = completion_module()
+  local previous: value = module["fact"]
+  local original = previous as function (...: value): (...: value)
+  module["fact"] = function (name: value, candidate: value, declaration: value,
+      domain: value, owner: value, mode: value, depth: value,
+      private: value, spelling_only: value): value
+    local fact: value = original(name, candidate, declaration, domain, owner,
+      mode, depth, private, spelling_only)
+    if fact ~= nil then
+      local row = required_map(fact, "titan-compiler.completion", "candidate")
+      self:completion_presentation(row, name, candidate, declaration)
+    end
+    return fact
+  end
+  return function () module["fact"] = previous end
+end
+```
+*Source: [`src/server/compiler_bridge/cache_and_completion.titan`](../src/server/compiler_bridge/cache_and_completion.titan) — `Compiler:observe_completion_facts`*
 
 ## Hover from recent completion
 
-An accepted preparation also writes per-occurrence hover text for the captured
-contributors of the active logical module. Hover reads these scalar TEMP rows
-without rechecking source or decoding compiler descriptors. It maps positions
-back from the disposable source and skips the synthetic hole itself.
-Occurrences before and after the hole keep their original UTF-16 coordinates.
+Each accepted private preparation also writes per-occurrence rendered Markdown (`PreparedView:completion_hovers`) for every captured contributor of the active logical module. Hover queries read those scalar TEMP rows without rechecking source or decoding compiler descriptors. `completion_hovers` in [`src/server/completion_service.titan`](../src/server/completion_service.titan) maps byte spans back across the synthetic hole delta and drops any span touching the dummy identifier, preserving original UTF-16 coordinates before and after the hole.
 
-The first completion request activates continuing private analysis for the
-most recently requested document and logical module. Buffer edits, including
-an accepted call snippet, coalesce behind a 200 ms trailing debounce
-(`HOVER_DEBOUNCE_MS` in `src/server/completion_service.titan`). Newer edits
-cancel superseded preparation, and explicit completion requests take priority
-over queued hover refreshes. A refresh checks the ordinary captured editor
-bytes without the completion hole. The newly inserted callee and its arguments
-therefore get occurrence facts without another completion request. Imports
-still see one committed saved baseline.
+The first completion request activates live private hover for the active document and logical module. Subsequent buffer edits — including accepting a call snippet — coalesce behind a 200 ms trailing debounce (`HOVER_DEBOUNCE_MS`). Newer edits cancel superseded preparation, and explicit completion requests preempt queued hover refreshes. Debounced hover preparation checks the raw captured editor bytes without a completion hole, so newly inserted callees and arguments gain exact hover facts without another completion trigger while imports read one committed saved baseline.
 
-A usable preparation atomically replaces the accepted hover snapshot. During
-the debounce, compiler work or a malformed edit, the previous snapshot stays
-available with its original version and saved-generation provenance. Hover
-maps the current position back to that snapshot, and maps the occurrence range
-forward to current UTF-16 coordinates. Each full-sync change contributes a
-conservative common-prefix and common-suffix replacement. An occurrence is
-omitted if any replacement touches it, or if its complete token bytes or
-boundaries changed. At most 64 changes per contributor are mapped; a fresh
-snapshot resets that history. Two separate edits in one full-sync change can
-conservatively omit unchanged occurrences between them. Until replacement
-facts arrive, an untouched occurrence may show the previous type or
-documentation, but it is never relabeled as freshly checked. Provisional
-completion candidates never authorize hover.
+When a usable preparation finishes, it atomically replaces the accepted `HoverContext`. During debounce, compilation, or transient syntax errors, the preceding accepted snapshot stays queryable with its original version and saved-generation provenance. `HoverContext:follow` records one conservative common-prefix/common-suffix `ByteChange` (`changed_bytes`) per full-sync edit, up to 64 changes per contributor (`exhausted` beyond that). `Service:read_hover` maps the current caret byte backward (`HoverFile:original_offset`), queries `temp.retained_hovers` under the SQLite lease, maps the hit span forward (`HoverFile:current_span`), and rejects the match if any edit touched the occurrence, altered its token bytes, or joined adjacent identifier characters at either boundary. Two disjoint edits inside one full-sync payload conservatively omit occurrences between them. Untouched occurrences display their retained type and documentation without ever being relabeled as current-version facts, and provisional completion candidates never authorize hover.
 
-Hover requests capture exact current inputs before scheduling and reject
-requests superseded during SQL reads. Closing and reopening a document, or
-exceeding a contributor's buffer budget, retires its context. Reopening the
-active path queues analysis for the new session, which cannot borrow old
-occurrences. A save keeps the accepted hover while the watcher prepares saved
-facts. The committed saved publication then queues reanalysis against the new
-baseline.
+```titan
+local const HOVER_DEBOUNCE_MS = 200
+-- ...
+function Service:hover(capture: buffers.Capture): dispatcher.SemanticOutcome?
+  for _ = 1, 2 do
+    local context? = self.hover_context
+    if self.closed or context == nil or not self.buffers:current(capture) then return nil end
+    local outcome? = self:read_hover(capture, context)
+    if outcome ~= nil then return outcome end
+    -- An accepted artifact may change while the lookup waits for SQL. Retained
+    -- original rows cover that handoff; retry once also finds a newly available
+    -- occurrence that was absent from the previous completion-hole snapshot.
+    if self.hover_context == context then return nil end
+  end
+  return nil
+end
+```
+*Source: [`src/server/completion_service.titan`](../src/server/completion_service.titan) — `HOVER_DEBOUNCE_MS`, `Service:hover`*
 
-Hover returns no result for dirty text before completion activates analysis,
-and at an occurrence without a safe mapping. Clean text and closed documents
-keep ordinary saved hover. Context that depends on unsaved-only C headers is
-not kept for hover, because those headers have no saved watcher freshness.
+Hover requests capture exact editor inputs synchronously in `Application:capture_hover` before scheduling a `Task`, rejecting results superseded during SQL reads. Closing and reopening a document or exceeding a contributor's buffer cap retires its context; reopening the active path schedules fresh analysis under a new session that cannot borrow prior occurrences. Saving keeps the accepted hover active while the watcher reindexes disk; committing the new saved generation queues reanalysis against the updated baseline.
 
-Optional hover data is capped at 4 MiB and 100,000 occurrences
-(`MAX_HOVER_BYTES` and `MAX_HOVER_ROWS` in `completion_types`). The cap lives
-within the shared TEMP snapshot limits below. Separate retained hover tables
-keep candidate replacement and saved-generation eviction from deleting
-accepted hover during a handoff. The previous artifact survives one
-replacement, so a reader queued behind publication can finish with its
-captured snapshot id; the next publication retires it. A miss retries once
-against an accepted context that changed while it waited for SQL. Fresh
-candidates become ready after their usable hover artifact is accepted, which
-covers immediate snippet selection. Exceeding a limit keeps valid completion
-results and leaves the accepted hover artifact in place. Eviction can still
-remove bounded retained artifacts. Process exit discards all TEMP rows.
+Dirty text before the first completion returns no hover result, as does any occurrence without a safe edit mapping. Clean open text matching committed bytes and closed documents use saved hover (`Features:matches_source`). Preparations that depend on unsaved-only C headers (`volatile_headers`) are never retained for hover because those headers lack watcher-owned freshness.
+
+Optional hover rows are capped at 4 MiB and 100,000 occurrences (`MAX_HOVER_BYTES` and `MAX_HOVER_ROWS` in [`src/server/completion_types.titan`](../src/server/completion_types.titan)), counted inside the shared TEMP snapshot budget. Dedicated `temp.retained_hover_*` tables isolate accepted hover from candidate eviction and saved-generation cleanup. `Store:publish_hover` retains one preceding artifact (`previous_id`) across pointer swap so a lookup queued behind SQL publication finishes cleanly against its captured snapshot ID; the following publication retires it, and `Service:hover` retries once if `hover_context` advanced during the wait. Fresh completion candidates become visible only after their usable hover artifact is accepted, covering immediate snippet selection. Exceeding a hover cap preserves valid completion candidates and retains the prior accepted hover artifact; process exit drops all TEMP rows.
 
 ## Input and publication ownership
 
-`document_buffers` assigns a fresh session to each open document and accepts
-increasing versions. The coordinator captures immutable inputs before it
-creates a request Task. Every open selected contributor to the active folder
-module takes part. Open inactive target variants add nothing and receive no
-semantic completion. Other modules' editor text is ignored, so imports see one
-committed saved baseline. A new file-backed path works when the configured
-roots and the captured catalog prove an unambiguous module identity selected
-for the root's target (`completion_discovery`). Untitled, unmapped, inactive,
-ambiguous, excluded and uncovered paths are deferred. Known saved ownership
-stays authoritative.
+`BufferStore` in [`src/server/document_buffers.titan`](../src/server/document_buffers.titan) assigns a fresh monotonic `session` to each open document, accepts strictly increasing versions, and tracks retained byte totals. Before the coordinator spawns a request `Task`, `BufferStore:capture` freezes an immutable `Capture` containing `const {Input}` and `const {string}` views:
 
-The watcher publishes the `main.completion_*` configuration, exact provenance,
-source and header inventories, scalar members and body-free compiler
-descriptors in the same transaction as the saved semantic facts. Completion
-never uses mutable graph work rows as a committed baseline. Warm startup keeps
-the catalog without waiting for background compiler-manifest restoration.
+```titan
+record Capture
+  const document: Input
+  const inputs: const {Input}
+  const unavailable_paths: const {string}
+  const epoch: integer
+  const position: source_text.Position
+end
+-- ...
+function BufferStore:capture(path: string, position: source_text.Position): Capture?
+  if self.capacity_exceeded then return nil end
+  local state? = self:find(path)
+  if state == nil or state.input == nil then return nil end
+  local unavailable: {string} = {}
+  for index = 1, #self.documents do
+    if self.documents[index].input == nil then
+      unavailable[#unavailable + 1] = self.documents[index].path
+    end
+  end
+  local unavailable_paths = unavailable as const {string}
+  return Capture {
+    document = state.input,
+    inputs = self:inputs(),
+    unavailable_paths = unavailable_paths,
+    epoch = self.revision,
+    position = position,
+  }
+end
+```
+*Source: [`src/server/document_buffers.titan`](../src/server/document_buffers.titan) — `Capture`, `BufferStore:capture`*
 
-`completion_service` owns disposable preparation, using captured source bytes,
-private compiler entries and a private I/O provider. It decodes the captured
-dependency closure. The shared compiler scheduler still serializes the Lua
-global state. Persisted C cache reads are fenced by the saved generation, and
-transient work cannot publish persistent compiler caches. Resolution is closed
-over the captured source and provider inventory.
+Every open selected contributor of the active folder module participates in private analysis (`Request:active_module`), while open inactive target variants contribute nothing and receive no semantic completion. Editor text in other modules is ignored so imports resolve against one committed saved baseline.
 
-Selected static archives contribute their complete module inventory, including
-siblings that saved source does not import. The bridge accumulates whole
-provider captures across independent roots and fixed-point analysis. It
-validates their observed file identities and releases pending captures after
-publication. Recapturing an archive replaces its inventory as a unit
-(`merge_completion_catalog`), so removed siblings disappear. Saved source names
-and provider deselection keep stale binary entries from surviving. Embedded
-inventories also survive a compatible warm restart.
+For an unsaved file not yet present in `main.semantic_files`, `find` in [`src/server/completion_discovery.titan`](../src/server/completion_discovery.titan) proves unambiguous module ownership purely from captured roots, include/exclude filters, inactive-variant paths, open paths, and the committed baseline — without filesystem I/O. It imports `server.project_discovery` through its ordinary compiled public interface (`relative_parent`, `valid_path_components`, `valid_module_name`, `module_path`, `terminal_component`, `module_owner`), avoiding production `.titan` source imports across server modules. Known saved ownership remains authoritative; untitled, unmapped, inactive, ambiguous, excluded, and uncovered paths yield no candidates.
 
-An unrelated saved refresh keeps an untouched provider's committed catalog
-while a clean project still reaches that provider. If all its importers fail
-and no fresh capture is available, the old catalog is discarded: current file
-observations alone cannot validate its previous bytes. Fresh captures still
-work alongside unrelated source diagnostics. Completion results that are
-already prepared stay available under the ordinary context and session rules.
+The watcher commits `main.completion_*` configuration, provenance, source and header inventories, scalar members, and body-free descriptors (`completion_store.publish_saved`) in the same SQLite transaction as saved semantic facts. Completion reads only committed baselines, never mutable graph rows, and warm startup retains the committed catalog without waiting for background compiler-manifest restoration.
 
-Header and include-search identities are checked before and after private
-analysis (`restat_c_header_dependencies`) and compared with the analysis's
-actual observations. Newly introduced explicit headers are checked too. Until
-saved indexing owns them, later requests schedule private header validation
-before they treat the prepared result as fresh. Usable provisional candidates
-stay available during that validation.
+`Service:prepare` runs a disposable `Compiler` configured with `analysis_only`, `completion_closed_world`, and `transient_caches`. It restores only the transitive dependency closure reported by `bridge.completion_dependencies(active)` through `Store:read_descriptor`, reading persisted C-header caches through `Store:read_saved_cache` fenced by `saved_generation` while discarding all cache writes. Shared Lua global state remains serialized by `compiler_scheduler`.
 
-The compiler inserts a marked dummy identifier into a disposable copy of the
-source, keeping the operator and surrounding foreign-type syntax. It finds the
-exact span and captures scope and receiver facts before the expected dummy
-lookup failure. Ordinary checking is unchanged. Persisted descriptors carry
-their own format version, separate from language-server API `1`.
+Selected static archives contribute their complete module inventory, including siblings unimported by saved source. `merge_completion_catalog` in [`src/server/compiler_bridge/cache_and_completion.titan`](../src/server/compiler_bridge/cache_and_completion.titan) replaces each recaptured archive by provider key so removed siblings disappear, while saved-source precedence and provider deselection prevent stale binary entries from surviving. Untouched providers retain their committed catalog across unrelated refreshes as long as a clean project reaches them; when every importer fails without a fresh capture, the prior catalog is dropped.
+
+Before and after private analysis, `Service:prepare` validates every captured and observed C header with `Compiler:restat_c_header_dependencies`. Newly introduced unsaved headers are recorded in `volatile_headers`; subsequent requests re-stat them before treating a prepared result as fresh, while serving usable provisional candidates during revalidation.
+
+`bridge.prepare_completion` inserts a marked dummy identifier into a disposable copy of the active file while preserving surrounding operator and foreign-type syntax, captures scope and receiver facts before the expected dummy lookup failure, and leaves ordinary checking untouched. Persisted descriptors carry their own format version, independent of language-server API version `1`.
 
 ## TEMP storage and selection
 
-Completion shares the workspace's single serialized SQLite connection; see
-[workspace storage](sqlite-backend-storage.md#connection-ownership). Opening it
-runs `PRAGMA temp_store=MEMORY` and verifies that it reads back `2` before any
-TEMP object is created. Saved publications, TEMP publications and logical reads
-each hold the connection lease for their complete operation.
+Completion shares the workspace's serialized SQLite connection; see [Connection ownership](sqlite-backend-storage.md#connection-ownership). `workspace_store.open` sets `PRAGMA temp_store = MEMORY`, and `completion_store.open` verifies that `PRAGMA temp_store` reads back `2` before creating any TEMP table. Saved publications, TEMP writes, and logical reads each hold the connection lease for their entire unit of work.
 
-Candidate publication inserts 11 rows of 17 bindings per statement. That stays
-under Titan's 200-position variadic-call limit. A superseded TEMP publication
-rolls back its whole transaction, including batches already inserted.
-`main.completion_descriptors` is a rowid table, so its primary key has a
-separate index. Child foreign-key checks then read only the narrow module key,
-not the large descriptor payload. Keep large payloads out of parent-key
-indexes.
+`write_candidates` in [`src/server/completion_store.titan`](../src/server/completion_store.titan) inserts 11 rows of 17 bindings per statement (187 parameters), staying below Titan's 200-argument variadic call limit; optional `call_snippet` and `documentation` fields pass empty blobs restored to SQL `NULL` by `NULLIF(?, X'')`. A superseded TEMP publication returns `false` and rolls back its entire transaction. `main.completion_descriptors` is a rowid table rather than `WITHOUT ROWID` so child foreign-key probes read only the compact primary-key index instead of multi-megabyte descriptor overflow pages.
 
-TEMP owns open documents, input vectors, coverage, scopes, scalar candidates
-and hover rows. Its cascading foreign keys stay within the TEMP schema.
-Snapshots record the saved generation, buffer epoch, session and version, and
-the exact caret context. Coverage stays explicit for empty or failed analyses,
-so obsolete saved declarations cannot reappear under another prefix.
+TEMP tables (`open_documents`, `completion_snapshots`, `completion_inputs`, `covered_modules`, `completion_scopes`, `completion_candidates`, `completion_hovers`, and `retained_hover_*`) enforce cascading foreign keys exclusively within `temp`. Explicit `covered_modules` rows cover empty or errored analyses so obsolete saved declarations cannot leak through under another prefix.
 
-Fresh selection uses only qualified SELECTs over scalar columns. Under the same
-lease it validates the generation and inputs, chooses the nearest available
-compiler lookup keys, and applies a binary, case-sensitive prefix range
-(`label COLLATE BINARY >= ? AND < ?`), so `_` is literal. The limit is 200
-items. Truncation or partial knowledge sets `isIncomplete`.
+Fresh selection runs strictly qualified `SELECT` statements over scalar TEMP columns under one lease: validating `saved_generation`, `context_key`, `prefix`, and live `open_documents`, deduplicating shadowed bindings with `ROW_NUMBER() OVER (PARTITION BY lookup_domain, lookup_key ORDER BY scope_depth DESC, declaration_order DESC, ordinal)`, and filtering prefixes with a binary, case-sensitive range (`label COLLATE BINARY >= ? AND label COLLATE BINARY < ?` using `prefix_upper`) so `_` matches literally. Selection caps responses at 200 items and sets `isIncomplete` on truncation or non-`complete` quality:
 
-Interactive completion favors useful suggestions while fresh analysis catches
-up. During a buffer change, a saved-generation refresh or header validation,
-it can reuse the last prepared candidates for the same document and open
-session. It does so only when the source before the active token is unchanged.
-This anchor keeps an unrelated receiver or lexical context from borrowing the
-result. Provisional selection reads only the retained TEMP snapshot, never a
-mix of old candidates and newer saved facts. It filters with the current
-prefix and builds the whole-token edit range from the current UTF-16 text.
-Every provisional list has `isIncomplete: true`, and its declarations and
-types may be out of date. Fresh results still pass the strict generation,
-input and context checks above.
+```titan
+function Store:select(snapshot_id: string, context_key: string,
+                       prefix: string, limit: integer, current: Current): facts.Selection?
+  if self.closed then return nil end
+  local access = self.store:acquire()
+  defer access:release()
+  local connection = access.connection
+  local snapshots = sql.rows(connection,
+    "SELECT saved_generation,quality FROM temp.completion_snapshots WHERE id=? AND context_key=? AND prefix=?",
+    blob(snapshot_id), blob(context_key), prefix)
+  if #snapshots ~= 1 or not current() or
+      not current_generation(connection, snapshots[1]:get(1)) then return nil end
+  if sql.scalar_integer(connection,
+      "SELECT count(*) FROM temp.completion_inputs AS i WHERE i.snapshot_id=? AND i.session>0 " ..
+      "AND NOT EXISTS(SELECT 1 FROM temp.open_documents AS d WHERE d.filename=i.filename " ..
+      "AND d.session=i.session AND d.version=i.version AND d.contents=i.contents)", blob(snapshot_id)) ~= 0 then
+    return nil
+  end
+  return select_candidates(connection, snapshot_id, prefix, limit, snapshots[1]:get(2), current)
+end
+```
+*Source: [`src/server/completion_store.titan`](../src/server/completion_store.titan) — `Store:select`*
 
-Without a usable prepared result, `Service:answer` polls for preparation for
-about 150 ms (15 sleeps of 10 ms), subject to cooperative scheduling. If none
-is ready, it returns an incomplete list. It does not wait for workspace
-restoration. Cancelling a request does not cancel the watcher or a TEMP
-transaction. Changed inputs cancel stale private preparation. An independent
-transaction owner completes or rolls back before shutdown drains it.
+While replacement preparation runs after an edit, a saved refresh, or header revalidation, `Service:provisional` reuses the last prepared TEMP snapshot for the same document and open session whenever the source bytes preceding the active token match `ready.anchor` verbatim. Provisional selection (`Store:select_provisional`) reads only that retained TEMP snapshot — never mixing old candidates with newer saved rows — filters with the current prefix, computes the whole-token replacement range from current UTF-16 text, and always marks `isIncomplete: true`.
 
-Saving never promotes TEMP facts: the watcher reindexes disk while the editor
-keeps its version. Closing retires editor state, and reopening gets a new
-session. A changed saved generation makes old snapshots ineligible for fresh
-selection. Bounded retention can still serve provisional candidates across
-ordinary saves. The first accepted view and any later semantic configuration
-change retire provisional completion and retained private hover from an
-earlier baseline. Closed sessions cannot reuse their snapshots. Other
-database connections cannot see TEMP content.
+When neither a fresh nor a provisional result is available, `Service:answer` polls for up to 150 ms (15 iterations of `timer.sleep(10)`) without waiting for workspace restoration, returning an empty incomplete list if preparation has not finished. Request cancellation detaches only the caller; `Store:write` executes every TEMP transaction in an independent `Task` so cancellation cannot strand an uncommitted SQLite transaction, and `Service:close` joins all writers before closing the store. Input changes cancel superseded private preparation tasks.
+
+Saving a file never promotes TEMP facts: the watcher reindexes disk independently. Closing a document retires its TEMP rows, and reopening opens a new session that cannot reuse old snapshots. A newer saved generation disqualifies older snapshots from fresh selection while allowing bounded provisional reuse across ordinary saves; the first accepted `View` and any later semantic configuration change advance `minimum_saved_generation` (`Service:saved_changed`), retiring earlier provisional completion and retained hover. Other database connections cannot see TEMP tables.
 
 ## Bounds and checks
 
@@ -256,40 +171,17 @@ database connections cannot see TEMP content.
 | Captured saved baseline source, interfaces | 32 MiB, 64 MiB | `completion_store` |
 | Detached descriptor preparation | 64 MiB | `completion_service` |
 
-Oversized text keeps a version watermark and can recover on a bounded full
-update. Exceeding the document count disables completion until the server
-restarts, because forgetting a contributor could wrongly restore its saved
-bytes. Exceeding a preparation limit leaves completion incomplete. Superseded
-snapshots and closed editor rows are evicted. Retained provisional candidates
-count against the same snapshot limits. These bounds cap owned data, not
-process RSS.
+Oversized editor text retains a version watermark so a later bounded full-sync update recovers cleanly. Exceeding the 256-document cap disables completion until restart (`capacity_exceeded`) because dropping an open contributor could falsely substitute saved bytes. Exceeding a preparation cap leaves completion incomplete. `make_snapshot_room` evicts the oldest snapshots across both completion and retained hover inventories by monotonic `serial`. These limits cap server-owned data rather than total process RSS.
 
-Focused tests cover buffers, discovery, storage, service and protocol
-(`*_test.titan` beside each module, and `make completion-protocol-test`).
-Real-file storage tests check that main bytes are unchanged, that a second
-connection is isolated, and that TEMP rows are lost on restart. They also check
-rollback, stale identities, empty coverage and binary-prefix and shadowing
-rules. Compiler tests own lexical and receiver semantics. For timing
-measurements, see [completion timings](benchmarks.md#completion-timings).
+Native tests beside each module (`*_test.titan`) and `make completion-protocol-test` exercise buffers, discovery, TEMP storage, isolation across connections, restart disposal, rollback, stale identities, empty coverage, binary-prefix shadowing, and live stdio interactions. Compiler tests own lexical and receiver lookup semantics. For measured request and preparation timings, see [Completion timings](benchmarks.md#completion-timings).
 
 ## Design precedents
 
-The design follows published language-server practice:
+- [LSP 3.17 completion](https://github.com/microsoft/language-server-protocol/blob/gh-pages/_specifications/lsp/3.17/language/completion.md) keeps `label` as the bare name, places signatures in `labelDetails.detail` and `detail`, gates snippets on `snippetSupport`, and uses explicit whole-token `textEdit` plus `filterText` to avoid client word guessing.
+- [LuaLS](https://luals.github.io/wiki/settings/#completionshowparams), [rust-analyzer](https://rust-analyzer.github.io/book/configuration#rust-analyzercompletioncallablesnippets), and [gopls](https://go.dev/gopls/settings#completeFunctionCalls) separate signature display from call insertion so users can take function references without snippet expansion.
+- The [Haskell Language Server](https://github.com/haskell/haskell-language-server/blob/5327ae014b5fa7fce028f22c55499ddd9f0d2de7/ghcide/src/Development/IDE/Core/PositionMapping.hs) serves retained semantic results across edits via conservative position mapping, matching retained live hover here.
+- [clangd](https://clangd.llvm.org/design/threads) debounces rebuilds across a 50–500 ms window; the fixed 200 ms `HOVER_DEBOUNCE_MS` sits within that range.
 
-- [LSP 3.17 completion](https://github.com/microsoft/language-server-protocol/blob/gh-pages/_specifications/lsp/3.17/language/completion.md)
-  keeps `label` as the bare name and puts signatures in `labelDetails.detail`
-  and `detail`. Advertised `snippetSupport` gates snippet syntax. An explicit
-  whole-token `textEdit` with `filterText` avoids client word guessing.
-- [LuaLS](https://luals.github.io/wiki/settings/#completionshowparams),
-  [rust-analyzer](https://rust-analyzer.github.io/book/configuration#rust-analyzercompletioncallablesnippets)
-  and [gopls](https://go.dev/gopls/settings#completeFunctionCalls) show
-  signatures independently of insertion and offer a way to insert a function
-  reference. A callable candidate alone does not prove that the user wants to
-  call it.
-- The [Haskell Language Server](https://github.com/haskell/haskell-language-server/blob/5327ae014b5fa7fce028f22c55499ddd9f0d2de7/ghcide/src/Development/IDE/Core/PositionMapping.hs)
-  serves a retained, possibly stale result and maps positions conservatively
-  through edits. Retained hover here works the same way.
-- [clangd](https://clangd.llvm.org/design/threads) debounces rebuilds with an
-  adaptive delay of 50 to 500 ms. The fixed 200 ms interval here is a tuning
-  choice within that range. Adaptive timing can follow if measured preparation
-  cost justifies it.
+---
+
+← Previous: [Chapter 5](semantic-features.md) | [Table of Contents](index.md) | Next: [Appendix A: Build System, Static Providers, Testing, and Packaging](native-build.md) →
