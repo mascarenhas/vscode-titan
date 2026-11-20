@@ -140,14 +140,19 @@ return function(mode, contextual_provider_file, workspace_root, headers_root, sd
     if mode == "completion-catalog" then
       local name = context.checked_source_modules[1]
       if name == "fixture.first" or name == "fixture.second" then
-        local provider = contextual_provider_file ..
-          (name == "fixture.second" and ".second" or "")
-        assert(context.io:lstat(provider))
-        local suffix = context.catalog_replacement and ".fresh" or ".old"
-        return { [name .. suffix] = {
-          serialized = "interface:" .. name .. suffix,
-          kind = "static", filename = provider,
-        } }
+        local selected_name = name .. ".selected"
+        local selected = assert(driver.imported[selected_name])
+        local sibling = name .. (context.catalog_replacement and ".fresh" or ".old")
+        return {
+          [selected_name] = {
+            serialized = "interface:" .. selected_name,
+            kind = "static", filename = selected.static_archive,
+          },
+          [sibling] = {
+            serialized = "interface:" .. sibling,
+            kind = "static", filename = selected.static_archive,
+          },
+        }
       end
     end
     return {}
@@ -631,10 +636,20 @@ return function(mode, contextual_provider_file, workspace_root, headers_root, sd
         end
       end
       local context = assert(options.context)
-      if mode == "completion-catalog" then
+      if mode == "completion-catalog" and (name == "fixture.first" or name == "fixture.second") then
         local source = options.source_overrides[name]
         context.catalog_replacement = source and
           source.contents[source.main] == "replacement"
+        -- An ordinary selected member makes this a complete archive capture,
+        -- unlike a lookup of one member through contextual provenance.
+        local provider = contextual_provider_file ..
+          (name == "fixture.second" and ".second" or "")
+        assert(context.io:lstat(provider))
+        local selected_name = name .. ".selected"
+        driver.imported[selected_name] = {
+          kind = "static", static_archive = provider,
+          type = module_type(selected_name), c_header_dependencies = {},
+        }
       end
       context.checked_source_modules[
         #context.checked_source_modules + 1] = name
@@ -1260,17 +1275,18 @@ function test_compiler_bridge_completion_catalog_owns_complete_pending_providers
         bridge.ProjectModule.new("fixture.last", {bridge.SourceFile.new(test_paths.workspace_root() .. "/last.titan", "old")}),
       }
       compiler:analyze_incremental(projects, {"fixture.first", "fixture.second", "fixture.last"}, {})
-      test.assert(#compiler:completion_binary_catalog() == 2,
+      test.assert(#compiler:completion_binary_catalog() == 4,
         "independent root attempts replaced earlier provider siblings")
       compiler:analyze_incremental(projects, {"fixture.last"}, {})
-      test.assert(#compiler:completion_binary_catalog() == 2,
+      test.assert(#compiler:completion_binary_catalog() == 4,
         "a later fixed-point iteration lost an unpublished provider")
       projects[1] = bridge.ProjectModule.new("fixture.first", {
         bridge.SourceFile.new(test_paths.workspace_root() .. "/first.titan", "replacement"),
       })
       compiler:analyze_incremental(projects, {"fixture.first"}, {})
       local catalog = compiler:completion_binary_catalog()
-      test.assert(#catalog == 2)
+      test.assert(#catalog == 4,
+        "recapture must retire the removed sibling and preserve the other archive")
       local fresh = false
       for index = 1, #catalog do
         test.assert(catalog[index].module_name ~= "fixture.first.old",
@@ -1280,8 +1296,11 @@ function test_compiler_bridge_completion_catalog_owns_complete_pending_providers
       test.assert(fresh, "recaptured provider lost its replacement inventory")
       fs.write_file(provider, "same pathname now contains a replaced archive")
       catalog = compiler:completion_binary_catalog()
-      test.assert(#catalog == 1 and catalog[1].filename == second,
-        "stale pending provider bytes survived a same-path replacement")
+      test.assert(#catalog == 2, "stale pending provider bytes survived a same-path replacement")
+      for index = 1, #catalog do
+        test.assert(catalog[index].filename == second,
+          "replacement retired descriptors from the wrong archive")
+      end
       compiler:release_completion_exports()
       test.assert(#compiler:completion_binary_catalog() == 0,
         "accepted publication retained pending compiler catalog memory")
