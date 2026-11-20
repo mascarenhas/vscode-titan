@@ -30,7 +30,7 @@ local const SNAPSHOT_INVENTORY = "SELECT id,byte_count,serial,0 AS kind FROM tem
 local const SAVED_SCHEMA_STATEMENTS: const {string} = {
   "CREATE TABLE IF NOT EXISTS main.completion_configuration(singleton INTEGER PRIMARY KEY CHECK(singleton=1),source_roots_present INTEGER NOT NULL,binary_root BLOB,include_roots_present INTEGER NOT NULL,cppflags BLOB)",
   "CREATE TABLE IF NOT EXISTS main.completion_roots(kind INTEGER NOT NULL,position INTEGER NOT NULL,path BLOB NOT NULL,PRIMARY KEY(kind,position)) WITHOUT ROWID",
-  "CREATE TABLE IF NOT EXISTS main.completion_descriptors(module_name BLOB PRIMARY KEY NOT NULL,revision INTEGER NOT NULL,state INTEGER NOT NULL,provenance TEXT NOT NULL,main_file BLOB NOT NULL,payload BLOB,public_interface BLOB NOT NULL,source_interface BLOB,documentation BLOB)",
+  "CREATE TABLE IF NOT EXISTS main.completion_descriptors(module_name BLOB PRIMARY KEY NOT NULL,revision INTEGER NOT NULL,state INTEGER NOT NULL,provenance TEXT NOT NULL,main_file BLOB NOT NULL,payload BLOB,public_interface BLOB NOT NULL,source_interface BLOB,documentation BLOB,provider_witness BLOB)",
   "CREATE TABLE IF NOT EXISTS main.completion_source_files(module_name BLOB NOT NULL REFERENCES completion_descriptors(module_name) ON DELETE CASCADE,position INTEGER NOT NULL,filename BLOB NOT NULL,PRIMARY KEY(module_name,position)) WITHOUT ROWID",
   "CREATE TABLE IF NOT EXISTS main.completion_imports(module_name BLOB NOT NULL REFERENCES completion_descriptors(module_name) ON DELETE CASCADE,position INTEGER NOT NULL,alias BLOB NOT NULL,dependency BLOB NOT NULL,source_required INTEGER NOT NULL,filename BLOB NOT NULL,line INTEGER NOT NULL,column INTEGER NOT NULL,PRIMARY KEY(module_name,position)) WITHOUT ROWID",
   "CREATE TABLE IF NOT EXISTS main.completion_header_inputs(module_name BLOB NOT NULL REFERENCES completion_descriptors(module_name) ON DELETE CASCADE,position INTEGER NOT NULL,kind INTEGER NOT NULL,path BLOB NOT NULL,identity BLOB NOT NULL,modified_seconds INTEGER,modified_nanoseconds INTEGER,physical_identity BLOB,precision TEXT,size INTEGER,changed_seconds INTEGER,changed_nanoseconds INTEGER,PRIMARY KEY(module_name,position)) WITHOUT ROWID",
@@ -73,6 +73,7 @@ record SavedDescriptor
   const header_inputs: {bridge.CHeaderDependency}
   const candidates: {facts.Candidate}
   const documentation: string?
+  const provider_witness: string?
 end
 
 record SavedModule
@@ -542,10 +543,11 @@ function publish_saved(connection: sqlite3.Connection,
     end
     sql.execute(connection, "DELETE FROM main.completion_descriptors WHERE module_name=?", blob(descriptor.module_name))
     sql.execute(connection,
-      "INSERT INTO main.completion_descriptors VALUES(?,?,?,?,?,?,?,?,?)",
+      "INSERT INTO main.completion_descriptors VALUES(?,?,?,?,?,?,?,?,?,?)",
       blob(descriptor.module_name), descriptor.revision, descriptor.state,
       descriptor.provenance, blob(descriptor.main_file), optional_blob(descriptor.payload),
-      blob(descriptor.public_interface), optional_blob(descriptor.source_interface), optional_blob(descriptor.documentation))
+      blob(descriptor.public_interface), optional_blob(descriptor.source_interface),
+      optional_blob(descriptor.documentation), optional_blob(descriptor.provider_witness))
     if descriptor.payload == nil and descriptor.provenance == "project" then
       sql.execute(connection,
         "UPDATE main.completion_descriptors SET payload=(SELECT p.payload FROM main.project_snapshots AS p " ..

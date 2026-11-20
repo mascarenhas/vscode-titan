@@ -618,14 +618,17 @@ function test_workspace_cache_rebuilds_the_previous_schema_before_graph_use(
     local root = new_root()
     defer cleanup(root)
     local cache = caches.open(root,"same-context")
-    initialize_revision(cache)
-    cache:prepare()
-    cache:set_projects({bridge.ProjectPayload.new("main","previous-schema")})
-    publish(cache)
     do
       local access = cache.store:acquire()
       defer access:release()
-      sql.execute(access.connection,"PRAGMA main.user_version=7")
+      -- The actual v8 descriptor layout had no provider_witness column.
+      sql.execute(access.connection, "CREATE TABLE main.completion_descriptors(" ..
+        "module_name BLOB PRIMARY KEY NOT NULL,revision INTEGER NOT NULL,state INTEGER NOT NULL," ..
+        "provenance TEXT NOT NULL,main_file BLOB NOT NULL,payload BLOB,public_interface BLOB NOT NULL," ..
+        "source_interface BLOB,documentation BLOB)")
+      sql.execute(access.connection, "INSERT INTO main.completion_descriptors VALUES(?,0,2,'dynamic',?,NULL,?,NULL,NULL)",
+        sqlite3.Blob("stock.quantity"), sqlite3.Blob("/bin/stock.so"), sqlite3.Blob("old interface"))
+      sql.execute(access.connection,"PRAGMA main.user_version=8")
     end
     cache.store:close()
     local reopened = caches.open(root,"same-context")
@@ -634,8 +637,14 @@ function test_workspace_cache_rebuilds_the_previous_schema_before_graph_use(
     test.assert(#reopened:project_payloads() == 0,"previous graph schema survived a cache reopen")
     local access = reopened.store:acquire()
     defer access:release()
-    test.assert(sql.scalar_integer(access.connection,"PRAGMA main.user_version") == 8,
-      "rebuild did not install the new graph schema version")
+    test.assert(sql.scalar_integer(access.connection,"PRAGMA main.user_version") == 1,
+      "rebuild did not install workspace schema 1")
+    test.assert(sql.scalar_integer(access.connection,
+      "SELECT count(*) FROM pragma_table_info('completion_descriptors') WHERE name='provider_witness'") == 1,
+      "v8 completion layout survived discard")
+    test.assert(sql.scalar_integer(access.connection,
+      "SELECT count(*) FROM main.completion_descriptors WHERE provenance='dynamic'") == 0,
+      "v8 descriptor survived discard")
   end)
 end
 
