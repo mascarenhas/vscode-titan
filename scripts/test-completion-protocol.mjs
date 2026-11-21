@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { copyFile, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { copyFile, mkdir, readFile, rename, rm, stat, utimes, writeFile } from "node:fs/promises";
 import * as path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { pathToFileURL } from "node:url";
@@ -227,10 +227,8 @@ async function testContextualBinaryCompletion() {
   const owner = path.join(built, "owner");
   compile(owner, undefined, "stock.quantity", "stock.rate", "stock.sleeping");
   const replacement = path.join(built, "replacement");
-  if (process.platform !== "win32") {
-    await writeFile(path.join(library, "quantity.titan"), "record Quantity\n  amount: integer\nend\n");
-    compile(replacement, undefined, "stock.quantity", "stock.rate", "stock.sleeping");
-  }
+  await writeFile(path.join(library, "quantity.titan"), "record Quantity\n  amount: integer\nend\n");
+  compile(replacement, undefined, "stock.quantity", "stock.rate", "stock.sleeping");
   const via = path.join(built, "via");
   const other = path.join(built, "other");
   // Only stock's compiled output is on the producer's dependency path.
@@ -249,6 +247,11 @@ async function testContextualBinaryCompletion() {
     await copyFile(path.join(owner, `stock${extension}`), provider);
     await copyFile(path.join(via, `via${extension}`), path.join(providers, `via${extension}`));
     await copyFile(path.join(other, `other${extension}`), path.join(providers, `other${extension}`));
+    async function replaceProvider(output) {
+      const staged = path.join(providers, "stock.next");
+      await copyFile(path.join(output, `stock${extension}`), staged);
+      await rename(staged, provider);
+    }
     await writeFile(path.join(project, "titan-config.lua"),
       'include = { "./src" }\nsource_module_roots = { "./src" }\nbinary_modules_root = "./providers"\n');
     const first = path.join(src, "app.titan");
@@ -261,6 +264,7 @@ async function testContextualBinaryCompletion() {
       "function rate(): integer return rates.Rate(25).percent end\n";
     const measured = 'local units = import "stock.quantity"\n' + rated +
       "function count(): integer return units.Quantity(7).count end\n";
+    const touchedFacade = firstSource + "\n-- Recheck the facade after touching the provider.\n";
     await writeFile(first, firstSource);
     await writeFile(second, secondSource);
     await writeFile(unrelated, unrelatedSource);
@@ -279,20 +283,24 @@ async function testContextualBinaryCompletion() {
       }
       const document = (file) => ({ uri: uri(file) });
       const pull = (file) => ask("textDocument/diagnostic", { textDocument: document(file) });
-      function assertCatalog(names, ordinary = []) {
+      function assertCatalog(names, ordinary = [], forbidden = []) {
         const database = new DatabaseSync(path.join(project, ".titan-ls", "index.sqlite3"), { readOnly: true });
         try {
           const rows = database.prepare("SELECT module_name,provenance,main_file " +
             "FROM completion_descriptors WHERE CAST(module_name AS TEXT) LIKE 'stock.%' ORDER BY module_name").all();
-          assert.deepEqual(rows.map(({ module_name }) => Buffer.from(module_name).toString()), names);
+          const actual = rows.map(({ module_name }) => Buffer.from(module_name).toString());
+          if (names !== undefined) assert.deepEqual(actual, names);
+          for (const name of forbidden) assert.ok(!actual.includes(name), `unexpected ${name} descriptor`);
           for (const row of rows) {
             assert.equal(row.provenance, extension === ".a" ? "static" : "dynamic");
             assert.equal(path.normalize(Buffer.from(row.main_file).toString()), path.normalize(provider));
           }
-          const selected = database.prepare("SELECT name FROM external_records " +
-            "WHERE CAST(name AS TEXT) LIKE 'stock.%' ORDER BY name").all();
-          assert.deepEqual(selected.map(({ name }) => Buffer.from(name).toString()), ordinary,
-            "unexpected ordinary stock provider selections");
+          if (names !== undefined) {
+            const selected = database.prepare("SELECT name FROM external_records " +
+              "WHERE CAST(name AS TEXT) LIKE 'stock.%' ORDER BY name").all();
+            assert.deepEqual(selected.map(({ name }) => Buffer.from(name).toString()), ordinary,
+              "unexpected ordinary stock provider selections");
+          }
         } finally {
           database.close();
         }
@@ -321,6 +329,17 @@ async function testContextualBinaryCompletion() {
         assert.equal(result.items.find((item) => item.label === name)?.detail, "integer");
         send("textDocument/didClose", { textDocument: document(file) });
       }
+      async function excludesMember(file, contents, name) {
+        const caret = marked(contents.replace(`.${name}`, `.${name[0]}@${name.slice(1)}`));
+        send("textDocument/didOpen", {
+          textDocument: { ...document(file), languageId: "titan", version: 1, text: caret.text }
+        });
+        const result = await ask("textDocument/completion", {
+          textDocument: document(file), position: caret.position
+        });
+        excludes(result, name);
+        send("textDocument/didClose", { textDocument: document(file) });
+      }
       async function imports(expected, ...absent) {
         const caret = marked('local item = import "stock.@"\n');
         send("textDocument/didOpen", {
@@ -337,9 +356,31 @@ async function testContextualBinaryCompletion() {
         });
         assert.ok(initialized.capabilities.diagnosticProvider);
         send("initialized", {});
-        assert.deepEqual((await pull(first)).items, []);
-        assert.deepEqual((await pull(second)).items, []);
-        if (phase === "mixed") {
+        const firstDiagnostics = await pull(first);
+        const secondDiagnostics = await pull(second);
+        if (phase !== "replaced" && phase !== "removed") {
+          assert.deepEqual(firstDiagnostics.items, []);
+          assert.deepEqual(secondDiagnostics.items, []);
+        }
+        if (phase === "replaced") {
+          assert.match(JSON.stringify(secondDiagnostics.items), /count/);
+          assertCatalog(["stock.rate"], ["stock.rate"]);
+          await excludesMember(second, firstSource, "count");
+          const updated = firstSource.replace("().count", "().amount");
+          await writeFile(second, updated);
+          assert.deepEqual((await pull(second)).items, []);
+          assertCatalog(["stock.quantity", "stock.rate"], ["stock.rate"]);
+          await member(second, updated, "amount");
+          await excludesMember(second, firstSource, "count");
+        } else if (phase === "removed") {
+          assert.ok(firstDiagnostics.items.length > 0 && secondDiagnostics.items.length > 0);
+          assertCatalog(undefined, [], ["stock.quantity", "stock.sleeping"]);
+          await excludesMember(second, firstSource.replace("().count", "().amount"), "amount");
+        } else if (phase === "warm-touched") {
+          assertCatalog(["stock.quantity", "stock.rate"], ["stock.rate"]);
+          await member(second, touchedFacade, "count");
+          await imports("stock.quantity", "stock.sleeping");
+        } else if (phase === "mixed") {
           assertCatalog(["stock.rate"], ["stock.rate"]);
           await member(first, rated, "percent");
           await member(second, secondSource, "percent");
@@ -350,6 +391,12 @@ async function testContextualBinaryCompletion() {
           assertCatalog(["stock.quantity", "stock.rate"], ["stock.rate"]);
           await member(contextual, firstSource, "count");
           await member(ordinary, rated, "percent");
+          const updatedRate = rated.replace("Rate(25)", "Rate(26)");
+          await writeFile(ordinary, updatedRate);
+          assert.deepEqual((await pull(ordinary)).items, []);
+          assertCatalog(["stock.quantity", "stock.rate"], ["stock.rate"]);
+          await member(contextual, firstSource, "count");
+          await member(ordinary, updatedRate, "percent");
           await imports("stock.quantity", "stock.sleeping");
           console.log(`${extension} ${phase}: contextual and ordinary members completed`);
 
@@ -371,16 +418,41 @@ async function testContextualBinaryCompletion() {
             assertCatalog(["stock.rate"], ["stock.rate"]);
             await imports("stock.rate", "stock.quantity", "stock.sleeping");
 
-            // Windows can retain a mapped DLL; test removal there without
-            // requiring the OS to replace that running worker's image on disk.
-            if (extension === ".so") {
-              const staged = path.join(providers, "stock.next");
-              await copyFile(path.join(replacement, "stock.so"), staged);
-              await rename(staged, provider);
-              assert.deepEqual((await pull(first)).items, []);
-              assertCatalog(["stock.rate"], ["stock.rate"]);
-              await imports("stock.rate", "stock.quantity", "stock.sleeping");
-            }
+            await writeFile(second, firstSource);
+            assert.deepEqual((await pull(second)).items, []);
+            assertCatalog(["stock.quantity", "stock.rate"], ["stock.rate"]);
+
+            // Change only the file's timestamp. Each publisher must preserve
+            // the already witnessed bytes, including after an unprovable live
+            // facade recapture by this still-resident worker.
+            const before = await stat(provider);
+            await utimes(provider, before.atime, new Date(before.mtimeMs + 5000));
+            const after = await stat(provider);
+            assert.equal(after.ino, before.ino);
+            assert.equal(after.dev, before.dev);
+            assert.notEqual(after.mtimeMs, before.mtimeMs);
+
+            await writeFile(unrelated, unrelatedSource.replace("return 1", "return 3"));
+            assert.deepEqual((await pull(unrelated)).items, []);
+            assertCatalog(["stock.quantity", "stock.rate"], ["stock.rate"]);
+            await member(second, firstSource, "count");
+
+            await writeFile(first, rated.replace("Rate(25)", "Rate(27)"));
+            assert.deepEqual((await pull(first)).items, []);
+            assertCatalog(["stock.quantity", "stock.rate"], ["stock.rate"]);
+            await member(second, firstSource, "count");
+
+            await writeFile(second, touchedFacade);
+            assert.deepEqual((await pull(second)).items, []);
+            assertCatalog(["stock.quantity", "stock.rate"], ["stock.rate"]);
+            await member(second, touchedFacade, "count");
+          } else if (extension === ".so") {
+            // The old image remains resident even though the analyzed path now
+            // points to a new provider. It cannot authenticate a saved row.
+            await replaceProvider(replacement);
+            await pull(contextual);
+            assertCatalog(["stock.rate"], ["stock.rate"]);
+            await excludesMember(contextual, firstSource, "count");
           }
         } else {
           assertCatalog(["stock.quantity", "stock.rate"]);
@@ -447,9 +519,21 @@ async function testContextualBinaryCompletion() {
       await writeFile(first, firstSource);
       await writeFile(second, rated);
       await session("contextual-first");
+      if (extension === ".so") await replaceProvider(owner);
       await writeFile(first, rated);
       await writeFile(second, firstSource);
       await session("ordinary-first");
+      await session("warm-touched");
+      // Unlike a touch, new bytes on the very same object invalidate the old
+      // witness. Do this after shutdown, including on Windows.
+      const beforeRewrite = await stat(provider);
+      await writeFile(provider, await readFile(path.join(replacement, `stock${extension}`)));
+      const afterRewrite = await stat(provider);
+      assert.equal(afterRewrite.ino, beforeRewrite.ino);
+      assert.equal(afterRewrite.dev, beforeRewrite.dev);
+      await session("replaced");
+      await rm(provider);
+      await session("removed");
     }
     console.log(`contextual completion ${extension}: exact owners, dormancy, retirement, repair and warm reuse passed`);
   }

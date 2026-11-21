@@ -13,6 +13,8 @@ local completion_store = import "server.completion_store"
 local completion_types = import "server.completion_types"
 local sql = import "server.workspace_store"
 local header_store = import "server.header_store"
+local compiler_io = import "server.compiler_io"
+local content_identity = import "server.content_identity"
 foreign import "compiler_io_clock.h"
 
 local function phase(name: string, cpu: float, wall: float)
@@ -58,6 +60,8 @@ local function completion_catalog(connection: sqlite3.Connection,
   for index = 1, #graph_rows do graph_names[graph_rows[index]:get(1)] = graph_rows[index]:get(2) end
   local clean: {string: boolean} = {}
   local contextual: {string: string} = {}
+  local contextual_versions: {string: string} = {}
+  local contextual_witnesses: {string: string} = {}
   local reachable = sql.rows(connection,
     "WITH RECURSIVE reachable(name) AS (" ..
     "SELECT imported FROM main.graph_imports AS e JOIN main.graph_modules AS m ON m.name=e.importer " ..
@@ -67,12 +71,12 @@ local function completion_catalog(connection: sqlite3.Connection,
     "contextual(name) AS (SELECT DISTINCT e.imported FROM reachable AS r " ..
     "JOIN main.graph_modules AS m ON m.name=r.name AND m.provenance=2 AND m.state=2 " ..
     "JOIN main.graph_imports AS e ON e.importer=m.name WHERE e.visibility=0) " ..
-    "SELECT r.name,o.kind,o.main_path FROM reachable AS r " ..
-    "LEFT JOIN contextual AS c ON c.name=r.name " ..
-    "LEFT JOIN main.external_observations AS o ON o.name=CAST(c.name AS BLOB) " ..
-    "AND o.kind IN (1,2) AND o.error IS NULL AND EXISTS (" ..
-    "SELECT 1 FROM main.external_files AS f WHERE f.scope=0 AND f.module=o.name " ..
-    "AND f.path=o.main_path AND f.identity IS NOT NULL)")
+    "SELECT r.name,o.kind,o.main_path,f.physical_identity,f.size,f.seconds,f.nanos,f.identity " ..
+    "FROM reachable AS r LEFT JOIN contextual AS c ON c.name=r.name " ..
+    "LEFT JOIN (main.external_observations AS o JOIN main.external_files AS f " ..
+    "ON f.scope=0 AND f.module=o.name AND f.ordinal=1 AND f.path=o.main_path " ..
+    "AND f.identity IS NOT NULL) ON o.name=CAST(c.name AS BLOB) " ..
+    "AND o.kind IN (1,2) AND o.error IS NULL")
   for index = 1, #reachable do
     local row = reachable[index]
     local name: string = row:get(1)
@@ -81,6 +85,13 @@ local function completion_catalog(connection: sqlite3.Connection,
     if kind ~= nil and graph_names[name] == nil then
       contextual[name] = binary_provider_key(kind == 1 and "dynamic" or "static",
         sql.bytes(row, 3))
+      if kind == 1 then
+        local identity? = sql.optional_bytes(row, 4)
+        contextual_versions[name] = content_identity.saved_file_version(
+          identity, row:get(5), row:get(6), row:get(7))
+        contextual_witnesses[name] = content_identity.saved_file_content_witness(
+          identity, sql.bytes(row, 8))
+      end
     end
   end
   local selected: {string: boolean} = {}
@@ -102,7 +113,7 @@ local function completion_catalog(connection: sqlite3.Connection,
   if sql.scalar_integer(connection,
       "SELECT count(*) FROM main.sqlite_master WHERE name='completion_descriptors' AND type='table'") ~= 0 then
     previous = sql.rows(connection,
-      "SELECT module_name,provenance,main_file FROM main.completion_descriptors " ..
+      "SELECT module_name,provenance,main_file,provider_witness FROM main.completion_descriptors " ..
       "WHERE provenance IN ('static','dynamic','embedded') ORDER BY module_name")
   end
   local replaced: {string: boolean} = {}
@@ -114,7 +125,8 @@ local function completion_catalog(connection: sqlite3.Connection,
     if binary.kind == "embedded" or key == browser_provider_key or
        (binary.replaces_group and selected[key]) then
       replaced[key] = true
-    elseif contextual[binary.module_name] == key then
+    end
+    if binary.kind ~= "dynamic" and contextual[binary.module_name] == key then
       recaptured_contextual[binary.module_name] = true
     end
     local provenance? = graph_names[binary.module_name]
@@ -145,10 +157,15 @@ local function completion_catalog(connection: sqlite3.Connection,
     elseif key == browser_provider_key or (kind == "static" and selected[key]) then
       keep = reusable or clean_providers[key] == true
     elseif contextual[name] == key then
-      keep = not recaptured_contextual[name]
+      if kind == "dynamic" then
+        local witness? = sql.optional_bytes(row, 4)
+        keep = witness ~= nil and witness == contextual_witnesses[name]
+      else
+        keep = not recaptured_contextual[name]
+      end
     end
-    if graph_names[name] == nil and not blocked[key] and not replaced[key] and
-       keep then
+    if graph_names[name] == nil and not blocked[key] and keep and
+        (not replaced[key] or kind == "dynamic") then
       names[#names + 1] = name
       choices[name] = bridge.CompletionBinary {
         module_name = name,
@@ -161,9 +178,17 @@ local function completion_catalog(connection: sqlite3.Connection,
   for index = 1, #binaries do
     local binary = binaries[index]
     local key = binary_provider_key(binary.kind, binary.filename)
+    local contextual_owner = contextual[binary.module_name] == key
+    if contextual_owner and binary.kind == "dynamic" then
+      -- Compare the worker's first possible native mapping, not a later
+      -- stat of the pathname that may now name another image.
+      local observed? = compiler_io.dynamic_provider_witness(binary.filename)
+      contextual_owner = observed ~= nil and observed == contextual_versions[binary.module_name] and
+        contextual_witnesses[binary.module_name] ~= nil
+    end
     if graph_names[binary.module_name] == nil and not blocked[key] and
        (binary.kind == "embedded" or key == browser_provider_key or
-        (binary.kind == "static" and selected[key]) or contextual[binary.module_name] == key) then
+        (binary.kind == "static" and selected[key]) or contextual_owner) then
       local previous? = choices[binary.module_name]
       if previous == nil then
         names[#names + 1] = binary.module_name
@@ -175,9 +200,9 @@ local function completion_catalog(connection: sqlite3.Connection,
       elseif previous.kind ~= "embedded" then
         local authorized? = contextual[binary.module_name]
         local previous_key = binary_provider_key(previous.kind, previous.filename)
-        -- An exact observed owner wins over an unrelated captured sibling,
-        -- without changing the compiler's order among ordinary inventories.
-        if (authorized == key and authorized ~= previous_key) or
+        -- An admissible DSO capture supersedes matching saved bytes. Exact
+        -- contextual ownership still wins over an unrelated archive sibling.
+        if (authorized == key and (authorized ~= previous_key or binary.kind == "dynamic")) or
            (authorized ~= previous_key and binary.filename > previous.filename) then
           choices[binary.module_name] = binary
           fresh[binary.module_name] = true
@@ -192,6 +217,8 @@ local function completion_catalog(connection: sqlite3.Connection,
     local binary = choices[name]
     retained[#retained + 1] = name
     if fresh[name] then
+      local witness?: string
+      if binary.kind == "dynamic" then witness = contextual_witnesses[name] end
       descriptors[#descriptors + 1] = completion_store.SavedDescriptor {
         module_name = name,
         revision = 0,
@@ -204,6 +231,7 @@ local function completion_catalog(connection: sqlite3.Connection,
         header_inputs = {},
         candidates = {},
         documentation = binary.documentation,
+        provider_witness = witness,
       }
     end
   end

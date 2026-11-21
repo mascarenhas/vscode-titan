@@ -106,7 +106,7 @@ end
 
 Startup opens the database with `open_for_inventory`, and `open_compatible` enforces three checks before retaining it:
 
-- `PRAGMA main.user_version` must be `0` (an empty file initialized in place) or `SCHEMA_VERSION` (`8`).
+- `PRAGMA main.user_version` must be `0` (an empty file initialized in place) or `SCHEMA_VERSION` (`1`).
 - A versioned database must contain a `compatibility` entry in `main.cache_meta`, and every key and value in `cache_meta` must have SQLite storage type `BLOB`.
 - A database with a `compatibility` entry must pass `PRAGMA main.quick_check`.
 
@@ -120,7 +120,7 @@ Startup opens the database with `open_for_inventory`, and `open_compatible` enfo
 
 Saved browser source revisions that reach the lazy C probe—including failed checks producing no header inputs—record revision-qualified ownership (`provenance:revision\0identity`) in `main.cache_meta` through `write_browser_foreign_owner` and `browser_foreign_owners`. Ownership tracks accepted source revisions; a pure replacement or removal retires the prior owner even when a failed external check retains an import edge for recovery. A completed view writes one `browser_foreign` identity only when all active owners agree. An incompatible observation invalidates affected revisions and their dependants before the next view commits. On reopen, the loader validates the probe environment only if retained revisions own it, so a pure warm start never invokes Emscripten.
 
-A rejected file, or one failing with `SQLITE_CORRUPT` (`11`) or `SQLITE_NOTADB` (`26`), is deleted and recreated. Any other open failure logs `cache.memory_fallback` and opens `:memory:` with the same schema. Every table uses `CREATE TABLE IF NOT EXISTS`, so a dropped table recreates empty. Changing the compiler, server image, or configuration therefore costs one cold index without changing `SCHEMA_VERSION`.
+A rejected file—including any database carrying an incompatible `user_version` (neither `0` nor `SCHEMA_VERSION`)—or one failing with `SQLITE_CORRUPT` (`11`) or `SQLITE_NOTADB` (`26`) is deleted and recreated with no schema migration or previous-version reader. Any other open failure logs `cache.memory_fallback` and opens `:memory:` with the same schema. Every table uses `CREATE TABLE IF NOT EXISTS`, so a dropped table recreates empty. Changing the compiler, server image, or configuration therefore costs one cold index without changing `SCHEMA_VERSION`.
 
 ## Connection ownership
 
@@ -310,7 +310,7 @@ Refreshing an owner (`refresh`) replaces only that owner's links without mutatin
 
 Before serving reused SQL answers, `load_or_raise` in [`src/server/project_loader.titan`](../src/server/project_loader.titan) validates the compiler inventory (reusing `main.compiler_inputs` stat stamps through `Cache:inventory_identity`), the native context, saved project sources, and compiler-owned header inputs, and dirties any `unpublished_projects` whose graph revision lacks complete semantic or completion rows.
 
-Saved-source validation (`read_saved_file` in [`src/server/project_service/scan_and_provenance.titan`](../src/server/project_service/scan_and_provenance.titan)) records `lstat` and `stat` kind, device, inode, size, mode, and nanosecond mtime. An unchanged observation reuses the stored fingerprint without reading the file; a changed observation performs a stable read and SHA-256 hash. A deliberate byte edit that preserves all of that metadata goes undetected.
+Saved-source and external-file validation (`read_saved_file` in [`src/server/project_service/scan_and_provenance.titan`](../src/server/project_service/scan_and_provenance.titan)) records `lstat` and `stat` kind, device, inode, size, mode, and nanosecond mtime. An unchanged observation reuses the stored fingerprint without reading the file; a changed observation performs a stable read and SHA-256 hash. A deliberate byte edit that preserves all of that metadata goes undetected.
 
 Header validation follows the compiler's stricter contract: metadata-only reuse requires nanosecond precision and a change timestamp (`ctime`). Because `titan.fs.Stat` exposes no change timestamp, header restatting rereads and hashes header bytes. Equal bytes preserve semantic identity across a timestamp-only touch, while `origin` realpaths and exact `search` candidates remain independent inputs so symlink retargeting and newly eligible earlier include candidates invalidate even when another header's bytes are unchanged.
 

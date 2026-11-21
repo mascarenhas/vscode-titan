@@ -88,3 +88,36 @@ function same_observation(left: FileObservation, right: FileObservation): boolea
     left.modified_nanoseconds == right.modified_nanoseconds and
     left.size == right.size and left.physical_identity == right.physical_identity
 end
+
+-- Store an exact followed file version, independent of the link spelling.
+local function file_version(physical: string, size: integer, seconds: integer,
+                            nanos: integer): string
+  return physical .. "\0" .. size .. ":" .. seconds .. ":" .. nanos
+end
+
+function observed_file_version(metadata: fs.Stat): string
+  return file_version(physical(metadata), metadata.size,
+    metadata.modified_seconds, metadata.modified_nanoseconds)
+end
+
+local function followed_identity(identity: string?): string?
+  if identity == nil then return nil end
+  local separator? = strings.find(identity, "\0")
+  if separator == nil then return nil end
+  return strings.sub(identity, separator + 1)
+end
+
+function saved_file_version(identity: string?, size: integer, seconds: integer,
+                            nanos: integer): string?
+  local followed? = followed_identity(identity)
+  if followed == nil then return nil end
+  return file_version(followed, size, seconds, nanos)
+end
+
+-- A retained descriptor needs the same followed object and content, not the
+-- same timestamps that proved eligibility when the interface was captured.
+function saved_file_content_witness(identity: string?, digest: string): string?
+  local followed? = followed_identity(identity)
+  if followed == nil or #digest ~= 32 then return nil end
+  return followed .. "\0" .. digest
+end

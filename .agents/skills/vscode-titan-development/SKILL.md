@@ -82,8 +82,10 @@ extraction; release them after accepted SQL publication and retain unchanged
 modules' SQL facts. External source and binary modules retain manifests and
 provenance only. Compiler-observed C-header dependency closures are metadata.
 Keep large compiler payloads out of foreign-key parent key indexes. Completion
-descriptors use a rowid table with a separate unique module key; bump the
-workspace cache schema when changing that layout.
+descriptors use a rowid table with a separate unique module key; update
+`SCHEMA_VERSION` (incompatible caches are discarded without migration) when
+changing that layout, and keep large interface BLOBs out of catalog eviction
+queries.
 
 Project watchers cover `.titan` creation, changes, and deletion. They never
 watch external trees. Revalidate an encountered external import from its exact
@@ -97,13 +99,19 @@ visibility, actual receiver/ffi lookup and the distinct foreign type namespace.
 Read the sibling `titan-completion` skill when changing its compiler boundary.
 Capture committed completion descriptors with semantic publication; never use
 mutable graph work rows as a saved baseline. Selected static archives contribute
-complete sibling inventories. Accumulate captures by physical provider across
-independent roots and fixed-point passes, replace recaptured groups completely,
-and release pending captures after publication or configuration changes. Validate
-pending provider identities from compiler observations; preserve untouched SQL
-catalogs only through accepted provider ownership, with source overlap rejecting
-the entire provider. Retain embedded inventories during compatible warm startup.
-Test unrelated refresh, provider replacement/removal, and warm restoration.
+complete sibling inventories; dynamic providers capture only exact observed
+members. Accumulate captures by physical provider across independent roots and
+fixed-point passes, replace recaptured ordinary groups completely, and release
+pending captures after publication or configuration changes. Validate pending
+provider identities from compiler observations; admit a fresh contextual-only
+DSO descriptor only when a clean compiled exposer and the worker's first
+possible mapping match the current scope-0 stamp, and retain an existing row
+across ordinary recaptures only when its stored `provider_witness` matches both
+the followed physical object and content digest—never from path match or
+ordinary selection alone, and never eclipsing a valid row with an ineligible
+recapture. Source overlap rejects the entire static provider. Retain embedded
+inventories during compatible warm startup. Test unrelated refresh, provider
+replacement/removal, timestamp-only touches, and warm restoration.
 Decode descriptors only during private preparation; selection reads indexed
 scalar facts under one connection
 lease. Add deterministic held/free compiler-permit tests and measure preparation

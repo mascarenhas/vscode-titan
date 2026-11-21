@@ -12,6 +12,7 @@ local math = import "math"
 local system = import "os"
 local strings = import "string"
 local paths = import "path"
+local content_identity = import "server.content_identity"
 foreign import "compiler_io_clock.h"
 foreign import "compiler_io_platform.h"
 
@@ -45,6 +46,75 @@ end
 local record LstatObservation
   identity: LstatIdentity?
   consistent: boolean
+end
+
+local record PossibleNativeLoad
+  metadata: fs.Stat?
+end
+
+-- Native handles outlive Compiler and CompilerIO instances. Keep the first
+-- possible mapping, even for topology probes or attempts that fail checking.
+-- The compiler lstat's each occupied dynamic candidate before probing it;
+-- carried probes can only refer to a provider already selected that way.
+local const possible_native_loads: {string: PossibleNativeLoad} = {}
+
+local function dynamic_path_key(path: string): string
+  if ffi.VSCODE_TITAN_WINDOWS ~= 0 then return strings.lower(paths.to_slash(path)) end
+  return path
+end
+
+local function dynamic_candidate(path: string): boolean
+  if ffi.VSCODE_TITAN_WINDOWS ~= 0 then return strings.sub(path, -4) == ".dll" end
+  return strings.sub(path, -3) == ".so"
+end
+
+local function same_native_file_version(before: fs.Stat?, after: fs.Stat): boolean
+  return before ~= nil and before.device == after.device and before.inode == after.inode and
+    before.mode == after.mode and before.size == after.size and
+    before.modified_seconds == after.modified_seconds and
+    before.modified_nanoseconds == after.modified_nanoseconds
+end
+
+local function remember_native_candidate(path: string, followed: fs.Stat?)
+  local key = dynamic_path_key(path)
+  local first? = possible_native_loads[key]
+  if followed == nil or followed.kind ~= "file" or followed.inode == 0 then
+    if first == nil then possible_native_loads[key] = PossibleNativeLoad(nil)
+    else first.metadata = nil end
+    return
+  end
+  if first ~= nil and same_native_file_version(first.metadata, followed) then return end
+
+  -- A different pathname may reach an image already mapped through a
+  -- symlink or a hard link. Group by normalized name and followed inode.
+  local inode_key = "\0" .. followed.device .. ":" .. followed.inode
+  local real_key?: string
+  do
+    real_key = dynamic_path_key(fs.realpath(path))
+  catch
+    if error is async.CancellationReason then raise end
+  end
+  local physical? = possible_native_loads[inode_key]
+  local canonical?: PossibleNativeLoad
+  if real_key ~= nil then canonical = possible_native_loads[real_key] end
+  if real_key == nil or (first ~= nil and not same_native_file_version(first.metadata, followed)) or
+      (physical ~= nil and not same_native_file_version(physical.metadata, followed)) or
+      (canonical ~= nil and not same_native_file_version(canonical.metadata, followed)) then
+    if first ~= nil then first.metadata = nil end
+    if physical ~= nil then physical.metadata = nil end
+    if canonical ~= nil then canonical.metadata = nil end
+    followed = nil
+  end
+  local observed = first or canonical or physical or PossibleNativeLoad(followed)
+  possible_native_loads[key] = observed
+  possible_native_loads[inode_key] = observed
+  if real_key ~= nil then possible_native_loads[real_key] = observed end
+end
+
+function dynamic_provider_witness(path: string): string?
+  local observed? = possible_native_loads[dynamic_path_key(path)]
+  if observed == nil or observed.metadata == nil then return nil end
+  return content_identity.observed_file_version(observed.metadata)
 end
 
 -- The compiler sees this record only through its ordinary Lua userdata proxy.
@@ -290,20 +360,19 @@ function CompilerIO:lstat(path: string): ({string: value}?, string?)
     self:observe_lstat(path, nil)
     return nil, nil
   end
-  if self.observing_lstats then
+  local dynamic = dynamic_candidate(path)
+  if self.observing_lstats or dynamic then
     -- Do not change the public lstat result when this validation-only follow
     -- fails. Cancellation remains authoritative because the extra stat is a
     -- real asynchronous operation in the compiler Task.
     do
       local followed? = fs.stat(path)
-      if followed == nil then
-        self:observe_lstat(path, nil)
-      else
-        self:observe_lstat(
-          path, identity_for(path, followed))
-      end
+      if dynamic then remember_native_candidate(path, followed) end
+      if followed == nil then self:observe_lstat(path, nil)
+      elseif self.observing_lstats then self:observe_lstat(path, identity_for(path, followed)) end
     catch
       if error is async.CancellationReason then raise end
+      if dynamic then remember_native_candidate(path, nil) end
       self:observe_lstat(path, nil)
     end
   end
