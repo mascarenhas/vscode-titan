@@ -1,5 +1,5 @@
 -- Validate the complete published semantic SDK, without invoking a toolchain.
-local compiler, sdk = ...
+local compiler, sdk, release = ...
 local share = compiler .. "/share/lua/5.5/"
 local suffix = package.config:sub(1, 1) == "\\" and "dll" or "so"
 package.path = share .. "?.lua;" .. share .. "?/init.lua"
@@ -46,4 +46,8 @@ assert(strategy:read_file(accepted.directory .. "/absent-modules", 64 * 1024) ==
     "absent-modules: not the canonical browser absent-module inventory")
 local descriptor = assert(target.decode_analysis(options,
     assert(strategy:read_file(accepted.directory .. "/analysis-target", 64 * 1024))))
+if release then
+    assert(driver.TITAN_VERSION == release, "SDK compiler release differs from companion")
+    assert(descriptor.release == release, "browser descriptor release differs from companion")
+end
 print(descriptor.build_profile)

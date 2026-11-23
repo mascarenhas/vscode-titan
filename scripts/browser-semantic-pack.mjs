@@ -5,9 +5,9 @@ import { lstat, mkdir, mkdtemp, readFile, rename, rm, writeFile } from "node:fs/
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { crc32, inflateRawSync } from "node:zlib";
-import { compilerDiscoveryEnvironment, resolveTitanSdk } from "./titan-sdk.mjs";
+import { compilerDiscoveryEnvironment, resolveTitanSdk, titanLibrarySeries, titanReleaseSeries } from "./titan-sdk.mjs";
 
-export const semanticDirectory = "lib/titan-browser/0.6";
+export const semanticDirectory = `lib/titan-browser/${titanLibrarySeries}`;
 export const semanticFiles = ["absent-modules", "analysis-target", "titan.a"];
 export const semanticNotices = ["LICENSE", "LICENSES/go-LICENSE", "LICENSES/lpeg-LICENSE",
   "LICENSES/lpeg-patterns-LICENSE", "LICENSES/lpeglabel-LICENSE", "LICENSES/lua-LICENSE",
@@ -15,15 +15,19 @@ export const semanticNotices = ["LICENSE", "LICENSES/go-LICENSE", "LICENSES/lpeg
 const semanticPaths = semanticFiles.map((name) => `${semanticDirectory}/${name}`);
 const noticePaths = semanticNotices.map((name) => `share/titan/${name}`);
 const payloadPaths = [...semanticPaths, ...noticePaths];
-const release = "0.6.1";
-const tag = `v${release}`;
-const rockName = `titan-${release}-1.src.rock`;
-const packName = `titan-${release}-1-browser-semantics.tar.gz`;
 const sha256 = (bytes) => createHash("sha256").update(bytes).digest("hex");
 const hexDigest = /^[0-9a-f]{64}$/;
 const block = 512;
 const record = 20 * block;
 const maxPack = 96 * 1024 * 1024;
+
+function releaseFromTag(tag) {
+  assert(
+    typeof tag === "string" && tag.startsWith("v") && titanReleaseSeries(tag.slice(1)) === titanLibrarySeries,
+    `TITAN_RELEASE must be a v${titanLibrarySeries}.PATCH tag`
+  );
+  return tag.slice(1);
+}
 
 // The producer writes sorted regular files in a fixed POSIX ustar encoding.
 // Validate this small closed format instead of extracting transport paths.
@@ -68,7 +72,8 @@ function readPack(bytes) {
   return members;
 }
 
-export function verifyBrowserCompanion(bytes, { packSha256, rockSha256, commit, profile }) {
+export function verifyBrowserCompanion(bytes, { tag, packSha256, rockSha256, commit, profile }) {
+  const release = releaseFromTag(tag);
   assert(hexDigest.test(packSha256) && hexDigest.test(rockSha256) && /^[0-9a-f]{40}$/.test(commit),
     "browser companion needs exact SHA-256 values and a Titan commit");
   assert(profile === "production" || profile === "validation", "invalid browser companion profile");
@@ -86,10 +91,10 @@ export function verifyBrowserCompanion(bytes, { packSha256, rockSha256, commit, 
     emscripten_version: "6.0.13",
     files,
     language_server_api: 1,
-    library_version: "0.6",
+    library_version: titanLibrarySeries,
     release,
     sdk_digests: files.slice(0, semanticFiles.length).map(({ path, sha256 }) => ({ path, sha256 })),
-    source_rock: { name: rockName, sha256: rockSha256 },
+    source_rock: { name: `titan-${release}-1.src.rock`, sha256: rockSha256 },
     tag,
     titan_commit: commit
   };
@@ -114,10 +119,12 @@ export async function verifyBrowserNotices(sdk, readNotice) {
   }
 }
 
-export async function verifyInstalledBrowserPack(compiler, assets = compiler, profile) {
+export async function verifyInstalledBrowserPack(compiler, assets = compiler, { release, profile } = {}) {
   const lua = path.join(compiler, "bin", process.platform === "win32" ? "lua.exe" : "lua");
   const script = fileURLToPath(new URL("./verify-browser-semantics.lua", import.meta.url));
-  const probe = spawnSync(lua, [script, compiler, assets], {
+  const args = [script, compiler, assets];
+  if (release !== undefined) args.push(release);
+  const probe = spawnSync(lua, args, {
     env: { ...compilerDiscoveryEnvironment(), TITAN_ROOT: compiler },
     encoding: "utf8", shell: false, windowsHide: true
   });
@@ -139,6 +146,9 @@ async function ensureDirectories(sdk, directoryName) {
 }
 
 export async function installBrowserCompanion(sdk, archive, expected) {
+  const release = releaseFromTag(expected.tag);
+  const packName = `titan-${release}-1-browser-semantics.tar.gz`;
+  const provenance = { release, profile: expected.profile };
   assert.equal(path.basename(archive), packName, "unexpected browser companion basename");
   assert((await lstat(sdk)).isDirectory(), `browser pack SDK is not a real directory: ${sdk}`);
   const members = verifyBrowserCompanion(await regularBytes(path.dirname(archive), packName), expected);
@@ -159,7 +169,7 @@ export async function installBrowserCompanion(sdk, archive, expected) {
       assert(installed.equals(members.get(`${semanticDirectory}/${name}`)),
         `cached SDK browser semantic file differs from the exact companion: ${name}`);
     }
-    await verifyInstalledBrowserPack(sdk, sdk, expected.profile);
+    await verifyInstalledBrowserPack(sdk, sdk, provenance);
     return;
   }
   // Stage on the same volume and publish the three verified files together.
@@ -171,7 +181,7 @@ export async function installBrowserCompanion(sdk, archive, expected) {
       await writeFile(path.join(scratch, name), members.get(`${semanticDirectory}/${name}`),
         { flag: "wx", mode: 0o644 });
     }
-    await verifyInstalledBrowserPack(sdk, staging, expected.profile);
+    await verifyInstalledBrowserPack(sdk, staging, provenance);
     await rename(scratch, destination);
   } finally {
     await rm(staging, { recursive: true, force: true });
@@ -182,13 +192,15 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
   const [mode, ...args] = process.argv.slice(2);
   if (mode === "--install" && args.length === 6) {
     const [sdk, archive, packSha256, rockSha256, commit, profile] = args;
-    await installBrowserCompanion(sdk, archive, { packSha256, rockSha256, commit, profile });
+    await installBrowserCompanion(sdk, archive, {
+      tag: process.env.TITAN_RELEASE, packSha256, rockSha256, commit, profile
+    });
   } else if (mode === "--check-prefix" && args.length <= 2) {
     await verifyInstalledBrowserPack(args[0] ?? resolveTitanSdk(), args[1]);
   } else if (mode === "--check-notices" && args.length === 2) {
     await verifyBrowserNotices(args[0], (name) => regularBytes(args[1], name));
   } else {
-    throw new Error("usage: browser-semantic-pack.mjs --install SDK PACK PACK_SHA256 ROCK_SHA256 COMMIT PROFILE | " +
+    throw new Error("usage: TITAN_RELEASE=vX.Y.Z browser-semantic-pack.mjs --install SDK PACK PACK_SHA256 ROCK_SHA256 COMMIT PROFILE | " +
       "--check-prefix [SDK [SEMANTIC_SDK]] | --check-notices SDK PACKAGED_TITAN_NOTICES");
   }
 }

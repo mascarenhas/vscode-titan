@@ -3,6 +3,13 @@ import { spawnSync } from "node:child_process";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 
+export const titanLibrarySeries = "0.6";
+
+export function titanReleaseSeries(release) {
+  if (typeof release !== "string") return undefined;
+  return /^((?:0|[1-9][0-9]*)[.](?:0|[1-9][0-9]*))[.](?:0|[1-9][0-9]*)$/.exec(release)?.[1];
+}
+
 function environmentValue(environment, name, platform) {
   return platform === "win32"
     ? Object.entries(environment).find(([key]) => key.toUpperCase() === name)?.[1]
