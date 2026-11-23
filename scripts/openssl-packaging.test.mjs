@@ -39,7 +39,7 @@ async function compilerSDK(context) {
     await result.put(`sdk/share/lua/5.5/${member}`);
   }
   await result.put("sdk/share/lua/5.5/titan-compiler/driver.lua", "driver.LANGUAGE_SERVER_API_VERSION = 1\n");
-  await result.put("sdk/share/lua/5.5/titan-compiler/version.lua", 'LUA_VERSION = "5.5"\nTITAN_ABI_VERSION = "2"\nTITAN_VERSION = "0.6.0"\n');
+  await result.put("sdk/share/lua/5.5/titan-compiler/version.lua", 'LUA_VERSION = "5.5"\nTITAN_ABI_VERSION = "2"\nTITAN_VERSION = "0.6.1"\n');
   const extension = process.platform === "win32" ? "dll" : "so";
   for (const member of ["lfs", "lpeglabel", "luv"]) await result.put(`sdk/lib/lua/5.5/${member}.${extension}`);
   for (const header of ["lauxlib.h", "llhttp.h", "luaconf.h", "lua.h", "lua.hpp", "lualib.h", "minicoro.h", "sqlite3.h", "titan.h", "transfer.h", "uv.h"]) {

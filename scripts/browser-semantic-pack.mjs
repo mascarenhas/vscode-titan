@@ -15,7 +15,7 @@ export const semanticNotices = ["LICENSE", "LICENSES/go-LICENSE", "LICENSES/lpeg
 const semanticPaths = semanticFiles.map((name) => `${semanticDirectory}/${name}`);
 const noticePaths = semanticNotices.map((name) => `share/titan/${name}`);
 const payloadPaths = [...semanticPaths, ...noticePaths];
-const release = "0.6.0";
+const release = "0.6.1";
 const tag = `v${release}`;
 const rockName = `titan-${release}-1.src.rock`;
 const packName = `titan-${release}-1-browser-semantics.tar.gz`;
