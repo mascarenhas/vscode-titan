@@ -8,6 +8,7 @@ import { fileURLToPath } from "node:url";
 import { runShards, serverTestShards, validateShards } from "./run-server-tests.mjs";
 
 const shards = [["server.first_test"], ["server.second_test"]];
+const unixShardsOnly = process.platform === "win32" ? "the Windows native aggregate does not use POSIX shell shards" : false;
 
 async function fixture(context, mode = "success") {
   const root = await mkdtemp(path.join(os.tmpdir(), "titan-shard-runner-test-"));
@@ -51,7 +52,7 @@ test("shards cover the canonical native test imports once", async () => {
   assert.throws(() => validateShards(source, [serverTestShards[0], [...serverTestShards[1], serverTestShards[0][0]]]), /both shards/);
 });
 
-test("runs both shards concurrently in isolated directories and records results", async (context) => {
+test("runs both shards concurrently in isolated directories and records results", { skip: unixShardsOnly }, async (context) => {
   const { root, binary, options } = await fixture(context);
   const results = await runShards(binary, options);
   assert.equal(results.length, 2);
@@ -64,7 +65,9 @@ test("runs both shards concurrently in isolated directories and records results"
   assert.deepEqual(await readdir(options.logs), ["shard-1.log", "shard-2.log", "summary.json"]);
 });
 
-test("Make execution targets query the selected Lua for paths outside its installed tree", async (context) => {
+test("Make execution targets query the selected Lua for paths outside its installed tree", {
+  skip: process.platform === "win32" ? "Windows uses build-windows.mjs instead of the Unix Makefile" : false
+}, async (context) => {
   const root = await mkdtemp(path.join(os.tmpdir(), "titan-test-runtime-"));
   context.after(() => rm(root, { recursive: true, force: true }));
   await mkdir(path.join(root, "scripts"));
@@ -134,19 +137,19 @@ switch (process.argv[4]) {
   }
 });
 
-test("propagates a failed shard while collecting both results", async (context) => {
+test("propagates a failed shard while collecting both results", { skip: unixShardsOnly }, async (context) => {
   const { binary, options } = await fixture(context, "failure");
   await assert.rejects(runShards(binary, options), /native shard 1 failed: exit 17/);
   const summary = JSON.parse(await readFile(path.join(options.logs, "summary.json"), "utf8"));
   assert.deepEqual(summary.map((result) => result.code), [17, 0]);
 });
 
-test("rejects zero selected tests even when the native runner exits successfully", async (context) => {
+test("rejects zero selected tests even when the native runner exits successfully", { skip: unixShardsOnly }, async (context) => {
   const { binary, options } = await fixture(context, "empty");
   await assert.rejects(runShards(binary, options), /test selection mismatch/);
 });
 
-test("cancellation terminates both worker process groups", { timeout: 10_000 }, async (context) => {
+test("cancellation terminates both worker process groups", { skip: unixShardsOnly, timeout: 10_000 }, async (context) => {
   const { root, binary, options } = await fixture(context, "cancel");
   const controller = new AbortController();
   let started = 0;

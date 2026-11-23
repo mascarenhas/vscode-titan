@@ -3,7 +3,7 @@ set -euo pipefail
 
 # The CI release pin selects both the source rock and its exact browser companion.
 identify() {
-  local version release commit prefix source_dir identity role name entry id digest executable
+  local version release commit prefix source_dir identity role name entry id digest
   TITAN_RELEASE=${TITAN_RELEASE:-v0.6.1}
   [[ "$TITAN_RELEASE" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
   version=${TITAN_RELEASE#v}
@@ -45,30 +45,35 @@ identify() {
   done
 
   identity=$({
-    printf '%s\n' "$prefix" "$source_dir" "$OPENSSL_MODE" "$TITAN_BUILD_PROFILE"
-    for executable in make cmake; do "$executable" --version; done
-    case "$RUNNER_OS" in
-      Linux)
-        cc --version
-        dpkg-query -W gcc libc6-dev libreadline-dev libssl-dev libuv1-dev
-        ;;
-      macOS)
-        test "$(uname -m)" = arm64
-        sw_vers
-        cc --version
-        xcrun --show-sdk-path
-        brew list --versions readline
-        ;;
-      Windows)
-        test "$MSYSTEM" = CLANG64
-        test "$(uname -m)" = x86_64
-        cygpath -m /clang64
-        pacman -Q
-        ;;
-    esac
+    toolchain_inputs "$prefix" "$source_dir"
   } | tee "$RUNNER_TEMP/titan-toolchain" | checksum | cut -d' ' -f1)
   cat "$RUNNER_TEMP/titan-toolchain"
   printf 'toolchain=%s\n' "$identity" >> "$GITHUB_OUTPUT"
+}
+
+toolchain_inputs() {
+  printf '%s\n' "$1" "$2" "$OPENSSL_MODE" "$TITAN_BUILD_PROFILE"
+  make --version
+  cmake --version
+  case "$RUNNER_OS" in
+    Linux)
+      cc --version
+      dpkg-query -W gcc libc6-dev libreadline-dev libssl-dev libuv1-dev
+      ;;
+    macOS)
+      test "$(uname -m)" = arm64
+      sw_vers
+      cc --version
+      xcrun --show-sdk-path
+      brew list --versions readline
+      ;;
+    Windows)
+      test "$MSYSTEM" = CLANG64
+      test "$(uname -m)" = x86_64
+      cygpath -m /clang64
+      pacman -Q
+      ;;
+  esac
 }
 
 checksum() {

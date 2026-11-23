@@ -333,15 +333,8 @@ server-coverage-run:
 server-coverage: server-coverage-build
 	+$(MAKE) server-coverage-run
 
-shard-runner-test:
-	node --test scripts/titan-sdk.test.mjs
-	node --test scripts/server-coverage.test.mjs scripts/run-extension-host-tests.test.mjs
-	node --test scripts/run-server-tests.test.mjs
-	node --test scripts/openssl-packaging.test.mjs
-	node --test scripts/makefile-contract.test.mjs
-	node --test scripts/build-windows.test.mjs scripts/inspect-windows-package.test.mjs \
-		scripts/compiler-rocks.test.mjs scripts/stage-lua-modules.test.mjs scripts/stage-notices.test.mjs
-	node --test scripts/browser-semantic-pack.test.mjs
+shard-runner-test: npm-ci
+	npm run test:helpers
 
 incremental-build-test:
 	node scripts/test-incremental-build.mjs --prefix $(call shell_quote,$(TITAN_PREFIX))

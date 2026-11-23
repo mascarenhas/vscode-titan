@@ -119,6 +119,9 @@ test("system SDK staging omits unrelated headers and rejects symlinked OpenSSL",
   assert.match(result.stderr, /SDK include tree inventory changed/);
 });
 
+const unixInspectionOnly = process.platform === "win32" ? "Windows uses PE/DLL inspection instead of inspect-server.sh" : false;
+const unixMakeOnly = process.platform === "win32" ? "Windows uses build-windows.mjs instead of the Unix Makefile" : false;
+
 async function nativeInspection(context, host, bundled, irregular) {
   const state = await fixture(context);
   await mkdir(path.join(state.sdk, "include", ...(bundled ? ["openssl"] : [])), { recursive: true });
@@ -153,12 +156,12 @@ for (const host of ["Linux", "Darwin"]) {
     const libraries = host === "Linux"
       ? [`libssl.so.${major}`, `libcrypto.so.${major}`]
       : [`libssl.${major}.dylib`, `libcrypto.${major}.dylib`];
-    test(`${host} system SDK inspection accepts exact OpenSSL ${major} dependencies`, async (context) => {
+    test(`${host} system SDK inspection accepts exact OpenSSL ${major} dependencies`, { skip: unixInspectionOnly }, async (context) => {
       const inspect = await nativeInspection(context, host, false);
       const result = inspect(dependencies(...libraries));
       assert.equal(result.status, 0, result.stderr);
     });
-    test(`${host} bundled SDK inspection rejects dynamic OpenSSL ${major}`, async (context) => {
+    test(`${host} bundled SDK inspection rejects dynamic OpenSSL ${major}`, { skip: unixInspectionOnly }, async (context) => {
       const inspect = await nativeInspection(context, host, true);
       const result = inspect(dependencies(...libraries));
       assert.notEqual(result.status, 0);
@@ -166,7 +169,7 @@ for (const host of ["Linux", "Darwin"]) {
     });
   }
   const libraries = host === "Linux" ? ["libssl.so.3", "libcrypto.so.3"] : ["libssl.3.dylib", "libcrypto.3.dylib"];
-  test(`${host} system SDK inspection rejects wrong OpenSSL versions and unrelated runtimes`, async (context) => {
+  test(`${host} system SDK inspection rejects wrong OpenSSL versions and unrelated runtimes`, { skip: unixInspectionOnly }, async (context) => {
     const inspect = await nativeInspection(context, host, false);
     for (const name of host === "Linux" ? ["libssl.so.1.1", "libcrypto.so.30", "libssl.so.40", "liblua.so.5.5", "libuv.so.1"]
       : ["libssl.1.1.dylib", "libcrypto.30.dylib", "libssl.40.dylib", "liblua.5.5.dylib", "libuv.1.dylib"]) {
@@ -177,7 +180,7 @@ for (const host of ["Linux", "Darwin"]) {
   });
 }
 
-test("system SDK inspection rejects unresolved OpenSSL dependencies", async (context) => {
+test("system SDK inspection rejects unresolved OpenSSL dependencies", { skip: unixInspectionOnly }, async (context) => {
   const inspect = await nativeInspection(context, "Linux", false);
   const result = inspect("\tlibcrypto.so.3 => not found\n");
   assert.notEqual(result.status, 0);
@@ -185,7 +188,7 @@ test("system SDK inspection rejects unresolved OpenSSL dependencies", async (con
 });
 
 for (const layout of ["file", "link"]) {
-  test(`server inspection rejects ${layout} as an SDK OpenSSL mode marker`, async (context) => {
+  test(`server inspection rejects ${layout} as an SDK OpenSSL mode marker`, { skip: unixInspectionOnly }, async (context) => {
     const inspect = await nativeInspection(context, "Linux", false, layout);
     const result = inspect("\tlibcrypto.so.3 => /usr/lib/libcrypto.so.3 (0x0000)\n");
     assert.notEqual(result.status, 0);
@@ -195,7 +198,7 @@ for (const layout of ["file", "link"]) {
 
 for (const mode of ["system", "bundled"]) {
   test(`${mode} installed SDK uses explicit OpenSSL switches and child-only SDK selection`,
-    { skip: process.platform === "win32" }, async (context) => {
+    { skip: unixMakeOnly }, async (context) => {
       const state = await fixture(context);
       const build = path.join(state.root, "build");
       await state.put("sdk/bin/titanc", "#!/bin/sh\nexit 0\n", true);
@@ -241,7 +244,7 @@ esac
 }
 
 test("embedded interface generation acknowledges unchanged output and keeps input invalidation", {
-  skip: process.platform === "win32"
+  skip: unixMakeOnly
 }, async (context) => {
   const state = await fixture(context);
   const build = path.join(state.root, "build");
@@ -322,7 +325,7 @@ if ! cmp -s "$2" "$3"; then cp "$2" "$3"; fi
 });
 
 test("missing installed compiler fails without bootstrapping or changing the SDK", {
-  skip: process.platform === "win32"
+  skip: unixMakeOnly
 }, async (context) => {
   const state = await fixture(context);
   const result = spawnSync("make", ["--no-print-directory", "-f", repositoryMakefile,

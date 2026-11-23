@@ -170,6 +170,12 @@ manual dispatch, with one job per platform:
 | [macOS](../.github/workflows/macos.yml) | `macos-15` arm64, Homebrew GNU Make and readline, bundled OpenSSL | The complete Unix application gate (`make verify`'s targets), including both test shards, the arm64 Extension Host, and VSIX, Mach-O linkage, and standalone server inspection. |
 | [Windows](../.github/workflows/windows.yml) | `windows-2025-vs2026` x64 with MSYS2 CLANG64, bundled OpenSSL, and local NTFS | Native server and full test aggregate via `build-windows.mjs`, all stdio protocol and workspace cache suites, the Codex adapter, extension and portable helper unit tests, native Extension Host, and PE/DLL and extracted-VSIX inspection. |
 
+All three run the same Node helper test inventory, with explicit skip reasons
+for platform-specific cases. Windows runs the native aggregate in place of
+the POSIX shard launcher and uses PE/DLL and extracted-VSIX inspection in
+place of `install-server-test`, `inspect-vsix` and `inspect-server`. The
+Makefile-driven incremental smoke and GCC coverage gate do not run on Windows.
+
 [`scripts/ci-titan-sdk.sh`](../scripts/ci-titan-sdk.sh) pins `TITAN_RELEASE`
 for all three. It resolves the exact source rock and companion asset IDs,
 SHA-256 digests and release commit. A cache miss installs the validation SDK
