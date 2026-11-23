@@ -118,6 +118,10 @@ Tests live with their implementation:
 Run the focused tests while iterating and `make verify` before committing. A
 passing compile alone is not a passing test.
 
+GitHub-hosted Linux and macOS run the Unix gate; Windows runs the complete
+native aggregate, stdio protocols, Extension Host, and Windows VSIX inspection
+using the native Windows driver. See the [CI inventory](docs/native-build.md#continuous-integration).
+
 ## Work tracking and delivery
 
 GitHub Project 2, `Titan VSCode Extension`, is the Kanban source of truth.

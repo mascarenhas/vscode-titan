@@ -16,8 +16,8 @@ concurrency:
 
 jobs:
   verify-linux-x64:
-    name: Verify Ubuntu 24.04 x64 on Ubicloud
-    runs-on: ubicloud-standard-2
+    name: Verify Ubuntu 24.04 x64
+    runs-on: ubuntu-24.04
     timeout-minutes: 120
 
     env:
@@ -27,9 +27,9 @@ jobs:
       TITAN_MAX_GLIBC_VERSION: "2.39"
       TITAN_JOBS: "2"
       BUILD_PROFILE: validation
+      TITAN_BUILD_PROFILE: validation
       LUA_RELEASE: v5.5.1-1
       LUAROCKS_VERSION: "3.13.0"
-      TITAN_RELEASE: v0.6.1
 
     steps:
       - name: Check out vscode-titan
@@ -90,151 +90,43 @@ jobs:
         id: compiler-identity
         working-directory: vscode-titan
         env:
-          GH_TOKEN: ${{ secrets.TITAN_RELEASE_TOKEN || github.token }}
-        run: |
-          set -euo pipefail
-          [[ "$TITAN_RELEASE" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
-          version=${TITAN_RELEASE#v}
-          TITAN_ROCK="titan-$version-1.src.rock"
-          TITAN_BROWSER_PACK="titan-$version-1-browser-semantics.tar.gz"
-          printf 'TITAN_ROCK=%s\nTITAN_BROWSER_PACK=%s\n' \
-            "$TITAN_ROCK" "$TITAN_BROWSER_PACK" >> "$GITHUB_ENV"
-          # A release can be re-cut under the same tag. The cache names the
-          # exact pair and the commit that the release tag currently selects.
-          release=$(gh api "repos/mascarenhas/titan/releases/tags/$TITAN_RELEASE")
-          commit=$(gh api "repos/mascarenhas/titan/commits/$TITAN_RELEASE" --jq '.sha')
-          [[ "$commit" =~ ^[0-9a-f]{40}$ ]]
-          echo "commit=$commit" >> "$GITHUB_OUTPUT"
-          for role in rock pack; do
-            if [[ "$role" == rock ]]; then name=$TITAN_ROCK; else name=$TITAN_BROWSER_PACK; fi
-            entry=$(jq -er --arg n "$name" --arg t "$TITAN_RELEASE" '
-              select(.tag_name == $t) | [.assets[] | select(.name == $n)] |
-              select(length == 1) | first |
-              select((.id | type) == "number" and (.id > 0) and
-                     (.digest | type) == "string" and (.digest | test("^sha256:[0-9a-f]{64}$"))) |
-              [.id, (.digest | sub("^sha256:"; ""))] | @tsv
-            ' <<<"$release")
-            read -r id digest <<<"$entry"
-            printf '%s_id=%s\n%s=%s\n' "$role" "$id" "$role" "$digest" >> "$GITHUB_OUTPUT"
-          done
-          # Runtime lookup is relocatable, but LuaRocks build configuration still
-          # records its install prefix. Keep build caches specific to that layout.
-          node --input-type=module -e '
-            import { createHash } from "node:crypto";
-            import { appendFileSync, realpathSync } from "node:fs";
-            import path from "node:path";
-            const prefix = path.join(realpathSync("."), ".titan-validation");
-            const identity = createHash("sha256").update(prefix).digest("hex");
-            appendFileSync(process.env.GITHUB_OUTPUT, `prefix=${identity}\n`);
-            appendFileSync(process.env.GITHUB_ENV, `TITAN_PREFIX=${prefix}\n`);
-          '
+          GH_TOKEN: ${{ github.token }}
+        run: bash scripts/ci-titan-sdk.sh identify
 
       - name: Restore the Titan release installation
         id: compiler-cache
-        uses: ubicloud/cache/restore@v4
+        uses: actions/cache/restore@v4
         with:
           path: vscode-titan/.titan-validation
-          # No fallback keys: another source rock is never a valid hit.
-          # Bump the format when compiler build policy changes. The pinned
-          # bundled Lua components come from scripts/compiler-rocks.mjs.
-          key: titan-sdk-v11-source-rock-validation-titan-o0-lua-deps-optimized-ubuntu24.04-${{ runner.arch }}-readline-system-openssl-system-${{ env.LUA_RELEASE }}-${{ env.LUAROCKS_VERSION }}-${{ steps.compiler-identity.outputs.commit }}-rock-${{ steps.compiler-identity.outputs.rock }}-pack-${{ steps.compiler-identity.outputs.pack }}-components-${{ hashFiles('vscode-titan/scripts/compiler-rocks.mjs') }}-${{ steps.compiler-identity.outputs.prefix }}
+          # Exact only: the toolchain, both assets, and the layout must match.
+          key: titan-sdk-v12-ubuntu-24.04-${{ runner.arch }}-${{ env.LUA_RELEASE }}-${{ env.LUAROCKS_VERSION }}-${{ steps.compiler-identity.outputs.toolchain }}-${{ steps.compiler-identity.outputs.commit }}-${{ steps.compiler-identity.outputs.rock }}-${{ steps.compiler-identity.outputs.pack }}-${{ hashFiles('vscode-titan/scripts/ci-titan-sdk.sh', 'vscode-titan/scripts/compiler-rocks.mjs') }}
 
-      - name: Download, build and install Lua 5.5.1
-        if: steps.compiler-cache.outputs.cache-hit != 'true'
-        run: |
-          mkdir -p "$RUNNER_TEMP/titan-sdk-sources/lua"
-          cd "$RUNNER_TEMP/titan-sdk-sources"
-          curl -fL --retry 3 -o lua.tar.gz \
-            "https://github.com/mascarenhas/lua-5.5.1/archive/refs/tags/$LUA_RELEASE.tar.gz"
-          tar -xzf lua.tar.gz --strip-components=1 -C lua
-          make -C lua -j2 linux-readline PREFIX="$TITAN_PREFIX" \
-            CC=cc MYCFLAGS='-O2 -fno-lto' MYLDFLAGS='-O2 -fno-lto'
-          make -C lua install PREFIX="$TITAN_PREFIX"
-
-      - name: Download, build and install LuaRocks
-        if: steps.compiler-cache.outputs.cache-hit != 'true'
-        run: |
-          cd "$RUNNER_TEMP/titan-sdk-sources"
-          curl -fL --retry 3 -o luarocks.tar.gz \
-            "https://luarocks.org/releases/luarocks-$LUAROCKS_VERSION.tar.gz"
-          tar -xzf luarocks.tar.gz
-          cd "luarocks-$LUAROCKS_VERSION"
-          ./configure --prefix="$TITAN_PREFIX" --rocks-tree="$TITAN_PREFIX" \
-            --with-lua="$TITAN_PREFIX" --force-config
-          make LUA_DIR="$TITAN_PREFIX"
-          make install LUA_DIR="$TITAN_PREFIX"
-
-      - name: Install the pinned bundled Lua components
+      - name: Install the validation Titan release SDK
         if: steps.compiler-cache.outputs.cache-hit != 'true'
         working-directory: vscode-titan
-        run: |
-          # The VSIX bundles these exact versions with their notices. Install
-          # them before the Titan rock so its dependency ranges resolve to them
-          # instead of the newest upstream releases.
-          components=$(node --input-type=module -e '
-            import { compilerRocks } from "./scripts/compiler-rocks.mjs";
-            for (const rock of compilerRocks("linux")) {
-              console.log(`${rock.directory ?? rock.rockName} ${rock.version}`);
-            }
-          ')
-          test -n "$components"
-          while read -r rock version; do
-            PATH="$TITAN_PREFIX/bin:$PATH" "$TITAN_PREFIX/bin/luarocks" install "$rock" "$version"
-          done <<<"$components"
-
-      - name: Download and install the Titan release source rock
-        if: steps.compiler-cache.outputs.cache-hit != 'true'
         env:
-          GH_TOKEN: ${{ secrets.TITAN_RELEASE_TOKEN || github.token }}
+          GH_TOKEN: ${{ github.token }}
           ROCK_ID: ${{ steps.compiler-identity.outputs.rock_id }}
           ROCK_SHA256: ${{ steps.compiler-identity.outputs.rock }}
-        run: |
-          cd "$RUNNER_TEMP/titan-sdk-sources"
-          gh api -H 'Accept: application/octet-stream' \
-            "repos/mascarenhas/titan/releases/assets/$ROCK_ID" > "$TITAN_ROCK"
-          echo "$ROCK_SHA256  $TITAN_ROCK" | sha256sum --check --strict
-          PATH="$TITAN_PREFIX/bin:$PATH" TITAN_BUILD_PROFILE=validation \
-            "$TITAN_PREFIX/bin/luarocks" install "$TITAN_ROCK"
+        run: bash scripts/ci-titan-sdk.sh install
+
+      - name: Validate the compiler installation
+        working-directory: vscode-titan
+        run: bash scripts/ci-titan-sdk.sh inspect
 
       - name: Provision and verify the paired browser semantic pack
         working-directory: vscode-titan
         env:
-          GH_TOKEN: ${{ secrets.TITAN_RELEASE_TOKEN || github.token }}
+          GH_TOKEN: ${{ github.token }}
           PACK_ID: ${{ steps.compiler-identity.outputs.pack_id }}
           PACK_SHA256: ${{ steps.compiler-identity.outputs.pack }}
           ROCK_SHA256: ${{ steps.compiler-identity.outputs.rock }}
           TITAN_COMMIT: ${{ steps.compiler-identity.outputs.commit }}
-        run: |
-          # A warm cache must contain these exact bytes, not merely usable
-          # browser files. Re-fetch and verify the small companion on every run.
-          archive="$RUNNER_TEMP/$TITAN_BROWSER_PACK"
-          gh api -H 'Accept: application/octet-stream' \
-            "repos/mascarenhas/titan/releases/assets/$PACK_ID" > "$archive"
-          node scripts/browser-semantic-pack.mjs --install "$TITAN_PREFIX" "$archive" \
-            "$PACK_SHA256" "$ROCK_SHA256" "$TITAN_COMMIT" production
-          TITAN_ROOT="$TITAN_PREFIX" TITAN_TEST_BROWSER_COMPANION="$archive" \
-            TITAN_TEST_BROWSER_COMPANION_SHA256="$PACK_SHA256" \
-            TITAN_TEST_BROWSER_ROCK_SHA256="$ROCK_SHA256" \
-            TITAN_TEST_BROWSER_COMMIT="$TITAN_COMMIT" TITAN_TEST_BROWSER_PROFILE=production \
-            node --test scripts/browser-semantic-pack.test.mjs
-
-      - name: Validate the compiler installation
-        working-directory: vscode-titan
-        run: |
-          test -x "$TITAN_PREFIX/bin/titanc"
-          test -s "$TITAN_PREFIX/lib/titan/0.6/titan.a"
-          test -s "$TITAN_PREFIX/lib/titan/0.6/libtitan.a"
-          test -s "$TITAN_PREFIX/lib/lua/5.5/titan.so"
-          test -s "$TITAN_PREFIX/include/titan/ffi.h"
-          test -s "$TITAN_PREFIX/src/lua-5.5.1/lua.h"
-          test -s "$TITAN_PREFIX/share/titan/LICENSE"
-          test "$(cat "$TITAN_PREFIX/etc/titan/build-profile")" = validation
-          test "$("$TITAN_PREFIX/bin/titanc" --print-root)" = "$TITAN_PREFIX"
-          "$TITAN_PREFIX/bin/titanc" --help
+        run: bash scripts/ci-titan-sdk.sh pack
 
       - name: Cache the completed compiler installation
         if: steps.compiler-cache.outputs.cache-hit != 'true'
-        uses: ubicloud/cache/save@v4
+        uses: actions/cache/save@v4
         with:
           path: vscode-titan/.titan-validation
           key: ${{ steps.compiler-cache.outputs.cache-primary-key }}

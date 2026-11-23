@@ -209,18 +209,18 @@ cache state, diagnostic success, warm work avoided, full background restoration,
 compiler/source revisions and host-load limits; an early READY notification is
 not full restoration. Keep failed runs as failed evidence.
 
-CI explicitly builds and caches the complete validation compiler installation at
-`.titan-validation` by installing tagged Lua 5.5.1, LuaRocks 3.13.0 and the
-Titan v0.6 source rock with `luarocks install` before invoking
-the consumer build. Select it with `TITAN_PREFIX`. Key the cache on both
-release asset digests, the resolved commit, profile, architecture, build
-policy and absolute prefix. Validate the browser companion even on a cache
-hit. CI builds disposable packages for inspection and uploads no VSIX/server
-artifacts. Future main-only release jobs must rebuild inputs in production.
-Native tests compile once and execute in two shards on the two-CPU runner.
-Maintain the module inventory in
-`scripts/run-server-tests.mjs` when adding a test owner, inspect positive test
-selection and both shard outcomes, and use `make verify` for the complete gate.
+GitHub-hosted CI runs one job each on Linux x64, macOS arm64, and Windows
+x64; see [the platform gates](../../../docs/native-build.md#continuous-integration).
+The jobs all provision a validation SDK from the source rock selected by
+`TITAN_RELEASE`, and verify the exact browser companion even on a cache hit.
+Key the SDK cache on both release asset digests, resolved commit, profile,
+platform toolchain, build policy, and absolute prefix. Select the SDK with
+`TITAN_PREFIX`. CI builds disposable packages for inspection and uploads no
+VSIX or server artifacts; production release jobs need separate inputs.
+Unix native tests compile once and run in two shards. Maintain the module
+inventory in `scripts/run-server-tests.mjs` when adding a test owner, and
+inspect both shard outcomes and their selected counts. Windows uses the
+unfiltered aggregate through `scripts/build-windows.mjs`.
 
 ## Native production line coverage
 
