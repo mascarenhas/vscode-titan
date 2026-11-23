@@ -142,6 +142,39 @@ test("a private SDK receives the full companion and refuses damaged warm caches"
     assert.deepEqual((await readdir(pack)).sort(), semanticFiles);
     await installBrowserCompanion(prefix, companion, expected);
 
+    await context.test("installation checks both release values against the chosen tag", async () => {
+      const release = expected.tag.slice(1);
+      const otherRelease = release === "0.6.99" ? "0.6.0" : "0.6.99";
+      await assert.rejects(verifyInstalledBrowserPack(prefix, prefix, { release: otherRelease }),
+        /SDK compiler release differs from companion/);
+
+      const lua = path.join(prefix, "bin", process.platform === "win32" ? "lua.exe" : "lua");
+      const descriptor = path.join(pack, "analysis-target");
+      const original = await readFile(descriptor);
+      try {
+        const retagged = spawnSync(lua, ["-E", "-", prefix, descriptor, otherRelease], {
+          encoding: "utf8",
+          input: `
+local prefix, filename, release = ...
+package.path = prefix .. "/share/lua/5.5/?.lua"
+local codec = require "titan-compiler.graphcodec"
+local input = assert(io.open(filename, "rb"))
+local data = assert(codec.decode(assert(input:read("a"))))
+assert(input:close())
+data.release = release
+local output = assert(io.open(filename, "wb"))
+assert(output:write(assert(codec.encode(data))))
+assert(output:close())
+`
+        });
+        assert.equal(retagged.status, 0, retagged.stderr);
+        await assert.rejects(verifyInstalledBrowserPack(prefix, prefix, { release }),
+          /browser descriptor release differs from companion|incompatible browser semantic target/);
+      } finally {
+        await writeFile(descriptor, original);
+      }
+    });
+
     const absent = path.join(pack, "absent-modules");
     await writeFile(absent, "different bytes\n");
     await assert.rejects(installBrowserCompanion(prefix, companion, expected), /differs from the exact companion/);
