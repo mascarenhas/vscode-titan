@@ -128,7 +128,7 @@ No native `lib/titan` archive, `share/lua/5.5/titan` source tree, Wasm runtime, 
 
 ### Paired browser semantic pack
 
-Pair the Titan source rock with `titan-0.6.0-1-browser-semantics.tar.gz` from the same release. Provision a native-only SDK with the companion's recorded Git commit and SHA-256 digests before packaging:
+Pair the Titan source rock with `titan-0.6.1-1-browser-semantics.tar.gz` from the same release. Provision a native-only SDK with the companion's recorded Git commit and SHA-256 digests before packaging:
 
 ```sh
 node scripts/browser-semantic-pack.mjs --install "$TITAN_PREFIX" "$PACK" \

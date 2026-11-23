@@ -51,7 +51,7 @@ test("staging requires and copies the portable compiler path helper", async (con
   };
   for (const file of requiredShareFiles.filter((file) => file !== "titan-compiler/path.lua"))
     await put(`share/lua/5.5/${file}`);
-  await put("share/lua/5.5/titan-compiler/version.lua", 'LUA_VERSION="5.5"\nTITAN_ABI_VERSION="2"\nTITAN_VERSION="0.6.0"\n');
+  await put("share/lua/5.5/titan-compiler/version.lua", 'LUA_VERSION="5.5"\nTITAN_ABI_VERSION="2"\nTITAN_VERSION="0.6.1"\n');
   await put("share/lua/5.5/titan-compiler/driver.lua", "driver.LANGUAGE_SERVER_API_VERSION = 1\n");
   await put("share/lua/5.5/argparse.lua");
   for (const member of nativeRootInventory()) await put(`lib/lua/5.5/${member.split(":")[0]}`);

@@ -12,7 +12,7 @@ const LUA_SOURCE_VERSION = "5.5.1";
 const EXPECTED_COMPILER_VERSION = {
   LUA_VERSION,
   TITAN_ABI_VERSION: "2",
-  TITAN_VERSION: "0.6.0"
+  TITAN_VERSION: "0.6.1"
 };
 const EXPECTED_LANGUAGE_SERVER_API_VERSION = 1;
 // The compiler modules, their packaged dependencies and nothing else. The
