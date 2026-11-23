@@ -1,0 +1,206 @@
+name: Windows
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify-windows-x64:
+    name: Verify Windows x64 CLANG64
+    runs-on: windows-2025-vs2026
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: pwsh
+        working-directory: C:/vscode-ci
+    env:
+      CCACHE_DISABLE: "1"
+      CI: "true"
+      OPENSSL_MODE: bundled
+      TITAN_JOBS: "4"
+      TITAN_BUILD_PROFILE: validation
+      LUA_RELEASE: v5.5.1-1
+      LUAROCKS_VERSION: "3.13.0"
+      LC_ALL: C.UTF-8
+      LANG: C.UTF-8
+
+    steps:
+      - uses: actions/checkout@v7.0.1
+        env:
+          GIT_CONFIG_COUNT: "1"
+          GIT_CONFIG_KEY_0: core.autocrlf
+          GIT_CONFIG_VALUE_0: "false"
+        with:
+          persist-credentials: false
+
+      - name: Set up native Node.js
+        uses: actions/setup-node@v7.0.0
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install MSYS2 CLANG64 build tools
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: CLANG64
+          location: C:/titan-msys2
+          path-type: inherit
+          cache: true
+          install: >-
+            git make perl curl tar unzip jq
+            mingw-w64-clang-x86_64-clang
+            mingw-w64-clang-x86_64-clang-tools-extra
+            mingw-w64-clang-x86_64-llvm
+            mingw-w64-clang-x86_64-make
+            mingw-w64-clang-x86_64-cmake
+            mingw-w64-clang-x86_64-ninja
+            mingw-w64-clang-x86_64-openssl
+            mingw-w64-clang-x86_64-python
+
+      - name: Stage the checkout and runtime fixtures on local NTFS
+        shell: msys2 {0}
+        working-directory: ${{ github.workspace }}
+        run: |
+          set -euo pipefail
+          test ! -e /c/vscode-ci
+          cp -a . /c/vscode-ci
+          mkdir /c/vscode-ci-temp
+          printf '%s\n' 'TEMP=C:/vscode-ci-temp' 'TMP=C:/vscode-ci-temp' \
+            >> "$(cygpath -u "$GITHUB_ENV")"
+          printf 'CLANG64_BIN=%s\n' "$(cygpath -m /clang64/bin)" >> "$(cygpath -u "$GITHUB_ENV")"
+          cygpath -w /clang64/bin >> "$(cygpath -u "$GITHUB_PATH")"
+
+      - name: Verify native Windows runner and paths
+        run: |
+          if ((Get-Volume -DriveLetter C).FileSystem -ne 'NTFS') { throw 'The native suite requires local NTFS' }
+          node -e 'if (process.platform !== "win32" || process.arch !== "x64") process.exit(1)'
+          & "$env:CLANG64_BIN/clang.exe" --version
+
+      - name: Identify the compiler installation cache
+        id: compiler-identity
+        shell: msys2 {0}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash scripts/ci-titan-sdk.sh identify
+
+      - name: Restore the Titan release installation
+        id: compiler-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: C:/titan-sdk
+          key: titan-sdk-v12-windows-2025-vs2026-${{ runner.arch }}-${{ steps.compiler-identity.outputs.toolchain }}-${{ steps.compiler-identity.outputs.commit }}-${{ steps.compiler-identity.outputs.rock }}-${{ steps.compiler-identity.outputs.pack }}-${{ hashFiles('scripts/ci-titan-sdk.sh', 'scripts/compiler-rocks.mjs') }}
+
+      - name: Install the validation Titan release SDK
+        if: steps.compiler-cache.outputs.cache-hit != 'true'
+        shell: msys2 {0}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ROCK_ID: ${{ steps.compiler-identity.outputs.rock_id }}
+          ROCK_SHA256: ${{ steps.compiler-identity.outputs.rock }}
+        run: bash scripts/ci-titan-sdk.sh install
+
+      - name: Validate the compiler installation
+        shell: msys2 {0}
+        run: bash scripts/ci-titan-sdk.sh inspect
+
+      - name: Provision and verify the paired browser semantic pack
+        shell: msys2 {0}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PACK_ID: ${{ steps.compiler-identity.outputs.pack_id }}
+          PACK_SHA256: ${{ steps.compiler-identity.outputs.pack }}
+          ROCK_SHA256: ${{ steps.compiler-identity.outputs.rock }}
+          TITAN_COMMIT: ${{ steps.compiler-identity.outputs.commit }}
+        run: bash scripts/ci-titan-sdk.sh pack
+
+      - name: Cache the completed compiler installation
+        if: steps.compiler-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: C:/titan-sdk
+          key: ${{ steps.compiler-cache.outputs.cache-primary-key }}
+
+      - name: Install the native npm dependencies
+        id: npm
+        run: npm ci
+
+      - name: Build the native server and test aggregate
+        id: build
+        run: |
+          $tools = @('--clang', "$env:CLANG64_BIN/clang.exe", '--ar', "$env:CLANG64_BIN/llvm-ar.exe",
+            '--ranlib', "$env:CLANG64_BIN/llvm-ranlib.exe")
+          node scripts/build-windows.mjs server @tools
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          node scripts/build-windows.mjs server-test-build @tools
+
+      - name: Run the complete native test aggregate
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: |
+          node scripts/build-windows.mjs server-test-run --clang "$env:CLANG64_BIN/clang.exe" `
+            --ar "$env:CLANG64_BIN/llvm-ar.exe" --ranlib "$env:CLANG64_BIN/llvm-ranlib.exe"
+
+      - name: Run server protocol, cache, and Codex adapter regressions
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: |
+          $sdk = $env:TITAN_PREFIX
+          Remove-Item Env:TITAN_PREFIX
+          $env:TITAN_ROOT = $sdk
+          $env:TITAN_LS_LUA_PATH = "$sdk/share/lua/5.5/?.lua;$sdk/share/lua/5.5/?/init.lua"
+          $env:TITAN_LS_LUA_CPATH = "$sdk/lib/lua/5.5/?.dll"
+          $env:TITAN_ROUTER_WORKER_FIXTURE = (Resolve-Path .build/windows/tests/native/router-worker/bin/router_worker_fixture.exe).Path
+          $env:CC = '"' + $env:CLANG64_BIN + '/clang.exe"'
+          $env:AR = '"' + $env:CLANG64_BIN + '/llvm-ar.exe"'
+          $env:RANLIB = '"' + $env:CLANG64_BIN + '/llvm-ranlib.exe"'
+          $env:RC = '"' + $env:CLANG64_BIN + '/llvm-rc.exe"'
+          $env:TITAN_EXTRA_CPPFLAGS = '-I"' + $sdk + '/include"'
+          $server = (Resolve-Path bin/titan-language-server.exe).Path
+          node --test scripts/browser-analysis-fixture.test.mjs
+          $failed = $LASTEXITCODE -ne 0
+          foreach ($suite in 'completion-protocol', 'server-protocol', 'workspace-cache', 'multi-root', 'codex-native') {
+            node "scripts/test-$suite.mjs" $server
+            if ($LASTEXITCODE) { $failed = $true }
+          }
+          if ($failed) { exit 1 }
+
+      - name: Run extension and helper unit tests
+        if: ${{ !cancelled() && steps.npm.outcome == 'success' }}
+        run: |
+          npm run test:unit
+          $failed = $LASTEXITCODE -ne 0
+          npm run test:helpers
+          if ($failed -or $LASTEXITCODE) { exit 1 }
+
+      - name: Report Unix-only gate exclusions
+        run: |
+          Write-Host 'SKIP incremental-build-test: the application smoke drives the Unix Makefile.'
+          Write-Host 'SKIP install-server-test, inspect-vsix, inspect-server: Windows uses the native VSIX and PE/DLL inspection below.'
+          Write-Host 'SKIP native line coverage: the covered application gate uses GCC and the Unix Makefile.'
+
+      - name: Run the VS Code extension-host smoke test
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: |
+          $env:TITAN_LSP_TEST_SERVER = (Resolve-Path bin/titan-language-server.exe).Path
+          $env:CC = '"' + $env:CLANG64_BIN + '/clang.exe"'
+          $env:AR = '"' + $env:CLANG64_BIN + '/llvm-ar.exe"'
+          $env:RANLIB = '"' + $env:CLANG64_BIN + '/llvm-ranlib.exe"'
+          $env:RC = '"' + $env:CLANG64_BIN + '/llvm-rc.exe"'
+          npm run test:vscode
+
+      - name: Build and inspect a disposable Windows VSIX
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: |
+          node scripts/build-windows.mjs package --clang "$env:CLANG64_BIN/clang.exe" `
+            --ar "$env:CLANG64_BIN/llvm-ar.exe" --ranlib "$env:CLANG64_BIN/llvm-ranlib.exe"
+
+      - name: Validate the Codex plugin inventory
+        if: ${{ !cancelled() && steps.npm.outcome == 'success' }}
+        run: node scripts/validate-plugin.mjs

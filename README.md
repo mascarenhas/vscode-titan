@@ -108,6 +108,11 @@ packaging, linkage checks, and plugin validation—with `make verify` (or
 `TITAN_PREFIX="$HOME/.local/titan"` to target a specific SDK, and run
 `make help` to list every target.
 
+Pull requests and pushes to `main` run native, Extension Host, and packaging
+checks on GitHub-hosted Linux x64, Apple Silicon macOS, and Windows x64.
+See [Continuous integration](docs/native-build.md#continuous-integration) for
+each platform's verification commands.
+
 To launch the extension in a VS Code Extension Development Host:
 
 1. Open this repository in VS Code.

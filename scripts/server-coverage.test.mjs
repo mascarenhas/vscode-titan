@@ -10,6 +10,7 @@ import { buildCoverage, discoverProductionModules, execute, parseArguments, runC
 
 const repository = fileURLToPath(new URL("..", import.meta.url));
 const ownersOutput = () => serverTestShards.flat().map((name) => `[ RUN      ] ${name}.test_case`).join("\n");
+const unixCoverageOnly = process.platform === "win32" ? "native coverage supports GCC Linux/macOS only" : false;
 
 async function fixture(context) {
   const root = await realpath(await mkdtemp(path.join(os.tmpdir(), "vscode-titan-coverage-test-")));
@@ -76,38 +77,48 @@ async function sourceFiles(directory, relative = "") {
   return result;
 }
 
+// The coverage discovery input and output are relative native paths.
+const nativePaths = (files) => files.map((file) => path.normalize(file));
+
 test("authored production discovery includes current entry, unused modules, and new modules automatically", async () => {
   const authored = await sourceFiles(path.join(repository, "src"));
   const names = discoverProductionModules(authored).map((module) => module.name);
   assert.ok(names.includes("titan_language_server"));
   assert.ok(names.includes("server.response_queue"));
   assert.ok(!names.some((name) => name.endsWith("_test") || name === "server.tests" || name.startsWith("server.test_")));
-  assert.ok(discoverProductionModules([...authored, "server/future_unused.titan"]).some((module) => module.name === "server.future_unused"));
+  assert.ok(discoverProductionModules([...authored, path.join("server", "future_unused.titan")])
+    .some((module) => module.name === "server.future_unused"));
 });
 
 test("discovery reserves exact test naming and ignores only generated .coverage trees", () => {
-  const modules = discoverProductionModules(["tests.titan", "test_helper.titan", "thing_test.titan", "testable.titan", "contest.titan",
-    "server/test.titan", "server/tests_more.titan", "server/.coverage/generated.titan", "server/.scratch/authored.titan"]);
+  const modules = discoverProductionModules(nativePaths(["tests.titan", "test_helper.titan", "thing_test.titan", "testable.titan", "contest.titan",
+    "server/test.titan", "server/tests_more.titan", "server/.coverage/generated.titan", "server/.scratch/authored.titan"]));
   assert.deepEqual(modules.map((module) => module.name), ["contest", "server..scratch.authored", "server.test", "server.tests_more", "testable"]);
   assert.throws(() => discoverProductionModules(["tests.titan", "test_helper.titan"]), /no production/);
 });
 
 test("folder mains own all immediate contributors and shadow flat alternatives", () => {
-  const modules = discoverProductionModules(["server/parser.titan", "server/parser/parser.titan", "server/parser/tokens.titan",
+  const modules = discoverProductionModules(nativePaths(["server/parser.titan", "server/parser/parser.titan", "server/parser/tokens.titan",
     "server/parser/contributor_test.titan", "server/parser/deep/node.titan", "server/test_support/test_support.titan",
-    "server/test_support/helpers.titan", "entry.titan"]);
+    "server/test_support/helpers.titan", "entry.titan"]));
   assert.deepEqual(modules, [
     { name: "entry", main: "entry.titan", sources: ["entry.titan"] },
-    { name: "server.parser", main: "server/parser/parser.titan", sources: ["server/parser/contributor_test.titan", "server/parser/parser.titan", "server/parser/tokens.titan"] },
-    { name: "server.parser.deep.node", main: "server/parser/deep/node.titan", sources: ["server/parser/deep/node.titan"] }
+    { name: "server.parser", main: path.normalize("server/parser/parser.titan"),
+      sources: nativePaths(["server/parser/contributor_test.titan", "server/parser/parser.titan", "server/parser/tokens.titan"]) },
+    { name: "server.parser.deep.node", main: path.normalize("server/parser/deep/node.titan"),
+      sources: nativePaths(["server/parser/deep/node.titan"]) }
   ]);
 });
 
 test("build options select explicit SDK/toolchain and optional formats; run needs only build and timeout", () => {
-  const parsed = parseArguments(["build", "--build-dir", "/tmp/build", "--native-dir", "/tmp/native", "--format", "html", "--format", "lcov", "--format", "html"],
-    { TITAN_PREFIX: "/tmp/sdk", CC: "gcc-14", GCOV: "gcov-14" });
-  assert.equal(parsed.prefix, "/tmp/sdk");
-  assert.equal(parsed.reportDir, "/tmp/build/report");
+  const root = path.resolve(os.tmpdir());
+  const prefix = path.join(root, "sdk");
+  const build = path.join(root, "build");
+  const native = path.join(root, "native");
+  const parsed = parseArguments(["build", "--build-dir", build, "--native-dir", native, "--format", "html", "--format", "lcov", "--format", "html"],
+    { TITAN_PREFIX: prefix, CC: "gcc-14", GCOV: "gcov-14" });
+  assert.equal(parsed.prefix, prefix);
+  assert.equal(parsed.reportDir, path.join(build, "report"));
   assert.deepEqual(parsed.formats, ["html", "lcov"]);
   assert.equal(parsed.cc, "gcc-14");
   const run = parseArguments(["run", "--build-dir", "/tmp/build", "--timeout", "45"], {});
@@ -119,7 +130,7 @@ test("build options select explicit SDK/toolchain and optional formats; run need
   assert.throws(() => parseArguments(["run", "--build-dir", "/tmp/build", "--scope", "all"]), /invalid coverage option/);
 });
 
-test("single direct test build roots every discovered production module and isolates source-adjacent artifacts", async (context) => {
+test("single direct test build roots every discovered production module and isolates source-adjacent artifacts", { skip: unixCoverageOnly }, async (context) => {
   const { options, calls, run, environment } = await fixture(context);
   const build = await buildCoverage(options, { run, environment });
   const compilations = calls.filter((call) => path.basename(call.command) === "titanc");
@@ -152,7 +163,7 @@ test("single direct test build roots every discovered production module and isol
   await assert.rejects(buildCoverage(options, { run, environment }), { code: "EEXIST" });
 });
 
-test("optional richer formats are passed to the compiler only when requested", async (context) => {
+test("optional richer formats are passed to the compiler only when requested", { skip: unixCoverageOnly }, async (context) => {
   const { options, calls, run, environment } = await fixture(context);
   options.formats = ["html", "lcov", "cobertura"];
   await buildCoverage(options, { run, environment });
@@ -162,7 +173,7 @@ test("optional richer formats are passed to the compiler only when requested", a
   await runCoverage(options, { run, environment });
 });
 
-test("metadata inventory audit rejects omitted production coverage and absent notes before execution", async (context) => {
+test("metadata inventory audit rejects omitted production coverage and absent notes before execution", { skip: unixCoverageOnly }, async (context) => {
   const { options, calls, run, environment } = await fixture(context);
   await assert.rejects(buildCoverage(options, { environment, run: async (command, args, execution) => {
     const output = await run(command, args, execution);
@@ -175,7 +186,7 @@ test("metadata inventory audit rejects omitted production coverage and absent no
   await assert.rejects(runCoverage(other, { run, environment }), { code: "ENOENT" });
 });
 
-test("colocated test exclusion from compiler metadata propagates a useful build failure", async (context) => {
+test("colocated test exclusion from compiler metadata propagates a useful build failure", { skip: unixCoverageOnly }, async (context) => {
   const { options, run, environment } = await fixture(context);
   const failure = new Error("server.unimported: production module was not instrumented (colocated test_ functions are excluded)");
   await assert.rejects(buildCoverage(options, { environment, run: (command, args, execution) => {
@@ -185,7 +196,7 @@ test("colocated test exclusion from compiler metadata propagates a useful build 
   await assert.rejects(stat(path.join(options.buildDir, "coverage-build.json")), { code: "ENOENT" });
 });
 
-test("direct execution uses selected runtime paths, ignores ambient filters, and reports producer totals", async (context) => {
+test("direct execution uses selected runtime paths, ignores ambient filters, and reports producer totals", { skip: unixCoverageOnly }, async (context) => {
   const { options, calls, run, environment } = await fixture(context);
   await buildCoverage(options, { run, environment });
   assert.deepEqual(await runCoverage(options, { run, environment }), { covered: 12, total: 20, reportDir: options.reportDir });
@@ -206,7 +217,7 @@ test("direct execution uses selected runtime paths, ignores ambient filters, and
   await runCoverage(options, { run, environment }); // direct executable resets its own counters on each run
 });
 
-test("failed rerun removes old owned reports, retains unrelated files, and preserves the test failure", async (context) => {
+test("failed rerun removes old owned reports, retains unrelated files, and preserves the test failure", { skip: unixCoverageOnly }, async (context) => {
   const { options, run, environment, put } = await fixture(context);
   await buildCoverage(options, { run, environment });
   await runCoverage(options, { run, environment });
@@ -222,7 +233,7 @@ test("failed rerun removes old owned reports, retains unrelated files, and prese
   assert.equal(await readFile(path.join(options.reportDir, "unrelated.txt"), "utf8"), "keep");
 });
 
-test("incomplete test-owner execution, missing totals, and absent report reject successful child status", async (context) => {
+test("incomplete test-owner execution, missing totals, and absent report reject successful child status", { skip: unixCoverageOnly }, async (context) => {
   const { options, run, environment } = await fixture(context);
   await buildCoverage(options, { run, environment });
   await assert.rejects(runCoverage(options, { environment, run: async (command, args, execution) => {
@@ -240,7 +251,7 @@ test("incomplete test-owner execution, missing totals, and absent report reject 
   } }), { code: "ENOENT" });
 });
 
-test("a failed rerun inventory audit also clears the preceding successful report", async (context) => {
+test("a failed rerun inventory audit also clears the preceding successful report", { skip: unixCoverageOnly }, async (context) => {
   const { options, run, environment } = await fixture(context);
   const build = await buildCoverage(options, { run, environment });
   await runCoverage(options, { run, environment });

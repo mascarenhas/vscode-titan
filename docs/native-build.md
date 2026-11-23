@@ -161,20 +161,34 @@ The checked-in smaller browser fixture serves only source-tree protocol tests. T
 
 ## Continuous integration
 
-[`.github/workflows/ci.yml`](../.github/workflows/ci.yml) runs `verify-linux-x64` on `ubicloud-standard-2` (Ubuntu 24.04) with `BUILD_PROFILE=validation`, `OPENSSL_MODE=system`, `TITAN_JOBS=2`, and `TITAN_MAX_GLIBC_VERSION=2.39` on pushes to `main`, pull requests, and manual dispatch:
+Three GitHub-hosted workflows run on pull requests, pushes to `main`, and
+manual dispatch, with one job per platform:
 
-1. **SDK:** Derives both asset names from `TITAN_RELEASE`, then resolves the
-   exact asset IDs, SHA-256 digests, and commit SHA for that tag. It restores
-   `.titan-validation` under an exact cache key (no fallback keys) covering
-   rock, pack, Lua 5.5.1, LuaRocks 3.13.0, pinned `compiler-rocks.mjs`, build
-   policy, and prefix; installs on a miss with
-   `TITAN_BUILD_PROFILE=validation`; and re-downloads and verifies the
-   production browser semantic pack on every run.
-2. **Build and test:** Runs `make -j2 server server-test-build`, then serially runs `server-test-sharded`, `incremental-build-test`, `server-protocol-test`, `codex-native-test`, `extension-test`, `shard-runner-test`, and `xvfb-run -a make extension-host-test`.
-3. **Package:** Runs `make package`, followed by `inspect-vsix`, `inspect-server`, `plugin-validate`, and `install-server-test`.
-4. **Coverage:** Builds and runs the [covered aggregate](coverage.md) with `CC=gcc-14`, gcov 14, and gcovr 8.4 (HTML, LCOV, Cobertura), uploading reports and logs as `titan-language-server-line-coverage` for 7 days.
+| Workflow | Runner and SDK | Verification |
+| --- | --- | --- |
+| [Linux](../.github/workflows/ci.yml) | `ubuntu-24.04` x64, system OpenSSL | Native server, both test shards, incremental-build smoke, all protocol and Codex adapter regressions, extension and launcher unit tests, Extension Host under `xvfb-run`, VSIX and installed-server inspection, plugin validation, and [native line coverage](coverage.md). |
+| [macOS](../.github/workflows/macos.yml) | `macos-15` arm64, Homebrew GNU Make and readline, bundled OpenSSL | The complete Unix application gate (`make verify`'s targets), including both test shards, the arm64 Extension Host, and VSIX, Mach-O linkage, and standalone server inspection. |
+| [Windows](../.github/workflows/windows.yml) | `windows-2025-vs2026` x64 with MSYS2 CLANG64, bundled OpenSSL, and local NTFS | Native server and full test aggregate via `build-windows.mjs`, all stdio protocol and workspace cache suites, the Codex adapter, extension and portable helper unit tests, native Extension Host, and PE/DLL and extracted-VSIX inspection. |
 
-CI requires no Titan checkout or deploy key and publishes no binaries or VSIX packages. Release publishing belongs in a dedicated `main`-only job after validation passes, building from a separate production SDK on the oldest supported Linux glibc baseline with full optimization.
+All three run the same Node helper test inventory, with explicit skip reasons
+for platform-specific cases. Windows runs the native aggregate in place of
+the POSIX shard launcher and uses PE/DLL and extracted-VSIX inspection in
+place of `install-server-test`, `inspect-vsix` and `inspect-server`. The
+Makefile-driven incremental smoke and GCC coverage gate do not run on Windows.
+
+[`scripts/ci-titan-sdk.sh`](../scripts/ci-titan-sdk.sh) pins `TITAN_RELEASE`
+for all three. It resolves the exact source rock and companion asset IDs,
+SHA-256 digests and release commit. A cache miss installs the validation SDK
+and the exact bundled LuaRocks dependencies; Windows unpacks the same source
+rock and uses its `Makefile.win` recipes. Each platform caches the installed
+SDK with an exact key covering the release inputs, toolchain, absolute prefix
+and installation layout. Every run downloads and verifies the production
+browser semantic companion, even after a cache hit.
+
+CI requires no Titan checkout or deploy key. It builds disposable packages for
+inspection but publishes no binaries or VSIX packages. Linux uploads coverage
+reports and logs for 7 days. Release publishing belongs in a dedicated
+`main`-only job that uses a separate production SDK.
 
 ## Experimental Windows build
 
@@ -221,11 +235,19 @@ Dependency notices come from installed rockspecs, `rock_manifest` checksums, and
 
 ### Windows validation gates
 
-Native tests, SQLite cache reopen tests, stdio protocol suites, package inspection, and interactive Extension Host (F5) sessions are independent gates. Symlink tests skip unless run elevated on local NTFS; qualify both the Extension Host symlink case and multi-root SDK-farm symlink cases in an elevated local-NTFS session.
+Native tests, SQLite cache reopen tests, stdio protocol suites, package
+inspection, and Extension Host smoke tests run on local NTFS in CI. Symlink
+fixtures run when the account can create and traverse the links; cases with a
+known platform limitation print their skip reason. Interactive F5 is a
+separate local check.
 
 [`scripts/test-server-protocol.mjs`](../scripts/test-server-protocol.mjs), [`scripts/test-workspace-cache.mjs`](../scripts/test-workspace-cache.mjs), [`scripts/test-multi-root.mjs`](../scripts/test-multi-root.mjs), and [`scripts/test-completion-protocol.mjs`](../scripts/test-completion-protocol.mjs) take the server executable as their first argument and require `TITAN_ROOT`, `TITAN_LS_LUA_PATH` (`<sdk>/share/lua/5.5/?.lua;<sdk>/share/lua/5.5/?/init.lua`), `TITAN_LS_LUA_CPATH` (`<sdk>/lib/lua/5.5/?.dll`), `TITAN_ROUTER_WORKER_FIXTURE` (`.build/windows/tests/native/router-worker/bin/router_worker_fixture.exe`), and an unset `TITAN_PREFIX` so each root keeps its private `.titan-ls` cache. `test-multi-root.mjs` accepts an optional group name as its second argument to rerun one group.
 
-Run `npm run test:vscode` serially from an interactive desktop session with native Node and CLANG64 tools on `PATH`, `TITAN_PREFIX` set for staging, `TITAN_LSP_TEST_CODE` pointing to `Code.exe`, and `TITAN_LSP_TEST_SERVER` pointing to `titan-language-server.exe`.
+Run `npm run test:vscode` serially with native Node and CLANG64 tools on `PATH`,
+`TITAN_PREFIX` set for staging, and `TITAN_LSP_TEST_SERVER` pointing to
+`titan-language-server.exe`. Use `TITAN_LSP_TEST_CODE` to select a local
+`Code.exe`; otherwise the test launcher downloads the configured VS Code
+release, as it does on CI.
 
 For interactive F5 debugging, give the interactive account read/execute access to the SDK and tools alongside its own writable workspace, build tree, `node_modules`, VS Code state, and analysis cache on local NTFS. Set `TITAN_PREFIX`, `CC`, `AR`, `RANLIB`, `RC`, and `PATH` before launching VS Code, quoting the four tool paths with forward slashes (such as `"C:/tools/clang64/bin/clang.exe"`) because Titan parses them as shell words (see Titan's [Windows user guide](https://github.com/mascarenhas/titan/blob/master/doc/language/windows-build.md)). The `npm: compile` pre-launch task stages the compiler payload, and `.vscode/launch.json` clears `TITAN_PREFIX` inside the Extension Host. Filesystem watcher validation applies only to guest-local NTFS; shared folders may require an explicit refresh.
 

@@ -8,12 +8,12 @@ import { fileURLToPath } from "node:url";
 
 const repository = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
-const located = spawnSync("bash", ["-c", "command -v make"], { encoding: "utf8" });
-const make = located.status === 0 ? located.stdout.trim() : "";
-const identified = spawnSync(make === "" ? "make" : make, ["--version"], { encoding: "utf8" });
-const skip = identified.status === 0 && /GNU Make/.test(identified.stdout)
-  ? false
-  : "GNU Make is not installed";
+const windows = process.platform === "win32";
+const located = !windows && spawnSync("bash", ["-c", "command -v make"], { encoding: "utf8" });
+const make = located && located.status === 0 ? located.stdout.trim() : "";
+const identified = !windows && spawnSync(make === "" ? "make" : make, ["--version"], { encoding: "utf8" });
+const skip = windows ? "Windows uses build-windows.mjs instead of the Unix Makefile" :
+  identified.status === 0 && /GNU Make/.test(identified.stdout) ? false : "GNU Make is not installed";
 
 // Targets that CI, the README, the docs or users invoke directly. `make help`
 // is their discovery path, so it must keep every one of them listed.

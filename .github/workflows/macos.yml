@@ -1,0 +1,126 @@
+name: macOS
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify-macos-arm64:
+    name: Verify macOS 15 arm64
+    runs-on: macos-15
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: bash
+        working-directory: vscode-titan
+    env:
+      CCACHE_DISABLE: "1"
+      CI: "true"
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+      OPENSSL_MODE: bundled
+      TITAN_JOBS: "3"
+      BUILD_PROFILE: validation
+      TITAN_BUILD_PROFILE: validation
+      LUA_RELEASE: v5.5.1-1
+      LUAROCKS_VERSION: "3.13.0"
+
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          path: vscode-titan
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7.0.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: vscode-titan/package-lock.json
+
+      - name: Install native build tools
+        run: |
+          brew install make cmake readline pkgconf
+          echo "$(brew --prefix make)/libexec/gnubin" >> "$GITHUB_PATH"
+          echo "TMPDIR=$(mktemp -d /private/tmp/vscode-titan.XXXXXX)" >> "$GITHUB_ENV"
+
+      - name: Identify the compiler installation cache
+        id: compiler-identity
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash scripts/ci-titan-sdk.sh identify
+
+      - name: Restore the Titan release installation
+        id: compiler-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: vscode-titan/.titan-validation
+          key: titan-sdk-v12-macos-15-${{ runner.arch }}-${{ env.LUA_RELEASE }}-${{ env.LUAROCKS_VERSION }}-${{ steps.compiler-identity.outputs.toolchain }}-${{ steps.compiler-identity.outputs.commit }}-${{ steps.compiler-identity.outputs.rock }}-${{ steps.compiler-identity.outputs.pack }}-${{ hashFiles('vscode-titan/scripts/ci-titan-sdk.sh', 'vscode-titan/scripts/compiler-rocks.mjs') }}
+
+      - name: Install the validation Titan release SDK
+        if: steps.compiler-cache.outputs.cache-hit != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ROCK_ID: ${{ steps.compiler-identity.outputs.rock_id }}
+          ROCK_SHA256: ${{ steps.compiler-identity.outputs.rock }}
+        run: bash scripts/ci-titan-sdk.sh install
+
+      - name: Validate the compiler installation
+        run: bash scripts/ci-titan-sdk.sh inspect
+
+      - name: Provision and verify the paired browser semantic pack
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PACK_ID: ${{ steps.compiler-identity.outputs.pack_id }}
+          PACK_SHA256: ${{ steps.compiler-identity.outputs.pack }}
+          ROCK_SHA256: ${{ steps.compiler-identity.outputs.rock }}
+          TITAN_COMMIT: ${{ steps.compiler-identity.outputs.commit }}
+        run: bash scripts/ci-titan-sdk.sh pack
+
+      - name: Cache the completed compiler installation
+        if: steps.compiler-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: vscode-titan/.titan-validation
+          key: ${{ steps.compiler-cache.outputs.cache-primary-key }}
+
+      - name: Build the native server and test aggregate
+        id: build
+        run: make -j3 server server-test-build
+
+      - name: Run two native test shards in parallel
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: make server-test-sharded
+
+      - name: Smoke-test compiler-owned incremental builds
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: make incremental-build-test
+
+      - name: Run server protocol and Codex adapter regressions
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: make -j1 server-protocol-test codex-native-test
+
+      - name: Run extension and shard-launcher unit tests
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: make -j1 extension-test shard-runner-test
+
+      - name: Run the VS Code extension-host smoke test
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: make extension-host-test
+
+      - name: Build a disposable VSIX for validation
+        id: package
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: make package
+
+      - name: Inspect packaged and standalone artifacts
+        if: ${{ !cancelled() && steps.package.outcome == 'success' }}
+        run: make -j1 inspect-vsix inspect-server plugin-validate install-server-test

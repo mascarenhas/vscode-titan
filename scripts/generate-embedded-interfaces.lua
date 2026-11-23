@@ -733,9 +733,9 @@ if driver.LANGUAGE_SERVER_API_VERSION ~= 1 then
 end
 local context = driver.new_resolver_context()
 local ok, profile, profile_error = pcall(function()
-    local service, service_error = driver.get_probe_service(context)
-    if not service then return nil, service_error end
-    local data, export_error = csemantics.export_profile(service.profile)
+    local live_profile, probe_error = driver.get_target_profile(context)
+    if not live_profile then return nil, context.foreign_c_profile_error or probe_error end
+    local data, export_error = csemantics.export_profile(live_profile)
     if not data then return nil, export_error end
     -- The archive and generated profile must describe the same native target.
     -- Leave all type validation and numeric trait reconstruction to the
@@ -745,7 +745,7 @@ local ok, profile, profile_error = pcall(function()
             provider.entries[name].types, name, archive)
         if not module_type then return nil, decode_error end
         local normalized, normalize_error =
-            types.normalize_portable_c_numeric_types(module_type, service.profile)
+            types.normalize_portable_c_numeric_types(module_type, live_profile)
         if not normalized then return nil, name .. ": " .. normalize_error end
     end
     return data
