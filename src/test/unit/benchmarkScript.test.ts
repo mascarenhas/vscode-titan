@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import {
   mkdirSync,
   mkdtempSync,
+  realpathSync,
   rmSync,
   symlinkSync,
   writeFileSync
@@ -11,7 +12,7 @@ import * as path from "node:path";
 import { spawnSync } from "node:child_process";
 import { once } from "node:events";
 import { PassThrough } from "node:stream";
-import { afterEach, describe, test } from "node:test";
+import { afterEach, describe, test, type TestContext } from "node:test";
 import { pathToFileURL } from "node:url";
 
 const repositoryRoot = path.resolve(__dirname, "../../../..");
@@ -172,18 +173,29 @@ async function aggregateColdProfile(
   return (await benchmarkExports()).aggregateColdProfile(records);
 }
 
-function makeWorkspace(): {
-  physicalRoot: string;
-  lexicalRoot: string;
-} {
+function makeSymlinkWorkspace(context: TestContext): { lexicalRoot: string } | undefined {
   const directory = mkdtempSync(path.join(tmpdir(), "vscode-titan-benchmark-"));
   temporaryDirectories.push(directory);
   const physicalRoot = path.join(directory, "physical");
   const lexicalRoot = path.join(directory, "lexical");
   mkdirSync(physicalRoot);
-  symlinkSync(physicalRoot, lexicalRoot, "dir");
-  writeFileSync(path.join(physicalRoot, "target.titan"), "local target = 1\n");
-  return { physicalRoot, lexicalRoot };
+  const target = path.join(physicalRoot, "target.titan");
+  const linkedFile = path.join(physicalRoot, "linked.titan");
+  writeFileSync(target, "local target = 1\n");
+  try {
+    symlinkSync(physicalRoot, lexicalRoot, "dir");
+    symlinkSync(target, linkedFile, "file");
+    realpathSync(lexicalRoot);
+    realpathSync(linkedFile);
+  } catch (cause) {
+    const code = (cause as NodeJS.ErrnoException).code ?? "";
+    if (process.platform === "win32" && ["EPERM", "EACCES", "UNKNOWN", "ENOSYS"].includes(code)) {
+      context.skip("Windows account cannot create or traverse the benchmark fixture symlinks");
+      return;
+    }
+    throw cause;
+  }
+  return { lexicalRoot };
 }
 
 function runValidation(root: string, ...arguments_: string[]) {
@@ -216,11 +228,10 @@ afterEach(() => {
 });
 
 describe("language-server benchmark input validation", () => {
-  test("canonicalizes the workspace root and rejects a symlinked target", {
-    skip: process.platform === "win32"
-  }, () => {
-    const { physicalRoot, lexicalRoot } = makeWorkspace();
-    symlinkSync("target.titan", path.join(physicalRoot, "linked.titan"));
+  test("canonicalizes the workspace root and rejects a symlinked target", (context) => {
+    const workspace = makeSymlinkWorkspace(context);
+    if (!workspace) return;
+    const { lexicalRoot } = workspace;
 
     const result = runValidation(
       lexicalRoot,
@@ -230,11 +241,10 @@ describe("language-server benchmark input validation", () => {
     assert.match(reportedError(result), /--file target must not traverse symlinks/);
   });
 
-  test("rejects a probe that reaches its file through a symlink", {
-    skip: process.platform === "win32"
-  }, () => {
-    const { physicalRoot, lexicalRoot } = makeWorkspace();
-    symlinkSync("target.titan", path.join(physicalRoot, "linked.titan"));
+  test("rejects a probe that reaches its file through a symlink", (context) => {
+    const workspace = makeSymlinkWorkspace(context);
+    if (!workspace) return;
+    const { lexicalRoot } = workspace;
 
     const result = runValidation(
       lexicalRoot,

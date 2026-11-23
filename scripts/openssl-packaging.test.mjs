@@ -76,7 +76,7 @@ test("system SDK staging preserves its exact header inventory without copying ho
 });
 
 test("Windows SDK staging accepts an older absent pair and rejects a partial libbacktrace install",
-  { skip: process.platform !== "win32" }, async (context) => {
+  { skip: process.platform !== "win32" ? "the optional libbacktrace pair belongs to the Windows SDK" : false }, async (context) => {
     const state = await compilerSDK(context);
     await rm(path.join(state.sdk, "include/backtrace.h"));
     let result = stage(state);
