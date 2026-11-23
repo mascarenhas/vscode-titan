@@ -1,10 +1,12 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 import { copyFile, cp, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { test } from "node:test";
+import { fileURLToPath } from "node:url";
 import { fixtureRoot } from "./browser-analysis-fixture.mjs";
 import {
   installBrowserCompanion, semanticDirectory, semanticFiles, semanticNotices,
@@ -33,8 +35,34 @@ test("browser transport SHA is verified before decoding", () => {
   const invalid = Buffer.from("not a gzip archive");
   const digest = "0".repeat(64);
   assert.throws(() => verifyBrowserCompanion(invalid, {
-    packSha256: digest, rockSha256: digest, commit: "0".repeat(40), profile: "validation"
+    tag: "v0.6.99", packSha256: digest, rockSha256: digest, commit: "0".repeat(40), profile: "validation"
   }), /transport SHA-256 differs/);
+});
+
+test("the install CLI uses TITAN_RELEASE to select the exact companion basename", async (context) => {
+  const prefix = await mkdtemp(path.join(tmpdir(), "vscode-titan-semantic-tag-"));
+  context.after(() => rm(prefix, { recursive: true, force: true }));
+  const archive = path.join(prefix, "titan-0.6.99-1-browser-semantics.tar.gz");
+  await writeFile(archive, "not a companion");
+  const script = fileURLToPath(new URL("./browser-semantic-pack.mjs", import.meta.url));
+  const digest = "0".repeat(64);
+  const run = (tag) => {
+    const env = { ...process.env, TITAN_RELEASE: tag };
+    if (tag === undefined) delete env.TITAN_RELEASE;
+    return spawnSync(process.execPath, [script, "--install", prefix, archive,
+      digest, digest, "0".repeat(40), "validation"], { env, encoding: "utf8" });
+  };
+  for (const [tag, pattern] of [
+    ["v0.6.99", /transport SHA-256 differs/],
+    ["v0.6.0", /unexpected browser companion basename/],
+    ["v0.6.099", /TITAN_RELEASE must be/],
+    ["v0.7.0", /TITAN_RELEASE must be/],
+    [undefined, /TITAN_RELEASE must be/]
+  ]) {
+    const result = run(tag);
+    assert.equal(result.status, 1, result.stderr);
+    assert.match(result.stderr, pattern);
+  }
 });
 
 async function copyPack(context, source) {
@@ -74,12 +102,13 @@ test("the valid protocol fixture is not the full packaging provider", { skip: no
 const companion = process.env.TITAN_TEST_BROWSER_COMPANION;
 const noCompanion = companion ? false : "set TITAN_TEST_BROWSER_COMPANION and its exact pairing values";
 const expected = {
+  tag: process.env.TITAN_RELEASE,
   packSha256: process.env.TITAN_TEST_BROWSER_COMPANION_SHA256,
   rockSha256: process.env.TITAN_TEST_BROWSER_ROCK_SHA256,
   commit: process.env.TITAN_TEST_BROWSER_COMMIT,
   profile: process.env.TITAN_TEST_BROWSER_PROFILE
 };
-test("the actual companion rejects wrong transport, rock, commit, profile and member bytes",
+test("the actual companion rejects wrong release, transport, rock, commit, profile and member bytes",
   { skip: noCompanion }, async () => {
     const bytes = await readFile(companion);
     const hash = (input) => createHash("sha256").update(input).digest("hex");
@@ -87,6 +116,7 @@ test("the actual companion rejects wrong transport, rock, commit, profile and me
     verifyBrowserCompanion(bytes, expected);
     assert.throws(() => verifyBrowserCompanion(bytes, { ...expected, packSha256: wrongDigest }), /transport SHA-256/);
     for (const wrong of [
+      { tag: expected.tag === "v0.6.99" ? "v0.6.0" : "v0.6.99" },
       { rockSha256: wrongDigest }, { commit: "0".repeat(40) },
       { profile: expected.profile === "validation" ? "production" : "validation" }
     ]) {
@@ -111,6 +141,39 @@ test("a private SDK receives the full companion and refuses damaged warm caches"
     assert.deepEqual((await readdir(path.dirname(pack))).sort(), ["0.6"]);
     assert.deepEqual((await readdir(pack)).sort(), semanticFiles);
     await installBrowserCompanion(prefix, companion, expected);
+
+    await context.test("installation checks both release values against the chosen tag", async () => {
+      const release = expected.tag.slice(1);
+      const otherRelease = release === "0.6.99" ? "0.6.0" : "0.6.99";
+      await assert.rejects(verifyInstalledBrowserPack(prefix, prefix, { release: otherRelease }),
+        /SDK compiler release differs from companion/);
+
+      const lua = path.join(prefix, "bin", process.platform === "win32" ? "lua.exe" : "lua");
+      const descriptor = path.join(pack, "analysis-target");
+      const original = await readFile(descriptor);
+      try {
+        const retagged = spawnSync(lua, ["-E", "-", prefix, descriptor, otherRelease], {
+          encoding: "utf8",
+          input: `
+local prefix, filename, release = ...
+package.path = prefix .. "/share/lua/5.5/?.lua"
+local codec = require "titan-compiler.graphcodec"
+local input = assert(io.open(filename, "rb"))
+local data = assert(codec.decode(assert(input:read("a"))))
+assert(input:close())
+data.release = release
+local output = assert(io.open(filename, "wb"))
+assert(output:write(assert(codec.encode(data))))
+assert(output:close())
+`
+        });
+        assert.equal(retagged.status, 0, retagged.stderr);
+        await assert.rejects(verifyInstalledBrowserPack(prefix, prefix, { release }),
+          /browser descriptor release differs from companion|incompatible browser semantic target/);
+      } finally {
+        await writeFile(descriptor, original);
+      }
+    });
 
     const absent = path.join(pack, "absent-modules");
     await writeFile(absent, "different bytes\n");

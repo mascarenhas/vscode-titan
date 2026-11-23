@@ -124,18 +124,32 @@ Top-level `make -j` would overlap `package` (which stages `dist/` and temporaril
 - `src/lua-5.5.1`;
 - `lib/titan-browser/0.6`, limited to `analysis-target`, `absent-modules`, and `titan.a`.
 
+Staging accepts a compiler release in the `0.6` library series with Titan ABI
+`2`, Lua `5.5` and language-server API `1`; it does not pin the patch number.
+
 No native `lib/titan` archive, `share/lua/5.5/titan` source tree, Wasm runtime, or Emscripten tool is staged. [`scripts/stage-notices.mjs`](../scripts/stage-notices.mjs) bundles browser provider licenses and rock notices verified through [`scripts/compiler-rocks.mjs`](../scripts/compiler-rocks.mjs). [`scripts/inspect-vsix.sh`](../scripts/inspect-vsix.sh) and [`scripts/inspect-server.sh`](../scripts/inspect-server.sh) validate package contents, browser provider metadata, offline extracted-server execution, and native linkage: rejecting dynamic language/runtime dependencies, allowing dynamic OpenSSL 3/4 only for system-OpenSSL SDKs, and enforcing `TITAN_MAX_GLIBC_VERSION` when set.
 
 ### Paired browser semantic pack
 
-Pair the Titan source rock with `titan-0.6.1-1-browser-semantics.tar.gz` from the same release. Provision a native-only SDK with the companion's recorded Git commit and SHA-256 digests before packaging:
+Pair the Titan source rock with `titan-<release>-1-browser-semantics.tar.gz`
+from the same exact release. Provision a native-only SDK with the release tag,
+the companion's recorded Git commit and the two asset SHA-256 digests before
+packaging:
 
 ```sh
-node scripts/browser-semantic-pack.mjs --install "$TITAN_PREFIX" "$PACK" \
+TITAN_RELEASE="$TAG" node scripts/browser-semantic-pack.mjs --install "$TITAN_PREFIX" "$PACK" \
   "$PACK_SHA256" "$ROCK_SHA256" "$TITAN_COMMIT" production
 ```
 
-Pass `validation` for a deliberately built validation companion. The offline installer verifies the archive digest, exact regular members, manifest pairing, rock notices, and complete Wasm interface inventory, atomically moving only the three semantic files into place and refusing partial or conflicting installations. `make package` never downloads or repairs inputs.
+`TAG` is the GitHub release tag (for example `v0.6.1`), not the SDK library
+series. Pass `validation` for a deliberately built validation companion.
+The offline installer verifies the archive digest, exact regular members,
+manifest pairing, SDK compiler and descriptor release, rock notices, and
+complete Wasm interface inventory. It atomically moves only the three semantic
+files into place, refusing partial or conflicting installations. Ordinary
+package checks validate the installed files through the selected compiler and
+do not require a separate `TITAN_RELEASE`. `make package` never downloads or
+repairs inputs.
 
 The checked-in smaller browser fixture serves only source-tree protocol tests. To exercise live foreign C work against an extracted package, activate Emscripten 6.0.13 and set `TITAN_LS_TEST_BROWSER_LIVE=1` before running `inspect-vsix`.
 
@@ -149,7 +163,13 @@ The checked-in smaller browser fixture serves only source-tree protocol tests. T
 
 [`.github/workflows/ci.yml`](../.github/workflows/ci.yml) runs `verify-linux-x64` on `ubicloud-standard-2` (Ubuntu 24.04) with `BUILD_PROFILE=validation`, `OPENSSL_MODE=system`, `TITAN_JOBS=2`, and `TITAN_MAX_GLIBC_VERSION=2.39` on pushes to `main`, pull requests, and manual dispatch:
 
-1. **SDK:** Resolves exact release asset IDs, SHA-256 digests, and commit SHA for the release tag; restores `.titan-validation` under an exact cache key (no fallback keys) covering rock, pack, Lua 5.5.1, LuaRocks 3.13.0, pinned `compiler-rocks.mjs`, build policy, and prefix; installs on a miss with `TITAN_BUILD_PROFILE=validation`; re-downloads and verifies the production browser semantic pack on every run.
+1. **SDK:** Derives both asset names from `TITAN_RELEASE`, then resolves the
+   exact asset IDs, SHA-256 digests, and commit SHA for that tag. It restores
+   `.titan-validation` under an exact cache key (no fallback keys) covering
+   rock, pack, Lua 5.5.1, LuaRocks 3.13.0, pinned `compiler-rocks.mjs`, build
+   policy, and prefix; installs on a miss with
+   `TITAN_BUILD_PROFILE=validation`; and re-downloads and verifies the
+   production browser semantic pack on every run.
 2. **Build and test:** Runs `make -j2 server server-test-build`, then serially runs `server-test-sharded`, `incremental-build-test`, `server-protocol-test`, `codex-native-test`, `extension-test`, `shard-runner-test`, and `xvfb-run -a make extension-host-test`.
 3. **Package:** Runs `make package`, followed by `inspect-vsix`, `inspect-server`, `plugin-validate`, and `install-server-test`.
 4. **Coverage:** Builds and runs the [covered aggregate](coverage.md) with `CC=gcc-14`, gcov 14, and gcovr 8.4 (HTML, LCOV, Cobertura), uploading reports and logs as `titan-language-server-line-coverage` for 7 days.

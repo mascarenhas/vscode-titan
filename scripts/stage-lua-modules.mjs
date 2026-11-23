@@ -4,15 +4,14 @@ import { cp, lstat, mkdir, readFile, readdir, rm } from "node:fs/promises";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { validateSdkIncludeInventory } from "./sdk-include-inventory.mjs";
-import { resolveTitanSdk } from "./titan-sdk.mjs";
+import { resolveTitanSdk, titanLibrarySeries, titanReleaseSeries } from "./titan-sdk.mjs";
 import { semanticDirectory, semanticFiles } from "./browser-semantic-pack.mjs";
 
 const LUA_VERSION = "5.5";
 const LUA_SOURCE_VERSION = "5.5.1";
 const EXPECTED_COMPILER_VERSION = {
   LUA_VERSION,
-  TITAN_ABI_VERSION: "2",
-  TITAN_VERSION: "0.6.1"
+  TITAN_ABI_VERSION: "2"
 };
 const EXPECTED_LANGUAGE_SERVER_API_VERSION = 1;
 // The compiler modules, their packaged dependencies and nothing else. The
@@ -163,6 +162,12 @@ async function validateCompilerVersion(shareRoot) {
         `incompatible compiler ${name} in ${filename}: expected ${expected}, found ${actual}`
       );
     }
+  }
+  const release = assignedLuaString(source, "TITAN_VERSION", filename);
+  if (titanReleaseSeries(release) !== titanLibrarySeries) {
+    throw new Error(
+      `incompatible compiler TITAN_VERSION in ${filename}: expected a ${titanLibrarySeries} release, found ${release}`
+    );
   }
 
   const driverFilename = await requireRegularFile(

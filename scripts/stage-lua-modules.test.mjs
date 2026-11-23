@@ -51,7 +51,9 @@ test("staging requires and copies the portable compiler path helper", async (con
   };
   for (const file of requiredShareFiles.filter((file) => file !== "titan-compiler/path.lua"))
     await put(`share/lua/5.5/${file}`);
-  await put("share/lua/5.5/titan-compiler/version.lua", 'LUA_VERSION="5.5"\nTITAN_ABI_VERSION="2"\nTITAN_VERSION="0.6.1"\n');
+  const putVersion = (release, abi = "2") => put("share/lua/5.5/titan-compiler/version.lua",
+    `LUA_VERSION="5.5"\nTITAN_ABI_VERSION="${abi}"\nTITAN_VERSION="${release}"\n`);
+  await putVersion("0.6.0");
   await put("share/lua/5.5/titan-compiler/driver.lua", "driver.LANGUAGE_SERVER_API_VERSION = 1\n");
   await put("share/lua/5.5/argparse.lua");
   for (const member of nativeRootInventory()) await put(`lib/lua/5.5/${member.split(":")[0]}`);
@@ -76,6 +78,18 @@ test("staging requires and copies the portable compiler path helper", async (con
   await rm(path.join(sdk, "include/transfer.h"));
   assert.equal(await readFile(path.join(root, "dist/titan", semanticDirectory, "analysis-target"), "utf8"),
     "analysis-target\n");
+  await context.test("staging checks the SDK's series and ABI, not the patch", async () => {
+    await putVersion("0.6.99");
+    const compatible = run();
+    assert.equal(compatible.status, 0, compatible.stderr);
+    for (const release of ["0.5.0", "0.7.0", "0.6", "0.6.01", "0.6.99\n", "v0.6.99", "0.6.x"]) {
+      await putVersion(release);
+      await assert.rejects(stageLuaModules({ sdk }), /incompatible compiler TITAN_VERSION.*expected a 0[.]6 release/);
+    }
+    await putVersion("0.6.99", "1");
+    await assert.rejects(stageLuaModules({ sdk }), /incompatible compiler TITAN_ABI_VERSION/);
+    await putVersion("0.6.0");
+  });
   const legacyDestination = path.join(root, "legacy");
   await stageLuaModules({ sdk, destination: legacyDestination });
   await validateStagedLuaModules(sdk, legacyDestination);
